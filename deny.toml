@@ -1,0 +1,15 @@
+# Advisory policy for the full workspace. `cargo deny check advisories` reads
+# only the [advisories] section, so the bans and license policy live in
+# deny-wire.toml (the wire crate's portable-surface gate) and are not
+# duplicated here.
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained (no vulnerability, no safe upgrade). It reaches
+    # the graph only transitively through Apache Iggy
+    # (iggy -> iggy_common -> lending-iterator -> macro_rules_attribute -> paste)
+    # and only into the examples and the SDK's dev-dependencies, never the
+    # published laser-wire crate. Pinned so a genuine future advisory still
+    # fails the gate, revisit when upstream Iggy drops the dependency.
+    "RUSTSEC-2024-0436",
+]

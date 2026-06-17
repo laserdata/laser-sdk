@@ -1,0 +1,12 @@
+debug/
+target/
+.idea/
+.vscode/
+.cargo/
+.zed/
+.DS_Store
+/rust-clippy-results.sarif
+.env
+gha-creds-*.json
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

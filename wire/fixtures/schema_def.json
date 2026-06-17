@@ -1,0 +1,7 @@
+{
+  "id": 7,
+  "source": {
+    "kind": "avro",
+    "schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[]}"
+  }
+}

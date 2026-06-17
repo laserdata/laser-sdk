@@ -1,0 +1,36 @@
+{
+  "rows": [
+    {
+      "headers": {
+        "amount": "42",
+        "customer": "alice"
+      },
+      "metadata": {
+        "agdx.ct": "1"
+      },
+      "partition": 2,
+      "offset": 17,
+      "payload": [
+        123,
+        34,
+        116,
+        111,
+        116,
+        97,
+        108,
+        34,
+        58,
+        52,
+        50,
+        125
+      ],
+      "score": 0.5
+    }
+  ],
+  "page": {
+    "offset": 0,
+    "limit": 50,
+    "total": 1,
+    "has_more": false
+  }
+}

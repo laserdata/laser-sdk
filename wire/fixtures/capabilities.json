@@ -1,0 +1,17 @@
+{
+  "managed": true,
+  "query": true,
+  "projections": true,
+  "schemas": true,
+  "kv": true,
+  "fork": true,
+  "kv_cas": true,
+  "read_your_writes": true,
+  "strong_consistency": false,
+  "versions": {
+    "query": 1,
+    "control": 1,
+    "kv": 1,
+    "fork": 1
+  }
+}

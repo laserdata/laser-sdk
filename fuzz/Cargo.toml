@@ -1,0 +1,30 @@
+[package]
+name = "laser-wire-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the parent workspace: cargo-fuzz crates build standalone on a
+# nightly toolchain and are not part of the published workspace graph.
+[workspace]
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_envelope"
+path = "fuzz_targets/decode_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+laser-wire = { path = "../wire", features = ["cbor", "codecs", "fixtures"] }
+libfuzzer-sys = "0.4"

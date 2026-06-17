@@ -1,0 +1,45 @@
+---
+name: wire-contract
+description: The laser-wire crate - `wire/`, the LaserData wire contract as one typed, runtime-free, wasm-portable crate. Use when changing any command code, envelope, header or topic dictionary, cap, the Agent Data Exchange Protocol envelope (`wire/src/agent.rs`), the golden fixture corpus, the CBOR framing, or the payload codecs.
+---
+
+# laser-wire - the wire contract crate
+
+## What it is
+
+Data and pure functions only: no IO, no clock, no randomness (and no async except the opt-in `http-client` client, which is runtime-agnostic). The crate compiles unchanged for native servers and `wasm32-unknown-unknown`, and CI bans iggy, tokio, bytes, ulid, dashmap, tracing, and getrandom from its portable graph (`deny-wire.toml` + the `wasm` job, both now also exercising `builders` + `http-client`). Modules carve the API surface. Features gate only dependencies (`cbor`, `codecs`, `bson` native-only, `fixtures`, `builders` = bon's `Query::builder`, `http-client` = the typed `http_client` client + serde_urlencoded). No wire-contract *type* is ever feature-gated. The two gated surfaces are conveniences, not wire types: `builders` gates only the `Query::builder` method (struct-literal construction is always available), and `http-client` gates the `http_client` module.
+
+the AGDX spec is the prose form of this crate, and this crate is the executable form of the AGDX spec. Both change in the same commit or neither does.
+
+## Hard invariants
+
+- **Bytes are the contract.** Field names, serde attributes, declaration order, the bin encodings, and the u8 dictionaries are all on the wire. The golden corpus (`wire/fixtures/`, asserted by `wire/tests/wire_fixtures.rs`) fails on any drift. Regenerate only for an intentional change (`just fixtures-regen`), then propagate to LaserData Cloud per the standing release process and bump the surface's op version when the change is not additive.
+
+- **Constants are pinned as literals** in `wire/tests/constants.rs`, so a refactor cannot silently renumber a code.
+- **Decoding untrusted bytes never panics** and the crate is `#![forbid(unsafe_code)]`. The guarantee is held by `wire/tests/robustness.rs` (random, byte-flipped, and truncated inputs through `frame_decode` and every envelope decoder, plus `validate()`) and the `fuzz/` cargo-fuzz crate (`just fuzz`). A new decode path must return a value or a `DecodeError`, never panic or index past a slice.
+- **Byte fields are `Vec<u8>`** with the bin-encoding helpers in `wire/src/encoding.rs` (one shared module, no per-surface drift), never `bytes::Bytes`, never a bare `Vec<u8>` (which would encode as a CBOR array). This holds for *every* surface, including the forwarded frames (`ForwardedQuery.query_envelope`, `ForwardedCommand.payload`) and `SchemaSource::Protobuf.descriptor_set`, historically the only stragglers, now compliant.
+- **The opaque machine ids (`RecordId`/`ConversationId`/`CorrelationId`/`ChannelId`) ride the payload as one atomic 16-byte CBOR byte string** (big-endian), through the hand-written serde in the `wire_id!` macro (`wire/src/agent.rs`). Routing headers duplicating one use Iggy's typed `Uint128`. **`AgentId` is the exception: a bounded name string** (the `IdempotencyKey` newtype pattern, not the macro), because agent identity is a named principal in every edge protocol (A2A/MCP/OTel). Its routing-header duplicate (`agdx.to`) is a typed string.
+- **Dictionaries we own are u8 codes with unknown-code passthrough** (`ContentType`, `TaskState`, `AgentErrorCode`, `DeadLetterReason`): codes are permanent and never renumbered, and a raw u8 always decodes. Vocabularies owned by others stay strings (`finish_reason`).
+- **Errors are crate-local and structured**: `DecodeError` (codec/framing) and `InvalidError` (builder/parse validation). The SDK maps both into `LaserError`. Never import the SDK from here (the dependency arrow only points the other way).
+
+## Module map
+
+`codes` (command codes + op versions, incl. `AGDX_KV_CAS_CODE`) / `headers` (the `agdx.*` + `gen_ai.*` dictionaries + caps) / `topics` / `limits` / `content` / `hello` (`OpVersions` with the additive, skip-when-zero `agent` field + the skip-when-zero `features` capability bitset and `feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY}` + `has_feature`, plus `BackendAnnounce` the backend-to-streaming-server capability announce on `AGDX_BACKEND_HELLO_CODE`) / `query` (incl. the `Consistency` level + `QueryError::Stale` + the `ConsistencyGate` server helper) / `result` (the unified `ResultCode` space + HTTP status, `From` projections off every surface error, and `CommandError` the surface-agnostic fallback reply) / `browse` (incl. `DecodeRecord`) / `control` / `kv` (incl. `KvCas`/`CasExpect`, the entry `version`, `KvOutcome::Committed`, `KvError::VersionConflict`) / `fork` (incl. `validate_fork_id`, the shared id charset safelist) / `agent` / `forward` (forwarded managed-request frames) / `commands` (the `Command` trait pairing code with request/reply types) / `http` (route constants + path builders + typed query-param structs/`PARAM_*` consts + JSON views incl. the extended capability flags which now default **off** via `Capabilities::new` + opt-in `with_*` + `from_versions` syncing them from the `OpVersions` bitset + the canonical `ErrorBody` reply contract) / `http_client` (feature-gated typed `/agdx/*` client over an injected `Transport`, owning routes/base64url/query strings/the bare-Ok-or-ErrorBody unwrap) / `framing` (`encode_named` / `decode_named` / `frame_encode` / `frame_decode`, sans-io, 64 MiB cap) / `codecs` / `fixtures`. Forward-compat note: `SchemaSource` is internally tagged on `kind` and `SchemaSource`/`RetentionPolicy` carry an `Unknown` `#[serde(other)]` catch-all (lossy, read-only).
+
+## The agent module (Agent Data Exchange Protocol)
+
+`AgentEnvelope` is one CBOR named-field decode unit, versioned OUT-OF-BAND by the `agdx.av` header (`AGENT_OP_VERSION`), never by a `v` field. Per-kind constructors (`command` / `response` / `event` / `chunk` / `status` / `error`) stamp the required shape, and `validate()` enforces the full per-kind validity matrix and the caps (the matrix table lives next to it in the source and in the AGDX spec). Skip-serializing discipline everywhere: an absent optional, `last = false`, and an empty `body` cost zero bytes (pinned by a field-count assertion in the wire tests).
+
+Identity rules baked into the types: every agent-written field is a claim (`source` is not stamped identity), `usage` is advisory, foreign metadata never enters `metadata` (it tunnels whole in `body`), and the `Signature` type exists but is dormant (no crypto dependency here, ever). Id GENERATION is deliberately impossible in this crate: the SDK's `MintUlid` (in `sdk/src/types/ids.rs`) mints the u128 ids. `AgentId::wire_id` is the SDK name verbatim (no derivation, since the wire agent id is itself a string).
+
+Pinned conventions next to the envelope: the chunk-stream purpose vocabulary (`OPERATION_CHAT` / `OPERATION_REASONING` / `OPERATION_TOOL_ARGS`, REQUIRED via `operation` on the stream-opening chunk and invalid after it, enforced by `validate()` like the closed status discriminator), the state-sync event operations (`OPERATION_STATE_SNAPSHOT` / `OPERATION_STATE_DELTA`, RFC 6902 JSON Patch deltas), the `must_understand` u64 bitset (A9.1: skip-when-zero feature-bit marker, `requiring()` to set, `unmet_requirements(understood)` for a receiver to reject what it cannot handle, defined bits live in `agent::features`), the AGDX-native metadata keys (`METADATA_ROLE`, `METADATA_BRIDGE_HOPS` with its bridge loop-guard rule), `BodyRef` (the claim-check capsule a `agdx.ct = ref` body carries: bounded `reference`, `size_bytes`, 32-byte `sha256`, dormant `encryption` scheme code, plus `BodyRef::validate` for decoded capsules), `AgentCard` (the pinned minimal card body: name/version/capabilities/ttl, capped), and the signature canonicalization pins (`SIGNATURE_DOMAIN`, per-scheme lengths via `Signature::validate`, the rolling stream-hash definition). All in the AGDX spec The agent fixtures are embedded in the `fixtures` corpus like every other surface.
+
+The agent fixtures are DRAFT-grade until a real multi-agent application has bent the envelope. The `agent_invalid_*.bin` negatives pin what every port's validator must reject identically.
+
+## Adding a field / surface, the checklist
+
+1. Additive optional field: add with `#[serde(default, skip_serializing_if = ...)]`, no version bump, regen fixtures.
+2. New enum variant on an externally tagged wire enum: bump the surface's op version in `codes.rs` and thread it through the hello advertisement.
+3. New code in a u8 dictionary: take the next free code, never reuse one.
+4. New command: code in `codes.rs`, request/reply types in the surface module, a `command!` pairing in `commands.rs`, fixtures, constants test.
+5. Always: `just fixtures-regen`, update `wire/tests/constants.rs`, the AGDX spec, and the consumer repos per the release process.
