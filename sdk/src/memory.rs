@@ -107,8 +107,8 @@ pub trait LocalMemory {
 /// from the log on its first recall. There is no side checkpoint to keep
 /// because the log already holds the truth (contrast [`KvMemory`], whose store
 /// is the truth).
-pub struct LogMemory<'a> {
-    laser: &'a Laser,
+pub struct LogMemory {
+    laser: Laser,
     projection: Mutex<Projection>,
 }
 
@@ -151,9 +151,13 @@ impl Projection {
     }
 }
 
-impl<'a> LogMemory<'a> {
-    /// A log-backed memory over `laser`.
-    pub fn new(laser: &'a Laser) -> Self {
+impl LogMemory {
+    /// A log-backed memory over an owned `Laser` (cheap to clone, shares the one
+    /// connection). Hold a single instance to keep recall incremental: it folds
+    /// only what was appended since the last recall, never rescanning from offset
+    /// zero. A fresh instance rebuilds the projection from the log on its first
+    /// recall, so reuse one instance for an agent that recalls repeatedly.
+    pub fn new(laser: Laser) -> Self {
         Self {
             laser,
             projection: Mutex::new(Projection::default()),
@@ -235,7 +239,7 @@ impl<'a> LogMemory<'a> {
     }
 }
 
-impl Memory for LogMemory<'_> {
+impl Memory for LogMemory {
     async fn remember(
         &self,
         scope: &MemoryScope,

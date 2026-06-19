@@ -553,8 +553,9 @@ Each sub-conversation gets its own partition (= total order within that branch) 
 
 ```rust
 // LogMemory writes to the Audit topic, scoped by agent + conversation. Recall is
-// incremental - it folds only what is new since the last call, never from offset 0.
-let mem = LogMemory::new(&laser);
+// incremental - hold one instance and it folds only what is new since the last
+// call, never from offset 0. It owns the Laser (cheap to clone, shared connection).
+let mem = LogMemory::new(laser.clone());
 let scope = MemoryScope::builder()
     .conversation(conv)
     .agent("assistant".parse()?)

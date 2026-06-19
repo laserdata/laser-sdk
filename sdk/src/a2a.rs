@@ -2,25 +2,36 @@ use crate::agent::Laser;
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
+#[cfg(feature = "a2a-http")]
 use axum::Router;
+#[cfg(feature = "a2a-http")]
 use axum::extract::State;
+#[cfg(feature = "a2a-http")]
 use axum::routing::post;
 use laser_wire::agent::{self as agdx, AgentEnvelope, AgentId, CorrelationId, OPERATION_CHAT};
 use laser_wire::content::ContentType;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, to_value};
+use serde_json::Value as JsonValue;
+#[cfg(feature = "a2a-http")]
+use serde_json::to_value;
+#[cfg(feature = "a2a-http")]
 use std::str::FromStr;
+#[cfg(feature = "a2a-http")]
 use std::sync::Arc;
+#[cfg(feature = "a2a-http")]
 use strum::{Display, EnumString};
 
 pub use laser_wire::agent::TaskState;
 
+#[cfg(feature = "a2a-http")]
 const JSONRPC_VERSION: &str = "2.0";
 // JSON-RPC reserved range ends at -32000, and -32000..=-32099 is for application errors.
+#[cfg(feature = "a2a-http")]
 const APP_ERROR_CODE: i32 = -32000;
 
 /// The A2A JSON-RPC methods the bridge serves. `Display`/`FromStr` (strum) carry
 /// the exact wire spelling, so the dispatch never matches on bare string literals.
+#[cfg(feature = "a2a-http")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
 pub enum A2aMethod {
     #[strum(serialize = "message/send")]
@@ -321,7 +332,9 @@ impl A2aBridge {
     }
 
     /// An axum router: the JSON-RPC endpoint at `/` plus the Agent Card at the
-    /// A2A well-known discovery path.
+    /// A2A well-known discovery path. Requires the `a2a-http` feature. The bridge
+    /// adapter (`submit` / `task` / `cancel` / `card`) is usable without it.
+    #[cfg(feature = "a2a-http")]
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/", post(handle_rpc))
@@ -333,6 +346,7 @@ impl A2aBridge {
     }
 }
 
+#[cfg(feature = "a2a-http")]
 async fn handle_card(State(bridge): State<Arc<A2aBridge>>) -> axum::Json<AgentCard> {
     axum::Json(bridge.card())
 }
@@ -344,6 +358,7 @@ fn correlation_of(conversation: ConversationId) -> CorrelationId {
     CorrelationId::from_u128(conversation.as_u128())
 }
 
+#[cfg(feature = "a2a-http")]
 async fn handle_rpc(
     State(bridge): State<Arc<A2aBridge>>,
     axum::Json(request): axum::Json<JsonRpcRequest>,
@@ -434,6 +449,7 @@ mod tests {
         assert!(from_str::<TaskStatus>(r#"{"state":"nope"}"#).is_err());
     }
 
+    #[cfg(feature = "a2a-http")]
     #[test]
     fn given_a2a_methods_when_round_tripped_then_should_match_the_wire_names() {
         assert_eq!(A2aMethod::MessageSend.to_string(), "message/send");

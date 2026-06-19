@@ -17,8 +17,10 @@ bdd/
 │   ├── capabilities.feature    negotiation + the Unsupported boundary
 │   ├── provenance.feature      provenance + causality round-trip
 │   ├── agent.feature           the AGDX agent envelope + conversation threading
-│   └── query.feature           projections + the query DSL (in-process worker)
+│   ├── query.feature           the query DSL semantics (reference engine)
+│   └── kv_cas.feature          compare-and-swap semantics (reference engine)
 ├── rust/                       Rust reference runner (cucumber-rs)
+├── python/                     Python runner (pytest-bdd), same scenarios
 ├── docker-compose.yml          shared server + per-language runner services
 └── README.md
 ```
@@ -38,6 +40,14 @@ just bdd                       # or: cd bdd/rust && cargo test
 ```
 
 Needs Docker. The runner manages its own Apache Iggy testcontainer by default. Set `LASER_BDD_ADDR=host:3000` to run against an already-running server (the path other language runners share via docker-compose).
+
+The Python runner covers the same scenarios:
+
+```sh
+cd bdd/python && pytest -q     # needs the laser-sdk wheel installed and Docker
+```
+
+It runs streaming, capabilities, provenance, and agent against a testcontainer, and serves `query.feature` and `kv_cas.feature` from a pure-Python port of the reference engines (`bdd/python/reference.py`), so both languages answer the semantics scenarios identically.
 
 ## Adding a language
 

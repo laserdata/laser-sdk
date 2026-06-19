@@ -20,6 +20,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Harden cargo's network against the runner's flaky HTTP/2 to crates.io: retry
+  # transient failures and drop HTTP/2 multiplexing, which triggers the recurring
+  # "Error in the HTTP2 framing layer" curl failures.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   # fmt, sort, unused-deps, and clippy: the static gates, in the order the

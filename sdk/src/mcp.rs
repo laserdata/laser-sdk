@@ -2,19 +2,29 @@ use crate::agent::Laser;
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
+#[cfg(feature = "mcp-http")]
 use axum::Router;
+#[cfg(feature = "mcp-http")]
 use axum::extract::State;
+#[cfg(feature = "mcp-http")]
 use axum::routing::post;
 use laser_wire::agent::{self as agdx, AgentEnvelope, AgentId, CorrelationId};
 use laser_wire::content::ContentType;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value as JsonValue, json, to_value};
+#[cfg(feature = "mcp-http")]
+use serde_json::to_value;
+use serde_json::{Value as JsonValue, json};
+#[cfg(feature = "mcp-http")]
 use std::str::FromStr;
+#[cfg(feature = "mcp-http")]
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "mcp-http")]
 use strum::{Display, EnumString};
 
+#[cfg(feature = "mcp-http")]
 const JSONRPC_VERSION: &str = "2.0";
+#[cfg(feature = "mcp-http")]
 const APP_ERROR_CODE: i32 = -32000;
 // Echoed when the client sends no protocolVersion (an MCP server otherwise
 // echoes the client's requested version on initialize).
@@ -22,6 +32,7 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MCP JSON-RPC methods the bridge serves.
+#[cfg(feature = "mcp-http")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
 pub enum McpMethod {
     #[strum(serialize = "initialize")]
@@ -55,22 +66,22 @@ pub struct McpResource {
 }
 
 /// One argument of an [`McpPrompt`] (the MCP `PromptArgument` shape).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpPromptArgument {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
 }
 
 /// A prompt the bridge advertises in `prompts/list` (the MCP `Prompt` shape).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpPrompt {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<McpPromptArgument>,
@@ -348,7 +359,9 @@ impl McpBridge {
         Ok(tool_result_from_envelope(&envelope))
     }
 
-    /// An axum router exposing the MCP JSON-RPC endpoint at `/`.
+    /// An axum router exposing the MCP JSON-RPC endpoint at `/`. Requires the
+    /// `mcp-http` feature. The bridge adapter is usable without it.
+    #[cfg(feature = "mcp-http")]
     pub fn router(self: Arc<Self>) -> Router {
         Router::new().route("/", post(handle_mcp)).with_state(self)
     }
@@ -381,6 +394,7 @@ pub struct McpRpcError {
     pub message: String,
 }
 
+#[cfg(feature = "mcp-http")]
 async fn handle_mcp(
     State(bridge): State<Arc<McpBridge>>,
     axum::Json(request): axum::Json<McpRpcRequest>,
@@ -462,6 +476,7 @@ mod tests {
     use laser_wire::framing::{decode_named, encode_named};
     use serde_json::to_string;
 
+    #[cfg(feature = "mcp-http")]
     #[test]
     fn given_mcp_method_when_round_tripped_then_should_match_the_wire_name() {
         assert_eq!(McpMethod::ToolsCall.to_string(), "tools/call");

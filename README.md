@@ -1,10 +1,10 @@
 # Laser SDK
 
-> **Status: edge / prerelease (`0.0.1-rc.1`).** Pre-1.0 and moving fast. The wire contract, the AGDX spec, and the public API may change in any release, with no stability guarantee yet. Pin an exact version and expect breaking changes.
+> **Status: edge / prerelease (`0.0.1-rc.2`).** Pre-1.0 and moving fast. The wire contract, the AGDX spec, and the public API may change in any release, with no stability guarantee yet. Pin an exact version and expect breaking changes.
 
 An open data platform by [LaserData, Inc.](https://laserdata.com) over [Apache Iggy](https://iggy.apache.org) for streaming, querying, and coordinating data on a durable log. Ultra-low-latency streaming is the foundation, and on top of it sit declared projections with a query DSL, a key-value store, and copy-on-write forks, all on one connection. The log is the source of truth and every other surface is a read model on it. A reliable agent runtime and the Agent Data Exchange Protocol (AGDX) layer come on top when you build agents, but they are an optional extension. The streaming and data core stands on its own.
 
-This repository ships the **Rust** SDK, the first and reference implementation. The wire contract is a standalone, language-neutral crate ([`laser-wire`](wire/README.md)) pinned byte-for-byte by a cross-language conformance suite, so SDKs for the other Apache Iggy languages can follow. Those are planned, not yet shipped.
+This repository ships the **Rust** SDK, the first and reference implementation, and a **Python** SDK ([`foreign/python`](foreign/python/README.md)) built as native bindings over it. The wire contract is a standalone, language-neutral crate ([`laser-wire`](wire/README.md)) pinned byte-for-byte by a cross-language conformance suite, so SDKs for the other Apache Iggy languages can follow under `foreign/`. The rest are planned, not yet shipped.
 
 The log is the source of truth. Messages are appended once and stay replayable from offset 0. Queries, projections, KV, and agent coordination are all read models built on top of it, never a second system to keep in sync.
 
@@ -12,7 +12,7 @@ The log is the source of truth. Messages are appended once and stay replayable f
 
 The data platform:
 
-- **Typed publish and consume**: serde values onto Iggy topics in one call, JSON/MessagePack/CBOR/BSON or schema-first Avro/Protobuf, batched in one network round-trip.
+- **Typed publish and consume**: serde values onto Iggy topics in one call, JSON/MessagePack/CBOR/BSON, schema-first Avro/Protobuf, or any raw bytes the SDK never inspects, batched in one network round-trip on both the send and poll sides.
 - **Declared projections and a query DSL**: filters, aggregates, time ranges, pagination, and vector recall over materialized indexes, declared once per topic like a database index, with an opt-in read-your-writes consistency level for reads that must see their own prior writes.
 - **A key-value store and copy-on-write forks** of the materialized read model, for working state and speculative branches. The store offers compare-and-swap for lock-free optimistic concurrency on a shared key.
 
@@ -32,7 +32,7 @@ The SDK is built on the Apache Iggy SDK and never hides it: `laser.iggy_producer
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.1", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.2", features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -66,6 +66,20 @@ async fn main() -> Result<(), LaserError> {
         .await?;
     Ok(())
 }
+```
+
+### Batch and any payload
+
+The single publish above is the simplest call, not the common one. `publish_batch` accumulates records and ships them in one network round-trip, the largest throughput lever the SDK gives you, and consuming mirrors it: a `reader` cursor drains every record that arrived since the last poll in one call. Batch both sides and the per-message overhead is gone.
+
+The payload is yours, in any format. `json` / `msgpack` (and the batch `add_json` / `add_msgpack`) are conveniences over `add_payload`, which takes raw bytes the SDK never inspects, so Avro, Protobuf, a compressed blob, or your own framing ride unchanged.
+
+```rust
+let mut batch = laser.publish_batch("inferences");
+for inference in &window {
+    batch = batch.add_json(inference)?;   // or .add_payload(raw_bytes) for any format
+}
+batch.send().await?;                      // the whole window, one round-trip
 ```
 
 From here the [tutorial](docs/tutorial.md) takes over: nine chapters building one observability pipeline from a single message to projections, queries, aggregates, vector recall, codecs, multi-stream topologies, and the agent runtime.

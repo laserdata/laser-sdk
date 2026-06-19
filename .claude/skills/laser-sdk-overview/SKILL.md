@@ -35,6 +35,7 @@ Connection vs stream: `Laser::connect(connection_string)` takes only the connect
 - Query DSL, `Record`/`publish`, `query()` (LaserData Cloud only: the `AGDX_QUERY` managed command off the log via `send_raw_with_response`, raw Apache Iggy returns `Unsupported`. No topic request/reply query path), the `agdx.idx.*` indexing contract -> [query](../query/SKILL.md)
 - Managed key-value store (`Laser::kv`, get/set/delete/scan, optional expiry) over the `AGDX_KV_*` managed commands, backed by LaserData Cloud's managed point-state store (`kv` feature, builds on `query`. Client-only, backend is managed-side) -> [kv](../kv/SKILL.md) (wire the AGDX spec)
 - A2A JSON-RPC bridge (message/send + stream, tasks/get + cancel, Agent Card), the sibling MCP bridge (initialize, tools, resources, prompts), and AG-UI state sync + event rendering (`agui`), all over the AGDX verbs (`a2a-bridge` / `mcp-bridge` / `agui` features) -> [a2a-bridge](../a2a-bridge/SKILL.md)
+- The Python SDK under `foreign/python/` (PyO3 bindings over this crate), its maturin packaging, the `.pyi` stubs, the pytest suite, or the Python BDD runner -> [python-bindings](../python-bindings/SKILL.md)
 
 ## The spine in one paragraph
 
