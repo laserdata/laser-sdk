@@ -4,7 +4,7 @@ use laser_sdk::prelude::*;
 #[tokio::test]
 async fn given_remembered_items_when_recalling_and_forgetting_then_should_reflect_the_changes() {
     let laser = harness::laser().await;
-    let memory = LogMemory::new(&laser);
+    let memory = LogMemory::new(laser.clone());
     let scope = MemoryScope::builder()
         .conversation(ConversationId::new())
         .agent("notetaker".parse().expect("notetaker is a valid agent id"))
@@ -56,8 +56,8 @@ async fn given_two_streams_when_recalling_then_should_isolate_at_the_stream_boun
     // one remembers is invisible from the other - the connection itself is the boundary.
     let acme = harness::laser().await;
     let globex = harness::laser().await;
-    let acme_memory = LogMemory::new(&acme);
-    let globex_memory = LogMemory::new(&globex);
+    let acme_memory = LogMemory::new(acme.clone());
+    let globex_memory = LogMemory::new(globex.clone());
     let conversation = ConversationId::new();
     let scope = MemoryScope::builder().conversation(conversation).build();
 

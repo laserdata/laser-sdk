@@ -133,13 +133,20 @@ sdk/src/
 sdk/tests/integration/  one shared Apache Iggy, one stream per test, BDD-named cases
   iggy_container.rs   TestIggy testcontainer harness (test-only, not shipped)
   query/              test-only query worker + backends (Memory, durable SQL)
+foreign/python/         the Python SDK (outside the workspace): PyO3 bindings over the
+                        laser-sdk crate (cdylib lib laser_sdk_py, import name laser_sdk),
+                        src/ one module per area + bin/stub_gen.rs, tests/ pytest
+                        (offline + a testcontainer), maturin packaging. See the
+                        python-bindings skill.
 bdd/                    cross-SDK conformance (outside the workspace): scenarios/
                         shared Gherkin (runs vs Apache Iggy, no Cloud), rust/ the cucumber-rs
                         runner (tests/) + src/query_engine.rs (the pure reference query
-                        engine the query scenarios run against), docker-compose for
+                        engine the query scenarios run against), python/ the pytest-bdd
+                        runner over the Iggy-native scenarios, docker-compose for
                         the multi-language path
 scripts/run-bdd-tests.sh  driver for the per-language BDD runners
 examples/rust/          [[example]] bins under src/<scenario>/main.rs, LlmClient seam in lib.rs
+examples/python/        one runnable script per scenario + a shared _common.py connect helper
 docs/                   tutorial.md (progressive guide), agdx.md (the AGDX spec),
                         interop.md (A2A / MCP / AG-UI bridges)
 ```

@@ -1,11 +1,11 @@
 ---
 name: a2a-bridge
-description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`, behind the `a2a-bridge` feature. Use when changing the A2A task lifecycle (TaskState), the JSON-RPC envelope, the `A2aBridge` (submit / task / cancel / Agent Card / axum router, riding the typed AGDX verbs), or the mapping from A2A methods onto agent topics. Sibling: the MCP bridge `McpBridge` in `sdk/src/mcp.rs` (`mcp-bridge` feature). Pulls axum + serde under the feature.
+description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`. The adapter (submit / task / cancel / Agent Card, riding the typed AGDX verbs) is behind the `a2a-bridge` feature (serde only, no HTTP). The ready-made axum `router()` is behind the additive `a2a-http` feature. Use when changing the A2A task lifecycle (TaskState), the JSON-RPC envelope, the adapter, the router, or the mapping from A2A methods onto agent topics. Sibling: the MCP bridge `McpBridge` in `sdk/src/mcp.rs` (`mcp-bridge` adapter, `mcp-http` router).
 ---
 
 # A2A bridge
 
-`a2a.rs` exposes internal agents to A2A-speaking clients over JSON-RPC, mapping the synchronous edge onto durable agent topics so tasks survive a bridge restart and stay replayable. Feature-gated (`a2a-bridge`). Not in the default build. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
+`a2a.rs` exposes internal agents to A2A-speaking clients over JSON-RPC, mapping the synchronous edge onto durable agent topics so tasks survive a bridge restart and stay replayable. The transport-agnostic adapter (`submit` / `task` / `cancel` / `card`) is behind `a2a-bridge` (serde only). The axum `router()`, the `A2aMethod` dispatch enum, and the JSON-RPC handlers are behind the additive `a2a-http` feature, so a caller can drive the bridge over any transport (or from Python) without compiling axum. Neither is in the default build. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
 
 ## STOP and ask the user before
 
@@ -23,7 +23,7 @@ description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`, behind the `a2a-bridge`
   - `task(id) -> Task` (`tasks/get`): read the reply topic (envelope-aware `ContextAssembler`), map the answering `response`/`error` envelope with the matching `correlation` via `task_from_envelope`, else `Working`.
   - `cancel(id) -> Task` (`tasks/cancel`): publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`), returns `Canceled`.
   - `card() -> AgentCard`: served at `GET /.well-known/agent-card.json`.
-  - `router() -> axum::Router`: the JSON-RPC endpoint at `POST /` plus the card route.
+  - `router() -> axum::Router` (requires `a2a-http`): the JSON-RPC endpoint at `POST /` plus the card route. The adapter above is usable without it (serve it over any transport, or call `submit` / `task` / `cancel` directly).
   - A worker behind the bridge reads `message.envelope` (the decoded command) and answers via `ctx.laser().agdx(reply_topic, source, conversation).respond(correlation, body)`.
 
 ## Rules specific to this area

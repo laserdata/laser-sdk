@@ -173,7 +173,7 @@ async fn given_one_log_memory_wrote_when_a_fresh_instance_recalls_then_should_fo
     let scope = MemoryScope::builder().conversation(conversation).build();
 
     // One instance appends three items, advancing only its own in-memory cursor.
-    let writer = LogMemory::new(&laser);
+    let writer = LogMemory::new(laser.clone());
     for i in 1..=3 {
         writer
             .remember(&scope, format!("item-{i}").into_bytes())
@@ -184,7 +184,7 @@ async fn given_one_log_memory_wrote_when_a_fresh_instance_recalls_then_should_fo
     // A fresh instance has no folded projection and no saved offsets, so its first
     // recall rebuilds from offset 0 and sees all three, independent of the
     // writer's cursor.
-    let reader = LogMemory::new(&laser);
+    let reader = LogMemory::new(laser.clone());
     let items = harness::eventually(|| {
         let reader = &reader;
         let scope = &scope;

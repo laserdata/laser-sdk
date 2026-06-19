@@ -17,9 +17,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.1", default-features = false, features = ["query"] }   # generic substrate
+laser-sdk = { version = "0.0.1-rc.2", default-features = false, features = ["query"] }   # generic substrate
 # or with the agent runtime layered on top:
-laser-sdk = { version = "0.0.1-rc.1", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.2", features = ["query"] }
 ```
 
 ## Quick example
@@ -53,6 +53,25 @@ let slow: Vec<ApiCall> = laser.query("api_calls")
     .order_desc("latency_ms")
     .limit(20)
     .fetch_typed().await?;
+# Ok(()) }
+```
+
+## Batch and any payload
+
+A single publish is the simplest call, not the common one. `publish_batch` accumulates records and sends them in one network round-trip, the largest throughput lever the SDK offers, and reads mirror it: a `reader` cursor drains every record that arrived since the last poll in one call. Batching on both sides is what makes the path efficient.
+
+The body is opaque bytes in any format. `json` / `msgpack` and the batch `add_json` / `add_msgpack` are conveniences over `add_payload`, which takes raw bytes the SDK never inspects. Use `raw_bytes(bytes, ContentType::Avro)` for an already-encoded body, or `add_avro` for schema-first encoding, so Avro, Protobuf, a compressed blob, or your own framing all ride unchanged.
+
+```rust,no_run
+# use laser_sdk::prelude::*;
+# use serde::Serialize;
+# #[derive(Serialize)] struct ApiCall { status: u16 }
+# async fn run(laser: Laser, window: Vec<ApiCall>) -> Result<(), LaserError> {
+let mut batch = laser.publish_batch("api_calls");
+for call in &window {
+    batch = batch.add_json(call)?;        // or .add_payload(raw_bytes) for any format
+}
+batch.send().await?;                      // the whole window, one round-trip
 # Ok(()) }
 ```
 

@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["bdd/rust", "fuzz"]
+exclude = ["bdd/rust", "foreign/python", "fuzz"]
 members = ["examples/rust", "sdk", "wire"]
 resolver = "2"
 
@@ -8,7 +8,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
 rust-version = "1.96"
-version = "0.0.1-rc.1"
+version = "0.0.1-rc.2"
 
 [workspace.dependencies]
 apache-avro = { version = "0.21.0" }
@@ -16,7 +16,7 @@ async-trait = { version = "0.1.89" }
 axum = { version = "0.8.9" }
 bon = { version = "3.9.3" }
 bson = { version = "3.1.0", features = ["serde"] }
-bytes = { version = "1.11.1" }
+bytes = { version = "1.12.0" }
 ciborium = { version = "0.2.2" }
 colored = { version = "3.1.1" }
 dashmap = { version = "6.2.1" }
@@ -26,7 +26,7 @@ iggy = { version = "0.10.1-edge.2" }
 json-patch = { version = "4.2.0" }
 jsonschema = { version = "0.46.5", default-features = false }
 laser-sdk = { path = "sdk" }
-laser-wire = { path = "wire", version = "=0.0.1-rc.1" }
+laser-wire = { path = "wire", version = "=0.0.1-rc.2" }
 prost = { version = "0.14.4" }
 prost-reflect = { version = "0.16.4", features = ["serde"] }
 protox = { version = "0.9.1" }

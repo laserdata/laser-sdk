@@ -10,3 +10,11 @@ target/
 gha-creds-*.json
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Python (foreign bindings, bdd runner, examples)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.so
+foreign/python/dist/

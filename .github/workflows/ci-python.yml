@@ -1,0 +1,131 @@
+name: ci-python
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "py-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+# Harden cargo's network against the runner's flaky HTTP/2 to crates.io: retry
+# transient failures and drop HTTP/2 multiplexing, which triggers the recurring
+# "Error in the HTTP2 framing layer" curl failures.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+defaults:
+  run:
+    working-directory: foreign/python
+
+jobs:
+  # Build the extension and run the offline + integration tests against a real
+  # Apache Iggy container (Linux has Docker on the GitHub runner).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the extension and install test dependencies
+        # `pip install -e` builds via the maturin backend straight into the
+        # runner's Python, so it needs no virtualenv (unlike `maturin develop`).
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[testing]"
+      - name: Verify the stub is current
+        run: |
+          cargo run --bin stub_gen
+          git diff --exit-code -- laser_sdk.pyi
+      - name: Lint (ruff)
+        run: |
+          ruff check . ../../bdd/python ../../examples/python
+          ruff format --check . ../../bdd/python ../../examples/python
+      - name: Run unit and integration tests
+        run: pytest -q
+      - name: Run the cross-SDK BDD conformance suite
+        run: pytest -q
+        working-directory: bdd/python
+
+  # abi3 wheels: one wheel per platform covers Python 3.10+.
+  wheels:
+    name: wheels-${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # aarch64 builds on a native arm64 runner, not cross-compiled: the
+          # rustls crypto backend (aws-lc-sys, a C library) does not cross-compile
+          # cleanly in the x86 manylinux container, but builds with the native
+          # toolchain here.
+          - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          # One universal2 wheel (Intel + Apple Silicon) on an Apple Silicon
+          # runner, so this needs no scarce, deprecated macos-13 Intel runner.
+          - { runner: macos-14, target: universal2-apple-darwin, manylinux: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist
+          # No sccache: its compiler wrapper fails the aws-lc-sys C build (the
+          # rustls crypto backend) inside the manylinux container, returning a
+          # bare non-zero with no diagnostic. cc-rs calls the compiler directly.
+          working-directory: foreign/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-${{ matrix.platform.runner }}
+          path: foreign/python/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: foreign/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: foreign/python/dist
+
+  # Publish to PyPI on a py-v* tag, using the laserdata account's trusted publisher.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    needs: [test, wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

@@ -15,8 +15,12 @@ all-features = true
 
 [features]
 default = ["agent", "provenance"]
-# Bridge the A2A JSON-RPC edge onto agent topics (axum router + task lifecycle).
-a2a-bridge = ["agent", "dep:axum", "dep:serde_json", "dep:strum"]
+# The A2A bridge ADAPTER: map A2A JSON-RPC methods onto agent topics and drive the
+# task lifecycle (submit / task / cancel / card). Transport-agnostic, no HTTP deps.
+a2a-bridge = ["agent", "dep:serde_json"]
+# Add the ready-made axum HTTP router for the A2A bridge. Opt-in: the adapter
+# above is usable over any transport (or programmatically) without axum.
+a2a-http = ["a2a-bridge", "dep:axum", "dep:strum"]
 # AG-UI state sync: emit `state_snapshot`/`state_delta` events and reconstruct
 # shared state by replaying them (RFC 6902 JSON Patch), over the log not SSE.
 agui = ["agent", "dep:json-patch", "dep:serde_json"]
@@ -34,8 +38,11 @@ integration = []
 # Managed key-value store over the `AGDX_KV` managed commands, backed by LaserData Cloud's
 # point-state backend. Rides the same managed bridge as `query`, so it builds on it.
 kv = ["query"]
-# Bridge MCP JSON-RPC tool calls/results onto AGDX commands/responses.
-mcp-bridge = ["agent", "dep:axum", "dep:serde_json", "dep:strum"]
+# The MCP bridge ADAPTER: map MCP tool calls / results onto AGDX commands /
+# responses, plus the tool / resource / prompt catalog. No HTTP deps.
+mcp-bridge = ["agent", "dep:serde_json"]
+# Add the ready-made axum HTTP router for the MCP bridge. Opt-in.
+mcp-http = ["mcp-bridge", "dep:axum", "dep:strum"]
 provenance = []
 # Client-side schema-first codec helpers: compile a registered `SchemaDef`
 # (Avro / Protobuf) locally, encode Avro bodies from serde values, and validate

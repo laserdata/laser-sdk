@@ -1,8 +1,10 @@
 pub use crate::error::LaserError;
 pub use crate::types::{AgentId, ConversationId, IdError, MessageId};
 
+#[cfg(feature = "a2a-http")]
+pub use crate::a2a::A2aMethod;
 #[cfg(feature = "a2a-bridge")]
-pub use crate::a2a::{A2aBridge, A2aMethod, Artifact, Task, TaskState, TaskStatus};
+pub use crate::a2a::{A2aBridge, Artifact, Task, TaskState, TaskStatus};
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agdx, AgdxSend, AgdxStream, Agent, AgentConsumer, AgentCtx, AgentHandle, AgentHandler,
@@ -23,10 +25,11 @@ pub use crate::fork::{ForkHandle, ForkInfo, ForkKind, ForkStatus};
 pub use crate::kv::{Kv, KvEntry, KvPage};
 #[cfg(any(feature = "agent", feature = "query"))]
 pub use crate::laser::{Laser, LaserBuilder};
+#[cfg(feature = "mcp-http")]
+pub use crate::mcp::McpMethod;
 #[cfg(feature = "mcp-bridge")]
 pub use crate::mcp::{
-    McpBridge, McpContent, McpMethod, McpPrompt, McpPromptArgument, McpResource, McpTool,
-    McpToolResult,
+    McpBridge, McpContent, McpPrompt, McpPromptArgument, McpResource, McpTool, McpToolResult,
 };
 #[cfg(all(feature = "agent", feature = "kv"))]
 pub use crate::memory::KvMemory;
