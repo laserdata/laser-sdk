@@ -23,6 +23,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::register(py, module)?;
     module.add_class::<client::PyLaser>()?;
     module.add_class::<client::PyCapabilities>()?;
+    module.add_class::<client::PyBackendDescriptor>()?;
     module.add_class::<publish::PyPublish>()?;
     module.add_class::<publish::PyBatchPublish>()?;
     module.add_class::<schema::PyCompiledSchema>()?;

@@ -1,5 +1,5 @@
 use crate::errors::to_pyerr;
-use laser_sdk::capabilities::Capabilities;
+use laser_sdk::capabilities::{BackendDescriptor, Capabilities};
 use laser_sdk::laser::Laser;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -158,6 +158,9 @@ pub struct PyCapabilities {
     pub kv_cas: bool,
     pub read_your_writes: bool,
     pub strong_consistency: bool,
+    /// The materialization backends the connected server exposes (identity
+    /// only). Empty against raw Apache Iggy and servers that advertise none.
+    pub backends: Vec<PyBackendDescriptor>,
 }
 
 impl From<Capabilities> for PyCapabilities {
@@ -174,6 +177,11 @@ impl From<Capabilities> for PyCapabilities {
             kv_cas: value.kv_cas,
             read_your_writes: value.read_your_writes,
             strong_consistency: value.strong_consistency,
+            backends: value
+                .backends
+                .into_iter()
+                .map(PyBackendDescriptor::from)
+                .collect(),
         }
     }
 }
@@ -183,8 +191,57 @@ impl From<Capabilities> for PyCapabilities {
 impl PyCapabilities {
     fn __repr__(&self) -> String {
         format!(
-            "Capabilities(managed_host={}, managed_query={}, managed_kv={}, forks={}, kv_cas={})",
-            self.managed_host, self.managed_query, self.managed_kv, self.forks, self.kv_cas
+            "Capabilities(managed_host={}, managed_query={}, managed_kv={}, forks={}, kv_cas={}, backends={})",
+            self.managed_host,
+            self.managed_query,
+            self.managed_kv,
+            self.forks,
+            self.kv_cas,
+            self.backends.len()
+        )
+    }
+}
+
+/// One materialization backend the connected server exposes: identity only, a
+/// stable `id` and an opaque engine `kind`, with optional advisory `label` and
+/// `version` and a set of opaque `capabilities` tags the backend declares about
+/// itself (e.g. "ingest", "query", a query-surface feature). A consumer routes
+/// only to an advertised `id` and matches the tags it understands.
+#[gen_stub_pyclass]
+#[pyclass(name = "BackendDescriptor", frozen, get_all, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyBackendDescriptor {
+    pub id: String,
+    pub kind: String,
+    pub label: Option<String>,
+    pub version: Option<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl From<BackendDescriptor> for PyBackendDescriptor {
+    fn from(value: BackendDescriptor) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            label: value.label,
+            version: value.version,
+            capabilities: value.capabilities,
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyBackendDescriptor {
+    /// Whether the backend declared the opaque capability `tag`.
+    fn has_capability(&self, tag: &str) -> bool {
+        self.capabilities.iter().any(|c| c == tag)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BackendDescriptor(id={}, kind={}, capabilities={:?})",
+            self.id, self.kind, self.capabilities
         )
     }
 }

@@ -23,7 +23,7 @@ use laser_wire::fork::{
 };
 use laser_wire::forward::{ForwardedCommand, ForwardedQuery};
 use laser_wire::framing::{decode_named, encode_named};
-use laser_wire::hello::{BackendAnnounce, HelloReply, OpVersions, feature};
+use laser_wire::hello::{BackendAnnounce, BackendDescriptor, HelloReply, OpVersions, feature};
 use laser_wire::http::{Capabilities, ErrorBody, KvEntryView, KvPageView};
 use laser_wire::kv::{
     CasExpect, KvCas, KvEntry, KvError, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvReply,
@@ -609,6 +609,11 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
     );
     // The managed backend announces its served capabilities to the streaming server over
     // their private socket, so the streaming server relays them instead of hardcoding bits.
+    // The announce also lists the materialization backends the server exposes:
+    // each an identity-only descriptor (stable id + opaque engine kind) with an
+    // optional advisory label/version and a set of opaque capability tags the
+    // backend declares about itself. The embedded engine serves everything; a
+    // second backend advertises a narrower tag set, so a consumer can gate.
     assert_frame(
         "backend_announce.bin",
         &BackendAnnounce::new(
@@ -619,7 +624,18 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
                 FORK_OP_VERSION,
             )
             .with_features(feature::KV_CAS),
-        ),
+        )
+        .with_backends(vec![
+            BackendDescriptor::new("embedded", "embedded").with_capabilities([
+                "ingest",
+                "query",
+                "vector_search",
+            ]),
+            BackendDescriptor::new("warehouse", "columnar")
+                .with_label("Analytics warehouse")
+                .with_version("2.1.0")
+                .with_capabilities(["ingest", "query", "percentile"]),
+        ]),
     );
 }
 
@@ -662,9 +678,22 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
         "capabilities.json",
         // The embedded transactional backend serves CAS and read-your-writes,
         // so it opts both on. Strong consistency stays off (per deployment).
+        // The reply also lists the materialization backends the server exposes,
+        // mirroring the binary announce, so the HTTP client sees the same set.
         &Capabilities::new(true, OpVersions::new(1, 1, 1, 1))
             .with_kv_cas(true)
-            .with_read_your_writes(true),
+            .with_read_your_writes(true)
+            .with_backends(vec![
+                BackendDescriptor::new("embedded", "embedded").with_capabilities([
+                    "ingest",
+                    "query",
+                    "vector_search",
+                ]),
+                BackendDescriptor::new("warehouse", "columnar")
+                    .with_label("Analytics warehouse")
+                    .with_version("2.1.0")
+                    .with_capabilities(["ingest", "query", "percentile"]),
+            ]),
     );
     assert_json(
         "kv_page_view.json",

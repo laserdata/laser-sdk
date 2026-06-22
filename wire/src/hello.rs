@@ -100,25 +100,117 @@ impl HelloReply {
     }
 }
 
+/// One materialization backend a server exposes, advertised so a client can see
+/// what it may route to. `id` is the stable handle a binding references; `kind`
+/// is the engine family as an opaque string, so a new engine is advertised by
+/// name without any wire change. Carries identity only, never settings or
+/// secrets. Integration-agnostic: the wire pins no specific engine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BackendDescriptor {
+    pub id: String,
+    pub kind: String,
+    /// Human-friendly display name for a UI, when the server has one. Advisory.
+    /// Absent (the default, skipped on the wire) means a client derives a label
+    /// from `id` or `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Engine or build version string, opaque to the wire. Advisory, for display
+    /// and compatibility hints. Absent (the default, skipped on the wire) means
+    /// the server did not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Opaque capability tags the backend declares about itself, so a consumer
+    /// can reason about what this backend is good for (e.g. ingest, query, a
+    /// particular query-surface feature, or a storage trait) and gate a decision
+    /// before attempting an op. Each tag is an opaque string the wire pins no
+    /// meaning to: a producer emits what it supports and a consumer matches the
+    /// tags it understands, ignoring the rest, so a new capability is advertised
+    /// by name with no wire change. Integration-agnostic. Empty (the default,
+    /// skipped on the wire) means none declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+impl BackendDescriptor {
+    /// A descriptor for the backend at `id` of engine family `kind`.
+    pub fn new(id: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind: kind.into(),
+            label: None,
+            version: None,
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Returns a copy with a human-friendly display label.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Returns a copy advertising an engine or build version.
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Returns a copy advertising the opaque `capabilities` tags this backend
+    /// declares about itself.
+    #[must_use]
+    pub fn with_capabilities<I, S>(mut self, capabilities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.capabilities = capabilities.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether the backend declared the opaque capability `tag`.
+    pub fn has_capability(&self, tag: &str) -> bool {
+        self.capabilities.iter().any(|c| c == tag)
+    }
+}
+
 /// The managed backend's capability announcement to the streaming server, sent over their
 /// private socket on connect (`AGDX_BACKEND_HELLO_CODE`). The streaming server caches the
-/// `versions` and relays them verbatim when it answers a client `AGDX_HELLO`, so
-/// the streaming server never hardcodes feature bits the backend may or may not serve.
+/// `versions` and the advertised `backends`, and relays them verbatim when it answers a
+/// client `AGDX_HELLO` / capabilities probe, so the streaming server never hardcodes feature
+/// bits or backend identities the backend may or may not serve.
 /// This makes the backend the single source of its own capability truth and
 /// keeps the binary `features` bitset and the HTTP capability flags in agreement
 /// with what is actually served. A separate type from [`HelloReply`] because the
-/// direction and sender differ (backend to streaming server, not server to client), even
-/// though both wrap [`OpVersions`] today.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// direction and sender differ (backend to streaming server, not server to client).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct BackendAnnounce {
     pub versions: OpVersions,
+    /// Materialization backends the server currently exposes (the ones it has
+    /// open). A client routes only to an advertised id. Empty (the default) is
+    /// skipped on encode, so a pre-backends announce stays byte-identical and an
+    /// older reader simply sees no advertised backends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<BackendDescriptor>,
 }
 
 impl BackendAnnounce {
     /// Constructor for the non-exhaustive wire struct.
     pub fn new(versions: OpVersions) -> Self {
-        Self { versions }
+        Self {
+            versions,
+            backends: Vec::new(),
+        }
+    }
+
+    /// Returns a copy advertising `backends`.
+    #[must_use]
+    pub fn with_backends(mut self, backends: Vec<BackendDescriptor>) -> Self {
+        self.backends = backends;
+        self
     }
 }
 
@@ -165,6 +257,53 @@ mod tests {
         // Pre-versioned servers answer the probe with an empty body. The probe
         // treats a failed decode as "no versions advertised", never an error.
         assert!(decode_named::<HelloReply>(&[]).is_err());
+    }
+
+    #[test]
+    fn given_advertised_backends_when_round_tripped_then_should_preserve_them_and_skip_empty() {
+        let announce = BackendAnnounce::new(OpVersions::new(
+            QUERY_OP_VERSION,
+            CONTROL_OP_VERSION,
+            KV_OP_VERSION,
+            FORK_OP_VERSION,
+        ))
+        .with_backends(vec![
+            BackendDescriptor::new("embedded", "embedded"),
+            BackendDescriptor::new("warehouse", "columnar")
+                .with_label("Analytics warehouse")
+                .with_version("2.1.0")
+                .with_capabilities(["ingest", "query", "percentile"]),
+        ]);
+        let bytes = encode_named(&announce).expect("encodes");
+        let back: BackendAnnounce = decode_named(&bytes).expect("decodes");
+        assert_eq!(back, announce);
+        assert_eq!(back.backends.len(), 2);
+        assert_eq!(back.backends[1].id, "warehouse");
+        assert_eq!(back.backends[1].kind, "columnar");
+        assert_eq!(
+            back.backends[1].label.as_deref(),
+            Some("Analytics warehouse")
+        );
+        assert_eq!(back.backends[1].version.as_deref(), Some("2.1.0"));
+        assert!(back.backends[1].has_capability("query"));
+        assert!(!back.backends[1].has_capability("vector_search"));
+        // The minimal descriptor omits the advisory fields on the wire.
+        assert_eq!(back.backends[0].label, None);
+        assert_eq!(back.backends[0].version, None);
+        assert!(back.backends[0].capabilities.is_empty());
+        let minimal_json = serde_json::to_string(&back.backends[0]).expect("json");
+        assert!(
+            !minimal_json.contains("label")
+                && !minimal_json.contains("version")
+                && !minimal_json.contains("capabilities"),
+            "absent advisory fields omitted: {minimal_json}"
+        );
+
+        // No advertised backends (the default) is omitted on the wire, so a
+        // pre-backends announce stays byte-identical.
+        let plain = BackendAnnounce::new(OpVersions::new(1, 1, 1, 1));
+        let json = serde_json::to_string(&plain).expect("json");
+        assert!(!json.contains("backends"), "empty backends omitted: {json}");
     }
 
     #[test]

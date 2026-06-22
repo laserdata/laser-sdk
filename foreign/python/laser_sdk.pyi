@@ -10,6 +10,7 @@ __all__ = [
     "AgentCtx",
     "AgentHandle",
     "AgentMessage",
+    "BackendDescriptor",
     "BatchPublishRequest",
     "Capabilities",
     "CompiledSchema",
@@ -226,6 +227,31 @@ class AgentMessage:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class BackendDescriptor:
+    r"""
+    One materialization backend the connected server exposes: identity only, a
+    stable `id` and an opaque engine `kind`, with optional advisory `label` and
+    `version` and a set of opaque `capabilities` tags the backend declares about
+    itself (e.g. "ingest", "query", a query-surface feature). A consumer routes
+    only to an advertised `id` and matches the tags it understands.
+    """
+    @property
+    def id(self) -> builtins.str: ...
+    @property
+    def kind(self) -> builtins.str: ...
+    @property
+    def label(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def version(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def capabilities(self) -> builtins.list[builtins.str]: ...
+    def has_capability(self, tag: builtins.str) -> builtins.bool:
+        r"""
+        Whether the backend declared the opaque capability `tag`.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class BatchPublishRequest:
     r"""
     Fluent builder for a batch publish, finished with `await .send()` returning
@@ -324,6 +350,12 @@ class Capabilities:
     def read_your_writes(self) -> builtins.bool: ...
     @property
     def strong_consistency(self) -> builtins.bool: ...
+    @property
+    def backends(self) -> builtins.list[BackendDescriptor]:
+        r"""
+        The materialization backends the connected server exposes (identity
+        only). Empty against raw Apache Iggy and servers that advertise none.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
