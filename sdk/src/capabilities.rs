@@ -9,7 +9,7 @@
 /// log (query, kv, memory). A bare flag is an infrastructure-native capability
 /// (`managed_host`, `sessions`, `forks`, `durable_dedup`, `a2a_gateway`).
 /// The distinction is intentional, and it says where the capability lives.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Capabilities {
     /// Infrastructure-native session start (the platform tracks a session lifecycle).
@@ -56,9 +56,16 @@ pub struct Capabilities {
     /// typed `Version` error before a round-trip whenever its own pinned op
     /// version is not the advertised one.
     pub versions: Option<OpVersions>,
+    /// The materialization backends the connected server currently exposes,
+    /// advertised in its `AGDX_HELLO` reply (and mirrored on the HTTP
+    /// capabilities surface). Each is identity only: a stable `id` and an
+    /// opaque engine `kind`, never settings or secrets. Empty against raw
+    /// Apache Iggy and against servers that advertise none, so a caller routes
+    /// only to an advertised id and learns what is available without guessing.
+    pub backends: Vec<BackendDescriptor>,
 }
 
-pub use laser_wire::hello::OpVersions;
+pub use laser_wire::hello::{BackendDescriptor, OpVersions};
 
 impl Capabilities {
     /// The baseline every deployment has: nothing beyond the open SDK surface.
@@ -75,6 +82,7 @@ impl Capabilities {
         read_your_writes: false,
         strong_consistency: false,
         versions: None,
+        backends: Vec::new(),
     };
 
     /// True when the connected infrastructure advertised nothing beyond the open SDK (`OPEN`).
@@ -171,6 +179,14 @@ impl Capabilities {
         self
     }
 
+    /// Returns a copy advertising the materialization `backends` the server
+    /// exposes (identity only: stable `id` + opaque engine `kind`).
+    #[must_use]
+    pub fn with_backends(mut self, value: Vec<BackendDescriptor>) -> Self {
+        self.backends = value;
+        self
+    }
+
     /// OR in the per-feature managed sub-capabilities a hello reply's op
     /// versions advertise (compare-and-swap, read-your-writes, strong
     /// consistency). The connect probe calls this. A flag already set by a BYO
@@ -244,6 +260,23 @@ mod tests {
             caps.kv_cas,
             "an explicit flag must not be cleared by the merge"
         );
+    }
+
+    #[test]
+    fn given_advertised_backends_when_set_then_should_expose_them_and_open_has_none() {
+        assert!(
+            Capabilities::OPEN.backends.is_empty(),
+            "raw open Iggy advertises no backends"
+        );
+        let caps = Capabilities::OPEN.with_backends(vec![
+            BackendDescriptor::new("embedded", "embedded"),
+            BackendDescriptor::new("warehouse", "columnar").with_version("2.1.0"),
+        ]);
+        assert_eq!(caps.backends.len(), 2);
+        assert_eq!(caps.backends[1].id, "warehouse");
+        assert_eq!(caps.backends[1].version.as_deref(), Some("2.1.0"));
+        // Advertising backends does not flip any premium flag.
+        assert!(!caps.is_open_only() && !caps.managed_host);
     }
 
     #[test]

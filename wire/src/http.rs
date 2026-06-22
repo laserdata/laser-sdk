@@ -31,7 +31,7 @@
 //! ```
 
 use crate::fork::{ForkError, ForkKind};
-use crate::hello::OpVersions;
+use crate::hello::{BackendDescriptor, OpVersions};
 use crate::kv::KvError;
 use crate::query::QueryError;
 use crate::result::ResultCode;
@@ -138,6 +138,12 @@ pub struct Capabilities {
     #[serde(default)]
     pub strong_consistency: bool,
     pub versions: OpVersions,
+    /// Materialization backends the server currently exposes, so a client can
+    /// show what it may route to. Identity only (id + engine kind), no settings
+    /// or secrets. Empty (the default) is skipped on encode, so a pre-backends
+    /// capabilities reply stays byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<BackendDescriptor>,
 }
 
 impl Capabilities {
@@ -163,7 +169,16 @@ impl Capabilities {
             read_your_writes: false,
             strong_consistency: false,
             versions,
+            backends: Vec::new(),
         }
+    }
+
+    /// Advertise the materialization backends the server exposes. The wire pins
+    /// no engine, so a server lists whatever it has open by id and kind.
+    #[must_use]
+    pub fn with_backends(mut self, backends: Vec<BackendDescriptor>) -> Self {
+        self.backends = backends;
+        self
     }
 
     /// Advertise compare-and-swap on the KV surface (`AGDX_KV_CAS`). Only a
@@ -507,6 +522,26 @@ mod tests {
         );
         let opted = caps.with_kv_cas(true).with_read_your_writes(true);
         assert!(opted.kv_cas && opted.read_your_writes && !opted.strong_consistency);
+    }
+
+    #[test]
+    fn given_capabilities_backends_when_json_round_tripped_then_should_preserve_and_omit_empty() {
+        use crate::hello::BackendDescriptor;
+        let caps = Capabilities::new(true, OpVersions::new(1, 1, 1, 1)).with_backends(vec![
+            BackendDescriptor::new("embedded", "embedded"),
+            BackendDescriptor::new("warehouse", "columnar"),
+        ]);
+        let json = serde_json::to_string(&caps).expect("serializes");
+        let back: Capabilities = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.backends.len(), 2);
+        assert_eq!(back.backends[1].id, "warehouse");
+        assert_eq!(back.backends[1].kind, "columnar");
+
+        // No advertised backends is omitted on the wire, so a pre-backends
+        // capabilities reply stays byte-identical.
+        let plain = Capabilities::new(true, OpVersions::new(1, 1, 1, 1));
+        let json = serde_json::to_string(&plain).expect("json");
+        assert!(!json.contains("backends"), "empty backends omitted: {json}");
     }
 
     #[test]

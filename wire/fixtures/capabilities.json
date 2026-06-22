@@ -13,5 +13,27 @@
     "control": 1,
     "kv": 1,
     "fork": 1
-  }
+  },
+  "backends": [
+    {
+      "id": "embedded",
+      "kind": "embedded",
+      "capabilities": [
+        "ingest",
+        "query",
+        "vector_search"
+      ]
+    },
+    {
+      "id": "warehouse",
+      "kind": "columnar",
+      "label": "Analytics warehouse",
+      "version": "2.1.0",
+      "capabilities": [
+        "ingest",
+        "query",
+        "percentile"
+      ]
+    }
+  ]
 }

@@ -551,12 +551,47 @@ impl ProjectionBindingBuilder {
     /// Materialize into a table of this name on the embedded backend: sugar for
     /// a single `read_write`, `effectively_once` target. The common case.
     pub fn target_table(self, table: impl Into<String>) -> Self {
+        self.target_on("embedded", table)
+    }
+
+    /// Materialize into `table` on a named backend: the `read_write`,
+    /// `effectively_once` query-serving home. This is how a binding routes one
+    /// index to a specific configured backend (e.g. an external warehouse
+    /// declared as `warehouse`) while other bindings stay on `embedded`, so
+    /// different topics materialize to and are served from different stores at
+    /// once.
+    ///
+    /// ```no_run
+    /// # use laser_wire::control::ProjectionBinding;
+    /// // orders -> external warehouse, events stay on the embedded engine.
+    /// let binding = ProjectionBinding::builder()
+    ///     .source("shop", "orders")
+    ///     .allow("orders.v1")
+    ///     .target_on("warehouse", "orders_rows")
+    ///     .build();
+    /// ```
+    pub fn target_on(self, backend: impl Into<String>, table: impl Into<String>) -> Self {
         self.add_target(Target {
-            backend: "embedded".to_owned(),
+            backend: backend.into(),
             table: table.into(),
             role: TargetRole::ReadWrite,
             delivery: Delivery::EffectivelyOnce,
             required: true,
+        })
+    }
+
+    /// Add a write-only mirror of this binding's rows into `table` on a named
+    /// backend. The mirror does not serve queries (exactly one `read_write`
+    /// target does) and is non-blocking, so one projection can fan the same rows
+    /// to several backends at once (e.g. the embedded engine for low-latency
+    /// reads plus an external warehouse for analytics).
+    pub fn mirror_to(self, backend: impl Into<String>, table: impl Into<String>) -> Self {
+        self.add_target(Target {
+            backend: backend.into(),
+            table: table.into(),
+            role: TargetRole::WriteOnly,
+            delivery: Delivery::EffectivelyOnce,
+            required: false,
         })
     }
 
@@ -816,6 +851,39 @@ mod tests {
         assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
         assert_eq!(binding.targets[0].delivery, Delivery::EffectivelyOnce);
         assert!(binding.targets[0].required);
+    }
+
+    #[test]
+    fn given_target_on_named_backend_when_built_then_should_route_read_write_to_it() {
+        let binding = ProjectionBinding::builder()
+            .source("shop", "orders")
+            .allow("order.v1")
+            .target_on("warehouse", "orders_rows")
+            .build();
+        assert_eq!(binding.targets.len(), 1);
+        assert_eq!(binding.targets[0].backend, "warehouse");
+        assert_eq!(binding.targets[0].table, "orders_rows");
+        assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
+        assert!(binding.targets[0].required);
+    }
+
+    #[test]
+    fn given_target_on_and_mirror_to_when_built_then_should_fan_one_projection_to_two_backends() {
+        // Read-serve from the embedded engine, mirror the same rows into an
+        // external warehouse: one projection, two backends at once.
+        let binding = ProjectionBinding::builder()
+            .source("shop", "orders")
+            .allow("order.v1")
+            .target_on("embedded", "orders_rows")
+            .mirror_to("warehouse", "orders_warehouse")
+            .build();
+        assert_eq!(binding.targets.len(), 2);
+        assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
+        assert_eq!(binding.targets[0].backend, "embedded");
+        assert_eq!(binding.targets[1].role, TargetRole::WriteOnly);
+        assert_eq!(binding.targets[1].backend, "warehouse");
+        assert_eq!(binding.targets[1].table, "orders_warehouse");
+        assert!(!binding.targets[1].required, "a mirror is non-blocking");
     }
 
     #[test]

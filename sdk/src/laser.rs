@@ -220,7 +220,7 @@ impl Laser {
     /// [`Capabilities::OPEN`]). Async to reserve a future capability negotiation
     /// round-trip. Open features work regardless of the result.
     pub async fn capabilities(&self) -> Capabilities {
-        self.capabilities
+        self.capabilities.clone()
     }
 
     /// Idempotently creates `topic` on the default stream with `partitions`,
@@ -620,11 +620,15 @@ impl LaserBuilder {
         let mut capabilities = self.capabilities;
         #[cfg(feature = "query")]
         {
-            let (managed_host, versions) = probe_managed_host(&client).await;
+            let (managed_host, versions, backends) = probe_managed_host(&client).await;
             capabilities.managed_host = managed_host;
             // Advertised wire op versions, when the server's hello reply
             // carried a body (older servers answer with an empty body).
             capabilities.versions = versions;
+            // Materialization backends the server exposes, advertised in the
+            // same hello reply. Empty against raw Apache Iggy and pre-backends
+            // servers, so a caller routes only to an advertised id.
+            capabilities.backends = backends;
             capabilities.managed_query |= managed_host;
             // The same bridge serves the `AGDX_KV` store, so the probe implies `managed_kv`
             // too. An older LaserData Cloud without KV answers `AGDX_KV` with `Unsupported`, which the
@@ -665,13 +669,21 @@ impl LaserBuilder {
 // over the binary connection. `Ok` means the connected infrastructure is the fork
 // and exposes the managed bridge (query/KV/browse/fork off the log). Any error (raw
 // Apache Iggy answers `InvalidCommand`) leaves `managed_host` false. A reply body,
-// when present, is the msgpack `HelloReply` advertising the wire op versions the
-// server accepts. Older servers answer with an empty body, which leaves the
-// versions unadvertised (`None`) and the SDK skips fail-fast version checks.
+// when present, is the CBOR `BackendAnnounce` advertising the wire op versions
+// the server accepts plus the materialization backends it exposes. It decodes
+// byte-identically from a pre-backends `HelloReply` (the `backends` list is
+// skip-when-empty), so an older server's versions-only reply still parses.
+// Older servers answer with an empty body, which leaves the versions
+// unadvertised (`None`), the backends empty, and the SDK skips fail-fast version
+// checks.
 #[cfg(feature = "query")]
 async fn probe_managed_host(
     client: &IggyClient,
-) -> (bool, Option<crate::capabilities::OpVersions>) {
+) -> (
+    bool,
+    Option<crate::capabilities::OpVersions>,
+    Vec<crate::capabilities::BackendDescriptor>,
+) {
     let wrapper = client.client();
     let guard = wrapper.read().await;
     let result = match &*guard {
@@ -680,16 +692,14 @@ async fn probe_managed_host(
         ClientWrapper::WebSocket(client) => {
             client.send_raw_with_response(AGDX_HELLO_CODE, Bytes::new())
         }
-        ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => return (false, None),
+        ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => return (false, None, Vec::new()),
     };
     match result.await {
-        Ok(reply) => {
-            let versions = decode_named::<crate::query::HelloReply>(&reply)
-                .ok()
-                .map(|hello| hello.versions);
-            (true, versions)
-        }
-        Err(_) => (false, None),
+        Ok(reply) => match decode_named::<laser_wire::hello::BackendAnnounce>(&reply) {
+            Ok(announce) => (true, Some(announce.versions), announce.backends),
+            Err(_) => (true, None, Vec::new()),
+        },
+        Err(_) => (false, None, Vec::new()),
     }
 }
 
