@@ -295,12 +295,16 @@ pub struct PromotedView {
     pub rows: usize,
 }
 
-/// One graph node on the HTTP surface: id as a string plus its labels.
+/// One graph node on the HTTP surface: id as a string, its labels, and its
+/// attributes rendered as strings (e.g. the entity `value`) for a browser or
+/// wasm client that has no access to the typed `Value`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphNodeView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attrs: Vec<(String, String)>,
 }
 
 /// One graph edge on the HTTP surface: endpoint ids as strings, the type, and the

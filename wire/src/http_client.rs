@@ -477,6 +477,37 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// `GET /agdx/graphs`: list the registered graph projections, the discovery
+    /// surface a graph explorer reads to offer the available graphs. Reuses the
+    /// projection-list filter, narrowed to graph-kind projections server-side.
+    pub async fn list_graphs(
+        &self,
+        filter: &ProjectionListQuery,
+    ) -> ClientResult<Vec<ProjectionInfo>, T::Error> {
+        self.get(with_query(http::GRAPHS_PATH, filter)?).await
+    }
+
+    /// `POST /agdx/graphs`: register a graph projection (a [`Projection`] with
+    /// `kind = Graph` and an entity schema). Applied asynchronously, like every
+    /// control command.
+    pub async fn register_graph(&self, projection: &Projection) -> ClientResult<(), T::Error> {
+        self.send_json_ok(Method::Post, http::GRAPHS_PATH.to_owned(), projection)
+            .await
+    }
+
+    /// `GET /agdx/graphs/{id}`: read one graph projection by id, or `None` when no
+    /// graph projection has it.
+    pub async fn get_graph(&self, id: &str) -> ClientResult<Option<ProjectionInfo>, T::Error> {
+        self.get_optional(http::graph_path(id)).await
+    }
+
+    /// `DELETE /agdx/graphs/{id}`: drop the graph projection registered under
+    /// `id`. The materialized nodes and edges are left untouched.
+    pub async fn drop_graph(&self, id: &str) -> ClientResult<(), T::Error> {
+        self.expect_ok(Method::Delete, http::graph_path(id), None)
+            .await
+    }
+
     async fn get<R: DeserializeOwned>(&self, path: String) -> ClientResult<R, T::Error> {
         let response = self.dispatch(Method::Get, path, None).await?;
         decode_ok(&response)

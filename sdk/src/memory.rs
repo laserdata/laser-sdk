@@ -1352,6 +1352,24 @@ impl GraphHandle<'_> {
         self
     }
 
+    /// Follow edges of `edge_type` one hop in both directions.
+    #[must_use]
+    pub fn both(mut self, edge_type: impl Into<String>) -> Self {
+        self.hops.push(laser_wire::graph::Hop {
+            edge_type: Some(edge_type.into()),
+            dir: laser_wire::graph::EdgeDir::Both,
+            max: 1,
+        });
+        self
+    }
+
+    /// Return the traversed edges instead of the reachable nodes.
+    #[must_use]
+    pub fn return_edges(mut self) -> Self {
+        self.return_ = laser_wire::graph::GraphReturn::Edges;
+        self
+    }
+
     /// Return whole paths (node and edge id sequences) instead of nodes.
     #[must_use]
     pub fn return_paths(mut self) -> Self {
@@ -1369,12 +1387,8 @@ impl GraphHandle<'_> {
     /// Run the traversal. Requires `managed_graph`. Otherwise returns
     /// [`LaserError::Unsupported`].
     pub async fn fetch(self) -> Result<laser_wire::graph::GraphResult, LaserError> {
-        use laser_wire::graph::{GraphQuery, GraphReply, GraphStart};
-        if !self.laser.caps().graph {
-            return Err(LaserError::Unsupported(
-                "graph traversal requires managed_graph (LaserData Cloud)".to_owned(),
-            ));
-        }
+        use laser_wire::graph::{GraphQuery, GraphStart};
+        self.require_graph()?;
         let query = GraphQuery {
             v: laser_wire::codes::GRAPH_OP_VERSION,
             graph: self.name,
@@ -1395,13 +1409,96 @@ impl GraphHandle<'_> {
             .laser
             .send_raw_with_response(laser_wire::codes::AGDX_GRAPH_QUERY_CODE, payload)
             .await?;
-        match crate::error::decode_managed_reply::<GraphReply>(&bytes)? {
-            GraphReply::Ok(result) => Ok(result),
-            GraphReply::Err(error) => Err(error.into()),
-            _ => Err(LaserError::Protocol(
-                "graph: unknown reply variant".to_owned(),
-            )),
+        decode_graph_reply(&bytes)
+    }
+
+    /// Read a node's neighbors: the nodes reachable in `dir` over `edge_type` (or
+    /// any type when `None`), following the same hop `depth` times. The cheap,
+    /// common traversal. Requires `managed_graph`. Otherwise returns
+    /// [`LaserError::Unsupported`].
+    pub async fn neighbors(
+        self,
+        node: laser_wire::graph::NodeId,
+        dir: laser_wire::graph::EdgeDir,
+        edge_type: Option<String>,
+        depth: u32,
+    ) -> Result<laser_wire::graph::GraphResult, LaserError> {
+        use laser_wire::graph::GraphNeighbors;
+        self.require_graph()?;
+        let request = GraphNeighbors {
+            v: laser_wire::codes::GRAPH_OP_VERSION,
+            graph: self.name,
+            node,
+            dir,
+            edge_type,
+            depth,
+            limit: self.limit,
+        };
+        let payload = bytes::Bytes::from(
+            laser_wire::framing::encode_named(&request)
+                .map_err(|error| LaserError::Codec(format!("encode graph neighbors: {error}")))?,
+        );
+        let bytes = self
+            .laser
+            .send_raw_with_response(laser_wire::codes::AGDX_GRAPH_NEIGHBORS_CODE, payload)
+            .await?;
+        decode_graph_reply(&bytes)
+    }
+
+    /// Write `nodes` and `edges` into the graph: the projector path, surfaced for
+    /// callers that build the graph directly rather than through a `graph`
+    /// projection. Idempotent on content-addressed ids
+    /// ([`GraphNode::entity`](laser_wire::graph::GraphNode::entity),
+    /// [`GraphEdge::relate`](laser_wire::graph::GraphEdge::relate)), so re-applying
+    /// the same entities is a no-op. Requires `managed_graph`. Otherwise returns
+    /// [`LaserError::Unsupported`].
+    pub async fn upsert(
+        self,
+        nodes: Vec<laser_wire::graph::GraphNode>,
+        edges: Vec<laser_wire::graph::GraphEdge>,
+    ) -> Result<(), LaserError> {
+        use laser_wire::graph::GraphUpsert;
+        self.require_graph()?;
+        let request = GraphUpsert {
+            v: laser_wire::codes::GRAPH_OP_VERSION,
+            graph: self.name,
+            nodes,
+            edges,
+        };
+        let payload = bytes::Bytes::from(
+            laser_wire::framing::encode_named(&request)
+                .map_err(|error| LaserError::Codec(format!("encode graph upsert: {error}")))?,
+        );
+        let bytes = self
+            .laser
+            .send_raw_with_response(laser_wire::codes::AGDX_GRAPH_UPSERT_CODE, payload)
+            .await?;
+        decode_graph_reply(&bytes).map(|_| ())
+    }
+
+    // Every graph op rides the managed binary transport, so it is unavailable
+    // against raw Apache Iggy. Fail the same way before encoding any request.
+    fn require_graph(&self) -> Result<(), LaserError> {
+        if self.laser.caps().graph {
+            Ok(())
+        } else {
+            Err(LaserError::Unsupported(
+                "graph traversal requires managed_graph (LaserData Cloud)".to_owned(),
+            ))
         }
+    }
+}
+
+// Decode a managed `GraphReply` into the `Ok` result or its typed error.
+#[cfg(feature = "query")]
+fn decode_graph_reply(bytes: &[u8]) -> Result<laser_wire::graph::GraphResult, LaserError> {
+    use laser_wire::graph::GraphReply;
+    match crate::error::decode_managed_reply::<GraphReply>(bytes)? {
+        GraphReply::Ok(result) => Ok(result),
+        GraphReply::Err(error) => Err(error.into()),
+        _ => Err(LaserError::Protocol(
+            "graph: unknown reply variant".to_owned(),
+        )),
     }
 }
 

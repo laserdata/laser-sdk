@@ -52,11 +52,16 @@ pub use crate::provenance::{AgentTopic, LlmUsage, Provenance, ProvenanceError, k
 #[cfg(feature = "query")]
 pub use crate::query::{
     AggCall, AggFunc, Aggregate, BatchPublishRequest, Bindings, CmpOp, Codec, ContentType, Decoder,
-    Delivery, Dir, FieldType, Filter, IndexField, IndexSchema, KeyMatch, Page, Predicate,
-    Projection, ProjectionBinding, ProjectionId, ProjectionInfo, Projections, ProjectionsRequest,
-    PublishRequest, Query, QueryError, QueryRequest, QueryResult, RawSql, Record,
-    RegisterSchemaRequest, RetentionPolicy, Row, SchemaDef, SchemaInfo, SchemaSource, Schemas,
-    Select, Sort, SourceSelector, Target, TargetRole, Value, VectorQuery, Window,
+    Delivery, Dir, EdgeExtract, EntitySchema, FieldType, Filter, IndexField, IndexSchema, KeyMatch,
+    NodeExtract, Page, Predicate, Projection, ProjectionBinding, ProjectionId, ProjectionInfo,
+    ProjectionKind, Projections, ProjectionsRequest, PublishRequest, Query, QueryError,
+    QueryRequest, QueryResult, RawSql, Record, RegisterSchemaRequest, RetentionPolicy, Row,
+    SchemaDef, SchemaInfo, SchemaSource, Schemas, Select, Sort, SourceSelector, Target, TargetRole,
+    Value, VectorQuery, Window,
+};
+#[cfg(all(feature = "agent", feature = "query"))]
+pub use laser_wire::graph::{
+    EdgeDir, EdgeId, GraphEdge, GraphNode, GraphResult, GraphReturn, NodeId,
 };
 // `Json` and `Msgpack` are codec marker types - intentionally NOT in the
 // prelude because the short names collide too easily with user code

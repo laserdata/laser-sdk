@@ -6,7 +6,7 @@
 // the contract every language SDK must honor.
 
 use crate::harness::laser;
-use laser_sdk::prelude::Capabilities;
+use laser_sdk::prelude::{Capabilities, EdgeDir, GraphEdge, GraphNode};
 use laser_sdk::query::{Consistency, ResultCode};
 
 #[tokio::test]
@@ -86,6 +86,56 @@ async fn given_open_iggy_when_strong_consistency_query_then_should_be_unsupporte
         .fetch()
         .await
         .expect_err("strong consistency must be unsupported on open Apache Iggy");
+    assert!(
+        error.is_unsupported(),
+        "expected Unsupported, got {error:?}"
+    );
+    assert_eq!(error.code(), ResultCode::Unsupported);
+}
+
+#[tokio::test]
+async fn given_open_iggy_when_graph_traversal_then_should_be_unsupported() {
+    let laser = laser().await;
+    let error = laser
+        .graph("knowledge")
+        .start_match(laser_sdk::query::Filter::All(vec![]))
+        .fetch()
+        .await
+        .expect_err("a graph traversal must be unsupported on open Apache Iggy");
+    assert!(
+        error.is_unsupported(),
+        "expected Unsupported, got {error:?}"
+    );
+    assert_eq!(error.code(), ResultCode::Unsupported);
+}
+
+#[tokio::test]
+async fn given_open_iggy_when_graph_neighbors_then_should_be_unsupported() {
+    let laser = laser().await;
+    let node = GraphNode::entity("Person", "Alice");
+    let error = laser
+        .graph("knowledge")
+        .neighbors(node.id, EdgeDir::Out, None, 1)
+        .await
+        .expect_err("a graph neighbor read must be unsupported on open Apache Iggy");
+    assert!(
+        error.is_unsupported(),
+        "expected Unsupported, got {error:?}"
+    );
+    assert_eq!(error.code(), ResultCode::Unsupported);
+}
+
+#[tokio::test]
+async fn given_open_iggy_when_graph_upsert_then_should_be_unsupported() {
+    let laser = laser().await;
+    let alice = GraphNode::entity("Person", "Alice");
+    let acme = GraphNode::entity("Company", "Acme");
+    let edge = GraphEdge::relate(&alice, "works_at", &acme);
+    let error = laser
+        .graph("knowledge")
+        .upsert(vec![alice, acme], vec![edge])
+        .await
+        .expect_err("a graph upsert must be unsupported on open Apache Iggy");
     assert!(
         error.is_unsupported(),
         "expected Unsupported, got {error:?}"

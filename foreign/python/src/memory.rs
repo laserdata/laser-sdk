@@ -119,8 +119,13 @@ impl Backend {
         on_backend!(self, |memory| Memory::forget(memory, &scope, id).await)
     }
 
-    async fn improve(&self, scope: MemoryScope, feedback: Feedback) -> Result<MemoryId, LaserError> {
-        on_backend!(self, |memory| Memory::improve(memory, &scope, feedback).await)
+    async fn improve(
+        &self,
+        scope: MemoryScope,
+        feedback: Feedback,
+    ) -> Result<MemoryId, LaserError> {
+        on_backend!(self, |memory| Memory::improve(memory, &scope, feedback)
+            .await)
     }
 }
 
@@ -141,7 +146,6 @@ fn map_strategy(strategy: &str) -> PyResult<RecallStrategy> {
         }
     })
 }
-
 
 fn build_scope(agent: Option<String>, conversation: Option<String>) -> PyResult<MemoryScope> {
     let agent = match agent {

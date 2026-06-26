@@ -52,6 +52,32 @@ async def test_fork_against_raw_iggy_is_unsupported(laser):
         await laser.fork("exp-1").create()
 
 
+async def test_graph_against_raw_iggy_is_unsupported(laser):
+    alice = ls.graph_node("Person", "Alice")
+    acme = ls.graph_node("Company", "Acme")
+    edge = ls.graph_edge(alice, "works_at", acme)
+    with pytest.raises(ls.UnsupportedError):
+        await laser.graph("knowledge").upsert([alice, acme], [edge])
+
+
+def test_graph_ids_are_content_addressed_and_match_the_cross_sdk_golden():
+    # The same entity yields the same id, a different label or value a different
+    # one, pinned to the cross-SDK golden vector the wire crate fixes, so a graph
+    # shared across languages converges on one node.
+    assert ls.node_id("Person", "Alice") == ls.node_id("Person", "Alice")
+    assert ls.node_id("Person", "Alice") != ls.node_id("Company", "Alice")
+    assert ls.node_id("Person", "Alice") == "13NCEPHNVFHHGNK9GD3MT0W1AB"
+    alice = ls.graph_node("Person", "Alice")
+    assert alice["id"] == "13NCEPHNVFHHGNK9GD3MT0W1AB"
+    assert alice["labels"] == ["Person"]
+    acme = ls.graph_node("Company", "Acme")
+    edge = ls.graph_edge(alice, "works_at", acme)
+    assert edge["from"] == alice["id"]
+    assert edge["to"] == acme["id"]
+    assert edge["edge_type"] == "works_at"
+    assert edge["id"] == ls.edge_id(alice["id"], "works_at", acme["id"])
+
+
 async def test_agent_echo_request_reply(laser):
     await laser.bootstrap(partitions=2)
 

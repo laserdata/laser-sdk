@@ -43,8 +43,8 @@ name = "concierge"
 path = "src/concierge/main.rs"
 
 [[example]]
-name = "recall"
-path = "src/recall/main.rs"
+name = "memory"
+path = "src/memory/main.rs"
 
 [[example]]
 name = "interop"

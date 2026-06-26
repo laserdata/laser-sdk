@@ -17,6 +17,33 @@ crate::agent::wire_id!(
     EdgeId
 );
 
+impl NodeId {
+    /// A content-addressed node id: the stable hash of the entity's `label` and
+    /// canonical `value`, so the same entity extracted from different records (or
+    /// upserted by different callers, in any SDK) converges on one node, which is
+    /// what makes a graph rather than disconnected pairs. The one canonical
+    /// [`content_id`](crate::hashing::content_id), so every SDK mints the same id
+    /// from the same segments (pinned by the golden vector below).
+    pub fn content(label: &str, value: &[u8]) -> Self {
+        Self::from_u128(crate::hashing::content_id(&[label.as_bytes(), &[0], value]))
+    }
+}
+
+impl EdgeId {
+    /// A content-addressed edge id over its endpoints and type, so the same
+    /// relationship observed any number of times is one edge. Idempotent upsert
+    /// keys off this id.
+    pub fn content(from: NodeId, edge_type: &str, to: NodeId) -> Self {
+        Self::from_u128(crate::hashing::content_id(&[
+            &from.to_bytes(),
+            &[0],
+            edge_type.as_bytes(),
+            &[0],
+            &to.to_bytes(),
+        ]))
+    }
+}
+
 /// Which way a hop follows edges from the current frontier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +156,25 @@ pub struct GraphNode {
     pub embedding: Option<Vec<f32>>,
 }
 
+impl GraphNode {
+    /// A node for the entity `value` labelled `label`. Its id is content-addressed
+    /// over the label and value (so re-observing the same entity converges on one
+    /// node), and the value is kept as a `value` attribute so a `label` or
+    /// attribute [`Match`](GraphStart::Match) start can find it. The ergonomic way
+    /// to build a node for [`GraphUpsert`] without hand-minting an id.
+    pub fn entity(label: impl Into<String>, value: impl Into<String>) -> Self {
+        let label = label.into();
+        let value = value.into();
+        let id = NodeId::content(&label, value.as_bytes());
+        Self {
+            id,
+            labels: vec![label],
+            attrs: vec![("value".to_owned(), Value::from(value))],
+            embedding: None,
+        }
+    }
+}
+
 /// One edge: its id, endpoints, type, weight, and attributes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphEdge {
@@ -139,6 +185,23 @@ pub struct GraphEdge {
     pub weight: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attrs: Vec<(String, Value)>,
+}
+
+impl GraphEdge {
+    /// An edge of `edge_type` from `from` to `to`, weight `1.0`. Its id is
+    /// content-addressed over the endpoints and type, so the same relationship is
+    /// one edge. The ergonomic way to relate two [`GraphNode`]s for an upsert.
+    pub fn relate(from: &GraphNode, edge_type: impl Into<String>, to: &GraphNode) -> Self {
+        let edge_type = edge_type.into();
+        Self {
+            id: EdgeId::content(from.id, &edge_type, to.id),
+            from: from.id,
+            to: to.id,
+            edge_type,
+            weight: 1.0,
+            attrs: Vec::new(),
+        }
+    }
 }
 
 /// One path through the graph: parallel node and edge id sequences.
@@ -301,5 +364,38 @@ mod tests {
         let id = NodeId::from_u128(987_654_321);
         let parsed: NodeId = id.to_string().parse().expect("a node id parses");
         assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn given_the_same_entity_when_addressed_twice_then_should_converge_on_one_node_id() {
+        let a = NodeId::content("Person", b"Alice");
+        let b = NodeId::content("Person", b"Alice");
+        assert_eq!(a, b, "the same entity is one node");
+        // A different label or value is a different node.
+        assert_ne!(a, NodeId::content("Company", b"Alice"));
+        assert_ne!(a, NodeId::content("Person", b"Bob"));
+    }
+
+    #[test]
+    fn given_the_pinned_entity_when_addressed_then_should_match_the_golden_id() {
+        // The cross-SDK golden vector: the Person entity "Alice". Every SDK renders
+        // this NodeId identically, so a graph shared across languages converges.
+        assert_eq!(
+            NodeId::content("Person", b"Alice").to_string(),
+            "13NCEPHNVFHHGNK9GD3MT0W1AB"
+        );
+    }
+
+    #[test]
+    fn given_two_nodes_when_related_then_should_content_address_the_edge() {
+        let alice = GraphNode::entity("Person", "Alice");
+        let acme = GraphNode::entity("Company", "Acme");
+        let one = GraphEdge::relate(&alice, "works_at", &acme);
+        let two = GraphEdge::relate(&alice, "works_at", &acme);
+        assert_eq!(one.id, two.id, "the same relationship is one edge");
+        assert_eq!(one.from, alice.id);
+        assert_eq!(one.to, acme.id);
+        // The direction is part of the identity: the reverse edge is a different id.
+        assert_ne!(one.id, GraphEdge::relate(&acme, "works_at", &alice).id);
     }
 }

@@ -17,9 +17,10 @@ pub use laser_wire::codes::{
 };
 pub use laser_wire::content::ContentType;
 pub use laser_wire::control::{
-    ControlCommand, ControlEnvelope, Delivery, FieldType, IndexField, IndexSchema,
-    IndexSchemaBuilder, Projection, ProjectionBinding, ProjectionBindingBuilder, ProjectionBuilder,
-    ProjectionId, RetentionPolicy, SchemaDef, SchemaSource, SourceSelector, Target, TargetRole,
+    ControlCommand, ControlEnvelope, Delivery, EdgeExtract, EntitySchema, FieldType, IndexField,
+    IndexSchema, IndexSchemaBuilder, NodeExtract, Projection, ProjectionBinding,
+    ProjectionBindingBuilder, ProjectionBuilder, ProjectionId, ProjectionKind, RetentionPolicy,
+    SchemaDef, SchemaSource, SourceSelector, Target, TargetRole,
 };
 pub use laser_wire::headers::{
     CONTENT_TYPE, FIELD_MESSAGE_TYPE, FIELD_TS, IDX_PREFIX, INLINE_PAYLOAD, PROJECTION_REF,

@@ -312,6 +312,27 @@ impl<'a> Projections<'a> {
             .await
     }
 
+    /// Register a graph projection: a [`Projection`] with `kind = Graph` and an
+    /// entity schema (build it with [`Projection::builder`]`.graph(schema)`).
+    /// LaserData Cloud starts extracting nodes and edges from the bound source
+    /// into the named knowledge graph. A distinct command from
+    /// [`register`](Self::register) so a backend can gate graph registration on
+    /// the `graph` capability.
+    pub async fn register_graph(&self, projection: Projection) -> Result<(), LaserError> {
+        self.laser
+            .publish_control(ControlCommand::RegisterGraph(projection))
+            .await
+    }
+
+    /// Drop the graph projection registered under `id` by publishing a
+    /// `DropGraph` control command. The materialized nodes and edges are left
+    /// untouched, the same as [`drop`](Self::drop) for a row projection.
+    pub async fn drop_graph(&self, id: impl Into<String>) -> Result<(), LaserError> {
+        self.laser
+            .publish_control(ControlCommand::DropGraph(id.into()))
+            .await
+    }
+
     /// Read one projection's details by `id` (schema, content type, indexed
     /// fields, bindings), or `None` when no projection has that id.
     pub async fn get(&self, id: impl Into<String>) -> Result<Option<ProjectionInfo>, LaserError> {

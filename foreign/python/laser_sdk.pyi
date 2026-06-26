@@ -18,6 +18,7 @@ __all__ = [
     "FileStore",
     "ForkHandle",
     "ForkPutRequest",
+    "Graph",
     "InMemoryStore",
     "Kv",
     "KvDeleteManyRequest",
@@ -37,8 +38,12 @@ __all__ = [
     "Row",
     "Topics",
     "derive_conversation_id",
+    "edge_id",
+    "graph_edge",
+    "graph_node",
     "new_conversation_id",
     "new_correlation_id",
+    "node_id",
 ]
 
 @typing.final
@@ -531,6 +536,34 @@ class ForkPutRequest:
         """
 
 @typing.final
+class Graph:
+    r"""
+    A handle to the knowledge-graph surface `name`, built with `laser.graph(name)`.
+    `upsert` writes nodes and edges, `neighbors` reads a node's neighborhood, and
+    `query` runs a multi-hop traversal. A managed feature: against raw Apache Iggy
+    every call raises `UnsupportedError`.
+    """
+    def upsert(self, nodes: list, edges: list) -> typing.Any:
+        r"""
+        Write `nodes` and `edges` (lists of dicts from `graph_node` / `graph_edge`)
+        into the graph. Idempotent on the content-addressed ids, so re-upserting the
+        same entities is a no-op.
+        """
+    def neighbors(self, node: builtins.str, *, direction: builtins.str = 'out', edge_type: typing.Optional[builtins.str] = None, depth: builtins.int = 1, limit: builtins.int = 0) -> typing.Any:
+        r"""
+        Read `node`'s neighbors: the nodes reachable in `direction` over
+        `edge_type` (any type when `None`), following the same hop `depth` times.
+        Returns a `{"nodes": [...], "edges": [...]}` dict.
+        """
+    def query(self, *, start_ids: typing.Optional[typing.Sequence[builtins.str]] = None, match_label: typing.Optional[builtins.str] = None, hops: typing.Optional[typing.Sequence[tuple[builtins.str, builtins.str]]] = None, returns: builtins.str = 'nodes', limit: builtins.int = 0) -> typing.Any:
+        r"""
+        Run a traversal. Start from explicit node `start_ids`, or from every node
+        whose label equals `match_label`. `hops` is a list of `(edge_type,
+        direction)` tuples, one per step. `returns` is `"nodes"` or `"edges"`.
+        Returns a `{"nodes": [...], "edges": [...]}` dict.
+        """
+
+@typing.final
 class InMemoryStore:
     r"""
     An in-memory `StateStore`: `get` / `set` / `delete` over a process-local map.
@@ -839,6 +872,22 @@ class Laser:
     def forks(self) -> typing.Any:
         r"""
         Every open fork for the authenticated user, as a list of dicts.
+        """
+    def graph(self, name: builtins.str) -> Graph:
+        r"""
+        A handle to the knowledge-graph surface `name`. A managed feature: against
+        raw Apache Iggy its calls raise `UnsupportedError`.
+        """
+    def register_graph(self, projection: typing.Any) -> typing.Any:
+        r"""
+        Register a graph projection from a dict (a projection with `kind = "graph"`
+        and an `entity_schema`). The managed host extracts nodes and edges from the
+        bound source into the named knowledge graph. Applied asynchronously.
+        """
+    def drop_graph(self, id: builtins.str) -> typing.Any:
+        r"""
+        Drop the graph projection registered under `id`. Materialized nodes and
+        edges are left untouched.
         """
     def a2a_bridge(self, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str) -> A2aBridge:
         r"""
@@ -1353,9 +1402,34 @@ def derive_conversation_id(seed: builtins.str) -> builtins.str:
     same id), for per-seed ordering and isolation without coordination.
     """
 
+def edge_id(from_id: builtins.str, edge_type: builtins.str, to_id: builtins.str) -> builtins.str:
+    r"""
+    The content-addressed id for the edge `edge_type` from `from_id` to `to_id`.
+    """
+
+def graph_edge(from_node: typing.Any, edge_type: builtins.str, to_node: typing.Any) -> typing.Any:
+    r"""
+    Build an edge dict of `edge_type` from `from_node` to `to_node` (both node
+    dicts), its id content-addressed over the endpoints and type.
+    """
+
+def graph_node(label: builtins.str, value: builtins.str) -> typing.Any:
+    r"""
+    Build a node dict for the entity `value` labelled `label`: its id
+    content-addressed and the value kept as a `value` attribute, so re-observing
+    the same entity converges. The ergonomic way to assemble a node for `upsert`.
+    """
+
 def new_conversation_id() -> builtins.str: ...
 
 def new_correlation_id() -> builtins.str: ...
+
+def node_id(label: builtins.str, value: builtins.str) -> builtins.str:
+    r"""
+    The content-addressed id for the entity `value` labelled `label`, as a
+    Crockford string. The same entity always yields the same id, in any SDK, so a
+    graph shared across languages converges on one node.
+    """
 
 
 class LaserError(Exception):

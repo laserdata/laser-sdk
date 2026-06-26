@@ -5,6 +5,7 @@ mod client;
 mod convert;
 mod errors;
 mod fork;
+mod graph;
 mod interop;
 mod kv;
 mod memory;
@@ -49,6 +50,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<reader::PyMessage>()?;
     module.add_class::<memory::PyMemory>()?;
     module.add_class::<memory::PyMemoryItem>()?;
+    module.add_class::<graph::PyGraph>()?;
     module.add_class::<state_store::PyInMemoryStore>()?;
     module.add_class::<state_store::PyFileStore>()?;
     module.add_class::<interop::PyA2aBridge>()?;
@@ -56,6 +58,10 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(agent::new_conversation_id, module)?)?;
     module.add_function(wrap_pyfunction!(agent::new_correlation_id, module)?)?;
     module.add_function(wrap_pyfunction!(agent::derive_conversation_id, module)?)?;
+    module.add_function(wrap_pyfunction!(graph::node_id, module)?)?;
+    module.add_function(wrap_pyfunction!(graph::edge_id, module)?)?;
+    module.add_function(wrap_pyfunction!(graph::graph_node, module)?)?;
+    module.add_function(wrap_pyfunction!(graph::graph_edge, module)?)?;
     Ok(())
 }
 
