@@ -41,6 +41,9 @@ const KNOWLEDGE: &[&str] = &[
 // vocabulary. Good enough to rank related facts, and reproducible.
 const DIMS: usize = 64;
 
+// The knowledge graph the second half builds and traverses.
+const GRAPH: &str = "ops";
+
 struct BagOfWords;
 
 impl Embedder for BagOfWords {
@@ -113,6 +116,18 @@ fn value_of(node: &GraphNode) -> &str {
 
 fn print_nodes(label: &str, nodes: &[GraphNode]) {
     let mut values: Vec<&str> = nodes.iter().map(value_of).collect();
+    values.sort_unstable();
+    info!("{label}: {}", values.join(", "));
+}
+
+// A traversal result is seeded with its start frontier, so the start nodes ride
+// along in `nodes`. Narrow to one entity kind to print just what was reached.
+fn print_nodes_of(label: &str, kind: &str, nodes: &[GraphNode]) {
+    let mut values: Vec<&str> = nodes
+        .iter()
+        .filter(|node| node.labels.iter().any(|l| l == kind))
+        .map(value_of)
+        .collect();
     values.sort_unstable();
     info!("{label}: {}", values.join(", "));
 }
@@ -203,8 +218,6 @@ async fn main() -> Result<(), LaserError> {
         return Ok(());
     };
 
-    const GRAPH: &str = "ops";
-
     // BUILD. A realistic slice of a platform's operational knowledge: services own
     // teams, depend on components, fail over to mitigations, and incidents touch
     // both. `GraphNode::entity` content-addresses the id, so a component named by
@@ -294,17 +307,49 @@ async fn main() -> Result<(), LaserError> {
     let checkout = by_value["checkout"].clone();
     let incident = by_value["INC-101"].clone();
     info!("built {} nodes and {} edges", nodes.len(), edges.len());
+    // Register the graph projection so the console explorer lists `ops`. A graph
+    // built only by `upsert` (no projection) is reachable by name but not
+    // discoverable. The entity schema is the projector path: bind it to a source
+    // topic and the projector extracts the same nodes and edges this writes here.
+    laser
+        .projections()
+        .register_graph(
+            Projection::builder(format!("{GRAPH}.v1"))
+                .name(GRAPH)
+                .content_type(ContentType::Json)
+                .graph(EntitySchema {
+                    nodes: vec![
+                        NodeExtract {
+                            label: "Service".to_owned(),
+                            value_pointer: "/service".to_owned(),
+                            embedding_pointer: None,
+                        },
+                        NodeExtract {
+                            label: "Component".to_owned(),
+                            value_pointer: "/component".to_owned(),
+                            embedding_pointer: None,
+                        },
+                    ],
+                    edges: vec![EdgeExtract {
+                        edge_type: "depends_on".to_owned(),
+                        from_pointer: "/service".to_owned(),
+                        to_pointer: "/component".to_owned(),
+                    }],
+                })
+                .build(),
+        )
+        .await?;
     laser.graph(GRAPH).upsert(nodes, edges).await?;
-    info!("upserted the '{GRAPH}' graph, browsable in the console explorer");
+    info!("registered and upserted the '{GRAPH}' graph, browsable in the console explorer");
 
-    // NEIGHBORS. The cheap one-hop read: everything checkout points at, its
+    // NEIGHBORS. The cheap one-hop read: checkout and everything it points at, its
     // dependencies and its failover.
     phase("Read a node's neighbors");
     let around = laser
         .graph(GRAPH)
         .neighbors(checkout.id, EdgeDir::Out, None, 1)
         .await?;
-    print_nodes("one hop out from checkout", &around.nodes);
+    print_nodes("checkout's one-hop neighborhood", &around.nodes);
 
     // TRAVERSE. From every Service, follow `depends_on` to the components the
     // whole platform rests on, the structural view recall cannot give.
@@ -316,7 +361,11 @@ async fn main() -> Result<(), LaserError> {
         .limit(100)
         .fetch()
         .await?;
-    print_nodes("components every Service depends on", &dependencies.nodes);
+    print_nodes_of(
+        "components every Service depends on",
+        "Component",
+        &dependencies.nodes,
+    );
 
     // BLAST RADIUS. From an incident, follow `affected` to everything it touched,
     // the question an on-call engineer actually asks.
@@ -327,7 +376,14 @@ async fn main() -> Result<(), LaserError> {
         .out("affected")
         .fetch()
         .await?;
-    print_nodes("what INC-101 affected", &blast.nodes);
+    let mut touched: Vec<&str> = blast
+        .nodes
+        .iter()
+        .filter(|node| node.id != incident.id)
+        .map(value_of)
+        .collect();
+    touched.sort_unstable();
+    info!("what INC-101 affected: {}", touched.join(", "));
 
     info!("done: memory recalls what is relevant, the graph shows how it connects");
     Ok(())

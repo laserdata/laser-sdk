@@ -87,9 +87,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets --all-features
 
-  # Every advertised feature combination must build on its own: `--all-features`
-  # hides a feature-gated module leaking into an always-built one, so each
-  # combination is checked individually.
+  # Every advertised feature combination must lint clean on its own with
+  # `-D warnings`: `--all-features` hides a feature-gated module leaking into an
+  # always-built one, and it also hides code that is dead under a smaller feature
+  # set (e.g. a helper whose only callers are behind `kv`/`query`). `cargo check`
+  # only prints such warnings, so each combination is linted with clippy and
+  # warnings are denied.
   wire-feature-matrix:
     runs-on: ubuntu-latest
     strategy:
@@ -109,7 +112,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p laser-wire ${{ matrix.features }}
+      - run: cargo clippy -p laser-wire ${{ matrix.features }} -- -D warnings
 
   feature-matrix:
     runs-on: ubuntu-latest
@@ -121,13 +124,14 @@ jobs:
           - "--no-default-features"
           - "--no-default-features --features agent"
           - "--no-default-features --features query"
+          - "--no-default-features --features kv"
           - "--no-default-features --features a2a-bridge"
           - "--all-features"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p laser-sdk ${{ matrix.features }}
+      - run: cargo clippy -p laser-sdk ${{ matrix.features }} -- -D warnings
 
   # The gate that makes the wasm guarantee real: the wire crate's portable
   # surface must compile for wasm32-unknown-unknown. Omits `bson` (native-only).
