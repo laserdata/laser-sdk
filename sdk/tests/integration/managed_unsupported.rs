@@ -13,14 +13,14 @@ use laser_sdk::query::{Consistency, ResultCode};
 async fn given_open_iggy_when_capabilities_read_then_should_report_coordination_features_off() {
     let laser = laser().await;
     let caps = laser.capabilities().await;
-    assert!(!caps.managed_host, "open Apache Iggy is not a managed host");
-    assert!(!caps.kv_cas, "compare-and-swap must not be advertised");
+    assert!(!caps.managed, "open Apache Iggy is not a managed host");
+    assert!(!caps.kv.cas, "compare-and-swap must not be advertised");
     assert!(
-        !caps.read_your_writes,
+        !caps.serves_consistency(Consistency::ReadYourWrites),
         "read-your-writes must not be advertised"
     );
     assert!(
-        !caps.strong_consistency,
+        !caps.serves_consistency(Consistency::Strong),
         "strong consistency must not be advertised"
     );
 }
@@ -124,7 +124,7 @@ async fn given_a_set_without_a_precondition_when_committed_then_should_be_invali
 async fn given_managed_query_without_read_your_writes_when_querying_then_should_refuse_the_level() {
     let laser = laser()
         .await
-        .with_capabilities(Capabilities::OPEN.with_managed_query(true));
+        .with_capabilities(Capabilities::OPEN.with_query(true));
     let error = laser
         .query("events")
         .read_your_writes()
@@ -144,8 +144,8 @@ async fn given_read_your_writes_only_when_querying_strong_then_should_refuse_the
     // only the weaker level still refuses a strong query locally.
     let laser = laser().await.with_capabilities(
         Capabilities::OPEN
-            .with_managed_query(true)
-            .with_read_your_writes(true),
+            .with_query(true)
+            .with_query_consistency(Consistency::ReadYourWrites),
     );
     let error = laser
         .query("events")
@@ -169,8 +169,8 @@ async fn given_read_your_writes_only_when_querying_strong_then_should_refuse_the
 async fn given_advertised_read_your_writes_when_querying_then_should_pass_the_local_gate() {
     let laser = laser().await.with_capabilities(
         Capabilities::OPEN
-            .with_managed_query(true)
-            .with_read_your_writes(true),
+            .with_query(true)
+            .with_query_consistency(Consistency::ReadYourWrites),
     );
     let error = laser
         .query("events")

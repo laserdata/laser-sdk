@@ -174,3 +174,128 @@ class KvEngine:
         if not committable:
             return CasOutcome(is_conflict=True, conflict_current=live)
         return CasOutcome(committed=self.set(key, value, expires_at, now))
+
+
+# Agent-memory and knowledge-graph reference engines: the Python port of the Rust
+# reference engines, returning the same answers for the same inputs. The content
+# hashes mirror the Rust SDK exactly, so a deduped id and a converged node id are
+# identical across the two SDKs.
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_U64_MASK = 0xFFFFFFFFFFFFFFFF
+_FNV_OFFSET = 0xCBF29CE484222325
+_FNV_PRIME = 0x100000001B3
+
+
+def _fnv1a(salt, data):
+    """One salted FNV-1a pass over `data`, the hash the SDK content ids use."""
+    value = _FNV_OFFSET
+    for byte in bytes([salt]) + data:
+        value ^= byte
+        value = (value * _FNV_PRIME) & _U64_MASK
+    return value
+
+
+def _crockford(value):
+    """A 128-bit value as a 26-character Crockford base32 string, the ULID form
+    the SDK renders a memory id as."""
+    out = [""] * 26
+    for index in range(25, -1, -1):
+        out[index] = _CROCKFORD[value & 0x1F]
+        value >>= 5
+    return "".join(out)
+
+
+def memory_content_id(agent, kind_code, body):
+    """The content-addressed memory id for an owner and body, byte-for-byte the
+    Rust `MemoryId::content`. Stream is unset in these scenarios."""
+    seed = bytearray()
+    seed.append(0)  # empty stream segment
+    if agent:
+        seed += agent.encode()
+    seed.append(0)
+    seed.append(kind_code)
+    seed += body
+    seed = bytes(seed)
+    value = (_fnv1a(0x4D, seed) << 64) | _fnv1a(0xC7, seed)
+    return _crockford(value)
+
+
+@dataclass
+class MemoryEngine:
+    """An in-memory agent-memory store under one durable owner. Items keep arrival
+    order, so the most recent are the tail. Mirrors the Rust `MemoryEngine`."""
+
+    agent: str = "agent"
+    items: list = field(default_factory=list)
+    forgotten: set = field(default_factory=set)
+    feedback: dict = field(default_factory=dict)
+    counter: int = 0
+
+    def remember(self, body, dedup):
+        if dedup:
+            mid = memory_content_id(self.agent, 1, body)
+            if any(item_id == mid for item_id, _ in self.items):
+                return mid
+        else:
+            self.counter += 1
+            salted = body + self.counter.to_bytes(16, "big")
+            mid = memory_content_id(self.agent, 1, salted)
+        self.items.append((mid, body))
+        return mid
+
+    def live_len(self):
+        return sum(1 for item_id, _ in self.items if item_id not in self.forgotten)
+
+    def improve(self, target, weight):
+        self.feedback[target] = self.feedback.get(target, 0.0) + weight
+
+    def forget(self, mid):
+        self.forgotten.add(mid)
+
+    def recall(self, limit):
+        live = [item for item in self.items if item[0] not in self.forgotten]
+        live.reverse()
+        if self.feedback:
+            live.sort(key=lambda item: self.feedback.get(item[0], 0.0), reverse=True)
+        return [body.decode() for _, body in live[:limit]]
+
+
+def _node_id(value):
+    """A node's content-addressed id, the same salted FNV-1a the Rust graph engine
+    uses, so the same entity converges on one node across SDKs."""
+    return _fnv1a(0x6E, value.encode())
+
+
+@dataclass
+class GraphEngine:
+    """An in-memory graph of labelled nodes and typed edges, keyed by node value
+    so re-adding a value is the same node. Mirrors the Rust `GraphEngine`."""
+
+    nodes: dict = field(default_factory=dict)
+    edges: list = field(default_factory=list)
+
+    def upsert_node(self, value):
+        nid = _node_id(value)
+        self.nodes.setdefault(nid, value)
+        return nid
+
+    def add_edge(self, from_id, edge_type, to_id):
+        self.edges.append((from_id, edge_type, to_id))
+
+    def node_count(self):
+        return len(self.nodes)
+
+    def traverse(self, start, hops):
+        frontier = {_node_id(start)}
+        for edge_type, direction in hops:
+            nxt = set()
+            for from_id, etype, to_id in self.edges:
+                if etype != edge_type:
+                    continue
+                if direction == "out" and from_id in frontier:
+                    nxt.add(to_id)
+                if direction == "in" and to_id in frontier:
+                    nxt.add(from_id)
+            frontier = nxt
+        return sorted(self.nodes[i] for i in frontier if i in self.nodes)

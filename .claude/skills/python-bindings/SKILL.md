@@ -29,7 +29,7 @@ Read-side coverage is the resumable `Cursor` (`Laser.reader`) and `Laser.assembl
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- The Python package tracks its own version, independent of the Rust workspace, so each language SDK releases on its own cadence. It currently sits at `0.0.1-rc.1` while binding the Rust `laser-sdk` at `=0.0.1-rc.2` (the dependency pin).
+- The Python package tracks its own version, independent of the Rust workspace, so each language SDK releases on its own cadence. It currently sits at `0.0.1-rc.3` while binding the Rust `laser-sdk` at `=0.0.1-rc.4` (the dependency pin).
 
 ## Working on it
 

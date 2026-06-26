@@ -6,6 +6,8 @@
 //   1_000_100..=1_000_199  query family (query, projection/schema browse)
 //   1_000_200..=1_000_299  key-value store
 //   1_000_300..=1_000_399  forks
+//   1_000_400..=1_000_499  agentic memory (remember/recall/improve/forget)
+//   1_000_500..=1_000_599  knowledge graph (traverse, neighbors, upsert)
 //
 // A query is a non-replicated read, so it is served off the log via these
 // managed commands instead of a topic round-trip. Raw Apache Iggy rejects them
@@ -68,6 +70,21 @@ pub const AGDX_KV_NAMESPACES_CODE: u32 = AGDX_KV_BASE + 5;
 /// rejects the code, which the client surfaces as an unsupported error. Whether
 /// it is served is advertised by the `kv_cas` capability flag.
 pub const AGDX_KV_CAS_CODE: u32 = AGDX_KV_BASE + 6;
+/// Managed command code: test presence and read metadata without the value
+/// (the formal `EXISTS` object primitive).
+pub const AGDX_KV_EXISTS_CODE: u32 = AGDX_KV_BASE + 7;
+/// Managed command code: set, refresh, or clear a key's expiry in place without
+/// rewriting its value (the formal `EXPIRE` primitive).
+pub const AGDX_KV_EXPIRE_CODE: u32 = AGDX_KV_BASE + 8;
+/// Managed command code: apply a merge patch to a structured value (the formal
+/// `PATCH` primitive).
+pub const AGDX_KV_PATCH_CODE: u32 = AGDX_KV_BASE + 9;
+/// Managed command code: acquire an advisory lease on a key (the formal `LEASE`
+/// primitive). A backend that cannot serve it returns a clean unsupported error.
+pub const AGDX_KV_LEASE_CODE: u32 = AGDX_KV_BASE + 10;
+/// Managed command code: release an advisory lease early (the formal `RELEASE`
+/// primitive).
+pub const AGDX_KV_RELEASE_CODE: u32 = AGDX_KV_BASE + 11;
 
 // Fork block (1_000_300..): agentic copy-on-write branches of the materialized
 // read model. Each op is its own managed command, forwarded over the same bridge.
@@ -84,6 +101,21 @@ pub const AGDX_FORK_LIST_CODE: u32 = AGDX_FORK_BASE + 3;
 /// Managed command code: write a speculative fork row.
 pub const AGDX_FORK_PUT_CODE: u32 = AGDX_FORK_BASE + 4;
 
+// Knowledge graph block (1_000_500..=1_000_599). Traversal reads and the
+// projector's node/edge upsert. Whether they are served is advertised by the
+// `managed_graph` capability flag. Agentic memory is not a wire band of its own:
+// the four-verb memory API is an SDK facade that composes `publish`, the query
+// block, and this graph block, so there is one managed read/write model, not a
+// parallel one.
+/// Base of the graph managed-command block.
+pub const AGDX_GRAPH_BASE: u32 = AGDX_COMMAND_BASE + 500;
+/// Managed command code: run a graph traversal.
+pub const AGDX_GRAPH_QUERY_CODE: u32 = AGDX_GRAPH_BASE;
+/// Managed command code: write nodes and edges (the projector path).
+pub const AGDX_GRAPH_UPSERT_CODE: u32 = AGDX_GRAPH_BASE + 1;
+/// Managed command code: one-hop neighbor read.
+pub const AGDX_GRAPH_NEIGHBORS_CODE: u32 = AGDX_GRAPH_BASE + 2;
+
 // Per-surface op-schema versions, stamped on every request envelope (or, for
 // the agent surface, carried as the `agdx.av` header). A peer rejects a payload
 // it cannot decode rather than mis-reading a skewed schema.
@@ -95,6 +127,8 @@ pub const CONTROL_OP_VERSION: u32 = 1;
 pub const KV_OP_VERSION: u32 = 1;
 /// Wire version of the fork op envelopes.
 pub const FORK_OP_VERSION: u32 = 1;
+/// Wire version of the graph op envelopes.
+pub const GRAPH_OP_VERSION: u32 = 1;
 /// Wire version of the agent envelope (the Agent Data Exchange Protocol). Carried
 /// out-of-band as the typed `agdx.av` header, never inside the body: a durable
 /// log record must select its decoder before any body byte is read.

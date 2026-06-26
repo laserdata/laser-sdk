@@ -1,9 +1,11 @@
 use crate::error::LaserError;
 use crate::kv::{
-    AGDX_KV_CAS_CODE, AGDX_KV_DELETE_CODE, AGDX_KV_DELETE_MANY_CODE, AGDX_KV_GET_CODE,
-    AGDX_KV_NAMESPACES_CODE, AGDX_KV_SCAN_CODE, AGDX_KV_SET_CODE, CasExpect, DEFAULT_SCAN_LIMIT,
-    KV_OP_VERSION, KvCas, KvDelete, KvDeleteMany, KvEntry, KvError, KvGet, KvNamespaceInfo,
-    KvNamespaces, KvOutcome, KvPage, KvReply, KvScan, KvSet, MAX_KEY_BYTES, MAX_VALUE_BYTES,
+    AGDX_KV_CAS_CODE, AGDX_KV_DELETE_CODE, AGDX_KV_DELETE_MANY_CODE, AGDX_KV_EXISTS_CODE,
+    AGDX_KV_EXPIRE_CODE, AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE, AGDX_KV_NAMESPACES_CODE,
+    AGDX_KV_PATCH_CODE, AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE, AGDX_KV_SET_CODE, CasExpect,
+    DEFAULT_SCAN_LIMIT, KV_OP_VERSION, KvCas, KvDelete, KvDeleteMany, KvEntry, KvError, KvExists,
+    KvExpire, KvGet, KvLease, KvMetadata, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage,
+    KvPatch, KvRelease, KvReply, KvScan, KvSet, MAX_KEY_BYTES, MAX_VALUE_BYTES,
 };
 use crate::laser::Laser;
 use crate::query::{Codec, Decoder};
@@ -11,6 +13,14 @@ use laser_wire::framing::encode_named;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A granted advisory lease: the fencing token to present on protected mutations
+/// and the TTL the store granted (which may be shorter than requested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    pub token: u64,
+    pub granted_ttl: Duration,
+}
 
 impl Laser {
     /// A handle to the managed key-value store, scoped to `namespace`. Cheap to
@@ -55,7 +65,7 @@ impl Laser {
         request: &impl Serialize,
     ) -> Result<KvOutcome, LaserError> {
         let capabilities = self.capabilities().await;
-        if !capabilities.managed_kv {
+        if !capabilities.kv.available {
             return Err(LaserError::Unsupported(
                 "kv requires LaserData Cloud".to_owned(),
             ));
@@ -110,6 +120,7 @@ impl<'a> Kv<'a> {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
             key,
+            if_none_match: None,
         };
         match self.laser.execute_kv(AGDX_KV_GET_CODE, &request).await? {
             KvOutcome::Value(entry) => Ok(entry),
@@ -172,10 +183,112 @@ impl<'a> Kv<'a> {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
             key,
+            if_match: None,
         };
         match self.laser.execute_kv(AGDX_KV_DELETE_CODE, &request).await? {
             KvOutcome::Deleted(existed) => Ok(existed),
             other => Err(unexpected("delete", &other)),
+        }
+    }
+
+    /// Test presence and read metadata (version, expiry, value size) without
+    /// transferring the value. The cheap precondition check before a large fetch.
+    pub async fn exists(&self, key: impl AsRef<[u8]>) -> Result<Option<KvMetadata>, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        let request = KvExists {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+        };
+        match self.laser.execute_kv(AGDX_KV_EXISTS_CODE, &request).await? {
+            KvOutcome::Metadata(metadata) => Ok(metadata),
+            other => Err(unexpected("exists", &other)),
+        }
+    }
+
+    /// Set or refresh the entry's expiry in place without rewriting its value.
+    /// `ttl` of `None` clears the expiry. Returns the entry's (unchanged) version.
+    pub async fn expire(
+        &self,
+        key: impl AsRef<[u8]>,
+        ttl: Option<Duration>,
+    ) -> Result<u64, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        let expires_at_micros = ttl.map(|ttl| now_micros().saturating_add(ttl.as_micros() as u64));
+        let request = KvExpire {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            expires_at_micros,
+        };
+        match self.laser.execute_kv(AGDX_KV_EXPIRE_CODE, &request).await? {
+            KvOutcome::Versioned { version } => Ok(version),
+            other => Err(unexpected("expire", &other)),
+        }
+    }
+
+    /// Apply a merge `patch` to a structured value without transferring the whole
+    /// object, returning the new version. The patch bytes are codec-specific (a
+    /// JSON merge patch over a JSON value, for instance).
+    pub async fn patch(
+        &self,
+        key: impl AsRef<[u8]>,
+        patch: impl Into<Vec<u8>>,
+    ) -> Result<u64, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        let request = KvPatch {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            patch: patch.into(),
+            if_match: None,
+        };
+        match self.laser.execute_kv(AGDX_KV_PATCH_CODE, &request).await? {
+            KvOutcome::Versioned { version } => Ok(version),
+            other => Err(unexpected("patch", &other)),
+        }
+    }
+
+    /// Acquire an advisory lease (a bounded-TTL distributed lock) on `key`. The
+    /// returned [`Lease`] carries the fencing token to present on protected
+    /// mutations and the TTL the store granted.
+    pub async fn lease(&self, key: impl AsRef<[u8]>, ttl: Duration) -> Result<Lease, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        let request = KvLease {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            lease_ttl_micros: ttl.as_micros() as u64,
+        };
+        match self.laser.execute_kv(AGDX_KV_LEASE_CODE, &request).await? {
+            KvOutcome::Leased {
+                lease_token,
+                granted_ttl_micros,
+            } => Ok(Lease {
+                token: lease_token,
+                granted_ttl: Duration::from_micros(granted_ttl_micros),
+            }),
+            other => Err(unexpected("lease", &other)),
+        }
+    }
+
+    /// Release a held lease early, presenting the `token` the grant returned.
+    /// Returns `true` when a held lease was released.
+    pub async fn release(&self, key: impl AsRef<[u8]>, token: u64) -> Result<bool, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        let request = KvRelease {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            lease_token: token,
+        };
+        match self
+            .laser
+            .execute_kv(AGDX_KV_RELEASE_CODE, &request)
+            .await?
+        {
+            KvOutcome::Released(released) => Ok(released),
+            other => Err(unexpected("release", &other)),
         }
     }
 
@@ -342,7 +455,7 @@ impl<'a> KvSetRequest<'a> {
         // Unlike a plain set, CAS rides its own command code an unaware server
         // rejects, but checking the advertised capability locally turns that
         // into the documented `Unsupported` before the round-trip.
-        if !self.laser.capabilities().await.kv_cas {
+        if !self.laser.capabilities().await.kv.cas {
             return Err(LaserError::Unsupported(
                 "compare-and-swap requires a backend that serves it (kv_cas capability)".to_owned(),
             ));

@@ -44,6 +44,12 @@ impl ContentType {
     /// shape planned for Iggy's native reserved content-type field): raw=0,
     /// json=1, msgpack=2, cbor=3, bson=4, avro=5, protobuf=6, arrow=7,
     /// ref=8 (claim-check body reference), any=255 (best-effort sentinel).
+    /// Whether this is the default `Raw` codec (omitted on the wire when a
+    /// field defaults to it).
+    pub const fn is_raw(&self) -> bool {
+        matches!(self, ContentType::Raw)
+    }
+
     pub const fn code(self) -> u8 {
         match self {
             ContentType::Raw => 0,

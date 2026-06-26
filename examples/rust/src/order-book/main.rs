@@ -228,7 +228,7 @@ async fn main() -> Result<(), LaserError> {
     // `managed_query` so the analytics half works: the example spawns its own
     // in-process projector locally, and on LaserData Cloud the connect-time
     // `AGDX_HELLO` probe upgrades the read path to the `AGDX_QUERY` managed command.
-    let capabilities = Capabilities::OPEN.with_managed_query(true);
+    let capabilities = Capabilities::OPEN.with_query(true);
     let data_stream = stream_for("order-book");
     let laser = laser(&data_stream, capabilities).await?;
     laser.ensure_topic(FEED_TOPIC, PARTITIONS).await?;
@@ -262,7 +262,7 @@ async fn main() -> Result<(), LaserError> {
     // LaserData Cloud resolves the registered writer schema via `agdx.sid` and extracts
     // the indexed columns out of the binary bodies, and the notionals must
     // come out the same as the JSON tape's.
-    if laser.capabilities().await.managed_host {
+    if laser.capabilities().await.managed {
         phase("schema-first tape: Avro fills decoded by a registered writer schema");
         avro_tape(&laser, &trades).await?;
     } else {

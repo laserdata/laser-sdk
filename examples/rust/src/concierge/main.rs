@@ -178,7 +178,7 @@ async fn main() -> Result<(), LaserError> {
     backlog_snapshot(&laser).await?;
 
     let capabilities = laser.capabilities().await;
-    if !fork_feature_ready(capabilities.managed_host, "the agentic desk", "concierge") {
+    if !fork_feature_ready(capabilities.managed, "the agentic desk", "concierge") {
         return Ok(());
     }
 

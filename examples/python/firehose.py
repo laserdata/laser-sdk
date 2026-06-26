@@ -226,7 +226,7 @@ async def main() -> None:
     for topic in topics:
         await laser.ensure_topic(topic, partitions=config.partitions)
 
-    register = config.register and caps.managed_query
+    register = config.register and caps.query
     if register:
         for topic in topics:
             await register_index(laser, topic)
@@ -254,7 +254,7 @@ async def main() -> None:
     rate = config.messages / elapsed
     print(f"done: {config.messages} messages in {elapsed:.1f}s ({rate:.0f} msg/s)")
 
-    if config.query and _common.managed_gate(caps.managed_query, "query", EXAMPLE):
+    if config.query and _common.managed_gate(caps.query, "query", EXAMPLE):
         await _common.wait_for_projection(laser, topics[0], per_org + (1 if remainder else 0))
         print("sample analytics over the firehose")
         await run_sample_queries(laser, topics)

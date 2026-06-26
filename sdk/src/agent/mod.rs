@@ -4,6 +4,7 @@ mod builder;
 mod consumer;
 mod ctx;
 mod laser;
+mod memory_handler;
 mod router;
 mod session;
 mod state;
@@ -21,6 +22,7 @@ pub use consumer::{
     SlidingWindow,
 };
 pub use ctx::AgentCtx;
+pub use memory_handler::MemoryHandler;
 pub use router::Router;
 pub use session::SessionPolicy;
 pub use state::ConversationState;

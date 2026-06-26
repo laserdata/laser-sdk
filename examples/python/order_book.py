@@ -247,7 +247,7 @@ async def main() -> None:
 
     # Register the analytics projector before the tape is written so no fill is
     # missed by a projector that starts afterwards (managed-only).
-    if caps.managed_query:
+    if caps.query:
         await _common.start_projector(laser, TAPE_TOPIC, COLUMNS)
 
     print(f"streaming a live market feed of {count} fills across {len(OPENING)} symbols")
@@ -256,15 +256,15 @@ async def main() -> None:
 
     await index_tape(laser, trades)
 
-    if _common.managed_gate(caps.managed_query, "query", EXAMPLE):
+    if _common.managed_gate(caps.query, "query", EXAMPLE):
         await _common.wait_for_projection(laser, TAPE_TOPIC, count)
         await report_volume_and_vwap(laser)
 
     # The schema-first coda needs writer schemas, which live on LaserData Cloud.
-    if caps.managed_host:
+    if caps.managed:
         print("schema-first tape: Avro fills decoded by a registered writer schema")
         await avro_tape(laser, trades)
-    elif caps.managed_query:
+    elif caps.query:
         print("writer schemas live on LaserData Cloud, skipping the Avro tape (needs the Cloud)")
 
 

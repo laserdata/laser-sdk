@@ -140,7 +140,7 @@ async fn main() -> Result<(), LaserError> {
     // `managed_query` so the analytics half works: the example spawns its own
     // in-process projector locally. On LaserData Cloud the connect-time
     // `AGDX_HELLO` probe upgrades the read path to the `AGDX_QUERY` managed command.
-    let capabilities = Capabilities::OPEN.with_managed_query(true);
+    let capabilities = Capabilities::OPEN.with_query(true);
     let laser = laser(&stream_for("event-analytics"), capabilities).await?;
     laser.ensure_topic(TOPIC, PARTITIONS).await?;
 
@@ -173,7 +173,7 @@ async fn main() -> Result<(), LaserError> {
     // record stamping the schema's id has its decoded payload validated by
     // LaserData Cloud's projector. A malformed event is counted, optionally
     // dead-lettered, and never pollutes the index.
-    if laser.capabilities().await.managed_host {
+    if laser.capabilities().await.managed {
         phase("validated ingest: a JSON Schema guards the index");
         run_guarded_ingest(&laser).await?;
     } else {

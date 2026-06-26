@@ -135,6 +135,98 @@ impl PyKv {
         })
     }
 
+    /// Test presence and read metadata without the value. Returns
+    /// `(version, expires_at_micros, size_bytes)` or `None` when absent.
+    fn exists<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        future_into_py(py, async move {
+            let meta = laser.kv(namespace).exists(key).await.map_err(to_pyerr)?;
+            Ok(meta.map(|m| (m.version, m.expires_at_micros, m.size_bytes)))
+        })
+    }
+
+    /// Set or refresh the entry's expiry in place. `ttl_secs` of `None` clears it.
+    /// Returns the entry's (unchanged) version.
+    #[pyo3(signature = (key, ttl_secs=None))]
+    fn expire<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        ttl_secs: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        let ttl = ttl_secs.map(Duration::from_secs_f64);
+        future_into_py(py, async move {
+            laser.kv(namespace).expire(key, ttl).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Apply a merge `patch` (bytes) to a structured value, returning the new
+    /// version.
+    fn patch<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        patch: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        let patch = payload_bytes(patch)?;
+        future_into_py(py, async move {
+            laser
+                .kv(namespace)
+                .patch(key, patch)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Acquire an advisory lease on `key` for `ttl_secs`. Returns
+    /// `(lease_token, granted_ttl_secs)`.
+    fn lease<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        ttl_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        future_into_py(py, async move {
+            let lease = laser
+                .kv(namespace)
+                .lease(key, Duration::from_secs_f64(ttl_secs))
+                .await
+                .map_err(to_pyerr)?;
+            Ok((lease.token, lease.granted_ttl.as_secs_f64()))
+        })
+    }
+
+    /// Release a held lease early, presenting its `token`. Returns `True` when a
+    /// held lease was released.
+    fn release<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        token: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        future_into_py(py, async move {
+            laser
+                .kv(namespace)
+                .release(key, token)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
     /// Start a filtered bulk delete over this namespace.
     fn delete_many(&self) -> PyKvDeleteMany {
         PyKvDeleteMany {

@@ -230,6 +230,88 @@ impl From<String> for ProjectionId {
 /// The body may carry fields that are not indexed. Only the declared fields
 /// are queryable. Everything else rides through as part of the inlined body
 /// (when on) or is reachable only by Iggy replay (when off).
+/// What a projection materializes: queryable rows, or a knowledge graph of
+/// nodes and edges. Rides the wire as a u8 code (the growable-dictionary pattern)
+/// so a future kind flows through an old reader as
+/// [`Unrecognized`](Self::Unrecognized) rather than failing the listing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "u8", into = "u8")]
+pub enum ProjectionKind {
+    /// Materialize queryable rows (the default).
+    #[default]
+    Row,
+    /// Materialize a knowledge graph (nodes, edges, triplets).
+    Graph,
+    /// A code this build does not know, passed through.
+    Unrecognized(u8),
+}
+
+impl ProjectionKind {
+    /// The pinned wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            ProjectionKind::Row => 0,
+            ProjectionKind::Graph => 1,
+            ProjectionKind::Unrecognized(code) => code,
+        }
+    }
+
+    /// The kind for a wire code (unknown codes become
+    /// [`Unrecognized`](Self::Unrecognized)).
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            0 => ProjectionKind::Row,
+            1 => ProjectionKind::Graph,
+            other => ProjectionKind::Unrecognized(other),
+        }
+    }
+
+    /// Whether this is the default `Row` kind (omitted on the wire).
+    pub const fn is_row(&self) -> bool {
+        matches!(self, ProjectionKind::Row)
+    }
+}
+
+impl From<u8> for ProjectionKind {
+    fn from(code: u8) -> Self {
+        Self::from_code(code)
+    }
+}
+
+impl From<ProjectionKind> for u8 {
+    fn from(kind: ProjectionKind) -> u8 {
+        kind.code()
+    }
+}
+
+/// How a graph projection extracts nodes and edges from a payload. Pointer-based
+/// (RFC 6901) and deterministic, so no model call is needed to build the graph.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntitySchema {
+    pub nodes: Vec<NodeExtract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<EdgeExtract>,
+}
+
+/// One node-extraction rule: the node's label and the pointer to its canonical
+/// value (which content-addresses its id, so the same entity converges).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeExtract {
+    pub label: String,
+    pub value_pointer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_pointer: Option<String>,
+}
+
+/// One edge-extraction rule: the edge type and the pointers to its endpoint
+/// values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EdgeExtract {
+    pub edge_type: String,
+    pub from_pointer: String,
+    pub to_pointer: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Projection {
     /// Stable id used on the wire as `agdx.ref`.
@@ -240,11 +322,18 @@ pub struct Projection {
     /// Schema-evolution version. Bump on incompatible changes. The wire id
     /// usually encodes this (`order.v2`).
     pub version: u32,
+    /// What this projection materializes: rows (default) or a graph.
+    #[serde(default, skip_serializing_if = "ProjectionKind::is_row")]
+    pub kind: ProjectionKind,
     /// Expected payload codec. `Any` means best-effort decode: the extraction
     /// plan tolerates an opaque payload.
     pub content_type: ContentType,
     /// Field extraction plan.
     pub extraction: IndexSchema,
+    /// Node/edge extraction plan for a `Graph` projection. `None` for a row
+    /// projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_schema: Option<EntitySchema>,
     /// Default `inline_payload` for records routed through this projection,
     /// overridable per record.
     #[serde(default)]
@@ -259,6 +348,7 @@ impl Projection {
                 id: id.into(),
                 name: String::new(),
                 version: 1,
+                kind: ProjectionKind::Row,
                 content_type: ContentType::Any,
                 // Default: inline the body alongside the indexed row so typed
                 // fetches can decode it without going back to the Iggy log.
@@ -269,6 +359,7 @@ impl Projection {
                     vector_field: None,
                     inline_payload: true,
                 },
+                entity_schema: None,
                 inline_payload_default: true,
             },
         }
@@ -302,6 +393,13 @@ impl ProjectionBuilder {
     /// Set the full index schema (instead of `field`/`vector_field`).
     pub fn extraction(mut self, value: IndexSchema) -> Self {
         self.projection.extraction = value;
+        self
+    }
+
+    /// Make this a graph projection with the given node/edge extraction plan.
+    pub fn graph(mut self, schema: EntitySchema) -> Self {
+        self.projection.kind = ProjectionKind::Graph;
+        self.projection.entity_schema = Some(schema);
         self
     }
 
@@ -798,6 +896,13 @@ pub enum ControlCommand {
     RegisterSchema(SchemaDef),
     /// Drop the schema registered under this id.
     DropSchema(u32),
+    /// Register (or replace by id) a graph projection: a [`Projection`] with
+    /// `kind = Graph` and an `entity_schema`. A distinct command from
+    /// [`RegisterProjection`](Self::RegisterProjection) so a deployment can gate
+    /// graph registration separately.
+    RegisterGraph(Projection),
+    /// Drop the graph projection registered under this id.
+    DropGraph(String),
 }
 
 /// Versioned wrapper around a [`ControlCommand`], CBOR-named on the wire.

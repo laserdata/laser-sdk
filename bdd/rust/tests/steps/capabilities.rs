@@ -1,7 +1,7 @@
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_sdk::prelude::Capabilities;
-use laser_sdk::query::ResultCode;
+use laser_sdk::query::{Consistency, ResultCode};
 
 #[given("a managed-query connection that does not advertise read-your-writes")]
 async fn managed_query_without_read_your_writes(world: &mut LaserWorld) {
@@ -12,19 +12,19 @@ async fn managed_query_without_read_your_writes(world: &mut LaserWorld) {
         .laser
         .take()
         .expect("a Laser is connected")
-        .with_capabilities(Capabilities::OPEN.with_managed_query(true));
+        .with_capabilities(Capabilities::OPEN.with_query(true));
     world.laser = Some(laser);
 }
 
 #[when("I read the negotiated capabilities")]
 async fn read_capabilities(world: &mut LaserWorld) {
     let capabilities = world.laser().capabilities().await;
-    world.managed_query = Some(capabilities.managed_query);
-    world.managed_kv = Some(capabilities.managed_kv);
+    world.managed_query = Some(capabilities.query.available);
+    world.managed_kv = Some(capabilities.kv.available);
     world.forks = Some(capabilities.forks);
-    world.kv_cas = Some(capabilities.kv_cas);
-    world.read_your_writes = Some(capabilities.read_your_writes);
-    world.strong_consistency = Some(capabilities.strong_consistency);
+    world.kv_cas = Some(capabilities.kv.cas);
+    world.read_your_writes = Some(capabilities.serves_consistency(Consistency::ReadYourWrites));
+    world.strong_consistency = Some(capabilities.serves_consistency(Consistency::Strong));
 }
 
 #[then("managed query is unavailable")]

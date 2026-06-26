@@ -15,12 +15,12 @@ def read_capabilities(world):
 
 @then("managed query is unavailable")
 def query_unavailable(world):
-    assert world.caps.managed_query is False
+    assert world.caps.query is False
 
 
 @then("managed key-value is unavailable")
 def kv_unavailable(world):
-    assert world.caps.managed_kv is False
+    assert world.caps.kv is False
 
 
 @then("forks are unavailable")
@@ -31,8 +31,8 @@ def forks_unavailable(world):
 @then("the coordination features are unavailable")
 def coordination_unavailable(world):
     assert world.caps.kv_cas is False
-    assert world.caps.read_your_writes is False
-    assert world.caps.strong_consistency is False
+    # Consistency is one ordered level. Raw Apache Iggy serves only the weakest.
+    assert world.caps.query_consistency == "eventual"
 
 
 @when(parsers.parse('I run a query against topic "{topic}"'))

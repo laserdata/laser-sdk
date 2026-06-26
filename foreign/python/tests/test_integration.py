@@ -9,8 +9,8 @@ pytestmark = pytest.mark.integration
 async def test_connect_reports_open_capabilities(laser):
     caps = await laser.capabilities()
     # Raw Apache Iggy advertises no managed features.
-    assert caps.managed_query is False
-    assert caps.managed_kv is False
+    assert caps.query is False
+    assert caps.kv is False
     assert caps.forks is False
 
 
@@ -325,3 +325,29 @@ async def test_vector_memory_ranks_by_semantic_similarity(laser):
 
     refund = await memory.recall(conversation=conversation, semantic="refund", limit=1)
     assert refund[0].text == "billing refund double charge"
+
+
+async def test_vector_memory_improve_promotes_a_recalled_item(laser):
+    # Feedback re-ranks recall: a promoted item floats to the front on the next
+    # recall, mirroring the Rust feedback contract.
+    async def embed(text: str) -> list[float]:
+        return [1.0 if term in set(text.lower().split()) else 0.0 for term in ("cat", "dog")]
+
+    memory = laser.vector_memory(embed)
+    conversation = ls.new_conversation_id()
+    await memory.remember("the cat sat", conversation=conversation)
+    dog = await memory.remember("the dog ran", conversation=conversation)
+
+    before = await memory.recall(conversation=conversation, limit=2)
+    assert before[0].text == "the cat sat"
+
+    await memory.improve(dog, 5.0, conversation=conversation)
+    after = await memory.recall(conversation=conversation, limit=2)
+    assert after[0].text == "the dog ran"
+    assert after[0].score == 5.0
+
+
+async def test_recall_with_unknown_strategy_raises(laser):
+    memory = laser.memory()
+    with pytest.raises(ls.CodecError):
+        await memory.recall(conversation=ls.new_conversation_id(), strategy="nonsense")

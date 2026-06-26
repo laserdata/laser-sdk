@@ -92,7 +92,11 @@ fn is_false(value: &bool) -> bool {
 /// it, not the instant it is appended. This level says what the query requires
 /// of that lag, and the contract is fail-not-downgrade: a level that cannot be
 /// met returns [`QueryError::Stale`] rather than silently serving older data.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+// `Ord` follows the declaration order, which is the strength ladder
+// (Eventual < ReadYourWrites < Strong), so a stronger level compares greater and
+// a capability check is `want <= served`. A new variant must be appended to keep
+// the order meaningful.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Consistency {

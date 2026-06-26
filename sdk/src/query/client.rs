@@ -122,11 +122,11 @@ impl Laser {
     /// Lower-level: execute a pre-built `Query` and return the raw paged result.
     /// Most callers want `query(index).where_eq(...).fetch().await` instead.
     ///
-    /// Query is a LaserData Cloud feature. Against raw Apache Iggy (`managed_query`
-    /// false) this returns `LaserError::Unsupported`.
+    /// Query is a LaserData Cloud feature. Against raw Apache Iggy
+    /// (`query.available` false) this returns `LaserError::Unsupported`.
     pub async fn execute_query(&self, query: Query) -> Result<QueryResult, LaserError> {
         let capabilities = self.capabilities().await;
-        if !capabilities.managed_query {
+        if !capabilities.query.available {
             return Err(LaserError::Unsupported(
                 "query is a LaserData Cloud feature".to_owned(),
             ));
@@ -229,7 +229,7 @@ impl Laser {
         request: &impl Serialize,
     ) -> Result<BrowseOutcome, LaserError> {
         let capabilities = self.capabilities().await;
-        if !capabilities.managed_host {
+        if !capabilities.managed {
             return Err(LaserError::Unsupported(
                 "projection browse requires LaserData Cloud".to_owned(),
             ));

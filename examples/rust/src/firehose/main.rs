@@ -251,7 +251,7 @@ async fn main() -> Result<(), LaserError> {
 
     // `managed_query` so the trailing analytics work against the in-process worker
     // locally, or the `AGDX_QUERY` managed command on a deployment.
-    let capabilities = Capabilities::OPEN.with_managed_query(true);
+    let capabilities = Capabilities::OPEN.with_query(true);
     let laser = laser(&stream_name, capabilities).await?;
 
     let topics: Vec<String> = (0..config.orgs)

@@ -96,3 +96,22 @@ pub const MAX_METADATA_TOTAL_BYTES: usize = 8192;
 pub const MAX_BODY_REFERENCE_BYTES: usize = 1024;
 /// Max capability entries on an [`AgentCard`](crate::agent::AgentCard).
 pub const MAX_CARD_CAPABILITIES: usize = 64;
+
+// Memory and graph caps, sized inside the existing cap family. A memory body
+// shares the opaque-value ceiling. A recall page shares the query page cap.
+/// Max bytes in one memory item's body (shares the opaque-value ceiling).
+pub const MAX_MEMORY_BODY_BYTES: usize = MAX_VALUE_BYTES;
+/// Max items a single recall returns (shares the query page cap).
+pub const MAX_RECALL_LIMIT: usize = MAX_PAGE_SIZE;
+/// Recall page size when the caller sets none.
+pub const DEFAULT_RECALL_LIMIT: usize = DEFAULT_STREAM_PAGE_SIZE;
+/// Max tags on one memory item.
+pub const MAX_MEMORY_TAGS: usize = 16;
+/// Max bytes in one memory tag.
+pub const MAX_MEMORY_TAG_BYTES: usize = 64;
+/// Hard ceiling on the hop depth a single graph traversal may request.
+pub const MAX_GRAPH_TRAVERSE_DEPTH: u32 = 8;
+/// Hard ceiling on nodes plus edges in one graph reply.
+pub const MAX_GRAPH_RESULT_ELEMENTS: usize = 10_000;
+/// Max labels on one graph node.
+pub const MAX_GRAPH_NODE_LABELS: usize = 16;

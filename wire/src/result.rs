@@ -158,6 +158,8 @@ impl From<&KvError> for ResultCode {
             KvError::Backend(_) => ResultCode::Backend,
             KvError::Version { .. } => ResultCode::VersionSkew,
             KvError::VersionConflict { .. } => ResultCode::Conflict,
+            KvError::LeaseLost => ResultCode::Conflict,
+            KvError::NotFound => ResultCode::NotFound,
         }
     }
 }

@@ -14,10 +14,11 @@
 use crate::browse::{ProjectionInfo, SchemaInfo};
 use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector};
 use crate::fork::ForkInfo;
+use crate::graph::GraphQuery;
 use crate::http::{
     self, Capabilities, CasCommittedView, DecodeRecordBody, DeletedManyView, ErrorBody,
-    ForkCreateBody, ForkPutBody, KvCasQuery, KvPageView, KvPutQuery, KvScanQuery,
-    ProjectionListQuery, PromotedView, RemoveBindingBody, SchemaListQuery,
+    ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
+    KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, RemoveBindingBody, SchemaListQuery,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
@@ -450,6 +451,32 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// `POST /agdx/graph/{name}/query`: run a traversal over a named graph, get
+    /// back the reachable nodes and traversed edges. Backend-gated by the `graph`
+    /// capability: a deployment without a graph backend answers unsupported.
+    pub async fn graph_query(
+        &self,
+        name: &str,
+        query: &GraphQuery,
+    ) -> ClientResult<GraphResultView, T::Error> {
+        self.send_json(Method::Post, http::graph_query_path(name), query)
+            .await
+    }
+
+    /// `GET /agdx/graph/{name}/neighbors/{node}`: the neighbor read, the cheap
+    /// common traversal. `node` is the Crockford-base32 node id. `query` carries
+    /// the direction, an optional edge-type filter, the hop depth, and a limit (a
+    /// default `query` reads one hop outward with no filter).
+    pub async fn graph_neighbors(
+        &self,
+        name: &str,
+        node: &str,
+        query: &GraphNeighborsQuery,
+    ) -> ClientResult<GraphResultView, T::Error> {
+        self.get(with_query(&http::graph_neighbors_path(name, node), query)?)
+            .await
+    }
+
     async fn get<R: DeserializeOwned>(&self, path: String) -> ClientResult<R, T::Error> {
         let response = self.dispatch(Method::Get, path, None).await?;
         decode_ok(&response)
@@ -737,7 +764,7 @@ mod tests {
             response: HttpResponse::new(200, body),
         });
         let caps = block_on(client.capabilities()).expect("decodes");
-        assert!(caps.managed && !caps.kv_cas);
+        assert!(caps.managed && !caps.kv.cas);
     }
 
     #[test]

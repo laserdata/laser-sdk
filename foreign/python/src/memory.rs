@@ -5,8 +5,8 @@ use crate::errors::to_pyerr;
 use laser_sdk::error::LaserError;
 use laser_sdk::laser::Laser;
 use laser_sdk::memory::{
-    Embedder, KvMemory, LogMemory, Memory, MemoryId, MemoryItem, MemoryQuery, MemoryScope,
-    QueryMemory, VectorMemory,
+    Embedder, Feedback, KvMemory, LogMemory, Memory, MemoryId, MemoryItem, MemoryKind, MemoryQuery,
+    MemoryScope, QueryMemory, RecallStrategy, VectorMemory,
 };
 use laser_sdk::types::{AgentId, ConversationId};
 use pyo3::prelude::*;
@@ -90,7 +90,7 @@ macro_rules! on_backend {
                 namespace,
                 ttl,
             } => {
-                let mut built = KvMemory::new(laser, namespace.clone());
+                let mut built = KvMemory::new(laser, namespace);
                 if let Some(ttl) = ttl {
                     built = built.with_ttl(*ttl);
                 }
@@ -118,7 +118,30 @@ impl Backend {
     async fn forget(&self, scope: MemoryScope, id: MemoryId) -> Result<(), LaserError> {
         on_backend!(self, |memory| Memory::forget(memory, &scope, id).await)
     }
+
+    async fn improve(&self, scope: MemoryScope, feedback: Feedback) -> Result<MemoryId, LaserError> {
+        on_backend!(self, |memory| Memory::improve(memory, &scope, feedback).await)
+    }
 }
+
+// Map a recall-strategy string (the Python surface uses string literals, mapped
+// to the typed `RecallStrategy`) to the enum, erroring on an unknown value.
+fn map_strategy(strategy: &str) -> PyResult<RecallStrategy> {
+    Ok(match strategy {
+        "auto" => RecallStrategy::Auto,
+        "recent" => RecallStrategy::Recent,
+        "semantic" => RecallStrategy::Semantic,
+        "graph" => RecallStrategy::Graph,
+        "temporal" => RecallStrategy::Temporal,
+        "hybrid" => RecallStrategy::Hybrid,
+        other => {
+            return Err(crate::errors::CodecError::new_err(format!(
+                "unknown recall strategy '{other}'"
+            )));
+        }
+    })
+}
+
 
 fn build_scope(agent: Option<String>, conversation: Option<String>) -> PyResult<MemoryScope> {
     let agent = match agent {
@@ -172,7 +195,7 @@ impl PyMemory {
     /// Recall up to `limit` items under the scope. Pass `semantic` text to rank by
     /// similarity (the vector backend embeds and scores it, the others ignore it
     /// and return the most recent).
-    #[pyo3(signature = (*, limit=50, agent=None, conversation=None, semantic=None))]
+    #[pyo3(signature = (*, limit=50, agent=None, conversation=None, semantic=None, strategy=None))]
     fn recall<'py>(
         &self,
         py: Python<'py>,
@@ -180,12 +203,21 @@ impl PyMemory {
         agent: Option<String>,
         conversation: Option<String>,
         semantic: Option<String>,
+        strategy: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let backend = self.inner.clone();
         let scope = build_scope(agent, conversation)?;
+        // An explicit strategy wins; otherwise a `semantic` query implies the
+        // semantic strategy, and a plain recall stays `Auto`.
+        let strategy = match strategy {
+            Some(name) => map_strategy(&name)?,
+            None if semantic.is_some() => RecallStrategy::Semantic,
+            None => RecallStrategy::Auto,
+        };
         let query = MemoryQuery::builder()
             .limit(limit)
             .maybe_semantic(semantic)
+            .strategy(strategy)
             .build();
         future_into_py(py, async move {
             let items = backend.recall(scope, query).await.map_err(to_pyerr)?;
@@ -193,6 +225,30 @@ impl PyMemory {
                 .into_iter()
                 .map(PyMemoryItem::from)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    /// Record feedback on a recalled item, the signal a ranking backend folds
+    /// into future recall. `weight` is positive to promote, negative to demote.
+    /// Returns the feedback record's id.
+    #[pyo3(signature = (memory_id, weight, *, agent=None, conversation=None))]
+    fn improve<'py>(
+        &self,
+        py: Python<'py>,
+        memory_id: String,
+        weight: f32,
+        agent: Option<String>,
+        conversation: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let backend = self.inner.clone();
+        let scope = build_scope(agent, conversation)?;
+        let target = MemoryId::from_str(&memory_id).map_err(|e| to_pyerr(e.into()))?;
+        future_into_py(py, async move {
+            let id = backend
+                .improve(scope, Feedback::new(target, weight))
+                .await
+                .map_err(to_pyerr)?;
+            Ok(id.to_string())
         })
     }
 
@@ -258,6 +314,26 @@ impl PyMemoryItem {
     #[getter]
     fn conversation_id(&self) -> String {
         self.inner.provenance.conversation_id.to_string()
+    }
+
+    /// What the item is, as a string (`fact` / `message` / `summary` / `entity`
+    /// / `feedback`).
+    #[getter]
+    fn kind(&self) -> String {
+        match self.inner.kind {
+            MemoryKind::Fact => "fact",
+            MemoryKind::Message => "message",
+            MemoryKind::Summary => "summary",
+            MemoryKind::Entity => "entity",
+            MemoryKind::Feedback => "feedback",
+        }
+        .to_owned()
+    }
+
+    /// The recall score from a ranking strategy, or `None` for an unranked recall.
+    #[getter]
+    fn score(&self) -> Option<f32> {
+        self.inner.score
     }
 
     /// Decode the payload as JSON into a Python value.

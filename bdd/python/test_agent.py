@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import laser_sdk as ls
-import pytest
 from pytest_bdd import parsers, scenarios, then, when
 
 # Background and the shared command / assemble / payload steps live in conftest.py.
@@ -39,29 +38,3 @@ def publish_agdx_command(world, body):
 @then(parsers.parse('the AGDX command body is "{body}"'))
 def agdx_command_body_is(world, body):
     assert any(message.agdx_body == body.encode() for message in world.assembled)
-
-
-# The must-understand validity matrix is a wire-contract concern, exercised
-# exhaustively by the language-agnostic wire fixture corpus and the Rust BDD
-# runner. The Python client does not construct raw envelopes, so these two
-# scenarios are skipped here rather than duplicated.
-
-
-@when("I build an agent event requiring feature bits the receiver lacks")
-def build_event_requiring_features():
-    pytest.skip("the AGDX validity matrix is covered by the wire fixture corpus")
-
-
-@then("the receiver rejects it as not understood")
-def receiver_rejects():
-    raise AssertionError("unreachable: the scenario is skipped")
-
-
-@when("I build a plain agent event")
-def build_plain_event():
-    pytest.skip("the AGDX validity matrix is covered by the wire fixture corpus")
-
-
-@then("the receiver understands it")
-def receiver_understands():
-    raise AssertionError("unreachable: the scenario is skipped")

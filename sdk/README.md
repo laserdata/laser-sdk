@@ -17,9 +17,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.2", default-features = false, features = ["query"] }   # generic substrate
+laser-sdk = { version = "0.0.1-rc.4", default-features = false, features = ["query"] }   # generic substrate
 # or with the agent runtime layered on top:
-laser-sdk = { version = "0.0.1-rc.2", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.4", features = ["query"] }
 ```
 
 ## Quick example

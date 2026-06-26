@@ -329,27 +329,56 @@ class Capabilities:
     infrastructure advertised. All flags are false against raw Apache Iggy.
     """
     @property
-    def sessions(self) -> builtins.bool: ...
+    def managed(self) -> builtins.bool:
+        r"""
+        Connected to a managed plane (the root managed switch).
+        """
     @property
-    def forks(self) -> builtins.bool: ...
+    def query(self) -> builtins.bool:
+        r"""
+        The managed query surface is served.
+        """
     @property
-    def durable_dedup(self) -> builtins.bool: ...
+    def query_consistency(self) -> builtins.str:
+        r"""
+        The strongest read-consistency the query surface serves
+        (`eventual` / `read_your_writes` / `strong`).
+        """
     @property
-    def managed_memory(self) -> builtins.bool: ...
+    def kv(self) -> builtins.bool:
+        r"""
+        The managed key-value surface is served.
+        """
     @property
-    def managed_query(self) -> builtins.bool: ...
+    def kv_cas(self) -> builtins.bool:
+        r"""
+        The key-value store serves compare-and-swap.
+        """
     @property
-    def managed_kv(self) -> builtins.bool: ...
+    def graph(self) -> builtins.bool:
+        r"""
+        The managed knowledge-graph surface is served.
+        """
     @property
-    def managed_host(self) -> builtins.bool: ...
+    def forks(self) -> builtins.bool:
+        r"""
+        Managed copy-on-write forks are served.
+        """
     @property
-    def a2a_gateway(self) -> builtins.bool: ...
+    def a2a_gateway(self) -> builtins.bool:
+        r"""
+        A managed A2A gateway is available.
+        """
     @property
-    def kv_cas(self) -> builtins.bool: ...
+    def sessions(self) -> builtins.bool:
+        r"""
+        Platform-native session lifecycle.
+        """
     @property
-    def read_your_writes(self) -> builtins.bool: ...
-    @property
-    def strong_consistency(self) -> builtins.bool: ...
+    def durable_dedup(self) -> builtins.bool:
+        r"""
+        Platform-side durable deduplication.
+        """
     @property
     def backends(self) -> builtins.list[BackendDescriptor]:
         r"""
@@ -551,6 +580,31 @@ class Kv:
     def delete(self, key: typing.Any) -> typing.Any:
         r"""
         Delete `key`. Returns `True` when a live entry was removed.
+        """
+    def exists(self, key: typing.Any) -> typing.Any:
+        r"""
+        Test presence and read metadata without the value. Returns
+        `(version, expires_at_micros, size_bytes)` or `None` when absent.
+        """
+    def expire(self, key: typing.Any, ttl_secs: typing.Optional[builtins.float] = None) -> typing.Any:
+        r"""
+        Set or refresh the entry's expiry in place. `ttl_secs` of `None` clears it.
+        Returns the entry's (unchanged) version.
+        """
+    def patch(self, key: typing.Any, patch: typing.Any) -> typing.Any:
+        r"""
+        Apply a merge `patch` (bytes) to a structured value, returning the new
+        version.
+        """
+    def lease(self, key: typing.Any, ttl_secs: builtins.float) -> typing.Any:
+        r"""
+        Acquire an advisory lease on `key` for `ttl_secs`. Returns
+        `(lease_token, granted_ttl_secs)`.
+        """
+    def release(self, key: typing.Any, token: builtins.int) -> typing.Any:
+        r"""
+        Release a held lease early, presenting its `token`. Returns `True` when a
+        held lease was released.
         """
     def delete_many(self) -> KvDeleteManyRequest:
         r"""
@@ -974,11 +1028,17 @@ class Memory:
         Remember `payload` (`str`, `bytes`, or `bytearray`) under the given scope.
         Returns the new item's id (a time-ordered ULID string).
         """
-    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None) -> typing.Any:
+    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         Recall up to `limit` items under the scope. Pass `semantic` text to rank by
         similarity (the vector backend embeds and scores it, the others ignore it
         and return the most recent).
+        """
+    def improve(self, memory_id: builtins.str, weight: builtins.float, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Record feedback on a recalled item, the signal a ranking backend folds
+        into future recall. `weight` is positive to promote, negative to demote.
+        Returns the feedback record's id.
         """
     def forget(self, memory_id: builtins.str, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
@@ -1004,6 +1064,17 @@ class MemoryItem:
     def provenance(self) -> Provenance: ...
     @property
     def conversation_id(self) -> builtins.str: ...
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        What the item is, as a string (`fact` / `message` / `summary` / `entity`
+        / `feedback`).
+        """
+    @property
+    def score(self) -> typing.Optional[builtins.float]:
+        r"""
+        The recall score from a ranking strategy, or `None` for an unranked recall.
+        """
     def json(self) -> typing.Any:
         r"""
         Decode the payload as JSON into a Python value.

@@ -47,6 +47,9 @@ pub enum LaserError {
     /// LaserData Cloud answered a fork op with a typed failure.
     #[error("fork: {0}")]
     Fork(#[from] ForkError),
+    /// LaserData Cloud answered a graph op with a typed failure.
+    #[error("graph: {0}")]
+    Graph(#[from] laser_wire::graph::GraphError),
     /// A client-side encode or decode failed (payload codec, wire envelope,
     /// reply bytes). Deterministic for a given input, so never retryable.
     #[error("codec: {0}")]
@@ -170,6 +173,7 @@ impl LaserError {
                 | Self::Query(QueryError::Unsupported(_))
                 | Self::Kv(KvError::Unsupported(_))
                 | Self::Fork(ForkError::Unsupported(_))
+                | Self::Graph(laser_wire::graph::GraphError::Unsupported(_))
         )
     }
 
