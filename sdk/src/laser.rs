@@ -42,7 +42,9 @@ type ProducerCell = Arc<OnceCell<Arc<IggyProducer>>>;
 #[derive(Clone)]
 pub struct Laser {
     inner: Arc<LaserInner>,
-    capabilities: Capabilities,
+    // Read in-crate by the memory and graph facades for synchronous capability
+    // checks (the public async `capabilities()` getter clones it out).
+    pub(crate) capabilities: Capabilities,
     ops_stream: String,
     // The control-command topic on the ops stream. Defaults to
     // `laser_wire::topics::CONTROL_TOPIC` (`control.commands`). Overridable so a
@@ -221,12 +223,6 @@ impl Laser {
     /// round-trip. Open features work regardless of the result.
     pub async fn capabilities(&self) -> Capabilities {
         self.capabilities.clone()
-    }
-
-    // The negotiated capability set, by reference, for synchronous in-crate
-    // checks (e.g. the memory/graph facade picking a backend without awaiting).
-    pub(crate) fn caps(&self) -> &Capabilities {
-        &self.capabilities
     }
 
     /// Idempotently creates `topic` on the default stream with `partitions`,

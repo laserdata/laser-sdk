@@ -1036,7 +1036,7 @@ impl Laser {
     /// rides the agent audit topic and ignores it.
     pub fn memory(&self, namespace: impl Into<String>) -> MemoryHandle {
         #[cfg(feature = "kv")]
-        if self.caps().kv.available {
+        if self.capabilities.kv.available {
             return MemoryHandle::Kv {
                 laser: self.clone(),
                 namespace: namespace.into(),
@@ -1479,7 +1479,7 @@ impl GraphHandle<'_> {
     // Every graph op rides the managed binary transport, so it is unavailable
     // against raw Apache Iggy. Fail the same way before encoding any request.
     fn require_graph(&self) -> Result<(), LaserError> {
-        if self.laser.caps().graph {
+        if self.laser.capabilities.graph {
             Ok(())
         } else {
             Err(LaserError::Unsupported(
