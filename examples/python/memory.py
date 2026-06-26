@@ -77,6 +77,15 @@ def print_nodes(label: str, nodes) -> None:
     print(f"{label}: {', '.join(values)}")
 
 
+def print_nodes_of(label: str, kind: str, nodes) -> None:
+    # A traversal result is seeded with its start frontier, so the start nodes ride
+    # along. Narrow to one entity kind to print just what was reached.
+    values = sorted(
+        node.get("attrs", {}).get("value", "?") for node in nodes if kind in node.get("labels", [])
+    )
+    print(f"{label}: {', '.join(values)}")
+
+
 async def run_memory(laser, conversation) -> None:
     """Part 1: the four memory verbs as one loop over an in-process vector memory."""
     memory = laser.vector_memory(embed)
@@ -180,23 +189,56 @@ async def run_graph(laser) -> None:
     ]
     nodes = list(by_value.values())
     edges = [ls.graph_edge(by_value[src], rel, by_value[dst]) for src, rel, dst in relationships]
+
+    # Register the graph projection so the console explorer lists `ops`. A graph
+    # built only by `upsert` (no projection) is reachable by name but not
+    # discoverable. The entity schema is the projector path: bind it to a source
+    # topic and the projector extracts the same nodes and edges this writes here.
+    await laser.register_graph(
+        {
+            "id": f"{GRAPH}.v1",
+            "name": GRAPH,
+            "version": 1,
+            "content_type": "json",
+            "extraction": {"fields": [], "inline_payload": False},
+            "entity_schema": {
+                "nodes": [
+                    {"label": "Service", "value_pointer": "/service"},
+                    {"label": "Component", "value_pointer": "/component"},
+                ],
+                "edges": [
+                    {
+                        "edge_type": "depends_on",
+                        "from_pointer": "/service",
+                        "to_pointer": "/component",
+                    },
+                ],
+            },
+        }
+    )
     graph = laser.graph(GRAPH)
     await graph.upsert(nodes, edges)
-    print(f"built {len(nodes)} nodes and {len(edges)} edges in the {GRAPH!r} graph")
+    print(f"registered and upserted {len(nodes)} nodes, {len(edges)} edges in the {GRAPH!r} graph")
 
-    # NEIGHBORS. The cheap one-hop read: everything checkout points at.
+    # NEIGHBORS. The cheap one-hop read: checkout and everything it points at.
     around = await graph.neighbors(by_value["checkout"]["id"], direction="out", depth=1)
-    print_nodes("one hop out from checkout", around["nodes"])
+    print_nodes("checkout's one-hop neighborhood", around["nodes"])
 
     # TRAVERSE. From every Service, follow `depends_on` to the components the whole
     # platform rests on, the structural view recall cannot give.
     dependencies = await graph.query(match_label="Service", hops=[("depends_on", "out")], limit=100)
-    print_nodes("components every Service depends on", dependencies["nodes"])
+    print_nodes_of("components every Service depends on", "Component", dependencies["nodes"])
 
     # BLAST RADIUS. From an incident, follow `affected` to everything it touched,
     # the question an on-call engineer actually asks.
-    blast = await graph.query(start_ids=[by_value["INC-101"]["id"]], hops=[("affected", "out")])
-    print_nodes("what INC-101 affected", blast["nodes"])
+    incident_id = by_value["INC-101"]["id"]
+    blast = await graph.query(start_ids=[incident_id], hops=[("affected", "out")])
+    touched = sorted(
+        node.get("attrs", {}).get("value", "?")
+        for node in blast["nodes"]
+        if node["id"] != incident_id
+    )
+    print(f"what INC-101 affected: {', '.join(touched)}")
 
 
 async def main() -> None:
