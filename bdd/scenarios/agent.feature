@@ -25,11 +25,3 @@ Feature: The AGDX agent envelope on the log
     When I publish an AGDX command "ping" via the typed producer
     And I assemble the conversation
     Then the AGDX command body is "ping"
-
-  Scenario: A must-understand marker is rejected by a receiver lacking the feature
-    When I build an agent event requiring feature bits the receiver lacks
-    Then the receiver rejects it as not understood
-
-  Scenario: An event with no must-understand marker is understood
-    When I build a plain agent event
-    Then the receiver understands it

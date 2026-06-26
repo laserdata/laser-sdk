@@ -122,11 +122,11 @@ impl Laser {
     /// Lower-level: execute a pre-built `Query` and return the raw paged result.
     /// Most callers want `query(index).where_eq(...).fetch().await` instead.
     ///
-    /// Query is a LaserData Cloud feature. Against raw Apache Iggy (`managed_query`
-    /// false) this returns `LaserError::Unsupported`.
+    /// Query is a LaserData Cloud feature. Against raw Apache Iggy
+    /// (`query.available` false) this returns `LaserError::Unsupported`.
     pub async fn execute_query(&self, query: Query) -> Result<QueryResult, LaserError> {
         let capabilities = self.capabilities().await;
-        if !capabilities.managed_query {
+        if !capabilities.query.available {
             return Err(LaserError::Unsupported(
                 "query is a LaserData Cloud feature".to_owned(),
             ));
@@ -229,7 +229,7 @@ impl Laser {
         request: &impl Serialize,
     ) -> Result<BrowseOutcome, LaserError> {
         let capabilities = self.capabilities().await;
-        if !capabilities.managed_host {
+        if !capabilities.managed {
             return Err(LaserError::Unsupported(
                 "projection browse requires LaserData Cloud".to_owned(),
             ));
@@ -309,6 +309,27 @@ impl<'a> Projections<'a> {
     pub async fn drop(&self, id: impl Into<String>) -> Result<(), LaserError> {
         self.laser
             .publish_control(ControlCommand::DropProjection(id.into()))
+            .await
+    }
+
+    /// Register a graph projection: a [`Projection`] with `kind = Graph` and an
+    /// entity schema (build it with [`Projection::builder`]`.graph(schema)`).
+    /// LaserData Cloud starts extracting nodes and edges from the bound source
+    /// into the named knowledge graph. A distinct command from
+    /// [`register`](Self::register) so a backend can gate graph registration on
+    /// the `graph` capability.
+    pub async fn register_graph(&self, projection: Projection) -> Result<(), LaserError> {
+        self.laser
+            .publish_control(ControlCommand::RegisterGraph(projection))
+            .await
+    }
+
+    /// Drop the graph projection registered under `id` by publishing a
+    /// `DropGraph` control command. The materialized nodes and edges are left
+    /// untouched, the same as [`drop`](Self::drop) for a row projection.
+    pub async fn drop_graph(&self, id: impl Into<String>) -> Result<(), LaserError> {
+        self.laser
+            .publish_control(ControlCommand::DropGraph(id.into()))
             .await
     }
 

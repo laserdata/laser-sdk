@@ -33,7 +33,7 @@
 use crate::fork::{ForkError, ForkKind};
 use crate::hello::{BackendDescriptor, OpVersions};
 use crate::kv::KvError;
-use crate::query::QueryError;
+use crate::query::{Consistency, QueryError};
 use crate::result::ResultCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,6 +52,23 @@ pub const SCHEMAS_PATH: &str = "/agdx/schemas";
 pub const KV_PATH: &str = "/agdx/kv";
 /// `GET /agdx/forks` to list, `POST` to create.
 pub const FORKS_PATH: &str = "/agdx/forks";
+/// `GET /agdx/graphs` to list graph projections, `POST` to register.
+pub const GRAPHS_PATH: &str = "/agdx/graphs";
+
+/// `DELETE`/`GET /agdx/graphs/{id}`: drop or read a graph projection.
+pub fn graph_path(id: &str) -> String {
+    format!("{GRAPHS_PATH}/{id}")
+}
+
+/// `POST /agdx/graph/{name}/query`: run a traversal (a `GraphQuery` body).
+pub fn graph_query_path(name: &str) -> String {
+    format!("/agdx/graph/{name}/query")
+}
+
+/// `GET /agdx/graph/{name}/neighbors/{node}`: one-hop neighbor read.
+pub fn graph_neighbors_path(name: &str, node: &str) -> String {
+    format!("/agdx/graph/{name}/neighbors/{node}")
+}
 
 /// `GET`/`DELETE /agdx/projections/{id}`.
 pub fn projection_path(id: &str) -> String {
@@ -114,29 +131,22 @@ pub fn fork_rows_path(id: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Capabilities {
+    /// Connected to a managed plane at all (the root: with no plane every managed
+    /// surface below is off, and the reply still answers `200` with `managed:
+    /// false`).
     pub managed: bool,
-    pub query: bool,
-    pub projections: bool,
-    pub schemas: bool,
-    pub kv: bool,
+    /// The managed query surface, its registry browse views, and the strongest
+    /// read-consistency it serves.
+    pub query: QueryCapsView,
+    /// The managed key-value surface and its conditional-write support.
+    pub kv: KvCapsView,
+    /// Whether the knowledge-graph ops (traversal, neighbors) are served. The
+    /// agentic-memory API composes the query and graph surfaces, so it has no
+    /// flag of its own: a client reads `query` and `graph`.
+    #[serde(default)]
+    pub graph: bool,
+    /// Whether copy-on-write forks are served.
     pub fork: bool,
-    /// Whether the KV backend serves compare-and-swap (`AGDX_KV_CAS`). A
-    /// transactional row store (the embedded engine) sets it. A backend that
-    /// cannot do a conditional write leaves it false, and a `cas` then returns a
-    /// clean unsupported error. Independent of `kv`: a deployment can serve
-    /// plain get/set without CAS.
-    #[serde(default)]
-    pub kv_cas: bool,
-    /// Whether the query surface honors `Consistency::ReadYourWrites` (waits for
-    /// the projector to reach the source log head before serving). Any backend
-    /// that exposes per-partition applied offsets can. A deployment that does
-    /// not leaves it false and such a query returns a clean unsupported error.
-    #[serde(default)]
-    pub read_your_writes: bool,
-    /// Whether the query surface honors `Consistency::Strong` (a linearizable
-    /// cross-replica read). The strongest level, off by default.
-    #[serde(default)]
-    pub strong_consistency: bool,
     pub versions: OpVersions,
     /// Materialization backends the server currently exposes, so a client can
     /// show what it may route to. Identity only (id + engine kind), no settings
@@ -146,31 +156,68 @@ pub struct Capabilities {
     pub backends: Vec<BackendDescriptor>,
 }
 
+/// The managed query surface on the HTTP capabilities reply: whether it is
+/// served, its registry browse views, and the consistency it honors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCapsView {
+    /// Whether `POST /agdx/query` is served.
+    pub available: bool,
+    /// Whether the projection registry browse routes are served.
+    pub projections: bool,
+    /// Whether the schema registry browse routes are served.
+    pub schemas: bool,
+    /// The strongest read-consistency the surface serves (the ladder
+    /// `eventual < read_your_writes < strong`, so a level implies the weaker
+    /// ones). Defaults to `eventual`, which every query surface serves.
+    #[serde(default)]
+    pub consistency: Consistency,
+}
+
+/// The managed key-value surface on the HTTP capabilities reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvCapsView {
+    /// Whether the get/set/scan routes are served.
+    pub available: bool,
+    /// Whether compare-and-swap (`AGDX_KV_CAS`) is served. Independent of plain
+    /// get/set: a backend that cannot do a conditional write leaves it off and a
+    /// `cas` returns a clean unsupported error.
+    #[serde(default)]
+    pub cas: bool,
+}
+
 impl Capabilities {
-    /// Constructor for the non-exhaustive wire struct. The core surfaces
-    /// (`query` / `projections` / `schemas` / `kv` / `fork`) track `enabled`,
-    /// the way the binary `AGDX_HELLO` probe answers. The extended features
-    /// (`kv_cas`, `read_your_writes`, `strong_consistency`) all start **off**:
-    /// they are real per-deployment capabilities a backend must opt into, and a
-    /// server that does not serve them must never advertise them (an
-    /// over-advertised feature turns a clean unsupported error into a silent
-    /// wrong answer). Turn each on with [`with_kv_cas`](Self::with_kv_cas),
-    /// [`with_read_your_writes`](Self::with_read_your_writes), and
-    /// [`with_strong_consistency`](Self::with_strong_consistency).
+    /// Constructor for the non-exhaustive wire struct. The core surfaces track
+    /// `enabled`, the way the binary `AGDX_HELLO` probe answers. The per-surface
+    /// sub-features (`kv.cas`, `query.consistency` above `eventual`, `graph`) all
+    /// start off: a server must opt into each, never over-advertising (which would
+    /// turn a clean unsupported error into a silent wrong answer). Build them with
+    /// [`from_versions`](Self::from_versions) or the setters.
     pub fn new(enabled: bool, versions: OpVersions) -> Self {
         Self {
             managed: enabled,
-            query: enabled,
-            projections: enabled,
-            schemas: enabled,
-            kv: enabled,
+            query: QueryCapsView {
+                available: enabled,
+                projections: enabled,
+                schemas: enabled,
+                consistency: Consistency::Eventual,
+            },
+            kv: KvCapsView {
+                available: enabled,
+                cas: false,
+            },
+            graph: false,
             fork: enabled,
-            kv_cas: false,
-            read_your_writes: false,
-            strong_consistency: false,
             versions,
             backends: Vec::new(),
         }
+    }
+
+    /// Advertise that the knowledge-graph ops are served. Off by default: a
+    /// server sets it only when a backend implements the graph surface.
+    #[must_use]
+    pub fn with_graph(mut self, value: bool) -> Self {
+        self.graph = value;
+        self
     }
 
     /// Advertise the materialization backends the server exposes. The wire pins
@@ -185,38 +232,37 @@ impl Capabilities {
     /// backend that does a genuine conditional write may set it.
     #[must_use]
     pub fn with_kv_cas(mut self, on: bool) -> Self {
-        self.kv_cas = on;
+        self.kv.cas = on;
         self
     }
 
-    /// Advertise that the query surface honors `Consistency::ReadYourWrites`.
-    /// Only a backend that exposes per-partition applied offsets may set it.
+    /// Advertise the strongest read-consistency the query surface serves.
     #[must_use]
-    pub fn with_read_your_writes(mut self, on: bool) -> Self {
-        self.read_your_writes = on;
-        self
-    }
-
-    /// Advertise that the query surface honors `Consistency::Strong` (a
-    /// linearizable cross-replica read).
-    #[must_use]
-    pub fn with_strong_consistency(mut self, on: bool) -> Self {
-        self.strong_consistency = on;
+    pub fn with_query_consistency(mut self, level: Consistency) -> Self {
+        self.query.consistency = level;
         self
     }
 
     /// Build the HTTP capabilities from the same `OpVersions` the binary
-    /// `AGDX_HELLO` probe answers with, reading the extended-feature booleans
-    /// straight off its `features` bitset. A server SHOULD use this so its two
-    /// capability carriages (the binary `features` bits and these HTTP
-    /// booleans) cannot disagree (A12): the one bitset drives both.
+    /// `AGDX_HELLO` probe answers with, reading the per-surface sub-features
+    /// straight off its `features` bitset and `graph` op version. A server SHOULD
+    /// use this so its two capability carriages (the binary `features` bits and
+    /// these HTTP fields) cannot disagree (A12): the one source drives both.
     pub fn from_versions(enabled: bool, versions: OpVersions) -> Self {
+        use crate::hello::feature;
+        let consistency = if versions.has_feature(feature::STRONG_CONSISTENCY) {
+            Consistency::Strong
+        } else if versions.has_feature(feature::READ_YOUR_WRITES) {
+            Consistency::ReadYourWrites
+        } else {
+            Consistency::Eventual
+        };
         Self::new(enabled, versions)
-            .with_kv_cas(versions.has_feature(crate::hello::feature::KV_CAS))
-            .with_read_your_writes(versions.has_feature(crate::hello::feature::READ_YOUR_WRITES))
-            .with_strong_consistency(
-                versions.has_feature(crate::hello::feature::STRONG_CONSISTENCY),
-            )
+            .with_kv_cas(versions.has_feature(feature::KV_CAS))
+            .with_query_consistency(consistency)
+            // The graph surface needs a backend that serves it, advertised as a
+            // non-zero graph op version, so it is gated on that rather than implied.
+            .with_graph(enabled && versions.graph > 0)
     }
 }
 
@@ -247,6 +293,38 @@ pub struct DeletedManyView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromotedView {
     pub rows: usize,
+}
+
+/// One graph node on the HTTP surface: id as a string, its labels, and its
+/// attributes rendered as strings (e.g. the entity `value`) for a browser or
+/// wasm client that has no access to the typed `Value`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNodeView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attrs: Vec<(String, String)>,
+}
+
+/// One graph edge on the HTTP surface: endpoint ids as strings, the type, and the
+/// weight.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphEdgeView {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub edge_type: String,
+    pub weight: f32,
+}
+
+/// `POST /agdx/graph/{name}/query` reply: the reachable nodes and traversed edges.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphResultView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<GraphNodeView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<GraphEdgeView>,
 }
 
 /// `POST /agdx/schemas` body: the register request without an id. The managed
@@ -465,6 +543,23 @@ pub struct KvPutQuery {
     pub expires_at_micros: Option<u64>,
 }
 
+/// `GET /agdx/graph/{name}/neighbors/{node}` query: the traversal direction
+/// (`out`, `in`, or `both`, omitted for the default `out`), an optional edge-type
+/// filter, the hop depth (omitted for the default one hop), and a result limit
+/// (omitted for the backend ceiling). One struct shared by the typed client and
+/// the server route, so the two cannot drift.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNeighborsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
 /// `PUT /agdx/kv/{namespace}/{key}/cas` query: the compare-and-swap precondition
 /// plus an optional expiry. Exactly one of `expect_version` (match the held
 /// version) or `expect_absent` (create-if-absent) is set, mirroring the binary
@@ -513,15 +608,17 @@ mod tests {
     fn given_capabilities_when_constructed_then_extended_features_default_off() {
         let caps = Capabilities::new(true, OpVersions::new(1, 1, 1, 1));
         assert!(
-            caps.query && caps.kv && caps.fork,
+            caps.query.available && caps.kv.available && caps.fork,
             "core surfaces track enabled"
         );
         assert!(
-            !caps.kv_cas && !caps.read_your_writes && !caps.strong_consistency,
-            "extended features must be opt-in, never on by default"
+            !caps.kv.cas && caps.query.consistency == Consistency::Eventual,
+            "sub-features must be opt-in, never on by default"
         );
-        let opted = caps.with_kv_cas(true).with_read_your_writes(true);
-        assert!(opted.kv_cas && opted.read_your_writes && !opted.strong_consistency);
+        let opted = caps
+            .with_kv_cas(true)
+            .with_query_consistency(Consistency::ReadYourWrites);
+        assert!(opted.kv.cas && opted.query.consistency == Consistency::ReadYourWrites);
     }
 
     #[test]

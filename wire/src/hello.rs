@@ -30,6 +30,12 @@ pub struct OpVersions {
     /// encode, so pre-AGDX hello frames stay byte-identical and decode unchanged.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub agent: u32,
+    /// The knowledge-graph op version served. `0` means not served, skipped on
+    /// encode so a pre-graph hello frame stays byte-identical. Mirrors the
+    /// `managed_graph` HTTP capability flag. (Agentic memory rides this plus the
+    /// query surface, so it has no op version of its own.)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub graph: u32,
     /// Capability feature bits (see [`feature`]): managed sub-features served
     /// beyond the base surface (compare-and-swap, read-your-writes, strong
     /// consistency). `0` (the default) is skipped on encode, so a pre-feature
@@ -57,6 +63,7 @@ impl OpVersions {
             kv,
             fork,
             agent: 0,
+            graph: 0,
             features: 0,
         }
     }
@@ -65,6 +72,13 @@ impl OpVersions {
     #[must_use]
     pub fn with_agent(mut self, agent: u32) -> Self {
         self.agent = agent;
+        self
+    }
+
+    /// Returns a copy advertising the knowledge-graph op version served.
+    #[must_use]
+    pub fn with_graph(mut self, graph: u32) -> Self {
+        self.graph = graph;
         self
     }
 

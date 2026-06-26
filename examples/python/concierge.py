@@ -593,7 +593,7 @@ async def main() -> None:
     await ingest_tickets(laser, total, chunk)
 
     caps = await laser.capabilities()
-    if not _common.managed_gate(caps.managed_query, "the agentic concierge desk", EXAMPLE):
+    if not _common.managed_gate(caps.query, "the agentic concierge desk", EXAMPLE):
         return
 
     phase("registering the index and waiting for the projector")

@@ -1,9 +1,13 @@
 use cucumber::World;
+use laser_bdd::graph_engine::GraphEngine;
 use laser_bdd::kv_engine::KvEngine;
+use laser_bdd::memory_engine::MemoryEngine;
 use laser_bdd::query_engine::QueryEngine;
 use laser_sdk::kv::KvError;
+use laser_sdk::memory::MemoryId;
 use laser_sdk::prelude::{ConversationId, Laser, QueryResult};
 use laser_sdk::query::ResultCode;
+use std::collections::HashMap;
 use std::fmt;
 
 /// Shared scenario state. Steps connect a `Laser`, act on it, and record the
@@ -44,6 +48,14 @@ pub struct LaserWorld {
     /// compare-and-swap, for the CAS-semantics scenarios (no Iggy, no transport).
     pub kv_engine: Option<KvEngine>,
     pub last_cas: Option<Result<u64, KvError>>,
+    /// The in-memory reference memory engine and the ids of the items remembered
+    /// so far (keyed by their text body), for the memory-semantics scenarios (no
+    /// Iggy, no transport).
+    pub memory_engine: Option<MemoryEngine>,
+    pub memory_ids: HashMap<String, MemoryId>,
+    /// The in-memory reference graph engine, for the graph-semantics scenarios (no
+    /// Iggy, no transport).
+    pub graph_engine: Option<GraphEngine>,
 }
 
 impl fmt::Debug for LaserWorld {

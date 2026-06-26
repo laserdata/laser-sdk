@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/laser-wire.svg)](https://crates.io/crates/laser-wire) [![docs.rs](https://docs.rs/laser-wire/badge.svg)](https://docs.rs/laser-wire)
 
-The wire contract by [LaserData, Inc.](https://laserdata.com) for [Apache Iggy](https://iggy.apache.org), as one typed, runtime-free crate: the managed command codes, the CBOR envelopes, the query IR, projections and schemas, the key-value and fork surfaces, the agent envelope (the Agent Data Exchange Protocol, AGDX), the HTTP views and routes, the header and topic dictionaries, the caps, and the golden fixture corpus that pins every byte.
+The wire contract by [LaserData, Inc.](https://laserdata.com) for [Apache Iggy](https://iggy.apache.org), as one typed, runtime-free crate: the managed command codes, the CBOR envelopes, the query IR, projections and schemas, the key-value, fork, and knowledge-graph surfaces, the agent envelope (the Agent Data Exchange Protocol, AGDX), the HTTP views and routes, the header and topic dictionaries, the caps, and the golden fixture corpus that pins every byte.
 
 The [laser-sdk](https://crates.io/crates/laser-sdk) client re-exports this crate as `laser_sdk::wire`, and LaserData Cloud consumes the same definitions instead of hand-mirroring them. No IO, no async, no clock, no randomness, so the crate compiles unchanged for native servers and `wasm32-unknown-unknown`.
 
@@ -32,9 +32,11 @@ Modules carve the API surface. Features gate dependencies. No wire-contract type
 | `query` | the query IR (incl. the `Consistency` level + the `ConsistencyGate` server helper), `QueryEnvelope`/`QueryReply`, `Row`, `QueryError` (incl. `Stale`) |
 | `result` | the unified `ResultCode` space + HTTP status mapping with `From` projections off every surface error, and `CommandError` (the surface-agnostic fallback reply) |
 | `browse` | registry browse requests + `BrowseReply`, including `DecodeRecord` |
-| `control` | `Projection`, `ProjectionBinding`, `SchemaDef`, `ControlEnvelope` |
+| `control` | `Projection` (incl. `ProjectionKind::Graph` + the `EntitySchema` node/edge extraction plan), `ProjectionBinding`, `SchemaDef`, `ControlEnvelope` |
 | `kv` | the key-value requests (incl. `KvCas`/`CasExpect`), `KvReply` (incl. `Committed`), `KvError` (incl. `VersionConflict`), the entry `version` token |
 | `fork` | the Iggy server requests, `ForkReply`, `ForkError`, and `validate_fork_id` (the shared id charset safelist) |
+| `graph` | the knowledge-graph ops (`GraphQuery`/`GraphNeighbors`/`GraphUpsert`), `GraphResult`, `GraphError`, `NodeId`/`EdgeId`, and the content-addressed constructors `NodeId::content`/`EdgeId::content` + `GraphNode::entity`/`GraphEdge::relate` |
+| `hashing` | the one canonical `content_id` (a dependency-free FNV over byte segments) every content-addressed id shares, pinned by a golden vector |
 | `agent` | the Agent Data Exchange Protocol: `AgentEnvelope`, ids, dictionaries, `validate`, `BodyRef`, the pinned operation/metadata vocabularies |
 | `forward` | the forwarded managed-request frames (`ForwardedQuery`/`ForwardedCommand`) |
 | `commands` | the `Command` trait pairing each code with its request/reply types |

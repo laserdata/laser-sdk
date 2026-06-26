@@ -1,6 +1,6 @@
 # Laser SDK
 
-> **Status: edge / prerelease (`0.0.1-rc.2`).** Pre-1.0 and moving fast. The wire contract, the AGDX spec, and the public API may change in any release, with no stability guarantee yet. Pin an exact version and expect breaking changes.
+> **Status: edge / prerelease (`0.0.1-rc.4`).** Pre-1.0 and moving fast. The wire contract, the AGDX spec, and the public API may change in any release, with no stability guarantee yet. Pin an exact version and expect breaking changes.
 
 An open data platform by [LaserData, Inc.](https://laserdata.com) over [Apache Iggy](https://iggy.apache.org) for streaming, querying, and coordinating data on a durable log. Ultra-low-latency streaming is the foundation, and on top of it sit declared projections with a query DSL, a key-value store, and copy-on-write forks, all on one connection. The log is the source of truth and every other surface is a read model on it. A reliable agent runtime and the Agent Data Exchange Protocol (AGDX) layer come on top when you build agents, but they are an optional extension. The streaming and data core stands on its own.
 
@@ -14,17 +14,18 @@ The data platform:
 
 - **Typed publish and consume**: serde values onto Iggy topics in one call, JSON/MessagePack/CBOR/BSON, schema-first Avro/Protobuf, or any raw bytes the SDK never inspects, batched in one network round-trip on both the send and poll sides.
 - **Declared projections and a query DSL**: filters, aggregates, time ranges, pagination, and vector recall over materialized indexes, declared once per topic like a database index, with an opt-in read-your-writes consistency level for reads that must see their own prior writes.
-- **A key-value store and copy-on-write forks** of the materialized read model, for working state and speculative branches. The store offers compare-and-swap for lock-free optimistic concurrency on a shared key.
+- **A key-value store and copy-on-write forks** of the materialized read model, for working state and speculative branches. The store offers compare-and-swap for lock-free optimistic concurrency, conditional reads and writes, expiry, JSON merge-patch, and advisory leases on a shared key.
+- **A knowledge graph** as a managed read model: content-addressed nodes and edges with traversal and neighbor reads, the relationship layer the agentic memory composes over.
 
 The optional agent layer (opt in only when you build agents):
 
-- **A reliable agent runtime**: consumer with dedup, retries, and dead-lettering, request/reply correlation, conversation and causality tracking, routing, sessions, context assembly, and a pluggable memory seam.
+- **A reliable agent runtime**: consumer with dedup, retries, and dead-lettering, request/reply correlation, conversation and causality tracking, routing, sessions, context assembly, and an agentic memory facade (`remember` / `recall` / `improve` / `forget`) composed over publish, query, and the knowledge graph.
 - **The Agent Data Exchange Protocol (AGDX)**: a typed, versioned, fixture-pinned envelope for agent messaging on the log, with typed producer verbs, token streams that resume from offsets, and deterministic reassembly. Specified in the [AGDX spec](docs/agdx.md).
 - **Edge interoperability**: optional A2A, MCP, and AG-UI bridges that map the edge standards onto AGDX and ride the durable log (no SSE), so one internal agent is reachable as an A2A agent, an MCP tool server, or an AG-UI event stream. See [docs/interop.md](docs/interop.md).
 
 ## Open core, managed surface
 
-The open surface (publish, consume, the agent runtime, provenance, log-backed memory, AGDX) runs against raw Apache Iggy. The managed surface (query, projections, KV, forks, durable dedup, managed memory) works against LaserData Cloud and returns `LaserError::Unsupported` against raw Apache Iggy. The same code runs in both cases. Capability negotiation at connect decides what is available.
+The open surface (publish, consume, the agent runtime, provenance, log-backed memory, AGDX) runs against raw Apache Iggy. The managed surface (query, projections, KV, forks, the knowledge graph, durable dedup) works against LaserData Cloud and returns `LaserError::Unsupported` against raw Apache Iggy. The same code runs in both cases. Capability negotiation at connect decides what is available. Agentic memory is not a separate managed surface: it composes query and graph, so it lights up when those do.
 
 The SDK is built on the Apache Iggy SDK and never hides it: `laser.iggy_producer`, `laser.iggy_consumer`, and `laser.client()` expose the full client when you want it directly.
 
@@ -32,7 +33,7 @@ The SDK is built on the Apache Iggy SDK and never hides it: `laser.iggy_producer
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.2", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.4", features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -90,7 +91,7 @@ From here the [tutorial](docs/tutorial.md) takes over: nine chapters building on
 | --- | --- |
 | [`laser-wire`](wire/README.md) (`wire/`) | the wire contract: codes, envelopes, the query IR, dictionaries, caps, the AGDX envelope, the golden fixture corpus. Runtime-free, wasm-portable |
 | [`laser-sdk`](sdk/README.md) (`sdk/`) | the client and agent runtime on top, re-exporting the wire crate as `laser_sdk::wire` |
-| [`examples/rust`](examples/rust/README.md) | five runnable systems: event analytics, an order book, a firehose load generator, an agentic support desk, and an A2A/MCP/AG-UI interop gateway, plus the cloud connection setup |
+| [`examples/rust`](examples/rust/README.md) | six runnable systems: event analytics, an order book, a firehose load generator, an agentic support desk, an agentic-memory recall loop, and an A2A/MCP/AG-UI interop gateway, plus the cloud connection setup |
 
 ## Documentation
 

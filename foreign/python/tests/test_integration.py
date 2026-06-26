@@ -9,8 +9,8 @@ pytestmark = pytest.mark.integration
 async def test_connect_reports_open_capabilities(laser):
     caps = await laser.capabilities()
     # Raw Apache Iggy advertises no managed features.
-    assert caps.managed_query is False
-    assert caps.managed_kv is False
+    assert caps.query is False
+    assert caps.kv is False
     assert caps.forks is False
 
 
@@ -50,6 +50,32 @@ async def test_kv_against_raw_iggy_is_unsupported(laser):
 async def test_fork_against_raw_iggy_is_unsupported(laser):
     with pytest.raises(ls.UnsupportedError):
         await laser.fork("exp-1").create()
+
+
+async def test_graph_against_raw_iggy_is_unsupported(laser):
+    alice = ls.graph_node("Person", "Alice")
+    acme = ls.graph_node("Company", "Acme")
+    edge = ls.graph_edge(alice, "works_at", acme)
+    with pytest.raises(ls.UnsupportedError):
+        await laser.graph("knowledge").upsert([alice, acme], [edge])
+
+
+def test_graph_ids_are_content_addressed_and_match_the_cross_sdk_golden():
+    # The same entity yields the same id, a different label or value a different
+    # one, pinned to the cross-SDK golden vector the wire crate fixes, so a graph
+    # shared across languages converges on one node.
+    assert ls.node_id("Person", "Alice") == ls.node_id("Person", "Alice")
+    assert ls.node_id("Person", "Alice") != ls.node_id("Company", "Alice")
+    assert ls.node_id("Person", "Alice") == "13NCEPHNVFHHGNK9GD3MT0W1AB"
+    alice = ls.graph_node("Person", "Alice")
+    assert alice["id"] == "13NCEPHNVFHHGNK9GD3MT0W1AB"
+    assert alice["labels"] == ["Person"]
+    acme = ls.graph_node("Company", "Acme")
+    edge = ls.graph_edge(alice, "works_at", acme)
+    assert edge["from"] == alice["id"]
+    assert edge["to"] == acme["id"]
+    assert edge["edge_type"] == "works_at"
+    assert edge["id"] == ls.edge_id(alice["id"], "works_at", acme["id"])
 
 
 async def test_agent_echo_request_reply(laser):
@@ -325,3 +351,29 @@ async def test_vector_memory_ranks_by_semantic_similarity(laser):
 
     refund = await memory.recall(conversation=conversation, semantic="refund", limit=1)
     assert refund[0].text == "billing refund double charge"
+
+
+async def test_vector_memory_improve_promotes_a_recalled_item(laser):
+    # Feedback re-ranks recall: a promoted item floats to the front on the next
+    # recall, mirroring the Rust feedback contract.
+    async def embed(text: str) -> list[float]:
+        return [1.0 if term in set(text.lower().split()) else 0.0 for term in ("cat", "dog")]
+
+    memory = laser.vector_memory(embed)
+    conversation = ls.new_conversation_id()
+    await memory.remember("the cat sat", conversation=conversation)
+    dog = await memory.remember("the dog ran", conversation=conversation)
+
+    before = await memory.recall(conversation=conversation, limit=2)
+    assert before[0].text == "the cat sat"
+
+    await memory.improve(dog, 5.0, conversation=conversation)
+    after = await memory.recall(conversation=conversation, limit=2)
+    assert after[0].text == "the dog ran"
+    assert after[0].score == 5.0
+
+
+async def test_recall_with_unknown_strategy_raises(laser):
+    memory = laser.memory()
+    with pytest.raises(ls.CodecError):
+        await memory.recall(conversation=ls.new_conversation_id(), strategy="nonsense")

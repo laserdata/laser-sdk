@@ -15,8 +15,8 @@ use laser_wire::codes::{
 use laser_wire::content::ContentType;
 use laser_wire::control::{
     ControlCommand, ControlEnvelope, Delivery, FieldType, IndexField, IndexSchema, Projection,
-    ProjectionBinding, ProjectionId, RetentionPolicy, SchemaDef, SchemaSource, SourceSelector,
-    Target, TargetRole,
+    ProjectionBinding, ProjectionId, ProjectionKind, RetentionPolicy, SchemaDef, SchemaSource,
+    SourceSelector, Target, TargetRole,
 };
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
@@ -95,6 +95,7 @@ fn canonical_projection() -> Projection {
         id: ProjectionId::new("order.v1"),
         name: "order".to_owned(),
         version: 1,
+        kind: ProjectionKind::Row,
         content_type: ContentType::Json,
         extraction: IndexSchema {
             fields: vec![
@@ -105,6 +106,7 @@ fn canonical_projection() -> Projection {
             vector_field: Some("/embedding".to_owned()),
             inline_payload: true,
         },
+        entity_schema: None,
         inline_payload_default: true,
     }
 }
@@ -682,7 +684,7 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
         // mirroring the binary announce, so the HTTP client sees the same set.
         &Capabilities::new(true, OpVersions::new(1, 1, 1, 1))
             .with_kv_cas(true)
-            .with_read_your_writes(true)
+            .with_query_consistency(laser_wire::query::Consistency::ReadYourWrites)
             .with_backends(vec![
                 BackendDescriptor::new("embedded", "embedded").with_capabilities([
                     "ingest",

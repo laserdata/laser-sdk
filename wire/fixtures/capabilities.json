@@ -1,13 +1,17 @@
 {
   "managed": true,
-  "query": true,
-  "projections": true,
-  "schemas": true,
-  "kv": true,
+  "query": {
+    "available": true,
+    "projections": true,
+    "schemas": true,
+    "consistency": "read_your_writes"
+  },
+  "kv": {
+    "available": true,
+    "cas": true
+  },
+  "graph": false,
   "fork": true,
-  "kv_cas": true,
-  "read_your_writes": true,
-  "strong_consistency": false,
   "versions": {
     "query": 1,
     "control": 1,

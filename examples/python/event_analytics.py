@@ -265,20 +265,20 @@ async def main() -> None:
     events = clickstream(count)
 
     # Register the projector before publishing so no event is missed (managed only).
-    if caps.managed_query:
+    if caps.query:
         await _common.start_projector(laser, TOPIC, COLUMNS)
 
     print("hot path: a live reader tails the stream while the producer runs")
     await live_monitor(laser, events)
 
-    if _common.managed_gate(caps.managed_query, "query", EXAMPLE):
+    if _common.managed_gate(caps.query, "query", EXAMPLE):
         await _common.wait_for_projection(laser, TOPIC, count)
         print("read model 1: ad-hoc analytics over the query layer")
         await run_analytics(laser)
         print("read model 2: a resumable downstream reader")
         await run_resumable_export(laser)
 
-    if caps.managed_host:
+    if caps.managed:
         print("validated ingest: a JSON Schema guards the index")
         await run_guarded_ingest(laser)
     else:

@@ -147,17 +147,27 @@ impl PyLaser {
 #[gen_stub_pyclass]
 #[pyclass(name = "Capabilities", frozen, get_all)]
 pub struct PyCapabilities {
-    pub sessions: bool,
-    pub forks: bool,
-    pub durable_dedup: bool,
-    pub managed_memory: bool,
-    pub managed_query: bool,
-    pub managed_kv: bool,
-    pub managed_host: bool,
-    pub a2a_gateway: bool,
+    /// Connected to a managed plane (the root managed switch).
+    pub managed: bool,
+    /// The managed query surface is served.
+    pub query: bool,
+    /// The strongest read-consistency the query surface serves
+    /// (`eventual` / `read_your_writes` / `strong`).
+    pub query_consistency: String,
+    /// The managed key-value surface is served.
+    pub kv: bool,
+    /// The key-value store serves compare-and-swap.
     pub kv_cas: bool,
-    pub read_your_writes: bool,
-    pub strong_consistency: bool,
+    /// The managed knowledge-graph surface is served.
+    pub graph: bool,
+    /// Managed copy-on-write forks are served.
+    pub forks: bool,
+    /// A managed A2A gateway is available.
+    pub a2a_gateway: bool,
+    /// Platform-native session lifecycle.
+    pub sessions: bool,
+    /// Platform-side durable deduplication.
+    pub durable_dedup: bool,
     /// The materialization backends the connected server exposes (identity
     /// only). Empty against raw Apache Iggy and servers that advertise none.
     pub backends: Vec<PyBackendDescriptor>,
@@ -166,17 +176,21 @@ pub struct PyCapabilities {
 impl From<Capabilities> for PyCapabilities {
     fn from(value: Capabilities) -> Self {
         Self {
-            sessions: value.sessions,
+            managed: value.managed,
+            query: value.query.available,
+            query_consistency: match value.query.consistency {
+                laser_sdk::query::Consistency::ReadYourWrites => "read_your_writes",
+                laser_sdk::query::Consistency::Strong => "strong",
+                _ => "eventual",
+            }
+            .to_owned(),
+            kv: value.kv.available,
+            kv_cas: value.kv.cas,
+            graph: value.graph,
             forks: value.forks,
-            durable_dedup: value.durable_dedup,
-            managed_memory: value.managed_memory,
-            managed_query: value.managed_query,
-            managed_kv: value.managed_kv,
-            managed_host: value.managed_host,
             a2a_gateway: value.a2a_gateway,
-            kv_cas: value.kv_cas,
-            read_your_writes: value.read_your_writes,
-            strong_consistency: value.strong_consistency,
+            sessions: value.sessions,
+            durable_dedup: value.durable_dedup,
             backends: value
                 .backends
                 .into_iter()
@@ -191,10 +205,11 @@ impl From<Capabilities> for PyCapabilities {
 impl PyCapabilities {
     fn __repr__(&self) -> String {
         format!(
-            "Capabilities(managed_host={}, managed_query={}, managed_kv={}, forks={}, kv_cas={}, backends={})",
-            self.managed_host,
-            self.managed_query,
-            self.managed_kv,
+            "Capabilities(managed={}, query={}, kv={}, graph={}, forks={}, kv_cas={}, backends={})",
+            self.managed,
+            self.query,
+            self.kv,
+            self.graph,
             self.forks,
             self.kv_cas,
             self.backends.len()

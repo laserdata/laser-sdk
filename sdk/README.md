@@ -7,7 +7,7 @@ An open SDK by [LaserData, Inc.](https://laserdata.com) over [Apache Iggy](https
 Laser SDK ships in two layers:
 
 - **generic** (`query` feature), typed publish, declared `Projection` schemas, query DSL with filters / aggregates / vector recall. No agent concepts. Suitable for API observability, analytics, audit logs, market data, IoT.
-- **agentic** (`agent` feature, default), reliable consumer + DLQ, conversation/causality spine, request/reply, `Router`, `Memory`, `Agent::builder` handlers, the typed AGDX verbs + envelope-aware consumer, and the edge bridges - A2A (`a2a-bridge`), MCP (`mcp-bridge`), AG-UI state sync + event rendering (`agui`). Built on the generic layer.
+- **agentic** (`agent` feature, default), reliable consumer + DLQ, conversation/causality spine, request/reply, `Router`, `Memory` and the managed knowledge graph (`Laser::graph`), `Agent::builder` handlers, the typed AGDX verbs + envelope-aware consumer, and the edge bridges - A2A (`a2a-bridge`), MCP (`mcp-bridge`), AG-UI state sync + event rendering (`agui`). Built on the generic layer.
 
 The SDK carries `gen_ai.*` provenance describing model calls but never makes them. It moves and coordinates messages only.
 
@@ -17,9 +17,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.2", default-features = false, features = ["query"] }   # generic substrate
+laser-sdk = { version = "0.0.1-rc.4", default-features = false, features = ["query"] }   # generic substrate
 # or with the agent runtime layered on top:
-laser-sdk = { version = "0.0.1-rc.2", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.4", features = ["query"] }
 ```
 
 ## Quick example

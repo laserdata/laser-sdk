@@ -10,6 +10,8 @@ pub(crate) mod encoding;
 pub mod error;
 pub mod fork;
 pub mod forward;
+pub mod graph;
+pub mod hashing;
 pub mod headers;
 pub mod hello;
 pub mod http;
@@ -37,14 +39,21 @@ pub mod prelude {
     pub use crate::browse::{BrowseOutcome, BrowseReply, ProjectionInfo, SchemaInfo};
     pub use crate::content::ContentType;
     pub use crate::control::{
-        ControlCommand, ControlEnvelope, Delivery, FieldType, IndexField, IndexSchema, Projection,
-        ProjectionBinding, ProjectionId, RetentionPolicy, SchemaDef, SchemaSource, SourceSelector,
-        Target, TargetRole,
+        ControlCommand, ControlEnvelope, Delivery, EdgeExtract, EntitySchema, FieldType,
+        IndexField, IndexSchema, NodeExtract, Projection, ProjectionBinding, ProjectionId,
+        ProjectionKind, RetentionPolicy, SchemaDef, SchemaSource, SourceSelector, Target,
+        TargetRole,
     };
     pub use crate::error::{DecodeError, InvalidError};
     pub use crate::fork::{ForkError, ForkInfo, ForkKind, ForkOutcome, ForkReply, ForkStatus};
+    pub use crate::graph::{
+        EdgeDir, EdgeId, GraphEdge, GraphError, GraphNeighbors, GraphNode, GraphQuery, GraphReply,
+        GraphResult, GraphReturn, GraphStart, GraphUpsert, Hop, NodeId, Path,
+    };
     pub use crate::hello::{HelloReply, OpVersions};
-    pub use crate::kv::{KvEntry, KvError, KvNamespaceInfo, KvOutcome, KvPage, KvReply};
+    pub use crate::kv::{
+        KvEntry, KvError, KvMetadata, KvNamespaceInfo, KvOutcome, KvPage, KvReply,
+    };
     pub use crate::query::{
         AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Page, Predicate,
         Query, QueryEnvelope, QueryError, QueryReply, QueryResult, RawSql, Row, Select, Sort,

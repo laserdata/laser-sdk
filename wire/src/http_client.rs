@@ -14,10 +14,11 @@
 use crate::browse::{ProjectionInfo, SchemaInfo};
 use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector};
 use crate::fork::ForkInfo;
+use crate::graph::GraphQuery;
 use crate::http::{
     self, Capabilities, CasCommittedView, DecodeRecordBody, DeletedManyView, ErrorBody,
-    ForkCreateBody, ForkPutBody, KvCasQuery, KvPageView, KvPutQuery, KvScanQuery,
-    ProjectionListQuery, PromotedView, RemoveBindingBody, SchemaListQuery,
+    ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
+    KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, RemoveBindingBody, SchemaListQuery,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
@@ -450,6 +451,63 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// `POST /agdx/graph/{name}/query`: run a traversal over a named graph, get
+    /// back the reachable nodes and traversed edges. Backend-gated by the `graph`
+    /// capability: a deployment without a graph backend answers unsupported.
+    pub async fn graph_query(
+        &self,
+        name: &str,
+        query: &GraphQuery,
+    ) -> ClientResult<GraphResultView, T::Error> {
+        self.send_json(Method::Post, http::graph_query_path(name), query)
+            .await
+    }
+
+    /// `GET /agdx/graph/{name}/neighbors/{node}`: the neighbor read, the cheap
+    /// common traversal. `node` is the Crockford-base32 node id. `query` carries
+    /// the direction, an optional edge-type filter, the hop depth, and a limit (a
+    /// default `query` reads one hop outward with no filter).
+    pub async fn graph_neighbors(
+        &self,
+        name: &str,
+        node: &str,
+        query: &GraphNeighborsQuery,
+    ) -> ClientResult<GraphResultView, T::Error> {
+        self.get(with_query(&http::graph_neighbors_path(name, node), query)?)
+            .await
+    }
+
+    /// `GET /agdx/graphs`: list the registered graph projections, the discovery
+    /// surface a graph explorer reads to offer the available graphs. Reuses the
+    /// projection-list filter, narrowed to graph-kind projections server-side.
+    pub async fn list_graphs(
+        &self,
+        filter: &ProjectionListQuery,
+    ) -> ClientResult<Vec<ProjectionInfo>, T::Error> {
+        self.get(with_query(http::GRAPHS_PATH, filter)?).await
+    }
+
+    /// `POST /agdx/graphs`: register a graph projection (a [`Projection`] with
+    /// `kind = Graph` and an entity schema). Applied asynchronously, like every
+    /// control command.
+    pub async fn register_graph(&self, projection: &Projection) -> ClientResult<(), T::Error> {
+        self.send_json_ok(Method::Post, http::GRAPHS_PATH.to_owned(), projection)
+            .await
+    }
+
+    /// `GET /agdx/graphs/{id}`: read one graph projection by id, or `None` when no
+    /// graph projection has it.
+    pub async fn get_graph(&self, id: &str) -> ClientResult<Option<ProjectionInfo>, T::Error> {
+        self.get_optional(http::graph_path(id)).await
+    }
+
+    /// `DELETE /agdx/graphs/{id}`: drop the graph projection registered under
+    /// `id`. The materialized nodes and edges are left untouched.
+    pub async fn drop_graph(&self, id: &str) -> ClientResult<(), T::Error> {
+        self.expect_ok(Method::Delete, http::graph_path(id), None)
+            .await
+    }
+
     async fn get<R: DeserializeOwned>(&self, path: String) -> ClientResult<R, T::Error> {
         let response = self.dispatch(Method::Get, path, None).await?;
         decode_ok(&response)
@@ -737,7 +795,7 @@ mod tests {
             response: HttpResponse::new(200, body),
         });
         let caps = block_on(client.capabilities()).expect("decodes");
-        assert!(caps.managed && !caps.kv_cas);
+        assert!(caps.managed && !caps.kv.cas);
     }
 
     #[test]

@@ -18,6 +18,7 @@ __all__ = [
     "FileStore",
     "ForkHandle",
     "ForkPutRequest",
+    "Graph",
     "InMemoryStore",
     "Kv",
     "KvDeleteManyRequest",
@@ -37,8 +38,12 @@ __all__ = [
     "Row",
     "Topics",
     "derive_conversation_id",
+    "edge_id",
+    "graph_edge",
+    "graph_node",
     "new_conversation_id",
     "new_correlation_id",
+    "node_id",
 ]
 
 @typing.final
@@ -329,27 +334,56 @@ class Capabilities:
     infrastructure advertised. All flags are false against raw Apache Iggy.
     """
     @property
-    def sessions(self) -> builtins.bool: ...
+    def managed(self) -> builtins.bool:
+        r"""
+        Connected to a managed plane (the root managed switch).
+        """
     @property
-    def forks(self) -> builtins.bool: ...
+    def query(self) -> builtins.bool:
+        r"""
+        The managed query surface is served.
+        """
     @property
-    def durable_dedup(self) -> builtins.bool: ...
+    def query_consistency(self) -> builtins.str:
+        r"""
+        The strongest read-consistency the query surface serves
+        (`eventual` / `read_your_writes` / `strong`).
+        """
     @property
-    def managed_memory(self) -> builtins.bool: ...
+    def kv(self) -> builtins.bool:
+        r"""
+        The managed key-value surface is served.
+        """
     @property
-    def managed_query(self) -> builtins.bool: ...
+    def kv_cas(self) -> builtins.bool:
+        r"""
+        The key-value store serves compare-and-swap.
+        """
     @property
-    def managed_kv(self) -> builtins.bool: ...
+    def graph(self) -> builtins.bool:
+        r"""
+        The managed knowledge-graph surface is served.
+        """
     @property
-    def managed_host(self) -> builtins.bool: ...
+    def forks(self) -> builtins.bool:
+        r"""
+        Managed copy-on-write forks are served.
+        """
     @property
-    def a2a_gateway(self) -> builtins.bool: ...
+    def a2a_gateway(self) -> builtins.bool:
+        r"""
+        A managed A2A gateway is available.
+        """
     @property
-    def kv_cas(self) -> builtins.bool: ...
+    def sessions(self) -> builtins.bool:
+        r"""
+        Platform-native session lifecycle.
+        """
     @property
-    def read_your_writes(self) -> builtins.bool: ...
-    @property
-    def strong_consistency(self) -> builtins.bool: ...
+    def durable_dedup(self) -> builtins.bool:
+        r"""
+        Platform-side durable deduplication.
+        """
     @property
     def backends(self) -> builtins.list[BackendDescriptor]:
         r"""
@@ -502,6 +536,34 @@ class ForkPutRequest:
         """
 
 @typing.final
+class Graph:
+    r"""
+    A handle to the knowledge-graph surface `name`, built with `laser.graph(name)`.
+    `upsert` writes nodes and edges, `neighbors` reads a node's neighborhood, and
+    `query` runs a multi-hop traversal. A managed feature: against raw Apache Iggy
+    every call raises `UnsupportedError`.
+    """
+    def upsert(self, nodes: list, edges: list) -> typing.Any:
+        r"""
+        Write `nodes` and `edges` (lists of dicts from `graph_node` / `graph_edge`)
+        into the graph. Idempotent on the content-addressed ids, so re-upserting the
+        same entities is a no-op.
+        """
+    def neighbors(self, node: builtins.str, *, direction: builtins.str = 'out', edge_type: typing.Optional[builtins.str] = None, depth: builtins.int = 1, limit: builtins.int = 0) -> typing.Any:
+        r"""
+        Read `node`'s neighbors: the nodes reachable in `direction` over
+        `edge_type` (any type when `None`), following the same hop `depth` times.
+        Returns a `{"nodes": [...], "edges": [...]}` dict.
+        """
+    def query(self, *, start_ids: typing.Optional[typing.Sequence[builtins.str]] = None, match_label: typing.Optional[builtins.str] = None, hops: typing.Optional[typing.Sequence[tuple[builtins.str, builtins.str]]] = None, returns: builtins.str = 'nodes', limit: builtins.int = 0) -> typing.Any:
+        r"""
+        Run a traversal. Start from explicit node `start_ids`, or from every node
+        whose label equals `match_label`. `hops` is a list of `(edge_type,
+        direction)` tuples, one per step. `returns` is `"nodes"` or `"edges"`.
+        Returns a `{"nodes": [...], "edges": [...]}` dict.
+        """
+
+@typing.final
 class InMemoryStore:
     r"""
     An in-memory `StateStore`: `get` / `set` / `delete` over a process-local map.
@@ -551,6 +613,31 @@ class Kv:
     def delete(self, key: typing.Any) -> typing.Any:
         r"""
         Delete `key`. Returns `True` when a live entry was removed.
+        """
+    def exists(self, key: typing.Any) -> typing.Any:
+        r"""
+        Test presence and read metadata without the value. Returns
+        `(version, expires_at_micros, size_bytes)` or `None` when absent.
+        """
+    def expire(self, key: typing.Any, ttl_secs: typing.Optional[builtins.float] = None) -> typing.Any:
+        r"""
+        Set or refresh the entry's expiry in place. `ttl_secs` of `None` clears it.
+        Returns the entry's (unchanged) version.
+        """
+    def patch(self, key: typing.Any, patch: typing.Any) -> typing.Any:
+        r"""
+        Apply a merge `patch` (bytes) to a structured value, returning the new
+        version.
+        """
+    def lease(self, key: typing.Any, ttl_secs: builtins.float) -> typing.Any:
+        r"""
+        Acquire an advisory lease on `key` for `ttl_secs`. Returns
+        `(lease_token, granted_ttl_secs)`.
+        """
+    def release(self, key: typing.Any, token: builtins.int) -> typing.Any:
+        r"""
+        Release a held lease early, presenting its `token`. Returns `True` when a
+        held lease was released.
         """
     def delete_many(self) -> KvDeleteManyRequest:
         r"""
@@ -786,6 +873,22 @@ class Laser:
         r"""
         Every open fork for the authenticated user, as a list of dicts.
         """
+    def graph(self, name: builtins.str) -> Graph:
+        r"""
+        A handle to the knowledge-graph surface `name`. A managed feature: against
+        raw Apache Iggy its calls raise `UnsupportedError`.
+        """
+    def register_graph(self, projection: typing.Any) -> typing.Any:
+        r"""
+        Register a graph projection from a dict (a projection with `kind = "graph"`
+        and an `entity_schema`). The managed host extracts nodes and edges from the
+        bound source into the named knowledge graph. Applied asynchronously.
+        """
+    def drop_graph(self, id: builtins.str) -> typing.Any:
+        r"""
+        Drop the graph projection registered under `id`. Materialized nodes and
+        edges are left untouched.
+        """
     def a2a_bridge(self, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str) -> A2aBridge:
         r"""
         An A2A bridge mapping JSON-RPC methods onto agent topics, publishing as
@@ -974,11 +1077,17 @@ class Memory:
         Remember `payload` (`str`, `bytes`, or `bytearray`) under the given scope.
         Returns the new item's id (a time-ordered ULID string).
         """
-    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None) -> typing.Any:
+    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         Recall up to `limit` items under the scope. Pass `semantic` text to rank by
         similarity (the vector backend embeds and scores it, the others ignore it
         and return the most recent).
+        """
+    def improve(self, memory_id: builtins.str, weight: builtins.float, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Record feedback on a recalled item, the signal a ranking backend folds
+        into future recall. `weight` is positive to promote, negative to demote.
+        Returns the feedback record's id.
         """
     def forget(self, memory_id: builtins.str, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
@@ -1004,6 +1113,17 @@ class MemoryItem:
     def provenance(self) -> Provenance: ...
     @property
     def conversation_id(self) -> builtins.str: ...
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        What the item is, as a string (`fact` / `message` / `summary` / `entity`
+        / `feedback`).
+        """
+    @property
+    def score(self) -> typing.Optional[builtins.float]:
+        r"""
+        The recall score from a ranking strategy, or `None` for an unranked recall.
+        """
     def json(self) -> typing.Any:
         r"""
         Decode the payload as JSON into a Python value.
@@ -1282,9 +1402,34 @@ def derive_conversation_id(seed: builtins.str) -> builtins.str:
     same id), for per-seed ordering and isolation without coordination.
     """
 
+def edge_id(from_id: builtins.str, edge_type: builtins.str, to_id: builtins.str) -> builtins.str:
+    r"""
+    The content-addressed id for the edge `edge_type` from `from_id` to `to_id`.
+    """
+
+def graph_edge(from_node: typing.Any, edge_type: builtins.str, to_node: typing.Any) -> typing.Any:
+    r"""
+    Build an edge dict of `edge_type` from `from_node` to `to_node` (both node
+    dicts), its id content-addressed over the endpoints and type.
+    """
+
+def graph_node(label: builtins.str, value: builtins.str) -> typing.Any:
+    r"""
+    Build a node dict for the entity `value` labelled `label`: its id
+    content-addressed and the value kept as a `value` attribute, so re-observing
+    the same entity converges. The ergonomic way to assemble a node for `upsert`.
+    """
+
 def new_conversation_id() -> builtins.str: ...
 
 def new_correlation_id() -> builtins.str: ...
+
+def node_id(label: builtins.str, value: builtins.str) -> builtins.str:
+    r"""
+    The content-addressed id for the entity `value` labelled `label`, as a
+    Crockford string. The same entity always yields the same id, in any SDK, so a
+    graph shared across languages converges on one node.
+    """
 
 
 class LaserError(Exception):

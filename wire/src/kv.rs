@@ -49,13 +49,18 @@ pub struct KvPage {
     pub cursor: Option<Vec<u8>>,
 }
 
-/// Request to read the value at `key` in `namespace`.
+/// Request to read the value at `key` in `namespace`. With `if_none_match` set to
+/// a version, the read returns [`KvOutcome::NotModified`] instead of the value
+/// when the live version matches (a conditional GET), so an up-to-date cache
+/// skips the body transfer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvGet {
     pub v: u32,
     pub namespace: String,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_none_match: Option<u64>,
 }
 
 /// Request to write `value` at `key` in `namespace`, with an optional expiry.
@@ -99,13 +104,90 @@ pub struct KvCas {
     pub expect: CasExpect,
 }
 
-/// Request to remove `key` from `namespace`.
+/// Request to remove `key` from `namespace`. With `if_match` set to a version,
+/// the delete applies only when the live version matches (a conditional delete),
+/// returning [`KvError::VersionConflict`] otherwise.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvDelete {
     pub v: u32,
     pub namespace: String,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_match: Option<u64>,
+}
+
+/// Request to test presence and read metadata without the value. The cheap way
+/// to check a precondition before transferring a large value (the formal
+/// `EXISTS` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvExists {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+}
+
+/// Request to set, refresh, or clear a key's expiry in place without rewriting
+/// its value. `expires_at_micros` of `None` clears the expiry (the formal
+/// `EXPIRE` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvExpire {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+}
+
+/// Request to apply a merge patch to a structured value without transferring the
+/// whole object. `patch` is a codec-specific patch document (the `content_type`
+/// names the format). With `if_match` set, the patch applies only at that version
+/// (the formal `PATCH` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvPatch {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub patch: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_match: Option<u64>,
+}
+
+/// Request to acquire an advisory lease (a bounded-TTL distributed lock) on
+/// `key`. On success the holder gets a `lease_token` to present on protected
+/// mutations (the formal `LEASE` primitive). Built on compare-and-swap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvLease {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    pub lease_ttl_micros: u64,
+}
+
+/// Request to release an advisory lease early, presenting the `lease_token` the
+/// grant returned (the formal `RELEASE` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvRelease {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    pub lease_token: u64,
+}
+
+/// One key's metadata without its value: version, expiry, and value size. The
+/// reply to [`KvExists`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvMetadata {
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+    pub size_bytes: usize,
 }
 
 /// Request to list every namespace that holds at least one entry for the caller.
@@ -218,6 +300,23 @@ pub enum KvOutcome {
     /// `namespaces`: every namespace holding at least one entry for the
     /// caller with its entry count, sorted by name.
     Namespaces(Vec<KvNamespaceInfo>),
+    /// `get` with `if_none_match`: the live version matched, so the body is
+    /// unchanged and not transferred (a conditional-GET hit).
+    NotModified,
+    /// `exists`: the key's metadata, or `None` when absent or expired.
+    Metadata(Option<KvMetadata>),
+    /// `expire` / `patch`: applied, carrying the entry's version. `expire` leaves
+    /// the version unchanged; `patch` bumps it.
+    Versioned { version: u64 },
+    /// `lease`: the lease was granted, carrying the fencing token and the granted
+    /// TTL (which the store may shorten from the request).
+    Leased {
+        lease_token: u64,
+        granted_ttl_micros: u64,
+    },
+    /// `release`: `true` when a held lease was released, `false` when none was
+    /// held (idempotent release).
+    Released(bool),
 }
 
 /// Why a key-value operation failed.
@@ -243,6 +342,14 @@ pub enum KvError {
     /// re-read and retry, or learn that an `Absent` precondition lost a race.
     #[error("kv version conflict (current: {current:?})")]
     VersionConflict { current: Option<u64> },
+    /// A held [`KvLease`] expired or was released, so its token no longer
+    /// protects mutations. The caller must re-acquire the lease.
+    #[error("kv lease lost")]
+    LeaseLost,
+    /// An in-place op (`expire`, `patch`) targeted a key that is absent or
+    /// expired (the formal `NOT_FOUND`).
+    #[error("kv key not found")]
+    NotFound,
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -360,6 +467,81 @@ mod tests {
             KvReply::Ok(KvOutcome::Committed { version }) => assert_eq!(version, 9),
             other => panic!("expected Committed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn given_an_exists_metadata_reply_when_round_tripped_then_should_preserve_metadata() {
+        let reply = KvReply::Ok(KvOutcome::Metadata(Some(KvMetadata {
+            version: 4,
+            expires_at_micros: Some(1_700_000_000_000_000),
+            size_bytes: 128,
+        })));
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        let KvReply::Ok(KvOutcome::Metadata(Some(meta))) = back else {
+            panic!("expected Ok(Metadata(Some))");
+        };
+        assert_eq!(meta.version, 4);
+        assert_eq!(meta.size_bytes, 128);
+    }
+
+    #[test]
+    fn given_a_patch_request_when_round_tripped_then_should_preserve_patch_and_precondition() {
+        let request = KvPatch {
+            v: KV_OP_VERSION,
+            namespace: "docs".to_owned(),
+            key: b"doc:1".to_vec(),
+            patch: br#"{"status":"closed"}"#.to_vec(),
+            if_match: Some(3),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvPatch = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.patch, br#"{"status":"closed"}"#);
+        assert_eq!(back.if_match, Some(3));
+    }
+
+    #[test]
+    fn given_a_lease_reply_when_round_tripped_then_should_preserve_token_and_ttl() {
+        let reply = KvReply::Ok(KvOutcome::Leased {
+            lease_token: 77,
+            granted_ttl_micros: 30_000_000,
+        });
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        match back {
+            KvReply::Ok(KvOutcome::Leased {
+                lease_token,
+                granted_ttl_micros,
+            }) => {
+                assert_eq!(lease_token, 77);
+                assert_eq!(granted_ttl_micros, 30_000_000);
+            }
+            other => panic!("expected Leased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_a_conditional_get_when_round_tripped_then_should_preserve_if_none_match() {
+        let request = KvGet {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            key: b"user:1".to_vec(),
+            if_none_match: Some(5),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvGet = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.if_none_match, Some(5));
+        // A plain get omits the precondition on the wire, so the pre-conditional
+        // contract stays byte-identical.
+        let plain = KvGet {
+            if_none_match: None,
+            ..request
+        };
+        let json = serde_json::to_string(&plain).expect("json");
+        assert!(
+            !json.contains("if_none_match"),
+            "absent precondition omitted"
+        );
     }
 
     #[test]

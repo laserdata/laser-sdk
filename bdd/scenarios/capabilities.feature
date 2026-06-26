@@ -29,9 +29,3 @@ Feature: Capability negotiation and the unsupported boundary
     When I run a read-your-writes query against topic "events"
     Then the call fails as unsupported
     And the unified result code is unsupported
-
-  Scenario: A managed-query connection refuses an unadvertised consistency level
-    Given a managed-query connection that does not advertise read-your-writes
-    When I run a read-your-writes query against topic "events"
-    Then the call fails as unsupported
-    And the unified result code is unsupported

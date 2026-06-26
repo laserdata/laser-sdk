@@ -223,6 +223,12 @@ impl Laser {
         self.capabilities.clone()
     }
 
+    // The negotiated capability set, by reference, for synchronous in-crate
+    // checks (e.g. the memory/graph facade picking a backend without awaiting).
+    pub(crate) fn caps(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
     /// Idempotently creates `topic` on the default stream with `partitions`,
     /// creating the stream first if needed. Requires a default stream (see
     /// [`with_stream`](Self::with_stream)). Use
@@ -612,16 +618,16 @@ impl LaserBuilder {
         // Non-fatal: any error just leaves `managed_host` false.
         //
         // A server that answers `AGDX_HELLO` exposes the whole managed bridge, so the
-        // probe also implies `managed_query`: a plain `Laser::connect(..)` against
-        // the fork can query out of the box without the caller hand-setting
-        // capabilities. An explicit `managed_query` (BYO client + `with_capabilities`)
-        // is kept as-is, so the `|=` only ever adds the fork-implied capability.
+        // probe implies the managed surfaces: a plain `Laser::connect(..)` against the
+        // fork can query out of the box without the caller hand-setting capabilities.
+        // A surface explicitly set by a BYO client is kept, so the `|=` only ever adds
+        // the bridge-implied one.
         #[allow(unused_mut)]
         let mut capabilities = self.capabilities;
         #[cfg(feature = "query")]
         {
             let (managed_host, versions, backends) = probe_managed_host(&client).await;
-            capabilities.managed_host = managed_host;
+            capabilities.managed |= managed_host;
             // Advertised wire op versions, when the server's hello reply
             // carried a body (older servers answer with an empty body).
             capabilities.versions = versions;
@@ -629,23 +635,19 @@ impl LaserBuilder {
             // same hello reply. Empty against raw Apache Iggy and pre-backends
             // servers, so a caller routes only to an advertised id.
             capabilities.backends = backends;
-            capabilities.managed_query |= managed_host;
-            // The same bridge serves the `AGDX_KV` store, so the probe implies `managed_kv`
-            // too. An older LaserData Cloud without KV answers `AGDX_KV` with `Unsupported`, which the
-            // SDK surfaces as `LaserError::Unsupported`.
-            capabilities.managed_kv |= managed_host;
-            // Forks (agentic copy-on-write branches of the read model) ride the same
-            // managed bridge, so the probe implies `forks` too. An older LaserData Cloud without
-            // forks answers `AGDX_FORK_*` with `Unsupported`.
+            // The bridge serves query, the KV store, and forks, so the probe implies
+            // all three. An older plane that lacks one answers its ops with
+            // `Unsupported`, which the SDK surfaces as `LaserError::Unsupported`.
+            capabilities.query.available |= managed_host;
+            capabilities.kv.available |= managed_host;
             capabilities.forks |= managed_host;
-            // Per-feature managed sub-capabilities (compare-and-swap,
-            // read-your-writes, strong consistency) are advertised as bits in
-            // the hello reply, NOT implied by `managed_host`: a managed host may
-            // serve plain KV without CAS, or eventual queries without a
-            // read-your-writes wait. A server that does not set a bit leaves the
-            // capability off, and the matching call returns `Unsupported`.
+            // The per-surface sub-features (compare-and-swap, the consistency level)
+            // are advertised as bits, NOT implied by the host. The graph surface
+            // needs a backend that implements it, advertised by a non-zero graph op
+            // version. Agentic memory composes query + graph, so it has no flag.
             if let Some(versions) = capabilities.versions {
                 capabilities.merge_features(&versions);
+                capabilities.graph |= versions.graph > 0;
             }
         }
         Ok(Laser {

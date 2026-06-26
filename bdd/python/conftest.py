@@ -120,6 +120,9 @@ class Bench:
         self.kv_engine = None
         self.last_query = None
         self.last_cas = None
+        self.memory_engine = None
+        self.memory_ids = {}
+        self.graph_engine = None
 
 
 @pytest.fixture
@@ -149,11 +152,6 @@ def fresh_stream_bootstrapped(world, partitions):
 @given("a new conversation")
 def new_conversation(world):
     world.new_conversation()
-
-
-@given("a managed-query connection that does not advertise read-your-writes")
-def managed_without_ryw():
-    pytest.skip("capability injection is not exposed in the Python SDK")
 
 
 # Shared steps used by both the provenance and agent features.

@@ -6,6 +6,8 @@ pub use crate::a2a::A2aMethod;
 #[cfg(feature = "a2a-bridge")]
 pub use crate::a2a::{A2aBridge, Artifact, Task, TaskState, TaskStatus};
 #[cfg(feature = "agent")]
+pub use crate::agent::MemoryHandler;
+#[cfg(feature = "agent")]
 pub use crate::agent::{
     Agdx, AgdxSend, AgdxStream, Agent, AgentConsumer, AgentCtx, AgentHandle, AgentHandler,
     AgentMessage, ChunkAssembler, ConversationState, Deduplicator, RetryPolicy, Router,
@@ -31,13 +33,17 @@ pub use crate::mcp::McpMethod;
 pub use crate::mcp::{
     McpBridge, McpContent, McpPrompt, McpPromptArgument, McpResource, McpTool, McpToolResult,
 };
+#[cfg(all(feature = "agent", feature = "query"))]
+pub use crate::memory::GraphHandle;
 #[cfg(all(feature = "agent", feature = "kv"))]
 pub use crate::memory::KvMemory;
 #[cfg(all(feature = "agent", feature = "query"))]
 pub use crate::memory::QueryMemory;
 #[cfg(feature = "agent")]
 pub use crate::memory::{
-    Embedder, LogMemory, Memory, MemoryId, MemoryItem, MemoryQuery, MemoryScope, VectorMemory,
+    Embedder, Feedback, Lifetime, LogMemory, Memory, MemoryHandle, MemoryId, MemoryItem,
+    MemoryKind, MemoryQuery, MemoryScope, RecallBuilder, RecallStrategy, RememberBuilder,
+    VectorMemory,
 };
 #[cfg(any(feature = "agent", feature = "query"))]
 pub use crate::message::Message;
@@ -46,11 +52,16 @@ pub use crate::provenance::{AgentTopic, LlmUsage, Provenance, ProvenanceError, k
 #[cfg(feature = "query")]
 pub use crate::query::{
     AggCall, AggFunc, Aggregate, BatchPublishRequest, Bindings, CmpOp, Codec, ContentType, Decoder,
-    Delivery, Dir, FieldType, Filter, IndexField, IndexSchema, KeyMatch, Page, Predicate,
-    Projection, ProjectionBinding, ProjectionId, ProjectionInfo, Projections, ProjectionsRequest,
-    PublishRequest, Query, QueryError, QueryRequest, QueryResult, RawSql, Record,
-    RegisterSchemaRequest, RetentionPolicy, Row, SchemaDef, SchemaInfo, SchemaSource, Schemas,
-    Select, Sort, SourceSelector, Target, TargetRole, Value, VectorQuery, Window,
+    Delivery, Dir, EdgeExtract, EntitySchema, FieldType, Filter, IndexField, IndexSchema, KeyMatch,
+    NodeExtract, Page, Predicate, Projection, ProjectionBinding, ProjectionId, ProjectionInfo,
+    ProjectionKind, Projections, ProjectionsRequest, PublishRequest, Query, QueryError,
+    QueryRequest, QueryResult, RawSql, Record, RegisterSchemaRequest, RetentionPolicy, Row,
+    SchemaDef, SchemaInfo, SchemaSource, Schemas, Select, Sort, SourceSelector, Target, TargetRole,
+    Value, VectorQuery, Window,
+};
+#[cfg(all(feature = "agent", feature = "query"))]
+pub use laser_wire::graph::{
+    EdgeDir, EdgeId, GraphEdge, GraphNode, GraphResult, GraphReturn, NodeId,
 };
 // `Json` and `Msgpack` are codec marker types - intentionally NOT in the
 // prelude because the short names collide too easily with user code

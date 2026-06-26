@@ -132,6 +132,10 @@ macro_rules! wire_id {
     };
 }
 
+// Reused by the memory and graph modules for their id newtypes (MemoryId,
+// NodeId, EdgeId), so every wire id shares one display, codec, and parse form.
+pub(crate) use wire_id;
+
 wire_id!(
     /// A record's producer-assigned identity, a ULID minted before publish.
     ///
@@ -1528,7 +1532,7 @@ pub const METADATA_BRIDGE_HOPS: &str = "bridge_hops";
 // dependency-free. Generation (entropy and clock) lives SDK-side.
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-fn crockford_encode(value: u128) -> [u8; 26] {
+pub(crate) fn crockford_encode(value: u128) -> [u8; 26] {
     let mut out = [0u8; 26];
     let mut v = value;
     for slot in out.iter_mut().rev() {
@@ -1538,7 +1542,7 @@ fn crockford_encode(value: u128) -> [u8; 26] {
     out
 }
 
-fn crockford_decode(s: &str) -> Result<u128, IdParseError> {
+pub(crate) fn crockford_decode(s: &str) -> Result<u128, IdParseError> {
     let bytes = s.as_bytes();
     if bytes.len() != 26 {
         return Err(IdParseError::Length { got: bytes.len() });
