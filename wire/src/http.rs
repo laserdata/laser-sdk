@@ -22,7 +22,7 @@
 //! assert_eq!(CAPABILITIES_PATH, "/agdx/capabilities");
 //! assert_eq!(kv_entry_path("sessions", "dXNlcjox"), "/agdx/kv/sessions/dXNlcjox");
 //!
-//! // A failure carries a machine-dispatchable code plus a human message;
+//! // A failure carries a machine-dispatchable code plus a human message.
 //! // the status line is derived from the code, so a client matches on `code`.
 //! let body = ErrorBody::new(ResultCode::NotFound, "no such fork");
 //! assert_eq!(body.http_status(), 404);
@@ -316,15 +316,31 @@ pub struct GraphEdgeView {
     pub to: String,
     pub edge_type: String,
     pub weight: f32,
+    /// Valid-time window (epoch micros) for a bitemporal edge, omitted when open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<u64>,
 }
 
-/// `POST /agdx/graph/{name}/query` reply: the reachable nodes and traversed edges.
+/// `POST /agdx/graph/{name}/query` reply: the reachable nodes, traversed edges,
+/// and (for a `paths` return) the reconstructed paths as id sequences.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphResultView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<GraphNodeView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edges: Vec<GraphEdgeView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathView>,
+}
+
+/// One path in a `GraphResultView`: parallel node and edge id sequences, ids as
+/// Crockford-base32 strings (the JSON view of [`crate::graph::Path`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PathView {
+    pub nodes: Vec<String>,
+    pub edges: Vec<String>,
 }
 
 /// `POST /agdx/schemas` body: the register request without an id. The managed
@@ -558,6 +574,9 @@ pub struct GraphNeighborsQuery {
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Valid-time "as of" read (epoch micros): only edges valid at this instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
 }
 
 /// `PUT /agdx/kv/{namespace}/{key}/cas` query: the compare-and-swap precondition

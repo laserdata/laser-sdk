@@ -18,6 +18,23 @@ struct Edge {
     from: u64,
     edge_type: String,
     to: u64,
+    valid_from: Option<u64>,
+    valid_to: Option<u64>,
+}
+
+impl Edge {
+    // Whether the edge's valid-time window contains `at` (half-open
+    // `[valid_from, valid_to)`), or always when no instant is asked for. An open
+    // bound is unbounded on that side.
+    fn valid_at(&self, at: Option<u64>) -> bool {
+        match at {
+            None => true,
+            Some(at) => {
+                self.valid_from.is_none_or(|from| at >= from)
+                    && self.valid_to.is_none_or(|to| at < to)
+            }
+        }
+    }
 }
 
 /// An in-memory graph of labelled nodes and typed edges. Nodes are keyed by the
@@ -43,10 +60,25 @@ impl GraphEngine {
 
     /// Add a typed edge between two nodes.
     pub fn add_edge(&mut self, from: u64, edge_type: &str, to: u64) {
+        self.add_edge_valid(from, edge_type, to, None, None);
+    }
+
+    /// Add a typed edge carrying a valid-time window (`valid_from`/`valid_to`,
+    /// each open-ended when `None`), the bitemporal write path.
+    pub fn add_edge_valid(
+        &mut self,
+        from: u64,
+        edge_type: &str,
+        to: u64,
+        valid_from: Option<u64>,
+        valid_to: Option<u64>,
+    ) {
         self.edges.push(Edge {
             from,
             edge_type: edge_type.to_owned(),
             to,
+            valid_from,
+            valid_to,
         });
     }
 
@@ -59,13 +91,24 @@ impl GraphEngine {
     /// Returns the display values of the reachable frontier after the last hop,
     /// sorted for a deterministic assertion.
     pub fn traverse(&self, start: &str, hops: &[(String, Dir)]) -> Vec<String> {
+        self.traverse_as_of(start, hops, None)
+    }
+
+    /// Traverse as of a valid-time instant (epoch micros): follow only edges whose
+    /// valid-time window contains `at`. `None` reads the current graph.
+    pub fn traverse_as_of(
+        &self,
+        start: &str,
+        hops: &[(String, Dir)],
+        at: Option<u64>,
+    ) -> Vec<String> {
         let mut frontier: BTreeSet<u64> = BTreeSet::new();
         frontier.insert(node_id(start));
         for (edge_type, dir) in hops {
             let mut next: BTreeSet<u64> = BTreeSet::new();
             for &node in &frontier {
                 for edge in &self.edges {
-                    if &edge.edge_type != edge_type {
+                    if &edge.edge_type != edge_type || !edge.valid_at(at) {
                         continue;
                     }
                     match dir {
@@ -151,5 +194,23 @@ mod tests {
         observe(&mut graph, "Alice", "works_at", "Acme");
         let reached = graph.traverse("Acme", &[("works_at".to_owned(), Dir::In)]);
         assert_eq!(reached, vec!["Alice"]);
+    }
+
+    #[test]
+    fn given_a_valid_from_edge_when_read_as_of_then_should_appear_only_after_the_window_opens() {
+        let mut graph = GraphEngine::new();
+        let from = graph.upsert_node("checkout");
+        let to = graph.upsert_node("replica");
+        graph.add_edge_valid(from, "mitigated_by", to, Some(100), None);
+        let hops = [("mitigated_by".to_owned(), Dir::Out)];
+        assert!(
+            graph.traverse_as_of("checkout", &hops, Some(50)).is_empty(),
+            "before the window opens the edge is invisible"
+        );
+        assert_eq!(
+            graph.traverse_as_of("checkout", &hops, Some(150)),
+            vec!["replica"],
+            "after the window opens the edge is followed"
+        );
     }
 }

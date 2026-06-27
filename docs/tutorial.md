@@ -576,7 +576,7 @@ The open streaming surface above - publish, batch, consume, the agentic runtime,
 | transport | one Iggy connection, publish + batch API | same connection, same wire. Adds capability negotiation at login + the query API |
 | query / projections | not available, returns `LaserError::Unsupported` | the long-running LaserData Cloud, picks up `Projection` + `ProjectionBinding` config and materializes per-user read models, served off the log |
 | reliable consumption | `ReliableConsumer` with in-memory dedup + DLQ | infrastructure-side durable dedup primitives surfaced through `Capabilities::durable_dedup` |
-| memory | `LogMemory` (folds the log) + `VectorMemory<E>` (in-memory cosine recall, bring your own `Embedder`) | `QueryMemory<E>` (durable vector recall, gated on `query.available`) + `KvMemory` (durable point-state, gated on `kv.available`); the graph-backed memory composes `query` + `graph`. Memory itself has no capability flag |
+| memory | `LogMemory` (folds the log) + `VectorMemory<E>` (in-memory cosine recall, bring your own `Embedder`) | `QueryMemory<E>` (durable vector recall, gated on `query.available`) + `KvMemory` (durable point-state, gated on `kv.available`). The graph-backed memory composes `query` + `graph`. Memory itself has no capability flag |
 | sessions / forks | not available, returns `LaserError::Unsupported` | infrastructure-native session start + fork-from primitives, surfaced through `Capabilities::sessions` + `Capabilities::forks` |
 | A2A | `A2aBridge` axum route customers self-host | managed A2A gateway with auth, streaming, persisted task store, agent-card metadata, surfaced through `Capabilities::a2a_gateway` |
 

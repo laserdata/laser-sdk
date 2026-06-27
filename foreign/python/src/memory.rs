@@ -211,7 +211,7 @@ impl PyMemory {
     ) -> PyResult<Bound<'py, PyAny>> {
         let backend = self.inner.clone();
         let scope = build_scope(agent, conversation)?;
-        // An explicit strategy wins; otherwise a `semantic` query implies the
+        // An explicit strategy wins. Otherwise a `semantic` query implies the
         // semantic strategy, and a plain recall stays `Auto`.
         let strategy = match strategy {
             Some(name) => map_strategy(&name)?,
@@ -321,7 +321,7 @@ impl PyMemoryItem {
     }
 
     /// What the item is, as a string (`fact` / `message` / `summary` / `entity`
-    /// / `feedback`).
+    /// / `feedback` / `procedure`).
     #[getter]
     fn kind(&self) -> String {
         match self.inner.kind {
@@ -330,6 +330,7 @@ impl PyMemoryItem {
             MemoryKind::Summary => "summary",
             MemoryKind::Entity => "entity",
             MemoryKind::Feedback => "feedback",
+            MemoryKind::Procedure => "procedure",
         }
         .to_owned()
     }

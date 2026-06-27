@@ -1,20 +1,23 @@
 """memory (agentic memory): an agent that recalls and reasons over connections.
 
-Agentic memory has two halves, and this runs both over one incident-knowledge
-domain:
+Agentic memory has three facets, run over one incident-knowledge domain:
 
   MEMORY (in-process)        remember what you know, recall what is relevant,
                              improve recall from feedback, and forget what is
                              stale. The four verbs as one loop over a vector
                              memory.
 
-  KNOWLEDGE GRAPH (managed)  the durable side: entities become content-addressed
-                             nodes, relationships typed edges, and a traversal
-                             answers how things connect, what recall alone cannot.
+  DURABLE MEMORY (managed)   the same verbs over the managed KV store, so facts
+                             survive restarts.
 
-The memory half runs against any connected server. The graph half is a managed
-read model (AGDX A13): against raw Apache Iggy it is skipped with a note. The
-named graph is browsable in the management console's graph explorer.
+  KNOWLEDGE GRAPH (managed)  entities become content-addressed nodes,
+                             relationships typed edges, and a traversal answers
+                             how things connect, what recall alone cannot.
+
+The first facet runs against any connected server. The durable-memory and graph
+facets are managed (AGDX A13): against raw Apache Iggy they are skipped with a
+note. The durable memories show in the console's Memory view (KV store) and the
+named graph in its explorer.
 
 Run it:
     docker run -p 8090:8090 apache/iggy:latest
@@ -188,12 +191,22 @@ async def run_graph(laser) -> None:
         ("INC-102", "affected", "search-index"),
     ]
     nodes = list(by_value.values())
-    edges = [ls.graph_edge(by_value[src], rel, by_value[dst]) for src, rel, dst in relationships]
+    # A `mitigated_by` edge is a bitemporal fact: stamp a `valid_from` so the edge
+    # records when the mitigation became true, not just that it holds. The
+    # orthogonal system-time axis (when we observed it) is the log offset of the
+    # upsert, recorded by the substrate for free. Other edges stay open-ended.
+    MITIGATION_SINCE_US = 1_900_000_000_000_000
+    edges = []
+    for src, rel, dst in relationships:
+        edge = ls.graph_edge(by_value[src], rel, by_value[dst])
+        if rel == "mitigated_by":
+            edge["valid_from"] = MITIGATION_SINCE_US
+        edges.append(edge)
 
-    # Register the graph projection so the console explorer lists `ops`. A graph
-    # built only by `upsert` (no projection) is reachable by name but not
-    # discoverable. The entity schema is the projector path: bind it to a source
-    # topic and the projector extracts the same nodes and edges this writes here.
+    # Register the graph projection so the console explorer lists `ops`. The
+    # entity schema is the extraction plan: bind it to a source topic and the
+    # projector applies it per record. This demo writes the graph directly with
+    # the `upsert` below, the same content-addressed write path.
     await laser.register_graph(
         {
             "id": f"{GRAPH}.v1",
@@ -240,6 +253,34 @@ async def run_graph(laser) -> None:
     )
     print(f"what INC-101 affected: {', '.join(touched)}")
 
+    # BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an `as_of` read
+    # sees the graph as it was then: no failover before the rollout, the
+    # read-replica mitigation after. Same query, two points in valid-time.
+    checkout_id = by_value["checkout"]["id"]
+    before = await graph.query(
+        start_ids=[checkout_id], hops=[("mitigated_by", "out")], as_of=MITIGATION_SINCE_US - 1
+    )
+    after = await graph.query(
+        start_ids=[checkout_id], hops=[("mitigated_by", "out")], as_of=MITIGATION_SINCE_US + 1
+    )
+    n_before = sum(1 for node in before["nodes"] if node["id"] != checkout_id)
+    n_after = sum(1 for node in after["nodes"] if node["id"] != checkout_id)
+    print(f"checkout mitigations before the rollout: {n_before}, after: {n_after}")
+
+    # PATHS. The same traversal, asking for whole paths instead of a node set.
+    paths = await graph.query(start_ids=[incident_id], hops=[("affected", "out")], returns="paths")
+    print(f"INC-101 reaches {len(paths.get('paths', []))} components by a traced path")
+
+
+async def run_durable(laser, conversation) -> None:
+    """Durable memory over the managed KV store: the same verbs, persisted across
+    restarts and browsable in the console's Memory view (the KV-store source)."""
+    durable = laser.kv_memory("incidents")
+    for fact in KNOWLEDGE:
+        await durable.remember(fact, conversation=conversation)
+    hits = await durable.recall(limit=3, conversation=conversation)
+    print(f"stored {len(KNOWLEDGE)} durable facts in the KV store, recalled {len(hits)}")
+
 
 async def main() -> None:
     laser = await _common.connect("memory")
@@ -248,8 +289,13 @@ async def main() -> None:
     # PART 1 - MEMORY, against any connected server.
     await run_memory(laser, conversation)
 
-    # PART 2 - KNOWLEDGE GRAPH, a managed read model.
     caps = await laser.capabilities()
+
+    # PART 2 - DURABLE MEMORY, the managed KV store.
+    if _common.managed_gate(caps.kv, "durable KV memory", "memory"):
+        await run_durable(laser, conversation)
+
+    # PART 3 - KNOWLEDGE GRAPH, a managed read model.
     if _common.managed_gate(caps.graph, "the knowledge graph", "memory"):
         await run_graph(laser)
 

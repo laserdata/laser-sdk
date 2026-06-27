@@ -41,8 +41,9 @@ pub use crate::memory::KvMemory;
 pub use crate::memory::QueryMemory;
 #[cfg(feature = "agent")]
 pub use crate::memory::{
-    Embedder, Feedback, Lifetime, LogMemory, Memory, MemoryHandle, MemoryId, MemoryItem,
-    MemoryKind, MemoryQuery, MemoryScope, RecallBuilder, RecallStrategy, RememberBuilder,
+    ConsolidationReport, Consolidator, Embedder, Feedback, Lifetime, LogMemory, Memory,
+    MemoryBackend, MemoryClass, MemoryHandle, MemoryId, MemoryItem, MemoryKind, MemoryQuery,
+    MemoryScope, RecallBuilder, RecallStrategy, RememberBuilder, RerankedMemory, Reranker,
     VectorMemory,
 };
 #[cfg(any(feature = "agent", feature = "query"))]

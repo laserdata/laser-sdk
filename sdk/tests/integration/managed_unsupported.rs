@@ -164,6 +164,46 @@ async fn given_a_set_without_a_precondition_when_committed_then_should_be_invali
     );
 }
 
+#[tokio::test]
+async fn given_a_graph_projection_via_register_when_called_then_should_be_invalid() {
+    use laser_sdk::query::{ContentType, EntitySchema, NodeExtract, Projection};
+    let laser = laser().await;
+    let graph = Projection::builder("ops.v1")
+        .name("ops")
+        .content_type(ContentType::Json)
+        .graph(EntitySchema {
+            nodes: vec![NodeExtract {
+                label: "Service".to_owned(),
+                value_pointer: "/service".to_owned(),
+                embedding_pointer: None,
+            }],
+            edges: Vec::new(),
+        })
+        .build();
+    let error = laser
+        .projections()
+        .register(graph)
+        .await
+        .expect_err("a graph projection must not register as a row projection");
+    assert_eq!(error.code(), ResultCode::InvalidArgument);
+}
+
+#[tokio::test]
+async fn given_a_row_projection_via_register_graph_when_called_then_should_be_invalid() {
+    use laser_sdk::query::Projection;
+    let laser = laser().await;
+    let row = Projection::builder("rows.v1")
+        .name("rows")
+        .fields(["a"])
+        .build();
+    let error = laser
+        .projections()
+        .register_graph(row)
+        .await
+        .expect_err("a row projection must not register as a graph projection");
+    assert_eq!(error.code(), ResultCode::InvalidArgument);
+}
+
 // The pre-gate in isolation: a connection where the base query surface IS
 // available but the consistency level is NOT advertised must refuse the level
 // locally, before any send. The open-Iggy tests above cannot reach this case

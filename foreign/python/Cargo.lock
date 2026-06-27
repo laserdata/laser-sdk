@@ -1916,7 +1916,7 @@ checksum = "507460a910eb7b32ee961886ff48539633b788a36b65692b95f225b844c82553"
 
 [[package]]
 name = "laser-sdk"
-version = "0.0.1-rc.4"
+version = "0.0.1-rc.5"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk-python"
-version = "0.0.1-rc.3"
+version = "0.0.1-rc.4"
 dependencies = [
  "async-trait",
  "iggy",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.0.1-rc.4"
+version = "0.0.1-rc.5"
 dependencies = [
  "bon",
  "bson",

@@ -120,6 +120,10 @@ pub struct GraphQuery {
     pub fork: Option<String>,
     #[serde(default, skip_serializing_if = "Consistency::is_eventual")]
     pub consistency: Consistency,
+    /// Valid-time "as of" read (epoch micros): keep only edges whose valid-time
+    /// window contains this instant. `None` traverses the current graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
 }
 
 impl GraphReturn {
@@ -142,6 +146,10 @@ pub struct GraphNeighbors {
     pub edge_type: Option<String>,
     pub depth: u32,
     pub limit: usize,
+    /// Valid-time "as of" read (epoch micros): keep only edges whose valid-time
+    /// window contains this instant. `None` reads the current graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<u64>,
 }
 
 /// One node: its id, labels, attributes, and optional embedding.
@@ -175,7 +183,8 @@ impl GraphNode {
     }
 }
 
-/// One edge: its id, endpoints, type, weight, and attributes.
+/// One edge: its id, endpoints, type, weight, attributes, and an optional
+/// valid-time window for bitemporal facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphEdge {
     pub id: EdgeId,
@@ -185,6 +194,16 @@ pub struct GraphEdge {
     pub weight: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attrs: Vec<(String, Value)>,
+    /// Valid-time start (epoch micros): when the relationship became true. `None`
+    /// is open-ended. The system-time axis (when observed) is the upsert's log
+    /// offset, so a fact can be superseded by closing `valid_to` and opening a new
+    /// edge rather than overwriting. Absent on the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<u64>,
+    /// Valid-time end (epoch micros): when the relationship stopped being true.
+    /// `None` is still valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<u64>,
 }
 
 impl GraphEdge {
@@ -200,7 +219,26 @@ impl GraphEdge {
             edge_type,
             weight: 1.0,
             attrs: Vec::new(),
+            valid_from: None,
+            valid_to: None,
         }
+    }
+
+    /// Set the valid-time window (epoch micros) on this edge, for a bitemporal
+    /// fact. Either bound may be `None` for open-ended. The edge id is unchanged:
+    /// validity is metadata on the relationship, not part of its identity, so
+    /// re-observing the same relationship with a new window updates the same edge.
+    pub fn valid(mut self, from: Option<u64>, to: Option<u64>) -> Self {
+        self.valid_from = from;
+        self.valid_to = to;
+        self
+    }
+
+    /// Whether this edge's valid-time window contains `at` (epoch micros). An
+    /// open bound is treated as unbounded, so an edge with no window always holds.
+    /// The half-open convention is `[valid_from, valid_to)`.
+    pub fn valid_at(&self, at: u64) -> bool {
+        self.valid_from.is_none_or(|from| at >= from) && self.valid_to.is_none_or(|to| at < to)
     }
 }
 
@@ -295,12 +333,14 @@ mod tests {
             limit: 100,
             fork: None,
             consistency: Consistency::Eventual,
+            as_of: Some(1_900_000_000_000_000),
         };
         let bytes = encode_named(&query).expect("serializes");
         let back: GraphQuery = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.graph, "knowledge");
         assert_eq!(back.traverse.len(), 2);
         assert_eq!(back.return_, GraphReturn::Paths);
+        assert_eq!(back.as_of, Some(1_900_000_000_000_000));
     }
 
     #[test]
@@ -319,6 +359,8 @@ mod tests {
                 edge_type: "works_at".to_owned(),
                 weight: 1.0,
                 attrs: Vec::new(),
+                valid_from: None,
+                valid_to: None,
             }],
             paths: Vec::new(),
         });
@@ -347,6 +389,7 @@ mod tests {
             limit: 10,
             fork: None,
             consistency: Consistency::Eventual,
+            as_of: None,
         };
         let bytes = encode_named(&query).expect("serializes");
         let back: GraphQuery = decode_named(&bytes).expect("deserializes");
@@ -397,5 +440,33 @@ mod tests {
         assert_eq!(one.to, acme.id);
         // The direction is part of the identity: the reverse edge is a different id.
         assert_ne!(one.id, GraphEdge::relate(&acme, "works_at", &alice).id);
+    }
+
+    #[test]
+    fn given_an_edge_validity_window_when_checked_then_should_hold_only_inside_it() {
+        let alice = GraphNode::entity("User", "alice");
+        let pro = GraphNode::entity("Plan", "pro");
+        let edge = GraphEdge::relate(&alice, "on_plan", &pro).valid(Some(100), Some(200));
+        assert!(!edge.valid_at(99), "before the window");
+        assert!(edge.valid_at(100), "the lower bound is inclusive");
+        assert!(edge.valid_at(150), "inside the window");
+        assert!(!edge.valid_at(200), "the upper bound is exclusive");
+        let open = GraphEdge::relate(&alice, "on_plan", &pro);
+        assert!(open.valid_at(0) && open.valid_at(u64::MAX));
+        assert_eq!(edge.id, open.id, "validity is not part of edge identity");
+    }
+
+    #[test]
+    fn given_an_edge_without_validity_when_serialized_then_should_omit_the_window() {
+        let edge = GraphEdge::relate(
+            &GraphNode::entity("A", "x"),
+            "rel",
+            &GraphNode::entity("B", "y"),
+        );
+        let json = serde_json::to_string(&edge).expect("serializes");
+        assert!(
+            !json.contains("valid_from") && !json.contains("valid_to"),
+            "an unset window must be omitted so a pre-bitemporal edge is byte-identical: {json}"
+        );
     }
 }

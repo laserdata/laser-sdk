@@ -398,7 +398,7 @@ class CompiledSchema:
     A compiled writer schema: parse a registered schema definition once
     client-side, then encode / validate / decode bodies against it. Mirrors the
     Rust `CompiledSchema`. Avro and Protobuf schemas decode their schema-first
-    bodies; a JSON Schema validates the decoded payload of a self-describing
+    bodies. A JSON Schema validates the decoded payload of a self-describing
     codec.
     """
     @staticmethod
@@ -549,18 +549,21 @@ class Graph:
         into the graph. Idempotent on the content-addressed ids, so re-upserting the
         same entities is a no-op.
         """
-    def neighbors(self, node: builtins.str, *, direction: builtins.str = 'out', edge_type: typing.Optional[builtins.str] = None, depth: builtins.int = 1, limit: builtins.int = 0) -> typing.Any:
+    def neighbors(self, node: builtins.str, *, direction: builtins.str = 'out', edge_type: typing.Optional[builtins.str] = None, depth: builtins.int = 1, limit: builtins.int = 0, as_of: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Read `node`'s neighbors: the nodes reachable in `direction` over
         `edge_type` (any type when `None`), following the same hop `depth` times.
         Returns a `{"nodes": [...], "edges": [...]}` dict.
         """
-    def query(self, *, start_ids: typing.Optional[typing.Sequence[builtins.str]] = None, match_label: typing.Optional[builtins.str] = None, hops: typing.Optional[typing.Sequence[tuple[builtins.str, builtins.str]]] = None, returns: builtins.str = 'nodes', limit: builtins.int = 0) -> typing.Any:
+    def query(self, *, start_ids: typing.Optional[typing.Sequence[builtins.str]] = None, match_label: typing.Optional[builtins.str] = None, nearest: typing.Optional[tuple[typing.Sequence[builtins.float], builtins.int]] = None, hops: typing.Optional[typing.Sequence[tuple[builtins.str, builtins.str]]] = None, returns: builtins.str = 'nodes', limit: builtins.int = 0, as_of: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
-        Run a traversal. Start from explicit node `start_ids`, or from every node
-        whose label equals `match_label`. `hops` is a list of `(edge_type,
-        direction)` tuples, one per step. `returns` is `"nodes"` or `"edges"`.
-        Returns a `{"nodes": [...], "edges": [...]}` dict.
+        Run a traversal. Start from explicit node `start_ids`, from every node
+        whose label equals `match_label`, or from the `nearest` nodes to an
+        embedding (a `(embedding, k)` pair). `hops` is a list of `(edge_type,
+        direction)` tuples, one per step. `returns` is `"nodes"`, `"edges"`,
+        `"triplets"`, or `"paths"`. `as_of` (epoch micros) follows only edges
+        valid at that instant.
+        Returns a `{"nodes": [...], "edges": [...], "paths": [...]}` dict.
         """
 
 @typing.final
@@ -881,8 +884,10 @@ class Laser:
     def register_graph(self, projection: typing.Any) -> typing.Any:
         r"""
         Register a graph projection from a dict (a projection with `kind = "graph"`
-        and an `entity_schema`). The managed host extracts nodes and edges from the
-        bound source into the named knowledge graph. Applied asynchronously.
+        and an `entity_schema`). It records the named knowledge graph and its
+        node/edge extraction plan. Graph data is written via `graph(name).upsert(..)`,
+        or by the projector when the projection is bound to a source topic, which
+        applies the entity schema to each record. Applied asynchronously.
         """
     def drop_graph(self, id: builtins.str) -> typing.Any:
         r"""
@@ -1117,7 +1122,7 @@ class MemoryItem:
     def kind(self) -> builtins.str:
         r"""
         What the item is, as a string (`fact` / `message` / `summary` / `entity`
-        / `feedback`).
+        / `feedback` / `procedure`).
         """
     @property
     def score(self) -> typing.Optional[builtins.float]:

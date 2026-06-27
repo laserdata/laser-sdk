@@ -6,9 +6,9 @@ use crate::query::{
     Aggregate, BrowseOutcome, BrowseReply, CONTROL_OP_VERSION, CmpOp, Codec, Consistency,
     ContentType, ControlCommand, ControlEnvelope, Decoder, Dir, Filter, GetProjection, GetSchema,
     Json, KeyMatch, ListProjections, ListSchemas, MAX_PAGE_SIZE, Msgpack, Projection,
-    ProjectionBinding, ProjectionInfo, QUERY_OP_VERSION, Query, QueryEnvelope, QueryError,
-    QueryReply, QueryResult, RawSql, Record, RegisterSchema, Row, SchemaInfo, SchemaSource, Select,
-    Sort, SourceSelector, VECTOR_FIELD, Value, VectorQuery, Window,
+    ProjectionBinding, ProjectionInfo, ProjectionKind, QUERY_OP_VERSION, Query, QueryEnvelope,
+    QueryError, QueryReply, QueryResult, RawSql, Record, RegisterSchema, Row, SchemaInfo,
+    SchemaSource, Select, Sort, SourceSelector, VECTOR_FIELD, Value, VectorQuery, Window,
 };
 use bytes::Bytes;
 use iggy::prelude::{HeaderKey, HeaderValue};
@@ -297,7 +297,19 @@ impl<'a> Projections<'a> {
     /// Register a [`Projection`] on LaserData Cloud by publishing a
     /// `RegisterProjection` control command. LaserData Cloud creates the backing
     /// table and starts applying the projection.
+    ///
+    /// Rejects a graph projection (one built with
+    /// [`ProjectionBuilder::graph`](crate::query::ProjectionBuilder::graph)) with
+    /// [`LaserError::Invalid`]: a graph materializes nodes and edges, not a
+    /// queryable row table, so it registers through
+    /// [`register_graph`](Self::register_graph) instead.
     pub async fn register(&self, projection: Projection) -> Result<(), LaserError> {
+        if projection.kind == ProjectionKind::Graph {
+            return Err(LaserError::Invalid(format!(
+                "projection `{}` is a graph projection; register it with `register_graph`",
+                projection.id
+            )));
+        }
         self.laser
             .publish_control(ControlCommand::RegisterProjection(projection))
             .await
@@ -313,12 +325,26 @@ impl<'a> Projections<'a> {
     }
 
     /// Register a graph projection: a [`Projection`] with `kind = Graph` and an
-    /// entity schema (build it with [`Projection::builder`]`.graph(schema)`).
-    /// LaserData Cloud starts extracting nodes and edges from the bound source
-    /// into the named knowledge graph. A distinct command from
+    /// entity schema (build it with [`Projection::builder`]`.graph(schema)`). It
+    /// records the named knowledge graph so it is discoverable, and declares the
+    /// node and edge extraction plan. A distinct command from
     /// [`register`](Self::register) so a backend can gate graph registration on
     /// the `graph` capability.
+    ///
+    /// Graph data is written content-addressed through
+    /// [`GraphHandle::upsert`](crate::memory::GraphHandle::upsert), or by the
+    /// managed projector when this projection is bound to a source topic via
+    /// [`Bindings::apply`](crate::query::Bindings::apply) (it applies the entity
+    /// schema to each record and upserts the extracted nodes and edges).
+    /// Registering a graph projection creates no row table. Rejects a non-graph
+    /// projection with [`LaserError::Invalid`].
     pub async fn register_graph(&self, projection: Projection) -> Result<(), LaserError> {
+        if projection.kind != ProjectionKind::Graph || projection.entity_schema.is_none() {
+            return Err(LaserError::Invalid(format!(
+                "projection `{}` is not a graph projection; build it with `Projection::builder(..).graph(schema)` or register it with `register`",
+                projection.id
+            )));
+        }
         self.laser
             .publish_control(ControlCommand::RegisterGraph(projection))
             .await

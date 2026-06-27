@@ -267,6 +267,15 @@ def _node_id(value):
     return _fnv1a(0x6E, value.encode())
 
 
+def _valid_at(valid_from, valid_to, at):
+    """Whether an edge's valid-time window contains `at` (half-open
+    [valid_from, valid_to)), or always when `at` is None. An open bound is
+    unbounded on that side. Mirrors the Rust `Edge::valid_at`."""
+    if at is None:
+        return True
+    return (valid_from is None or at >= valid_from) and (valid_to is None or at < valid_to)
+
+
 @dataclass
 class GraphEngine:
     """An in-memory graph of labelled nodes and typed edges, keyed by node value
@@ -280,18 +289,23 @@ class GraphEngine:
         self.nodes.setdefault(nid, value)
         return nid
 
-    def add_edge(self, from_id, edge_type, to_id):
-        self.edges.append((from_id, edge_type, to_id))
+    def add_edge(self, from_id, edge_type, to_id, valid_from=None, valid_to=None):
+        # An edge carries an optional valid-time window (open-ended when a bound
+        # is None), the bitemporal write path.
+        self.edges.append((from_id, edge_type, to_id, valid_from, valid_to))
 
     def node_count(self):
         return len(self.nodes)
 
-    def traverse(self, start, hops):
+    def traverse(self, start, hops, as_of=None):
+        # `as_of` (epoch micros) follows only edges whose valid-time window
+        # contains that instant (half-open [valid_from, valid_to)); None reads
+        # the current graph.
         frontier = {_node_id(start)}
         for edge_type, direction in hops:
             nxt = set()
-            for from_id, etype, to_id in self.edges:
-                if etype != edge_type:
+            for from_id, etype, to_id, valid_from, valid_to in self.edges:
+                if etype != edge_type or not _valid_at(valid_from, valid_to, as_of):
                     continue
                 if direction == "out" and from_id in frontier:
                     nxt.add(to_id)

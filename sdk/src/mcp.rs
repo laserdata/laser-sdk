@@ -256,6 +256,42 @@ impl McpBridge {
         self
     }
 
+    /// Advertise the two canonical portable-memory tools, `remember` and
+    /// `recall`, so an MCP host (Claude Desktop, Cursor, an IDE) sees this bridge
+    /// as a memory server and can carry memory across tools. Both route through
+    /// `call_tool` onto the agent's AGDX command topic exactly like any other
+    /// tool, so the agent behind the bridge backs them with a [`Memory`] of its
+    /// choosing. The schemas mirror the field's converging shape (a `text` to
+    /// remember, a `query` plus `limit` to recall), so a host that knows the
+    /// convention drives them without bespoke glue.
+    ///
+    /// [`Memory`]: crate::memory::Memory
+    pub fn with_memory_tools(self) -> Self {
+        self.with_tool(
+            "remember",
+            Some("Store a memory item for later recall.".to_owned()),
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The content to remember." }
+                },
+                "required": ["text"]
+            }),
+        )
+        .with_tool(
+            "recall",
+            Some("Retrieve the memory items most relevant to a query.".to_owned()),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What to recall." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Max items to return." }
+                },
+                "required": ["query"]
+            }),
+        )
+    }
+
     /// Override the per-call reply timeout (default 30s).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;

@@ -9,7 +9,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 /// A compiled writer schema: parse a registered schema definition once
 /// client-side, then encode / validate / decode bodies against it. Mirrors the
 /// Rust `CompiledSchema`. Avro and Protobuf schemas decode their schema-first
-/// bodies; a JSON Schema validates the decoded payload of a self-describing
+/// bodies. A JSON Schema validates the decoded payload of a self-describing
 /// codec.
 #[gen_stub_pyclass]
 #[pyclass(name = "CompiledSchema", frozen)]
