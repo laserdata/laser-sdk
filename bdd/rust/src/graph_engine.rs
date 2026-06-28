@@ -44,6 +44,10 @@ pub struct GraphEngine {
     // node id -> display value
     nodes: HashMap<u64, String>,
     edges: Vec<Edge>,
+    // Provenance. A node's source is first-writer (the first record it was seen
+    // in); an edge's is last-writer (the most recent record that asserted it).
+    node_sources: HashMap<u64, String>,
+    edge_sources: HashMap<(u64, String, u64), String>,
 }
 
 impl GraphEngine {
@@ -56,6 +60,34 @@ impl GraphEngine {
         let id = node_id(value);
         self.nodes.entry(id).or_insert_with(|| value.to_owned());
         id
+    }
+
+    /// Upsert a node and record the source it was observed in, first-writer.
+    pub fn upsert_node_with_source(&mut self, value: &str, source: &str) -> u64 {
+        let id = self.upsert_node(value);
+        self.node_sources
+            .entry(id)
+            .or_insert_with(|| source.to_owned());
+        id
+    }
+
+    /// Add a typed edge and record the source that asserted it, last-writer.
+    pub fn add_edge_with_source(&mut self, from: u64, edge_type: &str, to: u64, source: &str) {
+        self.add_edge(from, edge_type, to);
+        self.edge_sources
+            .insert((from, edge_type.to_owned(), to), source.to_owned());
+    }
+
+    /// The first source a node was observed in, if recorded.
+    pub fn node_source(&self, value: &str) -> Option<&str> {
+        self.node_sources.get(&node_id(value)).map(String::as_str)
+    }
+
+    /// The source that most recently asserted an edge, if recorded.
+    pub fn edge_source(&self, from: &str, edge_type: &str, to: &str) -> Option<&str> {
+        self.edge_sources
+            .get(&(node_id(from), edge_type.to_owned(), node_id(to)))
+            .map(String::as_str)
     }
 
     /// Add a typed edge between two nodes.
@@ -194,6 +226,27 @@ mod tests {
         observe(&mut graph, "Alice", "works_at", "Acme");
         let reached = graph.traverse("Acme", &[("works_at".to_owned(), Dir::In)]);
         assert_eq!(reached, vec!["Alice"]);
+    }
+
+    #[test]
+    fn given_an_element_re_observed_when_sourced_then_node_is_first_writer_and_edge_is_last_writer()
+    {
+        let mut graph = GraphEngine::new();
+        for source in ["orders/events/0/42", "orders/events/0/99"] {
+            let from = graph.upsert_node_with_source("Alice", source);
+            let to = graph.upsert_node_with_source("Acme", source);
+            graph.add_edge_with_source(from, "works_at", to, source);
+        }
+        assert_eq!(
+            graph.node_source("Alice"),
+            Some("orders/events/0/42"),
+            "a re-observed node keeps its first source"
+        );
+        assert_eq!(
+            graph.edge_source("Alice", "works_at", "Acme"),
+            Some("orders/events/0/99"),
+            "a re-observed edge keeps its latest source"
+        );
     }
 
     #[test]

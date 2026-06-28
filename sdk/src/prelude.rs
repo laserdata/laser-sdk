@@ -62,7 +62,7 @@ pub use crate::query::{
 };
 #[cfg(all(feature = "agent", feature = "query"))]
 pub use laser_wire::graph::{
-    EdgeDir, EdgeId, GraphEdge, GraphNode, GraphResult, GraphReturn, NodeId,
+    EdgeDir, EdgeId, GraphEdge, GraphNode, GraphResult, GraphReturn, NodeId, SourceRef,
 };
 // `Json` and `Msgpack` are codec marker types - intentionally NOT in the
 // prelude because the short names collide too easily with user code

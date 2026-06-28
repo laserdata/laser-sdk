@@ -115,3 +115,10 @@ pub const MAX_GRAPH_TRAVERSE_DEPTH: u32 = 8;
 pub const MAX_GRAPH_RESULT_ELEMENTS: usize = 10_000;
 /// Max labels on one graph node.
 pub const MAX_GRAPH_NODE_LABELS: usize = 16;
+/// Max encoded bytes of a node or edge `source` provenance reference. A source
+/// names a stream, topic, key, or id, all of which are bounded inputs already,
+/// so this is a defensive ceiling against a hostile or buggy upsert inflating
+/// per-element state. Sized at two key-lengths, since the largest variant (a
+/// key-value source) names both a namespace and a key; far under the opaque
+/// value ceiling, as a source ref is a short pointer, not a payload.
+pub const MAX_SOURCE_REF_BYTES: usize = 2 * MAX_KEY_BYTES;

@@ -25,7 +25,7 @@ use laser_wire::forward::{ForwardedCommand, ForwardedQuery};
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::graph::{
     EdgeDir, GraphEdge, GraphNeighbors, GraphNode, GraphQuery, GraphReply, GraphResult,
-    GraphReturn, GraphStart, GraphUpsert, Hop, Path,
+    GraphReturn, GraphStart, GraphUpsert, Hop, Path, SourceRef,
 };
 use laser_wire::hello::{BackendAnnounce, BackendDescriptor, HelloReply, OpVersions, feature};
 use laser_wire::http::{Capabilities, ErrorBody, KvEntryView, KvPageView};
@@ -613,6 +613,22 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
                 edges: vec![edge.id],
             }],
         }),
+    );
+
+    // Provenance is pinned cross-SDK on a dedicated node and edge, so the
+    // canonical source-less frames above stay byte-identical.
+    let source = SourceRef::Message {
+        stream: "orders".to_owned(),
+        topic: "events".to_owned(),
+        partition: 3,
+        offset: 4096,
+    };
+    let mut sourced_node = GraphNode::entity("Component", "cache");
+    sourced_node.source = Some(source.clone());
+    assert_frame("graph_node_sourced.bin", &sourced_node);
+    assert_frame(
+        "graph_edge_sourced.bin",
+        &GraphEdge::relate(&alice, "works_at", &acme).with_source(source),
     );
 }
 

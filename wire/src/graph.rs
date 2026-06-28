@@ -152,7 +152,32 @@ pub struct GraphNeighbors {
     pub as_of: Option<u64>,
 }
 
-/// One node: its id, labels, attributes, and optional embedding.
+/// Where a graph element was last observed: the source record an extraction came
+/// from, so a reader can navigate back to its origin. On an edge this is the
+/// record that asserted the relationship (the meaningful provenance, kept
+/// last-writer since the edge is rewritten on each observation to maintain its
+/// validity window). On a node it is the first record the entity was seen in
+/// (first-writer, so a re-observed node's stored bytes stay stable). Excluded
+/// from the content-addressed id, so it never affects identity or idempotent
+/// upsert. The complete history is the source log, which the projector can
+/// replay. Absent on the wire when unknown.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceRef {
+    /// A record on the message log, addressed by its stream, topic, partition,
+    /// and offset.
+    Message {
+        stream: String,
+        topic: String,
+        partition: u32,
+        offset: u64,
+    },
+    /// A key in the managed key-value store.
+    Kv { namespace: String, key: String },
+    /// A managed memory item, by its id.
+    Memory { id: String },
+}
+
+/// One node: its id, labels, attributes, optional embedding, and optional source.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GraphNode {
     pub id: NodeId,
@@ -162,6 +187,9 @@ pub struct GraphNode {
     pub attrs: Vec<(String, Value)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// The source this node was first observed in, if known. See [`SourceRef`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
 }
 
 impl GraphNode {
@@ -179,6 +207,7 @@ impl GraphNode {
             labels: vec![label],
             attrs: vec![("value".to_owned(), Value::from(value))],
             embedding: None,
+            source: None,
         }
     }
 }
@@ -204,6 +233,10 @@ pub struct GraphEdge {
     /// `None` is still valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_to: Option<u64>,
+    /// The source that most recently asserted this relationship, if known. See
+    /// [`SourceRef`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
 }
 
 impl GraphEdge {
@@ -221,7 +254,15 @@ impl GraphEdge {
             attrs: Vec::new(),
             valid_from: None,
             valid_to: None,
+            source: None,
         }
+    }
+
+    /// Set the source that asserted this relationship. See [`SourceRef`]. The
+    /// edge id is unchanged: provenance is metadata, not identity.
+    pub fn with_source(mut self, source: SourceRef) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// Set the valid-time window (epoch micros) on this edge, for a bitemporal
@@ -351,6 +392,7 @@ mod tests {
                 labels: vec!["Person".to_owned()],
                 attrs: vec![("name".to_owned(), Value::from("Alice"))],
                 embedding: None,
+                source: None,
             }],
             edges: vec![GraphEdge {
                 id: EdgeId::from_u128(2),
@@ -361,6 +403,7 @@ mod tests {
                 attrs: Vec::new(),
                 valid_from: None,
                 valid_to: None,
+                source: None,
             }],
             paths: Vec::new(),
         });
@@ -467,6 +510,96 @@ mod tests {
         assert!(
             !json.contains("valid_from") && !json.contains("valid_to"),
             "an unset window must be omitted so a pre-bitemporal edge is byte-identical: {json}"
+        );
+    }
+
+    #[test]
+    fn given_a_node_without_a_source_when_serialized_then_should_omit_it() {
+        let node = GraphNode::entity("Person", "Alice");
+        let json = serde_json::to_string(&node).expect("serializes");
+        assert!(
+            !json.contains("source"),
+            "an unknown source must be omitted so a pre-provenance node is byte-identical: {json}"
+        );
+    }
+
+    #[test]
+    fn given_a_node_with_a_source_when_round_tripped_then_should_preserve_it_and_keep_identity() {
+        let mut node = GraphNode::entity("Component", "cache");
+        node.source = Some(SourceRef::Message {
+            stream: "orders".to_owned(),
+            topic: "events".to_owned(),
+            partition: 3,
+            offset: 4096,
+        });
+        let bytes = encode_named(&node).expect("serializes");
+        let back: GraphNode = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.source, node.source);
+        assert_eq!(
+            back.id,
+            GraphNode::entity("Component", "cache").id,
+            "source is not part of node identity"
+        );
+    }
+
+    #[test]
+    fn given_an_edge_with_a_source_when_round_tripped_then_should_preserve_it_and_keep_identity() {
+        let from = GraphNode::entity("A", "x");
+        let to = GraphNode::entity("B", "y");
+        let edge = GraphEdge::relate(&from, "rel", &to).with_source(SourceRef::Kv {
+            namespace: "ns".to_owned(),
+            key: "k".to_owned(),
+        });
+        let bytes = encode_named(&edge).expect("serializes");
+        let back: GraphEdge = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.source, edge.source);
+        assert_eq!(
+            back.id,
+            GraphEdge::relate(&from, "rel", &to).id,
+            "source is not part of edge identity"
+        );
+    }
+
+    #[test]
+    fn given_a_max_element_reply_with_source_when_encoded_then_should_fit_one_frame() {
+        use crate::limits::{MAX_FRAME_BYTES, MAX_GRAPH_RESULT_ELEMENTS};
+        let source = SourceRef::Message {
+            stream: "a-fairly-long-stream-name-for-headroom".to_owned(),
+            topic: "a-fairly-long-topic-name-for-headroom".to_owned(),
+            partition: u32::MAX,
+            offset: u64::MAX,
+        };
+        let half = (MAX_GRAPH_RESULT_ELEMENTS / 2) as u128;
+        let nodes = (0..half)
+            .map(|i| {
+                let mut node = GraphNode::entity("Component", format!("entity-{i}"));
+                node.source = Some(source.clone());
+                node
+            })
+            .collect();
+        let edges = (0..half)
+            .map(|i| GraphEdge {
+                id: EdgeId::from_u128(i),
+                from: NodeId::from_u128(i),
+                to: NodeId::from_u128(i + 1),
+                edge_type: "relates_to".to_owned(),
+                weight: 1.0,
+                attrs: Vec::new(),
+                valid_from: None,
+                valid_to: None,
+                source: Some(source.clone()),
+            })
+            .collect();
+        let reply = GraphReply::Ok(GraphResult {
+            nodes,
+            edges,
+            paths: Vec::new(),
+        });
+        let encoded = encode_named(&reply).expect("serializes");
+        assert!(
+            encoded.len() < MAX_FRAME_BYTES,
+            "a full {MAX_GRAPH_RESULT_ELEMENTS}-element reply with source is {} bytes, over the frame cap {MAX_FRAME_BYTES}",
+            encoded.len()
         );
     }
 }

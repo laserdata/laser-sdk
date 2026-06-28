@@ -288,6 +288,23 @@ async fn main() -> Result<(), LaserError> {
     for value in incidents {
         by_value.insert(value, GraphNode::entity("Incident", value));
     }
+    // Provenance: register each entity as a real record in the `topology`
+    // key-value namespace, then point its graph node at that record. The node's
+    // source is then a live deep link, the console renders it as a click-through
+    // to the actual KV entry. First-writer on the node.
+    let registry = laser.kv("topology");
+    for (value, node) in by_value.iter_mut() {
+        let kind = node.labels.first().map(String::as_str).unwrap_or("Entity");
+        registry
+            .set(*value)
+            .bytes(format!("{{\"kind\":\"{kind}\",\"value\":\"{value}\"}}"))
+            .send()
+            .await?;
+        node.source = Some(SourceRef::Kv {
+            namespace: "topology".to_owned(),
+            key: (*value).to_owned(),
+        });
+    }
 
     // (from, relationship, to) triples, resolved against the nodes above.
     let relationships: &[(&str, &str, &str)] = &[
@@ -332,7 +349,13 @@ async fn main() -> Result<(), LaserError> {
     let edges: Vec<GraphEdge> = relationships
         .iter()
         .map(|(from, relationship, to)| {
-            let edge = GraphEdge::relate(&by_value[from], *relationship, &by_value[to]);
+            // The relationship is anchored on the `from` entity's record, so the
+            // edge carries that source (last-writer on the edge).
+            let edge = GraphEdge::relate(&by_value[from], *relationship, &by_value[to])
+                .with_source(SourceRef::Kv {
+                    namespace: "topology".to_owned(),
+                    key: (*from).to_owned(),
+                });
             if *relationship == "mitigated_by" {
                 edge.valid(Some(MITIGATION_SINCE_US), None)
             } else {
@@ -428,6 +451,22 @@ async fn main() -> Result<(), LaserError> {
         .collect();
     touched.sort_unstable();
     info!("what INC-101 affected: {}", touched.join(", "));
+
+    // PROVENANCE. Every node and edge records the source it was extracted from, so
+    // a traversal is navigable back to its origin. Here each entity points at its
+    // record in the `topology` key-value namespace. The console renders this
+    // `source` as a live click-through to that KV entry (or to the message, for a
+    // projector-built graph). Node source is first-writer, edge source last-writer.
+    phase("Trace a node back to its source");
+    if let Some(node) = around.nodes.iter().find(|node| node.id == checkout.id) {
+        match &node.source {
+            Some(SourceRef::Kv { namespace, key }) => {
+                info!("checkout's source record is {namespace}/{key}")
+            }
+            Some(other) => info!("checkout came from {other:?}"),
+            None => info!("checkout carries no source"),
+        }
+    }
 
     // BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an "as of" read
     // sees the graph as it was then. Before the mitigation was applied, checkout

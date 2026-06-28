@@ -103,3 +103,36 @@ async fn traverse_as_of_excludes(
         "{target} should not be reachable"
     );
 }
+
+#[when(regex = r#"^I observe "([^"]+)" (\w+) "([^"]+)" from "([^"]+)"$"#)]
+async fn observe_with_source(
+    world: &mut LaserWorld,
+    from: String,
+    edge_type: String,
+    to: String,
+    source: String,
+) {
+    let graph = engine(world);
+    let from_id = graph.upsert_node_with_source(&from, &source);
+    let to_id = graph.upsert_node_with_source(&to, &source);
+    graph.add_edge_with_source(from_id, &edge_type, to_id, &source);
+}
+
+#[then(regex = r#"^the source of node "([^"]+)" is "([^"]+)"$"#)]
+async fn node_source_is(world: &mut LaserWorld, value: String, source: String) {
+    assert_eq!(engine(world).node_source(&value), Some(source.as_str()));
+}
+
+#[then(regex = r#"^the source of edge "([^"]+)" (\w+) "([^"]+)" is "([^"]+)"$"#)]
+async fn edge_source_is(
+    world: &mut LaserWorld,
+    from: String,
+    edge_type: String,
+    to: String,
+    source: String,
+) {
+    assert_eq!(
+        engine(world).edge_source(&from, &edge_type, &to),
+        Some(source.as_str())
+    );
+}

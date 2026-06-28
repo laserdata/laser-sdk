@@ -31,6 +31,7 @@
 //! ```
 
 use crate::fork::{ForkError, ForkKind};
+use crate::graph::SourceRef;
 use crate::hello::{BackendDescriptor, OpVersions};
 use crate::kv::KvError;
 use crate::query::{Consistency, QueryError};
@@ -305,6 +306,9 @@ pub struct GraphNodeView {
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attrs: Vec<(String, String)>,
+    /// The source this node was first observed in, if known. See [`SourceRef`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
 }
 
 /// One graph edge on the HTTP surface: endpoint ids as strings, the type, and the
@@ -321,6 +325,10 @@ pub struct GraphEdgeView {
     pub valid_from: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_to: Option<u64>,
+    /// The source that most recently asserted this relationship, if known. See
+    /// [`SourceRef`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
 }
 
 /// `POST /agdx/graph/{name}/query` reply: the reachable nodes, traversed edges,

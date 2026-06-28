@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "laser-examples"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.0.1-rc.5"
+version = "0.0.1-rc.6"
 dependencies = [
  "bon",
  "bson",

@@ -157,6 +157,15 @@ async def run_graph(laser) -> None:
         ("Incident", "INC-102"),
     ]
     by_value = {value: ls.graph_node(label, value) for label, value in entities}
+    # Provenance: register each entity as a real record in the `topology` key-value
+    # namespace, then point its graph node at that record, so the node's source is a
+    # live deep link the console renders as a click-through to the actual KV entry.
+    # First-writer on the node.
+    registry = laser.kv("topology")
+    for value, node in by_value.items():
+        kind = node["labels"][0] if node.get("labels") else "Entity"
+        await registry.set(value).json({"kind": kind, "value": value}).send()
+        node["source"] = {"kind": "kv", "namespace": "topology", "key": value}
     relationships = [
         ("checkout", "depends_on", "orders-db"),
         ("checkout", "depends_on", "db-pool"),
@@ -199,6 +208,9 @@ async def run_graph(laser) -> None:
     edges = []
     for src, rel, dst in relationships:
         edge = ls.graph_edge(by_value[src], rel, by_value[dst])
+        # The relationship was asserted by the `src` entity's memory, so the edge
+        # carries that source (last-writer on the edge).
+        edge["source"] = {"kind": "kv", "namespace": "topology", "key": src}
         if rel == "mitigated_by":
             edge["valid_from"] = MITIGATION_SINCE_US
         edges.append(edge)
@@ -252,6 +264,17 @@ async def run_graph(laser) -> None:
         if node["id"] != incident_id
     )
     print(f"what INC-101 affected: {', '.join(touched)}")
+
+    # PROVENANCE. Every node and edge records the source it was extracted from, so
+    # a traversal is navigable back to its origin. Here each entity points at its
+    # record in the `topology` key-value namespace. The console renders this
+    # `source` as a live click-through to that KV entry (or to the message, for a
+    # projector-built graph). Node source is first-writer, edge source last-writer.
+    checkout_id = by_value["checkout"]["id"]
+    checkout_node = next((n for n in around["nodes"] if n["id"] == checkout_id), None)
+    source = (checkout_node or {}).get("source")
+    if source and source.get("kind") == "kv":
+        print(f"checkout's source record is {source['namespace']}/{source['key']}")
 
     # BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an `as_of` read
     # sees the graph as it was then: no failover before the rollout, the
