@@ -9,8 +9,8 @@ use laser_wire::browse::{
     BrowseOutcome, BrowseReply, DecodeRecord, ProjectionInfo, RegisterSchema, SchemaInfo,
 };
 use laser_wire::codes::{
-    AGDX_KV_SET_CODE, AGENT_OP_VERSION, CONTROL_OP_VERSION, FORK_OP_VERSION, KV_OP_VERSION,
-    QUERY_OP_VERSION,
+    AGDX_KV_SET_CODE, AGENT_OP_VERSION, CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION,
+    KV_OP_VERSION, QUERY_OP_VERSION,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
@@ -23,6 +23,10 @@ use laser_wire::fork::{
 };
 use laser_wire::forward::{ForwardedCommand, ForwardedQuery};
 use laser_wire::framing::{decode_named, encode_named};
+use laser_wire::graph::{
+    EdgeDir, GraphEdge, GraphNeighbors, GraphNode, GraphQuery, GraphReply, GraphResult,
+    GraphReturn, GraphStart, GraphUpsert, Hop, Path,
+};
 use laser_wire::hello::{BackendAnnounce, BackendDescriptor, HelloReply, OpVersions, feature};
 use laser_wire::http::{Capabilities, ErrorBody, KvEntryView, KvPageView};
 use laser_wire::kv::{
@@ -544,6 +548,75 @@ fn given_fork_frames_when_encoded_then_should_match_golden_fixtures() {
 }
 
 #[test]
+fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
+    let alice = GraphNode::entity("Person", "Alice");
+    let acme = GraphNode::entity("Company", "Acme");
+    let mut doc = GraphNode::entity("Doc", "spec");
+    doc.embedding = Some(vec![0.1, 0.2, 0.3]);
+    assert_frame("graph_node.bin", &doc);
+
+    let edge = GraphEdge::relate(&alice, "works_at", &acme).valid(Some(1_000), Some(2_000));
+    assert_frame("graph_edge.bin", &edge);
+
+    assert_frame(
+        "graph_upsert.bin",
+        &GraphUpsert {
+            v: GRAPH_OP_VERSION,
+            graph: "knowledge".to_owned(),
+            nodes: vec![alice.clone(), acme.clone()],
+            edges: vec![edge.clone()],
+        },
+    );
+
+    assert_frame(
+        "graph_query.bin",
+        &GraphQuery {
+            v: GRAPH_OP_VERSION,
+            graph: "knowledge".to_owned(),
+            start: GraphStart::Match(Filter::pred("label", CmpOp::Eq, "Person")),
+            traverse: vec![Hop {
+                edge_type: Some("works_at".to_owned()),
+                dir: EdgeDir::Out,
+                max: 2,
+            }],
+            node_filter: None,
+            edge_filter: None,
+            return_: GraphReturn::Paths,
+            limit: 100,
+            fork: None,
+            consistency: Consistency::Eventual,
+            as_of: Some(1_500),
+        },
+    );
+
+    assert_frame(
+        "graph_neighbors.bin",
+        &GraphNeighbors {
+            v: GRAPH_OP_VERSION,
+            graph: "knowledge".to_owned(),
+            node: alice.id,
+            dir: EdgeDir::Out,
+            edge_type: Some("works_at".to_owned()),
+            depth: 1,
+            limit: 50,
+            as_of: Some(1_500),
+        },
+    );
+
+    assert_frame(
+        "graph_reply.bin",
+        &GraphReply::Ok(GraphResult {
+            nodes: vec![alice.clone(), acme.clone()],
+            edges: vec![edge.clone()],
+            paths: vec![Path {
+                nodes: vec![alice.id, acme.id],
+                edges: vec![edge.id],
+            }],
+        }),
+    );
+}
+
+#[test]
 fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
     // Forwarded managed-request frames - the SDK never sends them, but the
     // server and LaserData Cloud both consume these exact bytes.
@@ -614,7 +687,7 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
     // The announce also lists the materialization backends the server exposes:
     // each an identity-only descriptor (stable id + opaque engine kind) with an
     // optional advisory label/version and a set of opaque capability tags the
-    // backend declares about itself. The embedded engine serves everything; a
+    // backend declares about itself. The embedded engine serves everything. A
     // second backend advertises a narrower tag set, so a consumer can gate.
     assert_frame(
         "backend_announce.bin",

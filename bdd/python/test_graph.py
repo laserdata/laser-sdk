@@ -20,6 +20,14 @@ def observe(bench, src, edge_type, dst):
     graph.add_edge(from_id, edge_type, to_id)
 
 
+@when(parsers.parse('I observe "{src}" {edge_type} "{dst}" valid from {valid_from:d}'))
+def observe_valid_from(bench, src, edge_type, dst, valid_from):
+    graph = bench.graph_engine
+    from_id = graph.upsert_node(src)
+    to_id = graph.upsert_node(dst)
+    graph.add_edge(from_id, edge_type, to_id, valid_from=valid_from)
+
+
 @then(parsers.parse("the graph holds {count:d} nodes"))
 def node_count(bench, count):
     assert bench.graph_engine.node_count() == count
@@ -44,3 +52,15 @@ def traverse_out_excludes(bench, start, edge, target):
 @then(parsers.parse('traversing from "{start}" incoming "{edge}" reaches "{target}"'))
 def traverse_in_reaches(bench, start, edge, target):
     assert target in bench.graph_engine.traverse(start, [(edge, "in")])
+
+
+@then(parsers.parse('traversing from "{start}" out "{edge}" as of {at:d} reaches "{target}"'))
+def traverse_as_of_reaches(bench, start, edge, at, target):
+    assert target in bench.graph_engine.traverse(start, [(edge, "out")], as_of=at)
+
+
+@then(
+    parsers.parse('traversing from "{start}" out "{edge}" as of {at:d} does not reach "{target}"')
+)
+def traverse_as_of_excludes(bench, start, edge, at, target):
+    assert target not in bench.graph_engine.traverse(start, [(edge, "out")], as_of=at)

@@ -15,10 +15,10 @@ use ulid::Ulid;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
-    /// A standalone fact (the default).
+    /// A standalone fact (the default). Semantic memory: what is known.
     #[default]
     Fact,
-    /// A conversation turn.
+    /// A conversation turn. Episodic memory: what happened.
     Message,
     /// A summary distilled from other items.
     Summary,
@@ -26,6 +26,9 @@ pub enum MemoryKind {
     Entity,
     /// A feedback signal that reweights recall.
     Feedback,
+    /// A reusable procedure: a skill or workflow recalled by task similarity and
+    /// improved by outcome feedback. Procedural memory: how things are done.
+    Procedure,
 }
 
 impl MemoryKind {
@@ -38,8 +41,37 @@ impl MemoryKind {
             MemoryKind::Summary => 3,
             MemoryKind::Entity => 4,
             MemoryKind::Feedback => 5,
+            MemoryKind::Procedure => 6,
         }
     }
+
+    /// The memory class this kind belongs to, in the converging
+    /// episodic / semantic / procedural taxonomy. `Episodic` is what happened
+    /// (messages), `Procedural` is how things are done (procedures), and
+    /// everything else is `Semantic` (what is known).
+    pub const fn class(self) -> MemoryClass {
+        match self {
+            MemoryKind::Message => MemoryClass::Episodic,
+            MemoryKind::Procedure => MemoryClass::Procedural,
+            MemoryKind::Fact | MemoryKind::Summary | MemoryKind::Entity | MemoryKind::Feedback => {
+                MemoryClass::Semantic
+            }
+        }
+    }
+}
+
+/// The high-level class a [`MemoryKind`] falls into, the field's converging
+/// taxonomy: episodic (what happened), semantic (what is known), procedural (how
+/// things are done).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryClass {
+    /// What happened: conversation turns and events.
+    Episodic,
+    /// What is known: facts, summaries, entities.
+    Semantic,
+    /// How things are done: procedures, skills, workflows.
+    Procedural,
 }
 
 /// How long a memory lives. `Session` is conversation-scoped and prunable, and
@@ -64,13 +96,17 @@ pub enum RecallStrategy {
     Auto,
     /// Most recent items first.
     Recent,
-    /// Rank by semantic similarity to the query.
+    /// Rank by semantic similarity to the query (vector signal).
     Semantic,
+    /// Rank by lexical overlap with the query (keyword signal), the complement to
+    /// `Semantic` for exact-term matches an embedding can blur.
+    Keyword,
     /// Traverse the knowledge graph from the query seed.
     Graph,
     /// Items inside the time range, most recent first.
     Temporal,
-    /// Blend semantic and graph.
+    /// Fuse every available signal (semantic + keyword + feedback) into one score.
+    /// The multi-signal default for quality recall.
     Hybrid,
 }
 
@@ -151,16 +187,28 @@ impl FromStr for MemoryId {
     }
 }
 
-/// Scopes memory to a stream, an agent, and a conversation, with a lifetime
-/// tier. Any field left unset widens recall to match across that dimension.
+/// Scopes memory along the converging identity layers (user / agent / session /
+/// app) plus the physical stream, with a lifetime tier. Any field left unset
+/// widens recall to match across that dimension.
+///
+/// `conversation` is the session layer (a single run or thread). `user` and `app`
+/// are the broader identity layers: the end user the memory is about, and the
+/// application or org it belongs to within a deployment. They narrow recall on
+/// backends that store them (e.g. [`VectorMemory`]). The physical isolation
+/// boundary stays the Iggy stream. ("tenant" is deliberately not a layer here: a
+/// deployment is the customer's alone, and `app` is a scope within it.)
 #[derive(Debug, Clone, Default, bon::Builder)]
 pub struct MemoryScope {
-    /// Restrict to this stream (none = any). The widest scope tier.
+    /// Restrict to this stream (none = any). The physical isolation boundary.
     pub stream: Option<String>,
+    /// Restrict to this end user (none = any). The identity the memory is about.
+    pub user: Option<String>,
     /// Restrict to this agent (none = any).
     pub agent: Option<AgentId>,
-    /// Restrict to this conversation (none = any).
+    /// Restrict to this conversation, the session layer (none = any).
     pub conversation: Option<ConversationId>,
+    /// Restrict to this application or org within the deployment (none = any).
+    pub app: Option<String>,
     /// Whether the item is conversation-scoped and prunable (`Session`, the
     /// default) or shared across conversations and graph-backed (`Durable`).
     #[builder(default)]
@@ -563,6 +611,98 @@ pub trait LocalEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, LaserError>;
 }
 
+/// Re-scores recall candidates after the first-pass retrieval: the optional
+/// second stage of a multi-signal recall pipeline (candidates -> fuse -> rerank
+/// -> top_k). The SDK stays model-agnostic, so a cross-encoder, an LLM judge, or
+/// a hosted rerank API lives in application code, the same seam as [`Embedder`].
+/// `rerank` receives the candidate items already ordered by the first pass and
+/// returns them re-ordered (and MAY drop or rescore them).
+#[trait_variant::make(Reranker: Send)]
+pub trait LocalReranker {
+    async fn rerank(
+        &self,
+        query: &str,
+        items: Vec<MemoryItem>,
+    ) -> Result<Vec<MemoryItem>, LaserError>;
+}
+
+/// What one consolidation pass changed. All counts are best-effort and advisory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidationReport {
+    /// Items folded into durable summaries.
+    pub summarized: usize,
+    /// Items whose recall weight was adjusted from feedback.
+    pub reweighted: usize,
+    /// Stale items pruned.
+    pub pruned: usize,
+    /// New facts or edges derived (e.g. graph extraction).
+    pub derived: usize,
+}
+
+/// Background memory evolution, the "memify" / sleep-time-compute pass: it runs off
+/// the log to summarize sessions into durable items, fold feedback into recall
+/// weights, prune stale items, and derive new facts and edges (the home for
+/// projector-driven graph extraction managed-side). It is the asynchronous
+/// counterpart to the synchronous [`Memory::improve`] verb. A seam like
+/// [`Embedder`] and [`Reranker`]: the policy lives in application or managed code,
+/// so the SDK ships the contract and a deployment fills it.
+#[trait_variant::make(Consolidator: Send)]
+pub trait LocalConsolidator {
+    /// Run one consolidation pass over `scope`, returning what it changed.
+    async fn consolidate(&self, scope: &MemoryScope) -> Result<ConsolidationReport, LaserError>;
+}
+
+/// Wraps any [`Memory`] with a [`Reranker`] second stage: `recall` runs the inner
+/// backend's retrieval, then reorders the candidates through the reranker when the
+/// query carries a `semantic` string (the rerank query). `remember` / `improve` /
+/// `forget` delegate unchanged. Composition, not configuration: the rerank stage
+/// is a wrapper so any backend gains it without a backend-specific flag.
+pub struct RerankedMemory<M, R> {
+    inner: M,
+    reranker: R,
+}
+
+impl<M, R> RerankedMemory<M, R> {
+    /// Wrap `inner` so its recall is reranked by `reranker`.
+    pub fn new(inner: M, reranker: R) -> Self {
+        Self { inner, reranker }
+    }
+}
+
+impl<M: Memory + Sync, R: Reranker + Sync> Memory for RerankedMemory<M, R> {
+    async fn remember(
+        &self,
+        scope: &MemoryScope,
+        payload: Vec<u8>,
+    ) -> Result<MemoryId, LaserError> {
+        self.inner.remember(scope, payload).await
+    }
+
+    async fn recall(
+        &self,
+        scope: &MemoryScope,
+        query: &MemoryQuery,
+    ) -> Result<Vec<MemoryItem>, LaserError> {
+        let candidates = self.inner.recall(scope, query).await?;
+        match &query.semantic {
+            Some(text) => self.reranker.rerank(text, candidates).await,
+            None => Ok(candidates),
+        }
+    }
+
+    async fn improve(
+        &self,
+        scope: &MemoryScope,
+        feedback: Feedback,
+    ) -> Result<MemoryId, LaserError> {
+        self.inner.improve(scope, feedback).await
+    }
+
+    async fn forget(&self, scope: &MemoryScope, id: MemoryId) -> Result<(), LaserError> {
+        self.inner.forget(scope, id).await
+    }
+}
+
 /// A `Memory` backend that rides the query layer: `remember` publishes the
 /// payload and embedding as a record on `topic`, `recall` runs a vector query
 /// against the materialized index. Production-friendly: it inherits
@@ -768,53 +908,78 @@ impl<E: Embedder + Sync> Memory for VectorMemory<E> {
         scope: &MemoryScope,
         query: &MemoryQuery,
     ) -> Result<Vec<MemoryItem>, LaserError> {
+        // Which signals this strategy fuses. `Auto`/`Semantic`/`Hybrid` use the
+        // embedding; `Keyword`/`Hybrid` add lexical overlap. `Keyword` skips the
+        // embed call entirely (no model round-trip when only lexical is wanted).
+        let wants_semantic = !matches!(query.strategy, RecallStrategy::Keyword);
+        let wants_keyword = matches!(
+            query.strategy,
+            RecallStrategy::Keyword | RecallStrategy::Hybrid
+        );
         // Embed the query before locking so the network/model call never holds the lock.
-        let query_embedding = match &query.semantic {
-            Some(text) => Some(self.embedder.embed(text).await?),
-            None => None,
+        let query_embedding = match (&query.semantic, wants_semantic) {
+            (Some(text), true) => Some(self.embedder.embed(text).await?),
+            _ => None,
+        };
+        let query_tokens = match (&query.semantic, wants_keyword) {
+            (Some(text), true) => Some(tokenize(text)),
+            _ => None,
         };
         let agent_filter = query.agent.as_ref().or(scope.agent.as_ref());
         let items = self.items.lock().await;
-        let mut matched: Vec<&VectorEntry> = items
+        let matched: Vec<&VectorEntry> = items
             .iter()
             .filter(|entry| {
                 scope
                     .conversation
                     .is_none_or(|c| entry.scope.conversation == Some(c))
                     && agent_filter.is_none_or(|a| entry.scope.agent.as_ref() == Some(a))
+                    && scope
+                        .user
+                        .as_ref()
+                        .is_none_or(|u| entry.scope.user.as_ref() == Some(u))
+                    && scope
+                        .app
+                        .as_ref()
+                        .is_none_or(|a| entry.scope.app.as_ref() == Some(a))
             })
             .collect();
 
         let any_feedback = matched.iter().any(|entry| entry.feedback != 0.0);
 
-        if let Some(query_embedding) = &query_embedding {
-            // Rank by similarity plus the entry's accumulated feedback boost.
-            let score =
-                |entry: &VectorEntry| cosine(query_embedding, &entry.embedding) + entry.feedback;
-            matched.sort_by(|a, b| score(b).total_cmp(&score(a)));
-            Ok(matched
+        // Fuse the active signals into one score: semantic similarity, lexical
+        // overlap, and the accumulated feedback boost. A signal that is off
+        // contributes nothing, so `Auto` with a query reduces to the prior
+        // similarity-plus-feedback behavior exactly.
+        let score = |entry: &VectorEntry| {
+            let mut total = entry.feedback;
+            if let Some(query_embedding) = &query_embedding {
+                total += cosine(query_embedding, &entry.embedding);
+            }
+            if let Some(query_tokens) = &query_tokens {
+                total += keyword_score(query_tokens, &entry.item.payload);
+            }
+            total
+        };
+
+        let any_query_signal = query_embedding.is_some() || query_tokens.is_some();
+        if any_query_signal || any_feedback {
+            // Score each entry once, then sort, so the cosine is not recomputed
+            // per comparison.
+            let mut scored: Vec<(f32, &VectorEntry)> =
+                matched.iter().map(|&entry| (score(entry), entry)).collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            Ok(scored
                 .into_iter()
                 .take(query.limit)
-                .map(|entry| {
+                .map(|(score, entry)| {
                     let mut item = entry.item.clone();
-                    item.score = Some(score(entry));
-                    item
-                })
-                .collect())
-        } else if any_feedback {
-            // No semantic query but feedback exists: rank promoted items first.
-            matched.sort_by(|a, b| b.feedback.total_cmp(&a.feedback));
-            Ok(matched
-                .into_iter()
-                .take(query.limit)
-                .map(|entry| {
-                    let mut item = entry.item.clone();
-                    item.score = Some(entry.feedback);
+                    item.score = Some(score);
                     item
                 })
                 .collect())
         } else {
-            // No semantic query and no feedback: the most recent `limit`.
+            // No query signal and no feedback: the most recent `limit`.
             let start = matched.len().saturating_sub(query.limit);
             Ok(matched[start..]
                 .iter()
@@ -852,6 +1017,34 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (norm_a * norm_b)
     }
+}
+
+// Lowercase alphanumeric word tokens, the unit the in-process keyword signal
+// scores on. A real backend uses BM25 over an inverted index. This is the
+// dependency-free equivalent for `VectorMemory`.
+fn tokenize(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+// The lexical-overlap signal for the hybrid recall: the fraction of the query's
+// tokens that appear in the item body, in [0, 1] so it composes on the same scale
+// as cosine similarity. Returns 0 when the body is not UTF-8 or the query is empty.
+fn keyword_score(query_tokens: &HashSet<String>, body: &[u8]) -> f32 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return 0.0;
+    };
+    let body_tokens = tokenize(text);
+    let hits = query_tokens
+        .iter()
+        .filter(|token| body_tokens.contains(*token))
+        .count();
+    hits as f32 / query_tokens.len() as f32
 }
 
 /// A `Memory` backend over the managed key-value store (`kv` feature, requires
@@ -1014,11 +1207,31 @@ impl Memory for KvMemory<'_> {
     }
 }
 
-/// The front door to agent memory. Created by [`Laser::memory`], it picks the
-/// strongest backend the negotiated capabilities allow (the managed key-value
-/// store when available, otherwise the append-only log) and runs the four verbs
-/// through it. Hold one instance per namespace and reuse it: the log backend
-/// keeps its incremental recall cursor across calls.
+/// Which backend the memory front door runs on. [`Auto`](Self::Auto) is the
+/// default and is what [`Laser::memory`] uses. Pass an explicit one to
+/// [`Laser::memory_with`] when the capability-driven pick is not what you want:
+/// force the durable key-value store, or force the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryBackend {
+    /// The managed key-value store when the connection advertises it, otherwise
+    /// the append-only log. The default.
+    #[default]
+    Auto,
+    /// Always the append-only log (works on raw Apache Iggy, no managed plane).
+    /// Recall replays the agent audit topic and folds the latest per item.
+    Log,
+    /// Always the managed key-value store: durable mutable point state, keyed by
+    /// conversation, with optional per-key expiry. Requires the `kv` feature and a
+    /// deployment that serves KV, otherwise the verbs return `Unsupported`.
+    #[cfg(feature = "kv")]
+    Kv,
+}
+
+/// The front door to agent memory. Created by [`Laser::memory`] (capability-driven
+/// pick) or [`Laser::memory_with`] (explicit backend), it runs the four verbs
+/// through the chosen backend. Hold one instance per namespace and reuse it: the
+/// log backend keeps its incremental recall cursor across calls. Call
+/// [`backend`](Self::backend) to see which backend a pick resolved to.
 pub enum MemoryHandle {
     /// The append-only log backend (open core).
     Log(LogMemory),
@@ -1027,23 +1240,67 @@ pub enum MemoryHandle {
     Kv { laser: Laser, namespace: String },
 }
 
+impl MemoryHandle {
+    /// Which backend this handle resolved to: `"kv"` for the managed key-value
+    /// store, `"log"` for the append-only log. The auto front door
+    /// [`Laser::memory`] picks by capability, so read this to confirm the pick
+    /// (for example, to warn when a deployment fell back to the log).
+    #[must_use]
+    pub fn backend(&self) -> &'static str {
+        match self {
+            Self::Log(_) => "log",
+            #[cfg(feature = "kv")]
+            Self::Kv { .. } => "kv",
+        }
+    }
+}
+
 impl Laser {
-    /// Memory in `namespace`. Picks the managed key-value backend when the
-    /// connection advertises it, otherwise the append-only log backend (which
-    /// works on raw Apache Iggy). For semantic or graph recall, construct
-    /// [`VectorMemory`], [`QueryMemory`], or use [`graph`](Self::graph) with an
-    /// embedder. The `namespace` scopes the key-value backend. The log backend
-    /// rides the agent audit topic and ignores it.
+    /// Memory in `namespace`, on the backend the negotiated capabilities favor:
+    /// the managed key-value store when the connection advertises it, otherwise
+    /// the append-only log (which works on raw Apache Iggy). This is
+    /// [`memory_with`](Self::memory_with) with [`MemoryBackend::Auto`]. To force a
+    /// backend regardless of negotiation use `memory_with`. For semantic or graph
+    /// recall, construct [`VectorMemory`], [`QueryMemory`], or use
+    /// [`graph`](Self::graph) with an embedder. The `namespace` scopes the
+    /// key-value backend. The log backend rides the agent audit topic and ignores
+    /// it.
     pub fn memory(&self, namespace: impl Into<String>) -> MemoryHandle {
-        #[cfg(feature = "kv")]
-        if self.capabilities.kv.available {
-            return MemoryHandle::Kv {
+        self.memory_with(namespace, MemoryBackend::Auto)
+    }
+
+    /// Memory in `namespace` on an explicit [`MemoryBackend`]. Use this when the
+    /// capability-driven default is not what you want: `Kv` forces the durable
+    /// key-value store (so a managed deployment persists the memory even when the
+    /// connection negotiated a narrower capability set), and `Log` forces the
+    /// append-only log. `Auto` is what [`memory`](Self::memory) uses.
+    pub fn memory_with(
+        &self,
+        namespace: impl Into<String>,
+        backend: MemoryBackend,
+    ) -> MemoryHandle {
+        match backend {
+            #[cfg(feature = "kv")]
+            MemoryBackend::Kv => MemoryHandle::Kv {
                 laser: self.clone(),
                 namespace: namespace.into(),
-            };
+            },
+            MemoryBackend::Log => {
+                let _ = namespace;
+                MemoryHandle::Log(LogMemory::new(self.clone()))
+            }
+            MemoryBackend::Auto => {
+                #[cfg(feature = "kv")]
+                if self.capabilities.kv.available {
+                    return MemoryHandle::Kv {
+                        laser: self.clone(),
+                        namespace: namespace.into(),
+                    };
+                }
+                let _ = namespace;
+                MemoryHandle::Log(LogMemory::new(self.clone()))
+            }
         }
-        let _ = namespace;
-        MemoryHandle::Log(LogMemory::new(self.clone()))
     }
 
     /// A handle to the knowledge-graph surface `name`. Traversals require the
@@ -1061,6 +1318,7 @@ impl Laser {
             edge_filter: None,
             return_: laser_wire::graph::GraphReturn::Nodes,
             limit: laser_wire::limits::DEFAULT_RECALL_LIMIT,
+            as_of: None,
         }
     }
 }
@@ -1305,6 +1563,7 @@ pub struct GraphHandle<'a> {
     edge_filter: Option<laser_wire::query::Filter>,
     return_: laser_wire::graph::GraphReturn,
     limit: usize,
+    as_of: Option<u64>,
 }
 
 #[cfg(feature = "query")]
@@ -1370,6 +1629,14 @@ impl GraphHandle<'_> {
         self
     }
 
+    /// Return the traversed edges as `(source, type, destination)` triplets
+    /// instead of the reachable nodes.
+    #[must_use]
+    pub fn return_triplets(mut self) -> Self {
+        self.return_ = laser_wire::graph::GraphReturn::Triplets;
+        self
+    }
+
     /// Return whole paths (node and edge id sequences) instead of nodes.
     #[must_use]
     pub fn return_paths(mut self) -> Self {
@@ -1381,6 +1648,15 @@ impl GraphHandle<'_> {
     #[must_use]
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Read the graph as of `micros` (valid-time, epoch micros): only edges whose
+    /// valid-time window contains that instant are traversed. Applies to both
+    /// `fetch` and `neighbors`.
+    #[must_use]
+    pub fn as_of(mut self, micros: u64) -> Self {
+        self.as_of = Some(micros);
         self
     }
 
@@ -1400,6 +1676,7 @@ impl GraphHandle<'_> {
             limit: self.limit,
             fork: None,
             consistency: laser_wire::query::Consistency::Eventual,
+            as_of: self.as_of,
         };
         let payload = bytes::Bytes::from(
             laser_wire::framing::encode_named(&query)
@@ -1433,6 +1710,7 @@ impl GraphHandle<'_> {
             edge_type,
             depth,
             limit: self.limit,
+            as_of: self.as_of,
         };
         let payload = bytes::Bytes::from(
             laser_wire::framing::encode_named(&request)
@@ -1614,6 +1892,112 @@ mod tests {
         .expect("recall should succeed");
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].payload.as_slice(), b"the cat sat");
+    }
+
+    #[test]
+    fn given_a_memory_backend_when_defaulted_then_should_be_auto() {
+        assert_eq!(MemoryBackend::default(), MemoryBackend::Auto);
+    }
+
+    #[test]
+    fn given_memory_kinds_when_classified_then_should_map_to_the_taxonomy() {
+        assert_eq!(MemoryKind::Message.class(), MemoryClass::Episodic);
+        assert_eq!(MemoryKind::Procedure.class(), MemoryClass::Procedural);
+        assert_eq!(MemoryKind::Fact.class(), MemoryClass::Semantic);
+        assert_eq!(MemoryKind::Summary.class(), MemoryClass::Semantic);
+    }
+
+    #[tokio::test]
+    async fn given_a_keyword_strategy_when_recalling_then_should_match_exact_terms() {
+        let memory = VectorMemory::new(WordEmbedder);
+        let scope = MemoryScope::builder()
+            .conversation(ConversationId::new())
+            .build();
+        Memory::remember(&memory, &scope, b"alpha beta".to_vec())
+            .await
+            .expect("remember alpha");
+        Memory::remember(&memory, &scope, b"gamma delta".to_vec())
+            .await
+            .expect("remember gamma");
+        let top = Memory::recall(
+            &memory,
+            &scope,
+            &MemoryQuery::builder()
+                .semantic("gamma".to_owned())
+                .strategy(RecallStrategy::Keyword)
+                .limit(1)
+                .build(),
+        )
+        .await
+        .expect("keyword recall");
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].payload.as_slice(), b"gamma delta");
+    }
+
+    #[tokio::test]
+    async fn given_a_user_scope_when_recalling_then_should_narrow_to_that_user() {
+        let memory = VectorMemory::new(WordEmbedder);
+        let conversation = ConversationId::new();
+        let alice = MemoryScope::builder()
+            .conversation(conversation)
+            .user("alice".to_owned())
+            .build();
+        let bob = MemoryScope::builder()
+            .conversation(conversation)
+            .user("bob".to_owned())
+            .build();
+        Memory::remember(&memory, &alice, b"alice secret".to_vec())
+            .await
+            .expect("remember alice");
+        Memory::remember(&memory, &bob, b"bob secret".to_vec())
+            .await
+            .expect("remember bob");
+        let hits = Memory::recall(&memory, &alice, &MemoryQuery::builder().build())
+            .await
+            .expect("recall alice");
+        assert_eq!(hits.len(), 1, "only alice's item is in scope");
+        assert_eq!(hits[0].payload.as_slice(), b"alice secret");
+    }
+
+    struct ReverseReranker;
+
+    impl Reranker for ReverseReranker {
+        async fn rerank(
+            &self,
+            _query: &str,
+            mut items: Vec<MemoryItem>,
+        ) -> Result<Vec<MemoryItem>, LaserError> {
+            items.reverse();
+            Ok(items)
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_reranked_memory_when_recalling_then_should_apply_the_reranker() {
+        let inner = VectorMemory::new(WordEmbedder);
+        let scope = MemoryScope::builder()
+            .conversation(ConversationId::new())
+            .build();
+        Memory::remember(&inner, &scope, b"the cat sat".to_vec())
+            .await
+            .expect("remember cat");
+        Memory::remember(&inner, &scope, b"the dog ran".to_vec())
+            .await
+            .expect("remember dog");
+        let reranked = RerankedMemory::new(inner, ReverseReranker);
+        let hits = Memory::recall(
+            &reranked,
+            &scope,
+            &MemoryQuery::builder().semantic("cat".to_owned()).build(),
+        )
+        .await
+        .expect("reranked recall");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].payload.as_slice(),
+            b"the dog ran",
+            "the reranker moved the dog note to the front"
+        );
     }
 
     #[test]

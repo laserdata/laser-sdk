@@ -11,17 +11,20 @@ use tracing::info;
 //                                    forget what is stale. The four verbs as one
 //                                    loop over `VectorMemory`.
 //
-//   KNOWLEDGE GRAPH (managed)        the durable side: entities become
-//                                    content-addressed nodes, relationships typed
-//                                    edges, and a traversal answers how things
-//                                    connect, what recall alone cannot.
+//   DURABLE MEMORY (managed)         the same verbs over `KvMemory`, the managed
+//                                    key-value store, so facts survive restarts.
+//
+//   KNOWLEDGE GRAPH (managed)        entities become content-addressed nodes,
+//                                    relationships typed edges, and a traversal
+//                                    answers how things connect, what recall
+//                                    alone cannot.
 //
 //   cargo run --example memory
 //
-// The memory half needs no server. The graph half is a managed read model (AGDX
-// A13): point the example at a LaserData Cloud deployment to run it, otherwise it
-// prints how and exits clean. The named graph is browsable in the management
-// console's graph explorer.
+// The first half needs no server. The durable-memory and graph halves are managed
+// (AGDX A13): point the example at a LaserData Cloud deployment to run them,
+// otherwise it prints how and exits clean. The durable memories show in the
+// console's Memory view (KV store) and the graph in its explorer.
 
 // What the assistant knows, each line one remembered fact.
 const KNOWLEDGE: &[&str] = &[
@@ -218,6 +221,29 @@ async fn main() -> Result<(), LaserError> {
         return Ok(());
     };
 
+    // DURABLE MEMORY (managed). The `VectorMemory` above lives in this process and
+    // is gone when it exits. `memory_with(.., Kv)` instead persists each item in
+    // the managed key-value store, so the facts survive restarts and are browsable
+    // in the console's Memory view (the KV-store source, namespace `incidents`).
+    // Same four verbs, a durable backend chosen explicitly. (Plain `memory(..)`
+    // would auto-pick by capability. Here we force KV.)
+    phase("Remember durable facts in the KV store");
+    let durable = laser.memory_with("incidents", MemoryBackend::Kv);
+    for fact in KNOWLEDGE {
+        durable
+            .remember(fact.as_bytes().to_vec())
+            .scope(conversation)
+            .send()
+            .await?;
+    }
+    let durable_hits = durable.recall(conversation).limit(3).fetch().await?;
+    info!(
+        "stored {} durable facts in the KV store via the {} backend, recalled {} most-recent",
+        KNOWLEDGE.len(),
+        durable.backend(),
+        durable_hits.len()
+    );
+
     // BUILD. A realistic slice of a platform's operational knowledge: services own
     // teams, depend on components, fail over to mitigations, and incidents touch
     // both. `GraphNode::entity` content-addresses the id, so a component named by
@@ -297,20 +323,36 @@ async fn main() -> Result<(), LaserError> {
         ("INC-102", "affected", "search"),
         ("INC-102", "affected", "search-index"),
     ];
+    // A `mitigated_by` edge is a bitemporal fact: the mitigation became true when
+    // it was applied. Stamp a valid-from so the edge records when, not just that,
+    // it holds. The orthogonal system-time axis (when we observed it) is the log
+    // offset of the upsert, which the substrate records for free, so a later
+    // traversal can ask what was true at a given time. Other edges are open-ended.
+    const MITIGATION_SINCE_US: u64 = 1_900_000_000_000_000;
     let edges: Vec<GraphEdge> = relationships
         .iter()
         .map(|(from, relationship, to)| {
-            GraphEdge::relate(&by_value[from], *relationship, &by_value[to])
+            let edge = GraphEdge::relate(&by_value[from], *relationship, &by_value[to]);
+            if *relationship == "mitigated_by" {
+                edge.valid(Some(MITIGATION_SINCE_US), None)
+            } else {
+                edge
+            }
         })
         .collect();
+    let mitigations = edges.iter().filter(|e| e.valid_from.is_some()).count();
     let nodes: Vec<GraphNode> = by_value.values().cloned().collect();
     let checkout = by_value["checkout"].clone();
     let incident = by_value["INC-101"].clone();
-    info!("built {} nodes and {} edges", nodes.len(), edges.len());
-    // Register the graph projection so the console explorer lists `ops`. A graph
-    // built only by `upsert` (no projection) is reachable by name but not
-    // discoverable. The entity schema is the projector path: bind it to a source
-    // topic and the projector extracts the same nodes and edges this writes here.
+    info!(
+        "built {} nodes and {} edges ({mitigations} bitemporal, carrying a valid-from)",
+        nodes.len(),
+        edges.len()
+    );
+    // Register the graph projection so the console explorer lists `ops`. The
+    // entity schema is the extraction plan: bind it to a source topic and the
+    // projector applies it per record. Here the demo writes the graph directly
+    // with the `upsert` below, which is the same content-addressed write path.
     laser
         .projections()
         .register_graph(
@@ -334,6 +376,8 @@ async fn main() -> Result<(), LaserError> {
                         edge_type: "depends_on".to_owned(),
                         from_pointer: "/service".to_owned(),
                         to_pointer: "/component".to_owned(),
+                        valid_from_pointer: None,
+                        valid_to_pointer: None,
                     }],
                 })
                 .build(),
@@ -384,6 +428,53 @@ async fn main() -> Result<(), LaserError> {
         .collect();
     touched.sort_unstable();
     info!("what INC-101 affected: {}", touched.join(", "));
+
+    // BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an "as of" read
+    // sees the graph as it was then. Before the mitigation was applied, checkout
+    // has no failover. After, the read-replica mitigation appears. Same query, two
+    // points in valid-time.
+    phase("Read the graph as of a point in time");
+    let before = laser
+        .graph(GRAPH)
+        .start_ids(vec![checkout.id])
+        .out("mitigated_by")
+        .as_of(MITIGATION_SINCE_US - 1)
+        .fetch()
+        .await?;
+    let after = laser
+        .graph(GRAPH)
+        .start_ids(vec![checkout.id])
+        .out("mitigated_by")
+        .as_of(MITIGATION_SINCE_US + 1)
+        .fetch()
+        .await?;
+    let reached = |result: &laser_sdk::wire::graph::GraphResult| {
+        result
+            .nodes
+            .iter()
+            .filter(|node| node.id != checkout.id)
+            .count()
+    };
+    info!(
+        "checkout mitigations before the rollout: {}, after: {}",
+        reached(&before),
+        reached(&after)
+    );
+
+    // PATHS. The same traversal, asking for whole paths instead of a node set, so
+    // a caller sees how an incident reaches a component, not just that it does.
+    phase("Return whole paths");
+    let paths = laser
+        .graph(GRAPH)
+        .start_ids(vec![incident.id])
+        .out("affected")
+        .return_paths()
+        .fetch()
+        .await?;
+    info!(
+        "INC-101 reaches {} components by a traced path",
+        paths.paths.len()
+    );
 
     info!("done: memory recalls what is relevant, the graph shows how it connects");
     Ok(())

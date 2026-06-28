@@ -28,3 +28,9 @@ Feature: Knowledge graph traversal semantics
     Given an empty graph
     When I observe "Alice" works_at "Acme"
     Then traversing from "Acme" incoming "works_at" reaches "Alice"
+
+  Scenario: An "as of" traversal follows only edges valid at that instant
+    Given an empty graph
+    When I observe "checkout" mitigated_by "replica" valid from 100
+    Then traversing from "checkout" out "mitigated_by" as of 50 does not reach "replica"
+    And traversing from "checkout" out "mitigated_by" as of 150 reaches "replica"

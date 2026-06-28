@@ -1,6 +1,6 @@
 // The one content-hash every SDK shares, so a content-addressed id (a deduped
 // memory item, a converged graph node) is identical across languages. Pure and
-// dependency-free FNV-1a, no clock or entropy (id GENERATION lives SDK-side; this
+// dependency-free FNV-1a, no clock or entropy (id GENERATION lives SDK-side. This
 // is deterministic hashing, which belongs in the contract). A port reproduces it
 // from the same byte segments and the fixture pins the result.
 

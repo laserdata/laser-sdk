@@ -81,7 +81,7 @@ impl MemoryEngine {
     }
 
     /// Recall up to `limit` items. With feedback present, items rank by weight
-    /// (promoted first); otherwise the most recent come first. Returns the bodies
+    /// (promoted first). Otherwise the most recent come first. Returns the bodies
     /// as text, the form the scenarios assert against.
     pub fn recall(&self, limit: usize) -> Vec<String> {
         let mut live: Vec<&Entry> = self

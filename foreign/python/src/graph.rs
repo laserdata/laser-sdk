@@ -109,6 +109,14 @@ fn edge_from_dict(obj: &Bound<'_, PyAny>) -> PyResult<GraphEdge> {
         Some(value) => value.extract::<f32>()?,
         None => 1.0,
     };
+    let valid_from = match dict.get_item("valid_from")? {
+        Some(value) => Some(value.extract::<u64>()?),
+        None => None,
+    };
+    let valid_to = match dict.get_item("valid_to")? {
+        Some(value) => Some(value.extract::<u64>()?),
+        None => None,
+    };
     Ok(GraphEdge {
         id,
         from,
@@ -116,6 +124,8 @@ fn edge_from_dict(obj: &Bound<'_, PyAny>) -> PyResult<GraphEdge> {
         edge_type,
         weight,
         attrs: attrs_from_dict(dict)?,
+        valid_from,
+        valid_to,
     })
 }
 
@@ -138,6 +148,12 @@ fn edge_to_py(py: Python<'_>, edge: &GraphEdge) -> PyResult<Py<PyAny>> {
     dict.set_item("to", edge.to.to_string())?;
     dict.set_item("edge_type", &edge.edge_type)?;
     dict.set_item("weight", edge.weight)?;
+    if let Some(valid_from) = edge.valid_from {
+        dict.set_item("valid_from", valid_from)?;
+    }
+    if let Some(valid_to) = edge.valid_to {
+        dict.set_item("valid_to", valid_to)?;
+    }
     Ok(dict.into_any().unbind())
 }
 
@@ -153,6 +169,22 @@ fn result_to_py(py: Python<'_>, result: &GraphResult) -> PyResult<Py<PyAny>> {
     }
     dict.set_item("nodes", nodes)?;
     dict.set_item("edges", edges)?;
+    if !result.paths.is_empty() {
+        let paths = PyList::empty(py);
+        for path in &result.paths {
+            let entry = PyDict::new(py);
+            entry.set_item(
+                "nodes",
+                path.nodes.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            )?;
+            entry.set_item(
+                "edges",
+                path.edges.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            )?;
+            paths.append(entry)?;
+        }
+        dict.set_item("paths", paths)?;
+    }
     Ok(dict.into_any().unbind())
 }
 
@@ -243,7 +275,8 @@ impl PyGraph {
     /// Read `node`'s neighbors: the nodes reachable in `direction` over
     /// `edge_type` (any type when `None`), following the same hop `depth` times.
     /// Returns a `{"nodes": [...], "edges": [...]}` dict.
-    #[pyo3(signature = (node, *, direction="out", edge_type=None, depth=1, limit=0))]
+    #[pyo3(signature = (node, *, direction="out", edge_type=None, depth=1, limit=0, as_of=None))]
+    #[allow(clippy::too_many_arguments)]
     fn neighbors<'py>(
         &self,
         py: Python<'py>,
@@ -252,15 +285,18 @@ impl PyGraph {
         edge_type: Option<String>,
         depth: u32,
         limit: usize,
+        as_of: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let node = parse_node_id(&node)?;
         let dir = parse_dir(direction)?;
         let laser = self.laser.clone();
         let name = self.name.clone();
         future_into_py(py, async move {
-            let result = laser
-                .graph(name)
-                .limit(limit)
+            let mut handle = laser.graph(name).limit(limit);
+            if let Some(at) = as_of {
+                handle = handle.as_of(at);
+            }
+            let result = handle
                 .neighbors(node, dir, edge_type, depth)
                 .await
                 .map_err(to_pyerr)?;
@@ -268,23 +304,34 @@ impl PyGraph {
         })
     }
 
-    /// Run a traversal. Start from explicit node `start_ids`, or from every node
-    /// whose label equals `match_label`. `hops` is a list of `(edge_type,
-    /// direction)` tuples, one per step. `returns` is `"nodes"` or `"edges"`.
-    /// Returns a `{"nodes": [...], "edges": [...]}` dict.
-    #[pyo3(signature = (*, start_ids=None, match_label=None, hops=None, returns="nodes", limit=0))]
+    /// Run a traversal. Start from explicit node `start_ids`, from every node
+    /// whose label equals `match_label`, or from the `nearest` nodes to an
+    /// embedding (a `(embedding, k)` pair). `hops` is a list of `(edge_type,
+    /// direction)` tuples, one per step. `returns` is `"nodes"`, `"edges"`,
+    /// `"triplets"`, or `"paths"`. `as_of` (epoch micros) follows only edges
+    /// valid at that instant.
+    /// Returns a `{"nodes": [...], "edges": [...], "paths": [...]}` dict.
+    #[pyo3(signature = (*, start_ids=None, match_label=None, nearest=None, hops=None, returns="nodes", limit=0, as_of=None))]
+    #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
         py: Python<'py>,
         start_ids: Option<Vec<String>>,
         match_label: Option<String>,
+        nearest: Option<(Vec<f32>, usize)>,
         hops: Option<Vec<(String, String)>>,
         returns: &str,
         limit: usize,
+        as_of: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if start_ids.is_some() == match_label.is_some() {
+        if [start_ids.is_some(), match_label.is_some(), nearest.is_some()]
+            .iter()
+            .filter(|set| **set)
+            .count()
+            != 1
+        {
             return Err(InvalidError::new_err(
-                "pass exactly one of 'start_ids' or 'match_label'",
+                "pass exactly one of 'start_ids', 'match_label', or 'nearest'",
             ));
         }
         let ids = match start_ids {
@@ -300,14 +347,15 @@ impl PyGraph {
             .into_iter()
             .map(|(edge_type, direction)| Ok((edge_type, parse_dir(&direction)?)))
             .collect::<PyResult<Vec<_>>>()?;
-        let returns_edges = returns == "edges";
+        let returns = returns.to_owned();
         let laser = self.laser.clone();
         let name = self.name.clone();
         future_into_py(py, async move {
             let mut handle = laser.graph(name).limit(limit);
-            handle = match ids {
-                Some(ids) => handle.start_ids(ids),
-                None => handle.start_match(Filter::pred(
+            handle = match (ids, nearest) {
+                (Some(ids), _) => handle.start_ids(ids),
+                (_, Some((embedding, k))) => handle.start_nearest(embedding, k),
+                _ => handle.start_match(Filter::pred(
                     "label",
                     CmpOp::Eq,
                     match_label.unwrap_or_default(),
@@ -320,8 +368,14 @@ impl PyGraph {
                     EdgeDir::Both => handle.both(edge_type),
                 };
             }
-            if returns_edges {
-                handle = handle.return_edges();
+            handle = match returns.as_str() {
+                "edges" => handle.return_edges(),
+                "triplets" => handle.return_triplets(),
+                "paths" => handle.return_paths(),
+                _ => handle,
+            };
+            if let Some(at) = as_of {
+                handle = handle.as_of(at);
             }
             let result = handle.fetch().await.map_err(to_pyerr)?;
             Python::attach(|py| result_to_py(py, &result))
@@ -342,8 +396,10 @@ impl PyLaser {
     }
 
     /// Register a graph projection from a dict (a projection with `kind = "graph"`
-    /// and an `entity_schema`). The managed host extracts nodes and edges from the
-    /// bound source into the named knowledge graph. Applied asynchronously.
+    /// and an `entity_schema`). It records the named knowledge graph and its
+    /// node/edge extraction plan. Graph data is written via `graph(name).upsert(..)`,
+    /// or by the projector when the projection is bound to a source topic, which
+    /// applies the entity schema to each record. Applied asynchronously.
     fn register_graph<'py>(
         &self,
         py: Python<'py>,

@@ -284,8 +284,10 @@ impl From<ProjectionKind> for u8 {
     }
 }
 
-/// How a graph projection extracts nodes and edges from a payload. Pointer-based
-/// (RFC 6901) and deterministic, so no model call is needed to build the graph.
+/// The declared plan for extracting nodes and edges from a payload. Pointer-based
+/// (RFC 6901) and deterministic, so no model call is needed. Recorded on a graph
+/// projection for discovery and as the extraction contract. Graph data is written
+/// via the graph upsert op. Applying this plan to a bound source is managed-side.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EntitySchema {
     pub nodes: Vec<NodeExtract>,
@@ -303,13 +305,21 @@ pub struct NodeExtract {
     pub embedding_pointer: Option<String>,
 }
 
-/// One edge-extraction rule: the edge type and the pointers to its endpoint
-/// values.
+/// One edge-extraction rule: the edge type, the pointers to its endpoint values,
+/// and optional pointers to the bitemporal valid-time window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EdgeExtract {
     pub edge_type: String,
     pub from_pointer: String,
     pub to_pointer: String,
+    /// RFC-6901 pointer to the valid-time start (epoch micros) for the extracted
+    /// edge, making it a bitemporal fact. `None` leaves the window open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from_pointer: Option<String>,
+    /// RFC-6901 pointer to the valid-time end (epoch micros). `None` leaves the
+    /// edge open-ended (still valid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to_pointer: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
