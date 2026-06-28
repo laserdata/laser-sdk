@@ -64,3 +64,21 @@ def traverse_as_of_reaches(bench, start, edge, at, target):
 )
 def traverse_as_of_excludes(bench, start, edge, at, target):
     assert target not in bench.graph_engine.traverse(start, [(edge, "out")], as_of=at)
+
+
+@when(parsers.parse('I observe "{src}" {edge_type} "{dst}" from "{source}"'))
+def observe_with_source(bench, src, edge_type, dst, source):
+    graph = bench.graph_engine
+    from_id = graph.upsert_node(src, source=source)
+    to_id = graph.upsert_node(dst, source=source)
+    graph.add_edge(from_id, edge_type, to_id, source=source)
+
+
+@then(parsers.parse('the source of node "{value}" is "{source}"'))
+def node_source_is(bench, value, source):
+    assert bench.graph_engine.node_source(value) == source
+
+
+@then(parsers.parse('the source of edge "{src}" {edge_type} "{dst}" is "{source}"'))
+def edge_source_is(bench, src, edge_type, dst, source):
+    assert bench.graph_engine.edge_source(src, edge_type, dst) == source

@@ -3,7 +3,9 @@ use crate::convert::py_to_de;
 use crate::errors::{InvalidError, to_pyerr};
 use laser_sdk::laser::Laser;
 use laser_sdk::query::{CmpOp, Filter, Projection, ProjectionKind, Value};
-use laser_sdk::wire::graph::{EdgeDir, EdgeId, GraphEdge, GraphNode, GraphResult, NodeId};
+use laser_sdk::wire::graph::{
+    EdgeDir, EdgeId, GraphEdge, GraphNode, GraphResult, NodeId, SourceRef,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -60,6 +62,50 @@ fn attrs_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Value)>> {
     Ok(attrs)
 }
 
+// Parse an optional `source` provenance dict (the inverse of `source_to_py`),
+// so a caller can stamp where a hand-built node or edge came from. Mirrors the
+// `SourceRef` variants by their `kind` tag.
+fn source_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<Option<SourceRef>> {
+    let Some(value) = dict.get_item("source")? else {
+        return Ok(None);
+    };
+    let source = value
+        .cast::<PyDict>()
+        .map_err(|_| InvalidError::new_err("'source' must be a dict"))?;
+    let get = |key: &str| -> PyResult<String> {
+        source
+            .get_item(key)?
+            .ok_or_else(|| InvalidError::new_err(format!("source needs '{key}'")))?
+            .extract::<String>()
+    };
+    let kind = get("kind")?;
+    let parsed = match kind.as_str() {
+        "message" => SourceRef::Message {
+            stream: get("stream")?,
+            topic: get("topic")?,
+            partition: source
+                .get_item("partition")?
+                .ok_or_else(|| InvalidError::new_err("source needs 'partition'"))?
+                .extract::<u32>()?,
+            offset: source
+                .get_item("offset")?
+                .ok_or_else(|| InvalidError::new_err("source needs 'offset'"))?
+                .extract::<u64>()?,
+        },
+        "kv" => SourceRef::Kv {
+            namespace: get("namespace")?,
+            key: get("key")?,
+        },
+        "memory" => SourceRef::Memory { id: get("id")? },
+        other => {
+            return Err(InvalidError::new_err(format!(
+                "source 'kind' must be 'message', 'kv', or 'memory', got '{other}'"
+            )));
+        }
+    };
+    Ok(Some(parsed))
+}
+
 fn node_from_dict(obj: &Bound<'_, PyAny>) -> PyResult<GraphNode> {
     let dict = obj
         .cast::<PyDict>()
@@ -77,6 +123,7 @@ fn node_from_dict(obj: &Bound<'_, PyAny>) -> PyResult<GraphNode> {
         labels,
         attrs: attrs_from_dict(dict)?,
         embedding: None,
+        source: source_from_dict(dict)?,
     })
 }
 
@@ -126,7 +173,38 @@ fn edge_from_dict(obj: &Bound<'_, PyAny>) -> PyResult<GraphEdge> {
         attrs: attrs_from_dict(dict)?,
         valid_from,
         valid_to,
+        source: source_from_dict(dict)?,
     })
+}
+
+// Render a node's or edge's source provenance to a tagged Python dict, so a
+// reader sees where a graph element came from. Mirrors the `SourceRef` variants.
+fn source_to_py(py: Python<'_>, source: &SourceRef) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    match source {
+        SourceRef::Message {
+            stream,
+            topic,
+            partition,
+            offset,
+        } => {
+            dict.set_item("kind", "message")?;
+            dict.set_item("stream", stream)?;
+            dict.set_item("topic", topic)?;
+            dict.set_item("partition", *partition)?;
+            dict.set_item("offset", *offset)?;
+        }
+        SourceRef::Kv { namespace, key } => {
+            dict.set_item("kind", "kv")?;
+            dict.set_item("namespace", namespace)?;
+            dict.set_item("key", key)?;
+        }
+        SourceRef::Memory { id } => {
+            dict.set_item("kind", "memory")?;
+            dict.set_item("id", id)?;
+        }
+    }
+    Ok(dict.into_any().unbind())
 }
 
 fn node_to_py(py: Python<'_>, node: &GraphNode) -> PyResult<Py<PyAny>> {
@@ -138,6 +216,9 @@ fn node_to_py(py: Python<'_>, node: &GraphNode) -> PyResult<Py<PyAny>> {
         attrs.set_item(key, value_to_py(py, value)?)?;
     }
     dict.set_item("attrs", attrs)?;
+    if let Some(source) = &node.source {
+        dict.set_item("source", source_to_py(py, source)?)?;
+    }
     Ok(dict.into_any().unbind())
 }
 
@@ -153,6 +234,9 @@ fn edge_to_py(py: Python<'_>, edge: &GraphEdge) -> PyResult<Py<PyAny>> {
     }
     if let Some(valid_to) = edge.valid_to {
         dict.set_item("valid_to", valid_to)?;
+    }
+    if let Some(source) = &edge.source {
+        dict.set_item("source", source_to_py(py, source)?)?;
     }
     Ok(dict.into_any().unbind())
 }
@@ -175,11 +259,17 @@ fn result_to_py(py: Python<'_>, result: &GraphResult) -> PyResult<Py<PyAny>> {
             let entry = PyDict::new(py);
             entry.set_item(
                 "nodes",
-                path.nodes.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                path.nodes
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
             )?;
             entry.set_item(
                 "edges",
-                path.edges.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                path.edges
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
             )?;
             paths.append(entry)?;
         }
@@ -324,10 +414,14 @@ impl PyGraph {
         limit: usize,
         as_of: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if [start_ids.is_some(), match_label.is_some(), nearest.is_some()]
-            .iter()
-            .filter(|set| **set)
-            .count()
+        if [
+            start_ids.is_some(),
+            match_label.is_some(),
+            nearest.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count()
             != 1
         {
             return Err(InvalidError::new_err(

@@ -283,19 +283,34 @@ class GraphEngine:
 
     nodes: dict = field(default_factory=dict)
     edges: list = field(default_factory=list)
+    # Provenance: a node's source is first-writer (the first record it was seen
+    # in), an edge's is last-writer (the most recent record that asserted it).
+    node_sources: dict = field(default_factory=dict)
+    edge_sources: dict = field(default_factory=dict)
 
-    def upsert_node(self, value):
+    def upsert_node(self, value, source=None):
         nid = _node_id(value)
         self.nodes.setdefault(nid, value)
+        if source is not None:
+            self.node_sources.setdefault(nid, source)
         return nid
 
-    def add_edge(self, from_id, edge_type, to_id, valid_from=None, valid_to=None):
+    def add_edge(self, from_id, edge_type, to_id, valid_from=None, valid_to=None, source=None):
         # An edge carries an optional valid-time window (open-ended when a bound
         # is None), the bitemporal write path.
         self.edges.append((from_id, edge_type, to_id, valid_from, valid_to))
+        if source is not None:
+            self.edge_sources[(from_id, edge_type, to_id)] = source
 
     def node_count(self):
         return len(self.nodes)
+
+    def node_source(self, value):
+        return self.node_sources.get(_node_id(value))
+
+    def edge_source(self, from_value, edge_type, to_value):
+        key = (_node_id(from_value), edge_type, _node_id(to_value))
+        return self.edge_sources.get(key)
 
     def traverse(self, start, hops, as_of=None):
         # `as_of` (epoch micros) follows only edges whose valid-time window

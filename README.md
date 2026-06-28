@@ -1,6 +1,6 @@
 # Laser SDK
 
-> **Status: edge / prerelease (`0.0.1-rc.5`).** Pre-1.0 and moving fast. The wire contract, the AGDX spec, and the public API may change in any release, with no stability guarantee yet. Pin an exact version and expect breaking changes.
+> **Status: edge / prerelease (`0.0.1-rc.6`).** Pre-1.0 and moving fast. The wire contract, the AGDX spec, and the public API may change in any release, with no stability guarantee yet. Pin an exact version and expect breaking changes.
 
 An open data platform by [LaserData, Inc.](https://laserdata.com) over [Apache Iggy](https://iggy.apache.org) for streaming, querying, and coordinating data on a durable log. Ultra-low-latency streaming is the foundation, and on top of it sit declared projections with a query DSL, a key-value store, and copy-on-write forks, all on one connection. The log is the source of truth and every other surface is a read model on it. A reliable agent runtime and the Agent Data Exchange Protocol (AGDX) layer come on top when you build agents, but they are an optional extension. The streaming and data core stands on its own.
 
@@ -15,7 +15,7 @@ The data platform:
 - **Typed publish and consume**: serde values onto Iggy topics in one call, JSON/MessagePack/CBOR/BSON, schema-first Avro/Protobuf, or any raw bytes the SDK never inspects, batched in one network round-trip on both the send and poll sides.
 - **Declared projections and a query DSL**: filters, aggregates, time ranges, pagination, and vector recall over materialized indexes, declared once per topic like a database index, with an opt-in read-your-writes consistency level for reads that must see their own prior writes.
 - **A key-value store and copy-on-write forks** of the materialized read model, for working state and speculative branches. The store offers compare-and-swap for lock-free optimistic concurrency, conditional reads and writes, expiry, JSON merge-patch, and advisory leases on a shared key.
-- **A knowledge graph** as a managed read model: content-addressed nodes and edges with traversal, neighbor, nearest-vector, and whole-path reads, the relationship layer the agentic memory composes over. Edges carry an optional valid-time window for bitemporal facts, so a changed relationship is superseded without being destroyed, and an "as of" read traverses the graph as it was at any past instant.
+- **A knowledge graph** as a managed read model: content-addressed nodes and edges with traversal, neighbor, nearest-vector, and whole-path reads, the relationship layer the agentic memory composes over. Edges carry an optional valid-time window for bitemporal facts, so a changed relationship is superseded without being destroyed, and an "as of" read traverses the graph as it was at any past instant. A node and an edge also carry an optional `source`, the record an extraction came from, so a graph element links back to its origin (a message position, a key-value entry, or a memory item).
 
 The optional agent layer (opt in only when you build agents):
 
@@ -33,7 +33,7 @@ The SDK is built on the Apache Iggy SDK and never hides it: `laser.iggy_producer
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.5", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.6", features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
