@@ -10,8 +10,10 @@ pub use crate::agent::MemoryHandler;
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agdx, AgdxSend, AgdxStream, Agent, AgentConsumer, AgentCtx, AgentHandle, AgentHandler,
-    AgentMessage, ChunkAssembler, ConversationState, Deduplicator, RetryPolicy, Router,
-    SessionPolicy, SlidingWindow, StreamEvent,
+    AgentMessage, AgentRegistry, Budget, CapabilitySelector, ChunkAssembler, Contract,
+    ContractBuilder, ConversationState, Deduplicator, Gather, GatherPolicy, InboxRoute,
+    RegisteredCard, RetryPolicy, RoutePolicy, Router, SessionPolicy, SlidingWindow, StepContext,
+    StepFn, StepHandle, StreamEvent, Verifier, Workflow, WorkflowOutcome,
 };
 #[cfg(feature = "agui")]
 pub use crate::agui::AgUiEvent;
@@ -41,10 +43,10 @@ pub use crate::memory::KvMemory;
 pub use crate::memory::QueryMemory;
 #[cfg(feature = "agent")]
 pub use crate::memory::{
-    ConsolidationReport, Consolidator, Embedder, Feedback, Lifetime, LogMemory, Memory,
-    MemoryBackend, MemoryClass, MemoryHandle, MemoryId, MemoryItem, MemoryKind, MemoryQuery,
-    MemoryScope, RecallBuilder, RecallStrategy, RememberBuilder, RerankedMemory, Reranker,
-    VectorMemory,
+    ConsolidationReport, Consolidator, DefaultConsolidator, Embedder, Feedback, Lifetime,
+    LogMemory, Memory, MemoryBackend, MemoryClass, MemoryHandle, MemoryId, MemoryItem, MemoryKind,
+    MemoryQuery, MemoryScope, RecallBuilder, RecallStrategy, RememberBuilder, RerankedMemory,
+    Reranker, VectorMemory, to_context_block,
 };
 #[cfg(any(feature = "agent", feature = "query"))]
 pub use crate::message::Message;

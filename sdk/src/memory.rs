@@ -114,7 +114,7 @@ pub enum RecallStrategy {
 const READ_BATCH: u32 = 1000;
 
 /// A memory item's id (a ULID, so it sorts by creation time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryId(Ulid);
 
 impl MemoryId {
@@ -246,12 +246,61 @@ impl MemoryItem {
     }
 }
 
+/// Render recalled `items` into one context block for a prompt, in rank order,
+/// filling up to `token_budget` (advisory tokens, estimated at ~4 bytes each).
+/// Each item's payload is read as UTF-8 (lossily). When the budget is reached the
+/// remaining items are dropped and a `[… N more recalled item(s) omitted …]`
+/// marker is appended (summarize-on-overflow, the cheap form). `None` budget
+/// renders every item. The byte-based estimate avoids a tokenizer dependency, so
+/// it is a safe lower bound on a real model's count, not an exact one.
+pub fn to_context_block(items: &[MemoryItem], token_budget: Option<usize>) -> String {
+    let mut block = String::new();
+    let mut spent = 0usize;
+    let mut rendered = 0usize;
+    for item in items {
+        let text = String::from_utf8_lossy(&item.payload);
+        let cost = estimate_tokens(&text);
+        if let Some(budget) = token_budget
+            && rendered > 0
+            && spent + cost > budget
+        {
+            break;
+        }
+        if rendered > 0 {
+            block.push_str("\n\n");
+        }
+        block.push_str(&text);
+        spent += cost;
+        rendered += 1;
+    }
+    let omitted = items.len() - rendered;
+    if omitted > 0 {
+        if rendered > 0 {
+            block.push_str("\n\n");
+        }
+        block.push_str(&format!("[… {omitted} more recalled item(s) omitted …]"));
+    }
+    block
+}
+
+/// A cheap token estimate: about four bytes per token, the common rough proxy
+/// when no tokenizer is available. Rounds up so an item never estimates as zero.
+fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
 /// How to recall: a result limit, an optional agent filter, and an optional semantic query.
 #[derive(Debug, Clone, bon::Builder)]
 pub struct MemoryQuery {
     /// Max items to return.
     #[builder(default = 50)]
     pub limit: usize,
+    /// An optional context-window budget in tokens, alongside the item-count
+    /// `limit`. The recall result is rendered to fit it by
+    /// [`to_context_block`], which fills in rank order until the budget is
+    /// reached. Advisory: tokens are estimated, not tokenized (no model
+    /// dependency in the SDK).
+    pub token_budget: Option<usize>,
     pub agent: Option<AgentId>,
     /// A semantic query. Backends that embed (e.g. `VectorMemory`) rank results
     /// by similarity to this text. The log-backed default ignores it.
@@ -652,6 +701,50 @@ pub trait LocalConsolidator {
     async fn consolidate(&self, scope: &MemoryScope) -> Result<ConsolidationReport, LaserError>;
 }
 
+/// How many items one consolidation pass scans (the recall window it operates
+/// over). Items older than this window are not recalled, so they are neither kept
+/// nor pruned by a pass, they simply age out of view.
+const CONSOLIDATION_WINDOW: usize = 10_000;
+
+/// The mechanical consolidation pass: keep the most recent `max_items` per scope,
+/// prune the rest (oldest first, by the ULID id's creation-time order). A real,
+/// dependency-free bound on unbounded memory growth, the "prune" of the memify
+/// pass. Reweighting from feedback already happens in the recall backends. The
+/// summarize and fact-invalidation passes (closing a superseded graph edge's
+/// `valid_to`) need a generation seam and the managed graph, and layer on top of
+/// this rather than replacing it.
+pub struct DefaultConsolidator<M> {
+    memory: M,
+    max_items: usize,
+}
+
+impl<M> DefaultConsolidator<M> {
+    /// Keep at most `max_items` per scope on each pass.
+    pub fn new(memory: M, max_items: usize) -> Self {
+        Self { memory, max_items }
+    }
+}
+
+impl<M: Memory + Sync> Consolidator for DefaultConsolidator<M> {
+    async fn consolidate(&self, scope: &MemoryScope) -> Result<ConsolidationReport, LaserError> {
+        let query = MemoryQuery::builder().limit(CONSOLIDATION_WINDOW).build();
+        let mut items = self.memory.recall(scope, &query).await?;
+        if items.len() <= self.max_items {
+            return Ok(ConsolidationReport::default());
+        }
+        // Oldest first, by creation-time-ordered id, so the prune drops the oldest.
+        items.sort_by_key(|item| item.id);
+        let prune_count = items.len() - self.max_items;
+        let mut report = ConsolidationReport::default();
+        for item in items.into_iter().take(prune_count) {
+            if self.memory.forget(scope, item.id).await.is_ok() {
+                report.pruned += 1;
+            }
+        }
+        Ok(report)
+    }
+}
+
 /// Wraps any [`Memory`] with a [`Reranker`] second stage: `recall` runs the inner
 /// backend's retrieval, then reorders the candidates through the reranker when the
 /// query carries a `semantic` string (the rerank query). `remember` / `improve` /
@@ -909,7 +1002,7 @@ impl<E: Embedder + Sync> Memory for VectorMemory<E> {
         query: &MemoryQuery,
     ) -> Result<Vec<MemoryItem>, LaserError> {
         // Which signals this strategy fuses. `Auto`/`Semantic`/`Hybrid` use the
-        // embedding; `Keyword`/`Hybrid` add lexical overlap. `Keyword` skips the
+        // embedding. `Keyword`/`Hybrid` add lexical overlap. `Keyword` skips the
         // embed call entirely (no model round-trip when only lexical is wanted).
         let wants_semantic = !matches!(query.strategy, RecallStrategy::Keyword);
         let wants_keyword = matches!(
@@ -1792,6 +1885,132 @@ mod tests {
             .parse::<MemoryId>()
             .expect("a formatted memory id should parse");
         assert_eq!(parsed, id);
+    }
+
+    // An in-memory Memory for testing the consolidator: stores items in a Vec,
+    // recall returns them (up to the limit), forget removes by id.
+    struct MockMemory {
+        items: std::sync::Mutex<Vec<MemoryItem>>,
+    }
+
+    impl Memory for MockMemory {
+        async fn remember(
+            &self,
+            _scope: &MemoryScope,
+            payload: Vec<u8>,
+        ) -> Result<MemoryId, LaserError> {
+            let id = MemoryId::new();
+            let provenance = Provenance::builder()
+                .conversation_id(crate::types::ConversationId::new())
+                .build();
+            self.items
+                .lock()
+                .expect("lock")
+                .push(MemoryItem::plain(id, payload, provenance));
+            Ok(id)
+        }
+
+        async fn recall(
+            &self,
+            _scope: &MemoryScope,
+            query: &MemoryQuery,
+        ) -> Result<Vec<MemoryItem>, LaserError> {
+            Ok(self
+                .items
+                .lock()
+                .expect("lock")
+                .iter()
+                .take(query.limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn improve(
+            &self,
+            _scope: &MemoryScope,
+            _feedback: Feedback,
+        ) -> Result<MemoryId, LaserError> {
+            Ok(MemoryId::new())
+        }
+
+        async fn forget(&self, _scope: &MemoryScope, id: MemoryId) -> Result<(), LaserError> {
+            self.items
+                .lock()
+                .expect("lock")
+                .retain(|item| item.id != id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn given_more_than_max_items_when_consolidated_then_should_prune_down_to_the_cap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime builds");
+        runtime.block_on(async {
+            let mock = MockMemory {
+                items: std::sync::Mutex::new(Vec::new()),
+            };
+            let scope = MemoryScope::builder().build();
+            for i in 0..5 {
+                Memory::remember(&mock, &scope, format!("item-{i}").into_bytes())
+                    .await
+                    .expect("remember");
+            }
+            let consolidator = DefaultConsolidator::new(mock, 2);
+            let report = Consolidator::consolidate(&consolidator, &scope)
+                .await
+                .expect("consolidate");
+            assert_eq!(
+                report.pruned, 3,
+                "five items down to a cap of two prunes three"
+            );
+
+            let remaining = Memory::recall(
+                &consolidator.memory,
+                &scope,
+                &MemoryQuery::builder().limit(100).build(),
+            )
+            .await
+            .expect("recall");
+            assert_eq!(remaining.len(), 2);
+        });
+    }
+
+    fn context_item(body: &str) -> MemoryItem {
+        let provenance = Provenance::builder()
+            .conversation_id(crate::types::ConversationId::new())
+            .build();
+        MemoryItem::plain(MemoryId::new(), body.as_bytes().to_vec(), provenance)
+    }
+
+    #[test]
+    fn given_no_budget_when_rendered_then_should_join_every_item() {
+        let items = [context_item("alpha"), context_item("beta")];
+        assert_eq!(to_context_block(&items, None), "alpha\n\nbeta");
+    }
+
+    #[test]
+    fn given_a_token_budget_when_rendered_then_should_fill_in_order_and_mark_the_overflow() {
+        // ~4 bytes per token: a 6-token budget (24 bytes) fits the two 20-byte
+        // items below only one at a time.
+        let items = [
+            context_item("first twenty bytes!!"),
+            context_item("second twenty bytes!"),
+        ];
+        let block = to_context_block(&items, Some(6));
+        assert_eq!(
+            block,
+            "first twenty bytes!!\n\n[… 1 more recalled item(s) omitted …]"
+        );
+    }
+
+    #[test]
+    fn given_a_budget_smaller_than_the_first_item_when_rendered_then_should_keep_at_least_one() {
+        // The first item always renders, so a block is never empty when items exist.
+        let items = [context_item("a much longer single memory item")];
+        let block = to_context_block(&items, Some(1));
+        assert_eq!(block, "a much longer single memory item");
     }
 
     fn item_entry(id: MemoryId, body: &[u8]) -> Vec<u8> {

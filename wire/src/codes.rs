@@ -8,6 +8,7 @@
 //   1_000_300..=1_000_399  forks
 //   1_000_400..=1_000_499  agentic memory (remember/recall/improve/forget)
 //   1_000_500..=1_000_599  knowledge graph (traverse, neighbors, upsert)
+//   1_000_600..=1_000_699  agent and workflow control (submit/cancel/status/list)
 //
 // A query is a non-replicated read, so it is served off the log via these
 // managed commands instead of a topic round-trip. Raw Apache Iggy rejects them
@@ -27,6 +28,17 @@ pub const AGDX_HELLO_CODE: u32 = AGDX_COMMAND_BASE;
 /// actually serves (the backend is the single source of its own truth). Not a
 /// client-facing code, a client never sends it.
 pub const AGDX_BACKEND_HELLO_CODE: u32 = AGDX_COMMAND_BASE + 1;
+/// Fork-native command code: set this connection's advertised metadata (the
+/// transport-level discovery primitive). Handled by the streaming server itself,
+/// not forwarded to the plane, because it touches per-connection session state the
+/// plane never sees. Connection-scoped and cleared on disconnect.
+pub const AGDX_SET_CLIENT_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 2;
+/// Fork-native command code: list every connection with its advertised metadata.
+/// The discovery read, answered by the streaming server from its connection table.
+/// A LaserData-owned reply ([`crate::clients::ClientMetadataList`]), never the
+/// upstream Apache Iggy `get_clients` shape, so a stock Iggy SDK against LaserData
+/// Cloud and the metadata read stay byte-independent.
+pub const AGDX_GET_CLIENTS_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 3;
 // Execute a `Query` (query block): request body is a CBOR `QueryEnvelope`,
 // reply a CBOR `QueryReply`, off the log over the managed command channel.
 // Direct query ops reserve 1_000_100..=1_000_109, registry browse 1_000_110+.
@@ -85,6 +97,13 @@ pub const AGDX_KV_LEASE_CODE: u32 = AGDX_KV_BASE + 10;
 /// Managed command code: release an advisory lease early (the formal `RELEASE`
 /// primitive).
 pub const AGDX_KV_RELEASE_CODE: u32 = AGDX_KV_BASE + 11;
+/// Managed command code: fenced compare-and-swap. Applies the CAS only while the
+/// task's fence sequence still equals the presented token (the at-most-one
+/// effective-writer gate). Additive over [`KV_OP_VERSION`] 1: a backend or server
+/// that does not serve it rejects the code, which the client surfaces as an
+/// unsupported error. Whether it is served is advertised by the `kv_cas_fenced`
+/// capability flag.
+pub const AGDX_KV_CAS_FENCED_CODE: u32 = AGDX_KV_BASE + 12;
 
 // Fork block (1_000_300..): agentic copy-on-write branches of the materialized
 // read model. Each op is its own managed command, forwarded over the same bridge.
@@ -116,6 +135,23 @@ pub const AGDX_GRAPH_UPSERT_CODE: u32 = AGDX_GRAPH_BASE + 1;
 /// Managed command code: one-hop neighbor read.
 pub const AGDX_GRAPH_NEIGHBORS_CODE: u32 = AGDX_GRAPH_BASE + 2;
 
+// Agent and workflow control band (1_000_600..=1_000_699). Plane-served control
+// operations over the agent and workflow surfaces, forwarded over the same
+// bridge. Distinct from the agent ENVELOPE (the on-the-log message form, carried
+// by `agdx.av`, not a command code): this band is the request-reply control
+// surface a coordinator drives. Whether it is served is advertised by the
+// `agent_workflow` feature bit.
+/// Base of the agent and workflow control band.
+pub const AGDX_AGENT_BASE: u32 = AGDX_COMMAND_BASE + 600;
+/// Managed command code: submit a task to an agent or workflow.
+pub const AGDX_AGENT_SUBMIT_CODE: u32 = AGDX_AGENT_BASE;
+/// Managed command code: cancel a submitted task.
+pub const AGDX_AGENT_CANCEL_CODE: u32 = AGDX_AGENT_BASE + 1;
+/// Managed command code: read a task's status.
+pub const AGDX_AGENT_STATUS_CODE: u32 = AGDX_AGENT_BASE + 2;
+/// Managed command code: list tasks.
+pub const AGDX_AGENT_LIST_CODE: u32 = AGDX_AGENT_BASE + 3;
+
 // Per-surface op-schema versions, stamped on every request envelope (or, for
 // the agent surface, carried as the `agdx.av` header). A peer rejects a payload
 // it cannot decode rather than mis-reading a skewed schema.
@@ -129,6 +165,18 @@ pub const KV_OP_VERSION: u32 = 1;
 pub const FORK_OP_VERSION: u32 = 1;
 /// Wire version of the graph op envelopes.
 pub const GRAPH_OP_VERSION: u32 = 1;
+/// Wire version of the agent and workflow control-band envelopes. Distinct from
+/// [`AGENT_OP_VERSION`] (the on-the-log envelope), this versions the request and
+/// reply types of the control band.
+pub const AGENT_WORKFLOW_OP_VERSION: u32 = 1;
+/// Wire version of the client-metadata discovery request and reply
+/// ([`crate::clients`]).
+pub const CLIENT_METADATA_OP_VERSION: u32 = 1;
+/// Wire version of the agent presence body ([`crate::agent::AgentPresence`]) an
+/// agent advertises in its connection metadata. Carried in the body's own `v`
+/// field, not out-of-band, because presence rides the opaque connection-metadata
+/// bytes with no envelope header to select a decoder.
+pub const PRESENCE_OP_VERSION: u32 = 1;
 /// Wire version of the agent envelope (the Agent Data Exchange Protocol). Carried
 /// out-of-band as the typed `agdx.av` header, never inside the body: a durable
 /// log record must select its decoder before any body byte is read.

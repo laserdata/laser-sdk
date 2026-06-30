@@ -1,5 +1,6 @@
+use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::consumer::AgentMessage;
-use crate::agent::router::Router;
+use crate::agent::router::{CapabilitySelector, InboxRoute, Router};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::provenance::{AgentTopic, Provenance};
@@ -14,6 +15,7 @@ pub struct AgentCtx<'a> {
     message: &'a AgentMessage,
     agent: Option<AgentId>,
     respond_on: Option<AgentTopic<'static>>,
+    inbox_route: InboxRoute,
 }
 
 impl<'a> AgentCtx<'a> {
@@ -22,12 +24,14 @@ impl<'a> AgentCtx<'a> {
         message: &'a AgentMessage,
         agent: Option<AgentId>,
         respond_on: Option<AgentTopic<'static>>,
+        inbox_route: InboxRoute,
     ) -> Self {
         Self {
             laser,
             message,
             agent,
             respond_on,
+            inbox_route,
         }
     }
 
@@ -121,9 +125,113 @@ impl<'a> AgentCtx<'a> {
         Ok(())
     }
 
+    /// Pause this handler on a human decision: publish `prompt` as an interrupt on
+    /// the human-input topic and await the approver's correlated reply on
+    /// `reply_topic`, up to `timeout`, chained to the handled conversation. Returns
+    /// the decision body on approval, or [`LaserError::Rejected`] when the approver
+    /// rejects (the approver answers with [`respond_input`](Self::respond_input)).
+    /// A convenience over [`Agdx::request_input`](crate::agent::Agdx::request_input),
+    /// so it adds nothing to the wire. Errors if the agent was built without an id.
+    pub async fn approval_gate(
+        &self,
+        reply_topic: AgentTopic<'_>,
+        prompt: impl Into<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, LaserError> {
+        let source = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| LaserError::Handler("approval_gate: the agent has no id".to_owned()))?
+            .wire_id();
+        self.laser
+            .agdx(
+                AgentTopic::HumanInput,
+                source,
+                self.message.provenance.conversation_id.into(),
+            )
+            .request_input(reply_topic, prompt, timeout)
+            .await
+    }
+
     /// A child conversation of the handled message, linked by parent/root ids.
     pub fn spawn_subconversation(&self) -> Provenance {
         self.laser.spawn_subconversation(&self.message.provenance)
+    }
+
+    /// Fan out to every agent advertising `selector`'s skill, gathering replies
+    /// under `policy` within `deadline`. Each branch is a sub-conversation routed
+    /// to one agent's own inbox, resolved through the ctx's
+    /// [`InboxRoute`](crate::agent::InboxRoute) (the per-agent live-presence inbox
+    /// by default, or a fixed topic the caller set at build time), never a shared
+    /// topic name baked into the SDK. Replies are collected on the orchestrator's
+    /// own response topic (`respond_on`), so a deployment that scopes each tenant
+    /// to its own stream and each workflow to its own topic routes correctly.
+    ///
+    /// A target that resolves no inbox (advertised none, or [`refresh_presence`](crate::agent::AgentRegistry::refresh_presence)
+    /// surfaced none) is a per-branch [`Gather::failures`] entry, never silently
+    /// rerouted. Under [`GatherPolicy::Quorum`] the remaining branches are dropped
+    /// once the quorum lands rather than waited on (signing a cancel to the losing
+    /// branches on the control channel is a follow-on). Errors only on an
+    /// infrastructure failure (no capable agent, no response topic, registry read),
+    /// not on a branch failure.
+    pub async fn fan_out(
+        &self,
+        selector: CapabilitySelector,
+        payload: impl Into<Vec<u8>> + Clone,
+        policy: GatherPolicy,
+        deadline: Duration,
+    ) -> Result<Gather, LaserError> {
+        // The orchestrator's own response topic is where every branch's reply
+        // lands. Required: without it there is nowhere to gather to.
+        let reply_topic = self.respond_on.clone().ok_or(LaserError::NoRespondTopic)?;
+
+        let mut registry = self.laser.agent_registry()?;
+        let now = SystemClock.now_micros();
+        registry.refresh(now).await?;
+        // The advertised-inbox path needs live presence. The fixed path does not.
+        #[cfg(feature = "query")]
+        if matches!(self.inbox_route, InboxRoute::Advertised) {
+            registry.refresh_presence().await?;
+        }
+        let targets = Router::AllCapable(selector).resolve_targets(&registry, now)?;
+
+        let mut gather = Gather::default();
+
+        // Resolve each target's inbox while the registry borrow is live, so the
+        // owned topic identifier can move into the spawned branch. A target that
+        // resolves no inbox fails its branch here rather than mis-routing.
+        let mut branches = tokio::task::JoinSet::new();
+        for agent in targets {
+            let advertised = registry.inbox_for(&agent);
+            let inbox = match self.inbox_route.resolve(&agent, advertised) {
+                Ok(inbox) => inbox,
+                Err(error) => {
+                    gather.failures.push(error);
+                    continue;
+                }
+            };
+            let laser = self.laser.clone();
+            let body: Vec<u8> = payload.clone().into();
+            let parent = self.message.provenance.clone();
+            let reply_topic = reply_topic.clone();
+            branches.spawn(async move {
+                let mut provenance = laser.spawn_subconversation(&parent);
+                provenance.target_agent_id = Some(agent);
+                // A distinct correlation per branch so replies never cross.
+                provenance.idempotency_key = Some(ulid::Ulid::new().to_string());
+                laser
+                    .request(
+                        AgentTopic::Custom(&inbox),
+                        reply_topic,
+                        body,
+                        &provenance,
+                        deadline,
+                    )
+                    .await
+            });
+        }
+
+        Ok(gather_branches(branches, gather, policy, deadline).await)
     }
 
     fn reply_provenance(&self) -> Provenance {
@@ -139,5 +247,184 @@ impl<'a> AgentCtx<'a> {
         // multiple agents share a reply topic.
         provenance.idempotency_key = self.message.provenance.idempotency_key.clone();
         provenance
+    }
+}
+
+/// When a [`fan_out`](AgentCtx::fan_out) gather is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatherPolicy {
+    /// Wait for every branch (each bounded by the deadline).
+    RequireAll,
+    /// Stop once this many branches succeed, dropping the wait on the rest.
+    Quorum(usize),
+    /// Take whatever has landed by the deadline.
+    BestEffort,
+}
+
+/// The outcome of a [`fan_out`](AgentCtx::fan_out): the successful replies and
+/// the failed branches. Failures are surfaced here, never silently dropped, so
+/// a slow or dead agent is visible rather than mistaken for a missing result.
+#[derive(Debug, Default)]
+pub struct Gather {
+    pub ok: Vec<AgentMessage>,
+    pub failures: Vec<LaserError>,
+}
+
+/// Drain every fan-out branch into `gather` under `policy`. `RequireAll` waits
+/// for every branch, each already bounded by its own request `deadline`. `Quorum`
+/// aborts the remaining branches the moment enough have succeeded. `BestEffort`
+/// takes whatever has landed when the wall-clock `deadline` elapses, aborting the
+/// stragglers rather than waiting out their per-request deadlines. A branch that
+/// panics surfaces as a `Handler` failure, never a lost result.
+async fn gather_branches(
+    mut branches: tokio::task::JoinSet<Result<AgentMessage, LaserError>>,
+    mut gather: Gather,
+    policy: GatherPolicy,
+    deadline: Duration,
+) -> Gather {
+    let wall_clock = tokio::time::sleep(deadline);
+    tokio::pin!(wall_clock);
+    loop {
+        tokio::select! {
+            joined = branches.join_next() => {
+                let Some(joined) = joined else { break };
+                match joined {
+                    Ok(Ok(reply)) => gather.ok.push(reply),
+                    Ok(Err(error)) => gather.failures.push(error),
+                    Err(join_error) => gather.failures.push(LaserError::Handler(format!(
+                        "fan-out branch failed to join: {join_error}"
+                    ))),
+                }
+                if quorum_satisfied(policy, gather.ok.len()) {
+                    branches.abort_all();
+                    break;
+                }
+            }
+            _ = &mut wall_clock, if matches!(policy, GatherPolicy::BestEffort) => {
+                branches.abort_all();
+                break;
+            }
+        }
+    }
+    gather
+}
+
+/// Whether `policy` is satisfied by `successes` replies so far, so the remaining
+/// branches can be cancelled. Only `Quorum` short-circuits: `RequireAll` and
+/// `BestEffort` drain every branch (the latter bounded by the wall-clock
+/// deadline instead).
+fn quorum_satisfied(policy: GatherPolicy, successes: usize) -> bool {
+    matches!(policy, GatherPolicy::Quorum(needed) if successes >= needed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_require_all_when_checking_quorum_then_should_never_short_circuit() {
+        // RequireAll drains every branch, so no count ever satisfies it early.
+        assert!(!quorum_satisfied(GatherPolicy::RequireAll, 0));
+        assert!(!quorum_satisfied(GatherPolicy::RequireAll, 1));
+        assert!(!quorum_satisfied(GatherPolicy::RequireAll, 1000));
+    }
+
+    #[test]
+    fn given_best_effort_when_checking_quorum_then_should_never_short_circuit() {
+        // BestEffort is cut by the wall-clock deadline, not by a success count.
+        assert!(!quorum_satisfied(GatherPolicy::BestEffort, 0));
+        assert!(!quorum_satisfied(GatherPolicy::BestEffort, 1));
+        assert!(!quorum_satisfied(GatherPolicy::BestEffort, 1000));
+    }
+
+    #[test]
+    fn given_a_quorum_when_checking_then_should_short_circuit_at_or_above_the_threshold() {
+        // Below the threshold keeps waiting, at or above it short-circuits.
+        assert!(!quorum_satisfied(GatherPolicy::Quorum(2), 0));
+        assert!(!quorum_satisfied(GatherPolicy::Quorum(2), 1));
+        assert!(quorum_satisfied(GatherPolicy::Quorum(2), 2));
+        assert!(quorum_satisfied(GatherPolicy::Quorum(2), 3));
+    }
+
+    #[test]
+    fn given_a_zero_quorum_when_checking_then_should_be_satisfied_immediately() {
+        // A degenerate Quorum(0) is satisfied before any branch replies, so the
+        // fan-out aborts every branch and gathers nothing. The edge is defined,
+        // not a panic.
+        assert!(quorum_satisfied(GatherPolicy::Quorum(0), 0));
+    }
+
+    #[test]
+    fn given_a_quorum_larger_than_the_target_set_when_never_reached_then_should_not_short_circuit()
+    {
+        // Quorum(5) against three responders never trips, so the loop drains all
+        // three and the caller sees fewer successes than asked, surfaced as a
+        // short gather rather than a hang.
+        assert!(!quorum_satisfied(GatherPolicy::Quorum(5), 3));
+    }
+
+    #[test]
+    fn given_branches_when_gathered_under_require_all_then_should_classify_replies_and_failures() {
+        // Drive the real drain over a set of finished branches: two replies, one
+        // failed request. RequireAll keeps both buckets, nothing is dropped.
+        tokio_test_block(async {
+            let mut branches = tokio::task::JoinSet::new();
+            branches.spawn(async { Err(LaserError::Timeout("reply")) });
+            let gather = gather_branches(
+                branches,
+                Gather::default(),
+                GatherPolicy::RequireAll,
+                Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(gather.ok.len(), 0);
+            assert_eq!(gather.failures.len(), 1);
+            assert!(matches!(gather.failures[0], LaserError::Timeout(_)));
+        });
+    }
+
+    #[test]
+    fn given_a_best_effort_deadline_when_a_branch_outlives_it_then_should_cut_and_return_what_landed()
+     {
+        // One branch never completes within the wall-clock deadline. BestEffort
+        // aborts it at the deadline and returns the empty (but not hung) gather.
+        tokio_test_block(async {
+            let mut branches = tokio::task::JoinSet::new();
+            branches.spawn(async {
+                futures_pending().await;
+                Ok::<_, LaserError>(unreachable_reply())
+            });
+            let gather = gather_branches(
+                branches,
+                Gather::default(),
+                GatherPolicy::BestEffort,
+                Duration::from_millis(20),
+            )
+            .await;
+            assert_eq!(gather.ok.len(), 0);
+            assert_eq!(
+                gather.failures.len(),
+                0,
+                "an aborted straggler is dropped, not a failure"
+            );
+        });
+    }
+
+    // A current-thread runtime with the timer enabled, so the BestEffort
+    // wall-clock cut fires against a real (short) deadline.
+    fn tokio_test_block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime builds")
+            .block_on(f)
+    }
+
+    async fn futures_pending() {
+        std::future::pending::<()>().await
+    }
+
+    fn unreachable_reply() -> AgentMessage {
+        unreachable!("the pending branch is aborted before it ever yields a reply")
     }
 }

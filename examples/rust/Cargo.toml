@@ -50,3 +50,7 @@ path = "src/memory/main.rs"
 name = "interop"
 path = "src/interop/main.rs"
 
+[[example]]
+name = "orchestra"
+path = "src/orchestra/main.rs"
+

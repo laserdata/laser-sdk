@@ -228,6 +228,13 @@ impl PyAgentMessage {
         self.inner.payload.clone()
     }
 
+    /// The task body regardless of message shape: the AGDX envelope body for a
+    /// command or response (its payload is the encoded envelope), else the raw
+    /// payload. A handler reached by a contract or workflow reads this.
+    fn body(&self) -> Vec<u8> {
+        self.inner.body().to_vec()
+    }
+
     #[getter]
     fn message_id(&self) -> String {
         self.inner.id.to_string()

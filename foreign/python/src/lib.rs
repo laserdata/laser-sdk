@@ -14,6 +14,7 @@ mod query;
 mod reader;
 mod schema;
 mod state_store;
+mod workflow;
 
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
@@ -46,6 +47,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<agdx::PyAgdxStream>()?;
     module.add_class::<agent_runtime::PyAgentCtx>()?;
     module.add_class::<agent_runtime::PyAgentHandle>()?;
+    module.add_class::<workflow::PyWorkflow>()?;
     module.add_class::<reader::PyCursor>()?;
     module.add_class::<reader::PyMessage>()?;
     module.add_class::<memory::PyMemory>()?;

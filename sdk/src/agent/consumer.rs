@@ -1,3 +1,4 @@
+use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::ctx::AgentCtx;
 use crate::error::LaserError;
 use crate::laser::Laser;
@@ -6,10 +7,13 @@ use crate::types::{AgentId, ConversationId, MessageId};
 use async_trait::async_trait;
 use iggy::consumer_ext::MessageConsumer;
 use iggy::prelude::*;
-use laser_wire::agent::{AgentDeadLetter, AgentEnvelope, DeadLetterReason, LogPosition};
+use laser_wire::agent::{
+    AgentDeadLetter, AgentEnvelope, AgentKind, DeadLetterReason, LogPosition, OPERATION_TASK,
+    TaskState,
+};
 use laser_wire::content::ContentType;
 use laser_wire::framing::{decode_named, encode_named};
-use laser_wire::headers::{AGENT_VERSION, CONTENT_TYPE};
+use laser_wire::headers::{AGENT_VERSION, CONTENT_TYPE, FENCE};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -47,6 +51,18 @@ pub struct AgentMessage {
 }
 
 impl AgentMessage {
+    /// The task body, regardless of message shape: the AGDX envelope's `body` when
+    /// the message is an AGDX command/response (its [`payload`](Self::payload) is
+    /// the encoded envelope, not the body), otherwise the raw `payload`. A handler
+    /// uses this so it does not have to know whether it was reached by a `contract`
+    /// or workflow (AGDX) or a plain `send_agent`.
+    pub fn body(&self) -> &[u8] {
+        match &self.envelope {
+            Some(envelope) => &envelope.body,
+            None => &self.payload,
+        }
+    }
+
     fn from_received(received: ReceivedMessage) -> Result<Self, LaserError> {
         // The message's own offset, not `received.current_offset` (the partition
         // high-water, shared across a polled batch).
@@ -106,6 +122,15 @@ fn provenance_from_envelope(envelope: &AgentEnvelope) -> Provenance {
                 .map(|key| key.as_str().to_owned()),
         )
         .maybe_deadline(envelope.deadline_micros.map(IggyTimestamp::from))
+        // An enveloped fenced effect carries the fence as the `agdx.fence`
+        // metadata key, so the consumer gate reads it the same way it reads the
+        // header on a generic-provenance message.
+        .maybe_fence_token(envelope.metadata.as_ref().and_then(
+            |metadata| match metadata.get(FENCE) {
+                Some(laser_wire::query::Value::Uint(fence)) => Some(*fence),
+                _ => None,
+            },
+        ))
         .build()
 }
 
@@ -157,6 +182,15 @@ pub struct AgentConsumer {
     #[builder(default = POLL_INTERVAL)]
     pub poll_interval: Duration,
     pub respond_on: Option<AgentTopic<'static>>,
+    /// Default inbox route for the ctx's directed-send and fan-out helpers.
+    #[builder(default)]
+    pub inbox_route: crate::agent::router::InboxRoute,
+    /// Emit a `Working` task status on `respond_on` the moment an AGDX command is
+    /// picked up, before the handler runs, so a [`contract`](crate::laser::Laser::contract)
+    /// caller can tell the command was consumed (versus expired unconsumed). Off by
+    /// default. Requires `respond_on` and a valid agent id.
+    #[builder(default)]
+    pub ack_on_pickup: bool,
     // Override the dedup backend. Defaults to an in-memory `SlidingWindow` of
     // `dedup_window` keys, and a durable backend is a drop-in via this seam.
     pub deduplicator: Option<Box<dyn Deduplicator>>,
@@ -165,6 +199,12 @@ pub struct AgentConsumer {
     // (the at-least-once + idempotent-handler default tolerates the replay).
     #[builder(default)]
     pub warm_dedup: bool,
+    /// When set, every message's envelope signature is verified against this
+    /// registry before dispatch, and an unsigned or unverified record is
+    /// dead-lettered. Set it on control and effect topics, where verification is
+    /// mandatory (the enforcement chokepoint for authorship and authorization).
+    #[cfg(feature = "sign")]
+    pub verifier: Option<std::sync::Arc<crate::sign::KeyRegistry>>,
 }
 
 impl AgentConsumer {
@@ -250,8 +290,14 @@ impl AgentConsumer {
             dedup: deduplicator,
             agent,
             respond_on: self.respond_on,
+            inbox_route: self.inbox_route,
+            ack_on_pickup: self.ack_on_pickup,
             stream_id,
             topic_id,
+            high_water_fence: dashmap::DashMap::new(),
+            fence_last_sweep: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "sign")]
+            verifier: self.verifier,
         };
         // `consume_messages` needs its own shutdown receiver, so we keep that sender
         // alive so the loop only stops on our external `shutdown`. An explicit
@@ -270,6 +316,84 @@ impl AgentConsumer {
     }
 }
 
+/// Separator between the principal and the idempotency key in the composed dedup
+/// key (ASCII unit separator, which cannot appear in an agent id).
+const DEDUP_SCOPE_SEP: char = '\u{1f}';
+
+/// The dedup key, principal-scoped so one producer cannot suppress or replay
+/// another's idempotency key. Composed as `{agent}{SEP}{key}`. The agent is
+/// publisher-asserted, so this is a namespace against accidental reuse, not a
+/// security boundary (the fence is the real at-most-once gate). The live and
+/// warm-up paths both go through this, or dedup breaks after a restart.
+fn dedup_key(provenance: &Provenance) -> Option<String> {
+    let key = provenance.idempotency_key.as_ref()?;
+    Some(match &provenance.agent {
+        Some(agent) => format!("{}{DEDUP_SCOPE_SEP}{key}", agent.as_str()),
+        None => key.clone(),
+    })
+}
+
+/// The most fence high-water entries kept before an idle-eviction sweep is
+/// considered, so a long-lived consumer's per-task fence map stays bounded by the
+/// recently-active working set rather than every task ever seen.
+const FENCE_MAP_SOFT_CAP: usize = 16_384;
+
+/// A fence entry untouched for this long is swept once the map is over its soft
+/// cap. The gate is kept for any task active within the window; only tasks long
+/// idle (where a stale-holder replay is no longer plausible, and dedup is the
+/// backstop) are dropped.
+const FENCE_ENTRY_TTL_MICROS: u64 = 600_000_000;
+
+/// The least time between idle-eviction sweeps, so the O(n) `retain` runs at most
+/// this often under load instead of on every accepted fence.
+const FENCE_SWEEP_INTERVAL_MICROS: u64 = 1_000_000;
+
+/// One task's fence high-water mark and when it was last advanced, so an idle
+/// entry can be swept without losing the gate for an active task.
+#[derive(Clone, Copy)]
+struct FenceEntry {
+    fence: u64,
+    touched_micros: u64,
+}
+
+/// The monotonic high-water-mark fence gate. Returns `true` to accept the fence
+/// (advancing the task's high water) or `false` to drop a stale-holder replay
+/// whose fence is below the highest already accepted. An equal fence is accepted,
+/// the same holder's legitimate retry, which dedup then handles. When the map is
+/// over its soft cap, an idle-entry sweep runs at most once per sweep interval,
+/// bounding memory without reopening the gate for any recently-active task.
+fn accept_fence(
+    high_water: &dashmap::DashMap<ConversationId, FenceEntry>,
+    last_sweep_micros: &std::sync::atomic::AtomicU64,
+    task: ConversationId,
+    fence: u64,
+    now_micros: u64,
+) -> bool {
+    if high_water.len() > FENCE_MAP_SOFT_CAP {
+        use std::sync::atomic::Ordering;
+        let previous = last_sweep_micros.load(Ordering::Relaxed);
+        if now_micros.saturating_sub(previous) > FENCE_SWEEP_INTERVAL_MICROS
+            && last_sweep_micros
+                .compare_exchange(previous, now_micros, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            high_water.retain(|_, entry| {
+                now_micros.saturating_sub(entry.touched_micros) < FENCE_ENTRY_TTL_MICROS
+            });
+        }
+    }
+    let mut entry = high_water.entry(task).or_insert(FenceEntry {
+        fence: 0,
+        touched_micros: now_micros,
+    });
+    if fence < entry.fence {
+        return false;
+    }
+    entry.fence = fence;
+    entry.touched_micros = now_micros;
+    true
+}
+
 struct ReliableConsumer<'a, H> {
     handler: H,
     laser: &'a Laser,
@@ -277,8 +401,21 @@ struct ReliableConsumer<'a, H> {
     dedup: Box<dyn Deduplicator>,
     agent: Option<AgentId>,
     respond_on: Option<AgentTopic<'static>>,
+    inbox_route: crate::agent::router::InboxRoute,
+    ack_on_pickup: bool,
     stream_id: u32,
     topic_id: u32,
+    #[cfg(feature = "sign")]
+    verifier: Option<std::sync::Arc<crate::sign::KeyRegistry>>,
+    /// Highest fence token accepted per task (the conversation is the task scope).
+    /// A log-resident effect with a lower fence is a stale-holder replay and is
+    /// dropped before dedup, so it never consumes the legitimate retry's slot.
+    /// Idle entries are swept past a ttl once over a soft cap, so the map stays
+    /// bounded by the active working set.
+    high_water_fence: dashmap::DashMap<ConversationId, FenceEntry>,
+    /// When the fence map was last swept of idle entries (epoch micros), so the
+    /// sweep runs at most once per interval under load.
+    fence_last_sweep: std::sync::atomic::AtomicU64,
 }
 
 impl<H> ReliableConsumer<'_, H> {
@@ -416,13 +553,57 @@ where
             return Ok(());
         }
 
-        if let Some(key) = &message.provenance.idempotency_key {
+        // Mandatory signature verification on a verified (control or effect) topic.
+        // An unsigned or unverified record is dead-lettered before any gate or
+        // handler runs: the field is optional on the wire, so the only enforcement
+        // is the consumer refusing to act on an unverified record here.
+        #[cfg(feature = "sign")]
+        if let Some(registry) = &self.verifier {
+            let verified = message
+                .envelope
+                .as_ref()
+                .is_some_and(|envelope| registry.verify(envelope).is_ok());
+            if !verified {
+                warn!(source = %message.id, "unsigned or unverified message on a verified topic, dead-lettering");
+                self.dead_letter(
+                    &message,
+                    DeadLetterReason::Rejected,
+                    0,
+                    "signature verification failed",
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
+        // Fence gate, ordered BEFORE dedup. A log-resident effect carrying a fence
+        // below the highest this task has accepted is a stale-holder replay: drop
+        // it (the offset still commits, it is not a dead-letter). Running this
+        // before `dedup.observe` matters, a fenced-out record must not consume the
+        // idempotency slot the legitimate holder's retry needs. A malformed fence
+        // already failed to decode (an error, never `.ok()`-ed to absent), so a
+        // present token here is trustworthy.
+        if let Some(fence) = message.provenance.fence_token
+            && !accept_fence(
+                &self.high_water_fence,
+                &self.fence_last_sweep,
+                message.provenance.conversation_id,
+                fence,
+                SystemClock.now_micros(),
+            )
+        {
+            debug!(source = %message.id, fence, "stale-holder fence, dropping replay");
+            return Ok(());
+        }
+
+        if let Some(key) = dedup_key(&message.provenance) {
             // Dedup marks the key seen before the handler runs: a duplicate arriving
             // while the original is still in the window is skipped even if the
             // original later dead-letters. This is the at-least-once + idempotent
-            // model, and a durable `Deduplicator` is the drop-in upgrade.
-            if !self.dedup.observe(key).await {
-                debug!(idempotency_key = %key, source = %message.id, "skipping duplicate message");
+            // model, and a durable `Deduplicator` is the drop-in upgrade. The key is
+            // principal-scoped (see `dedup_key`).
+            if !self.dedup.observe(&key).await {
+                debug!(dedup_key = %key, source = %message.id, "skipping duplicate message");
                 return Ok(());
             }
         }
@@ -441,11 +622,33 @@ where
             return Ok(());
         }
 
+        // Ack-on-pickup: a `Working` status the instant an AGDX command is taken,
+        // before the handler runs, so a contract caller distinguishes consumed
+        // from expired-unconsumed. The command survived the deadline check above,
+        // so it was consumed in time.
+        if self.ack_on_pickup
+            && let (Some(agent), Some(respond_on), Some(envelope)) =
+                (&self.agent, &self.respond_on, &message.envelope)
+            && envelope.kind == AgentKind::Command
+            && let Some(correlation) = envelope.correlation
+            && let Err(error) = self
+                .laser
+                .agdx(respond_on.clone(), agent.wire_id(), envelope.conversation)
+                .status(OPERATION_TASK)
+                .with_correlation(correlation)
+                .with_task_state(TaskState::Working)
+                .send()
+                .await
+        {
+            warn!(source = %message.id, %error, "failed to emit ack-on-pickup status");
+        }
+
         let ctx = AgentCtx::new(
             self.laser,
             &message,
             self.agent.clone(),
             self.respond_on.clone(),
+            self.inbox_route.clone(),
         );
         let mut attempt = 0;
         loop {
@@ -534,9 +737,9 @@ async fn warm_dedup_window(
                 continue;
             }
             if let Ok(provenance) = Provenance::try_from(&message)
-                && let Some(key) = &provenance.idempotency_key
+                && let Some(key) = dedup_key(&provenance)
             {
-                dedup.observe(key).await;
+                dedup.observe(&key).await;
             }
         }
     }
@@ -635,5 +838,49 @@ mod tests {
         assert_eq!(policy.delay_for(1), Duration::from_millis(200));
         assert_eq!(policy.delay_for(2), Duration::from_millis(400));
         assert!(policy.delay_for(60) >= policy.delay_for(2));
+    }
+
+    #[test]
+    fn given_two_agents_with_the_same_idempotency_key_when_scoped_then_should_differ() {
+        let conversation = ConversationId::new();
+        let with_agent = |agent: &str| {
+            Provenance::builder()
+                .conversation_id(conversation)
+                .agent(agent.parse().expect("valid agent id"))
+                .idempotency_key("attempt-1".to_owned())
+                .build()
+        };
+        // Same idempotency key, different producers, so the scoped keys differ and
+        // one cannot suppress the other.
+        assert_ne!(
+            dedup_key(&with_agent("planner")),
+            dedup_key(&with_agent("worker"))
+        );
+        // No agent falls back to the bare key.
+        let anon = Provenance::builder()
+            .conversation_id(conversation)
+            .idempotency_key("attempt-1".to_owned())
+            .build();
+        assert_eq!(dedup_key(&anon).as_deref(), Some("attempt-1"));
+    }
+
+    #[test]
+    fn given_a_fence_gate_when_a_stale_token_arrives_then_should_drop_it_and_keep_per_task_scope() {
+        let high_water = dashmap::DashMap::new();
+        let sweep = std::sync::atomic::AtomicU64::new(0);
+        let task_a = ConversationId::new();
+        let task_b = ConversationId::new();
+
+        // First grant accepted, advances the high water.
+        assert!(accept_fence(&high_water, &sweep, task_a, 1, 100));
+        // A fresh holder at a higher fence accepted.
+        assert!(accept_fence(&high_water, &sweep, task_a, 2, 101));
+        // The original holder's stale replay (below the high water) is dropped.
+        assert!(!accept_fence(&high_water, &sweep, task_a, 1, 102));
+        // An equal fence (the same holder's legitimate retry) is accepted, dedup
+        // handles the duplicate downstream.
+        assert!(accept_fence(&high_water, &sweep, task_a, 2, 103));
+        // A different task keeps its own high water, so a low fence there is fine.
+        assert!(accept_fence(&high_water, &sweep, task_b, 1, 104));
     }
 }

@@ -50,6 +50,9 @@ pub enum LaserError {
     /// LaserData Cloud answered a graph op with a typed failure.
     #[error("graph: {0}")]
     Graph(#[from] laser_wire::graph::GraphError),
+    /// LaserData Cloud answered an agent or workflow control op with a typed failure.
+    #[error("agent: {0}")]
+    Agent(#[from] laser_wire::agent_workflow::AgentError),
     /// A client-side encode or decode failed (payload codec, wire envelope,
     /// reply bytes). Deterministic for a given input, so never retryable.
     #[error("codec: {0}")]
@@ -66,6 +69,33 @@ pub enum LaserError {
     /// (raw Apache Iggy without LaserData Cloud). Permanent by definition.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// An envelope signature was absent where required, enrolled to no known key,
+    /// or failed verification. The authorship and control-plane authorization
+    /// gate, never retryable.
+    #[error("signature: {0}")]
+    Signature(String),
+    /// Capability routing found no live agent advertising `skill`. The caller
+    /// retries after the registry refreshes, or routes elsewhere.
+    #[error("no capable agent for skill: {skill}")]
+    NoCapableAgent { skill: String },
+    /// An advertised inbox route resolved a capable agent but the agent advertises
+    /// no inbox topic in its live presence, so there is nowhere to address it. The
+    /// caller waits for the agent to advertise, supplies an explicit
+    /// [`InboxRoute::Fixed`](crate::agent::InboxRoute::Fixed), or routes elsewhere.
+    /// Never falls back to a shared topic name.
+    #[error("agent has no advertised inbox: {agent}")]
+    NoInbox { agent: String },
+    /// A fenced write lost the fence: the held token is below the live sequence,
+    /// so a newer holder owns the task. Not alarming and never retryable by the
+    /// loser, it is the at-most-one-effective-writer gate doing its job.
+    #[error("fence violation: held {stale}, current {current}")]
+    FenceViolation { stale: u64, current: u64 },
+    /// A spend ceiling was reached. Not retryable until the ceiling is raised.
+    #[error("budget exceeded: spent {spent} of ceiling {ceiling}")]
+    BudgetExceeded { ceiling: u64, spent: u64 },
+    /// The agent was quarantined and may not act. Not retryable.
+    #[error("quarantined: {agent}")]
+    Quarantined { agent: String },
     #[error(transparent)]
     Iggy(#[from] IggyError),
     #[error(transparent)]
@@ -213,6 +243,33 @@ impl LaserError {
         matches!(self, Self::Query(QueryError::Stale { .. }))
     }
 
+    /// Whether capability routing found no live agent for the skill.
+    pub fn is_no_capable_agent(&self) -> bool {
+        matches!(self, Self::NoCapableAgent { .. })
+    }
+
+    /// Whether an advisory lease was lost (expired or re-acquired by another
+    /// holder). For a fenced write, see [`is_fence_violation`](Self::is_fence_violation).
+    pub fn is_lease_lost(&self) -> bool {
+        matches!(self, Self::Kv(KvError::LeaseLost))
+    }
+
+    /// Whether a fenced write lost the fence (a stale holder stepped aside). Not
+    /// alarming, never retryable by the loser.
+    pub fn is_fence_violation(&self) -> bool {
+        matches!(self, Self::FenceViolation { .. })
+    }
+
+    /// Whether a spend ceiling was reached.
+    pub fn is_budget_exceeded(&self) -> bool {
+        matches!(self, Self::BudgetExceeded { .. })
+    }
+
+    /// Whether the agent is quarantined.
+    pub fn is_quarantined(&self) -> bool {
+        matches!(self, Self::Quarantined { .. })
+    }
+
     /// This failure's place in the unified [`ResultCode`] space. A managed
     /// surface error projects onto its surface code, and a client-side failure maps
     /// to the closest code. Lets a caller branch on one dictionary instead of
@@ -225,6 +282,12 @@ impl LaserError {
             Self::Fork(error) => ResultCode::from(error),
             Self::Unsupported(_) | Self::NoStream | Self::NoRespondTopic => ResultCode::Unsupported,
             Self::Invalid(_) | Self::Config(_) | Self::Rejected(_) => ResultCode::InvalidArgument,
+            // A fenced write that lost the fence is a lost race, like a
+            // compare-and-swap conflict.
+            Self::FenceViolation { .. } => ResultCode::Conflict,
+            // Quarantine and an unverified signature are authorization failures.
+            Self::Quarantined { .. } | Self::Signature(_) => ResultCode::Unauthorized,
+            Self::NoCapableAgent { .. } | Self::NoInbox { .. } => ResultCode::NotFound,
             // A transport timeout is not read-model staleness (that is
             // `QueryError::Stale`), so it classifies as a backend/availability
             // failure, keeping `code()` and `is_stale()` in agreement.

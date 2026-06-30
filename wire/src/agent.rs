@@ -680,6 +680,89 @@ pub struct AgentDeadLetter {
     pub payload: Vec<u8>,
 }
 
+/// An advertised skill's health, a pinned u8 dictionary (the [`TaskState`]
+/// pattern: unknown codes pass through as [`Unrecognized`](Self::Unrecognized)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "u8", into = "u8")]
+pub enum Health {
+    Healthy,
+    Degraded,
+    Unavailable,
+    /// A code this build does not know.
+    Unrecognized(u8),
+}
+
+impl Health {
+    /// The pinned wire code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Health::Healthy => 1,
+            Health::Degraded => 2,
+            Health::Unavailable => 3,
+            Health::Unrecognized(code) => code,
+        }
+    }
+
+    /// The health for a wire code (unknown codes become
+    /// [`Unrecognized`](Self::Unrecognized)).
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Health::Healthy,
+            2 => Health::Degraded,
+            3 => Health::Unavailable,
+            other => Health::Unrecognized(other),
+        }
+    }
+}
+
+impl From<u8> for Health {
+    fn from(code: u8) -> Self {
+        Self::from_code(code)
+    }
+}
+
+impl From<Health> for u8 {
+    fn from(health: Health) -> u8 {
+        health.code()
+    }
+}
+
+/// The content shape on a capability's input or output: either a content-type
+/// or a registered writer-schema id. Untagged, so it rides as the bare
+/// content-type code or the schema-id string.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContentRef {
+    ContentType(crate::content::ContentType),
+    SchemaId(String),
+}
+
+/// A structured capability on an [`AgentCard`]: which skill, its I/O content
+/// shape, advisory cost and latency classes, concurrency, health, and load.
+/// Mirrors the SDK A2A `AgentSkill` so the bridge maps one to the other.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityDescriptor {
+    /// The skill identifier, capped like every vocabulary string.
+    pub skill_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<ContentRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ContentRef>,
+    /// Advisory cost class (lower is cheaper), opaque to the protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_class: Option<u8>,
+    /// Advisory latency class (lower is faster), opaque to the protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_class: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<Health>,
+    /// Current load, per-mille of advertised capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<u16>,
+}
+
 /// The pinned minimal body of a liveness or capability card (`status` with
 /// `operation = card`).
 ///
@@ -696,10 +779,10 @@ pub struct AgentCard {
     /// The agent's own version label, opaque to the protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// What the agent serves: operation and tool names, capped in both count
-    /// and entry size.
+    /// What the agent serves: structured capability descriptors, capped in both
+    /// count and per-entry skill-id size.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<CapabilityDescriptor>,
     /// How long this card stays fresh. A card older than its ttl means a dead
     /// agent, the convention that makes cards liveness and not just discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -719,8 +802,67 @@ impl AgentCard {
             });
         }
         for capability in &self.capabilities {
-            cap_str(Some(capability), "capability")?;
+            cap_str(Some(&capability.skill_id), "capability skill_id")?;
         }
+        Ok(())
+    }
+}
+
+/// The live presence an agent advertises in its connection metadata
+/// (`AGDX_SET_CLIENT_METADATA`), the body the discovery read surfaces per
+/// connection.
+///
+/// Distinct from [`AgentCard`] on purpose. The card is durable, replayable
+/// capability that outlives a brief disconnect (folded from the registry topic).
+/// Presence is live transport truth: it vanishes on disconnect and
+/// answers "where do I send this agent work right now," carrying the `inbox`
+/// topic the agent is currently consuming, which may be a topic it created for
+/// one workflow and drops when done. Routing resolves a capable agent to its
+/// inbox through this, never through a hard-coded shared topic name, which does
+/// not scale across tenants that each own their own streams and topics.
+///
+/// The body rides the opaque connection-metadata bytes with no envelope header,
+/// so it carries its own version `v` ([`PRESENCE_OP_VERSION`](crate::codes::PRESENCE_OP_VERSION)).
+/// The metadata channel stays opaque: a non-agent client advertises whatever blob
+/// its own consumers interpret, and only an AGDX agent advertises this shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPresence {
+    /// The presence body version, carried in-band (the metadata bytes have no
+    /// out-of-band version header).
+    pub v: u32,
+    /// Which agent this connection is, the link from a connection (keyed by
+    /// `client_id`/`user_id`) to its [`AgentCard`] (keyed by agent id). A claim
+    /// like every agent-written field, cross-checked against the verified
+    /// `user_id` the connection authenticated as.
+    pub agent: AgentId,
+    /// The topic this agent currently consumes its work on, within the stream its
+    /// connection is scoped to. Absent means liveness-only presence with no
+    /// declared inbox, so routing falls through to another signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<String>,
+}
+
+impl AgentPresence {
+    /// Presence for `agent` at the current [`PRESENCE_OP_VERSION`](crate::codes::PRESENCE_OP_VERSION),
+    /// with no declared inbox yet.
+    pub fn new(agent: AgentId) -> Self {
+        Self {
+            v: crate::codes::PRESENCE_OP_VERSION,
+            agent,
+            inbox: None,
+        }
+    }
+
+    /// Declare the `inbox` topic this agent consumes its work on.
+    pub fn with_inbox(mut self, inbox: impl Into<String>) -> Self {
+        self.inbox = Some(inbox.into());
+        self
+    }
+
+    /// Check a decoded presence body against the caps: the inbox topic is bounded
+    /// like every vocabulary string.
+    pub fn validate(&self) -> Result<(), ValidateError> {
+        cap_str(self.inbox.as_deref(), "inbox")?;
         Ok(())
     }
 }
@@ -945,7 +1087,7 @@ pub struct AgentEnvelope {
     /// `0` (the default, skipped on the wire so pre-marker records stay
     /// byte-identical) means "ignore anything you don't understand", the
     /// open-world default. This lets one message demand strict handling of a new
-    /// feature without a whole-envelope version bump (the spec's `must_understand`, A9.1).
+    /// feature without a whole-envelope version bump (a `must_understand` marker).
     ///
     /// [`features`]: crate::agent::features
     /// [`unmet_requirements`]: AgentEnvelope::unmet_requirements
@@ -959,6 +1101,14 @@ pub struct AgentEnvelope {
         with = "crate::encoding::bin_bytes"
     )]
     pub body: Vec<u8>,
+    /// A detached signature over the canonical encoding of this envelope with the
+    /// signature field absent, domain-separated by [`SIGNATURE_DOMAIN`]. Opt-in:
+    /// absent (the open-world default, skipped on the wire so an unsigned record
+    /// stays byte-identical) means an unsigned record. Verification is SDK-side
+    /// against a per-agent key registry, so the wire crate stays crypto-free. A
+    /// signature may ride any kind (no matrix row, like `metadata`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1006,6 +1156,7 @@ impl AgentEnvelope {
             metadata: None,
             must_understand: 0,
             body: Vec::new(),
+            signature: None,
         }
     }
 
@@ -1195,6 +1346,15 @@ impl AgentEnvelope {
             .insert(key.into(), value.into());
         self
     }
+
+    /// Attach a detached [`Signature`] over this envelope. The SDK signs the
+    /// canonical encoding with the signature absent and domain separator
+    /// [`SIGNATURE_DOMAIN`], so the field is set last. A signature may ride any
+    /// kind.
+    pub fn with_signature(mut self, signature: Signature) -> Self {
+        self.signature = Some(signature);
+        self
+    }
 }
 
 /// A validity-matrix or cap violation. Receivers treat these as protocol
@@ -1367,14 +1527,19 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
             if let Some(operation) = envelope.operation.as_deref()
                 && !matches!(
                     operation,
-                    OPERATION_TASK | OPERATION_CARD | OPERATION_PROGRESS
+                    OPERATION_TASK
+                        | OPERATION_CARD
+                        | OPERATION_PROGRESS
+                        | OPERATION_QUARANTINE
+                        | OPERATION_UNQUARANTINE
                 )
             {
                 return Err(ValidateError::Invalid {
                     field: "operation",
                     reason: format!(
                         "status operation must be `{OPERATION_TASK}`, `{OPERATION_CARD}`, \
-                         or `{OPERATION_PROGRESS}`, got `{operation}`"
+                         `{OPERATION_PROGRESS}`, `{OPERATION_QUARANTINE}`, or \
+                         `{OPERATION_UNQUARANTINE}`, got `{operation}`"
                     ),
                 });
             }
@@ -1481,6 +1646,11 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
             });
         }
     }
+    // A signature may ride any kind (no matrix row, like metadata). When present
+    // its capsule must hold its scheme's registered lengths.
+    if let Some(signature) = &envelope.signature {
+        signature.validate()?;
+    }
     Ok(())
 }
 
@@ -1490,6 +1660,16 @@ pub const OPERATION_TASK: &str = "task";
 pub const OPERATION_CARD: &str = "card";
 /// The `status` operation value for progress ticks.
 pub const OPERATION_PROGRESS: &str = "progress";
+/// The `status` operation value for a quarantine fact: an operator marks an agent
+/// out of routing. The body is the quarantined agent id. Authorized by the
+/// registry topic's write access control (only an operator may append it), and
+/// optionally signed for defense in depth.
+pub const OPERATION_QUARANTINE: &str = "quarantine";
+/// The `status` operation value for an un-quarantine fact: an operator lifts a
+/// prior quarantine, returning the agent to routing. The body is the agent id.
+/// Same authorization as [`OPERATION_QUARANTINE`], so quarantine is not a
+/// one-way door that only retention expiry can undo.
+pub const OPERATION_UNQUARANTINE: &str = "unquarantine";
 
 // The chunk-stream purpose vocabulary: `operation` on the stream-opening
 // chunk says what the channel IS, so a consumer reassembling several channels
@@ -1933,18 +2113,43 @@ mod tests {
         ));
     }
 
+    fn descriptor(skill_id: &str) -> CapabilityDescriptor {
+        CapabilityDescriptor {
+            skill_id: skill_id.to_owned(),
+            input: None,
+            output: None,
+            cost_class: None,
+            latency_class: None,
+            max_concurrency: None,
+            health: None,
+            load: None,
+        }
+    }
+
     #[test]
     fn given_an_agent_card_when_validated_then_should_enforce_the_caps() {
         let card = AgentCard {
             name: Some("trip-planner".to_owned()),
             version: Some("1.4.2".to_owned()),
-            capabilities: vec!["chat".to_owned(), "search_flights".to_owned()],
+            capabilities: vec![
+                CapabilityDescriptor {
+                    skill_id: "chat".to_owned(),
+                    input: Some(ContentRef::ContentType(crate::content::ContentType::Json)),
+                    output: Some(ContentRef::ContentType(crate::content::ContentType::Json)),
+                    cost_class: Some(2),
+                    latency_class: Some(1),
+                    max_concurrency: Some(8),
+                    health: Some(Health::Healthy),
+                    load: Some(250),
+                },
+                descriptor("search_flights"),
+            ],
             ttl_micros: Some(30_000_000),
         };
         card.validate().expect("a well-formed card validates");
 
         let mut crowded = card.clone();
-        crowded.capabilities = vec!["x".to_owned(); crate::limits::MAX_CARD_CAPABILITIES + 1];
+        crowded.capabilities = vec![descriptor("x"); crate::limits::MAX_CARD_CAPABILITIES + 1];
         assert!(matches!(
             crowded.validate(),
             Err(ValidateError::TooLarge {

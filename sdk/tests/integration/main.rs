@@ -8,6 +8,7 @@ mod agdx_stream;
 #[cfg(feature = "agui")]
 mod agui;
 mod context;
+mod contract;
 mod deadletter;
 mod fanout;
 mod handoff;
@@ -25,3 +26,4 @@ mod session;
 mod shutdown;
 mod state;
 mod warm_dedup;
+mod workflow;

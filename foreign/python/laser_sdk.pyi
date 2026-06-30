@@ -37,6 +37,7 @@ __all__ = [
     "QueryResult",
     "Row",
     "Topics",
+    "Workflow",
     "derive_conversation_id",
     "edge_id",
     "graph_edge",
@@ -225,6 +226,12 @@ class AgentMessage:
         Unlike `payload` (the raw CBOR envelope for an AGDX message), this is the
         inner body the producer sent.
         """
+    def body(self) -> builtins.list[builtins.int]:
+        r"""
+        The task body regardless of message shape: the AGDX envelope body for a
+        command or response (its payload is the encoded envelope), else the raw
+        payload. A handler reached by a contract or workflow reads this.
+        """
     def json(self) -> typing.Any:
         r"""
         Decode the payload as JSON into a Python value.
@@ -358,6 +365,12 @@ class Capabilities:
     def kv_cas(self) -> builtins.bool:
         r"""
         The key-value store serves compare-and-swap.
+        """
+    @property
+    def kv_cas_fenced(self) -> builtins.bool:
+        r"""
+        The key-value store serves fenced compare-and-swap (the monotonic fence an
+        exclusive workflow step needs for an at-most-once effect).
         """
     @property
     def graph(self) -> builtins.bool:
@@ -812,7 +825,7 @@ class Laser:
         re-read the original record and republish it verbatim so a fixed handler
         reprocesses it.
         """
-    def spawn_agent(self, agent_id: builtins.str, listen_on: builtins.str, handler: typing.Any, *, respond_on: typing.Optional[builtins.str] = None, poll_interval_ms: typing.Optional[builtins.int] = None, warm_dedup: builtins.bool = False, dedup: typing.Optional[typing.Any] = None) -> AgentHandle:
+    def spawn_agent(self, agent_id: builtins.str, listen_on: builtins.str, handler: typing.Any, *, respond_on: typing.Optional[builtins.str] = None, poll_interval_ms: typing.Optional[builtins.int] = None, warm_dedup: builtins.bool = False, dedup: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[builtins.str]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None) -> AgentHandle:
         r"""
         Spawn an agent: join an Iggy consumer group named `agent_id` over
         `listen_on` and drive `handler` (an `async def handle(ctx, message)`) for
@@ -820,6 +833,38 @@ class Laser:
         `dedup` (an `async def observe(key) -> bool`) for a custom, e.g. durable,
         deduplicator. Returns a handle to await readiness and stop it. Requires a
         default stream.
+        """
+    def contract(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 10000, fixed_inbox: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Send a directed task to one agent advertising `skill`, await its reply up to
+        `deadline_ms`. Returns the reply body, or `None` if it did not complete in
+        time. `fixed_inbox` routes to a fixed topic (a stock server with no presence
+        command). Omit it to resolve each agent's advertised inbox.
+        """
+    def scatter(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Scatter a directed task to every agent advertising `skill`, concurrently,
+        and return the reply body of each that completed (a verifier or diagnostic
+        panel). Unavailable and quarantined agents are excluded.
+        """
+    def quarantine(self, operator: builtins.str, agent: builtins.str) -> typing.Any:
+        r"""
+        Quarantine `agent` as `operator`: append the fact to the registry so every
+        fused registry folds it and excludes the agent from routing.
+        """
+    def unquarantine(self, operator: builtins.str, agent: builtins.str) -> typing.Any:
+        r"""
+        Lift a prior quarantine on `agent` as `operator`: append the counterpart
+        fact so every fused registry folds it and returns the agent to routing.
+        """
+    def workflow(self, name: builtins.str, *, fixed_inbox: typing.Optional[builtins.str] = None) -> Workflow:
+        r"""
+        Open a [`Workflow`](crate::workflow::PyWorkflow): dependency-ordered steps
+        over the coordination primitives, with budgets, verifier panels, fenced
+        exclusivity, on-timeout reassignment, and saga compensation. Declare steps,
+        then `await wf.run()`. The name is the orchestrator identity the run
+        dispatches as. `fixed_inbox` routes every step to a fixed topic (a stock
+        server with no presence command); omit it to resolve advertised inboxes.
         """
     def assemble_context(self, conversation_id: builtins.str, *, topics: typing.Optional[typing.Sequence[builtins.str]] = None, last_n: typing.Optional[builtins.int] = None, roles: typing.Optional[typing.Sequence[builtins.str]] = None) -> typing.Any:
         r"""
@@ -1400,6 +1445,42 @@ class Topics:
     HUMAN_INPUT: builtins.str = 'agent.human_input'
     AUDIT: builtins.str = 'agent.audit'
     DLQ: builtins.str = 'agent.dlq'
+
+@typing.final
+class Workflow:
+    r"""
+    A journalled directed-acyclic workflow over the coordination primitives, the
+    Python view of the Rust engine. Declare steps with [`step`](Self::step), set a
+    [`budget`](Self::budget), then `await wf.run(source=...)`. Each step is a
+    directed task to its target, ordered by its declared dependencies, with an
+    optional verifier panel, exclusivity (a fenced at-most-once effect), an
+    on-timeout policy, and a compensation (the saga rollback).
+    """
+    def budget(self, *, tokens: typing.Optional[builtins.int] = None, wall_clock_ms: typing.Optional[builtins.int] = None, invocations: typing.Optional[builtins.int] = None) -> None:
+        r"""
+        Cap the workflow's spend. Any dimension left `None` is unbounded. The token
+        ceiling counts only the usage an AGDX reply carries, so it is advisory.
+        """
+    def step(self, label: builtins.str, *, build: typing.Any, to: typing.Optional[builtins.str] = None, to_capable: typing.Optional[builtins.str] = None, all_capable: typing.Optional[builtins.str] = None, after: typing.Optional[typing.Sequence[builtins.str]] = None, verify: typing.Optional[typing.Any] = None, exclusive: builtins.bool = False, on_timeout: builtins.str = 'fail', compensate: typing.Optional[typing.Any] = None) -> None:
+        r"""
+        Add a step. Exactly one target is required: `to` (a named agent),
+        `to_capable` (one agent advertising a skill), or `all_capable` (scatter to
+        every agent advertising a skill and fold the replies, a verifier panel).
+        `build(outputs) -> bytes` forms the task from the prior outputs. `after`
+        declares the dependencies that order the step. `verify(output) -> bool`
+        gates completion. `exclusive` claims a fenced lease (needs the managed
+        plane). `on_timeout` is `"fail"` (default) or `"reassign"` (re-acquire the
+        lease, bumping the fence, and hand the task to a fresh holder; needs an
+        exclusive step). `compensate(outputs) -> bytes` is the rollback run if a
+        later step fails.
+        """
+    def run(self) -> typing.Any:
+        r"""
+        Run the workflow, returning the completed steps' outputs keyed by label.
+        The workflow name is the orchestrator identity it dispatches as, so it must
+        be a valid agent id. A failed step runs the compensations in reverse and
+        raises.
+        """
 
 def derive_conversation_id(seed: builtins.str) -> builtins.str:
     r"""

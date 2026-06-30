@@ -16,9 +16,10 @@ use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector
 use crate::fork::ForkInfo;
 use crate::graph::GraphQuery;
 use crate::http::{
-    self, Capabilities, CasCommittedView, DecodeRecordBody, DeletedManyView, ErrorBody,
-    ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
-    KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, RemoveBindingBody, SchemaListQuery,
+    self, Capabilities, CasCommittedView, ClientMetadataListView, ClientsQuery, DecodeRecordBody,
+    DeletedManyView, ErrorBody, ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView,
+    KvCasQuery, KvPageView, KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView,
+    RemoveBindingBody, SchemaListQuery,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
@@ -280,7 +281,7 @@ impl<T: Transport> HttpClient<T> {
             &KvPutQuery { expires_at_micros },
         )?;
         // The key is base64url in the path, but the value rides the raw request
-        // body (AGDX spec B4), so a large value carries no base64 inflation.
+        // body, so a large value carries no base64 inflation.
         self.expect_ok(Method::Put, path, Some(value.to_vec()))
             .await
     }
@@ -345,6 +346,16 @@ impl<T: Transport> HttpClient<T> {
     /// `GET /agdx/forks`: list the caller's forks.
     pub async fn list_forks(&self) -> ClientResult<Vec<ForkInfo>, T::Error> {
         self.get(http::FORKS_PATH.to_owned()).await
+    }
+
+    /// `GET /agdx/clients`: one page of live connections with their advertised
+    /// metadata, filtered and paginated per `query`. Follow `next_cursor` as the
+    /// next `after` to page.
+    pub async fn clients(
+        &self,
+        query: &ClientsQuery,
+    ) -> ClientResult<ClientMetadataListView, T::Error> {
+        self.get(with_query(http::CLIENTS_PATH, query)?).await
     }
 
     /// `GET /agdx/projections/{id}`: read one projection and its bindings, or

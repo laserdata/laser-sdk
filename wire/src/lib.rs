@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod agent_workflow;
 pub mod browse;
+pub mod clients;
 pub mod codes;
 pub mod commands;
 pub mod content;
@@ -19,6 +21,7 @@ pub mod kv;
 pub mod limits;
 pub mod query;
 pub mod result;
+pub mod snapshot;
 pub mod topics;
 
 #[cfg(feature = "codecs")]

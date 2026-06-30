@@ -96,6 +96,15 @@ pub const MAX_METADATA_TOTAL_BYTES: usize = 8192;
 pub const MAX_BODY_REFERENCE_BYTES: usize = 1024;
 /// Max capability entries on an [`AgentCard`](crate::agent::AgentCard).
 pub const MAX_CARD_CAPABILITIES: usize = 64;
+/// Ceiling on a connection's advertised metadata (`AGDX_SET_CLIENT_METADATA`).
+/// The metadata is an opaque byte payload any client may set, not agent-only: an
+/// agent advertises its card under the AGDX schema, a regular app sets whatever
+/// blob its own tooling and the console interpret. The ceiling bounds the
+/// per-connection state the streaming server holds and, because the discovery
+/// read (`AGDX_GET_CLIENTS_METADATA`) returns a page of N connections at once, it
+/// also bounds a page at `N * this`. 64 KiB is generous for any card or app blob
+/// while keeping a page well under the frame cap even at the max page size.
+pub const MAX_CLIENT_METADATA: usize = 64 * 1024;
 
 // Memory and graph caps, sized inside the existing cap family. A memory body
 // shares the opaque-value ceiling. A recall page shares the query page cap.
@@ -119,6 +128,6 @@ pub const MAX_GRAPH_NODE_LABELS: usize = 16;
 /// names a stream, topic, key, or id, all of which are bounded inputs already,
 /// so this is a defensive ceiling against a hostile or buggy upsert inflating
 /// per-element state. Sized at two key-lengths, since the largest variant (a
-/// key-value source) names both a namespace and a key; far under the opaque
+/// key-value source) names both a namespace and a key, far under the opaque
 /// value ceiling, as a source ref is a short pointer, not a payload.
 pub const MAX_SOURCE_REF_BYTES: usize = 2 * MAX_KEY_BYTES;

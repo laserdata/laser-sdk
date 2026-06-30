@@ -68,6 +68,10 @@ pub struct Provenance {
     pub deadline: Option<IggyTimestamp>,
     /// Dedup / reply-correlation key.
     pub idempotency_key: Option<String>,
+    /// The strictly-monotonic per-task fence the producer held, when this message
+    /// carries a fenced effect. The reliable consumer drops a message whose fence
+    /// is below the highest it has accepted for the task (a stale-holder replay).
+    pub fence_token: Option<u64>,
 }
 
 impl Provenance {
@@ -104,6 +108,9 @@ impl TryFrom<&Provenance> for BTreeMap<HeaderKey, HeaderValue> {
         }
         if let Some(key) = &p.idempotency_key {
             put(&mut map, keys::IDEMPOTENCY_KEY, key)?;
+        }
+        if let Some(fence) = p.fence_token {
+            put(&mut map, keys::FENCE, &fence.to_string())?;
         }
         if let Some(deadline) = &p.deadline {
             put(&mut map, keys::DEADLINE, &deadline.as_micros().to_string())?;
@@ -159,6 +166,7 @@ pub(crate) fn provenance_from_headers(
     let mut agent: Option<AgentId> = None;
     let mut target_agent_id: Option<AgentId> = None;
     let mut idempotency_key: Option<String> = None;
+    let mut fence_token: Option<u64> = None;
     let mut deadline: Option<IggyTimestamp> = None;
     let mut usage = LlmUsage::default();
     let mut has_usage = false;
@@ -192,6 +200,15 @@ pub(crate) fn provenance_from_headers(
             }
             keys::IDEMPOTENCY_KEY => {
                 idempotency_key = Some(str_value(value, keys::IDEMPOTENCY_KEY)?.to_owned());
+            }
+            // A malformed fence must be a decode error, never `.ok()`-ed to `None`:
+            // silently dropping it would skip the gate and let a tampered record
+            // through as unfenced.
+            keys::FENCE => {
+                fence_token = Some(parse_value::<u64>(
+                    str_value(value, keys::FENCE)?,
+                    keys::FENCE,
+                )?);
             }
             keys::DEADLINE => {
                 let micros = parse_value::<u64>(str_value(value, keys::DEADLINE)?, keys::DEADLINE)?;
@@ -233,6 +250,7 @@ pub(crate) fn provenance_from_headers(
         usage: has_usage.then_some(usage),
         deadline,
         idempotency_key,
+        fence_token,
     })
 }
 
@@ -300,6 +318,7 @@ mod tests {
             .agent("planner".parse().expect("planner is a valid agent id"))
             .target_agent_id("executor".parse().expect("executor is a valid agent id"))
             .idempotency_key("key-1".to_owned())
+            .fence_token(7)
             .usage(
                 LlmUsage::builder()
                     .input_tokens(10)
@@ -329,9 +348,27 @@ mod tests {
             "executor"
         );
         assert_eq!(back.idempotency_key.as_deref(), Some("key-1"));
+        assert_eq!(back.fence_token, Some(7));
         let usage = back.usage.expect("usage should be set");
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(20));
+    }
+
+    #[test]
+    fn given_a_malformed_fence_header_when_decoded_then_should_error_not_skip() {
+        let conversation = ConversationId::new();
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::from_str(keys::CONVERSATION_ID).expect("a valid header key"),
+            HeaderValue::from_str(&conversation.to_string()).expect("a valid header value"),
+        );
+        // A non-numeric fence must be rejected, never `.ok()`-ed to absent, or a
+        // tampered record would slip through the gate as unfenced.
+        headers.insert(
+            HeaderKey::from_str(keys::FENCE).expect("a valid header key"),
+            HeaderValue::from_str("not-a-number").expect("a valid header value"),
+        );
+        assert!(provenance_from_headers(&headers).is_err());
     }
 
     #[test]

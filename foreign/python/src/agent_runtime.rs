@@ -5,7 +5,10 @@ use crate::errors::{InvalidError, to_pyerr};
 use async_trait::async_trait;
 use iggy::prelude::Identifier;
 use laser_sdk::LaserError;
-use laser_sdk::agent::{AgentConsumer, AgentCtx, AgentHandler, AgentMessage, Deduplicator, Router};
+use laser_sdk::agent::{
+    AgentConsumer, AgentCtx, AgentHandler, AgentMessage, CapabilitySelector, Contract,
+    Deduplicator, InboxRoute, RoutePolicy, Router,
+};
 use laser_sdk::context::{ContextAssembler, ContextPolicy, LastN, RoleFilter};
 use laser_sdk::laser::Laser;
 use laser_sdk::provenance::{AgentTopic, Provenance};
@@ -24,6 +27,27 @@ use tokio::task::JoinHandle;
 
 fn topic_id(name: &str) -> PyResult<Identifier> {
     Identifier::named(name).map_err(|e| InvalidError::new_err(e.to_string()))
+}
+
+/// Parse an advertised-health string to a [`Health`]. Unknown text collapses to a
+/// single unrecognized sentinel, which routing treats as available (the permissive
+/// default), so a typo never silently removes an agent.
+fn parse_health(health: &str) -> laser_sdk::wire::agent::Health {
+    use laser_sdk::wire::agent::Health;
+    match health.to_ascii_lowercase().as_str() {
+        "healthy" => Health::Healthy,
+        "degraded" => Health::Degraded,
+        "unavailable" => Health::Unavailable,
+        _ => Health::Unrecognized(0),
+    }
+}
+
+/// A fixed inbox route to `topic` when given, else the default advertised route.
+fn inbox_route(fixed_inbox: Option<String>) -> InboxRoute {
+    match fixed_inbox {
+        Some(topic) => InboxRoute::Fixed(static_topic(topic)),
+        None => InboxRoute::default(),
+    }
 }
 
 /// A `respond_on` topic needs a `'static` `AgentTopic`. Well-known names map to
@@ -131,7 +155,7 @@ impl PyLaser {
     /// `dedup` (an `async def observe(key) -> bool`) for a custom, e.g. durable,
     /// deduplicator. Returns a handle to await readiness and stop it. Requires a
     /// default stream.
-    #[pyo3(signature = (agent_id, listen_on, handler, *, respond_on=None, poll_interval_ms=None, warm_dedup=false, dedup=None))]
+    #[pyo3(signature = (agent_id, listen_on, handler, *, respond_on=None, poll_interval_ms=None, warm_dedup=false, dedup=None, capabilities=None, ack_on_pickup=false, health=None))]
     #[allow(clippy::too_many_arguments)]
     fn spawn_agent(
         &self,
@@ -143,6 +167,9 @@ impl PyLaser {
         poll_interval_ms: Option<u64>,
         warm_dedup: bool,
         dedup: Option<Py<PyAny>>,
+        capabilities: Option<Vec<String>>,
+        ack_on_pickup: bool,
+        health: Option<String>,
     ) -> PyResult<PyAgentHandle> {
         let agent = AgentId::new(agent_id).map_err(|e| to_pyerr(e.into()))?;
         let laser = self.inner.clone();
@@ -156,10 +183,51 @@ impl PyLaser {
             dedup.map(|callback| Box::new(PyDeduplicator { callback }) as Box<dyn Deduplicator>);
         let respond_topic = respond_on.map(static_topic);
         let poll = poll_interval_ms.map(Duration::from_millis);
+        // Skills the agent advertises: a capability card published on start, the
+        // same auto-advertise the Rust `Agent` builder does when capabilities are
+        // set. An optional `health` ("healthy"/"degraded"/"unavailable") applies to
+        // every advertised skill.
+        let advertised_health = health.as_deref().map(parse_health);
+        let card = capabilities
+            .filter(|skills| !skills.is_empty())
+            .map(|skills| laser_sdk::wire::agent::AgentCard {
+                name: None,
+                version: None,
+                capabilities: skills
+                    .into_iter()
+                    .map(|skill_id| laser_sdk::wire::agent::CapabilityDescriptor {
+                        skill_id,
+                        input: None,
+                        output: None,
+                        cost_class: None,
+                        latency_class: None,
+                        max_concurrency: None,
+                        health: advertised_health,
+                        load: None,
+                    })
+                    .collect(),
+                ttl_micros: None,
+            });
         let locals = get_current_locals(py)?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
+        let advertise_id = agent.clone();
+        // The inbox the agent advertises is the topic it consumes on.
+        let presence_inbox = listen_on.clone();
         let join = get_runtime().spawn(scope(locals, async move {
+            if let Some(card) = card {
+                if let Err(error) = laser.publish_card(advertise_id.clone(), &card).await {
+                    eprintln!("failed to publish the agent capability card: {error}");
+                }
+                // Advertise the live inbox too, mirroring the Rust builder, so a
+                // capability route resolves this agent without a fixed inbox. Best
+                // effort: a stock server without the presence command is fine.
+                let presence = laser_sdk::wire::agent::AgentPresence::new(advertise_id.wire_id())
+                    .with_inbox(presence_inbox);
+                if let Err(error) = laser.advertise_presence(&presence).await {
+                    eprintln!("inbox presence not advertised: {error}");
+                }
+            }
             AgentConsumer::builder()
                 .group(group)
                 .topic(listen_on)
@@ -167,6 +235,7 @@ impl PyLaser {
                 .maybe_poll_interval(poll)
                 .warm_dedup(warm_dedup)
                 .maybe_deduplicator(deduplicator)
+                .ack_on_pickup(ack_on_pickup)
                 .build()
                 .run(&laser, py_handler, ready_tx, shutdown_rx)
                 .await
@@ -176,6 +245,114 @@ impl PyLaser {
             join: Mutex::new(Some(join)),
             ready: Mutex::new(Some(ready_rx)),
         })
+    }
+
+    /// Send a directed task to one agent advertising `skill`, await its reply up to
+    /// `deadline_ms`. Returns the reply body, or `None` if it did not complete in
+    /// time. `fixed_inbox` routes to a fixed topic (a stock server with no presence
+    /// command). Omit it to resolve each agent's advertised inbox.
+    #[pyo3(signature = (skill, payload, *, source, deadline_ms=10_000, fixed_inbox=None))]
+    fn contract<'py>(
+        &self,
+        py: Python<'py>,
+        skill: String,
+        payload: Vec<u8>,
+        source: String,
+        deadline_ms: u64,
+        fixed_inbox: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.inner.clone();
+        let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
+        let route = inbox_route(fixed_inbox);
+        future_into_py(py, async move {
+            let outcome = laser
+                .contract(Router::to_capable(skill, RoutePolicy::Any))
+                .from(source)
+                .payload(payload)
+                .inbox_route(route)
+                .deadline(Duration::from_millis(deadline_ms))
+                .send()
+                .await
+                .map_err(to_pyerr)?;
+            Ok(match outcome {
+                Contract::Completed(reply) => Some(reply.body().to_vec()),
+                _ => None,
+            })
+        })
+    }
+
+    /// Scatter a directed task to every agent advertising `skill`, concurrently,
+    /// and return the reply body of each that completed (a verifier or diagnostic
+    /// panel). Unavailable and quarantined agents are excluded.
+    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None))]
+    fn scatter<'py>(
+        &self,
+        py: Python<'py>,
+        skill: String,
+        payload: Vec<u8>,
+        source: String,
+        deadline_ms: u64,
+        fixed_inbox: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.inner.clone();
+        let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
+        let selector = CapabilitySelector::new(skill, RoutePolicy::Any);
+        let route = inbox_route(fixed_inbox);
+        future_into_py(py, async move {
+            laser
+                .scatter(
+                    source,
+                    &selector,
+                    &payload,
+                    &route,
+                    Duration::from_millis(deadline_ms),
+                )
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Quarantine `agent` as `operator`: append the fact to the registry so every
+    /// fused registry folds it and excludes the agent from routing.
+    fn quarantine<'py>(
+        &self,
+        py: Python<'py>,
+        operator: String,
+        agent: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.inner.clone();
+        let operator = AgentId::new(operator).map_err(|e| to_pyerr(e.into()))?;
+        let agent = AgentId::new(agent).map_err(|e| to_pyerr(e.into()))?;
+        future_into_py(py, async move {
+            laser.quarantine(operator, &agent).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Lift a prior quarantine on `agent` as `operator`: append the counterpart
+    /// fact so every fused registry folds it and returns the agent to routing.
+    fn unquarantine<'py>(
+        &self,
+        py: Python<'py>,
+        operator: String,
+        agent: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.inner.clone();
+        let operator = AgentId::new(operator).map_err(|e| to_pyerr(e.into()))?;
+        let agent = AgentId::new(agent).map_err(|e| to_pyerr(e.into()))?;
+        future_into_py(py, async move {
+            laser.unquarantine(operator, &agent).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Open a [`Workflow`](crate::workflow::PyWorkflow): dependency-ordered steps
+    /// over the coordination primitives, with budgets, verifier panels, fenced
+    /// exclusivity, on-timeout reassignment, and saga compensation. Declare steps,
+    /// then `await wf.run()`. The name is the orchestrator identity the run
+    /// dispatches as. `fixed_inbox` routes every step to a fixed topic (a stock
+    /// server with no presence command); omit it to resolve advertised inboxes.
+    #[pyo3(signature = (name, *, fixed_inbox=None))]
+    fn workflow(&self, name: String, fixed_inbox: Option<String>) -> crate::workflow::PyWorkflow {
+        crate::workflow::PyWorkflow::new(self.inner.clone(), name, fixed_inbox)
     }
 
     /// Replay a conversation's history off the log: read `topics` (default the

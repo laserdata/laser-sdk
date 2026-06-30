@@ -61,6 +61,16 @@ pub struct Laser {
 struct LaserInner {
     client: IggyClient,
     producers: DashMap<ProducerKey, ProducerCell>,
+    // The agent registry read model's per-stream cache, so a fresh `AgentRegistry`
+    // resumes the card fold instead of re-reading the registry topic from offset 0.
+    // Keyed by data stream (the tenant boundary the registry topic lives on).
+    #[cfg(feature = "agent")]
+    registry_caches: DashMap<String, Arc<std::sync::Mutex<crate::agent::registry::RegistryCache>>>,
+    // Optional enrolled-key verifier. When set, the agent registry rejects a
+    // quarantine fact that is not validly signed by an enrolled operator key
+    // (defense in depth over the registry topic's write access control).
+    #[cfg(feature = "sign")]
+    verifier: Option<Arc<crate::sign::KeyRegistry>>,
 }
 
 impl Laser {
@@ -136,6 +146,10 @@ impl Laser {
             inner: Arc::new(LaserInner {
                 client,
                 producers: DashMap::new(),
+                #[cfg(feature = "agent")]
+                registry_caches: DashMap::new(),
+                #[cfg(feature = "sign")]
+                verifier: None,
             }),
             capabilities: Capabilities::default(),
             ops_stream: OPS_STREAM_DEFAULT.to_owned(),
@@ -205,6 +219,29 @@ impl Laser {
     // methods that take just a topic.
     pub(crate) fn stream_required(&self) -> Result<&str, LaserError> {
         self.stream().ok_or(LaserError::NoStream)
+    }
+
+    /// The shared agent-registry cache for the default stream, created on first
+    /// use. Per-stream because the registry topic is scoped to the data stream
+    /// (the tenant boundary).
+    #[cfg(feature = "agent")]
+    pub(crate) fn registry_cache(
+        &self,
+    ) -> Result<Arc<std::sync::Mutex<crate::agent::registry::RegistryCache>>, LaserError> {
+        let stream = self.stream_required()?;
+        Ok(self
+            .inner
+            .registry_caches
+            .entry(stream.to_owned())
+            .or_default()
+            .clone())
+    }
+
+    /// The enrolled-key verifier the agent registry checks privileged facts
+    /// against, if one was set on the builder.
+    #[cfg(feature = "sign")]
+    pub(crate) fn registry_verifier(&self) -> Option<Arc<crate::sign::KeyRegistry>> {
+        self.inner.verifier.clone()
     }
 
     /// The Iggy stream carrying this laser's query/control ops surface
@@ -467,6 +504,8 @@ pub struct LaserBuilder {
     ops_stream: Option<String>,
     control_topic: Option<String>,
     capabilities: Capabilities,
+    #[cfg(feature = "sign")]
+    verifier: Option<Arc<crate::sign::KeyRegistry>>,
 }
 
 #[derive(Default)]
@@ -554,6 +593,17 @@ impl LaserBuilder {
     /// default is [`Capabilities::OPEN`]: everything off, raw Apache Iggy.
     pub fn capabilities(mut self, value: Capabilities) -> Self {
         self.capabilities = value;
+        self
+    }
+
+    /// Enroll the operator-key verifier the agent registry checks privileged
+    /// facts against. With it set, a quarantine or un-quarantine record is folded
+    /// only when it carries a signature that verifies against an enrolled key, so
+    /// the registry topic's write access control is no longer the sole gate on who
+    /// can evict an agent from routing. Omit it to fold on the write-ACL alone.
+    #[cfg(feature = "sign")]
+    pub fn verifier(mut self, verifier: Arc<crate::sign::KeyRegistry>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -650,6 +700,10 @@ impl LaserBuilder {
             inner: Arc::new(LaserInner {
                 client,
                 producers: DashMap::new(),
+                #[cfg(feature = "agent")]
+                registry_caches: DashMap::new(),
+                #[cfg(feature = "sign")]
+                verifier: self.verifier,
             }),
             capabilities,
             ops_stream: self

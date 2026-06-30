@@ -8,7 +8,10 @@ use axum::Router;
 use axum::extract::State;
 #[cfg(feature = "a2a-http")]
 use axum::routing::post;
-use laser_wire::agent::{self as agdx, AgentEnvelope, AgentId, CorrelationId, OPERATION_CHAT};
+use laser_wire::agent::{
+    self as agdx, AgentEnvelope, AgentId, CapabilityDescriptor, ContentRef, CorrelationId,
+    OPERATION_CHAT,
+};
 use laser_wire::content::ContentType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -86,6 +89,36 @@ pub struct AgentSkill {
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
+    /// The skill's accepted input content modes (A2A `inputModes`), derived from
+    /// the capability descriptor's input `ContentRef`. Omitted when unspecified.
+    #[serde(rename = "inputModes", skip_serializing_if = "Vec::is_empty")]
+    pub input_modes: Vec<String>,
+    /// The skill's produced output content modes (A2A `outputModes`).
+    #[serde(rename = "outputModes", skip_serializing_if = "Vec::is_empty")]
+    pub output_modes: Vec<String>,
+}
+
+/// Project a capability's [`ContentRef`] to an A2A content mode string: a
+/// content-type code to its media type, a registered schema id to an AGDX schema
+/// media type. Unknown codes fall back to opaque bytes.
+fn content_ref_mode(reference: &ContentRef) -> String {
+    match reference {
+        ContentRef::ContentType(content_type) => match content_type {
+            ContentType::Raw => "application/octet-stream",
+            ContentType::Json => "application/json",
+            ContentType::Msgpack => "application/msgpack",
+            ContentType::Cbor => "application/cbor",
+            ContentType::Bson => "application/bson",
+            ContentType::Avro => "application/avro",
+            ContentType::Protobuf => "application/protobuf",
+            ContentType::Arrow => "application/vnd.apache.arrow.stream",
+            ContentType::Ref => "application/x-agdx-ref",
+            ContentType::Any => "*/*",
+            _ => "application/octet-stream",
+        }
+        .to_owned(),
+        ContentRef::SchemaId(id) => format!("application/x-agdx-schema;id={id}"),
+    }
 }
 
 /// An A2A task's current state. `state` is the ONE wire dictionary
@@ -206,6 +239,12 @@ pub struct A2aBridge {
     source: AgentId,
     request_topic: AgentTopic<'static>,
     reply_topic: AgentTopic<'static>,
+    capabilities: Vec<CapabilityDescriptor>,
+    /// When set, control records the bridge emits (the cancel) are signed, so a
+    /// verifying consumer can authorize them against the enrolled key. Closes the
+    /// unauthenticated-cancel hole. Requires the `sign` feature.
+    #[cfg(feature = "sign")]
+    signing_key: Option<crate::sign::SigningKey>,
 }
 
 impl A2aBridge {
@@ -226,7 +265,31 @@ impl A2aBridge {
             source,
             request_topic,
             reply_topic,
+            capabilities: Vec::new(),
+            #[cfg(feature = "sign")]
+            signing_key: None,
         }
+    }
+
+    /// Sign the control records the bridge emits (the cancel) with `key`, so a
+    /// verifying consumer authorizes them against the enrolled key registry. This
+    /// is what corrects the otherwise-unauthenticated cancel. Requires the `sign`
+    /// feature.
+    #[cfg(feature = "sign")]
+    #[must_use]
+    pub fn with_signing_key(mut self, key: crate::sign::SigningKey) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    /// Advertise the agent's structured capabilities on the A2A card. Each
+    /// [`CapabilityDescriptor`] is projected to an A2A `AgentSkill` by
+    /// [`card`](Self::card), so a remote A2A client discovers the agent's skills
+    /// and their I/O shapes. Consumes and returns self for chaining.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Vec<CapabilityDescriptor>) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// `message/send`: publish the params as a typed AGDX `command` on a fresh
@@ -291,16 +354,23 @@ impl A2aBridge {
             retryable: false,
             detail: None,
         };
-        self.laser
-            .agdx(
-                self.reply_topic.clone(),
-                self.source.clone(),
-                conversation.into(),
-            )
+        let producer = self.laser.agdx(
+            self.reply_topic.clone(),
+            self.source.clone(),
+            conversation.into(),
+        );
+        let send = producer
             .fail(correlation_of(conversation), &error)?
-            .with_task_state(TaskState::Canceled)
-            .send()
-            .await?;
+            .with_task_state(TaskState::Canceled);
+        // Sign the cancel when a key is configured, so a verifying consumer can
+        // authorize it. Without a key it rides unsigned, and a topic that
+        // mandates verification rejects it.
+        #[cfg(feature = "sign")]
+        let send = match &self.signing_key {
+            Some(key) => send.signed_by(key),
+            None => send,
+        };
+        send.send().await?;
         Ok(Task {
             id: id.to_owned(),
             status: TaskStatus {
@@ -311,9 +381,23 @@ impl A2aBridge {
     }
 
     /// The bridge's A2A Agent Card, for discovery. Streaming is advertised
-    /// because AGDX chunk channels replay off the log. `skills` is empty here
-    /// (the bridge is a transport, not a skill catalog).
+    /// because AGDX chunk channels replay off the log. Each advertised
+    /// [`CapabilityDescriptor`] (set via [`with_capabilities`](Self::with_capabilities))
+    /// projects to an A2A `AgentSkill`: the skill id is its id and name, and the
+    /// I/O `ContentRef`s become the skill's input and output modes.
     pub fn card(&self) -> AgentCard {
+        let skills = self
+            .capabilities
+            .iter()
+            .map(|capability| AgentSkill {
+                id: capability.skill_id.clone(),
+                name: capability.skill_id.clone(),
+                description: String::new(),
+                tags: Vec::new(),
+                input_modes: capability.input.iter().map(content_ref_mode).collect(),
+                output_modes: capability.output.iter().map(content_ref_mode).collect(),
+            })
+            .collect();
         AgentCard {
             protocol_version: A2A_PROTOCOL_VERSION.to_owned(),
             name: self.source.as_str().to_owned(),
@@ -327,7 +411,7 @@ impl A2aBridge {
             },
             default_input_modes: vec!["text/plain".to_owned()],
             default_output_modes: vec!["text/plain".to_owned()],
-            skills: Vec::new(),
+            skills,
         }
     }
 

@@ -211,3 +211,25 @@ jobs:
       - name: BDD scenarios (Rust runner)
         working-directory: bdd/rust
         run: cargo test
+
+  # One aggregate gate so branch protection requires a single check, not every
+  # job and matrix leg. Runs after all of them and fails if any did not succeed.
+  ci-rust-complete:
+    name: ci-rust-complete
+    if: always()
+    needs:
+      - lint
+      - lint-detached
+      - build
+      - wire-feature-matrix
+      - feature-matrix
+      - wasm
+      - deny
+      - test
+      - fuzz
+      - bdd
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

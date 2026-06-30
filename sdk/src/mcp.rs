@@ -375,6 +375,12 @@ impl McpBridge {
     ) -> Result<McpToolResult, LaserError> {
         let conversation = ConversationId::new();
         let correlation = CorrelationId::from_u128(conversation.as_u128());
+        // Seed the reply reader at the topic tail before sending, so it reads only
+        // the reply rather than the topic's history.
+        let mut reader = self
+            .laser
+            .agdx_reply_reader(self.reply_topic.clone())
+            .await?;
         self.laser
             .agdx(
                 self.tool_topic.clone(),
@@ -386,11 +392,9 @@ impl McpBridge {
             .content_type(ContentType::Json)
             .send()
             .await?;
-        // The forward-advancing reply reader reads the reply topic incrementally
-        // (never re-scanned from 0 each poll).
         let envelope = self
             .laser
-            .await_agdx_reply(self.reply_topic.clone(), correlation, self.timeout)
+            .await_agdx_reply(&mut reader, correlation, self.timeout)
             .await?;
         Ok(tool_result_from_envelope(&envelope))
     }

@@ -85,9 +85,8 @@ impl ResultCode {
         }
     }
 
-    /// The HTTP status this code maps to, the one mapping every surface shares
-    /// (the AGDX spec's HTTP binding table), so a status need not be decided
-    /// per surface or per route.
+    /// The HTTP status this code maps to, the one mapping every surface shares,
+    /// so a status need not be decided per surface or per route.
     pub const fn http_status(self) -> u16 {
         match self {
             ResultCode::Ok => 200,

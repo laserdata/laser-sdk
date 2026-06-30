@@ -4,6 +4,7 @@
 // the SDK one generic send path and LaserData Cloud's dispatch table a fixture test
 // against the same pairings.
 
+use crate::agent_workflow::{AgentCancel, AgentList, AgentReply, AgentStatusReq, AgentSubmit};
 use crate::browse::{
     BrowseReply, DecodeRecord, GetProjection, GetSchema, ListProjections, ListSchemas,
     RegisterSchema,
@@ -49,6 +50,10 @@ command!(ForkDelete, AGDX_FORK_DELETE_CODE, ForkReply);
 command!(ForkPromote, AGDX_FORK_PROMOTE_CODE, ForkReply);
 command!(ForkList, AGDX_FORK_LIST_CODE, ForkReply);
 command!(ForkPut, AGDX_FORK_PUT_CODE, ForkReply);
+command!(AgentSubmit, AGDX_AGENT_SUBMIT_CODE, AgentReply);
+command!(AgentCancel, AGDX_AGENT_CANCEL_CODE, AgentReply);
+command!(AgentStatusReq, AGDX_AGENT_STATUS_CODE, AgentReply);
+command!(AgentList, AGDX_AGENT_LIST_CODE, AgentReply);
 
 #[cfg(test)]
 mod tests {
@@ -74,5 +79,9 @@ mod tests {
         assert_eq!(<ForkPromote as Command>::CODE, 1_000_302);
         assert_eq!(<ForkList as Command>::CODE, 1_000_303);
         assert_eq!(<ForkPut as Command>::CODE, 1_000_304);
+        assert_eq!(<AgentSubmit as Command>::CODE, 1_000_600);
+        assert_eq!(<AgentCancel as Command>::CODE, 1_000_601);
+        assert_eq!(<AgentStatusReq as Command>::CODE, 1_000_602);
+        assert_eq!(<AgentList as Command>::CODE, 1_000_603);
     }
 }
