@@ -13,6 +13,10 @@ pub mod feature {
     pub const READ_YOUR_WRITES: u64 = 1 << 1;
     /// The query surface honors `Consistency::Strong`.
     pub const STRONG_CONSISTENCY: u64 = 1 << 2;
+    /// The key-value store serves fenced compare-and-swap (`AGDX_KV_CAS_FENCED`).
+    pub const KV_CAS_FENCED: u64 = 1 << 3;
+    /// The plane serves the agent and workflow control band (`AGDX_AGENT_*`).
+    pub const AGENT_WORKFLOW: u64 = 1 << 4;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability
@@ -115,7 +119,7 @@ impl HelloReply {
 }
 
 /// One materialization backend a server exposes, advertised so a client can see
-/// what it may route to. `id` is the stable handle a binding references; `kind`
+/// what it may route to. `id` is the stable handle a binding references, `kind`
 /// is the engine family as an opaque string, so a new engine is advertised by
 /// name without any wire change. Carries identity only, never settings or
 /// secrets. Integration-agnostic: the wire pins no specific engine.

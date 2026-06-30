@@ -3,7 +3,7 @@ use laser_wire::query::Consistency;
 pub use laser_wire::hello::{BackendDescriptor, OpVersions};
 
 /// What the connected infrastructure serves beyond the open SDK surface. The open
-/// SDK works on raw Apache Iggy with everything off (`OPEN`); LaserData Cloud
+/// SDK works on raw Apache Iggy with everything off (`OPEN`). LaserData Cloud
 /// reports a richer set at connect, lighting up the matching paths with no change
 /// to the caller's imports. Nothing here falls back to a working state on raw
 /// Apache Iggy: when a capability is off, the matching call returns
@@ -37,6 +37,9 @@ pub struct Capabilities {
     pub forks: bool,
     /// A managed A2A gateway (auth, streaming, persisted task store).
     pub a2a_gateway: bool,
+    /// The managed agent and workflow control band (`Laser::agent_tasks` submit /
+    /// cancel / status / list). Off until the plane serves the band.
+    pub agent_workflow: bool,
     /// Platform-native session lifecycle (the infrastructure tracks a session).
     pub sessions: bool,
     /// Platform-side durable deduplication (survives a cold start without replay).
@@ -73,6 +76,11 @@ pub struct KvCaps {
     /// Independent of plain get/set: a backend that cannot do a conditional write
     /// leaves it off, and `commit()` then returns `LaserError::Unsupported`.
     pub cas: bool,
+    /// Whether the store serves fenced compare-and-swap (`Kv::cas_fenced(..)`).
+    /// Independent of plain `cas`: a backend leaves it off when it cannot gate a
+    /// write on a live fence sequence, and `cas_fenced` then returns
+    /// `LaserError::Unsupported`.
+    pub cas_fenced: bool,
 }
 
 impl Capabilities {
@@ -86,10 +94,12 @@ impl Capabilities {
         kv: KvCaps {
             available: false,
             cas: false,
+            cas_fenced: false,
         },
         graph: false,
         forks: false,
         a2a_gateway: false,
+        agent_workflow: false,
         sessions: false,
         durable_dedup: false,
         versions: None,
@@ -141,6 +151,13 @@ impl Capabilities {
         self
     }
 
+    /// Returns a copy advertising key-value fenced compare-and-swap.
+    #[must_use]
+    pub fn with_kv_cas_fenced(mut self, value: bool) -> Self {
+        self.kv.cas_fenced = value;
+        self
+    }
+
     /// Returns a copy with the managed graph surface available.
     #[must_use]
     pub fn with_graph(mut self, value: bool) -> Self {
@@ -159,6 +176,13 @@ impl Capabilities {
     #[must_use]
     pub fn with_a2a_gateway(mut self, value: bool) -> Self {
         self.a2a_gateway = value;
+        self
+    }
+
+    /// Returns a copy advertising the managed agent and workflow control band.
+    #[must_use]
+    pub fn with_agent_workflow(mut self, value: bool) -> Self {
+        self.agent_workflow = value;
         self
     }
 
@@ -200,6 +224,8 @@ impl Capabilities {
     pub(crate) fn merge_features(&mut self, versions: &OpVersions) {
         use laser_wire::hello::feature;
         self.kv.cas |= versions.has_feature(feature::KV_CAS);
+        self.kv.cas_fenced |= versions.has_feature(feature::KV_CAS_FENCED);
+        self.agent_workflow |= versions.has_feature(feature::AGENT_WORKFLOW);
         if versions.has_feature(feature::STRONG_CONSISTENCY) {
             self.query.consistency = self.query.consistency.max(Consistency::Strong);
         } else if versions.has_feature(feature::READ_YOUR_WRITES) {
@@ -226,10 +252,14 @@ mod tests {
     #[test]
     fn given_advertised_feature_bits_when_merged_then_should_light_up_the_capabilities() {
         let mut caps = Capabilities::OPEN;
-        let versions =
-            OpVersions::new(1, 1, 1, 1).with_features(feature::KV_CAS | feature::READ_YOUR_WRITES);
+        let versions = OpVersions::new(1, 1, 1, 1)
+            .with_features(feature::KV_CAS | feature::READ_YOUR_WRITES | feature::KV_CAS_FENCED);
         caps.merge_features(&versions);
         assert!(caps.kv.cas, "KV_CAS bit should set kv.cas");
+        assert!(
+            caps.kv.cas_fenced,
+            "KV_CAS_FENCED bit should set kv.cas_fenced"
+        );
         assert_eq!(
             caps.query.consistency,
             Consistency::ReadYourWrites,

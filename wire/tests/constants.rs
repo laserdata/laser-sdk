@@ -16,6 +16,8 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_COMMAND_BASE, 1_000_000);
     assert_eq!(AGDX_HELLO_CODE, 1_000_000);
     assert_eq!(AGDX_BACKEND_HELLO_CODE, 1_000_001);
+    assert_eq!(AGDX_SET_CLIENT_METADATA_CODE, 1_000_002);
+    assert_eq!(AGDX_GET_CLIENTS_METADATA_CODE, 1_000_003);
     assert_eq!(AGDX_QUERY_CODE, 1_000_100);
     assert_eq!(AGDX_GET_PROJECTION_CODE, 1_000_110);
     assert_eq!(AGDX_LIST_PROJECTIONS_CODE, 1_000_111);
@@ -31,12 +33,18 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_KV_DELETE_MANY_CODE, 1_000_204);
     assert_eq!(AGDX_KV_NAMESPACES_CODE, 1_000_205);
     assert_eq!(AGDX_KV_CAS_CODE, 1_000_206);
+    assert_eq!(AGDX_KV_CAS_FENCED_CODE, 1_000_212);
     assert_eq!(AGDX_FORK_BASE, 1_000_300);
     assert_eq!(AGDX_FORK_CREATE_CODE, 1_000_300);
     assert_eq!(AGDX_FORK_DELETE_CODE, 1_000_301);
     assert_eq!(AGDX_FORK_PROMOTE_CODE, 1_000_302);
     assert_eq!(AGDX_FORK_LIST_CODE, 1_000_303);
     assert_eq!(AGDX_FORK_PUT_CODE, 1_000_304);
+    assert_eq!(AGDX_AGENT_BASE, 1_000_600);
+    assert_eq!(AGDX_AGENT_SUBMIT_CODE, 1_000_600);
+    assert_eq!(AGDX_AGENT_CANCEL_CODE, 1_000_601);
+    assert_eq!(AGDX_AGENT_STATUS_CODE, 1_000_602);
+    assert_eq!(AGDX_AGENT_LIST_CODE, 1_000_603);
 }
 
 #[test]
@@ -46,6 +54,9 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(KV_OP_VERSION, 1);
     assert_eq!(FORK_OP_VERSION, 1);
     assert_eq!(AGENT_OP_VERSION, 1);
+    assert_eq!(AGENT_WORKFLOW_OP_VERSION, 1);
+    assert_eq!(CLIENT_METADATA_OP_VERSION, 1);
+    assert_eq!(PRESENCE_OP_VERSION, 1);
 }
 
 #[test]
@@ -57,6 +68,8 @@ fn given_capability_feature_bits_when_compared_then_should_match_the_dictionary(
     assert_eq!(feature::KV_CAS, 1 << 0);
     assert_eq!(feature::READ_YOUR_WRITES, 1 << 1);
     assert_eq!(feature::STRONG_CONSISTENCY, 1 << 2);
+    assert_eq!(feature::KV_CAS_FENCED, 1 << 3);
+    assert_eq!(feature::AGENT_WORKFLOW, 1 << 4);
 }
 
 #[test]
@@ -86,6 +99,7 @@ fn given_provenance_keys_when_compared_then_should_match_the_dictionary() {
     assert_eq!(headers::IDEMPOTENCY_KEY, "agdx.idem");
     assert_eq!(headers::DEADLINE, "agdx.deadline");
     assert_eq!(headers::COST_USD, "agdx.cost");
+    assert_eq!(headers::FENCE, "agdx.fence");
     assert_eq!(headers::AGENT_VERSION, "agdx.av");
 }
 
@@ -94,6 +108,8 @@ fn given_agent_vocabulary_when_compared_then_should_match_the_dictionary() {
     assert_eq!(agent::OPERATION_TASK, "task");
     assert_eq!(agent::OPERATION_CARD, "card");
     assert_eq!(agent::OPERATION_PROGRESS, "progress");
+    assert_eq!(agent::OPERATION_QUARANTINE, "quarantine");
+    assert_eq!(agent::OPERATION_UNQUARANTINE, "unquarantine");
     assert_eq!(agent::OPERATION_CHAT, "chat");
     assert_eq!(agent::OPERATION_REASONING, "reasoning");
     assert_eq!(agent::OPERATION_TOOL_ARGS, "tool_args");
@@ -137,6 +153,7 @@ fn given_limits_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(limits::MAX_METADATA_TOTAL_BYTES, 8192);
     assert_eq!(limits::MAX_BODY_REFERENCE_BYTES, 1024);
     assert_eq!(limits::MAX_CARD_CAPABILITIES, 64);
+    assert_eq!(limits::MAX_CLIENT_METADATA, 64 * 1024);
 }
 
 #[test]
@@ -184,4 +201,5 @@ fn given_http_routes_when_compared_then_should_match_the_router() {
     assert_eq!(laser_wire::http::SCHEMAS_PATH, "/agdx/schemas");
     assert_eq!(laser_wire::http::KV_PATH, "/agdx/kv");
     assert_eq!(laser_wire::http::FORKS_PATH, "/agdx/forks");
+    assert_eq!(laser_wire::http::CLIENTS_PATH, "/agdx/clients");
 }

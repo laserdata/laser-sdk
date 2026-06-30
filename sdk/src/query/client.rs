@@ -1601,7 +1601,7 @@ impl<'a> QueryRequest<'a> {
 
     /// AND `filter` into the query's predicate tree. The fluent `filter_*`
     /// helpers route through here, so chained filters compose as a conjunction.
-    /// Build `Any`/`Not` subtrees with [`Filter::any`]/[`Filter::not`] and pass
+    /// Build `Any`/`Not` subtrees with [`Filter::any`]/[`Filter::negate`] and pass
     /// them here.
     pub fn filter(self, filter: Filter) -> Self {
         self.and_filter(filter)

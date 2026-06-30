@@ -5,12 +5,17 @@
 // wire break. Consumer repos assert against the same bytes through the
 // `fixtures` feature instead of copying files.
 
+use laser_wire::agent::ConversationId;
+use laser_wire::agent_workflow::{
+    AgentOutcome, AgentReply, AgentRunInfo, AgentRunState, AgentSubmit,
+};
 use laser_wire::browse::{
     BrowseOutcome, BrowseReply, DecodeRecord, ProjectionInfo, RegisterSchema, SchemaInfo,
 };
+use laser_wire::clients::{ClientMetadata, ClientMetadataList, ClientMetadataQuery};
 use laser_wire::codes::{
-    AGDX_KV_SET_CODE, AGENT_OP_VERSION, CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION,
-    KV_OP_VERSION, QUERY_OP_VERSION,
+    AGDX_KV_SET_CODE, AGENT_OP_VERSION, AGENT_WORKFLOW_OP_VERSION, CLIENT_METADATA_OP_VERSION,
+    CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
@@ -30,8 +35,8 @@ use laser_wire::graph::{
 use laser_wire::hello::{BackendAnnounce, BackendDescriptor, HelloReply, OpVersions, feature};
 use laser_wire::http::{Capabilities, ErrorBody, KvEntryView, KvPageView};
 use laser_wire::kv::{
-    CasExpect, KvCas, KvEntry, KvError, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvReply,
-    KvScan, KvSet,
+    CasExpect, KvCas, KvCasFenced, KvEntry, KvError, KvNamespaceInfo, KvNamespaces, KvOutcome,
+    KvPage, KvReply, KvScan, KvSet,
 };
 use laser_wire::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Page, Query,
@@ -39,6 +44,7 @@ use laser_wire::query::{
     VectorQuery, Window,
 };
 use laser_wire::result::ResultCode;
+use laser_wire::snapshot::FoldSnapshot;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -464,6 +470,19 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         },
     );
     assert_frame(
+        "kv_cas_fenced.bin",
+        &KvCasFenced {
+            v: KV_OP_VERSION,
+            namespace: "effects".to_owned(),
+            key: b"apply-credit:order-7".to_vec(),
+            value: b"done".to_vec(),
+            expires_at_micros: None,
+            expect: CasExpect::Absent,
+            fence_key: b"task:order-7".to_vec(),
+            fence_token: 3,
+        },
+    );
+    assert_frame(
         "kv_reply_committed.bin",
         &KvReply::Ok(KvOutcome::Committed { version: 8 }),
     );
@@ -629,6 +648,80 @@ fn given_graph_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "graph_edge_sourced.bin",
         &GraphEdge::relate(&alice, "works_at", &acme).with_source(source),
+    );
+}
+
+#[test]
+fn given_agent_workflow_frames_when_encoded_then_should_match_golden_fixtures() {
+    assert_frame(
+        "agent_submit.bin",
+        &AgentSubmit {
+            v: AGENT_WORKFLOW_OP_VERSION,
+            agent_id: "diagnoser".to_owned(),
+            run_id: Some("run-7".to_owned()),
+            params: BTreeMap::from([("priority".to_owned(), "high".to_owned())]),
+            input: Some(br#"{"incident":"INC-7"}"#.to_vec()),
+        },
+    );
+    assert_frame(
+        "agent_reply_status.bin",
+        &AgentReply::Ok(AgentOutcome::Status(AgentRunInfo {
+            run_id: "run-7".to_owned(),
+            agent_id: "diagnoser".to_owned(),
+            user_id: 42,
+            state: AgentRunState::Running,
+            created_at_micros: 1_717_171_717_000_000,
+        })),
+    );
+}
+
+#[test]
+fn given_client_metadata_frames_when_encoded_then_should_match_golden_fixtures() {
+    assert_frame(
+        "client_metadata_query.bin",
+        &ClientMetadataQuery {
+            v: CLIENT_METADATA_OP_VERSION,
+            with_metadata_only: true,
+            user_id: Some(42),
+            after_client_id: Some(100),
+            limit: 50,
+        },
+    );
+    assert_frame(
+        "client_metadata_list.bin",
+        &ClientMetadataList {
+            clients: vec![
+                ClientMetadata {
+                    client_id: 7,
+                    user_id: Some(42),
+                    transport: 1,
+                    address: "127.0.0.1:8090".to_owned(),
+                    consumer_groups_count: 2,
+                    metadata: Some(br#"{"role":"planner"}"#.to_vec()),
+                },
+                ClientMetadata {
+                    client_id: 9,
+                    user_id: None,
+                    transport: 2,
+                    address: "10.0.0.2:7000".to_owned(),
+                    consumer_groups_count: 0,
+                    metadata: None,
+                },
+            ],
+            next_cursor: Some(9),
+        },
+    );
+}
+
+#[test]
+fn given_a_fold_snapshot_when_encoded_then_should_match_golden_fixture() {
+    assert_frame(
+        "fold_snapshot.bin",
+        &FoldSnapshot {
+            conversation: ConversationId::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            as_of: BTreeMap::from([(0, 41), (1, 9)]),
+            state: br#"{"folded":true}"#.to_vec(),
+        },
     );
 }
 
@@ -813,10 +906,12 @@ mod agent_fixtures {
     use super::{REGEN_ENV, assert_frame, decode_named, encode_named, fixture_path};
     use laser_wire::agent::{
         AgentCard, AgentDeadLetter, AgentEnvelope, AgentErrorBody, AgentErrorCode, AgentId,
-        AgentKind, BodyRef, ChannelId, ConversationId, CorrelationId, DeadLetterReason,
-        LogPosition, OPERATION_CARD, OPERATION_CHAT, OPERATION_REASONING, OPERATION_TASK, RecordId,
-        SIGNATURE_SCHEME_ED25519, Signature, TaskState, TokenUsage, validate,
+        AgentKind, AgentPresence, BodyRef, CapabilityDescriptor, ChannelId, ContentRef,
+        ConversationId, CorrelationId, DeadLetterReason, Health, LogPosition, OPERATION_CARD,
+        OPERATION_CHAT, OPERATION_REASONING, OPERATION_TASK, RecordId, SIGNATURE_SCHEME_ED25519,
+        Signature, TaskState, TokenUsage, validate,
     };
+    use laser_wire::content::ContentType;
     use laser_wire::query::Value;
     use std::collections::BTreeMap;
 
@@ -839,6 +934,17 @@ mod agent_fixtures {
         .with_metadata("priority", "high");
         validate(&command).expect("canonical command validates");
         assert_frame("agent_command.bin", &command);
+
+        // A signed command: the optional `signature` field present. The corpus
+        // keeps a fixed deterministic pattern (the wire crate is crypto-free), the
+        // real sign-and-verify round trip is an SDK unit test.
+        let signed = command.clone().with_signature(Signature {
+            scheme: SIGNATURE_SCHEME_ED25519,
+            key_id: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            bytes: (0u8..64).collect(),
+        });
+        validate(&signed).expect("signed command validates");
+        assert_frame("agent_command_signed.bin", &signed);
 
         let response = AgentEnvelope::response(
             record(),
@@ -982,11 +1088,41 @@ mod agent_fixtures {
         let agent_card = AgentCard {
             name: Some("trip-planner".to_owned()),
             version: Some("1.4.2".to_owned()),
-            capabilities: vec!["chat".to_owned(), "search_flights".to_owned()],
+            capabilities: vec![
+                CapabilityDescriptor {
+                    skill_id: "chat".to_owned(),
+                    input: Some(ContentRef::ContentType(ContentType::Json)),
+                    output: Some(ContentRef::ContentType(ContentType::Json)),
+                    cost_class: Some(2),
+                    latency_class: Some(1),
+                    max_concurrency: Some(8),
+                    health: Some(Health::Healthy),
+                    load: Some(250),
+                },
+                CapabilityDescriptor {
+                    skill_id: "search_flights".to_owned(),
+                    input: Some(ContentRef::SchemaId("order.v1".to_owned())),
+                    output: None,
+                    cost_class: None,
+                    latency_class: None,
+                    max_concurrency: None,
+                    health: Some(Health::Degraded),
+                    load: None,
+                },
+            ],
             ttl_micros: Some(30_000_000),
         };
         agent_card.validate().expect("canonical card validates");
         assert_frame("agent_card.bin", &agent_card);
+
+        // The live presence body an agent advertises in its connection metadata:
+        // the link from a connection to its card plus the inbox topic routing
+        // resolves to. Pinned so the discovery convention cannot drift.
+        let agent_presence = AgentPresence::new(source()).with_inbox("trip-planner.work");
+        agent_presence
+            .validate()
+            .expect("canonical presence validates");
+        assert_frame("agent_presence.bin", &agent_presence);
 
         // The dormant signature capsule: pinned so the wire shape cannot
         // drift before the opt-in activates.

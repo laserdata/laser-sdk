@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 // Stream name prefix when `LASER_STREAM` is unset. Each example gets its own
 // stream (`laser-<example>`, see `stream_for`), never one shared stream.
-// AGDX isolates workloads by stream, never by partition (the Iggy binding, spec
-// B1.1): unrelated apps sharing one stream would also share the well-known
+// AGDX isolates workloads by stream, never by partition: unrelated apps sharing
+// one stream would also share the well-known
 // agent topics (`agent.commands`, `agent.tool_calls`, ...), so each app's
 // freshly joined consumer group would replay the other app's traffic from
 // offset 0 and dead-letter every message it cannot decode. Per-example streams

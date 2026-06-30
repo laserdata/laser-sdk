@@ -17,6 +17,12 @@ pub enum AgentTopic<'a> {
     HumanInput,
     /// Audit / memory records.
     Audit,
+    /// The agent card registry: agents republish their cards here, and the
+    /// registry read model folds it to the latest card per agent.
+    Registry,
+    /// The workflow journal: the engine records each step's outcome here, keyed by
+    /// the workflow run, so a crashed run resumes by replaying it.
+    WorkflowJournal,
     /// The dead-letter queue.
     Dlq,
     /// Any other topic, by `Identifier`.
@@ -34,6 +40,8 @@ impl AgentTopic<'_> {
             Self::LlmIo => Some("agent.llm_io"),
             Self::HumanInput => Some("agent.human_input"),
             Self::Audit => Some("agent.audit"),
+            Self::Registry => Some("agent.registry"),
+            Self::WorkflowJournal => Some("agent.workflow_journal"),
             Self::Dlq => Some("agent.dlq"),
             Self::Custom(_) => None,
         }

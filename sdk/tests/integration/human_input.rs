@@ -103,6 +103,77 @@ async fn given_a_rejecter_when_requesting_input_then_should_surface_a_rejected_e
     );
 }
 
+// A handler that gates on a human decision via `ctx.approval_gate`, then reports
+// the decision on the audit topic so the test can observe it.
+struct Gatekeeper;
+
+impl AgentHandler for Gatekeeper {
+    async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
+        let decision = ctx
+            .approval_gate(
+                AgentTopic::Responses,
+                Bytes::from_static(b"approve a $500 credit?"),
+                Duration::from_secs(10),
+            )
+            .await?;
+        ctx.reply_on(AgentTopic::Audit, decision).await
+    }
+}
+
+#[tokio::test]
+async fn given_a_handler_gating_on_a_human_when_approved_then_should_resume_with_the_decision() {
+    let laser = harness::laser().await;
+    Agent::builder()
+        .id("approver".parse().expect("approver is a valid agent id"))
+        .listen_on(AgentTopic::HumanInput)
+        .handler(Approver)
+        .build()
+        .spawn(laser.clone());
+    let mut gatekeeper = Agent::builder()
+        .id("gatekeeper"
+            .parse()
+            .expect("gatekeeper is a valid agent id"))
+        .listen_on(AgentTopic::ToolCalls)
+        .respond_on(AgentTopic::Responses)
+        .handler(Gatekeeper)
+        .build()
+        .spawn(laser.clone());
+    gatekeeper
+        .ready()
+        .await
+        .expect("gatekeeper joins its group");
+
+    let trigger = Provenance::builder()
+        .conversation_id(ConversationId::new())
+        .build();
+    let conversation = trigger.conversation_id;
+    laser
+        .send_agent(AgentTopic::ToolCalls, Bytes::from_static(b"go"), &trigger)
+        .await
+        .expect("the trigger should be sent");
+
+    let decision = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let audit = ContextAssembler::builder()
+                .conversation_id(conversation)
+                .topics(vec![AgentTopic::Audit])
+                .build()
+                .assemble(&laser)
+                .await
+                .expect("reading the audit topic should succeed");
+            audit
+                .into_iter()
+                .find(|m| m.payload == b"approved")
+                .map(|m| m.payload)
+        }
+    })
+    .await;
+
+    assert_eq!(decision.as_slice(), b"approved");
+    gatekeeper.shutdown().await.expect("gatekeeper shuts down");
+}
+
 #[tokio::test]
 async fn given_no_approver_when_requesting_input_then_should_time_out() {
     let laser = harness::laser().await;

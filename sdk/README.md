@@ -17,9 +17,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = { version = "0.0.1-rc.6", default-features = false, features = ["query"] }   # generic substrate
+laser-sdk = { version = "0.0.1-rc.7", default-features = false, features = ["query"] }   # generic substrate
 # or with the agent runtime layered on top:
-laser-sdk = { version = "0.0.1-rc.6", features = ["query"] }
+laser-sdk = { version = "0.0.1-rc.7", features = ["query"] }
 ```
 
 ## Quick example
@@ -105,6 +105,7 @@ In production LaserData Cloud runs the projector for you. For local development 
 - `a2a-bridge`, A2A JSON-RPC bridge over the agent topology (message/send + stream, tasks/get + cancel, Agent Card)
 - `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
 - `agui`, AG-UI state sync and event rendering over the log
+- `sign`, ed25519 envelope signing and verification: signed `quarantine`/`unquarantine` registry facts, a `LaserBuilder::verifier` that folds only verified facts, and contract reply-signature verification
 
 ## Documentation
 

@@ -8,10 +8,12 @@
   },
   "kv": {
     "available": true,
-    "cas": true
+    "cas": true,
+    "cas_fenced": false
   },
   "graph": false,
   "fork": true,
+  "agent_workflow": false,
   "versions": {
     "query": 1,
     "control": 1,

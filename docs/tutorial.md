@@ -141,8 +141,8 @@ What runs on raw Apache Iggy is the open SDK's streaming, agent, provenance, ded
 
 LaserData Cloud serves two more read surfaces, both answering `LaserError::Unsupported` against raw Apache Iggy:
 
-- **Managed key-value store** (`kv` feature, `Laser::kv`, gated on `Capabilities::managed_kv`): `get` / `set` / `delete` / `scan` with optional expiry, arbitrary opaque byte keys/values, namespaced and user-scoped, backed by LaserData Cloud's managed point-state store. Values take the same codecs as publish - `.bytes` (raw), `.json`, `.msgpack`, `.encode_with::<C>` - and read back with `get` (bytes), `get_typed` (JSON), or `get_as::<C, _>` (any codec). See `the AGDX spec` §14.
-- **Registry browse** (`laser.projections().get(id)` / `laser.projections().list().fetch()` for projections, `laser.schemas().get(id)` / `laser.schemas().list()` for writer schemas, gated on `Capabilities::managed_host`): read back which projections and registered writer schemas (Avro/Protobuf/JSON Schema) exist and their full shape. Projection and schema CRUD stay writes on the control topic. See `the AGDX spec` §15.
+- **Managed key-value store** (`kv` feature, `Laser::kv`, gated on `Capabilities::managed_kv`): `get` / `set` / `delete` / `scan` with optional expiry, arbitrary opaque byte keys/values, namespaced and user-scoped, backed by LaserData Cloud's managed point-state store. Values take the same codecs as publish - `.bytes` (raw), `.json`, `.msgpack`, `.encode_with::<C>` - and read back with `get` (bytes), `get_typed` (JSON), or `get_as::<C, _>` (any codec).
+- **Registry browse** (`laser.projections().get(id)` / `laser.projections().list().fetch()` for projections, `laser.schemas().get(id)` / `laser.schemas().list()` for writer schemas, gated on `Capabilities::managed_host`): read back which projections and registered writer schemas (Avro/Protobuf/JSON Schema) exist and their full shape. Projection and schema CRUD stay writes on the control topic.
 
 > *Running this tutorial's snippets locally, without the cloud? The example crate ships a single-process projector you can spawn next to your code. See [Running locally](#running-locally) at the bottom of the reference section.*
 
@@ -167,7 +167,7 @@ let binding = ProjectionBinding::builder()
 - `TimeToLive { ttl_micros }` - keep rows for a fixed age after they were materialized, independent of the log.
 - `MaxRows { rows }` - keep only the newest N rows for the table.
 
-Leave `.retention(...)` unset to inherit LaserData Cloud's fleet-wide default. The policy is enforced by LaserData Cloud. See `the AGDX spec` §8.
+Leave `.retention(...)` unset to inherit LaserData Cloud's fleet-wide default. The policy is enforced by LaserData Cloud.
 
 ### Why the producer does not stamp `.index(...)` per record
 
@@ -595,6 +595,81 @@ cargo run --example concierge   # the AI support desk: triage fan-out + LLM synt
 The general-purpose counterpart (`event-analytics`) lives, with per-example READMEs, in [`examples/rust/README.md`](../examples/rust/README.md).
 
 ---
+
+## Chapter 10 - multi-agent orchestration
+
+The fan-out in Chapter 9 is manual: you pick the sub-conversations. The orchestration layer adds discovery and directed coordination so an orchestrator routes by capability, never by hard-coded agent ids, all over the same log with no separate orchestration server.
+
+### Agents advertise, the orchestrator resolves
+
+Give an agent `capabilities` and it self-advertises a capability card on the registry when it spawns. The orchestrator folds those cards into a registry and resolves a skill to the agents that serve it.
+
+```rust
+use laser_sdk::wire::agent::{AgentCard, CapabilityDescriptor};
+
+fn diagnose_card() -> AgentCard {
+    AgentCard { capabilities: vec![CapabilityDescriptor { skill_id: "diagnose".into(), ..Default::default() }], ..Default::default() }
+}
+
+let worker = Agent::builder()
+    .id("diag-alpha".parse()?)
+    .listen_on(AgentTopic::Commands)
+    .respond_on(AgentTopic::Responses)
+    .capabilities(diagnose_card().capabilities)  // auto-advertises the card on spawn
+    .ack_on_pickup(true)                          // emit a Working signal when a task is taken
+    .handler(handler)
+    .build()
+    .spawn(laser.clone());
+```
+
+### A contract: one directed task with a deadline
+
+`Laser::contract` hands a task to one capable agent and tells you whether it was consumed, completed, or timed out, with no hand-rolled correlation ids or timers.
+
+```rust
+let outcome = laser
+    .contract(Router::to_capable("diagnose", RoutePolicy::Any))
+    .from("orchestrator".parse()?)
+    .payload(b"checkout API latency spike".to_vec())
+    .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))  // a managed deployment uses the default Advertised
+    .deadline(Duration::from_secs(10))
+    .send()
+    .await?;
+match outcome {
+    Contract::Completed(reply) => { /* reply.body() is the finding */ }
+    Contract::NotConsumed | Contract::TimedOut | Contract::Failed(_) => { /* surface it */ }
+}
+```
+
+### A workflow: dependency-ordered steps, panels, and exclusivity
+
+The engine runs steps in dependency order, threads each step's output to the next, and scatters an `all_capable` step to every capable agent (a verifier panel). A budget caps spend, a journal makes a crashed run resumable, and one per-step `.exclusive()` claims a fenced lease and stamps its monotonic token on the step's command, pinned to a stable task conversation so a re-dispatch is fenced against the stale holder; for a durable at-most-once external effect the handler commits through the fenced `Kv::cas_fenced`. An exclusive step can declare `.on_timeout(OnTimeout::Reassign)`: a timed-out task is handed to a fresh holder by re-acquiring the lease, which bumps the fence sequence so the new token strictly exceeds the old one and the stale holder is gated out, bounded to a few reassignments. The default is `OnTimeout::Fail`.
+
+```rust
+let result = laser
+    .workflow("incident")
+    .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+    .step("triage", Router::to_capable("triage", RoutePolicy::Any), |_| b"incident".to_vec())
+    .step("diagnose", Router::all_capable("diagnose", RoutePolicy::Any),
+          |ctx| ctx.outputs.get("triage").cloned().unwrap_or_default())
+        .after("triage")
+    .run()
+    .await?;
+```
+
+### Health and quarantine
+
+An agent advertising itself `Unavailable` is left out of routing. An operator pulls a misbehaving agent with `quarantine`, and the next resolution routes around it. Quarantine is reversible: `unquarantine` lifts it and returns the agent to routing, so the only other way out is retention expiry.
+
+```rust
+laser.quarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
+// later, once the agent is healthy again:
+laser.unquarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
+```
+
+A registry write is authorized by the topic's write access control. With the `sign` feature you can layer signed facts on top: `quarantine_signed` / `unquarantine_signed` carry an ed25519 signature, and a registry built with `LaserBuilder::verifier(keys)` folds a quarantine fact only when its signature verifies. That is defense in depth over the broker ACL, which stays the primary gate.
+
+The `orchestra` example runs all of this end to end (a directed contract, a scatter panel, health exclusion, and quarantine), in both Rust (`cargo run --example orchestra`) and Python (`python orchestra.py`).
 
 ---
 

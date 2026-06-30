@@ -1,11 +1,12 @@
 use crate::error::LaserError;
 use crate::kv::{
-    AGDX_KV_CAS_CODE, AGDX_KV_DELETE_CODE, AGDX_KV_DELETE_MANY_CODE, AGDX_KV_EXISTS_CODE,
-    AGDX_KV_EXPIRE_CODE, AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE, AGDX_KV_NAMESPACES_CODE,
-    AGDX_KV_PATCH_CODE, AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE, AGDX_KV_SET_CODE, CasExpect,
-    DEFAULT_SCAN_LIMIT, KV_OP_VERSION, KvCas, KvDelete, KvDeleteMany, KvEntry, KvError, KvExists,
-    KvExpire, KvGet, KvLease, KvMetadata, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage,
-    KvPatch, KvRelease, KvReply, KvScan, KvSet, MAX_KEY_BYTES, MAX_VALUE_BYTES,
+    AGDX_KV_CAS_CODE, AGDX_KV_CAS_FENCED_CODE, AGDX_KV_DELETE_CODE, AGDX_KV_DELETE_MANY_CODE,
+    AGDX_KV_EXISTS_CODE, AGDX_KV_EXPIRE_CODE, AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE,
+    AGDX_KV_NAMESPACES_CODE, AGDX_KV_PATCH_CODE, AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE,
+    AGDX_KV_SET_CODE, CasExpect, DEFAULT_SCAN_LIMIT, KV_OP_VERSION, KvCas, KvCasFenced, KvDelete,
+    KvDeleteMany, KvEntry, KvError, KvExists, KvExpire, KvGet, KvLease, KvMetadata,
+    KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvPatch, KvRelease, KvReply, KvScan, KvSet,
+    MAX_KEY_BYTES, MAX_VALUE_BYTES,
 };
 use crate::laser::Laser;
 use crate::query::{Codec, Decoder};
@@ -172,6 +173,30 @@ impl<'a> Kv<'a> {
             value: Vec::new(),
             expires_at_micros: None,
             expect: None,
+        }
+    }
+
+    /// Start a fenced compare-and-swap on `key`: the write applies only while the
+    /// task's fence sequence still equals `fence_token` (the value a
+    /// [`lease`](Self::lease) returned). Supply a value and a precondition
+    /// (`.expect_absent()` or `.expect_version(..)`), then `.commit().await`. The
+    /// at-most-one-effective-writer gate for an exclusive effect: a zombie holder
+    /// at an older token is rejected even if its lease was presumed lost.
+    pub fn cas_fenced(
+        &self,
+        key: impl AsRef<[u8]>,
+        fence_key: impl AsRef<[u8]>,
+        fence_token: u64,
+    ) -> KvCasFencedRequest<'a> {
+        KvCasFencedRequest {
+            laser: self.laser,
+            namespace: self.namespace.clone(),
+            key: key.as_ref().to_vec(),
+            value: Vec::new(),
+            expires_at_micros: None,
+            expect: None,
+            fence_key: fence_key.as_ref().to_vec(),
+            fence_token,
         }
     }
 
@@ -490,6 +515,120 @@ impl<'a> KvSetRequest<'a> {
         match self.laser.execute_kv(AGDX_KV_SET_CODE, &request).await? {
             KvOutcome::Written => Ok(()),
             other => Err(unexpected("set", &other)),
+        }
+    }
+}
+
+/// Fluent builder for `Kv::cas_fenced`. Supply a value (`.bytes` / `.json` /
+/// `.msgpack` / `.encode_with`), a precondition (`.expect_absent` or
+/// `.expect_version`), an optional expiry, then `.commit().await`. The write
+/// lands only while the task fence sequence still equals the held token.
+pub struct KvCasFencedRequest<'a> {
+    laser: &'a Laser,
+    namespace: String,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    expires_at_micros: Option<u64>,
+    expect: Option<CasExpect>,
+    fence_key: Vec<u8>,
+    fence_token: u64,
+}
+
+impl<'a> KvCasFencedRequest<'a> {
+    /// Store raw `bytes` as the value (anything byte-like).
+    pub fn bytes(mut self, bytes: impl AsRef<[u8]>) -> Self {
+        self.value = bytes.as_ref().to_vec();
+        self
+    }
+
+    /// Encode `value` with any [`Codec`] and store the bytes.
+    pub fn encode_with<C, T>(mut self, value: &T) -> Result<Self, LaserError>
+    where
+        C: Codec<T>,
+        T: ?Sized,
+    {
+        self.value = C::encode(value)?;
+        Ok(self)
+    }
+
+    /// JSON-encode `value` and store the bytes.
+    pub fn json<T: Serialize + ?Sized>(self, value: &T) -> Result<Self, LaserError> {
+        self.encode_with::<crate::query::Json, T>(value)
+    }
+
+    /// MessagePack-encode `value` and store the bytes.
+    pub fn msgpack<T: Serialize + ?Sized>(self, value: &T) -> Result<Self, LaserError> {
+        self.encode_with::<crate::query::Msgpack, T>(value)
+    }
+
+    /// Expire the entry `ttl` from now.
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.expires_at_micros = Some(now_micros().saturating_add(ttl.as_micros() as u64));
+        self
+    }
+
+    /// Expire the entry at an absolute epoch-microseconds timestamp.
+    pub fn expires_at(mut self, epoch_micros: u64) -> Self {
+        self.expires_at_micros = Some(epoch_micros);
+        self
+    }
+
+    /// Apply only if the key currently holds `version`.
+    pub fn expect_version(mut self, version: u64) -> Self {
+        self.expect = Some(CasExpect::Match(version));
+        self
+    }
+
+    /// Apply only if the key does not yet exist (a create-if-absent).
+    pub fn expect_absent(mut self) -> Self {
+        self.expect = Some(CasExpect::Absent);
+        self
+    }
+
+    /// Apply the fenced compare-and-swap, returning the entry's new version. A
+    /// stale fence surfaces as
+    /// [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost) (a newer holder
+    /// bumped the sequence), a precondition miss as
+    /// [`KvError::VersionConflict`](laser_wire::kv::KvError::VersionConflict).
+    /// Returns `LaserError::Invalid` if no precondition was set, and
+    /// `LaserError::Unsupported` when the deployment does not advertise the
+    /// `kv_cas_fenced` capability.
+    pub async fn commit(self) -> Result<u64, LaserError> {
+        let Some(expect) = self.expect else {
+            return Err(LaserError::Invalid(
+                "commit() needs a precondition: call expect_version(..) or expect_absent()"
+                    .to_owned(),
+            ));
+        };
+        // Fail fast when the deployment does not advertise fenced compare-and-swap,
+        // turning the unaware-server code rejection into the documented
+        // `Unsupported` before the round-trip.
+        if !self.laser.capabilities().await.kv.cas_fenced {
+            return Err(LaserError::Unsupported(
+                "fenced compare-and-swap requires a backend that serves it (kv_cas_fenced capability)"
+                    .to_owned(),
+            ));
+        }
+        let key = validated_key(&self.key)?;
+        let fence_key = validated_key(&self.fence_key)?;
+        validated_value(&self.value)?;
+        let request = KvCasFenced {
+            v: KV_OP_VERSION,
+            namespace: self.namespace,
+            key,
+            value: self.value,
+            expires_at_micros: self.expires_at_micros,
+            expect,
+            fence_key,
+            fence_token: self.fence_token,
+        };
+        match self
+            .laser
+            .execute_kv(AGDX_KV_CAS_FENCED_CODE, &request)
+            .await?
+        {
+            KvOutcome::Committed { version } => Ok(version),
+            other => Err(unexpected("cas_fenced", &other)),
         }
     }
 }

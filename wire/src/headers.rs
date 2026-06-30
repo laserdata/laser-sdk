@@ -76,6 +76,10 @@ pub const IDEMPOTENCY_KEY: &str = "agdx.idem";
 pub const DEADLINE: &str = "agdx.deadline";
 /// Header key: LLM call cost in USD.
 pub const COST_USD: &str = "agdx.cost";
+/// Header key: the strictly-monotonic per-task fence the producer held (`u64`).
+/// A consumer rejects a log-resident effect whose fence is below the highest it
+/// has accepted for the task, so a stale-holder replay cannot re-fire.
+pub const FENCE: &str = "agdx.fence";
 /// Header key: the agent envelope's wire version (`u32` typed value).
 /// Rides outside the CBOR body so projections, a viewer, and rolling-upgrade
 /// consumers pick the decoder (and filter per version) without decoding the body.

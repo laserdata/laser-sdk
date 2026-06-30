@@ -4,6 +4,8 @@
 pub mod a2a;
 #[cfg(feature = "agent")]
 pub mod agent;
+#[cfg(feature = "query")]
+pub mod agent_tasks;
 #[cfg(feature = "agui")]
 pub mod agui;
 pub mod capabilities;
@@ -29,6 +31,9 @@ pub mod provenance;
 pub mod query;
 #[cfg(feature = "schema-codecs")]
 pub mod schema_codecs;
+#[cfg(feature = "sign")]
+pub mod sign;
+pub mod snapshot;
 #[cfg(feature = "agent")]
 pub mod state_store;
 pub mod types;

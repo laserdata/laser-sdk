@@ -1,35 +1,3 @@
-//! The `/agdx/*` HTTP surface: route constants, path builders for the
-//! parameterized routes, the typed query-parameter structs, and the JSON view
-//! and error types the server's router serves. This module is the first-class,
-//! executable definition of the HTTP binding (the prose lives in the AGDX spec,
-//! Part B4): both the server's router and every browser/native client share
-//! these exact paths, shapes, and the bare-`Ok`-or-[`ErrorBody`] reply contract,
-//! so a renamed route or a drifted shape is a compile or doc-test failure rather
-//! than a 404 in production.
-//!
-//! Path builders take PRE-ENCODED segments: a caller embedding a user-supplied
-//! namespace, key, or fork id must percent-encode it first. The crate stays
-//! dependency-free by not doing it here. The [`http_client`](crate::http_client)
-//! feature owns the base64url and query-string composition.
-//!
-//! The contract, exercised (this doc-test is the CI drift gate):
-//!
-//! ```
-//! use laser_wire::http::{kv_entry_path, ErrorBody, CAPABILITIES_PATH};
-//! use laser_wire::result::ResultCode;
-//!
-//! // Routes are owned as code, never hand-typed at a call site.
-//! assert_eq!(CAPABILITIES_PATH, "/agdx/capabilities");
-//! assert_eq!(kv_entry_path("sessions", "dXNlcjox"), "/agdx/kv/sessions/dXNlcjox");
-//!
-//! // A failure carries a machine-dispatchable code plus a human message.
-//! // the status line is derived from the code, so a client matches on `code`.
-//! let body = ErrorBody::new(ResultCode::NotFound, "no such fork");
-//! assert_eq!(body.http_status(), 404);
-//! let json = serde_json::to_string(&body).unwrap();
-//! assert_eq!(serde_json::from_str::<ErrorBody>(&json).unwrap(), body);
-//! ```
-
 use crate::fork::{ForkError, ForkKind};
 use crate::graph::SourceRef;
 use crate::hello::{BackendDescriptor, OpVersions};
@@ -55,6 +23,10 @@ pub const KV_PATH: &str = "/agdx/kv";
 pub const FORKS_PATH: &str = "/agdx/forks";
 /// `GET /agdx/graphs` to list graph projections, `POST` to register.
 pub const GRAPHS_PATH: &str = "/agdx/graphs";
+/// `GET /agdx/clients` to list live connections with their advertised metadata,
+/// filtered and paginated by query parameters. The HTTP face of the
+/// `AGDX_GET_CLIENTS_METADATA` discovery read.
+pub const CLIENTS_PATH: &str = "/agdx/clients";
 
 /// `DELETE`/`GET /agdx/graphs/{id}`: drop or read a graph projection.
 pub fn graph_path(id: &str) -> String {
@@ -148,6 +120,10 @@ pub struct Capabilities {
     pub graph: bool,
     /// Whether copy-on-write forks are served.
     pub fork: bool,
+    /// Whether the agent and workflow control band is served. Off until the plane
+    /// serves it (the engine is a later phase).
+    #[serde(default)]
+    pub agent_workflow: bool,
     pub versions: OpVersions,
     /// Materialization backends the server currently exposes, so a client can
     /// show what it may route to. Identity only (id + engine kind), no settings
@@ -184,6 +160,11 @@ pub struct KvCapsView {
     /// `cas` returns a clean unsupported error.
     #[serde(default)]
     pub cas: bool,
+    /// Whether fenced compare-and-swap (`AGDX_KV_CAS_FENCED`) is served. Independent
+    /// of plain `cas`: a backend leaves it off when it cannot gate a write on a live
+    /// fence sequence.
+    #[serde(default)]
+    pub cas_fenced: bool,
 }
 
 impl Capabilities {
@@ -205,9 +186,11 @@ impl Capabilities {
             kv: KvCapsView {
                 available: enabled,
                 cas: false,
+                cas_fenced: false,
             },
             graph: false,
             fork: enabled,
+            agent_workflow: false,
             versions,
             backends: Vec::new(),
         }
@@ -218,6 +201,14 @@ impl Capabilities {
     #[must_use]
     pub fn with_graph(mut self, value: bool) -> Self {
         self.graph = value;
+        self
+    }
+
+    /// Advertise that the agent and workflow control band is served. Off by
+    /// default: a server sets it only when it serves the band.
+    #[must_use]
+    pub fn with_agent_workflow(mut self, value: bool) -> Self {
+        self.agent_workflow = value;
         self
     }
 
@@ -237,6 +228,14 @@ impl Capabilities {
         self
     }
 
+    /// Advertise fenced compare-and-swap on the KV surface (`AGDX_KV_CAS_FENCED`).
+    /// Only a backend that gates a write on a live fence sequence may set it.
+    #[must_use]
+    pub fn with_kv_cas_fenced(mut self, on: bool) -> Self {
+        self.kv.cas_fenced = on;
+        self
+    }
+
     /// Advertise the strongest read-consistency the query surface serves.
     #[must_use]
     pub fn with_query_consistency(mut self, level: Consistency) -> Self {
@@ -248,7 +247,7 @@ impl Capabilities {
     /// `AGDX_HELLO` probe answers with, reading the per-surface sub-features
     /// straight off its `features` bitset and `graph` op version. A server SHOULD
     /// use this so its two capability carriages (the binary `features` bits and
-    /// these HTTP fields) cannot disagree (A12): the one source drives both.
+    /// these HTTP fields) cannot disagree: the one source drives both.
     pub fn from_versions(enabled: bool, versions: OpVersions) -> Self {
         use crate::hello::feature;
         let consistency = if versions.has_feature(feature::STRONG_CONSISTENCY) {
@@ -260,6 +259,8 @@ impl Capabilities {
         };
         Self::new(enabled, versions)
             .with_kv_cas(versions.has_feature(feature::KV_CAS))
+            .with_kv_cas_fenced(versions.has_feature(feature::KV_CAS_FENCED))
+            .with_agent_workflow(versions.has_feature(feature::AGENT_WORKFLOW))
             .with_query_consistency(consistency)
             // The graph surface needs a backend that serves it, advertised as a
             // non-zero graph op version, so it is gated on that rather than implied.
@@ -288,6 +289,49 @@ pub struct KvPageView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletedManyView {
     pub deleted: usize,
+}
+
+/// One connection on the `GET /agdx/clients` discovery surface. `metadata` is
+/// URL-safe unpadded base64 of the opaque advertised bytes (a JSON string cannot
+/// carry raw bytes), or `None` when the connection advertised none. The console
+/// decodes and interprets it per producer kind (an agent card or an app blob).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientMetadataView {
+    pub client_id: u32,
+    pub user_id: Option<u32>,
+    pub transport: u8,
+    pub address: String,
+    pub consumer_groups_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+}
+
+/// One page of the `GET /agdx/clients` discovery read. `next_cursor` is the
+/// `after` query parameter for the next page, or `None` on the last page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientMetadataListView {
+    pub clients: Vec<ClientMetadataView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u32>,
+}
+
+/// `GET /agdx/clients` query parameters: the discovery filters and the page
+/// window, all optional. Shared by the server handler and the typed client so the
+/// query string cannot drift between them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientsQuery {
+    /// Only return connections that advertised metadata.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub with_metadata_only: bool,
+    /// Only return connections authenticated as this principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<u32>,
+    /// Page cursor: only connections with `client_id` greater than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u32>,
+    /// Max entries per page (clamped server-side to the page cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// `POST /agdx/forks/{id}/promote` reply: the number of rows applied.
@@ -614,6 +658,7 @@ mod tests {
 
     #[test]
     fn given_path_builders_when_rendered_then_should_match_the_router() {
+        assert_eq!(CAPABILITIES_PATH, "/agdx/capabilities");
         assert_eq!(projection_path("order.v1"), "/agdx/projections/order.v1");
         assert_eq!(schema_path(7), "/agdx/schemas/7");
         assert_eq!(schema_decode_path(7), "/agdx/schemas/7/decode");

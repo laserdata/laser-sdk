@@ -49,6 +49,10 @@ provenance = []
 # payloads against the registered definition before publishing - the same
 # decode semantics LaserData Cloud's projector applies.
 schema-codecs = ["dep:apache-avro", "dep:jsonschema", "dep:prost-reflect", "query"]
+# Envelope signing and verification: activate the dormant `Signature` field with
+# Ed25519 keys and a per-agent key registry keyed by the enrolled principal. The
+# wire crate stays crypto-free, so the crypto lives here behind this gate.
+sign = ["agent", "dep:ed25519-dalek", "dep:sha2"]
 # Generic queryable projections over the log: the runtime over the laser-wire
 # contract (Record lowering, Laser::publish/query, the fluent builders) - the
 # generic substrate. No agent dependency. Enables the wire crate's codec
@@ -69,6 +73,7 @@ axum = { workspace = true, optional = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 iggy = { workspace = true }
 json-patch = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
@@ -76,6 +81,7 @@ laser-wire = { workspace = true, features = ["builders", "cbor"] }
 prost-reflect = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 strum = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }

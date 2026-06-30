@@ -134,6 +134,7 @@ One consequence matters for interoperability. The edge bridges (A2A, MCP, AG-UI,
 - **Declaration order, absent optionals skipped.** An unused optional field costs zero bytes. Unknown fields are ignored on decode, so every future field is additive and free.
 - **No silent skip.** A payload is exactly one CBOR item. Trailing bytes are a decode error. Decoding must fail on corrupt or wrong-typed known data, and only fields foreign to the schema may be ignored.
 - **Machine ids** ride as fixed-width 16-byte CBOR byte strings, not bignum-tagged integers, so a port needs only a byte-string reader.
+- **Signing input is canonical by this encoding.** The envelope signature (A9.5) covers the domain separator `agdx.signature.v1` followed by this same named-field encoding of the envelope with the signature field cleared. Because the encoding is deterministic (declaration order, absent optionals skipped), a decode-then-re-encode is byte-identical, so a verifier reconstructs the exact signing input. This round-trip property is pinned by fixtures.
 
 How a message frame is delimited and how a managed request and reply is carried are binding concerns (B1.4), not core.
 
@@ -171,6 +172,7 @@ The core defines which attributes must be carriable out of band and what they me
 | routing / ordering key | 128-bit | the substrate partitions and orders without reading the body |
 | operation identity | name or code | a request is dispatched without a parse |
 | correlation | 128-bit | a reply is matched and a stream is filtered cheaply |
+| fence token | u64, optional | a consumer rejects a stale-holder replay before the effect runs, without reading the body |
 
 ## A5. The operation registry
 
@@ -186,10 +188,12 @@ Operation **identity and semantics** are core. Operation **encoding** is binding
 | `registry.decode_record` | views | decode a body under a registered schema |  |
 | `kv.get` / `set` / `delete` / `delete_many` / `scan` / `namespaces` | state | key-value operations |  |
 | `kv.cas` | state | conditional set on a version token |  |
+| `kv.cas_fenced` | state | conditional set applied only while the task fence sequence still holds |  |
 | `kv.exists` / `expire` / `patch` | state | metadata probe, in-place expiry, merge patch (formal object primitives, C6) |  |
 | `kv.lease` / `release` | state | advisory lease on a key (unsupported error when the backend cannot serve it) |  |
 | `fork.create` / `delete` / `promote` / `list` / `put` | state | copy-on-write branch operations |  |
 | `graph.query` / `neighbors` / `upsert` | views | knowledge-graph traversal, one-hop neighbors, node/edge upsert (A13) |  |
+| `agent.submit` / `cancel` / `status` / `list` | coordination | hand a task to an agent or workflow by capability, cancel it, read its state, list tasks |  |
 | `watch` / `unwatch` | state/views | change notification over the read model | roadmap |
 
 The four-verb agentic-memory API (`remember` / `recall` / `improve` / `forget`) is **not** a registry operation: it is an SDK facade that composes `publish`, `query`, and the `graph` ops above (A13), so it adds no wire op of its own.
@@ -266,6 +270,7 @@ A `CommandError` of `{ code, message }` is the surface-agnostic reply for a comm
 - **Idempotency** is the business key (A3), scoped to the authenticated identity so one peer cannot replay or suppress another's operation.
 - **Expiry** is an absolute epoch-microsecond time. An expired object reads as absent.
 - **Consistency** is a per-query `Consistency` level (`eventual`, `read_your_writes`, `strong`), fail-not-downgrade: a level that cannot be met returns a `stale` result rather than silently serving older data (A11.3, A11.4).
+- **Fencing** is the at-most-one-effective-writer guarantee for an exclusive effect. The producer holds a strictly-monotonic per-task fence (the lease grant returns it, A10.3), and carries it out of band (the fence token, A4). An effect that lands in the key-value store is gated by the fenced compare-and-swap (A10.3), and an effect that lands on the log is gated consumer-side: a record whose fence is below the highest the consumer has accepted for the task is a stale-holder replay and is dropped, ordered before idempotency dedup so it cannot consume the legitimate retry's slot.
 
 Wire compatibility rules for the named-field CBOR encoding:
 
@@ -329,6 +334,7 @@ A streamed answer instead of a single `response` is a run of `chunk` records sha
 | `metadata` | map<string, scalar>, optional | envelope-native extension slot with pinned keys (A9.6) |
 | `must_understand` | u64 bitset, optional | must-understand marker: feature bits a receiver MUST implement to process this message, else reject. `0` (the default, skipped on the wire) is the open-world "ignore anything unknown". No bits are defined yet, so the marker is the mechanism awaiting its first strict-handling feature, letting a message demand strict handling without a whole-envelope version bump. The bound is inherent: a receiver predating the field ignores it like any unknown field, so the marker only binds receivers from the release that introduced it forward, which is why it ships now with zero bits ahead of any feature that needs it |
 | `body` | bytes | the content, codec per the content-type attribute |
+| `signature` | Signature capsule, optional | a detached signature over the canonical encoding with the signature absent, domain-separated by `agdx.signature.v1` (A9.5). Absent means an unsigned record (the open-world default). Verified SDK-side, the wire crate stays crypto-free. May ride any kind, like `metadata` |
 
 ### A9.2 The per-kind validity matrix
 
@@ -347,16 +353,17 @@ R required, O optional, X invalid. Enforced at three layers: the wire validate f
 | `idempotency_key` | O | O | O | X | X | X |
 | `deadline_micros` | O | X | X | O (opening chunk) | X | X |
 | `task_state` | X | O | X | X | R (`task`) | O |
-| `operation` | O | O | O | R on opening chunk, X after | R (`task`\|`card`\|`progress`) | O |
+| `operation` | O | O | O | R on opening chunk, X after | R (`task`\|`card`\|`progress`\|`quarantine`\|`unquarantine`) | O |
 | `tool` | O | O | O | O | X | O |
 | `usage` | X | O | O | O (terminal chunk) | O | O |
 | `body` | R | R | R | R (empty only with `last`) | O | R |
+| `signature` | O | O | O | O | O | O |
 
 The command and event boundary is the correlation rule: a message expecting a reply or effect is a `command` and requires `correlation`, a message expecting nothing is an `event`. Fire-and-forget commands do not exist.
 
 ### A9.3 Closed sub-vocabularies
 
-- `status` discriminator (`operation`): `task` (A2A lifecycle, requires `correlation` and `task_state`), `card` (liveness and capability), `progress` (advisory ticks).
+- `status` discriminator (`operation`): `task` (A2A lifecycle, requires `correlation` and `task_state`), `card` (liveness and capability), `progress` (advisory ticks), `quarantine` (an operator marks an agent out of routing, body is the quarantined agent id, authorized by the registry topic's write access control), `unquarantine` (an operator lifts a prior quarantine, body is the agent id, same authorization, so quarantine is not a one-way door only retention expiry undoes).
 - Chunk-stream purpose (`operation` on `sequence = 0`, required there, invalid after): `chat`, `reasoning`, `tool_args`.
 - State sync convention (an `event`, never a new kind): `operation = state_snapshot` (body is the full state) or `state_delta` (body is an RFC 6902 JSON Patch).
 
@@ -378,7 +385,9 @@ The synthetic finish reasons (`abandoned`, `gap`) are reader-local and never app
 - **BodyRef** (content-type `ref`): a claim-check naming where the content lives. Fields: `reference` (a URI, object key, or KV key, non-empty, at most 1024 bytes), `size_bytes`, `sha256` (exactly 32 bytes), and a dormant `encryption` scheme code (absent means plaintext). A consumer verifies the fetched bytes against the digest without trusting the store.
 - **Dead-letter capsule**: `source` (the poison message's log position), `reason` (the dead-letter dictionary), `attempts`, optional `detail`, and `payload` (the original encoded envelope verbatim, for trivially correct redrive).
 - **AgentCard** (the `card` status body): optional `name`, optional `version`, a capped `capabilities` list (at most 64), optional `ttl_micros`. A card older than its TTL means a dead agent.
-- **Signature** (dormant): `scheme` (Ed25519 = 1), `key_id` (8 bytes), `bytes` (64 bytes). The signing input is domain-separated by the fixed spec constant `agdx.signature.v1` prefixed to the canonical envelope encoding with the signature field absent. The constant is one agreed value for the whole spec, so signatures verify across parties. No crypto enters the wire crate. Activation is one additive optional envelope field.
+- **AgentPresence** (the live presence body, carried in the connection-metadata channel of the binding, not in an envelope): `v` (the body version, carried in-band because the metadata channel has no out-of-band version header), `agent` (which agent this connection is, the link from a connection to its card), and an optional `inbox` (the topic this agent currently consumes its work on, within the stream its connection is scoped to). It is the live counterpart to the durable card: it vanishes on disconnect and answers where to send an agent work right now. Routing resolves a target to its advertised inbox through this, never a hard-coded shared topic name, so a deployment that scopes each tenant to its own stream and each workflow to its own topic routes correctly. An absent inbox is liveness-only presence, and a target with no inbox is a routing failure surfaced to the caller, never silently rerouted.
+- **FoldSnapshot**: a periodic snapshot of a client-side fold (the conversation, a workflow journal) so replay resumes from the tail rather than offset zero. Fields: `conversation` (the fold this snapshots), `as_of` (a per-partition map of the last offset folded, inclusive), and `state` (the opaque folded bytes, the producer's codec). Resume seeds the cursor at `offset + 1` per partition, because the cursor takes the next offset to read while the snapshot records the last folded. It rides as a body under the existing content type, so A6 is unchanged. It bounds the conversation and the journal folds, not the registry (an incremental time-to-live-evicting fold, A12).
+- **Signature** (active, the optional `signature` envelope field A9.1): `scheme` (Ed25519 = 1), `key_id` (8 bytes), `bytes` (64 bytes). The signing input is domain-separated by the fixed spec constant `agdx.signature.v1` prefixed to the canonical envelope encoding with the signature field absent. The constant is one agreed value for the whole spec, so signatures verify across parties. No crypto enters the wire crate, verification is SDK-side against a per-agent key registry. The key is enrolled bound to the authenticated principal (the server-stamped identity), not the self-asserted `source`, so a verified signature proves the enrolled principal signed.
 
 ### A9.6 Pinned metadata keys
 
@@ -386,6 +395,8 @@ The synthetic finish reasons (`abandoned`, `gap`) are reader-local and never app
 | --- | --- | --- |
 | `role` | string | chat role, recommended `user` / `assistant` / `system` / `tool` |
 | `bridge_hops` | list of strings | the loop guard. A bridge appends its id and drops a message whose hop list already contains it |
+
+An enveloped message MAY carry the fence token (A4, A8) as a pinned `agdx.fence` metadata key instead of the binding header, exactly one carrier per message (the single-place rule, B1.2).
 
 ### A9.7 Envelope caps
 
@@ -415,6 +426,7 @@ The synthetic finish reasons (`abandoned`, `gap`) are reader-local and never app
 | `kv.get` | namespace, key, optional `if_none_match(version)` | `Value(Option<entry>)`, or `NotModified` when the conditional version matches |
 | `kv.set` | namespace, key, value, optional expiry | `Written` |
 | `kv.cas` | namespace, key, value, optional expiry, precondition (`match(version)` \| `absent`) | `Committed { version }`, or `VersionConflict { current }` on a precondition miss |
+| `kv.cas_fenced` | namespace, key, value, optional expiry, precondition, fence key, fence token | `Committed { version }`, `LeaseLost` on a stale fence, or `VersionConflict { current }` on a precondition miss |
 | `kv.delete` | namespace, key, optional `if_match(version)` | `Deleted(bool)`, or `VersionConflict` when the conditional version misses |
 | `kv.delete_many` | namespace, composed bounds (prefix, range, substring) | `DeletedMany(count)` |
 | `kv.scan` | namespace, composed bounds, limit, cursor | `Page { entries, cursor }` |
@@ -450,7 +462,9 @@ expect = match(version) | absent
 
 Success returns `Committed { version }` (the new version, so a caller can chain a further conditional write without a re-read). A precondition miss returns `version-conflict` carrying the current version (`some(v)` when present, `none` when absent), so the caller re-reads and retries, or learns that an `absent` precondition lost a race.
 
-Compare-and-swap is capability-gated by the `kv_cas` flag: a transactional row store (the embedded engine) serves it as a single conditional write, while a backend that cannot do a conditional write leaves the flag clear and returns a clean unsupported error. The version token rides on the entry either way, reading `0` on an unversioned store. The advisory lease (A10.4) builds on this: a lease is a key holding a token and an expiry, acquired and released by compare-and-swap, with the version as the fencing token.
+Compare-and-swap is capability-gated by the `kv_cas` flag: a transactional row store (the embedded engine) serves it as a single conditional write, while a backend that cannot do a conditional write leaves the flag clear and returns a clean unsupported error. The version token rides on the entry either way, reading `0` on an unversioned store. The advisory lease (A10.4) builds on this: a lease is a key holding a token and an expiry, acquired and released by compare-and-swap. The fencing token a holder presents is not the lease row's version (that version is TTL-bounded and resets when the lease expires and is re-acquired, so it is not monotonic), it is a dedicated never-expiring fence sequence (A10.3 fenced compare-and-swap).
+
+A fenced compare-and-swap (`kv.cas_fenced`, capability-gated by the `kv_cas_fenced` flag) is the sibling of `kv.cas`: the identical write and precondition, applied under one write guard only if the task's fence sequence still equals the presented `fence_token`. The fence sequence is a dedicated, never-expiring per-task counter the lease grant bumps and returns as the token, strictly monotonic for the life of the task key across acquire, re-acquire inside a live window, and post-expiry re-acquire alike. A failed fence returns `lease-lost`, a failed target precondition returns `version-conflict`. This is the at-most-one-effective-writer gate for an effect that lands in the key-value store, additive over the current key-value op version.
 
 ### A10.4 Advisory lease
 
@@ -459,7 +473,7 @@ kv.lease { namespace, key, lease_ttl_micros } -> Leased { lease_token, granted_t
 kv.release { namespace, key, lease_token } -> Released(bool)
 ```
 
-A bounded-TTL distributed lock built on compare-and-swap (A10.3): a lease is a key holding a token and an expiry, acquired and released by conditional write, with the version as the fencing token. Acquiring a key already held returns `version-conflict` (a contended lock, not a backend failure), so a caller retries. A holder presents the `lease_token` on protected mutations. A lease not renewed before its TTL expires is released automatically, release is atomic at the held token, and a stale token fails with `lease-lost`. The lease lives under a reserved per-caller namespace, so it never surfaces in the caller's own scans or namespace listings. A backend that cannot serve advisory leases returns a clean unsupported error, never a fallback. This realizes the formal-spec `LEASE` / `RELEASE` primitives (C6).
+A bounded-TTL distributed lock built on compare-and-swap (A10.3): a lease is a key holding a token and an expiry, acquired and released by conditional write. The fencing token a holder presents is a dedicated never-expiring fence sequence the grant bumps and returns, not the lease row's own version (which is TTL-bounded and resets on re-acquire after expiry, so it cannot fence). Acquiring a key already held returns `version-conflict` (a contended lock, not a backend failure), so a caller retries. A holder presents the `lease_token` on protected mutations. A lease not renewed before its TTL expires is released automatically, release is atomic at the held token, and a stale token fails with `lease-lost`. The lease lives under a reserved per-caller namespace, so it never surfaces in the caller's own scans or namespace listings. A backend that cannot serve advisory leases returns a clean unsupported error, never a fallback. This realizes the formal-spec `LEASE` / `RELEASE` primitives (C6).
 
 ### A10.5 Forks
 
@@ -560,8 +574,8 @@ query {
 
 A single connection negotiates what is available, and a managed feature works against a managed implementation or returns a clean unsupported error. There is no degraded path.
 
-- At connect the client runs the `hello` operation. The reply advertises per-surface op versions (`query`, `control`, `kv`, `fork`, and optional `agent` and `graph` versions where 0 means not advertised) plus an optional `features` bitset for managed sub-capabilities that vary independently of the base surface: compare-and-swap, read-your-writes, and strong consistency. The `graph` op version is what gates the knowledge-graph surface (A13). A `0` bitset (skipped on the wire) means none advertised, so a pre-feature reply stays byte-identical and an old client simply lights up no extra capability. The capabilities reply additionally lists the materialization backends the server currently exposes: each is a descriptor of a stable `id` and an opaque engine `kind`, with optional advisory `label` and `version` strings for display and a set of opaque `capabilities` tags the backend declares about itself, identity only with no settings or secrets, so a client can show what it may route to and a new engine is advertised by name without a wire change. The `capabilities` tags let a consumer reason about what a backend is good for (e.g. `ingest`, `query`, a particular query-surface feature) and gate a decision before attempting an op: the wire pins no meaning to a tag, a producer emits what it supports and a consumer matches the tags it understands and ignores the rest, so a new capability is advertised by name with no wire change. An empty list (the default, skipped on the wire) means none advertised, and an absent `label`/`version`/`capabilities` (also skipped) means the client derives a label from `id`/`kind`, shows no version, and assumes no declared tags. The binary `hello` reply carries the same backend list as the HTTP capabilities surface: it is a `BackendAnnounce` that decodes byte-identically from a pre-backends versions-only reply, so an older server's reply still parses with an empty backend list.
-- The SDK capability set is grouped by where a capability lives and what it depends on, not a flat list. A root `managed` flag says a managed plane is connected at all. The managed surfaces served off the log are `query`, `kv`, `graph`, `forks`, and the A2A gateway. The platform-native ones are `sessions` and `durable_dedup`. A surface's sub-features nest under it so a dependent feature cannot be advertised apart from its surface: `query.consistency` is the strongest read-consistency level the query surface serves (the `eventual < read_your_writes < strong` ladder, so a level implies the weaker ones, which makes the impossible "strong-but-not-read-your-writes" state unrepresentable), and `kv.cas` is the key-value conditional-write feature. Agentic memory composes the query and graph surfaces, so it has no capability of its own. On an open substrate with no managed surface every capability is off and the matching call returns unsupported. The wire `hello` reply still carries the flat `features` bitset (`kv_cas`, `read_your_writes`, `strong_consistency`). The SDK folds those bits into the grouped form (the consistency bits become the served level), and the HTTP capabilities reply mirrors the grouped shape (B4).
+- At connect the client runs the `hello` operation. The reply advertises per-surface op versions (`query`, `control`, `kv`, `fork`, and optional `agent` and `graph` versions where 0 means not advertised) plus an optional `features` bitset for managed sub-capabilities that vary independently of the base surface: compare-and-swap, read-your-writes, strong consistency, and fenced compare-and-swap. The `graph` op version is what gates the knowledge-graph surface (A13). A `0` bitset (skipped on the wire) means none advertised, so a pre-feature reply stays byte-identical and an old client simply lights up no extra capability. The capabilities reply additionally lists the materialization backends the server currently exposes: each is a descriptor of a stable `id` and an opaque engine `kind`, with optional advisory `label` and `version` strings for display and a set of opaque `capabilities` tags the backend declares about itself, identity only with no settings or secrets, so a client can show what it may route to and a new engine is advertised by name without a wire change. The `capabilities` tags let a consumer reason about what a backend is good for (e.g. `ingest`, `query`, a particular query-surface feature) and gate a decision before attempting an op: the wire pins no meaning to a tag, a producer emits what it supports and a consumer matches the tags it understands and ignores the rest, so a new capability is advertised by name with no wire change. An empty list (the default, skipped on the wire) means none advertised, and an absent `label`/`version`/`capabilities` (also skipped) means the client derives a label from `id`/`kind`, shows no version, and assumes no declared tags. The binary `hello` reply carries the same backend list as the HTTP capabilities surface: it is a `BackendAnnounce` that decodes byte-identically from a pre-backends versions-only reply, so an older server's reply still parses with an empty backend list.
+- The SDK capability set is grouped by where a capability lives and what it depends on, not a flat list. A root `managed` flag says a managed plane is connected at all. The managed surfaces served off the log are `query`, `kv`, `graph`, `forks`, and the A2A gateway. The platform-native ones are `sessions` and `durable_dedup`. A surface's sub-features nest under it so a dependent feature cannot be advertised apart from its surface: `query.consistency` is the strongest read-consistency level the query surface serves (the `eventual < read_your_writes < strong` ladder, so a level implies the weaker ones, which makes the impossible "strong-but-not-read-your-writes" state unrepresentable), and `kv.cas` is the key-value conditional-write feature, with `kv.cas_fenced` the fenced sibling that gates a write on a live fence sequence. Agentic memory composes the query and graph surfaces, so it has no capability of its own. On an open substrate with no managed surface every capability is off and the matching call returns unsupported. The wire `hello` reply still carries the flat `features` bitset (`kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`). The SDK folds those bits into the grouped form (the consistency bits become the served level), and the HTTP capabilities reply mirrors the grouped shape (B4).
 - When the advertised op version is not the SDK's pinned version, the call fails fast with the surface's typed version error before a round trip.
 - A feature carried as an additive request field, rather than its own operation, is refused locally when unadvertised. A compare-and-swap rides its own command code, so an unaware server rejects it cleanly even without a local check, but a read-your-writes (or strong) query rides the additive `consistency` field that an unaware server silently drops, so the client refuses an unadvertised level before sending. This is what keeps fail-not-downgrade honest (A8).
 - A server MUST keep its two capability carriages in agreement: the binary `hello` `features` bit and the HTTP capabilities boolean for the same feature say the same thing. The contract carries both because the two bindings are separate, and a divergence would let a feature look available on one surface and not the other.
@@ -628,6 +642,8 @@ The binding uses a dedicated ops stream carrying a fixed set of logical ops chan
 
 Partitioning and isolation are separate concerns on Iggy, and conflating them is a mistake. Using the conversation id as the partition key buys total order within a conversation and lets independent conversations run in parallel across a topic's partitions, one conversation pinned to one partition (so a single very high-throughput conversation is bounded by one partition's, and on a shard-per-core server one core's, throughput, which is the cost of total order). Partitions are a throughput-and-ordering tool, never an access boundary: Iggy RBAC is enforced at the stream and topic level, not the partition level. So isolation between agents or workloads is a topology decision made above the protocol, by giving each its own stream or topic (and, across credentials, its own connection), not by partitioning. The stream and the ops-topic names are deployment-configurable for exactly this reason.
 
+Authorship, and the write-exclusive topic. Per-record authorship is topology, not a server-stamped header. An agent writes only its own write-exclusive topic, whose write access control is bound to the authenticated `user_id` by the substrate permissioner, so the topic an agent writes is its producer identity at no per-message cost. This is the normative authorship baseline, and it revises the earlier framing that isolation is purely an above-the-protocol convenience: for authorship the per-principal write-exclusive topic is required, not optional. Defence in depth rides on top through the envelope signature (A9.5), whose key the control plane enrolls against the same authenticated `user_id`, and which a consumer verifies on control and effect topics. Neither mechanism touches the append or consume hot path: there is no per-message server stamp and no message-header field, so the streaming server's send and poll code is unchanged. This is the binding-level expression of the zero-overhead guarantee, the binding forbids a hot-path authorship field.
+
 Iggy accepts a stream or topic reference as either a name or a resolved numeric id, so the binding passes the numeric id on every publish and consume to save addressing bytes. This is a binding optimization, not a core requirement. The core names a topic logically (A3), and a substrate that addresses by name (Kafka, B2) simply does not get this particular saving. It is the same kind of substrate-specific win as the typed headers (B1.5), and it costs no portability because the core never pinned the addressing form.
 
 ### B1.2 Out-of-band carriage: the header dictionary
@@ -649,6 +665,7 @@ The custom keys are standardized under the `agdx.` namespace, fixed so independe
 | `gen_ai.agent.id` | string | producing agent (OpenTelemetry) |
 | `gen_ai.usage.input_tokens` / `output_tokens` | u64 | token usage (OpenTelemetry) |
 | `agdx.cause`, `agdx.parent_conv`, `agdx.root_conv`, `agdx.to`, `agdx.idem`, `agdx.deadline`, `agdx.cost` | mixed | provenance: causal parent, parent and root conversation, addressee, dedup key, deadline, cost |
+| `agdx.fence` | u64 | the strictly-monotonic per-task fence the producer held, so a consumer drops a stale-holder replay of a log-resident effect |
 
 Header caps: 1024-byte soft cap on total header bytes per record, 255-byte ceiling on a single value, 9 bytes of per-header framing counted toward the cap.
 
@@ -666,12 +683,16 @@ The operation registry (A5) is realized as a `u32` command code. Raw Apache Iggy
 | --- | --- |
 | `hello` | 1_000_000 |
 | `backend_hello` (internal: the managed backend announces its `OpVersions` to the streaming server, not client-facing) | 1_000_001 |
+| `set_client_metadata` / `get_clients_metadata` (the connection-scoped discovery channel: a connection advertises an opaque metadata blob, an `AgentPresence` for an agent, and a filtered, paginated read lists live connections with their metadata) | 1_000_002 / 1_000_003 |
 | `query` | 1_000_100 |
 | `registry.get_projection` / `list_projections` | 1_000_110 / 1_000_111 |
 | `registry.get_schema` / `list_schemas` | 1_000_120 / 1_000_121 |
 | `registry.register_schema` / `decode_record` | 1_000_122 / 1_000_123 |
 | `kv.get` / `set` / `scan` / `delete` / `delete_many` / `namespaces` / `cas` | 1_000_200 .. 1_000_206 |
+| `kv.exists` / `expire` / `patch` / `lease` / `release` | 1_000_207 .. 1_000_211 |
+| `kv.cas_fenced` | 1_000_212 |
 | `fork.create` / `delete` / `promote` / `list` / `put` | 1_000_300 .. 1_000_304 |
+| `agent.submit` / `cancel` / `status` / `list` | 1_000_600 .. 1_000_603 |
 
 The base value is high (a million) only to avoid colliding with Apache Iggy's own low command codes, and the 100-wide blocks are organizational. Both are Iggy-local. They are pinned and fixtured here in the binding, not in the core.
 

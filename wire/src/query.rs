@@ -126,7 +126,7 @@ impl Consistency {
 }
 
 /// The server-side gate that enforces a [`Consistency`] level the same way on
-/// every backend. The client refuses an unadvertised level before sending (A12),
+/// every backend. The client refuses an unadvertised level before sending,
 /// but a backend that does advertise `read_your_writes` or `strong_consistency`
 /// still has to honor the level, and the rule is fail-not-downgrade: serve only
 /// when the projector's `applied` offset for the queried source has reached the

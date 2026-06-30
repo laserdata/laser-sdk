@@ -304,7 +304,7 @@ async def test_custom_deduplicator_is_consulted(laser):
         await asyncio.sleep(1.0)
         # The custom deduplicator saw the repeated key and dropped the duplicate.
         assert len(handled) == 1
-        assert "dupe-key" in seen
+        assert any("dupe-key" in key for key in seen)
     finally:
         await agent.shutdown()
 

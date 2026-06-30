@@ -104,6 +104,31 @@ pub struct KvCas {
     pub expect: CasExpect,
 }
 
+/// Fenced compare-and-swap: the [`KvCas`] write and precondition, applied only
+/// while the task's fence sequence still equals `fence_token` (the at-most-one
+/// effective-writer gate). A failed fence maps to [`KvError::LeaseLost`], a failed
+/// precondition to [`KvError::VersionConflict`]. Additive over
+/// [`crate::codes::KV_OP_VERSION`] 1.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvCasFenced {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub value: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+    pub expect: CasExpect,
+    /// The task's fence-sequence key, in the reserved fence namespace the plane
+    /// owns.
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub fence_key: Vec<u8>,
+    /// The fencing token: the fence-sequence value the holder was granted.
+    /// Strictly monotonic per task, never the lease version.
+    pub fence_token: u64,
+}
+
 /// Request to remove `key` from `namespace`. With `if_match` set to a version,
 /// the delete applies only when the live version matches (a conditional delete),
 /// returning [`KvError::VersionConflict`] otherwise.
@@ -306,7 +331,7 @@ pub enum KvOutcome {
     /// `exists`: the key's metadata, or `None` when absent or expired.
     Metadata(Option<KvMetadata>),
     /// `expire` / `patch`: applied, carrying the entry's version. `expire` leaves
-    /// the version unchanged; `patch` bumps it.
+    /// the version unchanged, `patch` bumps it.
     Versioned { version: u64 },
     /// `lease`: the lease was granted, carrying the fencing token and the granted
     /// TTL (which the store may shorten from the request).

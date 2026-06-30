@@ -158,6 +158,9 @@ pub struct PyCapabilities {
     pub kv: bool,
     /// The key-value store serves compare-and-swap.
     pub kv_cas: bool,
+    /// The key-value store serves fenced compare-and-swap (the monotonic fence an
+    /// exclusive workflow step needs for an at-most-once effect).
+    pub kv_cas_fenced: bool,
     /// The managed knowledge-graph surface is served.
     pub graph: bool,
     /// Managed copy-on-write forks are served.
@@ -186,6 +189,7 @@ impl From<Capabilities> for PyCapabilities {
             .to_owned(),
             kv: value.kv.available,
             kv_cas: value.kv.cas,
+            kv_cas_fenced: value.kv.cas_fenced,
             graph: value.graph,
             forks: value.forks,
             a2a_gateway: value.a2a_gateway,

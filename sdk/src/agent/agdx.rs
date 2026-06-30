@@ -35,23 +35,24 @@ pub const MAX_CHUNK_BODY_BYTES: usize = 64 * 1024;
 #[derive(Clone)]
 pub struct Agdx {
     laser: Laser,
-    topic: AgentTopic<'static>,
+    topic: String,
     source: AgentId,
     conversation: ConversationId,
 }
 
 impl Laser {
     /// A typed AGDX producer publishing as `source` within `conversation` on
-    /// `topic`.
+    /// `topic`. The topic is resolved to its name at construction, so a runtime
+    /// `AgentTopic::Custom` built from a borrowed identifier is accepted.
     pub fn agdx(
         &self,
-        topic: AgentTopic<'static>,
+        topic: AgentTopic<'_>,
         source: AgentId,
         conversation: ConversationId,
     ) -> Agdx {
         Agdx {
             laser: self.clone(),
-            topic,
+            topic: topic.topic_string(),
             source,
             conversation,
         }
@@ -155,10 +156,13 @@ impl Agdx {
         timeout: Duration,
     ) -> Result<Vec<u8>, LaserError> {
         let interrupt = CorrelationId::mint();
+        // Seed the reply reader at the topic tail before sending the prompt, so it
+        // reads only the human's response rather than the topic's history.
+        let mut reader = self.laser.agdx_reply_reader(reply_topic).await?;
         self.command(interrupt, prompt.into()).send().await?;
         let reply = self
             .laser
-            .await_agdx_reply(reply_topic, interrupt, timeout)
+            .await_agdx_reply(&mut reader, interrupt, timeout)
             .await?;
         if reply.kind == AgentKind::Error {
             let message = decode_named::<AgentErrorBody>(&reply.body)
@@ -175,6 +179,8 @@ impl Agdx {
             agdx: self,
             envelope,
             content_type: ContentType::Raw,
+            #[cfg(feature = "sign")]
+            sign_key: None,
         }
     }
 
@@ -189,12 +195,7 @@ impl Agdx {
         let headers = agdx_headers(&envelope, content_type)?;
         let partition_key = envelope.conversation.to_string();
         self.laser
-            .send_with_headers(
-                &self.topic.topic_string(),
-                payload,
-                headers,
-                Some(&partition_key),
-            )
+            .send_with_headers(&self.topic, payload, headers, Some(&partition_key))
             .await?;
         Ok(record)
     }
@@ -207,11 +208,17 @@ pub struct AgdxSend<'a> {
     agdx: &'a Agdx,
     envelope: AgentEnvelope,
     content_type: ContentType,
+    /// When set, the envelope is signed with this key just before encoding (the
+    /// last step, so all the `with_*` refinements are covered). A verifying
+    /// consumer rejects an unsigned or unverified record on a control or effect
+    /// topic (the mandatory-verification gate), which is what makes a cancel or
+    /// quarantine authorizable.
+    #[cfg(feature = "sign")]
+    sign_key: Option<&'a crate::sign::SigningKey>,
 }
 
-impl AgdxSend<'_> {
-    /// Narrow delivery to one agent within the shared topic (routing, never
-    /// an ACL).
+impl<'a> AgdxSend<'a> {
+    /// Narrow delivery to one agent within the shared topic (routing, never an ACL).
     pub fn with_target(mut self, target: AgentId) -> Self {
         self.envelope = self.envelope.with_target(target);
         self
@@ -283,10 +290,40 @@ impl AgdxSend<'_> {
         self
     }
 
+    /// Attach the body for the kinds whose verb does not take one (`status`,
+    /// notably the `card` body of a registry advertisement). The body-carrying
+    /// verbs (`command`/`respond`/`emit`/`fail`) set it directly, so this is for
+    /// refining a `status`.
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.envelope.body = body.into();
+        self
+    }
+
+    /// Sign the envelope with `key` just before sending (after every `with_*`
+    /// refinement, so the signature covers the final shape). The consuming SDK
+    /// verifies it against the enrolled key registry, the authorship and
+    /// control-plane authorization gate. Requires the `sign` feature.
+    #[cfg(feature = "sign")]
+    pub fn signed_by(mut self, key: &'a crate::sign::SigningKey) -> Self {
+        self.sign_key = Some(key);
+        self
+    }
+
     /// Validate, encode, stamp the headers, and publish. Returns the minted
-    /// record id (chunks have none).
+    /// record id (chunks have none). When [`signed_by`](Self::signed_by) set a
+    /// key, the envelope is signed here, last, so the signature covers every
+    /// refinement.
     pub async fn send(self) -> Result<Option<RecordId>, LaserError> {
-        self.agdx.publish(self.envelope, self.content_type).await
+        #[cfg(feature = "sign")]
+        let envelope = if let Some(key) = self.sign_key {
+            let signature = key.sign(&self.envelope)?;
+            self.envelope.with_signature(signature)
+        } else {
+            self.envelope
+        };
+        #[cfg(not(feature = "sign"))]
+        let envelope = self.envelope;
+        self.agdx.publish(envelope, self.content_type).await
     }
 }
 

@@ -34,6 +34,7 @@ jobs:
   # Build the extension and run the offline + integration tests against a real
   # Apache Iggy container (Linux has Docker on the GitHub runner).
   test:
+    name: python-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -129,3 +130,19 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+
+  # One aggregate gate so branch protection requires a single check. Excludes
+  # publish (tag-only). Fails if any of the test/build jobs did not succeed.
+  ci-python-complete:
+    name: ci-python-complete
+    if: always()
+    needs:
+      - test
+      - wheels
+      - sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        working-directory: ${{ github.workspace }}
+        run: exit 1
