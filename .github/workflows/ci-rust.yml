@@ -1,0 +1,246 @@
+name: ci-rust
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Least privilege: CI only reads the repo. No job publishes or writes.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Harden cargo's network against the runner's flaky HTTP/2 to crates.io: retry
+  # transient failures and drop HTTP/2 multiplexing, which triggers the recurring
+  # "Error in the HTTP2 framing layer" curl failures.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # fmt, sort, unused-deps, and clippy: the static gates, in the order the
+  # global Rust verification rule enforces them.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - name: cargo sort
+        run: |
+          cargo install cargo-sort --locked --version 2.1.0
+          cargo sort --workspace --check
+      - name: cargo machete
+        run: |
+          cargo install cargo-machete --locked --version 0.9.2
+          cargo machete
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # The same static gates for the crates outside the workspace (bdd/rust and
+  # fuzz), which `--workspace` does not reach. Kept a separate job so it runs in
+  # parallel and its heavier dependency builds do not slow the workspace lint.
+  lint-detached:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo install cargo-sort --locked --version 2.1.0
+          cargo install cargo-machete --locked --version 0.9.2
+      - name: lint bdd/rust
+        working-directory: bdd/rust
+        run: |
+          cargo fmt --all --check
+          cargo sort --check
+          cargo machete
+          cargo clippy --all-targets -- -D warnings
+      - name: lint fuzz
+        working-directory: fuzz
+        run: |
+          cargo fmt --all --check
+          cargo sort --check
+          cargo machete
+          cargo clippy -- -D warnings
+
+  # The whole workspace must build at every target with every feature on.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets --all-features
+
+  # Every advertised feature combination must lint clean on its own with
+  # `-D warnings`: `--all-features` hides a feature-gated module leaking into an
+  # always-built one, and it also hides code that is dead under a smaller feature
+  # set (e.g. a helper whose only callers are behind `kv`/`query`). `cargo check`
+  # only prints such warnings, so each combination is linted with clippy and
+  # warnings are denied.
+  wire-feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--no-default-features --features cbor"
+          - "--no-default-features --features codecs"
+          - "--no-default-features --features fixtures"
+          - "--no-default-features --features builders"
+          - "--no-default-features --features http-client"
+          - "--no-default-features --features bson"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p laser-wire ${{ matrix.features }} -- -D warnings
+
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--no-default-features --features streaming"
+          - "--no-default-features --features agent"
+          - "--no-default-features --features query"
+          - "--no-default-features --features kv"
+          - "--no-default-features --features fork"
+          - "--no-default-features --features graph"
+          - "--no-default-features --features projections"
+          - "--no-default-features --features watch"
+          - "--no-default-features --features runs"
+          - "--no-default-features --features rbac"
+          - "--no-default-features --features schema-codecs"
+          - "--no-default-features --features managed"
+          - "--no-default-features --features a2a-bridge"
+          - "--no-default-features --features vsr"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p laser-sdk ${{ matrix.features }} -- -D warnings
+
+  # The gate that makes the wasm guarantee real: the wire crate's portable
+  # surface must compile for wasm32-unknown-unknown. Omits `bson` (native-only).
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo check -p laser-wire --target wasm32-unknown-unknown
+          --no-default-features --features cbor,codecs,fixtures,builders,http-client
+
+  # Dependency policy: the wire crate's portable graph bans iggy, tokio, bytes,
+  # ulid, dashmap, tracing, and getrandom. The whole workspace is scanned for
+  # vulnerability and unmaintained advisories.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo deny
+        run: |
+          cargo install cargo-deny --locked --version 0.19.8
+          cargo deny --manifest-path wire/Cargo.toml --target wasm32-unknown-unknown \
+            --no-default-features --features cbor,codecs,fixtures,builders,http-client \
+            check --config deny-wire.toml bans
+      - run: cargo deny check advisories
+
+  # All cargo tests: unit plus wire fixtures/robustness with every additive
+  # feature, then the Iggy-backed integration suite with classic framing, then
+  # doctests. VSR and classic framing cannot coexist in one Cargo feature set.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+      - run: cargo test -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
+      # Doctests are excluded by `clippy --all-targets` and by a default-feature
+      # `cargo test`, so a `///` example behind a non-default feature would never
+      # compile without this explicit gate.
+      - run: cargo test --workspace --all-features --doc
+
+  # Coverage-guided fuzzing of the wire decode surface, bounded per target. The
+  # in-tree robustness suite (run by `test`) covers the same entry points every
+  # run. This is the deeper, nightly-only pass.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fuzz
+        run: |
+          cargo install cargo-fuzz --locked --version 0.13.2
+          cd fuzz
+          cargo +nightly fuzz run frame_decode -- -max_total_time=30
+          cargo +nightly fuzz run decode_envelope -- -max_total_time=30
+
+  # Cross-SDK BDD conformance: the Rust reference runner executes the shared
+  # Gherkin scenarios against a real Apache Iggy testcontainer (needs Docker).
+  # Query is served by the SDK's in-process worker, no managed backend or Cloud.
+  bdd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: BDD scenarios (Rust runner)
+        working-directory: bdd/rust
+        run: cargo test
+
+  # One aggregate gate so branch protection requires a single check, not every
+  # job and matrix leg. Runs after all of them and fails if any did not succeed.
+  ci-rust-complete:
+    name: ci-rust-complete
+    if: always()
+    needs:
+      - lint
+      - lint-detached
+      - build
+      - wire-feature-matrix
+      - feature-matrix
+      - wasm
+      - deny
+      - test
+      - fuzz
+      - bdd
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

@@ -1,0 +1,7 @@
+{
+  "code": "conflict",
+  "message": "key-value version conflict: current version 3",
+  "detail": {
+    "current": 3
+  }
+}
