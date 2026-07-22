@@ -1,0 +1,32 @@
+name: Free up disk space
+# GitHub-hosted ubuntu runners ship ~14 GB free, and a dev-profile build of the
+# full test workspace (testcontainers) plus container images can fill
+# it ("No space left on device"). Strip the preinstalled toolchains we never
+# use before building.
+description: Remove preinstalled toolchains and images to free runner disk
+runs:
+  using: composite
+  steps:
+    - name: Remove unused preinstalled software
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+        sudo rm -rf /usr/local/share/boost /usr/share/swift
+        sudo rm -rf /usr/local/.ghcup /usr/local/share/powershell /usr/local/lib/node_modules
+        sudo rm -rf /usr/local/games /usr/local/julia* /usr/share/miniconda /usr/share/az_*
+        sudo rm -rf /opt/microsoft /opt/pipx /opt/google /opt/az
+        sudo rm -rf /usr/share/gradle* /usr/share/sbt
+        sudo rm -rf /usr/local/share/chromium /usr/local/share/chrome* /usr/local/share/edge*
+        sudo rm -rf /usr/lib/firefox /usr/lib/google* /usr/lib/mono /usr/lib/heroku
+        sudo rm -rf /usr/lib/jvm /usr/share/java /usr/share/kotlinc
+        sudo rm -rf /usr/local/go* /usr/local/n
+        sudo apt-get purge -y \
+          'php*' 'mysql*' 'dotnet*' 'mono*' 'apache2*' 'nginx*' \
+          'snapd' 'google-chrome*' 'firefox*' 'microsoft-edge*' \
+          'temurin-*' 'adoptium-*' 'mongodb*' 'postgresql-*' \
+          'heroku' 'r-base*' 'ruby*' 'golang-*' \
+          podman buildah skopeo 2>/dev/null || true
+        sudo apt-get autoremove -y 2>/dev/null || true
+        sudo apt-get clean
+        sudo docker system prune --all --force --volumes
+        df -h

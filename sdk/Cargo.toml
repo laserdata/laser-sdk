@@ -1,0 +1,149 @@
+[package]
+name = "laser-sdk"
+description = "Open data-platform SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+categories = ["asynchronous", "network-programming"]
+keywords = ["iggy", "agents", "streaming", "provenance", "messaging"]
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["provenance", "streaming"]
+# The A2A bridge ADAPTER: map A2A JSON-RPC methods onto agent topics and drive the
+# task lifecycle (submit / task / cancel / card). Transport-agnostic, no HTTP deps.
+a2a-bridge = ["agent", "dep:serde_json"]
+# Add the ready-made axum HTTP router for the A2A bridge. Opt-in: the adapter
+# above is usable over any transport (or programmatically) without axum.
+a2a-http = ["a2a-bridge", "dep:axum", "dep:strum"]
+# AG-UI state sync: emit `state_snapshot`/`state_delta` events and reconstruct
+# shared state by replaying them (RFC 6902 JSON Patch), over the log not SSE.
+agui = ["agent", "dep:json-patch", "dep:serde_json"]
+agent = [
+    "dep:async-trait",
+    "dep:blake3",
+    "dep:dashmap",
+    "dep:futures",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:strum",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:trait-variant",
+    "provenance",
+    "streaming",
+]
+# Copy-on-write forks of the materialized read model: the `ForkHandle` and its
+# fluent builders over the `AGDX_FORK` managed commands.
+fork = ["streaming"]
+# The managed knowledge-graph surface: `Laser::graph` traversal, neighbor
+# reads, and content-addressed node/edge upserts over the `AGDX_GRAPH`
+# managed commands.
+graph = ["streaming"]
+# Zero-dep gate so the classic-protocol Iggy integration target is opt-in:
+# `cargo test --workspace` stays unit-only and Docker-free. The target is
+# excluded when `vsr` is active because Cargo features cannot select two
+# mutually incompatible Iggy framings in one binary.
+integration = []
+# Managed key-value store over the `AGDX_KV` managed commands, backed by
+# LaserData Cloud's point-state backend.
+kv = ["streaming"]
+# The managed tier in one word: everything LaserData Cloud serves over the
+# command band. `--features managed` instead of remembering which per-surface
+# features compose it.
+managed = ["fork", "graph", "kv", "projections", "query", "rbac", "runs", "watch"]
+# The MCP bridge ADAPTER: map MCP tool calls / results onto AGDX commands /
+# responses, plus the tool / resource / prompt catalog. No HTTP deps.
+mcp-bridge = ["agent", "dep:serde_json"]
+# Add the ready-made axum HTTP router for the MCP bridge. Opt-in.
+mcp-http = ["mcp-bridge", "dep:axum", "dep:strum"]
+# Projection, binding, and schema-registry control: declare projections,
+# route sources into them, and manage writer schemas, over control commands
+# and the managed browse band.
+projections = ["streaming"]
+provenance = []
+# Capability RBAC over the managed surfaces: roles, grants, bindings, and the
+# authorization change history over the `AGDX_AUTHZ` managed commands.
+rbac = ["streaming"]
+# The managed run registry: submit, cancel, status, and list agent or workflow
+# runs over the `AGDX_AGENT_*` managed commands.
+runs = ["streaming"]
+# Client-side schema-first codec helpers: compile a registered `SchemaDef`
+# (Avro / Protobuf) locally, encode Avro bodies from serde values, and validate
+# payloads against the registered definition before publishing - the same
+# decode semantics LaserData Cloud's projector applies.
+schema-codecs = ["dep:apache-avro", "dep:jsonschema", "dep:prost-reflect", "projections"]
+# Envelope signing and verification: activate the dormant `Signature` field with
+# Ed25519 keys and a per-agent key registry keyed by the enrolled principal. The
+# wire crate stays crypto-free, so the crypto lives here behind this gate.
+sign = ["agent", "dep:ed25519-dalek", "dep:sha2"]
+# Managed materialized-view queries over the laser-wire contract. No agent
+# dependency. Includes the native-only BSON decoder for query rows.
+query = ["laser-wire/bson", "streaming"]
+# The open AGDX streaming foundation: connect, streams/topics, raw and typed
+# publish, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. It runs on
+# raw Apache Iggy and carries no managed query or agent runtime semantics.
+streaming = [
+    "dep:dashmap",
+    "dep:futures",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tracing",
+    "laser-wire/codecs",
+]
+# Switch the underlying Apache Iggy client to its VSR cluster protocol. This is
+# transport-only: streaming and agent log traffic keep the same API, while
+# classic-only custom managed command codes remain unavailable over VSR.
+vsr = ["iggy/vsr", "streaming"]
+# The materialized-view change feed: `Laser::watch()` over the `ChangeRecord`s
+# LaserData Cloud publishes per committed projector batch.
+watch = ["streaming"]
+
+[dependencies]
+apache-avro = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+bon = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+iggy = { workspace = true }
+json-patch = { workspace = true, optional = true }
+jsonschema = { workspace = true, optional = true }
+laser-wire = { workspace = true, features = ["builders", "cbor"] }
+prost-reflect = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+strum = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+trait-variant = { workspace = true, optional = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+apache-avro = { workspace = true }
+async-trait = { workspace = true }
+dtor = { workspace = true }
+iggy = { workspace = true }
+laser-wire = { workspace = true, features = ["builders", "cbor", "fixtures"] }
+prost = { workspace = true }
+protox = { workspace = true }
+serde_json = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+required-features = ["integration"]

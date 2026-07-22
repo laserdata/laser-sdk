@@ -1,0 +1,7 @@
+{
+  "extends": "./api-extractor.json",
+  "mainEntryPointFilePath": "<projectFolder>/dist/opentelemetry.d.ts",
+  "apiReport": {
+    "reportFileName": "laser-sdk-opentelemetry.api.md"
+  }
+}

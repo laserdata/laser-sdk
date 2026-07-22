@@ -1,0 +1,27 @@
+services:
+  iggy:
+    image: apache/iggy:latest
+    container_name: laser-iggy
+    restart: unless-stopped
+    environment:
+      IGGY_TCP_ADDRESS: 0.0.0.0:8090
+      IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+      IGGY_ROOT_USERNAME: iggy
+      IGGY_ROOT_PASSWORD: iggy
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - 8090:8090
+      - 8080:8080
+      - 3000:3000
+    volumes:
+      - iggy-data:/local_data
+
+volumes:
+  iggy-data:

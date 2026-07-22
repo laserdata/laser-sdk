@@ -1,0 +1,52 @@
+# The internal Rust crate name. The published artifact is the Python package
+# `laser-sdk` on PyPI (import `laser_sdk`), set in pyproject.toml and the maturin
+# module-name below. This crate is never published to crates.io (publish = false).
+[package]
+name = "laser-sdk-python"
+# The Python package version tracks the Rust workspace release train (one
+# version across laser-wire, laser-sdk, and the Python SDK), and the dependency
+# pin below binds the exact Rust laser-sdk it wraps.
+version = "0.0.1-rc.17"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/laserdata/laser-sdk"
+description = "Python bindings for the LaserData SDK: an open data-platform SDK over Apache Iggy (typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with AGDX)."
+publish = false
+
+# The cdylib is named `laser_sdk_py` to avoid clashing with the `laser_sdk`
+# dependency crate. Maturin renames the built module to `laser_sdk` (the import
+# name) via `module-name` in pyproject.toml.
+[lib]
+name = "laser_sdk_py"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+doc = false
+
+[features]
+# Maturin enables this so the wheel links against the host interpreter's
+# extension-module ABI instead of libpython. Off for `cargo test` / `cargo run`.
+extension-module = ["pyo3/extension-module"]
+# Source-build switch for Apache Iggy's VSR cluster protocol. Prebuilt wheels
+# stay on the classic protocol until upstream makes VSR the default.
+vsr = ["iggy/vsr", "laser-sdk/vsr"]
+
+[dependencies]
+async-trait = "0.1.89"
+futures = "0.3.32"
+iggy = "0.10.3-edge.2"
+# Path wins for the in-monorepo wheel build. The version lets a source build (an
+# sdist on a platform with no prebuilt wheel) fetch laser-sdk from crates.io once
+# it is published. Wheels carry it compiled in and pull nothing at install.
+laser-sdk = { path = "../../sdk", version = "=0.0.1-rc.17", features = ["a2a-bridge", "agent", "agui", "managed", "mcp-bridge", "provenance", "schema-codecs", "sign", "streaming"] }
+log = "0.4"
+pyo3 = { version = "0.28.3", features = ["abi3-py310", "experimental-async", "multiple-pymethods"] }
+pyo3-async-runtimes = { version = "0.28.0", features = ["attributes", "tokio-runtime"] }
+pyo3-log = "0.13"
+pyo3-stub-gen = "0.22.3"
+pythonize = "0.28.0"
+serde = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync"] }

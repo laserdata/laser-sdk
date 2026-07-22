@@ -1,0 +1,253 @@
+name: ci-typescript
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "ts-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+env:
+  IGGY_IMAGE: apache/iggy:0.8.0@sha256:99b42016a898381d4bab3c2d4613456eb04ad06a7a0688314823d798a685636b
+
+defaults:
+  run:
+    working-directory: foreign/typescript
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: foreign/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run verify
+      - run: npm audit --omit=dev --audit-level=high
+
+  unit-node:
+    name: unit-node-${{ matrix.node }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "22.14.0"
+          - "24"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: foreign/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run build:test
+      - run: npm test
+
+  integration-iggy:
+    name: integration-iggy
+    needs: quality
+    runs-on: ubuntu-latest
+    services:
+      iggy:
+        image: apache/iggy:0.8.0@sha256:99b42016a898381d4bab3c2d4613456eb04ad06a7a0688314823d798a685636b
+        ports:
+          - 8090:8090
+        env:
+          IGGY_TCP_ADDRESS: 0.0.0.0:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
+        options: >-
+          --ulimit nofile=65536:65536
+          --tmpfs /local_data:rw,size=1g
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: foreign/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run build:test
+      - run: npm run test:integration
+        env:
+          LASER_CONNECTION_STRING: iggy://iggy:iggy@127.0.0.1:8090
+          LASER_TEST_IGGY_IMAGE: ${{ env.IGGY_IMAGE }}
+
+  pack:
+    name: pack
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: foreign/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm run pack:check
+      - run: mkdir -p package
+      - run: npm pack --json --pack-destination package
+      - run: node scripts/pack-consumer-check.mjs package/laserdata-laser-sdk-*.tgz
+      - run: npm run sbom -- package/sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: laser-sdk-npm-package
+          path: |
+            foreign/typescript/package/*.tgz
+            foreign/typescript/package/sbom.cdx.json
+          if-no-files-found: error
+
+  bdd-typescript:
+    name: bdd-typescript
+    needs: pack
+    runs-on: ubuntu-latest
+    services:
+      iggy:
+        image: apache/iggy:0.8.0@sha256:99b42016a898381d4bab3c2d4613456eb04ad06a7a0688314823d798a685636b
+        ports:
+          - 8090:8090
+        env:
+          IGGY_TCP_ADDRESS: 0.0.0.0:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
+        options: >-
+          --ulimit nofile=65536:65536
+          --tmpfs /local_data:rw,size=1g
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: bdd/typescript/package-lock.json
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: laser-sdk-npm-package
+          path: package
+      - run: npm ci
+        working-directory: bdd/typescript
+      - run: npm install --no-save --ignore-scripts ../../package/laserdata-laser-sdk-*.tgz
+        working-directory: bdd/typescript
+      - run: npm run build
+        working-directory: bdd/typescript
+      - run: npx cucumber-js --config cucumber.js --dry-run
+        working-directory: bdd/typescript
+      - run: mkdir -p reports
+        working-directory: bdd/typescript
+      - run: npx cucumber-js --config cucumber.js --format progress --format json:reports/cucumber.json
+        working-directory: bdd/typescript
+        env:
+          LASER_BDD_URL: iggy://iggy:iggy@127.0.0.1:8090
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: typescript-cucumber-report
+          path: bdd/typescript/reports/cucumber.json
+          if-no-files-found: error
+
+  examples:
+    name: examples
+    needs: pack
+    runs-on: ubuntu-latest
+    services:
+      iggy:
+        image: apache/iggy:0.8.0@sha256:99b42016a898381d4bab3c2d4613456eb04ad06a7a0688314823d798a685636b
+        ports:
+          - 8090:8090
+        env:
+          IGGY_TCP_ADDRESS: 0.0.0.0:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
+        options: >-
+          --ulimit nofile=65536:65536
+          --tmpfs /local_data:rw,size=1g
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: examples/typescript/package-lock.json
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: laser-sdk-npm-package
+          path: package
+      - run: npm ci
+        working-directory: examples/typescript
+      - run: npm install --no-save --ignore-scripts ../../package/laserdata-laser-sdk-*.tgz
+        working-directory: examples/typescript
+      - run: npm run typecheck
+        working-directory: examples/typescript
+      - run: npm test
+        working-directory: examples/typescript
+        env:
+          LASER_CONNECTION_STRING: iggy://iggy:iggy@127.0.0.1:8090
+          LASER_MESSAGES: "24"
+          LASER_BATCH: "8"
+
+  publish:
+    name: publish
+    if: startsWith(github.ref, 'refs/tags/ts-v')
+    needs:
+      - quality
+      - unit-node
+      - integration-iggy
+      - bdd-typescript
+      - examples
+      - pack
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: laser-sdk-npm-package
+          path: foreign/typescript/package
+      - run: npm install --global npm@12.0.1
+      - run: node scripts/validate-release.mjs package/laserdata-laser-sdk-*.tgz "${GITHUB_REF_NAME}"
+      - run: node scripts/publish-release.mjs package/laserdata-laser-sdk-*.tgz "${GITHUB_REF_NAME}"
+
+  ci-typescript-complete:
+    name: ci-typescript-complete
+    if: always()
+    needs:
+      - quality
+      - unit-node
+      - integration-iggy
+      - bdd-typescript
+      - examples
+      - pack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+        working-directory: ${{ github.workspace }}
