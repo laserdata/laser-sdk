@@ -45,7 +45,7 @@ log = "0.4"
 pyo3 = { version = "0.28.3", features = ["abi3-py310", "experimental-async", "multiple-pymethods"] }
 pyo3-async-runtimes = { version = "0.28.0", features = ["attributes", "tokio-runtime"] }
 pyo3-log = "0.13"
-pyo3-stub-gen = "0.22.3"
+pyo3-stub-gen = "0.23.0"
 pythonize = "0.28.0"
 serde = "1.0"
 serde_json = "1.0"
