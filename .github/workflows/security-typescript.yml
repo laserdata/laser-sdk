@@ -79,7 +79,7 @@ jobs:
   osv-pr:
     name: osv-pr
     if: github.event_name == 'pull_request'
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@3adb4b14a2b0623876d18d863a498b785fb3752d # v2.3.8
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@a82132c0bd6c7261ffcb78e754c46c70ab57ad9a # v2.3.8
     with:
       scan-args: ./
     permissions:
