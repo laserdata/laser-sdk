@@ -1,0 +1,20 @@
+{
+  "name": "laser-bdd-typescript",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && cucumber-js --config cucumber.js --dry-run && cucumber-js --config cucumber.js",
+    "test:steps": "npm run build && cucumber-js --config cucumber.js --dry-run",
+    "test:implemented": "npm run build && cucumber-js --config cucumber.js --tags 'not @governance'"
+  },
+  "dependencies": {
+    "@cucumber/cucumber": "13.2.0",
+    "@laserdata/laser-sdk": "file:../../foreign/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
+  }
+}

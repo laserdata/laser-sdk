@@ -1,0 +1,74 @@
+[package]
+name = "laser-wire"
+description = "LaserData wire contract: managed command codes, CBOR envelopes including the Agent Data Exchange Protocol (AGDX) agent envelope, the query IR, projections, schemas, KV, forks, and the HTTP surface. Runtime-free, wasm-compatible."
+categories = ["encoding", "api-bindings", "wasm"]
+keywords = ["iggy", "laserdata", "wire", "cbor", "wasm"]
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["time"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["cbor"]
+# The Bson codec. Native-only: bson's tree pulls getrandom/rand/time, which do
+# not build on wasm32-unknown-unknown without explicit backend wiring. The
+# direct `time` dependency exists ONLY to bound the version: bson 3.1.0 fails
+# to compile against time 0.3.48 (its blanket `impl<T> From<T>` collides with
+# a `From` impl time added), so a plain `cargo update` would break the build
+# without this constraint. Drop the bound once a fixed bson ships.
+bson = ["codecs", "dep:bson", "dep:time"]
+# Named-field CBOR (RFC 8949) encode/decode + the u32-LE length framing
+# (sans-io). This is the envelope wire format. wasm-safe.
+cbor = ["dep:ciborium"]
+# Codec/Decoder traits + Json, Cbor, Msgpack body-codec impls and Row/KvEntry
+# decode helpers. wasm-safe.
+codecs = ["cbor", "dep:rmp-serde"]
+# The golden corpus embedded via include_bytes! plus assertion helpers.
+fixtures = ["codecs"]
+# The fluent `Query::builder()` (bon-derived). Non-default so a type-only
+# consumer (a browser UI that struct-literals `Query`) does not pull `bon` into
+# its wasm bundle. The SDK enables it, struct-literal construction never needs
+# it. wasm-safe.
+builders = ["dep:bon"]
+# A typed `/agdx/*` HTTP client over a caller-injected `Transport` (gloo-net on
+# wasm, reqwest natively), so a browser UI or a native tool drops its hand-rolled
+# route/base64/query-param glue. The crate's one async surface, runtime-agnostic
+# (no executor dependency) and wasm-safe. Pulls serde_urlencoded for the typed
+# query strings.
+http-client = ["cbor", "dep:serde_urlencoded"]
+
+[dependencies]
+bon = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
+rmp-serde = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true, optional = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+bson = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+
+[[test]]
+name = "robustness"
+path = "tests/robustness.rs"
+required-features = ["fixtures"]
+
+[[test]]
+name = "wire_fixtures"
+path = "tests/wire_fixtures.rs"
+required-features = ["fixtures"]
+
+[[test]]
+name = "constants"
+path = "tests/constants.rs"

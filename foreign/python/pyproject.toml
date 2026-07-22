@@ -1,0 +1,51 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "laser-sdk"
+description = "Open data-platform SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "LaserData" }]
+keywords = ["laserdata", "iggy", "streaming", "agents", "agentic", "ai"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://laserdata.com"
+Repository = "https://github.com/laserdata/laser-sdk"
+
+[project.optional-dependencies]
+testing = [
+    "pytest>=9.0,<10.0",
+    "pytest-asyncio>=1.0,<2.0",
+    "pytest-bdd>=8.0,<9.0",
+    "pytest-timeout>=2.0,<3.0",
+    "ruff>=0.6,<1.0",
+    "testcontainers>=4.0,<5.0",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "laser_sdk"
+include = [{ path = "laser_sdk.pyi", format = ["sdist", "wheel"] }]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+timeout = 60
+testpaths = ["tests"]
+markers = [
+    "bridges: edge bridge interoperability scenarios",
+    "integration: tests that need a running Iggy server (testcontainers)",
+    "unit: fast tests with no server",
+]

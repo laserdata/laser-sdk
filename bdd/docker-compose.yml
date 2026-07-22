@@ -1,0 +1,56 @@
+# Multi-language BDD orchestration: one shared Apache Iggy server, one runner
+# service per language, each connecting to it via LASER_BDD_ADDR and loading the
+# same scenarios. CI runs the Rust runner directly with a testcontainer, and this
+# compose file is the shared-server path that scales as language runners land.
+
+services:
+  iggy-server:
+    image: apache/iggy:latest
+    environment:
+      IGGY_ROOT_USERNAME: iggy
+      IGGY_ROOT_PASSWORD: iggy
+      IGGY_TCP_ENABLED: "true"
+      IGGY_TCP_ADDRESS: 0.0.0.0:3000
+      IGGY_HTTP_ENABLED: "true"
+      IGGY_HTTP_ADDRESS: 0.0.0.0:80
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      - laser-bdd
+
+  rust-bdd:
+    build:
+      context: ../..
+      dockerfile: bdd/rust/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      LASER_BDD_ADDR: iggy-server:3000
+    networks:
+      - laser-bdd
+
+  typescript-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/typescript/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      LASER_BDD_ADDR: iggy-server:3000
+    networks:
+      - laser-bdd
+
+  # Future language runners attach here, each connecting to iggy-server:3000 and
+  # loading the same bdd/scenarios. They are conformant when they pass the same
+  # scenarios the Rust runner does.
+  #
+  # python-bdd:  { build: { dockerfile: bdd/python/Dockerfile }, ... }
+  # go-bdd:      { build: { dockerfile: bdd/go/Dockerfile }, ... }
+
+networks:
+  laser-bdd:

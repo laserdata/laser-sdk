@@ -1,0 +1,79 @@
+// Managed command codes LaserData Cloud reserves. Upstream Apache Iggy uses
+// low codes (1..=605), so LaserData reserves everything from one million up
+// and the two never collide. Ported verbatim from `wire/src/codes.rs`, one
+// feature block per hundred, pinned by the constants fixture test.
+
+export const AGDX_COMMAND_BASE = 1_000_000
+
+export const AGDX_HELLO_CODE = AGDX_COMMAND_BASE
+export const AGDX_BACKEND_HELLO_CODE = AGDX_COMMAND_BASE + 1
+export const AGDX_SET_CLIENT_METADATA_CODE = AGDX_COMMAND_BASE + 2
+export const AGDX_GET_CLIENTS_METADATA_CODE = AGDX_COMMAND_BASE + 3
+export const AGDX_BATCH_CODE = AGDX_COMMAND_BASE + 20
+
+export const AGDX_AUTHZ_BASE = AGDX_COMMAND_BASE + 100
+export const AGDX_AUTHZ_WHOAMI_CODE = AGDX_AUTHZ_BASE
+export const AGDX_AUTHZ_LIST_ROLES_CODE = AGDX_AUTHZ_BASE + 1
+export const AGDX_AUTHZ_GET_ROLE_CODE = AGDX_AUTHZ_BASE + 2
+export const AGDX_AUTHZ_GET_BINDINGS_CODE = AGDX_AUTHZ_BASE + 3
+export const AGDX_AUTHZ_DEFINE_ROLE_CODE = AGDX_AUTHZ_BASE + 4
+export const AGDX_AUTHZ_DELETE_ROLE_CODE = AGDX_AUTHZ_BASE + 5
+export const AGDX_AUTHZ_BIND_ROLES_CODE = AGDX_AUTHZ_BASE + 6
+export const AGDX_AUTHZ_HISTORY_CODE = AGDX_AUTHZ_BASE + 7
+
+export const AGDX_QUERY_BASE = AGDX_COMMAND_BASE + 200
+export const AGDX_QUERY_CODE = AGDX_QUERY_BASE
+export const AGDX_GET_PROJECTION_CODE = AGDX_QUERY_BASE + 10
+export const AGDX_LIST_PROJECTIONS_CODE = AGDX_QUERY_BASE + 11
+export const AGDX_GET_SCHEMA_CODE = AGDX_QUERY_BASE + 20
+export const AGDX_LIST_SCHEMAS_CODE = AGDX_QUERY_BASE + 21
+export const AGDX_REGISTER_SCHEMA_CODE = AGDX_QUERY_BASE + 22
+export const AGDX_DECODE_RECORD_CODE = AGDX_QUERY_BASE + 23
+
+export const AGDX_KV_BASE = AGDX_COMMAND_BASE + 300
+export const AGDX_KV_GET_CODE = AGDX_KV_BASE
+export const AGDX_KV_SET_CODE = AGDX_KV_BASE + 1
+export const AGDX_KV_SCAN_CODE = AGDX_KV_BASE + 2
+export const AGDX_KV_DELETE_CODE = AGDX_KV_BASE + 3
+export const AGDX_KV_DELETE_MANY_CODE = AGDX_KV_BASE + 4
+export const AGDX_KV_NAMESPACES_CODE = AGDX_KV_BASE + 5
+export const AGDX_KV_CAS_CODE = AGDX_KV_BASE + 6
+export const AGDX_KV_EXISTS_CODE = AGDX_KV_BASE + 7
+export const AGDX_KV_EXPIRE_CODE = AGDX_KV_BASE + 8
+export const AGDX_KV_PATCH_CODE = AGDX_KV_BASE + 9
+export const AGDX_KV_LEASE_CODE = AGDX_KV_BASE + 10
+export const AGDX_KV_RELEASE_CODE = AGDX_KV_BASE + 11
+export const AGDX_KV_CAS_FENCED_CODE = AGDX_KV_BASE + 12
+export const AGDX_KV_COPY_CODE = AGDX_KV_BASE + 13
+export const AGDX_KV_MOVE_CODE = AGDX_KV_BASE + 14
+
+export const AGDX_FORK_BASE = AGDX_COMMAND_BASE + 400
+export const AGDX_FORK_CREATE_CODE = AGDX_FORK_BASE
+export const AGDX_FORK_DELETE_CODE = AGDX_FORK_BASE + 1
+export const AGDX_FORK_PROMOTE_CODE = AGDX_FORK_BASE + 2
+export const AGDX_FORK_LIST_CODE = AGDX_FORK_BASE + 3
+export const AGDX_FORK_PUT_CODE = AGDX_FORK_BASE + 4
+
+export const AGDX_GRAPH_BASE = AGDX_COMMAND_BASE + 600
+export const AGDX_GRAPH_QUERY_CODE = AGDX_GRAPH_BASE
+export const AGDX_GRAPH_UPSERT_CODE = AGDX_GRAPH_BASE + 1
+export const AGDX_GRAPH_NEIGHBORS_CODE = AGDX_GRAPH_BASE + 2
+
+export const AGDX_AGENT_BASE = AGDX_COMMAND_BASE + 700
+export const AGDX_AGENT_SUBMIT_CODE = AGDX_AGENT_BASE
+export const AGDX_AGENT_CANCEL_CODE = AGDX_AGENT_BASE + 1
+export const AGDX_AGENT_STATUS_CODE = AGDX_AGENT_BASE + 2
+export const AGDX_AGENT_LIST_CODE = AGDX_AGENT_BASE + 3
+
+export const AUTHZ_OP_VERSION = 1
+export const QUERY_OP_VERSION = 1
+export const CONTROL_OP_VERSION = 1
+export const KV_OP_VERSION = 1
+export const FORK_OP_VERSION = 1
+export const GRAPH_OP_VERSION = 1
+export const AGENT_WORKFLOW_OP_VERSION = 1
+export const BATCH_OP_VERSION = 1
+export const CHANGE_OP_VERSION = 1
+export const CLIENT_METADATA_OP_VERSION = 1
+export const PRESENCE_OP_VERSION = 1
+export const AGENT_OP_VERSION = 1

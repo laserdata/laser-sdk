@@ -1,0 +1,36 @@
+debug/
+target/
+.idea/
+.vscode/
+.cargo/
+.zed/
+.DS_Store
+/rust-clippy-results.sarif
+.env
+gha-creds-*.json
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Python (foreign bindings, bdd runner, examples)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.so
+foreign/python/dist/
+
+# TypeScript SDK, BDD runner, and examples
+foreign/typescript/node_modules/
+foreign/typescript/dist/
+foreign/typescript/dist-test/
+foreign/typescript/coverage/
+foreign/typescript/artifacts/
+foreign/typescript/package/
+foreign/typescript/*.tgz
+foreign/typescript/*.tsbuildinfo
+bdd/typescript/node_modules/
+bdd/typescript/dist/
+bdd/typescript/coverage/
+bdd/typescript/reports/
+examples/typescript/node_modules/
+examples/typescript/dist/
