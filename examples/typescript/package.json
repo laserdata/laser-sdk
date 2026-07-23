@@ -1,0 +1,31 @@
+{
+  "name": "@laserdata/examples-typescript",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "style:check": "node ../../foreign/typescript/scripts/style-check.mjs .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "smoke": "npm run build && node --test dist/test/smoke.test.js",
+    "example:native-streaming": "npm run build && node dist/src/native-streaming/main.js",
+    "example:event-analytics": "npm run build && node dist/src/event-analytics/main.js",
+    "example:order-book": "npm run build && node dist/src/order-book/main.js",
+    "example:firehose": "npm run build && node dist/src/firehose/main.js",
+    "example:concierge": "npm run build && node dist/src/concierge/main.js",
+    "example:memory": "npm run build && node dist/src/memory/main.js",
+    "example:interop": "npm run build && node dist/src/interop/main.js",
+    "example:orchestra": "npm run build && node dist/src/orchestra/main.js",
+    "example:governance": "npm run build && node dist/src/governance/main.js"
+  },
+  "dependencies": {
+    "@laserdata/laser-sdk": "file:../../foreign/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "prettier": "3.9.6",
+    "typescript": "7.0.2"
+  }
+}

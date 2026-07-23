@@ -1,0 +1,62 @@
+[
+  {
+    "projection": {
+      "id": "order.v1",
+      "name": "order",
+      "version": 1,
+      "content_type": "json",
+      "extraction": {
+        "fields": [
+          {
+            "name": "order_id",
+            "pointer": "/order_id"
+          },
+          {
+            "name": "customer",
+            "pointer": "/customer/id"
+          },
+          {
+            "name": "amount",
+            "pointer": "/amount",
+            "field_type": "int"
+          }
+        ],
+        "vector_field": "/embedding",
+        "inline_payload": true
+      },
+      "inline_payload_default": true
+    },
+    "bindings": [
+      {
+        "source": {
+          "stream": "shop",
+          "topic": "orders"
+        },
+        "allowed_projections": [
+          "order.v1"
+        ],
+        "default_projection": "order.v1",
+        "targets": [
+          {
+            "backend": "embedded",
+            "table": "orders_rows",
+            "role": "read_write",
+            "delivery": "effectively_once",
+            "required": true
+          },
+          {
+            "backend": "warehouse",
+            "table": "orders_mirror",
+            "role": "write_only",
+            "delivery": "at_most_once",
+            "required": false
+          }
+        ],
+        "retention": {
+          "kind": "time_to_live",
+          "ttl_micros": 3600000000
+        }
+      }
+    ]
+  }
+]
