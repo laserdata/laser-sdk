@@ -1,0 +1,113 @@
+import type { Laser } from "./client/laser.js"
+import type { GraphHandle } from "./managed/graph.js"
+import { ContextAssembler, LastN, type ContextMessage, type ContextPolicy } from "./context.js"
+import { ConversationState, type ReplayBound } from "./conversation-state.js"
+import type { SnapshotStore } from "./snapshot.js"
+import type { BytesLike } from "./client/bytes.js"
+import type { ConversationId } from "./types/ids.js"
+import type { MemoryHandle } from "./memory/handle.js"
+import type { Feedback, MemoryId } from "./memory/types.js"
+
+export class ContextScope {
+  constructor(
+    private readonly laser: Laser,
+    readonly conversation: ConversationId
+  ) {}
+
+  append(topic: string, payload: BytesLike): Promise<void> {
+    return this.laser.sendAgent(topic, payload, { conversationId: this.conversation })
+  }
+
+  fetch(topics: readonly string[], count: number): Promise<readonly ContextMessage[]> {
+    return this.fetchWith(topics, new LastN(count))
+  }
+
+  fetchWith(topics: readonly string[], policy: ContextPolicy): Promise<readonly ContextMessage[]> {
+    return ContextAssembler.builder(this.conversation)
+      .topics(topics)
+      .policy(policy)
+      .build()
+      .assemble(this.laser)
+  }
+
+  async block(topics: readonly string[], count: number): Promise<string> {
+    const messages = await this.fetch(topics, count)
+    return messages.map((message) => new TextDecoder().decode(message.payload)).join("\n")
+  }
+
+  /** Binds a memory namespace or existing handle to this conversation. */
+  memory(namespaceOrHandle: string | MemoryHandle): ScopedMemory {
+    const handle =
+      typeof namespaceOrHandle === "string"
+        ? this.laser.memory(namespaceOrHandle)
+        : namespaceOrHandle
+    return new ScopedMemory(handle, this.conversation)
+  }
+
+  /** The knowledge graph `name`, reached from this scope so one conversation's
+   * messages, memory, and the relationships between them share an entry point.
+   * Returned unnarrowed on purpose: a dependency edge holds no matter which
+   * conversation asserted it, so scoping the graph to one would hide the
+   * relationships the caller came for. Narrow explicitly with the graph's own
+   * `conversation(id)` lens for only what this conversation wrote. */
+  graph(name: string): GraphHandle {
+    return this.laser.graph(name)
+  }
+
+  state<State>(
+    topics: readonly string[],
+    bound: ReplayBound,
+    initial: State,
+    fold: (state: State, message: ContextMessage) => State
+  ): Promise<State> {
+    return ConversationState.load(this.laser, this.conversation, topics, bound, initial, fold)
+  }
+
+  stateWith<State>(
+    store: SnapshotStore,
+    topics: readonly string[],
+    initial: State,
+    decodeState: (bytes: Uint8Array) => State,
+    fold: (state: State, message: ContextMessage) => State
+  ): Promise<State> {
+    return ConversationState.loadWith(
+      this.laser,
+      store,
+      this.conversation,
+      topics,
+      initial,
+      decodeState,
+      fold
+    )
+  }
+}
+
+export class ScopedMemory {
+  constructor(
+    private readonly handle: MemoryHandle,
+    private readonly conversation: ConversationId
+  ) {}
+
+  remember(payload: Uint8Array) {
+    return this.handle.remember(payload).conversation(this.conversation)
+  }
+
+  recall() {
+    return this.handle.recall().conversation(this.conversation)
+  }
+
+  context(tokenBudget?: number): Promise<string> {
+    return this.handle.context(
+      { conversation: this.conversation },
+      tokenBudget === undefined ? {} : { tokenBudget }
+    )
+  }
+
+  forget(id: MemoryId): Promise<void> {
+    return this.handle.forget({ conversation: this.conversation }, id)
+  }
+
+  improve(feedback: Feedback): Promise<MemoryId> {
+    return this.handle.improve({ conversation: this.conversation }, feedback)
+  }
+}

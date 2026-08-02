@@ -1,0 +1,749 @@
+use crate::error::InvalidError;
+use crate::limits::MAX_NAMESPACE_BYTES;
+use serde::{Deserialize, Serialize};
+
+/// The memory scope a read-view row carries, stamped by the fold from the
+/// record's headers so recall reconstructs a memory item and narrows by scope.
+/// Absent on a generic key-value entry, which carries no scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRowScope {
+    /// The item kind word, from the record body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The producing agent, from `gen_ai.agent.id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The user scope layer, from `agdx.mem.user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The app scope layer, from `agdx.mem.app`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// The conversation that wrote the record, from `gen_ai.conversation.id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    /// The origin log record this memory item was folded from (stream, topic,
+    /// partition, offset), so a reader can navigate back to the source message
+    /// while it is still on the log. Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::graph::SourceRef>,
+}
+
+/// One stored entry: an arbitrary-bytes key and value plus optional expiry. The
+/// key and value are owned `Vec<u8>`, so the public API never leaks the `bytes`
+/// crate, and they ride the wire as CBOR byte strings, byte-exact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvEntry {
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub value: Vec<u8>,
+    /// Absolute expiry in epoch microseconds, or `None` for no expiry. Expired
+    /// entries are hidden on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+    /// Optimistic-concurrency version, assigned by the store and bumped on every
+    /// successful mutation of this key. The token a [`KvCas`] precondition
+    /// matches against. A versioned managed backend reports `>= 1` for a live
+    /// entry and reserves `0` solely for "unversioned": a store that does not
+    /// track versions, or an entry written before versioning. A caller must
+    /// therefore never treat `0` as a valid compare token. The field is skipped
+    /// on the wire when `0` so those entries stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub version: u64,
+    /// The memory scope, present only on a memory read-view row. Recall reads it
+    /// to rebuild the item and filter by scope. A generic entry leaves it `None`.
+    /// Boxed so a generic entry stays small (the scope is five optional strings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Box<MemoryRowScope>>,
+    /// The origin log record this entry was folded from (stream, topic,
+    /// partition, offset). Every managed write goes log-first through a
+    /// mutation topic, so a stored entry points back to the record that wrote
+    /// it, the same provenance a memory row carries. Absent on an entry
+    /// written before provenance stamping, or read from a store that does not
+    /// track it. Boxed, like `scope`, so a generic entry stays small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Box<crate::graph::SourceRef>>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+impl KvEntry {
+    /// The key decoded as UTF-8, or `None` when it is not valid UTF-8. Keys are
+    /// arbitrary bytes, so a binary key has no string form.
+    pub fn key_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.key).ok()
+    }
+}
+
+/// A page of scanned entries plus the cursor to resume after the last one.
+/// `cursor` is `None` when the scan reached the end.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct KvPage {
+    pub entries: Vec<KvEntry>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub cursor: Option<Vec<u8>>,
+}
+
+/// Request to read the value at `key` in `namespace`. With `if_none_match` set to
+/// a version, the read returns [`KvOutcome::NotModified`] instead of the value
+/// when the live version matches (a conditional GET), so an up-to-date cache
+/// skips the body transfer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvGet {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_none_match: Option<u64>,
+}
+
+/// Request to write `value` at `key` in `namespace`, with an optional expiry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvSet {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub value: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+}
+
+/// The precondition a [`KvCas`] write must satisfy to apply. The compare half
+/// of compare-and-swap: lock-free optimistic concurrency for callers contending
+/// on one key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CasExpect {
+    /// Apply only if the key currently holds this exact [`KvEntry::version`].
+    Match(u64),
+    /// Apply only if the key does not currently exist (a create-if-absent).
+    Absent,
+}
+
+/// Compare-and-swap write at `key` in `namespace`: apply `value` (with optional
+/// expiry) only if `expect` holds, else fail with
+/// [`KvError::VersionConflict`]. The swap half of optimistic concurrency, paired
+/// with [`KvEntry::version`] as the compare token.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvCas {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub value: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+    pub expect: CasExpect,
+}
+
+/// Fenced compare-and-swap: the [`KvCas`] write and precondition, applied only
+/// while the task's fence sequence still equals `fence_token` (the at-most-one
+/// effective-writer gate). A failed fence maps to [`KvError::LeaseLost`], a failed
+/// precondition to [`KvError::VersionConflict`]. Additive over
+/// [`crate::codes::KV_OP_VERSION`] 1.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvCasFenced {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub value: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+    pub expect: CasExpect,
+    /// The task's fence-sequence key, in the reserved fence namespace the plane
+    /// owns.
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub fence_key: Vec<u8>,
+    /// The fencing token: the fence-sequence value the holder was granted.
+    /// Strictly monotonic per task, never the lease version.
+    pub fence_token: u64,
+}
+
+/// Request to remove `key` from `namespace`. With `if_match` set to a version,
+/// the delete applies only when the live version matches (a conditional delete),
+/// returning [`KvError::VersionConflict`] otherwise.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvDelete {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_match: Option<u64>,
+}
+
+/// Request to test presence and read metadata without the value. The cheap way
+/// to check a precondition before transferring a large value (the formal
+/// `EXISTS` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvExists {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+}
+
+/// Request to set, refresh, or clear a key's expiry in place without rewriting
+/// its value. `expires_at_micros` of `None` clears the expiry (the formal
+/// `EXPIRE` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvExpire {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+}
+
+/// Request to apply a merge patch to a structured value without transferring the
+/// whole object. `patch` is a codec-specific patch document (the `content_type`
+/// names the format). With `if_match` set, the patch applies only at that version
+/// (the formal `PATCH` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvPatch {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub patch: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_match: Option<u64>,
+}
+
+/// Request to copy the value at `key` to `to_key` (optionally into another
+/// namespace via `to_namespace`) in a single backend transaction. `Committed`
+/// on success, `NotFound` when the source is absent. The destination is
+/// overwritten (a guarded copy composes `exists` + `cas` instead).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvCopy {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    /// The destination namespace. Absent means the source `namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_namespace: Option<String>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub to_key: Vec<u8>,
+}
+
+/// Request to move the value at `key` to `to_key`: copy plus delete of the
+/// source, one backend transaction, the same outcomes as [`KvCopy`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvMove {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    /// The destination namespace. Absent means the source `namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_namespace: Option<String>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub to_key: Vec<u8>,
+}
+
+/// Request to acquire an advisory lease (a bounded-TTL distributed lock) on
+/// `key`. On success the holder gets a `lease_token` to present on protected
+/// mutations (the formal `LEASE` primitive). Built on compare-and-swap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvLease {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    pub lease_ttl_micros: u64,
+}
+
+/// Request to release an advisory lease early, presenting the `lease_token` the
+/// grant returned (the formal `RELEASE` primitive).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvRelease {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    pub lease_token: u64,
+}
+
+/// One key's metadata without its value: version, expiry, and value size. The
+/// reply to [`KvExists`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvMetadata {
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_micros: Option<u64>,
+    pub size_bytes: usize,
+}
+
+/// Request to list every namespace that holds at least one entry for the caller.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvNamespaces {
+    pub v: u32,
+}
+
+/// One namespace summary in a `Namespaces` reply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvNamespaceInfo {
+    pub namespace: String,
+    pub entries: usize,
+}
+
+/// Request to list entries in `namespace`. With no bounds it lists the whole
+/// namespace. `prefix` matches keys that start with it in byte order. `start`
+/// and `end` bound an inclusive-start, exclusive-end key range. `key_contains`
+/// keeps only keys that are valid UTF-8 and contain the substring (binary keys
+/// are skipped). All bounds compose.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvScan {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub prefix: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub start: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub end: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_contains: Option<String>,
+    /// The conversation lens: keep only rows the given conversation wrote (the
+    /// text form of its `gen_ai.conversation.id`). The memory read view stamps
+    /// this on each record it materializes, generic key-value rows leave it
+    /// unset, so a scan narrows to one conversation's memory. Absent on the wire
+    /// when unfiltered, so a pre-lens scan stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    pub limit: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub cursor: Option<Vec<u8>>,
+}
+
+/// Request to bulk-delete entries in `namespace` matching the same composed
+/// bounds as a scan (`prefix`/`start`/`end`/`key_contains`). With no bounds it
+/// clears the whole namespace. No `limit`/`cursor`, and expiry is ignored (a
+/// matching expired entry is removed too).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvDeleteMany {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub prefix: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub start: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_bin_bytes"
+    )]
+    pub end: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_contains: Option<String>,
+    /// The conversation lens over a bulk delete: clear only the rows a given
+    /// conversation wrote. See [`KvScan::conversation`]. Absent when unfiltered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+}
+
+/// The result of a key-value operation: `Ok` with the operation's outcome, or
+/// `Err` with a structured failure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum KvReply {
+    Ok(KvOutcome),
+    Err(KvError),
+}
+
+/// The successful outcome of a KV command, shaped per op.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum KvOutcome {
+    /// `get`: the live entry, or `None` when absent or expired.
+    Value(Option<KvEntry>),
+    /// `set`: the write was applied.
+    Written,
+    /// `cas`: the compare-and-swap applied. Carries the entry's new version, so
+    /// the caller can chain a further conditional write without a re-read.
+    Committed { version: u64 },
+    /// `delete`: `true` when a live entry was removed, `false` when none existed.
+    Deleted(bool),
+    /// `delete_many`: the number of entries removed by a filtered bulk delete.
+    DeletedMany(usize),
+    /// `scan`: one page of entries.
+    Page(KvPage),
+    /// `namespaces`: every namespace holding at least one entry for the
+    /// caller with its entry count, sorted by name.
+    Namespaces(Vec<KvNamespaceInfo>),
+    /// `get` with `if_none_match`: the live version matched, so the body is
+    /// unchanged and not transferred (a conditional-GET hit).
+    NotModified,
+    /// `exists`: the key's metadata, or `None` when absent or expired.
+    Metadata(Option<KvMetadata>),
+    /// `expire` / `patch`: applied, carrying the entry's version. `expire` leaves
+    /// the version unchanged, `patch` bumps it.
+    Versioned { version: u64 },
+    /// `lease`: the lease was granted, carrying the fencing token and the granted
+    /// TTL (which the store may shorten from the request).
+    Leased {
+        lease_token: u64,
+        granted_ttl_micros: u64,
+    },
+    /// `release`: `true` when a held lease was released, `false` when none was
+    /// held (idempotent release).
+    Released(bool),
+}
+
+/// Why a key-value operation failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[non_exhaustive]
+pub enum KvError {
+    #[error("kv not supported: {0}")]
+    Unsupported(String),
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
+    /// The request named a namespace that fails [`validate_namespace`].
+    #[error("invalid namespace: {0}")]
+    InvalidNamespace(String),
+    #[error("{what} is {size}B, exceeds cap {cap}B")]
+    TooLarge {
+        what: String,
+        size: usize,
+        cap: usize,
+    },
+    #[error("kv backend error: {0}")]
+    Backend(String),
+    #[error("unsupported kv op version (expected {expected}, got {got})")]
+    Version { expected: u32, got: u32 },
+    /// A [`KvCas`] precondition was not met. `current` is the key's present
+    /// version (`Some`) or `None` when the key does not exist, so the caller can
+    /// re-read and retry, or learn that an `Absent` precondition lost a race.
+    #[error("kv version conflict (current: {current:?})")]
+    VersionConflict { current: Option<u64> },
+    /// A held [`KvLease`] expired or was released, so its token no longer
+    /// protects mutations. The caller must re-acquire the lease.
+    #[error("kv lease lost")]
+    LeaseLost,
+    /// An in-place op (`expire`, `patch`) targeted a key that is absent or
+    /// expired (the formal `NOT_FOUND`).
+    #[error("kv key not found")]
+    NotFound,
+    /// This plane does not own the mutation partition for the key. The caller
+    /// may retry after the streaming client refreshes partition leadership.
+    #[error("not the partition leader for this key")]
+    NotLeader,
+}
+
+/// The canonical namespace rule, shared by the SDK client edge and every
+/// serving tier: non-empty, at most [`MAX_NAMESPACE_BYTES`] bytes, no ASCII
+/// control characters. The charset is otherwise open, so `/`-style hierarchy
+/// stays legal. The bound is a size and sanity cap, not a safelist.
+pub fn validate_namespace(namespace: &str) -> Result<(), InvalidError> {
+    if namespace.is_empty() {
+        return Err(InvalidError::new("namespace must not be empty"));
+    }
+    if namespace.len() > MAX_NAMESPACE_BYTES {
+        return Err(InvalidError::new(format!(
+            "namespace is {}B, exceeds cap {MAX_NAMESPACE_BYTES}B",
+            namespace.len()
+        )));
+    }
+    if namespace.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(InvalidError::new(
+            "namespace must not contain ASCII control characters",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "cbor"))]
+mod tests {
+    use super::*;
+    use crate::codes::KV_OP_VERSION;
+    use crate::framing::{decode_named, encode_named};
+
+    #[test]
+    fn given_kv_delete_many_when_round_tripped_then_should_preserve_bounds() {
+        let request = KvDeleteMany {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            prefix: Some(b"user:".to_vec()),
+            start: None,
+            end: None,
+            key_contains: Some("stale".to_owned()),
+            conversation: None,
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvDeleteMany = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.prefix, Some(b"user:".to_vec()));
+        assert_eq!(back.key_contains.as_deref(), Some("stale"));
+    }
+
+    #[test]
+    fn given_kv_deleted_many_reply_when_round_tripped_then_should_preserve_count() {
+        let reply = KvReply::Ok(KvOutcome::DeletedMany(7));
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        match back {
+            KvReply::Ok(KvOutcome::DeletedMany(n)) => assert_eq!(n, 7),
+            other => panic!("expected DeletedMany, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_a_set_request_when_round_tripped_then_should_preserve_value_and_expiry() {
+        let request = KvSet {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            key: b"user:42".to_vec(),
+            value: b"online".to_vec(),
+            expires_at_micros: Some(1_700_000_000_000_000),
+        };
+        let bytes = encode_named(&request).expect("the request serializes");
+        let back: KvSet = decode_named(&bytes).expect("the request deserializes");
+        assert_eq!(back.key, b"user:42");
+        assert_eq!(back.value, b"online");
+        assert_eq!(back.expires_at_micros, Some(1_700_000_000_000_000));
+    }
+
+    #[test]
+    fn given_a_binary_key_entry_when_round_tripped_then_should_preserve_raw_bytes() {
+        let reply = KvReply::Ok(KvOutcome::Value(Some(KvEntry {
+            key: vec![0xff, 0x00, 0xfe],
+            value: vec![0x00, 0x01, 0x02],
+            expires_at_micros: None,
+            version: 0,
+            scope: None,
+            source: None,
+        })));
+        let bytes = encode_named(&reply).expect("the reply serializes");
+        let back: KvReply = decode_named(&bytes).expect("the reply deserializes");
+        let KvReply::Ok(KvOutcome::Value(Some(entry))) = back else {
+            panic!("expected an Ok(Value(Some)) reply");
+        };
+        assert_eq!(entry.key, vec![0xff, 0x00, 0xfe]);
+        assert_eq!(entry.key_str(), None, "non-UTF-8 key has no string form");
+        assert_eq!(entry.value, vec![0x00, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn given_a_scan_page_when_round_tripped_then_should_preserve_cursor() {
+        let reply = KvReply::Ok(KvOutcome::Page(KvPage {
+            entries: vec![KvEntry {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+                expires_at_micros: None,
+                version: 0,
+                scope: None,
+                source: None,
+            }],
+            cursor: Some(b"a".to_vec()),
+        }));
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        let KvReply::Ok(KvOutcome::Page(page)) = back else {
+            panic!("expected an Ok(Page) reply");
+        };
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].key_str(), Some("a"));
+        assert_eq!(page.cursor.as_deref(), Some(b"a".as_ref()));
+    }
+
+    #[test]
+    fn given_a_cas_request_when_round_tripped_then_should_preserve_the_precondition() {
+        for expect in [CasExpect::Match(7), CasExpect::Absent] {
+            let request = KvCas {
+                v: KV_OP_VERSION,
+                namespace: "counters".to_owned(),
+                key: b"hits".to_vec(),
+                value: b"42".to_vec(),
+                expires_at_micros: None,
+                expect,
+            };
+            let bytes = encode_named(&request).expect("serializes");
+            let back: KvCas = decode_named(&bytes).expect("deserializes");
+            assert_eq!(back.expect, expect);
+            assert_eq!(back.key, b"hits");
+        }
+    }
+
+    #[test]
+    fn given_a_committed_reply_when_round_tripped_then_should_preserve_the_version() {
+        let reply = KvReply::Ok(KvOutcome::Committed { version: 9 });
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        match back {
+            KvReply::Ok(KvOutcome::Committed { version }) => assert_eq!(version, 9),
+            other => panic!("expected Committed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_an_exists_metadata_reply_when_round_tripped_then_should_preserve_metadata() {
+        let reply = KvReply::Ok(KvOutcome::Metadata(Some(KvMetadata {
+            version: 4,
+            expires_at_micros: Some(1_700_000_000_000_000),
+            size_bytes: 128,
+        })));
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        let KvReply::Ok(KvOutcome::Metadata(Some(meta))) = back else {
+            panic!("expected Ok(Metadata(Some))");
+        };
+        assert_eq!(meta.version, 4);
+        assert_eq!(meta.size_bytes, 128);
+    }
+
+    #[test]
+    fn given_a_patch_request_when_round_tripped_then_should_preserve_patch_and_precondition() {
+        let request = KvPatch {
+            v: KV_OP_VERSION,
+            namespace: "docs".to_owned(),
+            key: b"doc:1".to_vec(),
+            patch: br#"{"status":"closed"}"#.to_vec(),
+            if_match: Some(3),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvPatch = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.patch, br#"{"status":"closed"}"#);
+        assert_eq!(back.if_match, Some(3));
+    }
+
+    #[test]
+    fn given_a_lease_reply_when_round_tripped_then_should_preserve_token_and_ttl() {
+        let reply = KvReply::Ok(KvOutcome::Leased {
+            lease_token: 77,
+            granted_ttl_micros: 30_000_000,
+        });
+        let bytes = encode_named(&reply).expect("serializes");
+        let back: KvReply = decode_named(&bytes).expect("deserializes");
+        match back {
+            KvReply::Ok(KvOutcome::Leased {
+                lease_token,
+                granted_ttl_micros,
+            }) => {
+                assert_eq!(lease_token, 77);
+                assert_eq!(granted_ttl_micros, 30_000_000);
+            }
+            other => panic!("expected Leased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_a_conditional_get_when_round_tripped_then_should_preserve_if_none_match() {
+        let request = KvGet {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            key: b"user:1".to_vec(),
+            if_none_match: Some(5),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvGet = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.if_none_match, Some(5));
+        // A plain get omits the precondition on the wire, so the pre-conditional
+        // contract stays byte-identical.
+        let plain = KvGet {
+            if_none_match: None,
+            ..request
+        };
+        let json = serde_json::to_string(&plain).expect("json");
+        assert!(
+            !json.contains("if_none_match"),
+            "absent precondition omitted"
+        );
+    }
+
+    #[test]
+    fn given_a_version_conflict_when_round_tripped_then_should_preserve_the_current_version() {
+        for current in [Some(3u64), None] {
+            let reply = KvReply::Err(KvError::VersionConflict { current });
+            let bytes = encode_named(&reply).expect("serializes");
+            let back: KvReply = decode_named(&bytes).expect("deserializes");
+            match back {
+                KvReply::Err(KvError::VersionConflict { current: got }) => assert_eq!(got, current),
+                other => panic!("expected VersionConflict, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_versioned_entry_when_round_tripped_then_should_preserve_version_and_skip_zero() {
+        let entry = KvEntry {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            expires_at_micros: None,
+            version: 5,
+            scope: None,
+            source: None,
+        };
+        let bytes = encode_named(&entry).expect("serializes");
+        let back: KvEntry = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.version, 5);
+        // An unversioned entry (version 0) omits the field on the wire, so a
+        // pre-versioning store stays byte-identical.
+        let unversioned = KvEntry {
+            version: 0,
+            ..entry
+        };
+        let json = serde_json::to_string(&unversioned).expect("json");
+        assert!(
+            !json.contains("version"),
+            "version 0 must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn given_a_scan_with_bounds_when_round_tripped_then_should_preserve_filters() {
+        let scan = KvScan {
+            v: KV_OP_VERSION,
+            namespace: "sessions".to_owned(),
+            prefix: Some(b"user:".to_vec()),
+            start: None,
+            end: None,
+            key_contains: Some("admin".to_owned()),
+            conversation: None,
+            limit: 50,
+            cursor: Some(b"user:9".to_vec()),
+        };
+        let bytes = encode_named(&scan).expect("serializes");
+        let back: KvScan = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.prefix.as_deref(), Some(b"user:".as_ref()));
+        assert_eq!(back.key_contains.as_deref(), Some("admin"));
+        assert_eq!(back.cursor.as_deref(), Some(b"user:9".as_ref()));
+    }
+}

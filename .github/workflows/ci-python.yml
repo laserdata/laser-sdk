@@ -1,0 +1,285 @@
+name: ci-python
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "py-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+# Harden cargo's network against the runner's flaky HTTP/2 to crates.io: retry
+# transient failures and drop HTTP/2 multiplexing, which triggers the recurring
+# "Error in the HTTP2 framing layer" curl failures.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+defaults:
+  run:
+    working-directory: foreign/python
+
+jobs:
+  # Decide whether the Iggy-server-backed suites run. A change carrying
+  # `[wire-break]` in its title, body, or commit message is a breaking wire
+  # change whose matching server release does not exist yet: the server-free
+  # gates still run and only the live suites skip. Release tags always run
+  # everything.
+  flags:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Decide the server-backed test mode
+        id: decide
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          mode=run
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            for text in "${PR_TITLE}" "${PR_BODY}" "${COMMIT_MESSAGE}"; do
+              if [[ "${text}" == *"[wire-break]"* ]]; then
+                mode=skip
+              fi
+            done
+          fi
+          echo "server-backed suites: ${mode}"
+          echo "server_tests=${mode}" >> "${GITHUB_OUTPUT}"
+    outputs:
+      server_tests: ${{ steps.decide.outputs.server_tests }}
+
+  # Build the extension and run the offline + integration tests against the
+  # pinned VSR Iggy release binary.
+  test:
+    name: python-test
+    needs: [flags]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Iggy runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhwloc15
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Build the extension and install test dependencies
+        run: uv sync --locked --extra testing
+      - name: Verify the stub is current
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
+        run: |
+          uv run cargo run --bin stub_gen
+          git diff --exit-code -- laser_sdk.pyi
+      - name: Verify the stub is valid Python a type checker can load
+        # A reserved keyword leaking into a parameter name (the `from` bug) makes
+        # the whole stub unparseable, so every user silently loses typing. Parse
+        # it here so that regression fails the build, not the user's editor.
+        run: uv run python -c "import ast; ast.parse(open('laser_sdk.pyi').read()); print('laser_sdk.pyi parses')"
+      - name: Verify the VSR-only extension
+        run: uv run cargo check --locked
+      - name: Lint (ruff)
+        run: |
+          uv run ruff check . ../../bdd/python ../../examples/python
+          uv run ruff format --check . ../../bdd/python ../../examples/python
+      - name: Run server-free tests
+        run: uv run pytest -q -m "not integration"
+      - name: Run Iggy integration tests
+        if: needs.flags.outputs.server_tests == 'run'
+        run: uv run pytest -q -m integration
+      - name: Run the cross-SDK BDD conformance suite
+        if: needs.flags.outputs.server_tests == 'run'
+        run: uv run pytest -q ../../bdd/python
+
+  # abi3 wheels: one wheel per platform covers Python 3.10+.
+  wheels:
+    name: wheels-${{ matrix.platform.target }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # aarch64 builds on a native arm64 runner, not cross-compiled: the
+          # rustls crypto backend (aws-lc-sys, a C library) does not cross-compile
+          # cleanly in the x86 manylinux container, but builds with the native
+          # toolchain here.
+          - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          # One universal2 wheel (Intel + Apple Silicon) on an Apple Silicon
+          # runner, so this needs no scarce, deprecated macos-13 Intel runner.
+          - { runner: macos-14, target: universal2-apple-darwin, manylinux: "" }
+          # One abi3 wheel for 64-bit Windows: the native MSVC toolchain builds
+          # the aws-lc-sys C backend, no manylinux container involved.
+          - { runner: windows-latest, target: x64, manylinux: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist
+          # No sccache: its compiler wrapper fails the aws-lc-sys C build (the
+          # rustls crypto backend) inside the manylinux container, returning a
+          # bare non-zero with no diagnostic. cc-rs calls the compiler directly.
+          working-directory: foreign/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-${{ matrix.platform.runner }}
+          path: foreign/python/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: foreign/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: foreign/python/dist
+
+  # The artifact gate: install every built wheel into a clean interpreter with
+  # no repository checkout, on the oldest supported Python and the current one,
+  # then import it and touch the public surface. Source-workspace tests cannot
+  # prove what an installed artifact ships.
+  wheel-install:
+    name: wheel-install-${{ matrix.platform.target }}-py${{ matrix.python }}
+    needs: [wheels]
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+        platform:
+          - { runner: ubuntu-latest, target: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64 }
+          - { runner: macos-14, target: universal2-apple-darwin }
+          - { runner: windows-latest, target: x64 }
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-${{ matrix.platform.runner }}
+          path: dist
+      - name: Install the wheel and smoke the public surface
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist laser-sdk
+          python - << 'EOF'
+          import importlib.metadata
+          import pathlib
+
+          import laser_sdk as ls
+
+          version = importlib.metadata.version("laser-sdk")
+          print(f"installed laser-sdk {version}")
+          package = pathlib.Path(ls.__file__).parent
+          stub = package / "__init__.pyi"
+          assert stub.is_file(), "the typing stub must ship inside the wheel"
+          assert (package / "py.typed").is_file(), "the PEP 561 marker must ship inside the wheel"
+          key = ls.SigningKey(bytes(range(32)))
+          registry = ls.KeyRegistry()
+          registry.enroll("smoke", key.verifying_key)
+          provenance = ls.Provenance(agent="smoke")
+          assert provenance.conversation_id
+          print("public surface smoke passed")
+          EOF
+
+  # Build the source distribution in a directory with no repository parents, so
+  # a vendoring or path-dependency defect fails here rather than on a user.
+  sdist-install:
+    needs: [sdist]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Build and install the sdist from a checkout-free directory
+        shell: bash
+        run: |
+          workdir="$(mktemp -d)"
+          cp dist/laser_sdk-*.tar.gz "${workdir}/"
+          cd "${workdir}"
+          python -m pip install laser_sdk-*.tar.gz
+          python -c "import laser_sdk; print('sdist import passed')"
+
+  # Publish to PyPI on a py-v* tag, using the laserdata account's trusted publisher.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    needs: [test, wheels, sdist, wheel-install, sdist-install]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # PEP 740 provenance: the trusted publisher signs digital attestations
+          # for every distribution, so an installer can verify origin.
+          attestations: true
+
+  # One aggregate gate so branch protection requires a single check. Excludes
+  # publish (tag-only). Fails if any of the test/build jobs did not succeed.
+  ci-python-complete:
+    name: ci-python-complete
+    if: always()
+    needs:
+      - test
+      - wheels
+      - sdist
+      - wheel-install
+      - sdist-install
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        working-directory: ${{ github.workspace }}
+        run: exit 1

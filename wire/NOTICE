@@ -1,0 +1,14 @@
+laser-wire
+Copyright 2026 LaserData, Inc.
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License in the accompanying LICENSE file or at
+http://www.apache.org/licenses/LICENSE-2.0
+
+This is the wire contract layer of laser-sdk (https://github.com/laserdata/laser-sdk),
+which builds on Apache Iggy (https://iggy.apache.org), a project of the Apache
+Software Foundation, distributed separately under the Apache License,
+Version 2.0.
+
+Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of
+these marks does not imply endorsement by the Apache Software Foundation.

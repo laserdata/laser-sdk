@@ -1,0 +1,93 @@
+[package]
+name = "laser-examples"
+edition.workspace = true
+license.workspace = true
+publish = false
+version.workspace = true
+
+[features]
+# Run the agentic example against a real model: `cargo run --example concierge
+# --features llm-anthropic` (ANTHROPIC_API_KEY) or `--features llm-openai`
+# (OPENAI_API_KEY). Off by default so CI and docs stay deterministic on MockLlm.
+llm-anthropic = ["dep:reqwest"]
+llm-openai = ["dep:reqwest"]
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+laser-sdk = { workspace = true, features = ["a2a-bridge", "agui", "managed", "mcp-bridge", "schema-codecs", "streaming"] }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "log"
+path = "src/log/main.rs"
+
+[[example]]
+name = "query"
+path = "src/query/main.rs"
+
+[[example]]
+name = "watch"
+path = "src/watch/main.rs"
+
+[[example]]
+name = "kv"
+path = "src/kv/main.rs"
+
+[[example]]
+name = "graph"
+path = "src/graph/main.rs"
+
+[[example]]
+name = "recall"
+path = "src/recall/main.rs"
+
+[[example]]
+name = "context"
+path = "src/context/main.rs"
+
+[[example]]
+name = "agent"
+path = "src/agent/main.rs"
+
+[[example]]
+name = "event-analytics"
+path = "src/event-analytics/main.rs"
+
+[[example]]
+name = "native-streaming"
+path = "src/native-streaming/main.rs"
+
+[[example]]
+name = "order-book"
+path = "src/order-book/main.rs"
+
+[[example]]
+name = "firehose"
+path = "src/firehose/main.rs"
+
+[[example]]
+name = "concierge"
+path = "src/concierge/main.rs"
+
+[[example]]
+name = "memory"
+path = "src/memory/main.rs"
+
+[[example]]
+name = "interop"
+path = "src/interop/main.rs"
+
+[[example]]
+name = "orchestra"
+path = "src/orchestra/main.rs"
+
+[[example]]
+name = "governance"
+path = "src/governance/main.rs"

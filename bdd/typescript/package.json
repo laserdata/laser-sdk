@@ -1,0 +1,19 @@
+{
+  "name": "laser-bdd-typescript",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node ../../scripts/run-with-test-iggy.mjs npm run test:run",
+    "test:run": "cucumber-js --config cucumber.js"
+  },
+  "dependencies": {
+    "@cucumber/cucumber": "13.2.0",
+    "@laserdata/laser-sdk": "file:../../foreign/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
+  }
+}

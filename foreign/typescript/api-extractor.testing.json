@@ -1,0 +1,7 @@
+{
+  "extends": "./api-extractor.json",
+  "mainEntryPointFilePath": "<projectFolder>/dist/testing.d.ts",
+  "apiReport": {
+    "reportFileName": "laser-sdk-testing.api.md"
+  }
+}

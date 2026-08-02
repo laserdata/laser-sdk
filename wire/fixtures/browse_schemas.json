@@ -1,0 +1,40 @@
+[
+  {
+    "schema": {
+      "id": 7,
+      "source": {
+        "kind": "avro",
+        "schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[]}"
+      }
+    },
+    "dropped": false
+  },
+  {
+    "schema": {
+      "id": 3,
+      "source": {
+        "kind": "protobuf",
+        "descriptor_set": [
+          0,
+          1,
+          2,
+          255
+        ],
+        "message_type": "shop.Order"
+      }
+    },
+    "dropped": true
+  },
+  {
+    "schema": {
+      "id": 9,
+      "source": {
+        "kind": "json_schema",
+        "schema": "{\"type\":\"object\",\"required\":[\"customer\"]}"
+      },
+      "name": "order-events",
+      "version": 2
+    },
+    "dropped": false
+  }
+]

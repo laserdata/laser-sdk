@@ -1,0 +1,42 @@
+# cargo-deny policy for the laser-wire crate's PORTABLE surface: the
+# wasm-safe feature set (cbor + codecs + fixtures, no bson). The bans list
+# is the runtime-free guarantee as code - if any of these ever appears in the
+# wire crate's graph, the contract crate has leaked a runtime or a
+# wasm-breaking dependency. The native all-features build (with bson) is
+# deliberately NOT checked here: bson pulls getrandom by design and is
+# excluded from the portable guarantee.
+
+[graph]
+targets = ["wasm32-unknown-unknown"]
+no-default-features = true
+# The full wasm-facing feature set: the data surfaces plus the two wasm-facing
+# additions a browser UI uses - `builders` (bon's `Query::builder`) and
+# `http-client` (the typed client over an injected transport, pulling
+# serde_urlencoded). All must stay free of the banned wasm-breakers below.
+features = ["cbor", "codecs", "fixtures", "builders", "http-client"]
+
+[bans]
+multiple-versions = "allow"
+deny = [
+    { crate = "bytes" },
+    { crate = "dashmap" },
+    # The canonical wasm-breaker: fails to compile on wasm32-unknown-unknown
+    # without explicit JS backend wiring. Arrives transitively via bson, which
+    # is exactly why bson is outside the portable feature set.
+    { crate = "getrandom" },
+    { crate = "iggy" },
+    { crate = "tokio" },
+    { crate = "tracing" },
+    { crate = "ulid" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[advisories]
+ignore = []

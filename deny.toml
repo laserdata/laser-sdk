@@ -1,0 +1,7 @@
+# Workspace advisory policy. Portable dependency and license rules live in deny-wire.toml.
+
+[advisories]
+ignore = [
+    # paste is an unmaintained transitive Apache Iggy dependency with no safe upgrade. Remove this exception when Apache Iggy removes paste.
+    "RUSTSEC-2024-0436",
+]

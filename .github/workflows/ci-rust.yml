@@ -1,0 +1,493 @@
+name: ci-rust
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "rust-v*"
+      - "wire-v*"
+  workflow_dispatch:
+
+# Least privilege by default. Only the tag-gated publish job can mint an OIDC token.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Harden cargo's network against the runner's flaky HTTP/2 to crates.io: retry
+  # transient failures and drop HTTP/2 multiplexing, which triggers the recurring
+  # "Error in the HTTP2 framing layer" curl failures.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # Decide whether the Iggy-server-backed suites run. They always run for a
+  # `rust-v*` release tag and on ordinary work. A `wire-v*` tag releases the
+  # wire crate alone, and a pull request or push carrying `[wire-break]` in
+  # its title, body, or commit message is a breaking wire change whose
+  # matching server release does not exist yet: both run every server-free
+  # gate and skip only the suites that need the released server binary. The
+  # follow-up that bumps the pinned server version runs the full pipeline.
+  flags:
+    runs-on: ubuntu-latest
+    outputs:
+      server_tests: ${{ steps.decide.outputs.server_tests }}
+    steps:
+      - name: Decide the server-backed test mode
+        id: decide
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          mode=run
+          if [[ "${GITHUB_REF}" == refs/tags/wire-v* ]]; then
+            mode=skip
+          elif [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            for text in "${PR_TITLE}" "${PR_BODY}" "${COMMIT_MESSAGE}"; do
+              if [[ "${text}" == *"[wire-break]"* ]]; then
+                mode=skip
+              fi
+            done
+          fi
+          echo "server-backed suites: ${mode}"
+          echo "server_tests=${mode}" >> "${GITHUB_OUTPUT}"
+
+  # fmt, sort, unused-deps, and clippy: the static gates, in the order the
+  # global Rust verification rule enforces them.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - name: cargo sort
+        run: |
+          cargo install cargo-sort --locked --version 2.1.0
+          cargo sort --workspace --check
+      - name: cargo machete
+        run: |
+          cargo install cargo-machete --locked --version 0.9.2
+          cargo machete
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # The same static gates for the crates outside the workspace (bdd/rust and
+  # fuzz), which `--workspace` does not reach. Kept a separate job so it runs in
+  # parallel and its heavier dependency builds do not slow the workspace lint.
+  lint-detached:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo install cargo-sort --locked --version 2.1.0
+          cargo install cargo-machete --locked --version 0.9.2
+      - name: lint bdd/rust
+        working-directory: bdd/rust
+        run: |
+          cargo fmt --all --check
+          cargo sort --check
+          cargo machete
+          cargo clippy --all-targets -- -D warnings
+      - name: lint fuzz
+        working-directory: fuzz
+        run: |
+          cargo fmt --all --check
+          cargo sort --check
+          cargo machete
+          cargo clippy -- -D warnings
+
+  # The whole workspace must build at every target with every feature on.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets --all-features
+
+  # Every advertised feature combination must lint clean on its own with
+  # `-D warnings`: `--all-features` hides a feature-gated module leaking into an
+  # always-built one, and it also hides code that is dead under a smaller feature
+  # set (e.g. a helper whose only callers are behind `kv`/`query`). `cargo check`
+  # only prints such warnings, so each combination is linted with clippy and
+  # warnings are denied.
+  wire-feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--no-default-features --features cbor"
+          - "--no-default-features --features codecs"
+          - "--no-default-features --features fixtures"
+          - "--no-default-features --features builders"
+          - "--no-default-features --features http-client"
+          - "--no-default-features --features bson"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p laser-wire ${{ matrix.features }} -- -D warnings
+
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--no-default-features --features streaming"
+          - "--no-default-features --features agent"
+          - "--no-default-features --features query"
+          - "--no-default-features --features kv"
+          - "--no-default-features --features fork"
+          - "--no-default-features --features graph"
+          - "--no-default-features --features projections"
+          - "--no-default-features --features watch"
+          - "--no-default-features --features runs"
+          - "--no-default-features --features rbac"
+          - "--no-default-features --features schema-codecs"
+          - "--no-default-features --features managed"
+          - "--no-default-features --features a2a-bridge"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p laser-sdk ${{ matrix.features }} -- -D warnings
+
+  # The gate that makes the wasm guarantee real: the wire crate's portable
+  # surface must compile for wasm32-unknown-unknown. Omits `bson` (native-only).
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo check -p laser-wire --target wasm32-unknown-unknown
+          --no-default-features --features cbor,codecs,fixtures,builders,http-client
+
+  # Dependency policy: the wire crate's portable graph bans iggy, tokio, bytes,
+  # ulid, dashmap, tracing, and getrandom. The whole workspace is scanned for
+  # vulnerability and unmaintained advisories.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo deny
+        run: |
+          cargo install cargo-deny --locked --version 0.19.8
+          cargo deny --manifest-path wire/Cargo.toml --target wasm32-unknown-unknown \
+            --no-default-features --features cbor,codecs,fixtures,builders,http-client \
+            check --config deny-wire.toml bans
+      - run: cargo deny check advisories
+
+  # All cargo tests: unit plus wire fixtures/robustness with every additive
+  # feature, the VSR fork-backed integration suite, then doctests. In the
+  # wire-release and wire-break modes the integration suite skips (its matching
+  # server release does not exist yet) while every server-free test still runs.
+  test:
+    needs: [flags]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+      - name: Install Iggy runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhwloc15
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - if: needs.flags.outputs.server_tests == 'run'
+        run: cargo test --workspace --all-features
+      - if: needs.flags.outputs.server_tests == 'run'
+        run: cargo test -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
+      - name: Server-free tests only (wire release or wire-break change)
+        if: needs.flags.outputs.server_tests == 'skip'
+        run: |
+          cargo test -p laser-wire --all-features
+          cargo test -p laser-sdk --all-features --lib --test signature_interop
+      # Doctests are excluded by `clippy --all-targets` and by a default-feature
+      # `cargo test`, so a `///` example behind a non-default feature would never
+      # compile without this explicit gate.
+      - run: cargo test --workspace --all-features --doc
+
+  # Coverage-guided fuzzing of the wire decode surface, bounded per target. The
+  # in-tree robustness suite (run by `test`) covers the same entry points every
+  # run. This is the deeper, nightly-only pass.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fuzz
+        run: |
+          cargo install cargo-fuzz --locked --version 0.13.2
+          cd fuzz
+          cargo +nightly fuzz run frame_decode -- -max_total_time=30
+          cargo +nightly fuzz run decode_envelope -- -max_total_time=30
+
+  # Cross-SDK BDD conformance: the Rust reference runner executes the shared
+  # Gherkin scenarios against the released VSR-only Iggy fork.
+  # Query DSL semantics run through the pure reference engine, with no managed backend.
+  bdd:
+    needs: [flags]
+    if: needs.flags.outputs.server_tests == 'run'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+      - name: Install Iggy runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhwloc15
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: BDD scenarios (Rust runner)
+        working-directory: bdd/rust
+        run: cargo test
+
+  # One aggregate gate so branch protection requires a single check, not every
+  # job and matrix leg. Runs after all of them and fails if any did not succeed.
+  ci-rust-complete:
+    name: ci-rust-complete
+    if: always()
+    needs:
+      - flags
+      - lint
+      - lint-detached
+      - build
+      - wire-feature-matrix
+      - feature-matrix
+      - wasm
+      - deny
+      - test
+      - fuzz
+      - bdd
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every required job result
+        env:
+          SERVER_TESTS: ${{ needs.flags.outputs.server_tests }}
+          FLAGS_RESULT: ${{ needs.flags.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          LINT_DETACHED_RESULT: ${{ needs['lint-detached'].result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          WIRE_FEATURE_MATRIX_RESULT: ${{ needs['wire-feature-matrix'].result }}
+          FEATURE_MATRIX_RESULT: ${{ needs['feature-matrix'].result }}
+          WASM_RESULT: ${{ needs.wasm.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
+          BDD_RESULT: ${{ needs.bdd.result }}
+        run: |
+          for result in \
+            "${FLAGS_RESULT}" \
+            "${LINT_RESULT}" \
+            "${LINT_DETACHED_RESULT}" \
+            "${BUILD_RESULT}" \
+            "${WIRE_FEATURE_MATRIX_RESULT}" \
+            "${FEATURE_MATRIX_RESULT}" \
+            "${WASM_RESULT}" \
+            "${DENY_RESULT}" \
+            "${TEST_RESULT}" \
+            "${FUZZ_RESULT}"
+          do
+            if [[ "${result}" != success ]]; then
+              echo "required CI job concluded ${result}" >&2
+              exit 1
+            fi
+          done
+
+          expected_bdd=success
+          if [[ "${SERVER_TESTS}" == skip ]]; then
+            expected_bdd=skipped
+          fi
+          if [[ "${BDD_RESULT}" != "${expected_bdd}" ]]; then
+            echo "BDD concluded ${BDD_RESULT}, expected ${expected_bdd}" >&2
+            exit 1
+          fi
+
+  # The wire-only release lane: a `wire-v*` tag publishes `laser-wire` alone
+  # behind every server-free gate, so a breaking wire change can ship the
+  # contract crate first and the matching server release can build against it.
+  publish-wire:
+    name: publish-wire
+    if: >-
+      always() &&
+      startsWith(github.ref, 'refs/tags/wire-v') &&
+      needs.ci-rust-complete.result == 'success'
+    needs:
+      - ci-rust-complete
+    runs-on: ubuntu-latest
+    environment: crates
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+
+      - name: Validate release tag
+        run: |
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "laser-wire") | .version'
+          )"
+          expected_tag="wire-v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match ${expected_tag}" >&2
+            exit 1
+          fi
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish laser-wire if missing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#wire-v}"
+          index_url="https://index.crates.io/la/se/laser-wire"
+          if curl --fail --silent "${index_url}" |
+            grep --fixed-strings "\"vers\":\"${version}\"" >/dev/null; then
+            echo "laser-wire ${version} is already published, skipping"
+            exit 0
+          fi
+          cargo publish -p laser-wire --locked
+
+  publish-sdk:
+    name: publish-sdk
+    if: >-
+      always() &&
+      startsWith(github.ref, 'refs/tags/rust-v') &&
+      needs.ci-rust-complete.result == 'success'
+    needs:
+      - ci-rust-complete
+    runs-on: ubuntu-latest
+    environment: crates
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+
+      - name: Validate release tag
+        run: |
+          mapfile -t versions < <(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "laser-wire" or .name == "laser-sdk") | .version' |
+              sort -u
+          )
+          if [[ "${#versions[@]}" -ne 1 ]]; then
+            echo "laser-wire and laser-sdk must have one shared version" >&2
+            printf '%s\n' "${versions[@]}" >&2
+            exit 1
+          fi
+          expected_tag="rust-v${versions[0]}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match ${expected_tag}" >&2
+            exit 1
+          fi
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish laser-wire if missing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#rust-v}"
+          index_url="https://index.crates.io/la/se/laser-wire"
+          if curl --fail --silent "${index_url}" |
+            grep --fixed-strings "\"vers\":\"${version}\"" >/dev/null; then
+            echo "laser-wire ${version} is already published; skipping"
+            exit 0
+          fi
+          cargo publish -p laser-wire --locked
+
+      - name: Wait for laser-wire index entry
+        run: |
+          version="${GITHUB_REF_NAME#rust-v}"
+          index_url="https://index.crates.io/la/se/laser-wire"
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent "${index_url}" |
+              grep --fixed-strings "\"vers\":\"${version}\"" >/dev/null; then
+              echo "laser-wire ${version} is available in the crates.io index"
+              exit 0
+            fi
+            echo "waiting for laser-wire ${version} (${attempt}/60)"
+            sleep 10
+          done
+          echo "laser-wire ${version} did not reach the crates.io index" >&2
+          exit 1
+
+      - name: Publish laser-sdk if missing
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#rust-v}"
+          index_url="https://index.crates.io/la/se/laser-sdk"
+          if curl --fail --silent "${index_url}" |
+            grep --fixed-strings "\"vers\":\"${version}\"" >/dev/null; then
+            echo "laser-sdk ${version} is already published; skipping"
+            exit 0
+          fi
+          cargo publish -p laser-sdk --locked

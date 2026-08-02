@@ -1,0 +1,30 @@
+services:
+  iggy:
+    image: docker.io/laserdatainc/iggy-server:0.0.1
+    container_name: laser-iggy
+    restart: unless-stopped
+    init: true
+    environment:
+      IGGY_TCP_ADDRESS: 0.0.0.0:8090
+      IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+      IGGY_ROOT_USERNAME: iggy
+      IGGY_ROOT_PASSWORD: iggy
+      IGGY_QUIC_ENABLED: "false"
+      IGGY_WEBSOCKET_ENABLED: "false"
+      IGGY_SYSTEM_PATH: /var/lib/iggy
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - 127.0.0.1:8090:8090
+      - 127.0.0.1:3000:3000
+    volumes:
+      - iggy-data:/var/lib/iggy
+
+volumes:
+  iggy-data:

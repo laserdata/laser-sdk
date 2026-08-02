@@ -1,0 +1,13 @@
+# Multi-language BDD orchestration. Each runner starts the versioned native
+# Apache Iggy server and loads the same scenarios.
+
+services:
+  rust-bdd:
+    build:
+      context: ../..
+      dockerfile: bdd/rust/Dockerfile
+
+  typescript-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/typescript/Dockerfile

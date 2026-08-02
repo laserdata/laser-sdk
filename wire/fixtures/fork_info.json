@@ -1,0 +1,9 @@
+{
+  "fork_id": "agent-run-7",
+  "parent": "trunk",
+  "kind": "severed",
+  "user_id": 5,
+  "status": "open",
+  "created_at_micros": 1717171717000000,
+  "row_count": 0
+}

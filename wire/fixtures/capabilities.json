@@ -1,0 +1,48 @@
+{
+  "managed": true,
+  "query": {
+    "available": true,
+    "projections": true,
+    "schemas": true,
+    "consistency": "read_your_writes",
+    "keyword": false
+  },
+  "kv": {
+    "available": true,
+    "cas": true,
+    "cas_fenced": false
+  },
+  "graph": false,
+  "fork": true,
+  "agent_workflow": false,
+  "watch": false,
+  "authz": false,
+  "versions": {
+    "query": 1,
+    "control": 1,
+    "kv": 1,
+    "fork": 1
+  },
+  "backends": [
+    {
+      "id": "embedded",
+      "kind": "embedded",
+      "capabilities": [
+        "ingest",
+        "query",
+        "vector_search"
+      ]
+    },
+    {
+      "id": "warehouse",
+      "kind": "columnar",
+      "label": "Analytics warehouse",
+      "version": "2.1.0",
+      "capabilities": [
+        "ingest",
+        "query",
+        "percentile"
+      ]
+    }
+  ]
+}

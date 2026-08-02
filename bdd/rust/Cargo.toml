@@ -1,0 +1,29 @@
+[package]
+name = "laser-bdd"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Cross-SDK BDD conformance runner (Rust reference) for the laser-sdk wire and behavior contract."
+
+[package.metadata.cargo-machete]
+ignored = ["bytes", "tempfile"]
+
+# Detached from the parent workspace: this is the Rust subdir of the
+# cross-language bdd/ harness and resolves laser-sdk by path.
+[workspace]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+cucumber = "0.23"
+iggy = { version = "=0.10.3-edge.3", features = ["vsr"] }
+laser-sdk = { path = "../../sdk", features = ["a2a-bridge", "agent", "agui", "managed", "streaming"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# cucumber brings its own harness, so the test target opts out of libtest.
+[[test]]
+name = "open"
+path = "tests/open.rs"
+harness = false
