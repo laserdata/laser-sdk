@@ -4,9 +4,7 @@
 
 **One connection replaces four systems.** The stream you already publish to becomes the store you query, the state you coordinate on, and the fabric your agents discover, route, and reason over. No second database, no cache, no orchestration server, nothing to keep in sync. The **log is the single source of truth**, and every other surface is a read model you can rebuild from offset 0. A support task, say, streams its messages, keeps its working memory, and resolves the dependencies between them, all in one place.
 
-> **Initial release (`0.0.1`).** The wire contract and public API are versioned from this release. Future releases may include breaking changes under semantic versioning.
-
-**Rust** is the reference SDK. **Python** ([`foreign/python`](foreign/python/README.md)) binds the same Rust core. **TypeScript** ([`foreign/typescript`](foreign/typescript/README.md)) is a native Node client checked against the same fixture and BDD corpus. All three SDKs are at `0.0.1`. The standalone [`laser-wire`](wire/README.md) crate owns the language-neutral contract.
+**Rust** ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) is the reference SDK. **Python** ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) binds the same Rust core. **TypeScript** ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) is a native Node client checked against the same fixture and BDD corpus. The standalone [`laser-wire` crate](https://crates.io/crates/laser-wire) ([source](wire/README.md)) owns the language-neutral contract.
 
 > **Run locally with [Laser Stack](https://github.com/laserdata/laser-stack).** It runs the LaserData Apache Iggy fork and `laser-plane` as a complete local development stack, so every Laser SDK surface, including managed queries, can be developed, tested, and deployed without LaserData Cloud. Run `./scripts/up` from the Laser Stack checkout to start the infrastructure and receive `LASER_CONNECTION_STRING`. Laser Stack does not include proprietary LaserData Cloud features such as the Stream and Data UI.
 
@@ -16,16 +14,33 @@ After the focused examples, [Photon Market](https://github.com/laserdata/laser-e
 
 ## Quick start
 
-Start Laser Stack for the complete local SDK surface, or a VSR-enabled Apache Iggy server for streaming-only development. Laser SDK always uses VSR and has no protocol flag.
+Choose where to run:
 
-**Rust** (`laser-sdk = "=0.0.1"`)
+- **LaserData Cloud:** [create a Free deployment](https://laserdata.cloud), copy its connection string from the Console's Credentials tab, and export it as `LASER_CONNECTION_STRING`.
+- **Laser Stack:** run `./scripts/up` in the [Laser Stack](https://github.com/laserdata/laser-stack) checkout. It starts the complete local SDK surface and prints a copyable `LASER_CONNECTION_STRING` export.
+- **Apache Iggy:** use a VSR-enabled server for the open streaming path, then set `LASER_CONNECTION_STRING` to its connection string.
+
+The repository examples read `LASER_CONNECTION_STRING`. Export it once or set it for one command:
+
+```sh
+export LASER_CONNECTION_STRING='<connection string>'
+LASER_CONNECTION_STRING='<connection string>' cargo run --example log
+```
+
+The snippets below connect to local Apache Iggy. `:8090` is the default TCP port and can be omitted. Laser SDK always uses VSR and has no protocol flag.
+
+**Rust** ([crates.io](https://crates.io/crates/laser-sdk))
+
+```sh
+cargo add laser-sdk
+```
 
 ```rust,no_run
 use laser_sdk::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), LaserError> {
-    let laser = Laser::connect("iggy:iggy@127.0.0.1:8090").await?;
+    let laser = Laser::connect("iggy:iggy@127.0.0.1").await?;
     let topic = laser.stream("telemetry").topic("inferences");
     topic.ensure(4).await?;
     topic.publish().json(&serde_json::json!({ "latency_ms": 42 }))?.send().await?;
@@ -36,14 +51,18 @@ async fn main() -> Result<(), LaserError> {
 }
 ```
 
-**Python** (`pip install laser-sdk`)
+**Python** ([PyPI](https://pypi.org/project/laser-sdk/))
+
+```sh
+pip install laser-sdk
+```
 
 ```python
 import asyncio
 import laser_sdk as ls
 
 async def main():
-    laser = await ls.Laser.connect("iggy:iggy@127.0.0.1:8090")
+    laser = await ls.Laser.connect("iggy:iggy@127.0.0.1")
     topic = laser.stream("telemetry").topic("inferences")
     await topic.ensure(partitions=4)
     await topic.publish().json({"latency_ms": 42}).send()
@@ -54,12 +73,16 @@ async def main():
 asyncio.run(main())
 ```
 
-**TypeScript** (`npm install @laserdata/laser-sdk`)
+**TypeScript** ([npm](https://www.npmjs.com/package/@laserdata/laser-sdk))
+
+```sh
+npm install @laserdata/laser-sdk
+```
 
 ```ts
 import { Laser } from "@laserdata/laser-sdk"
 
-await using laser = await Laser.connect("iggy:iggy@127.0.0.1:8090")
+await using laser = await Laser.connect("iggy:iggy@127.0.0.1")
 const topic = laser.stream("telemetry").topic("inferences")
 await topic.ensure(4)
 await topic.publish().json({ latency_ms: 42 }).send()
@@ -92,7 +115,7 @@ Learn the pattern once and the whole platform reads the same way. In Rust:
 ```rust,ignore
 use std::time::Duration;
 
-let laser = Laser::connect("iggy:iggy@127.0.0.1:8090").await?;
+let laser = Laser::connect("iggy:iggy@127.0.0.1").await?;
 let orders = laser.stream("app").topic("orders");
 let audit = laser.stream("audit").topic("events");
 
@@ -140,7 +163,7 @@ let page = laser.runs().list().state(AgentRunState::Running).fetch().await?;
 The same grammar in Python, one-to-one with the Rust accessors:
 
 ```python
-laser = await ls.Laser.connect("iggy:iggy@127.0.0.1:8090")
+laser = await ls.Laser.connect("iggy:iggy@127.0.0.1")
 orders = laser.stream("app").topic("orders")
 audit = laser.stream("audit").topic("events")
 
@@ -168,7 +191,7 @@ run = await laser.runs().submit("refund", task)
 And the same grammar in TypeScript, camelCase over the identical accessors:
 
 ```ts
-const laser = await Laser.connect("iggy:iggy@127.0.0.1:8090");
+const laser = await Laser.connect("iggy:iggy@127.0.0.1");
 const orders = laser.stream("app").topic("orders");
 const audit = laser.stream("audit").topic("events");
 
