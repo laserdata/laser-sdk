@@ -9,6 +9,7 @@ import {
 } from "apache-iggy"
 import type { ClientConfig, ClientCredentials, RawClient } from "apache-iggy"
 import { readFileSync } from "node:fs"
+import { isIP } from "node:net"
 import { ConfigError, TransportError } from "../client/errors.js"
 import { LASERDATA_ROOT_CA } from "../client/laserdata-ca.js"
 import type { PollingStrategy } from "../stream/polling-strategy.js"
@@ -453,6 +454,7 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
         options: {
           port: parsed.port,
           host: parsed.host,
+          ...(isIP(parsed.host) === 0 ? { servername: parsed.host } : {}),
           ...(parsed.ca !== undefined ? { ca: parsed.ca } : {})
         },
         credentials: parsed.credentials,
@@ -469,7 +471,11 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
 
   let raw: RawClient | undefined
   try {
-    raw = getRawClient(config)
+    raw = getVsrRawClient(config)
+  } catch (cause) {
+    throw new ConfigError("invalid Apache Iggy client configuration", { cause })
+  }
+  try {
     const connection = (raw as RawClient & RawClientConnection).connection
     const client = new SimpleClient(raw)
     await new Promise<void>((resolve, reject) => {
@@ -485,11 +491,32 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
     connection.on("error", () => undefined)
     return { client, raw }
   } catch (cause) {
-    raw?.destroy()
-    throw new TransportError(`failed to connect to ${parsed.host}:${String(parsed.port)}`, false, {
+    raw.destroy()
+    throw new TransportError(`failed to connect to ${parsed.host}:${String(parsed.port)}`, true, {
       cause
     })
   }
+}
+
+function getVsrRawClient(config: ClientConfig): RawClient {
+  if (config.transport !== "TLS") return getRawClient(config)
+
+  // apache-iggy@0.8.1-edge.3 has a stale normalization guard for VSR over TLS.
+  // Its TLS socket and VSR framing are transport-independent once normalized.
+  let firstTransportRead = true
+  const compatibleConfig = { ...config }
+  Object.defineProperty(compatibleConfig, "transport", {
+    configurable: true,
+    enumerable: true,
+    get: () => {
+      if (firstTransportRead) {
+        firstTransportRead = false
+        return "TCP"
+      }
+      return "TLS"
+    }
+  })
+  return getRawClient(compatibleConfig)
 }
 
 function serverResponseError(error: unknown): Error | undefined {
@@ -517,6 +544,7 @@ async function connectWithRetry(parsed: ParsedConnectionString): Promise<Connect
     try {
       return await connectSimpleClient(parsed)
     } catch (error) {
+      if (error instanceof ConfigError) throw error
       lastError = error
       if (serverResponseError(error) !== undefined) {
         break

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
+import { createServer } from "node:net"
 import { test } from "node:test"
+import { TransportError } from "../../src/client/errors.js"
 import { LASERDATA_ROOT_CA } from "../../src/client/laserdata-ca.js"
-import { parseConnectionString } from "../../src/iggy/apache-iggy.js"
+import { ApacheIggyTransport, parseConnectionString } from "../../src/iggy/apache-iggy.js"
 
 void test("given_the_sdk_certificate_when_compared_with_typescript_then_should_be_byte_identical", () => {
   const rustCertificate = readFileSync("../../sdk/certs/laserdata.crt", "utf8")
@@ -20,6 +22,31 @@ void test("given_a_laserdata_host_when_parsed_then_should_enable_tls_with_the_em
     assert.equal(parsed.tls, true)
     assert.equal(parsed.ca, LASERDATA_ROOT_CA)
     assert.deepEqual(parsed.credentials, { token: "token" })
+  }
+})
+
+void test("given_vsr_over_tls_when_connecting_then_should_reach_the_socket", async () => {
+  const server = createServer((socket) => socket.destroy())
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const address = server.address()
+  assert(address !== null && typeof address === "object")
+  try {
+    await assert.rejects(
+      ApacheIggyTransport.connect(
+        `iggy://token@127.0.0.1:${String(address.port)}?tls=true&reconnection_retries=0`
+      ),
+      (error: unknown) => error instanceof TransportError
+    )
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error === undefined) resolve()
+        else reject(error)
+      })
+    })
   }
 })
 
