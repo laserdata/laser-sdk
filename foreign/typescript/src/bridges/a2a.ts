@@ -20,7 +20,7 @@ import { bridgeHopMetadata, enterBridge } from "./hops.js"
 export const A2A_PROTOCOL_VERSION = "1.0"
 export const A2A_JSONRPC_BINDING = "JSONRPC"
 export const A2A_APP_ERROR_CODE = -32_000
-export const SDK_VERSION = "0.0.1"
+export const SDK_VERSION = "0.0.2"
 
 export const A2aMethod = {
   MessageSend: "SendMessage",

@@ -1,6 +1,6 @@
 {
   "name": "@laserdata/laser-sdk",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "LaserData SDK for TypeScript: an open data-platform SDK over Apache Iggy (typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with AGDX)",
   "type": "module",
   "main": "./dist/index.js",
