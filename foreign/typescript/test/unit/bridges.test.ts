@@ -127,3 +127,39 @@ void test("given_task_and_reasoning_envelopes_when_rendered_then_should_emit_agu
     ["RUN_STARTED", "REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END"]
   )
 })
+
+void test("given_a_proto_pointer_in_a_patch_when_applied_then_should_reject_and_not_pollute", () => {
+  const before = ({} as Record<string, unknown>)["polluted"]
+  assert.equal(before, undefined)
+  for (const path of ["/__proto__/polluted", "/constructor/polluted", "/prototype/polluted"]) {
+    assert.throws(
+      () => applyJsonPatch({ name: "state" }, [{ op: "add", path, value: true }]),
+      InvalidError,
+      `${path} must be refused`
+    )
+  }
+  assert.equal(
+    ({} as Record<string, unknown>)["polluted"],
+    undefined,
+    "Object.prototype must be untouched"
+  )
+})
+
+void test("given_a_nested_proto_pointer_in_a_patch_when_applied_then_should_reject", () => {
+  assert.throws(
+    () =>
+      applyJsonPatch({ nested: {} }, [
+        { op: "add", path: "/nested/__proto__/polluted", value: true }
+      ]),
+    InvalidError
+  )
+  assert.equal(({} as Record<string, unknown>)["polluted"], undefined)
+})
+
+void test("given_an_inherited_property_when_patched_then_should_not_count_as_existing", () => {
+  assert.throws(
+    () => applyJsonPatch({ nested: {} }, [{ op: "add", path: "/toString/x", value: 1 }]),
+    InvalidError,
+    "an inherited property must not satisfy the path-exists check"
+  )
+})

@@ -126,6 +126,11 @@ impl Laser {
     /// survives dedup while a double redrive of one capsule does not. Errors if
     /// the source stream/topic no longer exists or the record has aged out of
     /// the log's retention window.
+    ///
+    /// The capsule names its own source position, and any writer that can append
+    /// to the dead-letter topic can forge one. The redrive is therefore confined
+    /// to this connection's default stream: a capsule pointing anywhere else is
+    /// refused rather than copied into a stream the caller did not choose.
     pub async fn redrive_dead_letter(&self, capsule: &AgentDeadLetter) -> Result<(), LaserError> {
         let source = capsule.source;
         let stream = Identifier::numeric(source.stream_id)?;
@@ -141,6 +146,12 @@ impl Laser {
                 ))
             })?
             .name;
+        let expected = self.stream_required()?;
+        if stream_name != expected {
+            return Err(LaserError::Invalid(format!(
+                "dead-letter capsule names stream `{stream_name}`, outside this connection's stream `{expected}`"
+            )));
+        }
         let topic_name = self
             .client()
             .get_topic(&stream, &topic)
@@ -284,15 +295,16 @@ impl Laser {
     ) -> Result<AgentEnvelope, LaserError> {
         let deadline = Instant::now() + timeout;
         loop {
+            // Checked before the scan and on every branch: a busy reply topic
+            // keeps returning `More`, so testing the deadline only once caught
+            // up would let a flooded topic defer it forever.
+            if Instant::now() >= deadline {
+                return Err(LaserError::Timeout("the AGDX reply"));
+            }
             match reader.next_agdx_match(self.client(), correlation).await? {
                 ReplyScan::Found(envelope) => return Ok(*envelope),
                 ReplyScan::More => continue,
-                ReplyScan::CaughtUp => {
-                    if Instant::now() >= deadline {
-                        return Err(LaserError::Timeout("the AGDX reply"));
-                    }
-                    sleep(Duration::from_millis(50)).await;
-                }
+                ReplyScan::CaughtUp => sleep(Duration::from_millis(50)).await,
             }
         }
     }
@@ -300,25 +312,30 @@ impl Laser {
     /// One forward pass over `reply_topic` for the AGDX `response`/`error`
     /// carrying `correlation`: the answer if it has already landed, else `None`.
     /// A point lookup (no waiting), for the stateless A2A `tasks/get`.
+    /// The scan is bounded: this lookup is reachable from an unauthenticated
+    /// bridge request and starts at the topic's head, so an ever-growing reply
+    /// topic would otherwise turn one request into an unbounded read.
     #[cfg(feature = "a2a-bridge")]
     pub(crate) async fn find_agdx_reply(
         &self,
         reply_topic: AgentTopic<'_>,
         correlation: CorrelationId,
     ) -> Result<Option<AgentEnvelope>, LaserError> {
+        const MAX_LOOKUP_PASSES: usize = 32;
         let mut reader =
             AgentReplyReader::new(self.stream_required()?, reply_topic.as_identifier())?;
         #[cfg(feature = "sign")]
         {
             reader.verifier = self.registry_verifier();
         }
-        loop {
+        for _ in 0..MAX_LOOKUP_PASSES {
             match reader.next_agdx_match(self.client(), correlation).await? {
                 ReplyScan::Found(envelope) => return Ok(Some(*envelope)),
                 ReplyScan::More => continue,
                 ReplyScan::CaughtUp => return Ok(None),
             }
         }
+        Ok(None)
     }
 
     /// A fresh child conversation of `parent`, carrying its parent/root ids for causality.
@@ -551,7 +568,7 @@ impl AgentReplyReader {
     ) -> Result<Self, LaserError> {
         let mut reader = Self::new(stream, topic)?;
         let partitions = match client.get_topic(&reader.stream, &reader.topic).await? {
-            Some(details) => details.partitions_count,
+            Some(details) => crate::poll::bounded_partitions(details.partitions_count),
             // The topic does not exist yet: leave the reader unseeded (offsets at
             // zero), so once it is created the scan still finds the reply.
             None => return Ok(reader),
@@ -572,7 +589,7 @@ impl AgentReplyReader {
                 .await?;
             // Resume after the last existing record. An empty partition stays at 0.
             if let Some(last) = polled.messages.last() {
-                reader.offsets[partition as usize] = last.header.offset + 1;
+                reader.offsets[partition as usize] = last.header.offset.saturating_add(1);
             }
         }
         Ok(reader)

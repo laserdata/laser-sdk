@@ -162,7 +162,7 @@ impl ContextAssembler {
                     .client()
                     .get_topic(&stream, &topic_id)
                     .await?
-                    .map(|details| details.partitions_count);
+                    .map(|details| crate::poll::bounded_partitions(details.partitions_count));
                 Ok::<_, LaserError>((topic_idx, topic_id, count))
             });
         }
@@ -182,6 +182,18 @@ impl ContextAssembler {
             let start = self.from_offsets.get(&partition).copied().unwrap_or(0);
             drains.spawn(async move {
                 let consumer = Consumer::new(Identifier::named("laser-context-reader")?);
+                // Context selection keeps the most recent records, so a
+                // partition longer than the drain ceiling is read from a
+                // tail-anchored window rather than from its head.
+                let start = crate::poll::tail_anchored_offset(
+                    laser.client(),
+                    &stream,
+                    &topic_id,
+                    &consumer,
+                    partition,
+                    start,
+                )
+                .await?;
                 let batch = crate::poll::drain_partition(
                     laser.client(),
                     &stream,

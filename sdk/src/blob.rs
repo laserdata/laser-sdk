@@ -50,7 +50,20 @@ pub async fn check_in(
 pub async fn resolve_body(store: &dyn BlobStore, payload: &[u8]) -> Result<Vec<u8>, LaserError> {
     let capsule: BodyRef = decode_named(payload)
         .map_err(|error| LaserError::Codec(format!("decode body ref: {error}")))?;
+    // The capsule arrives off the log, so its reference is untrusted input to
+    // whatever store the caller supplied. Enforce the wire caps before handing
+    // it over.
+    capsule
+        .validate()
+        .map_err(|error| LaserError::Invalid(format!("body ref: {error}")))?;
     let payload = store.get(&capsule.reference).await?;
+    // The capsule states the size it externalized. A length that disagrees is
+    // already a failed claim check, caught before hashing the bytes.
+    if payload.len() as u64 != capsule.size_bytes {
+        return Err(LaserError::Integrity {
+            reference: capsule.reference,
+        });
+    }
     let digest: [u8; 32] = Sha256::digest(&payload).into();
     if digest.as_slice() != capsule.sha256.as_slice() {
         return Err(LaserError::Integrity {

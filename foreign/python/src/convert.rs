@@ -1,7 +1,7 @@
 use crate::errors::{CodecError, InvalidError};
 use laser_sdk::query::Value;
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyString};
+use pyo3::types::{PyByteArray, PyBytes, PyFloat, PyInt, PyList, PyString, PyTuple};
 use std::time::Duration;
 
 pub(crate) fn duration_seconds(value: f64, name: &str) -> PyResult<Duration> {
@@ -12,8 +12,8 @@ pub(crate) fn duration_seconds(value: f64, name: &str) -> PyResult<Duration> {
     })
 }
 
-// Convert a Python scalar (or list of scalars) into a query `Value`. `bool` is
-// checked before `int` because Python's `bool` is an `int` subclass.
+// Convert a Python scalar (or list/tuple of scalars) into a query `Value`.
+// `bool` is checked before `int` because Python's `bool` is an `int` subclass.
 pub(crate) fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
@@ -21,21 +21,31 @@ pub(crate) fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(value) = obj.extract::<bool>() {
         return Ok(Value::Bool(value));
     }
-    if let Ok(value) = obj.extract::<i64>() {
-        return Ok(Value::Int(value));
+    // An `int` is matched on its concrete type, so one too large for `i64` or
+    // `u64` raises instead of falling through to the float branch, where
+    // `__float__` would silently turn `2**64` into an imprecise comparison.
+    if obj.is_instance_of::<PyInt>() {
+        if let Ok(value) = obj.extract::<i64>() {
+            return Ok(Value::Int(value));
+        }
+        if let Ok(value) = obj.extract::<u64>() {
+            return Ok(Value::Uint(value));
+        }
+        return Err(InvalidError::new_err(
+            "query value integer is out of range: must fit a signed or unsigned 64-bit integer",
+        ));
     }
-    if let Ok(value) = obj.extract::<u64>() {
-        return Ok(Value::Uint(value));
+    if obj.is_instance_of::<PyFloat>() {
+        return Ok(Value::Float(obj.extract::<f64>()?));
     }
-    if let Ok(value) = obj.extract::<f64>() {
-        return Ok(Value::Float(value));
+    if let Ok(text) = obj.cast::<PyString>() {
+        return Ok(Value::Str(text.to_str()?.to_owned()));
     }
-    if let Ok(value) = obj.extract::<String>() {
-        return Ok(Value::Str(value));
-    }
-    if let Ok(items) = obj.try_iter() {
+    // Only real sequences become a list. A `dict` would otherwise fold to its
+    // keys and `bytes` to a list of integers, both silently.
+    if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
         let mut list = Vec::new();
-        for item in items {
+        for item in obj.try_iter()? {
             list.push(py_to_value(&item?)?);
         }
         return Ok(Value::List(list));

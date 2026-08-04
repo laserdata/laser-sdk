@@ -469,6 +469,24 @@ impl LaserError {
     }
 }
 
+// A remote-safe rendering of a failure, for the bridge HTTP routers. The
+// `Display` text names streams, topics, hosts, and transport detail, which an
+// unauthenticated JSON-RPC caller has no business seeing, so the wire carries
+// only the classification and the detail stays in the local log.
+#[cfg(any(feature = "a2a-http", feature = "mcp-http"))]
+pub(crate) fn public_error_message(error: &LaserError) -> &'static str {
+    match error.code() {
+        ResultCode::InvalidArgument => "invalid request",
+        ResultCode::Unsupported => "unsupported operation",
+        ResultCode::Conflict => "conflict",
+        ResultCode::Unauthenticated => "unauthenticated",
+        ResultCode::Forbidden => "forbidden",
+        ResultCode::StepUpRequired => "step-up authorization required",
+        ResultCode::NotFound => "not found",
+        _ => "internal error",
+    }
+}
+
 // The `Unsupported` display: a surface refusal reads `unsupported: kv: ...`,
 // a feature refusal names the capability that would serve it and where, so
 // the fix ships inside the message.

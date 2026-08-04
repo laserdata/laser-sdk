@@ -565,25 +565,33 @@ async fn handle_rpc(
                 result: Some(value),
                 error: None,
             },
-            Err(error) => JsonRpcResponse {
+            Err(error) => {
+                tracing::warn!(error = %error, "A2A reply serialization failed");
+                JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION,
+                    id: request.id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: APP_ERROR_CODE,
+                        message: "internal error".to_owned(),
+                    }),
+                }
+            }
+        },
+        Err(error) => {
+            // The detail stays local: `Display` names streams, topics, and
+            // transport state that an unauthenticated caller must not see.
+            tracing::warn!(error = %error, method = %request.method, "A2A request failed");
+            JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION,
                 id: request.id,
                 result: None,
                 error: Some(JsonRpcError {
                     code: APP_ERROR_CODE,
-                    message: format!("serialization failure: {error}"),
+                    message: crate::error::public_error_message(&error).to_owned(),
                 }),
-            },
-        },
-        Err(error) => JsonRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            id: request.id,
-            result: None,
-            error: Some(JsonRpcError {
-                code: APP_ERROR_CODE,
-                message: error.to_string(),
-            }),
-        },
+            }
+        }
     };
     axum::Json(response)
 }

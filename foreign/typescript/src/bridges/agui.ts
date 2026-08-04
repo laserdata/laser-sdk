@@ -54,6 +54,12 @@ function parseJson(bytes: Uint8Array, operation: string): unknown {
   }
 }
 
+// Tokens that address an object's internals rather than its data. A patch is
+// peer-supplied, so `/__proto__/...` must never reach a property write: `in`
+// resolves it on every object and the assignment would land on
+// `Object.prototype`, polluting every object in the process.
+const FORBIDDEN_TOKENS = new Set(["__proto__", "constructor", "prototype"])
+
 function decodePointer(path: string): readonly string[] {
   if (path === "") return []
   if (!path.startsWith("/")) throw new InvalidError(`invalid JSON Pointer \`${path}\``)
@@ -62,7 +68,11 @@ function decodePointer(path: string): readonly string[] {
     .split("/")
     .map((part) => {
       if (/~(?:[^01]|$)/.test(part)) throw new InvalidError(`invalid JSON Pointer \`${path}\``)
-      return part.replaceAll("~1", "/").replaceAll("~0", "~")
+      const token = part.replaceAll("~1", "/").replaceAll("~0", "~")
+      if (FORBIDDEN_TOKENS.has(token)) {
+        throw new InvalidError(`JSON Patch path \`${path}\` addresses a reserved property`)
+      }
+      return token
     })
 }
 
@@ -94,7 +104,9 @@ function parentAt(document: unknown, tokens: readonly string[], path: string): [
       current = current[arrayIndex(token, current.length, false)]
     } else {
       const object = objectOf(current, path)
-      if (!(token in object)) throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
+      if (!Object.hasOwn(object, token)) {
+        throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
+      }
       current = object[token]
     }
   }
@@ -108,7 +120,9 @@ function valueAt(document: unknown, path: string): unknown {
     if (Array.isArray(current)) current = current[arrayIndex(token, current.length, false)]
     else {
       const object = objectOf(current, path)
-      if (!(token in object)) throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
+      if (!Object.hasOwn(object, token)) {
+        throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
+      }
       current = object[token]
     }
   }
@@ -138,7 +152,9 @@ function removeValue(
     return { document, value }
   }
   const object = objectOf(parent, path)
-  if (!(token in object)) throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
+  if (!Object.hasOwn(object, token)) {
+    throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
+  }
   const value = object[token]
   Reflect.deleteProperty(object, token)
   return { document, value }
@@ -164,7 +180,7 @@ function equalJson(left: unknown, right: unknown): boolean {
     const keys = Object.keys(a)
     return (
       keys.length === Object.keys(b).length &&
-      keys.every((key) => key in b && equalJson(a[key], b[key]))
+      keys.every((key) => Object.hasOwn(b, key) && equalJson(a[key], b[key]))
     )
   }
   return false

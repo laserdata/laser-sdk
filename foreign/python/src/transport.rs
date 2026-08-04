@@ -314,14 +314,22 @@ fn header_value(value: &Bound<'_, PyAny>) -> PyResult<HeaderValue> {
     if let Ok(value) = value.extract::<bool>() {
         return Ok(value.into());
     }
-    if let Ok(value) = value.extract::<u64>() {
-        return Ok(value.into());
+    // Matched on the concrete type so an `int` too large for 64 bits raises
+    // rather than falling through to the float branch and being stamped as a
+    // lossy `Float64` header.
+    if value.is_instance_of::<pyo3::types::PyInt>() {
+        if let Ok(unsigned) = value.extract::<u64>() {
+            return Ok(unsigned.into());
+        }
+        if let Ok(signed) = value.extract::<i64>() {
+            return Ok(signed.into());
+        }
+        return Err(InvalidError::new_err(
+            "header integer is out of range: must fit a signed or unsigned 64-bit integer",
+        ));
     }
-    if let Ok(value) = value.extract::<i64>() {
-        return Ok(value.into());
-    }
-    if let Ok(value) = value.extract::<f64>() {
-        return Ok(value.into());
+    if value.is_instance_of::<pyo3::types::PyFloat>() {
+        return Ok(value.extract::<f64>()?.into());
     }
     if let Ok(value) = value.extract::<String>() {
         return HeaderValue::try_from(value).map_err(transport_error);

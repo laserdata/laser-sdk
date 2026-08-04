@@ -1328,18 +1328,35 @@ fn is_laserdata_host(host: &str) -> bool {
         || host.ends_with(".laserdata.com")
 }
 
+// Everything after the scheme, where the authority begins.
+fn after_scheme(connection_string: &str) -> &str {
+    connection_string
+        .split_once("://")
+        .map_or(connection_string, |(_, rest)| rest)
+}
+
+// Byte offset where the authority begins: everything before it is userinfo.
+// The userinfo terminator is located before the `/` and `?` delimiters are
+// applied, because a generated password routinely contains `/` and splitting
+// first would truncate the authority and hide the real host. The search is
+// bounded to the pre-query region so an `@` inside a query value cannot be
+// mistaken for the terminator. A literal `?` in a password must be
+// percent-encoded.
+fn authority_start(after_scheme: &str) -> usize {
+    let before_query = after_scheme
+        .find('?')
+        .map_or(after_scheme, |query| &after_scheme[..query]);
+    before_query.rfind('@').map_or(0, |at| at + 1)
+}
+
 // Strip scheme, userinfo, and port from a connection string's authority.
 fn host_of(connection_string: &str) -> &str {
-    let after_scheme = connection_string
-        .split_once("://")
-        .map_or(connection_string, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?'])
+    let after_scheme = after_scheme(connection_string);
+    let host_and_port = &after_scheme[authority_start(after_scheme)..];
+    let authority = host_and_port
+        .split(['/', '?', '#'])
         .next()
-        .unwrap_or(after_scheme);
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host_and_port)| host_and_port);
+        .unwrap_or(host_and_port);
     if let Some(bracketed) = authority.strip_prefix('[')
         && let Some(closing) = bracketed.find(']')
     {
@@ -1350,8 +1367,41 @@ fn host_of(connection_string: &str) -> &str {
         .map_or(authority, |(host, _)| host)
 }
 
+// The query string, located after the authority so a `/` inside userinfo does
+// not shift the split. `None` when the connection string carries no `?`.
+fn query_of(connection_string: &str) -> Option<&str> {
+    let after_scheme = after_scheme(connection_string);
+    let authority = &after_scheme[authority_start(after_scheme)..];
+    authority.split_once('?').map(|(_, query)| query)
+}
+
+// True when the connection string already carries this query parameter. Matched
+// key by key rather than by substring, so credential content cannot suppress
+// TLS by containing a parameter name.
+fn has_query_param(connection_string: &str, key: &str) -> bool {
+    query_of(connection_string).is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+            name.eq_ignore_ascii_case(key)
+        })
+    })
+}
+
+// An opt-out flag is read by value. Bare presence is not enough:
+// `LASER_NO_TLS=0` and `LASER_NO_TLS=false` must not disable TLS.
+fn flag_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| flag_value_enabled(&value))
+}
+
 fn resolve_tls(connection_string: String) -> Result<String, LaserError> {
-    if std::env::var("LASER_NO_TLS").is_ok() || connection_string.contains("tls_ca_file=") {
+    if env_flag_enabled("LASER_NO_TLS") || has_query_param(&connection_string, "tls_ca_file") {
         return Ok(connection_string);
     }
     if !is_laserdata_host(host_of(&connection_string)) {
@@ -1359,8 +1409,12 @@ fn resolve_tls(connection_string: String) -> Result<String, LaserError> {
     }
     let cert_path = resolve_cert_path()?;
     let mut with_tls = connection_string;
-    if !with_tls.contains("tls=") {
-        let separator = if with_tls.contains('?') { '&' } else { '?' };
+    if !has_query_param(&with_tls, "tls") {
+        let separator = if query_of(&with_tls).is_some() {
+            '&'
+        } else {
+            '?'
+        };
         with_tls = format!("{with_tls}{separator}tls=true");
     }
     Ok(format!("{with_tls}&tls_ca_file={}", cert_path.display()))
@@ -1372,18 +1426,98 @@ fn resolve_tls(connection_string: String) -> Result<String, LaserError> {
 // rotated CA is always reachable through that same override.
 static PROD_CERT: &[u8] = include_bytes!("../certs/laserdata.crt");
 
+// A private, user-owned directory to cache the bundled CA in. A world-writable
+// shared directory is never used with a fixed name: another local user could
+// pre-create the file and become the trust anchor for every Cloud connection.
+fn cert_cache_dir() -> Result<std::path::PathBuf, LaserError> {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base =
+        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Library/Caches"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        });
+    let base = base.ok_or(LaserError::Config(
+        "no per-user cache directory to store the LaserData CA in: set LASER_TLS_CERT to a CA file path",
+    ))?;
+    Ok(base.join("laser-sdk"))
+}
+
+// Restrict a directory to its owner. A cache directory that cannot be made
+// private is refused rather than used, so the CA is never read from a path
+// another local user can write.
+#[cfg(unix)]
+fn restrict_to_owner(dir: &std::path::Path) -> Result<(), LaserError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| LaserError::Invalid(format!("restrict CA cache directory: {error}")))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_dir: &std::path::Path) -> Result<(), LaserError> {
+    Ok(())
+}
+
+// Write the bundled CA to a fresh owner-only file, then rename it over the
+// target. A reader never observes a partial certificate, and a pre-planted file
+// or symlink at the target is replaced rather than followed.
+fn write_cert(dir: &std::path::Path, path: &std::path::Path) -> Result<(), LaserError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // The scratch name is unique per process and per attempt, so concurrent
+    // installs never collide on it.
+    static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(
+        "laserdata.crt.{}.{attempt}.tmp",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| LaserError::Invalid(format!("create CA cert: {error}")))?;
+    file.write_all(PROD_CERT)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| LaserError::Invalid(format!("write CA cert: {error}")))?;
+    drop(file);
+    std::fs::rename(&temp, path)
+        .map_err(|error| LaserError::Invalid(format!("install CA cert: {error}")))
+}
+
+// Cache the bundled CA in `dir` and return its path. The cached file is reused
+// only when its bytes are exactly the bundled CA, so a rotated certificate is
+// rewritten instead of going stale and a planted trust anchor is replaced
+// instead of being trusted.
+fn install_cert(dir: &std::path::Path) -> Result<std::path::PathBuf, LaserError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| LaserError::Invalid(format!("create CA cache directory: {error}")))?;
+    restrict_to_owner(dir)?;
+    let path = dir.join("laserdata.crt");
+    if std::fs::read(&path).is_ok_and(|cached| cached == PROD_CERT) {
+        return Ok(path);
+    }
+    write_cert(dir, &path)?;
+    Ok(path)
+}
+
 fn resolve_cert_path() -> Result<std::path::PathBuf, LaserError> {
     if let Ok(custom) = std::env::var("LASER_TLS_CERT")
         && !custom.is_empty()
     {
         return Ok(std::path::PathBuf::from(custom));
     }
-    let path = std::env::temp_dir().join("laserdata.crt");
-    if !path.exists() {
-        std::fs::write(&path, PROD_CERT)
-            .map_err(|error| LaserError::Invalid(format!("write CA cert: {error}")))?;
-    }
-    Ok(path)
+    install_cert(&cert_cache_dir()?)
 }
 
 pub(crate) async fn ensure_stream(client: &IggyClient, stream: &str) -> Result<(), LaserError> {
@@ -1514,7 +1648,10 @@ mod builder_conflict_tests {
 
 #[cfg(test)]
 mod connection_string_tests {
-    use super::{host_of, is_laserdata_host, normalize_connection_string, resolve_tls};
+    use super::{
+        PROD_CERT, flag_value_enabled, has_query_param, host_of, install_cert, is_laserdata_host,
+        normalize_connection_string, resolve_tls,
+    };
 
     #[test]
     fn given_a_full_tcp_connection_string_when_normalized_then_should_be_unchanged() {
@@ -1606,6 +1743,151 @@ mod connection_string_tests {
         assert_eq!(
             resolve_tls(connection_string.clone()).expect("tls resolution should succeed"),
             connection_string,
+        );
+    }
+
+    #[test]
+    fn given_a_password_containing_a_slash_when_the_host_is_extracted_then_should_find_the_real_host()
+     {
+        assert_eq!(
+            host_of("iggy+tcp://user:pa/ss@host.laserdata.cloud:8090"),
+            "host.laserdata.cloud",
+        );
+        assert_eq!(
+            host_of("iggy+tcp://user:a/b/c@host.laserdata.cloud"),
+            "host.laserdata.cloud",
+        );
+    }
+
+    #[test]
+    fn given_a_password_containing_a_slash_when_resolving_tls_then_should_still_attach_tls() {
+        let resolved = resolve_tls("iggy+tcp://user:pa/ss@h.laserdata.cloud:8090".to_owned())
+            .expect("tls resolution should succeed");
+        assert!(
+            resolved.contains("tls=true"),
+            "a slash in the password must not silently disable TLS: {resolved}"
+        );
+    }
+
+    #[test]
+    fn given_an_at_sign_inside_the_query_when_the_host_is_extracted_then_should_ignore_it() {
+        assert_eq!(
+            host_of("iggy+tcp://u:p@h.laserdata.cloud:8090?tls_ca_file=/x@y.crt"),
+            "h.laserdata.cloud",
+        );
+        assert_eq!(
+            host_of("iggy+tcp://h.laserdata.cloud:8090?note=a@b"),
+            "h.laserdata.cloud",
+        );
+    }
+
+    #[test]
+    fn given_a_bracketed_ipv6_authority_when_the_host_is_extracted_then_should_drop_the_brackets() {
+        assert_eq!(host_of("iggy+tcp://u:p@[::1]:8090"), "::1");
+    }
+
+    #[test]
+    fn given_a_parameter_name_inside_the_password_when_checked_then_should_not_count_as_a_query_param()
+     {
+        assert!(!has_query_param(
+            "iggy+tcp://u:tls_ca_file=x@h.laserdata.cloud:8090",
+            "tls_ca_file"
+        ));
+        assert!(has_query_param(
+            "iggy+tcp://u:p@h.laserdata.cloud:8090?tls_ca_file=/ca.crt",
+            "tls_ca_file"
+        ));
+        assert!(has_query_param(
+            "iggy+tcp://u:p@h.laserdata.cloud:8090?tls=true&tls_ca_file=/ca.crt",
+            "tls"
+        ));
+    }
+
+    #[test]
+    fn given_a_password_containing_a_parameter_name_when_resolving_tls_then_should_still_attach_the_ca()
+     {
+        let resolved = resolve_tls("iggy+tcp://u:tls_ca_file=x@h.laserdata.cloud:8090".to_owned())
+            .expect("tls resolution should succeed");
+        assert!(
+            resolved.contains("tls=true"),
+            "credential content must not suppress TLS: {resolved}"
+        );
+        assert!(resolved.ends_with(".crt"), "{resolved}");
+    }
+
+    #[test]
+    fn given_an_opt_out_flag_value_when_read_then_should_only_accept_an_affirmative() {
+        assert!(flag_value_enabled("1"));
+        assert!(flag_value_enabled("true"));
+        assert!(flag_value_enabled("TRUE"));
+        assert!(flag_value_enabled(" yes "));
+        assert!(flag_value_enabled("on"));
+        assert!(!flag_value_enabled("0"), "`0` must not disable TLS");
+        assert!(!flag_value_enabled("false"), "`false` must not disable TLS");
+        assert!(
+            !flag_value_enabled(""),
+            "an empty value must not disable TLS"
+        );
+        assert!(!flag_value_enabled("no"));
+    }
+
+    #[test]
+    fn given_no_cached_certificate_when_installed_then_should_write_the_bundled_ca() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = install_cert(dir.path()).expect("the certificate installs");
+        assert_eq!(
+            std::fs::read(&path).expect("the installed certificate reads"),
+            PROD_CERT,
+        );
+    }
+
+    #[test]
+    fn given_a_tampered_cached_certificate_when_installed_then_should_replace_it() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let planted = dir.path().join("laserdata.crt");
+        std::fs::write(&planted, b"-----BEGIN CERTIFICATE-----\nattacker\n")
+            .expect("the planted certificate writes");
+        let path = install_cert(dir.path()).expect("the certificate installs");
+        assert_eq!(path, planted);
+        assert_eq!(
+            std::fs::read(&path).expect("the installed certificate reads"),
+            PROD_CERT,
+            "a pre-planted trust anchor must be replaced, never trusted"
+        );
+    }
+
+    #[test]
+    fn given_an_already_current_certificate_when_installed_then_should_reuse_it() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let first = install_cert(dir.path()).expect("the certificate installs");
+        let second = install_cert(dir.path()).expect("the certificate installs again");
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read(&second).expect("the installed certificate reads"),
+            PROD_CERT,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_an_installed_certificate_when_inspected_then_should_be_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = install_cert(dir.path()).expect("the certificate installs");
+        let file_mode = std::fs::metadata(&path)
+            .expect("the certificate has metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "the cached CA must be owner-only");
+        let dir_mode = std::fs::metadata(dir.path())
+            .expect("the cache directory has metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "the cache directory must not be group or world writable"
         );
     }
 }

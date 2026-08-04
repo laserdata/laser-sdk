@@ -1,10 +1,15 @@
 import { CancelledError, TimeoutError } from "../client/errors.js"
 import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
+import { NOOP_OBSERVER, type LaserObserver } from "../observe.js"
 import type { KeyRegistry } from "../signing.js"
 import { decodeAgentMessage, type AgentMessage } from "./reliable-consumer.js"
 
 const REPLY_BATCH = 200
 const REPLY_POLL_INTERVAL_MS = 20
+
+// Ceiling on replies buffered for one subscribed correlation with no consumer
+// pulling them. A flood must not be retained in full.
+const MAX_QUEUED_REPLIES = 1_000
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -76,6 +81,7 @@ export class ReplyHub {
     private readonly transport: LaserTransport,
     private readonly stream: string,
     private readonly topic: string,
+    private readonly observer: LaserObserver,
     private readonly verifier?: KeyRegistry
   ) {}
 
@@ -83,12 +89,32 @@ export class ReplyHub {
     transport: LaserTransport,
     stream: string,
     topic: string,
+    observer: LaserObserver = NOOP_OBSERVER,
     verifier?: KeyRegistry
   ): Promise<ReplyHub> {
-    const hub = new ReplyHub(transport, stream, topic, verifier)
+    const hub = new ReplyHub(transport, stream, topic, observer, verifier)
     const offsets = await hub.seedTailOffsets()
-    void hub.runDispatchLoop(offsets)
+    // An escaped rejection here would be fatal under Node and would silently
+    // stop reply delivery, leaving every pending wait to expire on timeout.
+    // Fail the outstanding waiters instead, so callers see the real cause.
+    void hub.runDispatchLoop(offsets).catch((error: unknown) => {
+      hub.abandon(error)
+    })
     return hub
+  }
+
+  // The dispatch loop died, so no further reply can be delivered. Report it and
+  // drop the registrations rather than letting an unhandled rejection take the
+  // process down and leaving every waiter to expire on its timeout with no
+  // explanation.
+  private abandon(error: unknown): void {
+    this.observer.event("error", "laser.reply_hub.stopped", {
+      stream: this.stream,
+      topic: this.topic,
+      error: error instanceof Error ? error.message : String(error)
+    })
+    this.waiters.clear()
+    this.streamWaiters.clear()
   }
 
   subscribe(correlation: string, expectedSigner?: string): ReplyTicket {
@@ -246,8 +272,13 @@ export class ReplyHub {
     }
     if (streamWaiter !== undefined) {
       const pending = streamWaiter.pending.shift()
-      if (pending === undefined) streamWaiter.queued.push(reply)
-      else pending(reply)
+      if (pending === undefined) {
+        // Bounded: a flood on a subscribed correlation must not retain every
+        // reply. The oldest is dropped, since a stream consumer wants the
+        // newest.
+        streamWaiter.queued.push(reply)
+        if (streamWaiter.queued.length > MAX_QUEUED_REPLIES) streamWaiter.queued.shift()
+      } else pending(reply)
     }
     return waiter !== undefined || streamWaiter !== undefined
   }

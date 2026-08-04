@@ -23,6 +23,15 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
+// Capped exponential backoff between consecutive poll failures: 50ms, 100ms,
+// 200ms, up to one second.
+fn backoff_for(attempt: u32) -> Duration {
+    const BASE_MILLIS: u64 = 50;
+    const CEILING_MILLIS: u64 = 1000;
+    let scaled = BASE_MILLIS.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1).min(16)));
+    Duration::from_millis(scaled.min(CEILING_MILLIS))
+}
+
 /// The composed-dedup and fence-map tuning constants, grouped near the top so
 /// the consume path below reads without stopping at a definition.
 /// Separator between the principal and the idempotency key in the composed dedup
@@ -33,6 +42,12 @@ const DEDUP_SCOPE_SEP: char = '\u{1f}';
 /// considered, so a long-lived consumer's per-task fence map stays bounded by the
 /// recently-active working set rather than every task ever seen.
 const FENCE_MAP_SOFT_CAP: usize = 16_384;
+
+/// How many verified record ids a consumer remembers, to refuse a replay of the
+/// exact signed bytes. Sized like the fence map: bounded by the recently-active
+/// working set, not by every record ever seen.
+#[cfg(feature = "sign")]
+const VERIFIED_RECORD_WINDOW: usize = 16_384;
 
 /// A fence entry untouched for this long is swept once the map is over its soft
 /// cap. The gate is kept for any task active within the window. Only tasks long
@@ -511,6 +526,8 @@ impl ReliableConsumer {
             verifier: self.verifier,
             #[cfg(feature = "sign")]
             signing_key: self.signing_key,
+            #[cfg(feature = "sign")]
+            verified_records: Mutex::new(DedupWindow::new(VERIFIED_RECORD_WINDOW)),
         };
         match concurrency {
             ConcurrencyPolicy::Serial => {
@@ -672,6 +689,14 @@ where
     let byte_capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(max_queued_bytes));
     tokio::pin!(shutdown);
 
+    // A non-transport poll error (an authorization failure on the topic, say)
+    // is recoverable in principle, so it does not end the consumer. It is also
+    // usually persistent, so retrying it immediately would spin a core. Back
+    // off between consecutive failures and give up once they stop looking
+    // transient.
+    const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 10;
+    let mut consecutive_poll_errors: u32 = 0;
+
     let stopped = 'polling: loop {
         // Store every completed offset before polling again. The consumer is not
         // borrowed by any live future here, so this is the one place offsets are
@@ -693,6 +718,7 @@ where
             _ = notify.notified() => {}
             message = consumer.next() => match message {
                 Some(Ok(received)) => {
+                    consecutive_poll_errors = 0;
                     let partition = received.partition_id;
                     let known = lanes.contains_key(&partition);
                     if !known && lanes.len() >= max_partitions {
@@ -763,7 +789,18 @@ where
                     | IggyError::InvalidClientAddress
                     | IggyError::NotConnected
                     | IggyError::ClientShutdown => break Err(LaserError::from(error)),
-                    _ => {}
+                    other => {
+                        consecutive_poll_errors += 1;
+                        if consecutive_poll_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                            break 'polling Err(LaserError::from(other));
+                        }
+                        warn!(
+                            error = %other,
+                            attempt = consecutive_poll_errors,
+                            "agent consumer poll failed, backing off"
+                        );
+                        sleep(backoff_for(consecutive_poll_errors)).await;
+                    }
                 },
                 None => break Ok(()),
             },
@@ -899,6 +936,13 @@ struct ReliableWorker<H> {
     /// When the fence map was last swept of idle entries (epoch micros), so the
     /// sweep runs at most once per interval under load.
     fence_last_sweep: std::sync::atomic::AtomicU64,
+    /// Record ids already accepted through signature verification. The signed
+    /// preimage covers the envelope but binds it to no log position, so the
+    /// exact signed bytes stay valid wherever they are replayed. This bounded
+    /// window refuses the second delivery of a record id, the same guard the
+    /// registry fold keeps over applied facts.
+    #[cfg(feature = "sign")]
+    verified_records: Mutex<DedupWindow>,
 }
 
 impl<H> ReliableWorker<H> {
@@ -1075,6 +1119,25 @@ where
                 .map_err(|_| IggyError::Error)?;
                 return Ok(());
             };
+            // A verified signature proves who authored the envelope, not that
+            // this is its first delivery. Any writer on the topic can replay the
+            // captured bytes, and they verify again, so a repeat record id is
+            // dropped here before the handler acts on it.
+            if let Some(record) = message
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.record)
+            {
+                let first_delivery = self
+                    .verified_records
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(&record.to_string());
+                if !first_delivery {
+                    warn!(source = %message.id, %record, "replayed signed record, dropping");
+                    return Ok(());
+                }
+            }
             message.verified_principal = Some(verified.principal);
         }
 
@@ -1242,7 +1305,7 @@ async fn warm_dedup_window(
     let group_consumer = Consumer::group(Identifier::named(group)?);
     let reader = Consumer::new(Identifier::named("laser-dedup-warmer")?);
     let depth = u64::try_from(depth).unwrap_or(u64::MAX);
-    for partition in 0..details.partitions_count {
+    for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
         let Some(offset) = laser
             .client()
             .get_consumer_offset(&group_consumer, &stream, &topic_id, Some(partition))
@@ -1252,7 +1315,8 @@ async fn warm_dedup_window(
         };
         let stored = offset.stored_offset;
         let start = stored.saturating_sub(depth.saturating_sub(1));
-        let count = u32::try_from(stored - start + 1).unwrap_or(u32::MAX);
+        let count =
+            u32::try_from(stored.saturating_sub(start).saturating_add(1)).unwrap_or(u32::MAX);
         let polled = laser
             .client()
             .poll_messages(

@@ -296,3 +296,25 @@ export class BudgetExceededError extends LaserError {
 export function assertNever(value: never): never {
   throw new InvalidError("unreachable variant", { value })
 }
+
+// A remote-safe rendering of a failure, for the bridge JSON-RPC responses. A
+// `TransportError` message names hosts, streams, and topics, and a
+// `ConfigError` can carry connection detail, none of which an unauthenticated
+// caller should see. The classification goes on the wire, the detail stays in
+// the local log.
+export function publicErrorMessage(error: unknown): string {
+  if (!(error instanceof LaserError)) return "internal error"
+  const publicByKind: Partial<Record<LaserErrorKind, string>> = {
+    invalid: "invalid request",
+    codec: "invalid request",
+    unsupported: "unsupported operation",
+    routing: "not found",
+    timeout: "request timed out",
+    cancelled: "request cancelled",
+    rejected: "forbidden",
+    "policy-blocked": "forbidden",
+    signature: "unauthenticated",
+    "step-up-required": "step-up authorization required"
+  }
+  return publicByKind[error.kind] ?? "internal error"
+}

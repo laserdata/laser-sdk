@@ -230,7 +230,8 @@ impl PyWorkflow {
         let route = self
             .fixed_inbox
             .clone()
-            .map(|topic| InboxRoute::Fixed(static_topic(topic)));
+            .map(|topic| static_topic(topic).map(InboxRoute::Fixed))
+            .transpose()?;
         let specs = self.steps.clone();
         let registered = self.registered;
         future_into_py(py, async move {

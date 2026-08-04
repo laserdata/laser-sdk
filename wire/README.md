@@ -47,6 +47,7 @@ Modules carve the API surface. Features gate dependencies. No wire-contract type
 | `commands` | the `Command` trait pairing each code with its request/reply types |
 | `http` | `/agdx/*` route constants, path builders, typed query-parameter structs (`PARAM_*` + `KvScanQuery`/`ProjectionListQuery`/...), JSON view types, and the canonical `ErrorBody` reply contract |
 | `http_client` | (feature `http-client`) a typed `/agdx/*` client over an injected `Transport`, owning routes, base64url, query strings, and the bare-`Ok`-or-`ErrorBody` unwrap, including the `authz` whoami/roles/bindings routes |
+| `validate` | the `Validate` trait: the cap and shape checks a request enforces on itself, so the SDK spends the failure locally and a deployment re-runs the identical check after decode. Implemented for the batch, key-value set/scan, graph query and upsert (recursing into nodes, edges, and `SourceRef`), text and vector queries, memory records, and client metadata |
 | `framing` | `encode_named`/`decode_named` + `frame_encode`/`frame_decode` |
 | `codecs` | the payload codec traits and marker types |
 | `fixtures` | the embedded golden corpus |

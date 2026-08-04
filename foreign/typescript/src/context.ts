@@ -7,6 +7,13 @@ import type { AgentEnvelope } from "./wire/agent.js"
 
 const READ_BATCH = 1_000
 
+// Ceiling on the records one assembly holds in memory per topic. A conversation
+// topic grows without bound, and this read is reachable from bridge requests, so
+// the window keeps the most recent records rather than materializing the whole
+// history. Selection policies want the newest records, so the oldest are the
+// ones dropped.
+const MAX_CONTEXT_RECORDS = 10_000
+
 export interface ContextMessage {
   readonly id: MessageId
   readonly provenance: Provenance
@@ -152,6 +159,7 @@ export class ContextAssembler {
               timestampMicros: record.timestampMicros ?? 0n,
               topicIndex
             })
+            if (collected.length > MAX_CONTEXT_RECORDS) collected.shift()
           }
         }
         return collected

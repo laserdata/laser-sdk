@@ -1218,7 +1218,7 @@ export class Laser implements AsyncDisposable {
     const key = `${stream}\u001f${topic}`
     let hub = this.shared.replyHubs.get(key)
     if (hub === undefined) {
-      hub = ReplyHub.create(this.transport, stream, topic, this.verifier)
+      hub = ReplyHub.create(this.transport, stream, topic, this.observer, this.verifier)
       this.shared.replyHubs.set(key, hub)
       void hub.catch(() => this.shared.replyHubs.delete(key))
     }

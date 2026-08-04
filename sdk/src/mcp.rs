@@ -497,15 +497,20 @@ async fn handle_mcp(
             result: Some(result),
             error: None,
         },
-        Err(error) => McpRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            id: request.id,
-            result: None,
-            error: Some(McpRpcError {
-                code: APP_ERROR_CODE,
-                message: error.to_string(),
-            }),
-        },
+        Err(error) => {
+            // The detail stays local: `Display` names streams, topics, and
+            // transport state that an unauthenticated caller must not see.
+            tracing::warn!(error = %error, method = %request.method, "MCP request failed");
+            McpRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id: request.id,
+                result: None,
+                error: Some(McpRpcError {
+                    code: APP_ERROR_CODE,
+                    message: crate::error::public_error_message(&error).to_owned(),
+                }),
+            }
+        }
     };
     axum::Json(response)
 }

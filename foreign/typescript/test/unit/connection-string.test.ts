@@ -110,3 +110,45 @@ void test("given_invalid_reconnection_options_when_parsed_then_should_fail_befor
     /reconnection_interval/
   )
 })
+
+void test("given_a_malformed_connection_string_when_parsed_then_should_not_echo_the_credential", () => {
+  const secret = "sup3rs3cr3t"
+  assert.throws(
+    () => parseConnectionString(`iggy://user:${secret}@[`),
+    (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.ok(!error.message.includes(secret), `credential leaked: ${error.message}`)
+      return true
+    }
+  )
+})
+
+void test("given_an_invalid_port_when_parsed_then_should_not_echo_the_credential", () => {
+  const secret = "sup3rs3cr3t"
+  assert.throws(
+    () => parseConnectionString(`iggy://user:${secret}@host:99999`),
+    (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.ok(!error.message.includes(secret), `credential leaked: ${error.message}`)
+      return true
+    }
+  )
+})
+
+void test("given_a_negated_no_tls_flag_when_parsed_then_should_still_enable_tls", () => {
+  for (const value of ["0", "false", "", "no"]) {
+    const parsed = parseConnectionString("iggy://u:p@api.laserdata.cloud:8090", {
+      LASER_NO_TLS: value
+    })
+    assert.equal(parsed.tls, true, `LASER_NO_TLS=${value} must not disable TLS`)
+  }
+})
+
+void test("given_an_affirmative_no_tls_flag_when_parsed_then_should_disable_tls", () => {
+  for (const value of ["1", "true", "TRUE", " yes "]) {
+    const parsed = parseConnectionString("iggy://u:p@api.laserdata.cloud:8090", {
+      LASER_NO_TLS: value
+    })
+    assert.equal(parsed.tls, false, `LASER_NO_TLS=${value} must disable TLS`)
+  }
+})
