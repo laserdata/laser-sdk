@@ -295,6 +295,7 @@ impl GraphHandle<'_> {
         edges: Vec<laser_wire::graph::GraphEdge>,
     ) -> Result<(), LaserError> {
         use laser_wire::graph::GraphUpsert;
+        use laser_wire::validate::Validate;
         self.require_graph()?;
         let request = GraphUpsert {
             v: laser_wire::codes::GRAPH_OP_VERSION,
@@ -302,6 +303,10 @@ impl GraphHandle<'_> {
             nodes,
             edges,
         };
+        // Spend the cap failure locally rather than amplifying an over-cap
+        // upsert against the managed plane, which rejects it with the same
+        // reason.
+        request.validate()?;
         let payload = laser_wire::framing::encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode graph upsert: {error}")))?;
         let payload = self

@@ -78,8 +78,8 @@ impl PyLaser {
             inner: Arc::new(A2aBridge::new(
                 self.inner.clone(),
                 agent_id(&source)?,
-                static_topic(request_topic),
-                static_topic(reply_topic),
+                static_topic(request_topic)?,
+                static_topic(reply_topic)?,
             )),
         })
     }
@@ -108,8 +108,8 @@ impl PyLaser {
         let mut bridge = McpBridge::new(
             self.inner.clone(),
             agent_id(&source)?,
-            static_topic(tool_topic),
-            static_topic(reply_topic),
+            static_topic(tool_topic)?,
+            static_topic(reply_topic)?,
             server_name,
         );
         for tool in tools {
@@ -149,7 +149,7 @@ impl PyLaser {
         let state = py_to_json(state)?;
         future_into_py(py, async move {
             laser
-                .publish_state_snapshot(static_topic(topic), source, conversation, &state)
+                .publish_state_snapshot(static_topic(topic)?, source, conversation, &state)
                 .await
                 .map_err(to_pyerr)
         })
@@ -170,7 +170,7 @@ impl PyLaser {
         let patch = py_to_json(patch)?;
         future_into_py(py, async move {
             laser
-                .publish_state_delta(static_topic(topic), source, conversation, &patch)
+                .publish_state_delta(static_topic(topic)?, source, conversation, &patch)
                 .await
                 .map_err(to_pyerr)
         })
@@ -188,7 +188,7 @@ impl PyLaser {
         let conversation = parse_conversation(&conversation_id)?;
         future_into_py(py, async move {
             let state = laser
-                .reconstruct_state(conversation, static_topic(topic))
+                .reconstruct_state(conversation, static_topic(topic)?)
                 .await
                 .map_err(to_pyerr)?;
             Python::attach(|py| match state {
@@ -209,7 +209,7 @@ impl PyLaser {
         let conversation = parse_conversation(&conversation_id)?;
         future_into_py(py, async move {
             let events = laser
-                .agui_events(conversation, static_topic(topic))
+                .agui_events(conversation, static_topic(topic)?)
                 .await
                 .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &events))

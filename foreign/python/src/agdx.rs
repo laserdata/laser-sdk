@@ -56,7 +56,7 @@ impl PyLaser {
         let source = wire_agent(&source)?;
         let conversation = wire_conversation(&conversation_id)?;
         Ok(PyAgdx {
-            inner: self.inner.agdx(static_topic(topic), source, conversation),
+            inner: self.inner.agdx(static_topic(topic)?, source, conversation),
             signing_key: signing_key.map(|key| key.inner.clone()),
         })
     }
@@ -293,7 +293,7 @@ impl PyAgdx {
         future_into_py(py, async move {
             let body = agdx
                 .request_input(
-                    static_topic(reply_topic),
+                    static_topic(reply_topic)?,
                     prompt,
                     duration_seconds(timeout_secs, "timeout_secs")?,
                 )

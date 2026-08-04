@@ -1,6 +1,6 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::errors::to_pyerr;
+use crate::errors::{InvalidError, to_pyerr};
 use async_trait::async_trait;
 use laser_sdk::LaserError;
 use laser_sdk::govern::{
@@ -580,16 +580,19 @@ impl PyQuorumGovernor {
     /// Enroll one named voter (an object with `async def decide(action) ->
     /// ActionDecision`, the same contract `Laser.with_governor` takes). A
     /// `mandatory` voter must be affirmative, regardless of policy.
-    fn voter(&mut self, name: String, governor: Py<PyAny>, mandatory: bool) {
-        let current = self
-            .inner
-            .take()
-            .expect("QuorumGovernor always holds a value between calls");
+    fn voter(&mut self, name: String, governor: Py<PyAny>, mandatory: bool) -> PyResult<()> {
+        // The builder is consumed and put back. If a previous call unwound
+        // between the two, the slot stays empty, so report that as a typed
+        // error rather than panicking on every later call.
+        let current = self.inner.take().ok_or_else(|| {
+            InvalidError::new_err("this QuorumGovernor is unusable: a previous voter() call failed")
+        })?;
         self.inner = Some(current.voter(
             name,
             Arc::new(PyActionGovernor { hooks: governor }),
             mandatory,
         ));
+        Ok(())
     }
 
     /// Decide `action` by fanning out to every voter concurrently and folding

@@ -64,8 +64,9 @@ impl ReplyHub {
         let consumer = Consumer::new(Identifier::named("laser-reply-hub")?);
         let mut offsets: Vec<u64> = Vec::new();
         if let Some(details) = client.get_topic(&stream_id, &topic).await? {
-            offsets = vec![0u64; details.partitions_count as usize];
-            for partition in 0..details.partitions_count {
+            let partitions = crate::poll::bounded_partitions(details.partitions_count);
+            offsets = vec![0u64; partitions as usize];
+            for partition in 0..partitions {
                 let polled = client
                     .poll_messages(
                         &stream_id,
@@ -78,7 +79,7 @@ impl ReplyHub {
                     )
                     .await?;
                 if let Some(last) = polled.messages.last() {
-                    offsets[partition as usize] = last.header.offset + 1;
+                    offsets[partition as usize] = last.header.offset.saturating_add(1);
                 }
             }
         }
@@ -175,7 +176,7 @@ async fn dispatch_loop(
         // The reply topic may not exist at creation (a fan-out reply topic is
         // created by the first reply), so resolve partitions each pass until it is.
         let partitions = match client.get_topic(&stream, &topic).await {
-            Ok(Some(details)) => details.partitions_count,
+            Ok(Some(details)) => crate::poll::bounded_partitions(details.partitions_count),
             _ => {
                 drop(inner);
                 tokio::time::sleep(REPLY_POLL_INTERVAL).await;

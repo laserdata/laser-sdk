@@ -1,4 +1,4 @@
-import { CodecError, HandlerConfigError } from "../client/errors.js"
+import { CodecError, HandlerConfigError, publicErrorMessage } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import { signCardValue, type AgentCardSignature, type SigningKey } from "../signing.js"
@@ -20,7 +20,7 @@ import { bridgeHopMetadata, enterBridge } from "./hops.js"
 export const A2A_PROTOCOL_VERSION = "1.0"
 export const A2A_JSONRPC_BINDING = "JSONRPC"
 export const A2A_APP_ERROR_CODE = -32_000
-export const SDK_VERSION = "0.0.2"
+export const SDK_VERSION = "0.0.3"
 
 export const A2aMethod = {
   MessageSend: "SendMessage",
@@ -307,7 +307,7 @@ export class A2aBridge {
         id,
         error: {
           code: A2A_APP_ERROR_CODE,
-          message: error instanceof Error ? error.message : String(error)
+          message: publicErrorMessage(error)
         }
       }
     }

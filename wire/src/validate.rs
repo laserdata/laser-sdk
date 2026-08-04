@@ -1,12 +1,17 @@
 use crate::batch::BatchRequest;
+use crate::clients::ClientMetadata;
 use crate::codes::AGDX_BATCH_CODE;
 use crate::error::InvalidError;
-use crate::graph::GraphQuery;
+use crate::graph::{GraphEdge, GraphNode, GraphQuery, GraphUpsert, SourceRef};
 use crate::kv::{KvScan, KvSet};
 use crate::limits::{
-    MAX_BATCH_OPS, MAX_FRAME_BYTES, MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH,
-    MAX_KEY_BYTES, MAX_SCAN_LIMIT, MAX_VALUE_BYTES,
+    MAX_BATCH_OPS, MAX_CLIENT_METADATA, MAX_FRAME_BYTES, MAX_GRAPH_NODE_LABELS,
+    MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH, MAX_KEY_BYTES, MAX_MEMORY_BODY_BYTES,
+    MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_PAGE_SIZE, MAX_SCAN_LIMIT,
+    MAX_SOURCE_REF_BYTES, MAX_TEXT_QUERY_BYTES, MAX_VALUE_BYTES,
 };
+use crate::memory::MemoryRecord;
+use crate::query::{TextQuery, Value, VectorQuery};
 
 /// A capped request type that enforces its own size and shape limits, so the
 /// cap logic lives once in the wire crate and every port and both servers get
@@ -136,6 +141,138 @@ impl Validate for GraphQuery {
     }
 }
 
+impl Validate for SourceRef {
+    fn validate(&self) -> Result<(), InvalidError> {
+        let size = match self {
+            // A log pointer is fixed-width numerics plus an optional
+            // conversation id, so only the id needs a bound.
+            SourceRef::Message { conversation, .. } => conversation.as_ref().map_or(0, String::len),
+            SourceRef::Kv { namespace, key } => namespace.len() + key.len(),
+            SourceRef::Memory { id } => id.len(),
+        };
+        if size > MAX_SOURCE_REF_BYTES {
+            return Err(InvalidError::new(format!(
+                "source reference is {size}B, exceeds cap {MAX_SOURCE_REF_BYTES}B"
+            )));
+        }
+        Ok(())
+    }
+}
+
+// Attribute lists ride on both nodes and edges, so their bound lives once.
+fn validate_attrs(label: &str, attrs: &[(String, Value)]) -> Result<(), InvalidError> {
+    if attrs.len() > MAX_METADATA_ENTRIES {
+        return Err(InvalidError::new(format!(
+            "{label} carries {} attributes, exceeds cap {MAX_METADATA_ENTRIES}",
+            attrs.len()
+        )));
+    }
+    for (key, _) in attrs {
+        if key.len() > MAX_METADATA_KEY_BYTES {
+            return Err(InvalidError::new(format!(
+                "{label} attribute name is {}B, exceeds cap {MAX_METADATA_KEY_BYTES}B",
+                key.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl Validate for GraphNode {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.labels.len() > MAX_GRAPH_NODE_LABELS {
+            return Err(InvalidError::new(format!(
+                "graph node carries {} labels, exceeds cap {MAX_GRAPH_NODE_LABELS}",
+                self.labels.len()
+            )));
+        }
+        validate_attrs("graph node", &self.attrs)?;
+        if let Some(source) = &self.source {
+            source.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for GraphEdge {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_attrs("graph edge", &self.attrs)?;
+        if let Some(source) = &self.source {
+            source.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for GraphUpsert {
+    fn validate(&self) -> Result<(), InvalidError> {
+        crate::graph::validate_graph_name(&self.graph)?;
+        let elements = self.nodes.len() + self.edges.len();
+        if elements > MAX_GRAPH_RESULT_ELEMENTS {
+            return Err(InvalidError::new(format!(
+                "graph upsert carries {elements} elements, exceeds cap {MAX_GRAPH_RESULT_ELEMENTS}"
+            )));
+        }
+        for node in &self.nodes {
+            node.validate()?;
+        }
+        for edge in &self.edges {
+            edge.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Validate for TextQuery {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.query.len() > MAX_TEXT_QUERY_BYTES {
+            return Err(InvalidError::new(format!(
+                "text query is {}B, exceeds cap {MAX_TEXT_QUERY_BYTES}B",
+                self.query.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for VectorQuery {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.top_k > MAX_PAGE_SIZE {
+            return Err(InvalidError::new(format!(
+                "vector top_k {} exceeds cap {MAX_PAGE_SIZE}",
+                self.top_k
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for MemoryRecord {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if let MemoryRecord::Item { body, .. } = self
+            && body.len() > MAX_MEMORY_BODY_BYTES
+        {
+            return Err(InvalidError::new(format!(
+                "memory body is {}B, exceeds cap {MAX_MEMORY_BODY_BYTES}B",
+                body.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for ClientMetadata {
+    fn validate(&self) -> Result<(), InvalidError> {
+        let size = self.metadata.as_ref().map_or(0, Vec::len);
+        if size > MAX_CLIENT_METADATA {
+            return Err(InvalidError::new(format!(
+                "client metadata is {size}B, exceeds cap {MAX_CLIENT_METADATA}B"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +343,173 @@ mod tests {
             key: vec![b'x'; 8],
             value: vec![1, 2, 3],
             expires_at_micros: None,
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    fn node_with(labels: Vec<String>, attrs: Vec<(String, Value)>) -> GraphNode {
+        GraphNode {
+            id: crate::graph::NodeId::from_u128(1),
+            labels,
+            attrs,
+            embedding: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn given_a_node_over_the_label_cap_when_validated_then_should_reject() {
+        let over = node_with(
+            (0..=MAX_GRAPH_NODE_LABELS)
+                .map(|index| format!("label-{index}"))
+                .collect(),
+            Vec::new(),
+        );
+        assert!(over.validate().is_err());
+        assert!(
+            node_with(vec!["Person".to_owned()], Vec::new())
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_a_node_over_the_attribute_cap_when_validated_then_should_reject() {
+        let over = node_with(
+            Vec::new(),
+            (0..=MAX_METADATA_ENTRIES)
+                .map(|index| (format!("attr-{index}"), Value::from("x")))
+                .collect(),
+        );
+        assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn given_an_oversized_source_reference_when_validated_then_should_reject() {
+        let over = SourceRef::Kv {
+            namespace: "n".repeat(MAX_SOURCE_REF_BYTES),
+            key: "k".repeat(MAX_SOURCE_REF_BYTES),
+        };
+        assert!(over.validate().is_err());
+        assert!(
+            SourceRef::Memory {
+                id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_an_upsert_over_the_element_cap_when_validated_then_should_reject() {
+        let over = GraphUpsert {
+            v: 1,
+            graph: "knowledge".to_owned(),
+            nodes: (0..=MAX_GRAPH_RESULT_ELEMENTS)
+                .map(|_| node_with(Vec::new(), Vec::new()))
+                .collect(),
+            edges: Vec::new(),
+        };
+        assert!(over.validate().is_err());
+        let ok = GraphUpsert {
+            v: 1,
+            graph: "knowledge".to_owned(),
+            nodes: vec![node_with(vec!["Person".to_owned()], Vec::new())],
+            edges: Vec::new(),
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn given_an_upsert_carrying_an_over_cap_node_when_validated_then_should_reject() {
+        let upsert = GraphUpsert {
+            v: 1,
+            graph: "knowledge".to_owned(),
+            nodes: vec![node_with(
+                (0..=MAX_GRAPH_NODE_LABELS)
+                    .map(|index| format!("label-{index}"))
+                    .collect(),
+                Vec::new(),
+            )],
+            edges: Vec::new(),
+        };
+        assert!(
+            upsert.validate().is_err(),
+            "an upsert must enforce its elements' caps, not just its own"
+        );
+    }
+
+    #[test]
+    fn given_an_oversized_text_query_when_validated_then_should_reject() {
+        let over = TextQuery {
+            field: None,
+            query: "q".repeat(MAX_TEXT_QUERY_BYTES + 1),
+        };
+        assert!(over.validate().is_err());
+        let ok = TextQuery {
+            field: None,
+            query: "checkout is slow".to_owned(),
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn given_an_over_cap_vector_top_k_when_validated_then_should_reject() {
+        let over = VectorQuery {
+            field: "embedding".to_owned(),
+            embedding: vec![0.0; 4],
+            top_k: MAX_PAGE_SIZE + 1,
+        };
+        assert!(over.validate().is_err());
+        let ok = VectorQuery {
+            field: "embedding".to_owned(),
+            embedding: vec![0.0; 4],
+            top_k: 10,
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn given_an_oversized_memory_body_when_validated_then_should_reject() {
+        let over = MemoryRecord::Item {
+            id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+            kind: "fact".to_owned(),
+            body: vec![0u8; MAX_MEMORY_BODY_BYTES + 1],
+        };
+        assert!(over.validate().is_err());
+        let ok = MemoryRecord::Item {
+            id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+            kind: "fact".to_owned(),
+            body: b"checkout is slow".to_vec(),
+        };
+        assert!(ok.validate().is_ok());
+        assert!(
+            MemoryRecord::Forget {
+                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_oversized_client_metadata_when_validated_then_should_reject() {
+        let over = ClientMetadata {
+            client_id: 1,
+            user_id: None,
+            transport: 1,
+            address: "127.0.0.1:8090".to_owned(),
+            consumer_groups_count: 0,
+            metadata: Some(vec![0u8; MAX_CLIENT_METADATA + 1]),
+        };
+        assert!(over.validate().is_err());
+        let ok = ClientMetadata {
+            client_id: 1,
+            user_id: None,
+            transport: 1,
+            address: "127.0.0.1:8090".to_owned(),
+            consumer_groups_count: 0,
+            metadata: Some(b"card".to_vec()),
         };
         assert!(ok.validate().is_ok());
     }

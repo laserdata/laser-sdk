@@ -115,9 +115,11 @@ sdk/src/
                       the client call, never in the SDK's own signatures). `resolve_tls`
                       auto-attaches TLS + the bundled public CA (`certs/laserdata.crt`,
                       `include_bytes!`) for a `*.laserdata.cloud`/`*.laserdata.com` host with no
-                      `tls_ca_file=` already set. `LASER_TLS_CERT` overrides the cert,
-                      `LASER_NO_TLS` disables the whole check, any other host passes through
-                      untouched
+                      `tls_ca_file=` query parameter already set. The bundled CA is cached in a
+                      per-user, owner-only directory and reused only when its bytes still match
+                      the bundled cert. `LASER_TLS_CERT` overrides the cert, `LASER_NO_TLS=1`
+                      disables the whole check (read by value, so `0`/`false` do not), any other
+                      host passes through untouched
   types/              mod.rs re-exports the id types, ids.rs: ConversationId / AgentId /
                       MessageId (FromStr+Display) + the AGDX id bridge (MintUlid, ConversationId
                       <-> wire id, AgentId::wire_id = the name verbatim)
@@ -326,7 +328,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.0.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.0.2` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 

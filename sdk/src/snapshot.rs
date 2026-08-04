@@ -133,7 +133,7 @@ impl SnapshotStore for TopicSnapshotStore {
         // The partitioner owns the conversation-to-partition mapping, so every
         // partition's tail is walked and the newest match across them wins.
         let mut newest: Option<(u64, FoldSnapshot)> = None;
-        for partition in 0..details.partitions_count {
+        for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
             let tail = client
                 .poll_messages(
                     &stream,
@@ -148,7 +148,7 @@ impl SnapshotStore for TopicSnapshotStore {
             let Some(last) = tail.messages.last() else {
                 continue;
             };
-            let mut end = last.header.offset + 1;
+            let mut end = last.header.offset.saturating_add(1);
             // Walk backward in windows: newest window first, and within a
             // window the highest matching offset wins, so the scan stops at
             // the conversation's most recent checkpoint.

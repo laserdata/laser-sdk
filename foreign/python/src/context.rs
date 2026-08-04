@@ -53,7 +53,7 @@ impl PyContextScope {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let conversation = self.conversation;
-        let topic = static_topic(topic);
+        let topic = static_topic(topic)?;
         let payload = payload_bytes(payload)?;
         future_into_py(py, async move {
             laser
@@ -84,7 +84,7 @@ impl PyContextScope {
             .unwrap_or_default()
             .into_iter()
             .map(static_topic)
-            .collect();
+            .collect::<PyResult<Vec<_>>>()?;
         let policy = bounded_policy(last_n.unwrap_or(50), token_budget);
         future_into_py(py, async move {
             let messages = laser
@@ -125,7 +125,7 @@ impl PyContextScope {
             .unwrap_or_default()
             .into_iter()
             .map(static_topic)
-            .collect();
+            .collect::<PyResult<Vec<_>>>()?;
         let policy = bounded_policy(last_n.unwrap_or(50), token_budget);
         future_into_py(py, async move {
             let messages = laser

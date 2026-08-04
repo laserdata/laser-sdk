@@ -21,6 +21,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "query")]
 const PRESENCE_TTL_MICROS: u64 = 2_000_000;
 const APPLIED_FACT_CAPACITY: usize = 16_384;
+
+// Cards are keyed by the self-asserted envelope source and a card without a ttl
+// never ages out, so the map is capped like the applied-fact set rather than
+// left to grow with every id a registry writer invents.
+const MAX_REGISTERED_CARDS: usize = 4_096;
 const APPLIED_FACT_TTL_MICROS: u64 = 86_400_000_000;
 
 /// The registry read model's persisted state, shared per stream on the connection
@@ -391,6 +396,11 @@ fn apply_presence(
     let Ok(body) = decode_named::<AgentPresence>(metadata) else {
         return false;
     };
+    // Client metadata is peer-supplied, so the presence caps are enforced here
+    // rather than assumed to have been enforced on the write side.
+    if body.validate().is_err() {
+        return false;
+    }
     let Ok(agent) = AgentId::try_from(body.agent.as_str()) else {
         return false;
     };
@@ -711,6 +721,23 @@ fn apply_card(
     let Ok(card) = decode_named::<AgentCard>(&envelope.body) else {
         return false;
     };
+    // The card comes off the registry topic, so its caps are enforced on the
+    // read side too. An over-cap card is rejected, not folded in.
+    if card.validate().is_err() {
+        return false;
+    }
+    // A card map keyed by the self-asserted source grows with every distinct id
+    // a writer invents, and a card with no ttl is never swept by freshness. The
+    // cap bounds that, evicting the least recently observed entry.
+    if cards.len() >= MAX_REGISTERED_CARDS && !cards.contains_key(&agent) {
+        let oldest = cards
+            .iter()
+            .min_by_key(|(_, registered)| registered.observed_at_micros)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            cards.remove(&oldest);
+        }
+    }
     cards.insert(
         agent.clone(),
         RegisteredCard {

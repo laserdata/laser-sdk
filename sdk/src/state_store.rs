@@ -1,8 +1,23 @@
 use crate::error::LaserError;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+
+// Restrict a directory to its owner, where the platform has owner permissions.
+#[cfg(unix)]
+async fn restrict_to_owner(dir: &Path) -> Result<(), LaserError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|error| LaserError::StateStore(error.to_string()))
+}
+
+#[cfg(not(unix))]
+async fn restrict_to_owner(_dir: &Path) -> Result<(), LaserError> {
+    Ok(())
+}
 
 /// A durable key/value seam for agent state: dedup persistence, conversation
 /// checkpoints, stream-cursor offsets, arbitrary per-agent state. `get`/`set`/`delete`
@@ -36,10 +51,13 @@ impl InMemoryStore {
         Self::default()
     }
 
+    // A panic while another caller held the lock poisons it, but the map itself
+    // is still consistent. Recovering the inner value keeps one unrelated panic
+    // from turning every later dedup lookup into a second panic.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>> {
         self.entries
             .lock()
-            .expect("the state store mutex is not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -94,6 +112,10 @@ impl StateStore for FileStore {
         fs::create_dir_all(&self.root)
             .await
             .map_err(|error| LaserError::StateStore(error.to_string()))?;
+        // Dedup keys, cursors, and conversation state are this store's content,
+        // so the directory is restricted to its owner rather than left at the
+        // process umask.
+        restrict_to_owner(&self.root).await?;
         // Atomic write: stage in a `<file>.<ulid>.tmp` file then `rename` into
         // place. A crash partway through `fs::write` would otherwise leave a
         // partial or zero-length file that the next `get` returns as if it
@@ -107,10 +129,22 @@ impl StateStore for FileStore {
             let _ = std::fs::remove_file(&tmp_path);
             LaserError::StateStore(error.to_string())
         };
-        fs::write(&tmp_path, &value).await.map_err(cleanup_on_err)?;
+        // The staged bytes are flushed to disk before the rename. Without the
+        // sync, a crash after the rename can still surface a zero-length file,
+        // because the rename may reach disk before the data does.
+        let staged = fs::File::create(&tmp_path).await.map_err(cleanup_on_err)?;
+        let mut staged = staged;
+        staged.write_all(&value).await.map_err(cleanup_on_err)?;
+        staged.sync_all().await.map_err(cleanup_on_err)?;
+        drop(staged);
         fs::rename(&tmp_path, &final_path)
             .await
-            .map_err(|error| LaserError::StateStore(error.to_string()))
+            .map_err(|error| LaserError::StateStore(error.to_string()))?;
+        // Fsync the directory so the rename itself is durable.
+        if let Ok(dir) = std::fs::File::open(&self.root) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), LaserError> {

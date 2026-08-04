@@ -22,6 +22,10 @@ fn parse_conversation(conversation: Option<String>) -> PyResult<Option<Conversat
 
 #[derive(Clone)]
 enum Body {
+    // No value supplied yet. Distinct from an explicit empty payload, so
+    // forgetting `.payload()` / `.json()` raises instead of silently storing
+    // an empty value.
+    Unset,
     Bytes(Vec<u8>),
     Json(serde_json::Value),
     Msgpack(serde_json::Value),
@@ -130,7 +134,7 @@ impl PyKv {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
             key: payload_bytes(key)?,
-            body: Body::Bytes(Vec::new()),
+            body: Body::Unset,
             ttl_secs: None,
             expires_at_micros: None,
             expect: None,
@@ -610,6 +614,9 @@ fn apply_body(
     body: Body,
 ) -> Result<laser_sdk::kv::KvSetRequest, laser_sdk::LaserError> {
     match body {
+        Body::Unset => Err(laser_sdk::LaserError::Invalid(
+            "no value set: call .payload(), .json(), or .msgpack() before sending".to_owned(),
+        )),
         Body::Bytes(payload) => Ok(request.bytes(payload)),
         Body::Json(value) => request.json(&value),
         Body::Msgpack(value) => request.msgpack(&value),

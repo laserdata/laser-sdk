@@ -19,9 +19,9 @@ use laser_sdk::types::{AgentId, ConversationId, PrincipalId};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{get_current_locals, get_runtime, into_future, scope};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -44,34 +44,46 @@ fn parse_health(health: &str) -> laser_sdk::wire::agent::Health {
 }
 
 /// A fixed inbox route to `topic` when given, else the default advertised route.
-fn inbox_route(fixed_inbox: Option<String>) -> InboxRoute {
+fn inbox_route(fixed_inbox: Option<String>) -> PyResult<InboxRoute> {
     match fixed_inbox {
-        Some(topic) => InboxRoute::Fixed(static_topic(topic)),
-        None => InboxRoute::default(),
+        Some(topic) => Ok(InboxRoute::Fixed(static_topic(topic)?)),
+        None => Ok(InboxRoute::default()),
     }
 }
 
 /// A `respond_on` topic needs a `'static` `AgentTopic`. Well-known names map to
-/// their static variant. A custom name leaks one `Identifier` (an agent is
-/// long-lived and spawned rarely, so the one-time leak per agent is acceptable).
-pub(crate) fn static_topic(name: String) -> AgentTopic<'static> {
+/// their static variant. A custom name is interned: the leaked `Identifier` is
+/// memoized per distinct name, so a name reused on a per-message path costs one
+/// allocation for the process rather than one per call.
+///
+/// An unusable name raises rather than falling back to a well-known topic:
+/// silently rerouting a caller's messages onto the shared command topic is a
+/// misroute, not a recovery.
+pub(crate) fn static_topic(name: String) -> PyResult<AgentTopic<'static>> {
+    static INTERNED: OnceLock<Mutex<HashMap<String, &'static Identifier>>> = OnceLock::new();
     match name.as_str() {
-        "agent.commands" => AgentTopic::Commands,
-        "agent.responses" => AgentTopic::Responses,
-        "agent.tool_calls" => AgentTopic::ToolCalls,
-        "agent.tool_results" => AgentTopic::ToolResults,
-        "agent.llm_io" => AgentTopic::LlmIo,
-        "agent.human_input" => AgentTopic::HumanInput,
-        "agent.audit" => AgentTopic::Audit,
-        "agent.dlq" => AgentTopic::Dlq,
-        _ => {
-            let id: &'static Identifier =
-                Box::leak(Box::new(Identifier::named(&name).unwrap_or_else(|_| {
-                    Identifier::named("agent.commands").expect("static")
-                })));
-            AgentTopic::Custom(id)
-        }
+        "agent.commands" => return Ok(AgentTopic::Commands),
+        "agent.responses" => return Ok(AgentTopic::Responses),
+        "agent.tool_calls" => return Ok(AgentTopic::ToolCalls),
+        "agent.tool_results" => return Ok(AgentTopic::ToolResults),
+        "agent.llm_io" => return Ok(AgentTopic::LlmIo),
+        "agent.human_input" => return Ok(AgentTopic::HumanInput),
+        "agent.audit" => return Ok(AgentTopic::Audit),
+        "agent.dlq" => return Ok(AgentTopic::Dlq),
+        _ => {}
     }
+    let mut interned = INTERNED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(id) = interned.get(&name) {
+        return Ok(AgentTopic::Custom(id));
+    }
+    let id = Identifier::named(&name)
+        .map_err(|error| InvalidError::new_err(format!("invalid topic `{name}`: {error}")))?;
+    let id: &'static Identifier = Box::leak(Box::new(id));
+    interned.insert(name, id);
+    Ok(AgentTopic::Custom(id))
 }
 
 /// Parse a `fan_out` policy name into a `GatherPolicy`. `quorum` is required
@@ -384,7 +396,7 @@ impl PyLaser {
                 Duration::from_millis(delay.unwrap_or(200)),
             )),
         };
-        let respond_topic = respond_on.map(static_topic);
+        let respond_topic = respond_on.map(static_topic).transpose()?;
         let poll = poll_interval_ms.map(Duration::from_millis);
         let shutdown_grace = shutdown_grace_ms.map(Duration::from_millis);
         let verifier = verifier.map(PyKeyRegistry::snapshot);
@@ -484,7 +496,7 @@ impl PyLaser {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
-        let route = inbox_route(fixed_inbox);
+        let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
             let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
             if let Some(principal) = principal {
@@ -522,7 +534,7 @@ impl PyLaser {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
-        let route = inbox_route(fixed_inbox);
+        let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
             let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
             if let Some(principal) = principal {
@@ -582,7 +594,7 @@ impl PyLaser {
         if let Some(principal) = principal {
             selector = selector.principal(PrincipalId::new(principal));
         }
-        let route = inbox_route(fixed_inbox);
+        let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
             laser
                 .scatter(
@@ -622,7 +634,7 @@ impl PyLaser {
         if let Some(principal) = principal {
             selector = selector.principal(PrincipalId::new(principal));
         }
-        let route = inbox_route(fixed_inbox);
+        let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
             let report = laser
                 .scatter_report(
@@ -733,8 +745,14 @@ impl PyLaser {
         let laser = self.inner.clone();
         let conversation =
             ConversationId::from_str(&conversation_id).map_err(|e| to_pyerr(e.into()))?;
-        let topics: Option<Vec<AgentTopic<'static>>> =
-            topics.map(|names| names.into_iter().map(static_topic).collect());
+        let topics: Option<Vec<AgentTopic<'static>>> = topics
+            .map(|names| {
+                names
+                    .into_iter()
+                    .map(static_topic)
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
         let selected: Box<dyn ContextPolicy> = match roles {
             Some(roles) => {
                 let mut set = HashSet::new();
@@ -846,7 +864,7 @@ impl PyAgentCtx {
                     ))
                 })?
                 .wire_id();
-            let producer = laser.agdx(static_topic(reply_topic), source, envelope.conversation);
+            let producer = laser.agdx(static_topic(reply_topic)?, source, envelope.conversation);
             let send = producer.respond(correlation, response);
             let send = match &signing_key {
                 Some(key) => send.signed_by(key),
@@ -887,7 +905,7 @@ impl PyAgentCtx {
                     })?
                     .wire_id();
                 let producer = laser.agdx(
-                    static_topic(name),
+                    static_topic(name)?,
                     source,
                     message.provenance.conversation_id.into(),
                 );
@@ -1007,8 +1025,8 @@ impl PyAgentCtx {
         let laser = self.laser.clone();
         let message = self.message.clone();
         let agent = self.agent.clone();
-        let respond_on = self.respond_on.clone().map(static_topic);
-        let route = inbox_route(fixed_inbox);
+        let respond_on = self.respond_on.clone().map(static_topic).transpose()?;
+        let route = inbox_route(fixed_inbox)?;
         let payload = payload_bytes(payload)?;
         let gather_policy = parse_gather_policy(policy, quorum)?;
         future_into_py(py, async move {
@@ -1065,7 +1083,7 @@ impl PyAgentCtx {
         let laser = self.laser.clone();
         let message = self.message.clone();
         let agent = self.agent.clone();
-        let respond_on = self.respond_on.clone().map(static_topic);
+        let respond_on = self.respond_on.clone().map(static_topic).transpose()?;
         let prompt = payload_bytes(prompt)?;
         future_into_py(py, async move {
             let ctx = laser_sdk::testing::agent_ctx(
@@ -1077,7 +1095,7 @@ impl PyAgentCtx {
             );
             let decision = ctx
                 .approval_gate(
-                    static_topic(reply_topic),
+                    static_topic(reply_topic)?,
                     prompt,
                     duration_seconds(timeout_secs, "timeout_secs")?,
                 )
@@ -1140,6 +1158,35 @@ pub struct PyAgentHandle {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     join: Mutex<Option<JoinHandle<Result<(), LaserError>>>>,
     ready: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+// Dropping the handle without `shutdown()` or `abort()` would otherwise strand
+// the consumer task: it keeps polling, handling, and acking with its stop signal
+// gone. Collection of the Python object is the last chance to stop it.
+impl Drop for PyAgentHandle {
+    fn drop(&mut self) {
+        // Prefer the graceful signal so an in-flight handler still finishes.
+        // Abort only when the signal is already spent and the task is somehow
+        // still owned here, where there is nothing left to wind it down.
+        let signalled = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map(|sender| sender.send(()))
+            .is_some();
+        if signalled {
+            return;
+        }
+        if let Some(join) = self
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            join.abort();
+        }
+    }
 }
 
 #[gen_stub_pymethods]

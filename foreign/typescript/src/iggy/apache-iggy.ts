@@ -378,7 +378,9 @@ export function parseConnectionString(
   try {
     url = new URL(withScheme)
   } catch (cause) {
-    throw new ConfigError(`invalid connection string: ${connectionString}`, { cause })
+    // The string carries a password, so it is never echoed. Errors below can
+    // name the parsed authority, which holds no credential.
+    throw new ConfigError("invalid connection string", { cause })
   }
 
   if (url.protocol !== "iggy:" && url.protocol !== "iggy+tcp:") {
@@ -386,12 +388,12 @@ export function parseConnectionString(
   }
 
   if (!url.hostname) {
-    throw new ConfigError(`connection string missing host: ${connectionString}`)
+    throw new ConfigError("connection string missing host")
   }
 
   const port = url.port ? Number(url.port) : 8090
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new ConfigError(`connection string has invalid port: ${connectionString}`)
+    throw new ConfigError(`connection string has invalid port: ${url.port}`)
   }
 
   const username = decodeURIComponent(url.username)
@@ -403,7 +405,12 @@ export function parseConnectionString(
         ? { token: username }
         : { username, password }
 
-  const autoTls = env["LASER_NO_TLS"] === undefined && laserDataHost(url.hostname)
+  // Read by value, not by presence: `LASER_NO_TLS=0` and `=false` must not
+  // silently downgrade a managed host to plaintext.
+  const noTls = ["1", "true", "yes", "on"].includes(
+    (env["LASER_NO_TLS"] ?? "").trim().toLowerCase()
+  )
+  const autoTls = !noTls && laserDataHost(url.hostname)
   const tls = url.searchParams.get("tls") === "true" || autoTls
   const caPath = url.searchParams.get("tls_ca_file") ?? env["LASER_TLS_CERT"]
   let ca: string | undefined
@@ -471,7 +478,7 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
 
   let raw: RawClient | undefined
   try {
-    raw = getVsrRawClient(config)
+    raw = getRawClient(config)
   } catch (cause) {
     throw new ConfigError("invalid Apache Iggy client configuration", { cause })
   }
@@ -496,27 +503,6 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
       cause
     })
   }
-}
-
-function getVsrRawClient(config: ClientConfig): RawClient {
-  if (config.transport !== "TLS") return getRawClient(config)
-
-  // apache-iggy@0.8.1-edge.3 has a stale normalization guard for VSR over TLS.
-  // Its TLS socket and VSR framing are transport-independent once normalized.
-  let firstTransportRead = true
-  const compatibleConfig = { ...config }
-  Object.defineProperty(compatibleConfig, "transport", {
-    configurable: true,
-    enumerable: true,
-    get: () => {
-      if (firstTransportRead) {
-        firstTransportRead = false
-        return "TCP"
-      }
-      return "TLS"
-    }
-  })
-  return getRawClient(compatibleConfig)
 }
 
 function serverResponseError(error: unknown): Error | undefined {

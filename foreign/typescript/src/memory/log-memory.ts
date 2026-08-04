@@ -364,6 +364,10 @@ function mergePatch(base: unknown, patch: unknown): unknown {
   if (!isObject(patch)) return patch
   const output: Record<string, unknown> = isObject(base) ? { ...base } : {}
   for (const [key, value] of Object.entries(patch)) {
+    // `JSON.parse` produces `__proto__` as an own key, and assigning it would
+    // hit the prototype setter: the key is silently lost and the merged
+    // object's prototype is rewired. Reserved keys are skipped instead.
+    if (key === "__proto__" || key === "constructor" || key === "prototype") continue
     if (value === null) Reflect.deleteProperty(output, key)
     else output[key] = mergePatch(output[key], value)
   }

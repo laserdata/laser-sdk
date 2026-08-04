@@ -791,7 +791,7 @@ impl KvScanRequest {
 
     /// Cap the page at `n` entries (clamped to `MAX_SCAN_LIMIT`).
     pub fn limit(mut self, n: usize) -> Self {
-        self.limit = n;
+        self.limit = n.min(laser_wire::limits::MAX_SCAN_LIMIT);
         self
     }
 

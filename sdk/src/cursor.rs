@@ -74,7 +74,12 @@ impl Cursor {
         self
     }
 
-    /// Read at most `batch` messages per partition per poll (default 1000).
+    /// Size each server poll at `batch` messages per partition (default 1000).
+    ///
+    /// This is the per-request size, not a ceiling on one [`poll`](Self::poll):
+    /// a poll keeps requesting until it reaches the partition's tail or the
+    /// per-partition drain ceiling, whichever comes first. Persist
+    /// [`offsets`](Self::offsets) and poll again to continue past the ceiling.
     pub fn batch(mut self, batch: u32) -> Self {
         self.batch = batch.max(1);
         self
@@ -148,7 +153,7 @@ impl Cursor {
         else {
             return Ok(Vec::new());
         };
-        let partitions = details.partitions_count as usize;
+        let partitions = crate::poll::bounded_partitions(details.partitions_count) as usize;
         if self.offsets.len() < partitions {
             self.offsets.resize(partitions, 0);
         }

@@ -919,7 +919,7 @@ impl LogMemory {
         let Some(details) = self.laser.client().get_topic(&stream, &topic).await? else {
             return Ok(());
         };
-        let partitions = details.partitions_count;
+        let partitions = crate::poll::bounded_partitions(details.partitions_count);
         let consumer = Consumer::new(Identifier::named("laser-log-memory")?);
 
         let from = {

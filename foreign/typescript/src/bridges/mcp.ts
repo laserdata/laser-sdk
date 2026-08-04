@@ -1,4 +1,10 @@
-import { CodecError, HandlerConfigError, InvalidError, TimeoutError } from "../client/errors.js"
+import {
+  CodecError,
+  HandlerConfigError,
+  InvalidError,
+  publicErrorMessage,
+  TimeoutError
+} from "../client/errors.js"
 import { INTERNAL_REPLY_HUB } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ConversationId, type AgentId } from "../types/ids.js"
@@ -295,7 +301,7 @@ export class McpBridge {
         id,
         error: {
           code: MCP_APP_ERROR_CODE,
-          message: error instanceof Error ? error.message : String(error)
+          message: publicErrorMessage(error)
         }
       }
     }

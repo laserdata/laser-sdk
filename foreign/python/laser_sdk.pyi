@@ -708,7 +708,7 @@ class ChunkAssembler:
     def feed(self, message: AgentMessage) -> typing.Any:
         r"""
         Apply one message of this channel. Returns the events it produced, each a
-        dict: `{"kind": "body", "sequence": int, "bytes": bytes}`, `{"kind":
+        dict: `{"kind": "body", "sequence": int, "payload": bytes}`, `{"kind":
         "finished", "finish_reason": str|None, "synthetic": bool, "input_tokens":
         int|None, "output_tokens": int|None}`, or `{"kind": "failed", "bytes":
         bytes}` (the encoded error body). A plain (non-AGDX) message produces no

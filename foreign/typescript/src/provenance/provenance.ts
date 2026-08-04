@@ -140,7 +140,10 @@ function strValue(value: IggyHeaderValue, key: string): string {
 }
 
 function parseUnsignedBigInt(text: string, key: string): bigint {
-  if (!/^[0-9]+$/.test(text)) {
+  // Bounded before parsing: decimal-to-BigInt conversion is superlinear, so a
+  // megabyte of digits on a peer-supplied header would burn CPU per message.
+  // Encode enforces the same cap, so anything longer was never produced here.
+  if (text.length > HEADER_VALUE_MAX || !/^[0-9]+$/.test(text)) {
     throw new CodecError(`invalid value for header \`${key}\``, "provenance", "decode")
   }
   return BigInt(text)

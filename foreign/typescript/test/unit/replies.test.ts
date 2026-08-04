@@ -205,7 +205,7 @@ void test("given_a_verifier_when_an_unsigned_reply_echoes_the_correlation_then_s
     { strategy: "last", result: [] },
     { strategy: "offset", result: [agdxReply(correlation, "forged-unsigned", 1n)] }
   ])
-  const hub = await ReplyHub.create(transport, "stream", "replies", enrolled())
+  const hub = await ReplyHub.create(transport, "stream", "replies", undefined, enrolled())
   try {
     const ticket = hub.subscribe(correlation.toString())
     await assert.rejects(ticket.wait(100), TimeoutError)
@@ -219,7 +219,7 @@ void test("given_a_verifier_when_a_plain_reply_echoes_the_correlation_then_shoul
     { strategy: "last", result: [] },
     { strategy: "offset", result: [replyMessage("corr-plain", 1n)] }
   ])
-  const hub = await ReplyHub.create(transport, "stream", "replies", enrolled())
+  const hub = await ReplyHub.create(transport, "stream", "replies", undefined, enrolled())
   try {
     const ticket = hub.subscribe("corr-plain")
     await assert.rejects(ticket.wait(100), TimeoutError)
@@ -234,7 +234,7 @@ void test("given_a_bound_signer_when_a_different_enrolled_key_replies_then_shoul
     { strategy: "last", result: [] },
     { strategy: "offset", result: [agdxReply(correlation, "forged-wrong-signer", 1n, otherKey)] }
   ])
-  const hub = await ReplyHub.create(transport, "stream", "replies", enrolled())
+  const hub = await ReplyHub.create(transport, "stream", "replies", undefined, enrolled())
   try {
     const ticket = hub.subscribe(correlation.toString(), "tool")
     await assert.rejects(ticket.wait(100), TimeoutError)
@@ -249,7 +249,7 @@ void test("given_a_verifier_when_the_bound_signer_replies_then_should_resolve_wi
     { strategy: "last", result: [] },
     { strategy: "offset", result: [agdxReply(correlation, "honest", 1n, toolKey)] }
   ])
-  const hub = await ReplyHub.create(transport, "stream", "replies", enrolled())
+  const hub = await ReplyHub.create(transport, "stream", "replies", undefined, enrolled())
   try {
     const ticket = hub.subscribe(correlation.toString(), "tool")
     const reply = await ticket.wait(2_000)
