@@ -17,7 +17,14 @@ import {
   type FenceSweepState,
   type ReceivedAgentMessage
 } from "../../src/agent/reliable-consumer.js"
-import { RejectedError, TransportError } from "../../src/client/errors.js"
+import {
+  AgentWorkflowExecutionError,
+  AuthzExecutionError,
+  GraphExecutionError,
+  QueryExecutionError,
+  RejectedError,
+  TransportError
+} from "../../src/client/errors.js"
 import type { IggyHeaderValue } from "../../src/iggy/apache-iggy.js"
 import type { Provenance } from "../../src/provenance/provenance.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
@@ -183,4 +190,12 @@ void test("given_permanent_and_transient_errors_when_classified_then_should_retr
   assert.equal(isRetryable(new RejectedError("no")), false)
   assert.equal(isRetryable(new TransportError("temporary", true)), true)
   assert.equal(isRetryable(new TransportError("permanent", false)), false)
+  assert.equal(isRetryable(new QueryExecutionError("busy", { kind: "unavailable" })), true)
+  assert.equal(isRetryable(new QueryExecutionError("fault", { kind: "backend" })), false)
+  assert.equal(isRetryable(new GraphExecutionError("invalid", { kind: "invalidName" })), false)
+  assert.equal(
+    isRetryable(new AgentWorkflowExecutionError("redirect", { kind: "notLeader" })),
+    true
+  )
+  assert.equal(isRetryable(new AuthzExecutionError("forbidden", { kind: "unauthorized" })), false)
 })

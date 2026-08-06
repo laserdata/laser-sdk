@@ -1,4 +1,9 @@
-import type { IggyHeaderValue, LaserTransport, MessageWithHeaders } from "../iggy/apache-iggy.js"
+import type {
+  IggyHeaderValue,
+  LaserTransport,
+  MessageWithHeaders,
+  SendMessagesResponse
+} from "../iggy/apache-iggy.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
 import { InvalidError, UnsupportedError } from "../client/errors.js"
 import { CompiledSchema } from "../schema-codecs.js"
@@ -79,7 +84,7 @@ export class Topic {
     })
   }
 
-  async send(payload: BytesLike, options: RawSendOptions = {}): Promise<void> {
+  async send(payload: BytesLike, options: RawSendOptions = {}): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError("send() accepts a routing key or an explicit partition, not both")
     }
@@ -101,7 +106,7 @@ export class Topic {
         headers.set(key, value)
     }
     if (headers.size > 0) {
-      await this.observed("publish", { records: 1 }, () =>
+      return this.observed("publish", { records: 1 }, () =>
         this.transport.sendMessageWithHeaders(
           this.streamName,
           this.name,
@@ -115,13 +120,16 @@ export class Topic {
         )
       )
     } else {
-      await this.observed("publish", { records: 1 }, () =>
+      return this.observed("publish", { records: 1 }, () =>
         this.transport.sendMessages(this.streamName, this.name, [bytes], routing)
       )
     }
   }
 
-  async batch(payloads: readonly BytesLike[], options: RawSendOptions = {}): Promise<number> {
+  async batch(
+    payloads: readonly BytesLike[],
+    options: RawSendOptions = {}
+  ): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError("batch() accepts a routing key or an explicit partition, not both")
     }
@@ -147,7 +155,7 @@ export class Topic {
         headers.set(key, value)
     }
     if (headers.size > 0) {
-      await this.observed("publish_batch", { records: bytesList.length }, () =>
+      return this.observed("publish_batch", { records: bytesList.length }, () =>
         this.transport.sendMessagesWithHeaders(
           this.streamName,
           this.name,
@@ -160,17 +168,16 @@ export class Topic {
         )
       )
     } else {
-      await this.observed("publish_batch", { records: bytesList.length }, () =>
+      return this.observed("publish_batch", { records: bytesList.length }, () =>
         this.transport.sendMessages(this.streamName, this.name, bytesList, routing)
       )
     }
-    return bytesList.length
   }
 
   async sendRecords(
     records: readonly MessageWithHeaders[],
     options: { readonly key?: Uint8Array; readonly partition?: number } = {}
-  ): Promise<void> {
+  ): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError(
         "sendRecords() accepts a routing key or an explicit partition, not both"
@@ -185,7 +192,7 @@ export class Topic {
         headers: record.headers
       })
     }
-    await this.observed("publish_batch", { records: governed.length }, () =>
+    return this.observed("publish_batch", { records: governed.length }, () =>
       this.transport.sendMessagesWithHeaders(
         this.streamName,
         this.name,

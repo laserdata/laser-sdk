@@ -15,7 +15,11 @@ import {
   type PresenceEntry,
   type RegisteredCard
 } from "../../src/agent/registry.js"
-import type { LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
+import type {
+  LaserTransport,
+  PolledMessage,
+  SendMessagesResponse
+} from "../../src/iggy/apache-iggy.js"
 import { Cursor } from "../../src/stream/cursor.js"
 import { AgentId as SdkAgentId, PrincipalId } from "../../src/types/ids.js"
 import {
@@ -81,15 +85,15 @@ class RegistryTransport implements LaserTransport {
     return Promise.resolve(1)
   }
 
-  sendMessages(): Promise<void> {
+  sendMessages(): Promise<SendMessagesResponse> {
     return Promise.reject(new Error("unused"))
   }
 
-  sendMessageWithHeaders(): Promise<void> {
+  sendMessageWithHeaders(): Promise<SendMessagesResponse> {
     return Promise.reject(new Error("unused"))
   }
 
-  sendMessagesWithHeaders(): Promise<void> {
+  sendMessagesWithHeaders(): Promise<SendMessagesResponse> {
     return Promise.reject(new Error("unused"))
   }
 

@@ -3,6 +3,7 @@ import { test } from "node:test"
 import {
   resultCodeFromCode,
   resultCodeHttpStatus,
+  resultCodeIsRetryable,
   resultCodeToCode
 } from "../../src/wire/result.js"
 
@@ -18,7 +19,8 @@ const EXPECTED_CODE_AND_STATUS: readonly (readonly [string, number, number])[] =
   ["Unauthenticated", 8, 401],
   ["Backend", 9, 502],
   ["Forbidden", 10, 403],
-  ["StepUpRequired", 11, 403]
+  ["StepUpRequired", 11, 403],
+  ["Unavailable", 12, 503]
 ]
 
 void test("given_known_result_codes_when_mapped_then_should_match_the_pinned_dictionary", () => {
@@ -28,6 +30,21 @@ void test("given_known_result_codes_when_mapped_then_should_match_the_pinned_dic
     assert.equal(resultCodeToCode(value), code)
     assert.equal(resultCodeHttpStatus(value), httpStatus)
   }
+})
+
+void test("given_transient_result_codes_when_classified_then_should_be_the_only_retryable_ones", () => {
+  for (const name of ["Unavailable", "Stale"] as const) {
+    assert.equal(resultCodeIsRetryable({ kind: "known", name }), true)
+  }
+  for (const [name] of EXPECTED_CODE_AND_STATUS) {
+    if (name === "Unavailable" || name === "Stale") continue
+    assert.equal(
+      resultCodeIsRetryable({ kind: "known", name: name as "Ok" }),
+      false,
+      `${name} must not invite a blind retry`
+    )
+  }
+  assert.equal(resultCodeIsRetryable({ kind: "unrecognized", code: 9999 }), false)
 })
 
 void test("given_an_unrecognized_result_code_when_decoded_then_should_pass_through", () => {

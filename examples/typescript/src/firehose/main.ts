@@ -118,7 +118,8 @@ async function publishOrg(
     const batch = Array.from({ length: size }, (_, offset) =>
       telemetry(org, sent + offset, payloadBytes, rng)
     )
-    sent += await topic.publishBatch().inlinePayload().extendJson(batch, TELEMETRY_CODEC).send()
+    await topic.publishBatch().inlinePayload().extendJson(batch, TELEMETRY_CODEC).send()
+    sent += size
   }
   return sent
 }

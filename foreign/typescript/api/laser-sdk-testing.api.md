@@ -4,6 +4,7 @@
 
 ```ts
 
+import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
 
 // Warning: (ae-forgotten-export) The symbol "Laser" needs to be exported by the entry point testing.d.ts

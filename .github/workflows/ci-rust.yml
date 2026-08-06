@@ -89,8 +89,8 @@ jobs:
           cargo machete
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  # The same static gates for the crates outside the workspace (bdd/rust and
-  # fuzz), which `--workspace` does not reach. Kept a separate job so it runs in
+  # The same static gates for the crates outside the workspace (bdd/rust, bench,
+  # and fuzz), which `--workspace` does not reach. Kept a separate job so it runs in
   # parallel and its heavier dependency builds do not slow the workspace lint.
   lint-detached:
     runs-on: ubuntu-latest
@@ -111,6 +111,16 @@ jobs:
           cargo sort --check
           cargo machete
           cargo clippy --all-targets -- -D warnings
+      - name: lint and test bench
+        working-directory: bench
+        run: |
+          cargo fmt --all --check
+          cargo sort --check
+          cargo machete
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+          cargo test --locked --doc
+          cargo bench --locked --profile dev --bench micro --no-run
       - name: lint fuzz
         working-directory: fuzz
         run: |

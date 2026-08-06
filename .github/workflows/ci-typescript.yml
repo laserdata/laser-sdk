@@ -164,7 +164,10 @@ jobs:
         working-directory: bdd/typescript
       - run: npm run build
         working-directory: bdd/typescript
-      - run: mkdir -p reports
+      - name: Prepare Cucumber report
+        run: |
+          mkdir -p reports
+          printf '[]\n' > reports/cucumber.json
         working-directory: bdd/typescript
       - run: node ../../scripts/run-with-test-iggy.mjs npx cucumber-js --config cucumber.js --format progress --format json:reports/cucumber.json
         working-directory: bdd/typescript

@@ -93,6 +93,8 @@ console.log(`read ${messages.length} message(s)`)
 
 That is the complete open streaming path. Add `managed` for projections, query, KV, forks, graph, and the run registry on Laser Stack or LaserData Cloud. Add `agent` for reliable handlers, memory, contracts, and workflows.
 
+Every direct or fluent streaming send returns Apache Iggy's commit confirmations. Each confirmation identifies the selected stream, topic, partition, and batch base offset. The list can be empty when a server cannot report offsets. A confirmation is an in-memory commit position, not an fsync guarantee, and its base offset is meaningful only with its stream, topic, and partition.
+
 One connection addresses every stream on the server. The canonical path is `laser.stream(name).topic(name)`. Each SDK also offers a default-stream helper for applications that mostly use one stream, but that helper only enables the shorter `laser.topic(name)` accessor and never limits the connection.
 
 ## One grammar, every primitive
@@ -191,41 +193,47 @@ run = await laser.runs().submit("refund", task)
 And the same grammar in TypeScript, camelCase over the identical accessors:
 
 ```ts
-const laser = await Laser.connect("iggy:iggy@127.0.0.1");
-const orders = laser.stream("app").topic("orders");
-const audit = laser.stream("audit").topic("events");
+const laser = await Laser.connect("iggy:iggy@127.0.0.1")
+const orders = laser.stream("app").topic("orders")
+const audit = laser.stream("audit").topic("events")
 
 // Log
-await orders.publish().json(order).send();
-await audit.publish().json(event).send();
+await orders.publish().json(order).send()
+await audit.publish().json(event).send()
 
 // Views + graph + change feed
 const rows = await laser
   .query("orders_v1")
   .whereEq("status", "paid")
   .limit(10)
-  .fetch();
-const nearby = await laser.graph("kg").neighbors(node, "out", undefined, 2);
-const feed = await laser.watch().index("orders_v1").records();
+  .fetch()
+const nearby = await laser.graph("kg").neighbors(node, "out", undefined, 2)
+const feed = await laser.watch().index("orders_v1").records()
 
 // State
-await laser.kv("sessions").set(key).json(session).ttl(300_000_000n).send();
-const draft = laser.fork("what-if");
+await laser.kv("sessions").set(key).json(session).ttl(300_000_000n).send()
+const draft = laser.fork("what-if")
 
 // Fabric: one task streams its messages, keeps its memory, resolves its deps
-const ctx = laser.context(conversation);
-await ctx.append("audit", new TextEncoder().encode("step done"));
+const ctx = laser.context(conversation)
+await ctx.append("audit", new TextEncoder().encode("step done"))
 const facts = await ctx
   .memory("support")
   .recall()
   .semantic("refund disputes")
-  .fetch();
-const run = await laser.runs().submit("refund", task);
+  .fetch()
+const run = await laser.runs().submit("refund", task)
 ```
 
-The accessors are free to construct, IO happens at the terminal verb (`.send()` writes, `.fetch()` reads), and options are fluent. Ordinary services use `topic.producer()`, `topic.consumer(..)`, and `topic.consumer_group(..)`: direct batching and linger, retries, key/partition routing, live `futures::Stream` reads, group creation, polling strategy, replay, and automatic or explicit server offset commits are all Laser APIs. `ConsumerMessage` preserves exact Apache Iggy headers and log positions. The substrate still stays one call away through `topic.iggy_producer()`, `topic.iggy_consumer_group()`, the complete `laser.client()`, and the exact-version `laser_sdk::iggy` re-export for encryption or administration outside the Laser surface.
+### Streaming contract
 
-Laser SDK's Rust, Python, and TypeScript clients always use Apache Iggy's VSR client framing. There is no protocol feature flag and no classic-protocol build. Managed reads and plane-forwarded commands use VSR's non-replicated extension path, while role definition, deletion, and binding use dedicated replicated operations and are classified authoritatively by the server.
+- Accessors are free to construct. IO starts at terminal verbs such as `.send()` and `.fetch()`.
+- `topic.producer()` supports batching, linger, retries, and key or partition routing.
+- `topic.consumer(..)` and `topic.consumer_group(..)` provide live reads, replay, polling control, and automatic or explicit offset commits.
+- `ConsumerMessage` preserves the exact Apache Iggy headers and log position.
+- `topic.iggy_producer()`, `topic.iggy_consumer_group()`, `laser.client()`, and `laser_sdk::iggy` expose Apache Iggy directly when the Laser surface is not enough.
+
+All three SDKs use Apache Iggy VSR framing. Managed commands use the same connection and are dispatched according to the capabilities reported by the server.
 
 **Data platform** (the core, stands on its own):
 
@@ -267,13 +275,26 @@ The agent fabric is the part most systems bolt on as a separate service. Here, r
 
 ## Open core, managed surface
 
-The **open** surface (publish, consume, the agent runtime, provenance, log-backed memory, AGDX, and all coordination) runs on Apache Iggy. The **managed** surface (query, projections, KV, forks, the knowledge graph, durable dedup, and the fenced leases behind `.exclusive()` / `.exclusive_in(..)`) runs on [LaserData Cloud](https://laserdata.com) or [Laser Stack](https://github.com/laserdata/laser-stack) and returns `LaserError::Unsupported` on Apache Iggy without a managed backend. The same code runs in every deployment, and capability negotiation at connect decides what is available. The SDK never hides the Iggy client (`topic.iggy_producer()`, `topic.iggy_consumer(..)`, `laser.client()`).
+| Deployment | Available surfaces |
+| --- | --- |
+| Apache Iggy | Streaming, provenance, AGDX, the agent runtime, log-backed memory, contracts, and workflows |
+| Laser Stack | Everything above, plus query, projections, KV, forks, graph, durable memory, the run registry, durable dedup, and fenced leases |
+| LaserData Cloud | The complete SDK surface with managed deployment and UI services |
 
-Laser Stack packages the LaserData Apache Iggy fork and `laser-plane`. The fork's `server-ng` process serves VSR streaming, authenticates the connection, and handles or forwards the custom AGDX command band. `laser-plane` consumes the durable control and data logs, maintains the embedded query and state read models, and serves the forwarded query, projection, schema, KV, fork, graph, and run operations. LaserData Cloud uses the same core path and adds Warden, deployment services, and proprietary features such as the Stream and Data UI.
+Capability negotiation runs during connection setup. A managed call against Apache Iggy without a managed backend returns `LaserError::Unsupported`. The underlying client remains available through `topic.iggy_producer()`, `topic.iggy_consumer(..)`, and `laser.client()`.
 
-Access is governed in two layers. Iggy's native RBAC grants global, stream, and topic permissions, so it decides whether a credential can create streams, send records, poll topics, and see a stream at all. LaserData's governance RBAC grants managed-surface capabilities, so it decides whether the same server-stamped user can call query, KV, graph, projection, fork, agent, workflow, and `authz` operations. The layers are independent: creating a user does not bind any governance role, and an operator must explicitly bind roles to grant managed access. `LaserError::is_permission_denied()` and `is_stream_or_topic_not_found()` classify native permission misses, and managed authorization failures return the unified unauthorized result.
+Laser Stack runs the LaserData Apache Iggy fork with `laser-plane`. Apache Iggy owns the durable log and VSR connection. `laser-plane` maintains the managed read models and handles query, projection, schema, KV, fork, graph, and run operations.
 
-`Laser::connect` and `connect_with_stream` recognize a `*.laserdata.cloud` or `*.laserdata.com` host in the connection string and auto-attach TLS with LaserData's public root CA, embedded in the SDK itself so a bare connection string is enough (no cert file to fetch or ship). The CA is cached in a per-user, owner-only directory and refreshed whenever the bundled cert changes. `LASER_TLS_CERT=<path>` overrides it with any CA file (a rotated cert included), `LASER_NO_TLS=1` disables the auto-attach (read by value, so `0` and `false` do not disable it), and any other host is left untouched: bring your own `tls=true&tls_ca_file=<path>` for a self-hosted deployment.
+### Authorization
+
+- Apache Iggy RBAC controls server, stream, and topic access.
+- LaserData governance RBAC controls managed capabilities.
+- The layers are independent. Creating a user does not grant a managed role.
+- `LaserError::is_permission_denied()` and `is_stream_or_topic_not_found()` classify native access failures. Managed authorization uses the unified unauthorized result.
+
+### TLS
+
+Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the public LaserData CA bundled with the SDK. `LASER_TLS_CERT=<path>` overrides that CA, and `LASER_NO_TLS=1` disables automatic TLS setup. Other hosts keep the TLS settings from their connection string.
 
 ## Documentation
 
@@ -294,7 +315,26 @@ Access is governed in two layers. Iggy's native RBAC grants global, stream, and 
 | [`foreign/typescript`](foreign/typescript/README.md) | the native TypeScript SDK over Apache Iggy. |
 | [`examples`](examples/README.md) | eight tiny per-primitive examples (`log`, `query`, `watch`, `kv`, `graph`, `recall`, `context`, `agent`, one per accessor above, step-for-step identical in all three languages), plus nine runnable systems: a focused direct-streaming producer/consumer walkthrough, event analytics, an order book, a firehose load generator, an agentic support desk, an agentic-memory loop, an A2A/MCP/AG-UI interop gateway, the `orchestra` multi-agent orchestrator, and a governance scenario. |
 
+## Benchmarks
+
+Run the maintained native campaign from the repository root:
+
+```sh
+just bench
+just bench 15 3 8 # seconds per arm, repetitions, parallel lanes
+```
+
+- Matched raw Iggy and Laser streaming workloads use TCP VSR and one connection per producer or consumer lane.
+- The maintained campaign covers streaming, AGDX, managed surfaces, MCP, startup, and recovery.
+- The harness runs in release mode and keeps progress output outside timed regions.
+- Results include immutable JSON evidence, HDR histograms, CSV exports, and a standalone HTML report.
+- `bench/.env` can select caller-provided native binaries. Otherwise the harness resolves the maintained signed artifacts.
+
+Use `just bench-smoke` to validate the harness and `just bench-full` for the exhaustive matrix. Read [`bench/README.md`](bench/README.md) for workload definitions, result interpretation, and authoritative campaign requirements.
+
 ## Development
+
+Run the repository gates from the root:
 
 ```sh
 just lint    # fmt + sort + machete + clippy -D warnings
@@ -304,7 +344,14 @@ just bdd     # cross-SDK BDD conformance (needs Docker)
 just ci      # the full gate (lint, test, wasm, deny, advisories, fixtures)
 ```
 
-Build profiles select Laser capabilities only: the default is typed streaming plus provenance, `--no-default-features --features streaming` selects streaming alone, `--features agent` adds the agent fabric, and `--features managed` adds every managed platform surface. Every profile uses VSR.
+Feature profiles select Laser capabilities:
+
+- Default: typed streaming and provenance.
+- `--no-default-features --features streaming`: streaming only.
+- `--features agent`: agent runtime and coordination.
+- `--features managed`: every managed surface.
+
+Every profile uses VSR.
 
 ## Delivery model
 

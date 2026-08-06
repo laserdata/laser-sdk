@@ -116,6 +116,7 @@ impl Laser {
         }
         self.send_with_headers(&topic_name, payload, headers, Some(&key))
             .await
+            .map(|_| ())
     }
 
     /// Redrive a dead-lettered message: read the original record at the
@@ -220,6 +221,7 @@ impl Laser {
             .build()?;
         self.send_batch_on(&stream_name, &topic_name, vec![message], key.as_deref())
             .await
+            .map(|_| ())
     }
 
     /// Reassemble a chunk stream from the log: read `conversation` on `topic`,

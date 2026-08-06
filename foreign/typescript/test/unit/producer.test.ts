@@ -13,7 +13,9 @@ void test("given_retryable_transport_failures_when_sending_then_should_retry_to_
   let attempts = 0
   const transport = transportWithSend(() => {
     attempts += 1
-    return attempts < 3 ? Promise.reject(new TransportError("transient", true)) : Promise.resolve()
+    return attempts < 3
+      ? Promise.reject(new TransportError("transient", true))
+      : Promise.resolve({ confirmations: [] })
   })
   const producer = new Producer(transport, "stream", "topic", {
     retries: 2,
@@ -39,7 +41,7 @@ void test("given_a_non_retryable_transport_failure_when_sending_then_should_not_
 
 void test("given_a_producer_when_asynchronously_disposed_then_should_reject_further_sends", async () => {
   const producer = new Producer(
-    transportWithSend(() => Promise.resolve()),
+    transportWithSend(() => Promise.resolve({ confirmations: [] })),
     "stream",
     "topic"
   )
@@ -47,4 +49,22 @@ void test("given_a_producer_when_asynchronously_disposed_then_should_reject_furt
   await producer[Symbol.asyncDispose]()
 
   await assert.rejects(producer.send(new Uint8Array([1])), /called after shutdown/)
+})
+
+void test("given_a_committed_send_when_publishing_then_should_return_the_confirmation", async () => {
+  const confirmation = {
+    streamId: 1,
+    topicId: 2,
+    partitionId: 3,
+    baseOffset: 4n
+  }
+  const producer = new Producer(
+    transportWithSend(() => Promise.resolve({ confirmations: [confirmation] })),
+    "stream",
+    "topic"
+  )
+
+  const response = await producer.send(new Uint8Array([1]))
+
+  assert.deepEqual(response.confirmations, [confirmation])
 })

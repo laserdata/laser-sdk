@@ -677,6 +677,7 @@ export type QueryError =
   | { readonly kind: "indexNotFound"; readonly message: string }
   | { readonly kind: "forkNotFound"; readonly message: string }
   | { readonly kind: "backend"; readonly message: string }
+  | { readonly kind: "unavailable"; readonly message: string }
   | {
       readonly kind: "tooLarge"
       readonly what: string
@@ -704,6 +705,8 @@ export function encodeQueryError(error: QueryError): unknown {
       return new Map([["ForkNotFound", error.message]])
     case "backend":
       return new Map([["Backend", error.message]])
+    case "unavailable":
+      return new Map([["Unavailable", error.message]])
     case "tooLarge":
       return new Map([
         [
@@ -754,6 +757,8 @@ export function decodeQueryError(value: unknown, context: string): QueryError {
       return { kind: "forkNotFound", message: expectString(inner, context) }
     case "Backend":
       return { kind: "backend", message: expectString(inner, context) }
+    case "Unavailable":
+      return { kind: "unavailable", message: expectString(inner, context) }
     case "TooLarge": {
       const tooLargeMap = expectMap(inner, context)
       return {

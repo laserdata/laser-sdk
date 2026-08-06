@@ -7,7 +7,8 @@ import type {
   ConsumerTarget,
   LaserTransport,
   MessageWithHeaders,
-  PolledMessage
+  PolledMessage,
+  SendMessagesResponse
 } from "../../src/iggy/apache-iggy.js"
 import type { UlidSource } from "../../src/runtime/ulid.js"
 import { AgentId, ConversationId as SdkConversationId } from "../../src/types/ids.js"
@@ -92,7 +93,7 @@ class FakeTransport implements LaserTransport {
     return Promise.resolve(1)
   }
 
-  sendMessages(): Promise<void> {
+  sendMessages(): Promise<SendMessagesResponse> {
     return Promise.reject(new Error("unused"))
   }
 
@@ -102,7 +103,7 @@ class FakeTransport implements LaserTransport {
     payload: Uint8Array,
     headers: MessageWithHeaders["headers"],
     partitionKey?: string | Uint8Array
-  ): Promise<void> {
+  ): Promise<SendMessagesResponse> {
     return this.sendMessagesWithHeaders(stream, topic, [{ payload, headers }], partitionKey)
   }
 
@@ -111,7 +112,7 @@ class FakeTransport implements LaserTransport {
     topic: string,
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array
-  ): Promise<void> {
+  ): Promise<SendMessagesResponse> {
     this.batches.push({
       stream,
       topic,
@@ -119,7 +120,7 @@ class FakeTransport implements LaserTransport {
       ...(partitionKey !== undefined ? { partitionKey } : {})
     })
     this.onSend?.(messages)
-    return Promise.resolve()
+    return Promise.resolve({ confirmations: [] })
   }
 
   pollMessages(

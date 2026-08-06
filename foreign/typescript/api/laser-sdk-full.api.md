@@ -4,6 +4,8 @@
 
 ```ts
 
+import type { SendMessagesConfirmation } from 'apache-iggy';
+import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
 
 // @public (undocumented)
@@ -995,6 +997,9 @@ export type AgentWorkflowError = {
     readonly kind: "backend";
     readonly message: string;
 } | {
+    readonly kind: "unavailable";
+    readonly message: string;
+} | {
     readonly kind: "version";
     readonly expected: number;
     readonly got: number;
@@ -1438,7 +1443,7 @@ export class BatchPublishRequest {
     // (undocumented)
     schemaId(value: number): this;
     // (undocumented)
-    send(): Promise<number>;
+    send(): Promise<SendMessagesResponse>;
 }
 
 // @public (undocumented)
@@ -3804,6 +3809,9 @@ export type ForkError = {
     readonly kind: "backend";
     readonly message: string;
 } | {
+    readonly kind: "unavailable";
+    readonly message: string;
+} | {
     readonly kind: "version";
     readonly expected: number;
     readonly got: number;
@@ -4175,6 +4183,9 @@ export type GraphError = {
     readonly cap: number;
 } | {
     readonly kind: "backend";
+    readonly message: string;
+} | {
+    readonly kind: "unavailable";
     readonly message: string;
 } | {
     readonly kind: "version";
@@ -5013,6 +5024,9 @@ export type KvError = {
     readonly cap: number;
 } | {
     readonly kind: "backend";
+    readonly message: string;
+} | {
+    readonly kind: "unavailable";
     readonly message: string;
 } | {
     readonly kind: "version";
@@ -6482,21 +6496,21 @@ export class Producer implements AsyncDisposable {
     // (undocumented)
     flush(): Promise<void>;
     // (undocumented)
-    send(payload: BytesLike, options?: ProducerSendOptions): Promise<void>;
+    send(payload: BytesLike, options?: ProducerSendOptions): Promise<SendMessagesResponse>;
     // (undocumented)
-    sendBatch(messages: readonly (BytesLike | ProducerMessage)[], options?: ProducerSendOptions): Promise<number>;
+    sendBatch(messages: readonly (BytesLike | ProducerMessage)[], options?: ProducerSendOptions): Promise<SendMessagesResponse>;
     // (undocumented)
-    sendBatchWithRouting(messages: readonly ProducerMessage[], routing?: Routing): Promise<number>;
+    sendBatchWithRouting(messages: readonly ProducerMessage[], routing?: Routing): Promise<SendMessagesResponse>;
     // (undocumented)
-    sendKeyed(message: ProducerMessage, key: BytesLike): Promise<void>;
+    sendKeyed(message: ProducerMessage, key: BytesLike): Promise<SendMessagesResponse>;
     // Warning: (ae-forgotten-export) The symbol "Routing" needs to be exported by the entry point full.d.ts
     //
     // (undocumented)
-    sendMessage(message: ProducerMessage, routing?: Routing): Promise<void>;
+    sendMessage(message: ProducerMessage, routing?: Routing): Promise<SendMessagesResponse>;
     // (undocumented)
-    sendToPartition(message: ProducerMessage, partition: number): Promise<void>;
+    sendToPartition(message: ProducerMessage, partition: number): Promise<SendMessagesResponse>;
     // (undocumented)
-    sendWithRouting(message: ProducerMessage, routing: Routing): Promise<void>;
+    sendWithRouting(message: ProducerMessage, routing: Routing): Promise<SendMessagesResponse>;
     shutdown(): Promise<void>;
 }
 
@@ -6728,7 +6742,7 @@ export class PublishRequest {
     // (undocumented)
     schemaId(value: number): this;
     // (undocumented)
-    send(): Promise<void>;
+    send(): Promise<SendMessagesResponse>;
 }
 
 // @public (undocumented)
@@ -6821,6 +6835,9 @@ type QueryError = {
     readonly message: string;
 } | {
     readonly kind: "backend";
+    readonly message: string;
+} | {
+    readonly kind: "unavailable";
     readonly message: string;
 } | {
     readonly kind: "tooLarge";
@@ -7300,6 +7317,9 @@ function resultCodeFromCode(code: number): ResultCode;
 // @public (undocumented)
 function resultCodeHttpStatus(value: ResultCode): number;
 
+// @public
+function resultCodeIsRetryable(value: ResultCode): boolean;
+
 // @public (undocumented)
 const ResultCodeName: {
     readonly Ok: 0;
@@ -7314,6 +7334,7 @@ const ResultCodeName: {
     readonly Backend: 9;
     readonly Forbidden: 10;
     readonly StepUpRequired: 11;
+    readonly Unavailable: 12;
 };
 
 // @public (undocumented)
@@ -7639,7 +7660,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.0.3";
+export const SDK_VERSION = "0.1.0";
 
 // @public (undocumented)
 interface Select {
@@ -7651,6 +7672,10 @@ interface Select {
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;
+
+export { SendMessagesConfirmation }
+
+export { SendMessagesResponse }
 
 // @public (undocumented)
 export const SERIAL_CONCURRENCY: ConcurrencyPolicy;
@@ -8046,7 +8071,7 @@ export function toolResultFromEnvelope(envelope: AgentEnvelope): McpToolResult;
 export class Topic {
     constructor(transport: LaserTransport, streamName: string, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined);
     // (undocumented)
-    batch(payloads: readonly BytesLike[], options?: RawSendOptions): Promise<number>;
+    batch(payloads: readonly BytesLike[], options?: RawSendOptions): Promise<SendMessagesResponse>;
     // (undocumented)
     cbor<T>(codec: Codec<T>): TypedTopic<T>;
     // (undocumented)
@@ -8073,14 +8098,14 @@ export class Topic {
     // Warning: (ae-forgotten-export) The symbol "RawSendOptions" needs to be exported by the entry point full.d.ts
     //
     // (undocumented)
-    send(payload: BytesLike, options?: RawSendOptions): Promise<void>;
+    send(payload: BytesLike, options?: RawSendOptions): Promise<SendMessagesResponse>;
     // Warning: (ae-forgotten-export) The symbol "MessageWithHeaders" needs to be exported by the entry point full.d.ts
     //
     // (undocumented)
     sendRecords(records: readonly MessageWithHeaders[], options?: {
         readonly key?: Uint8Array;
         readonly partition?: number;
-    }): Promise<void>;
+    }): Promise<SendMessagesResponse>;
     // (undocumented)
     readonly streamName: string;
 }
@@ -8179,9 +8204,9 @@ export class TypedTopic<T> {
     // (undocumented)
     readonly kind: TypedTopicKind;
     // (undocumented)
-    publish(value: T, options?: RawSendOptions): Promise<void>;
+    publish(value: T, options?: RawSendOptions): Promise<SendMessagesResponse>;
     // (undocumented)
-    publishBatch(values: readonly T[], options?: RawSendOptions): Promise<number>;
+    publishBatch(values: readonly T[], options?: RawSendOptions): Promise<SendMessagesResponse>;
     // (undocumented)
     records(readerName: string, options?: CursorOptions): Promise<TypedRecords<T>>;
 }
@@ -9178,6 +9203,7 @@ declare namespace wire {
         resultCodeFromCode,
         resultCodeToCode,
         resultCodeHttpStatus,
+        resultCodeIsRetryable,
         ResultCodeName,
         ResultCode,
         encodeFoldSnapshot,

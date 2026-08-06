@@ -36,7 +36,7 @@ pub use crate::stream::ContentType;
 #[cfg(feature = "streaming")]
 pub use crate::stream::{
     CommitPolicy, Consumer, ConsumerMessage, ConsumerStart, Producer, ProducerMessage, Routing,
-    Stream, Topic,
+    SendMessagesConfirmationResponse, SendMessagesResponse, Stream, Topic,
 };
 #[cfg(feature = "streaming")]
 pub use crate::typed::{TypedDecodeError, TypedRecord, TypedRecords, TypedTopic};

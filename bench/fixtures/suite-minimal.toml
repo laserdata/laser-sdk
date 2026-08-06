@@ -1,0 +1,31 @@
+schema_version = 1
+name = "fixture-smoke"
+authoritative = false
+
+[provisioning]
+mode = "source"
+cpu_target = "native"
+iggy_root = "/path/to/iggy-source"
+plane_root = "/path/to/plane-source"
+
+[environment]
+tier = "A"
+durability_profile = "release_default"
+cache_state = "warm"
+
+[[scenarios]]
+name = "stream_direct"
+layer = "L2"
+arm = "laser"
+driver = "stream_direct"
+transport = "tcp_vsr"
+repetitions = 1
+warmup_seconds = 1
+duration_seconds = 5
+payload_bytes = 1024
+batch_size = 100
+partitions = 1
+producers = 1
+consumers = 1
+operations = 1000
+offered_rate = 1000

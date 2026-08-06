@@ -476,6 +476,7 @@ impl Laser {
             Some(&partition_key),
         )
         .await
+        .map(|_| ())
     }
 }
 

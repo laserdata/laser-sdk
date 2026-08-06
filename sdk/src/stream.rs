@@ -11,7 +11,8 @@ pub use iggy::prelude::{HeaderKey, HeaderValue};
 /// dependency of your own.
 pub use iggy::prelude::{
     BackgroundConfig, BalancedSharding, DirectConfig, IggyConsumer, IggyConsumerBuilder,
-    IggyProducer, IggyProducerBuilder, OrderedSharding, Sharding,
+    IggyProducer, IggyProducerBuilder, OrderedSharding, SendMessagesConfirmationResponse,
+    SendMessagesResponse, Sharding,
 };
 
 pub use laser_wire::codecs::{Cbor, Codec, Decoder, Json, Msgpack};
@@ -128,7 +129,7 @@ impl Topic {
         payload: impl Into<Vec<u8>>,
         headers: BTreeMap<HeaderKey, HeaderValue>,
         partition_key: Option<&str>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         let stream = self.stream()?.to_owned();
         self.laser
             .send_with_headers_on(&stream, &self.name, payload.into(), headers, partition_key)
@@ -141,7 +142,7 @@ impl Topic {
         &self,
         messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         let stream = self.stream()?.to_owned();
         self.laser
             .send_batch_on(&stream, &self.name, messages, partition_key)

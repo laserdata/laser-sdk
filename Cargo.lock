@@ -85,9 +85,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
+checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
 dependencies = [
  "libc",
 ]
@@ -405,9 +405,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.5"
+version = "1.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -1181,9 +1181,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.18.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e1dacd0d2082dfcf1351c4bdd566bbe89a2b263235a2b50058f1e130a47277"
+checksum = "476de73bddf2ef8490aa4ee8f1cf40b430bf1d56c48c22080e5186952cd580e6"
 dependencies = [
  "bit-set",
  "regex-automata",
@@ -1740,9 +1740,9 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f00cf7f6379205c85ae97839b9fa0f0924fd3f9018329a930c775b091183d843"
+checksum = "e3968022711db77152f5750c28e3c89f63f6070f47f475d0da6b6ec95091f148"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -1764,6 +1764,7 @@ dependencies = [
  "rustls",
  "secrecy",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1774,9 +1775,9 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "255063fad530d8f71630003c10035ba4f340004662f840b8f10694c11c200fe5"
+checksum = "97aeaefbb5ef42fc451c7a3a4ad85530a613a820dbb344dfe510e617ec4ddc7a"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -1787,9 +1788,9 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7819664e8b98036acd05f3577d18c112bee2daf0eca29ff6ffd19ad5813d174"
+checksum = "0033684f1b42053e0e6dc2366ad572bb9777430e4fe37180a12f0cd2aab007e7"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -1976,9 +1977,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.49.4"
+version = "0.49.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "257549c093d8f3d043337ba0d507e8eeace2447dfae3f0ee37eb0f57d3df7655"
+checksum = "8da60094fc1968bbd091e2cfa004415cb7b19e25e592376e66a64aa832bb6039"
 dependencies = [
  "ahash 0.8.12",
  "bytecount",
@@ -2005,18 +2006,18 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.49.4"
+version = "0.49.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "474790e948498099d61ec85c10dc72d459d61298b7975eda7fb163af1934b134"
+checksum = "36539f34ef9e5da418433fbbf7294522d8f930ecf6a540ccd1ec6481c9ff9056"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.49.4"
+version = "0.49.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8212315eb8e0bc44959d1af653cd5ec515771a3cdca966cfc0a10999bff144b9"
+checksum = "8bc513dfee68c6fe29498451df95a32951ea227801b476f4a1f236433986c891"
 dependencies = [
  "ahash 0.8.12",
  "bytecount",
@@ -2028,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "laser-examples"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2044,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2077,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "bon",
  "bson",
@@ -2944,9 +2945,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.49.4"
+version = "0.49.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf1a74e036be2546c0c81cdfad6b2def6a25bf31c4e34a468037058d3bd05c6"
+checksum = "05915176d843da9ec5c925e5e2631be9aa61b27430acfdd562e79cae8f559725"
 dependencies = [
  "ahash 0.8.12",
  "fluent-uri",
@@ -2973,9 +2974,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.16"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",

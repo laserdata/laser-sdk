@@ -717,6 +717,7 @@ export type KvError =
       readonly cap: number
     }
   | { readonly kind: "backend"; readonly message: string }
+  | { readonly kind: "unavailable"; readonly message: string }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
   | { readonly kind: "versionConflict"; readonly current?: bigint }
   | { readonly kind: "leaseLost" }
@@ -745,6 +746,8 @@ export function encodeKvError(error: KvError): unknown {
       ])
     case "backend":
       return new Map([["Backend", error.message]])
+    case "unavailable":
+      return new Map([["Unavailable", error.message]])
     case "version":
       return new Map([
         [
@@ -796,6 +799,8 @@ export function decodeKvError(value: unknown, context: string): KvError {
     }
     case "Backend":
       return { kind: "backend", message: expectString(inner, context) }
+    case "Unavailable":
+      return { kind: "unavailable", message: expectString(inner, context) }
     case "Version": {
       const versionMap = expectMap(inner, context)
       return {

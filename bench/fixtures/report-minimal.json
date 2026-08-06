@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-run",
+  "suite_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "scenario": "stream_direct",
+  "arm": "laser",
+  "repetition": 0,
+  "seed": 42,
+  "language": "rust",
+  "source": {
+    "sdk_revision": "fixture-sdk",
+    "benchmark_revision": "fixture-bench",
+    "dirty": false
+  },
+  "artifacts": [],
+  "environment": {
+    "tier": "A",
+    "durability_profile": "release_default",
+    "cache_state": "warm",
+    "kernel": "fixture",
+    "architecture": "x86_64"
+  },
+  "workload": {
+    "logical_unit": "record",
+    "payload_bytes": 1024,
+    "batch_size": 100,
+    "partitions": 1,
+    "offered_rate": 1000
+  },
+  "outcomes": {
+    "offered": 1000,
+    "dispatched": 1000,
+    "completed": 1000,
+    "successful": 1000,
+    "failed": 0,
+    "timed_out": 0,
+    "missed": 0,
+    "duplicates": 0,
+    "gaps": 0,
+    "ordering_violations": 0,
+    "checksum_failures": 0
+  },
+  "histograms": [],
+  "deterministic_gates": [
+    {
+      "name": "sdk-allocation-test",
+      "command": ["cargo", "test", "--locked", "-p", "laser-sdk", "--test", "alloc"],
+      "passed": true,
+      "observations": {
+        "body_pointer_identity": true,
+        "allocation_budget": 4
+      }
+    },
+    {
+      "name": "sdk-direct-zero-copy-test",
+      "command": ["cargo", "test", "--locked", "-p", "laser-sdk", "--lib", "stream::transport::tests::given_bytes_payload_when_lowered_to_iggy_then_should_preserve_pointer_identity"],
+      "passed": true,
+      "observations": {
+        "body_pointer_identity": true
+      }
+    }
+  ],
+  "observer_cost": {
+    "operations": 1000,
+    "minimal_elapsed_ns": 100000,
+    "instrumented_elapsed_ns": 110000,
+    "elapsed_ratio": 1.1
+  },
+  "analysis": {
+    "valid": true,
+    "publishable": false,
+    "invalidation_reason": null
+  }
+}

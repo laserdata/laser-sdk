@@ -757,16 +757,16 @@ impl LogMemory {
         let key = provenance.partition_key();
         let topic = self.topic.to_string();
         match &self.stream {
-            Some(stream) => {
-                self.laser
-                    .send_with_headers_on(stream, &topic, payload, headers, Some(&key))
-                    .await
-            }
-            None => {
-                self.laser
-                    .send_with_headers(&topic, payload, headers, Some(&key))
-                    .await
-            }
+            Some(stream) => self
+                .laser
+                .send_with_headers_on(stream, &topic, payload, headers, Some(&key))
+                .await
+                .map(|_| ()),
+            None => self
+                .laser
+                .send_with_headers(&topic, payload, headers, Some(&key))
+                .await
+                .map(|_| ()),
         }
     }
 

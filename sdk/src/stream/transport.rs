@@ -7,6 +7,7 @@ use iggy::prelude::{
     AutoCommit, AutoCommitWhen, BackgroundConfig, ConsumerGroupClient, DirectConfig, Identifier,
     IggyConsumer, IggyConsumerBuilder, IggyDuration, IggyExpiry, IggyMessage, IggyProducer,
     IggyTimestamp, MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage,
+    SendMessagesResponse,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -366,14 +367,19 @@ pub struct Producer {
 
 impl Producer {
     /// Send one record without user headers using the configured routing.
-    pub async fn send(&self, payload: impl Into<Bytes>) -> Result<(), LaserError> {
+    pub async fn send(
+        &self,
+        payload: impl Into<Bytes>,
+    ) -> Result<SendMessagesResponse, LaserError> {
         self.send_message(ProducerMessage::new(payload)).await
     }
 
     /// Send one record using the configured routing.
-    pub async fn send_message(&self, message: ProducerMessage) -> Result<(), LaserError> {
-        self.inner.send(vec![message.into_iggy()?]).await?;
-        Ok(())
+    pub async fn send_message(
+        &self,
+        message: ProducerMessage,
+    ) -> Result<SendMessagesResponse, LaserError> {
+        Ok(self.inner.send(vec![message.into_iggy()?]).await?)
     }
 
     /// Send one record with a per-call routing override.
@@ -381,14 +387,14 @@ impl Producer {
         &self,
         message: ProducerMessage,
         routing: Routing,
-    ) -> Result<(), LaserError> {
-        self.inner
+    ) -> Result<SendMessagesResponse, LaserError> {
+        Ok(self
+            .inner
             .send_with_partitioning(
                 vec![message.into_iggy()?],
                 Some(Arc::new(routing.into_partitioning()?)),
             )
-            .await?;
-        Ok(())
+            .await?)
     }
 
     /// Send one record with a per-call partition key.
@@ -396,7 +402,7 @@ impl Producer {
         &self,
         message: ProducerMessage,
         key: impl Into<Vec<u8>>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         self.send_with_routing(message, Routing::key(key)).await
     }
 
@@ -405,16 +411,16 @@ impl Producer {
         &self,
         message: ProducerMessage,
         partition: u32,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         self.send_with_routing(message, Routing::Partition(partition))
             .await
     }
 
-    /// Send a batch using the configured routing. Returns the record count.
+    /// Send a batch using the configured routing.
     pub async fn send_batch(
         &self,
         messages: impl IntoIterator<Item = ProducerMessage>,
-    ) -> Result<usize, LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         self.send_batch_with_routing(messages, None).await
     }
 
@@ -423,21 +429,21 @@ impl Producer {
         &self,
         messages: impl IntoIterator<Item = ProducerMessage>,
         routing: Option<Routing>,
-    ) -> Result<usize, LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         let messages = messages
             .into_iter()
             .map(ProducerMessage::into_iggy)
             .collect::<Result<Vec<_>, _>>()?;
-        let count = messages.len();
-        if count == 0 {
-            return Ok(0);
+        if messages.is_empty() {
+            return Ok(SendMessagesResponse {
+                confirmations: Vec::new(),
+            });
         }
         let routing = routing
             .map(Routing::into_partitioning)
             .transpose()?
             .map(Arc::new);
-        self.inner.send_with_partitioning(messages, routing).await?;
-        Ok(count)
+        Ok(self.inner.send_with_partitioning(messages, routing).await?)
     }
 
     /// Flushes buffered `background`-mode messages and stops the worker. A
@@ -844,5 +850,15 @@ mod tests {
                 .expect("the type header should remain uint16"),
             7
         );
+    }
+
+    #[test]
+    fn given_bytes_payload_when_lowered_to_iggy_then_should_preserve_pointer_identity() {
+        let payload = Bytes::from_static(&[0x42; 4096]);
+        let message = ProducerMessage::new(payload.clone())
+            .into_iggy()
+            .expect("the producer message should lower to Iggy");
+
+        assert_eq!(message.payload.as_ptr(), payload.as_ptr());
     }
 }

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laserdata.com/schemas/benchmark/mcp-review-signoff-v1.schema.json",
+  "title": "MCP benchmark reviewer sign-off",
+  "type": "object",
+  "required": ["schema_version", "bundle_sha256", "reviewer", "reviewed_at", "decision", "hypotheses", "findings"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "bundle_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "reviewer": { "type": "string", "minLength": 1 },
+    "reviewed_at": { "type": "string", "minLength": 1 },
+    "decision": { "enum": ["accepted", "changes_requested"] },
+    "hypotheses": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": { "enum": ["m1", "m2", "m3", "m4", "m5", "m6"] }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "summary"],
+        "properties": {
+          "severity": { "enum": ["blocking", "material", "note"] },
+          "summary": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

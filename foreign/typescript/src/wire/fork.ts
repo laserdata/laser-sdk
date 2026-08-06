@@ -262,6 +262,7 @@ export type ForkError =
   | { readonly kind: "invalidFork"; readonly message: string }
   | { readonly kind: "conflict"; readonly message: string }
   | { readonly kind: "backend"; readonly message: string }
+  | { readonly kind: "unavailable"; readonly message: string }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
   | { readonly kind: "notLeader" }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
@@ -278,6 +279,8 @@ export function encodeForkError(error: ForkError): unknown {
       return new Map([["Conflict", error.message]])
     case "backend":
       return new Map([["Backend", error.message]])
+    case "unavailable":
+      return new Map([["Unavailable", error.message]])
     case "version":
       return new Map([
         [
@@ -312,6 +315,8 @@ export function decodeForkError(value: unknown, context: string): ForkError {
       return { kind: "conflict", message: expectString(inner, context) }
     case "Backend":
       return { kind: "backend", message: expectString(inner, context) }
+    case "Unavailable":
+      return { kind: "unavailable", message: expectString(inner, context) }
     case "Version": {
       const versionMap = expectMap(inner, context)
       return {

@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laserdata.com/schemas/benchmark/report-v1.schema.json",
+  "title": "Laser benchmark run report",
+  "type": "object",
+  "required": ["schema_version", "run_id", "suite_digest", "scenario", "arm", "repetition", "seed", "language", "source", "artifacts", "environment", "workload", "outcomes", "histograms", "deterministic_gates", "observer_cost", "analysis"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "suite_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "scenario": { "type": "string", "minLength": 1 },
+    "arm": { "type": "string", "minLength": 1 },
+    "repetition": { "type": "integer", "minimum": 0 },
+    "seed": { "type": "integer", "minimum": 0 },
+    "language": { "const": "rust" },
+    "source": {
+      "type": "object",
+      "required": ["sdk_revision", "benchmark_revision", "dirty"],
+      "properties": {
+        "sdk_revision": { "type": "string", "minLength": 1 },
+        "benchmark_revision": { "type": "string", "minLength": 1 },
+        "dirty": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
+    "environment": {
+      "type": "object",
+      "required": ["tier", "durability_profile", "cache_state", "kernel", "architecture"],
+      "properties": {
+        "tier": { "type": "string", "minLength": 1 },
+        "durability_profile": { "type": "string", "minLength": 1 },
+        "cache_state": { "type": "string", "minLength": 1 },
+        "kernel": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "runtime_worker_threads": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "workload": {
+      "type": "object",
+      "required": ["logical_unit", "payload_bytes", "batch_size", "partitions", "offered_rate"],
+      "properties": {
+        "logical_unit": { "type": "string", "minLength": 1 },
+        "payload_bytes": { "type": "integer", "minimum": 1 },
+        "batch_size": { "type": "integer", "minimum": 1 },
+        "partitions": { "type": "integer", "minimum": 1 },
+        "offered_rate": { "type": ["integer", "null"], "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "outcomes": {
+      "type": "object",
+      "required": ["offered", "dispatched", "completed", "successful", "failed", "timed_out", "missed", "duplicates", "gaps", "ordering_violations", "checksum_failures"],
+      "properties": {
+        "offered": { "type": "integer", "minimum": 0 },
+        "dispatched": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "successful": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "timed_out": { "type": "integer", "minimum": 0 },
+        "missed": { "type": "integer", "minimum": 0 },
+        "duplicates": { "type": "integer", "minimum": 0 },
+        "gaps": { "type": "integer", "minimum": 0 },
+        "ordering_violations": { "type": "integer", "minimum": 0 },
+        "checksum_failures": { "type": "integer", "minimum": 0 },
+        "late_arrivals": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "histograms": { "type": "array", "items": { "$ref": "#/$defs/histogram" } },
+    "deterministic_gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "command", "passed", "observations"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "command": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "passed": { "type": "boolean" },
+          "observations": { "type": "object" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "observer_cost": {
+      "type": "object",
+      "properties": {
+        "operations": { "type": "integer", "minimum": 1 },
+        "minimal_elapsed_ns": { "type": "integer", "minimum": 1 },
+        "instrumented_elapsed_ns": { "type": "integer", "minimum": 1 },
+        "elapsed_ratio": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "required": ["operations", "minimal_elapsed_ns", "instrumented_elapsed_ns", "elapsed_ratio"],
+      "additionalProperties": false
+    },
+    "analysis": {
+      "type": "object",
+      "required": ["valid", "publishable", "invalidation_reason"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "publishable": { "type": "boolean" },
+        "invalidation_reason": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "histogram": {
+      "type": "object",
+      "required": ["class", "path", "sha256", "samples"],
+      "properties": {
+        "class": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "samples": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["name", "version", "source", "cpu_target", "sha256", "minisign_verified"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "cpu_target": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "minisign_verified": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

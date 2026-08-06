@@ -72,9 +72,9 @@ dependencies = [
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
+checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
 dependencies = [
  "libc",
 ]
@@ -281,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.5"
+version = "1.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -1295,9 +1295,9 @@ dependencies = [
 
 [[package]]
 name = "globset"
-version = "0.4.19"
+version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
 dependencies = [
  "aho-corasick",
  "bstr",
@@ -1608,9 +1608,9 @@ dependencies = [
 
 [[package]]
 name = "iggy"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f00cf7f6379205c85ae97839b9fa0f0924fd3f9018329a930c775b091183d843"
+checksum = "e3968022711db77152f5750c28e3c89f63f6070f47f475d0da6b6ec95091f148"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -1632,6 +1632,7 @@ dependencies = [
  "rustls",
  "secrecy",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -1642,9 +1643,9 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "255063fad530d8f71630003c10035ba4f340004662f840b8f10694c11c200fe5"
+checksum = "97aeaefbb5ef42fc451c7a3a4ad85530a613a820dbb344dfe510e617ec4ddc7a"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -1655,9 +1656,9 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7819664e8b98036acd05f3577d18c112bee2daf0eca29ff6ffd19ad5813d174"
+checksum = "0033684f1b42053e0e6dc2366ad572bb9777430e4fe37180a12f0cd2aab007e7"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -1693,9 +1694,9 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b17771570a2b94107741a7b033f19132c2eee21d59d21b24d2ced26500bd66e"
+checksum = "00b69833ed729dc5aa7d19541d96d6cf8e9137194207a04916d658e43168402f"
 dependencies = [
  "crossbeam-deque",
  "globset",
@@ -1889,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1913,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "bon",
  "bson",
@@ -2546,9 +2547,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.16"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",

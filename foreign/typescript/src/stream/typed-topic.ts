@@ -1,5 +1,6 @@
 import { CodecError, TypedDecodeError } from "../client/errors.js"
 import type { IggyHeaderValue } from "../iggy/apache-iggy.js"
+import type { SendMessagesResponse } from "../iggy/apache-iggy.js"
 import type { CompiledSchema } from "../schema-codecs.js"
 import type { MessageId } from "../types/ids.js"
 import {
@@ -42,7 +43,7 @@ export class TypedTopic<T> {
     }
   ) {}
 
-  async publish(value: T, options?: RawSendOptions): Promise<void> {
+  async publish(value: T, options?: RawSendOptions): Promise<SendMessagesResponse> {
     if (options?.key !== undefined && options.partition !== undefined) {
       throw new CodecError(
         "typed publish accepts a routing key or an explicit partition, not both",
@@ -57,16 +58,18 @@ export class TypedTopic<T> {
     if (options?.partition !== undefined) request.partition(options.partition)
     if (options?.provenance !== undefined) request.provenance(options.provenance)
     if (options?.headers !== undefined) {
-      await this.topic.send(payload, {
+      return this.topic.send(payload, {
         ...options,
         headers: this.contractHeaders(options.headers)
       })
-      return
     }
-    await request.send()
+    return request.send()
   }
 
-  async publishBatch(values: readonly T[], options?: RawSendOptions): Promise<number> {
+  async publishBatch(
+    values: readonly T[],
+    options?: RawSendOptions
+  ): Promise<SendMessagesResponse> {
     const payloads = values.map((value) => this.encode(value))
     const headers = this.contractHeaders(options?.headers)
     return this.topic.batch(payloads, { ...options, headers })

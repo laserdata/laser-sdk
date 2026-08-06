@@ -283,10 +283,9 @@ impl LaserError {
         }
     }
 
-    /// Whether retrying the same call can succeed. Transport and backend
-    /// failures are transient. Everything the caller would have to change
-    /// first (rejected, unsupported, invalid input, version skew, too-large,
-    /// not-found) is permanent and reports `false`.
+    /// Whether retrying the same call can succeed. Managed failures follow the
+    /// canonical [`ResultCode`] classifier, while transport, handler, routing,
+    /// timeout, and deferred-policy failures retain their local semantics.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Rejected(_)
@@ -296,18 +295,44 @@ impl LaserError {
             | Self::Protocol(_)
             | Self::Config(_)
             | Self::HandlerConfig(_)
+            | Self::StateStore(_)
             | Self::Integrity { .. }
             | Self::NoStream
             | Self::PolicyBlocked(_)
             | Self::StepUpRequired(_)
             | Self::NoRespondTopic
             | Self::PresenceConflict { .. }
-            | Self::RoutePrincipalMismatch { .. } => false,
-            Self::Query(error) => matches!(error, QueryError::Backend(_)),
-            Self::Kv(error) => matches!(error, KvError::Backend(_) | KvError::NotLeader),
-            Self::Fork(error) => matches!(error, ForkError::Backend(_) | ForkError::NotLeader),
-            _ => true,
+            | Self::RoutePrincipalMismatch { .. }
+            | Self::Signature(_)
+            | Self::FenceViolation { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::Cancelled { .. }
+            | Self::Quarantined { .. }
+            | Self::Authz(_)
+            | Self::Id(_) => false,
+            #[cfg(feature = "provenance")]
+            Self::Provenance(_) => false,
+            Self::Query(error) => ResultCode::from(error).is_retryable(),
+            Self::Kv(error) => ResultCode::from(error).is_retryable(),
+            Self::Fork(error) => ResultCode::from(error).is_retryable(),
+            Self::Agent(error) => ResultCode::from(error).is_retryable(),
+            Self::Graph(error) => ResultCode::from(error).is_retryable(),
+            Self::Handler(_)
+            | Self::Timeout(_)
+            | Self::PolicyDeferred(_)
+            | Self::NoCapableAgent { .. }
+            | Self::NoInbox { .. }
+            | Self::Iggy(_) => true,
         }
+    }
+
+    /// Whether the failure was transient: the store was momentarily out of reach,
+    /// a connection was refused or dropped, or a concurrency conflict was
+    /// aborted. The identical request may succeed on a later attempt, so this is
+    /// the flag a retry loop keys on when it wants only the recoverable class
+    /// rather than everything [`is_retryable`](Self::is_retryable) admits.
+    pub fn is_unavailable(&self) -> bool {
+        self.code() == ResultCode::Unavailable
     }
 
     /// Whether the connected plane declined a conditional write because it
@@ -441,6 +466,8 @@ impl LaserError {
             Self::Query(error) => ResultCode::from(error),
             Self::Kv(error) => ResultCode::from(error),
             Self::Fork(error) => ResultCode::from(error),
+            Self::Graph(error) => ResultCode::from(error),
+            Self::Agent(error) => ResultCode::from(error),
             Self::Unsupported { .. } | Self::NoStream | Self::NoRespondTopic => {
                 ResultCode::Unsupported
             }
@@ -529,6 +556,36 @@ mod tests {
         let error = LaserError::from(KvError::NotLeader);
         assert!(error.is_retryable());
         assert!(error.is_not_leader());
-        assert_eq!(error.code(), ResultCode::Backend);
+        assert_eq!(error.code(), ResultCode::Unavailable);
+    }
+
+    #[test]
+    fn given_a_backend_fault_when_classified_then_should_not_retry_blindly() {
+        for error in [
+            LaserError::from(QueryError::Backend("corrupt row".to_owned())),
+            LaserError::from(KvError::Backend("constraint missing".to_owned())),
+            LaserError::from(ForkError::Backend("invalid schema".to_owned())),
+        ] {
+            assert!(!error.is_retryable(), "{error} must be permanent");
+            assert_eq!(error.code(), ResultCode::Backend);
+        }
+    }
+
+    // A transient outcome classifies as retryable on every surface, and it keeps
+    // its own code so a caller can tell "retry me" from an unrecoverable fault
+    // without reading the message.
+    #[test]
+    fn given_a_temporarily_unavailable_surface_when_classified_then_should_retry() {
+        for error in [
+            LaserError::from(QueryError::Unavailable("dropped".to_owned())),
+            LaserError::from(KvError::Unavailable("dropped".to_owned())),
+            LaserError::from(ForkError::Unavailable("dropped".to_owned())),
+        ] {
+            assert!(error.is_retryable(), "{error} must be retryable");
+            assert!(error.is_unavailable());
+            assert_eq!(error.code(), ResultCode::Unavailable);
+            assert!(error.code().is_retryable());
+            assert!(!error.is_unsupported());
+        }
     }
 }

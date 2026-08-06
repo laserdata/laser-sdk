@@ -364,6 +364,8 @@ pub enum GraphError {
     },
     #[error("graph backend error: {0}")]
     Backend(String),
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
     #[error("unsupported graph op version (expected {expected}, got {got})")]
     Version { expected: u32, got: u32 },
 }

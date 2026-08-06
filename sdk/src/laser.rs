@@ -549,7 +549,7 @@ impl Laser {
         payload: impl Into<Vec<u8>>,
         headers: BTreeMap<HeaderKey, HeaderValue>,
         partition_key: Option<&str>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         self.send_with_headers_on(
             self.stream_required()?,
             topic,
@@ -569,7 +569,7 @@ impl Laser {
         payload: impl Into<Vec<u8>>,
         headers: BTreeMap<HeaderKey, HeaderValue>,
         partition_key: Option<&str>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         let payload: Vec<u8> = payload.into();
         let message = IggyMessage::builder()
             .payload(payload.into())
@@ -588,7 +588,7 @@ impl Laser {
         topic: &str,
         messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         let stream = self.stream_required()?.to_owned();
         self.send_batch_on(&stream, topic, messages, partition_key)
             .await
@@ -603,9 +603,11 @@ impl Laser {
         topic: &str,
         messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
-    ) -> Result<(), LaserError> {
+    ) -> Result<SendMessagesResponse, LaserError> {
         if messages.is_empty() {
-            return Ok(());
+            return Ok(SendMessagesResponse {
+                confirmations: Vec::new(),
+            });
         }
         let partitioning = Arc::new(match partition_key {
             Some(key) => Partitioning::messages_key_str(key)?,
@@ -613,17 +615,26 @@ impl Laser {
         });
         let key = (stream.to_owned(), topic.to_owned());
         let mut pending = messages;
+        let mut confirmations = Vec::new();
         for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
             let producer = self.producer_on(stream, topic).await?;
             match producer
                 .send_with_partitioning(pending, Some(partitioning.clone()))
                 .await
             {
-                Ok(()) => return Ok(()),
-                Err(IggyError::ProducerSendFailed { cause, failed, .. })
-                    if is_transient_iggy_io_error(&cause)
-                        && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
+                Ok(mut response) => {
+                    confirmations.append(&mut response.confirmations);
+                    return Ok(SendMessagesResponse { confirmations });
+                }
+                Err(IggyError::ProducerSendFailed {
+                    cause,
+                    failed,
+                    committed,
+                    ..
+                }) if is_transient_iggy_io_error(&cause)
+                    && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
                 {
+                    confirmations.extend(committed.iter().cloned());
                     pending = reclaim_failed_messages(failed);
                     self.inner.producers.remove(&key);
                     sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
@@ -1234,7 +1245,18 @@ fn merge_announcement(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "fork",
+        feature = "graph",
+        feature = "kv",
+        feature = "projections",
+        feature = "query",
+        feature = "rbac",
+        feature = "runs"
+    )
+))]
 mod announcement_tests {
     use super::*;
     use laser_wire::hello::{BackendAnnounce, BackendDescriptor, OpVersions, feature};
@@ -1276,6 +1298,18 @@ mod announcement_tests {
         assert_eq!(capabilities.versions, Some(announce.versions));
     }
 
+    // Gated exactly like `merge_announcement` itself: with none of the managed
+    // surface features enabled the function does not exist, so neither can its
+    // tests.
+    #[cfg(any(
+        feature = "fork",
+        feature = "graph",
+        feature = "kv",
+        feature = "projections",
+        feature = "query",
+        feature = "rbac",
+        feature = "runs"
+    ))]
     #[test]
     fn given_a_ready_backend_when_merged_then_should_enable_advertised_plane_surfaces() {
         let announce = BackendAnnounce::new(

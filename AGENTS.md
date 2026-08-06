@@ -129,7 +129,8 @@ sdk/src/
   stream.rs           the Log accessors: Laser::stream(name) -> Stream (real Iggy stream,
                       ensure/topic) and Laser::topic(name) -> Topic (default-stream shortcut,
                       publish()/publish_batch() fluent, send/batch raw (impl Into<Vec<u8>>,
-                      matching PublishRequest/BatchPublishRequest), replay() -> Cursor,
+                      matching PublishRequest/BatchPublishRequest), all returning Iggy's
+                      SendMessagesResponse commit positions, replay() -> Cursor,
                       ensure(partitions), producer/consumer/consumer_group, plus the raw
                       iggy_producer/iggy_consumer/iggy_consumer_group escape hatch)
                       Iggy VSR is unconditional. Standard Iggy
@@ -142,7 +143,8 @@ sdk/src/
                       ConsumerMessage path - ProducerMessage/ConsumerMessage keep `bytes::Bytes`
                       (zero-copy clone) on this hot path specifically, including routing,
                       polling/replay, group lifecycle, retries, exact headers, automatic commits,
-                      explicit commit-after-success, server offsets, and next_within(timeout) for
+                      explicit commit-after-success, producer commit confirmations, consumer
+                      offsets, and next_within(timeout) for
                       a bounded single-record wait
   batching.rs         Topic::batching() -> BatchingProducer: the governed size-and-time batcher
                       (max_records / max_bytes / linger) for typed agent paths (feature = "agent")
@@ -328,7 +330,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.0.2` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.1.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 

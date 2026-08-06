@@ -17,6 +17,7 @@ import asyncio
 class LaserError(Exception):
     code: builtins.str
     retryable: builtins.bool
+    unavailable: builtins.bool
     unsupported: builtins.bool
     not_found: builtins.bool
     version_skew: builtins.bool

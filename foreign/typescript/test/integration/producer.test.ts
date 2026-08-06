@@ -39,8 +39,9 @@ void test("given_a_direct_producer_when_a_batch_is_sent_then_should_use_one_orde
   try {
     const topic = await freshTopic(laser)
     const producer = topic.producer()
-    const count = await producer.sendBatch([utf8("x"), utf8("y")])
-    assert.equal(count, 2)
+    const committed = await producer.sendBatch([utf8("x"), utf8("y")])
+    assert.equal(committed.confirmations.length, 1)
+    assert.equal(committed.confirmations[0]?.partitionId, 0)
 
     const consumer = topic.consumer(0, { startFrom: { kind: "first" }, batchLength: 2 })
     const first = await consumer.nextWithin(1_000)

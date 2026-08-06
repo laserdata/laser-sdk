@@ -36,8 +36,8 @@ async fn publish_batch(world: &mut LaserWorld, count: u32, topic: String) {
         }
     }
     match batch.send().await {
-        Ok(published) => {
-            world.last_batch_count = Some(published);
+        Ok(_) => {
+            world.last_batch_count = Some(count as usize);
             world.last_result = Some(Ok(()));
         }
         Err(error) => world.last_result = Some(Err(format!("{error:?}"))),

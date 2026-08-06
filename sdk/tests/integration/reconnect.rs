@@ -50,7 +50,7 @@ async fn given_a_server_restart_when_reusing_the_same_client_then_should_publish
         })
         .await;
         match recovered {
-            Ok(Ok(())) => break,
+            Ok(Ok(_)) => break,
             Ok(Err(error)) => {
                 assert!(
                     Instant::now() < deadline,

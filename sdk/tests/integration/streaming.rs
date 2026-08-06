@@ -23,10 +23,15 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
     let type_key = HeaderKey::from_str("type").expect("the type header should be valid");
     let message = ProducerMessage::new(b"production-event".as_slice())
         .header(type_key.clone(), HeaderValue::from(7_u16));
-    producer
+    let first_send = producer
         .send_keyed(message, b"account-42".to_vec())
         .await
         .expect("the keyed message should publish");
+    let first_confirmation = first_send
+        .confirmations
+        .first()
+        .expect("the server should confirm the keyed message");
+    assert_eq!(first_confirmation.partition_id, 0);
     let sent = producer
         .send_batch_with_routing(
             [ProducerMessage::new(b"production-batch".as_slice())],
@@ -34,7 +39,12 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         )
         .await
         .expect("the Laser batch should publish");
-    assert_eq!(sent, 1);
+    let batch_confirmation = sent
+        .confirmations
+        .first()
+        .expect("the server should confirm the batch");
+    assert_eq!(batch_confirmation.partition_id, 0);
+    assert!(batch_confirmation.base_offset > first_confirmation.base_offset);
 
     let mut consumer = topic
         .consumer_group("production-auto-workers")

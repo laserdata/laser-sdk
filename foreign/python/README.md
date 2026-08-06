@@ -4,7 +4,7 @@ The LaserData SDK for Python: an open data-platform SDK over Apache Iggy. Native
 
 Rust and Python are one v1 contract. Every public primitive, builder option, validation rule, error classification, capability, and transport limitation ships in both SDKs with matched examples and shared BDD coverage where the behavior is language-neutral.
 
-> **Initial release (`0.0.1`).** The wire contract and public API are versioned from this release. Future releases may include breaking changes under semantic versioning.
+> **Current pre-1.0 release (`0.1.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` keeps logical identity separate from Iggy replica topology. The group defaults to the agent id spelling, set it explicitly when deployment grouping differs.
 
@@ -54,7 +54,7 @@ LaserData Cloud and Laser Stack enable managed surfaces only when their backend 
 orders = laser.stream("commerce").topic("orders")
 await orders.ensure(partitions=4)
 
-await (
+committed = await (
     orders.publish()
     .index("customer_id", "alice")
     .index("total", "129")
@@ -62,7 +62,10 @@ await (
     .json({"id": "o-1", "customer": "alice", "amount": 129})
     .send()
 )
+print(committed.confirmations)
 ```
+
+Direct producers and fluent publish terminals return `SendMessagesResponse`. Each `SendMessagesConfirmation` identifies the selected stream, topic, partition, and batch base offset. The list can be empty when a server cannot report offsets. A confirmation is an in-memory commit position, not an fsync guarantee.
 
 ## Batch and any payload
 
@@ -74,7 +77,7 @@ The payload is yours, in any format. `add_json` / `add_msgpack` (and `extend_jso
 batch = orders.publish_batch().inline_payload()
 batch.extend_json([{"id": "o-1", "amount": 129}, {"id": "o-2", "amount": 80}])
 batch.add_payload(b"\x00any-bytes-any-format")  # raw bytes, untouched by the SDK
-await batch.send()  # the whole batch, one round-trip
+committed = await batch.send()  # the whole batch, one round-trip
 ```
 
 ## Live producer and consumer
@@ -90,8 +93,8 @@ producer = topic.producer(
     partitions=4,
 )
 await producer.init()
-await producer.send(b"one", headers={"type": ("uint16", 7)}, key=b"account-42")
-await producer.send_batch(
+committed = await producer.send(b"one", headers={"type": ("uint16", 7)}, key=b"account-42")
+batch_committed = await producer.send_batch(
     [(b"two", {"type": 8}), b"three"],
     key=b"account-42",
 )

@@ -67,16 +67,17 @@ async def test_topic_ensure_then_publish_single(laser):
     )
 
 
-async def test_publish_batch_returns_count(laser):
+async def test_publish_batch_returns_commit_confirmation(laser):
     await laser.topic("events").ensure(partitions=1)
-    count = await (
+    committed = await (
         laser.topic("events")
         .publish_batch()
         .inline_payload()
         .extend_json([{"n": 1}, {"n": 2}, {"n": 3}])
         .send()
     )
-    assert count == 3
+    assert len(committed.confirmations) == 1
+    assert committed.confirmations[0].partition_id == 0
 
 
 async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery_and_offsets(
@@ -92,16 +93,20 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
         partitions=1,
     )
     await producer.init()
-    await producer.send(
+    first_send = await producer.send(
         b"one",
         headers={"kind": ("uint16", 7), "source": "python"},
         key=b"account-42",
     )
-    count = await producer.send_batch(
+    batch_send = await producer.send_batch(
         [(b"two", {"kind": 8}), b"three"],
         partition=0,
     )
-    assert count == 2
+    assert len(first_send.confirmations) == 1
+    assert first_send.confirmations[0].partition_id == 0
+    assert len(batch_send.confirmations) == 1
+    assert batch_send.confirmations[0].partition_id == 0
+    assert batch_send.confirmations[0].base_offset > first_send.confirmations[0].base_offset
 
     uncommitted = topic.consumer_group(
         "uncommitted-workers",
