@@ -8,11 +8,17 @@ on:
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
+      - "scripts/**"
   push:
     branches:
       - main
     tags:
       - "py-v*"
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.mdx"
+      - "docs/**"
+      - "scripts/**"
   workflow_dispatch:
 
 permissions:

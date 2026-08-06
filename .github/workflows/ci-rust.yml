@@ -8,12 +8,18 @@ on:
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
+      - "scripts/**"
   push:
     branches:
       - main
     tags:
       - "rust-v*"
       - "wire-v*"
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.mdx"
+      - "docs/**"
+      - "scripts/**"
   workflow_dispatch:
 
 # Least privilege by default. Only the tag-gated publish job can mint an OIDC token.
