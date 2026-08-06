@@ -9,6 +9,7 @@
 
 use crate::agent_workflow::AgentError;
 use crate::fork::ForkError;
+use crate::graph::GraphError;
 use crate::kv::KvError;
 use crate::query::QueryError;
 use serde::{Deserialize, Serialize};
@@ -47,10 +48,18 @@ pub enum ResultCode {
     /// Authenticated, but the operation needs a stronger authentication (a
     /// step-up) than the caller currently holds.
     StepUpRequired,
+    /// The request could not be served right now, and the same request may
+    /// succeed on a later attempt: the store was momentarily out of reach, a
+    /// connection was refused or dropped, a concurrency conflict was aborted, or
+    /// a resource limit was hit. Distinct from [`Backend`](Self::Backend), which
+    /// is a fault the caller cannot retry away. This is the one code a generic
+    /// client may safely retry with backoff, so it never has to parse a message
+    /// to decide (see [`is_retryable`](Self::is_retryable)).
+    Unavailable,
     /// A code from a newer peer this build does not name. Decodes and re-encodes
     /// byte-for-byte so an old build relays it rather than failing. Only a value
-    /// outside the named range (12 and up) should ever appear here: `from_code`
-    /// never produces `Unrecognized` for `0..=11`, which map to the named
+    /// outside the named range (13 and up) should ever appear here: `from_code`
+    /// never produces `Unrecognized` for `0..=12`, which map to the named
     /// variants.
     Unrecognized(u16),
 }
@@ -71,6 +80,7 @@ impl ResultCode {
             ResultCode::Backend => 9,
             ResultCode::Forbidden => 10,
             ResultCode::StepUpRequired => 11,
+            ResultCode::Unavailable => 12,
             ResultCode::Unrecognized(code) => code,
         }
     }
@@ -91,6 +101,7 @@ impl ResultCode {
             9 => ResultCode::Backend,
             10 => ResultCode::Forbidden,
             11 => ResultCode::StepUpRequired,
+            12 => ResultCode::Unavailable,
             other => ResultCode::Unrecognized(other),
         }
     }
@@ -114,8 +125,19 @@ impl ResultCode {
             // HTTP layer has a better challenge status for the chosen scheme.
             ResultCode::Forbidden => 403,
             ResultCode::StepUpRequired => 403,
+            // Retry-after territory, the same status a lagging read model gets.
+            ResultCode::Unavailable => 503,
             ResultCode::Unrecognized(_) => 500,
         }
+    }
+
+    /// Whether a caller may retry the identical request and reasonably expect a
+    /// different outcome. True only for the two transient classes: the store was
+    /// momentarily unreachable, or the read model had not caught up yet. Every
+    /// other code needs the request, the credential, or the data to change first,
+    /// so retrying it unchanged only wastes the attempt.
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, ResultCode::Unavailable | ResultCode::Stale)
     }
 }
 
@@ -159,6 +181,7 @@ impl From<&QueryError> for ResultCode {
             QueryError::Unauthorized(_) => ResultCode::Forbidden,
             QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_) => ResultCode::NotFound,
             QueryError::Backend(_) => ResultCode::Backend,
+            QueryError::Unavailable(_) => ResultCode::Unavailable,
             QueryError::TooLarge { .. } => ResultCode::TooLarge,
             QueryError::Version { .. } => ResultCode::VersionSkew,
             QueryError::Stale { .. } => ResultCode::Stale,
@@ -174,11 +197,12 @@ impl From<&KvError> for ResultCode {
             KvError::InvalidNamespace(_) => ResultCode::InvalidArgument,
             KvError::TooLarge { .. } => ResultCode::TooLarge,
             KvError::Backend(_) => ResultCode::Backend,
+            KvError::Unavailable(_) => ResultCode::Unavailable,
             KvError::Version { .. } => ResultCode::VersionSkew,
             KvError::VersionConflict { .. } => ResultCode::Conflict,
             KvError::LeaseLost => ResultCode::Conflict,
             KvError::NotFound => ResultCode::NotFound,
-            KvError::NotLeader => ResultCode::Backend,
+            KvError::NotLeader => ResultCode::Unavailable,
         }
     }
 }
@@ -191,8 +215,24 @@ impl From<&ForkError> for ResultCode {
             ForkError::InvalidFork(_) => ResultCode::InvalidArgument,
             ForkError::Conflict(_) => ResultCode::Conflict,
             ForkError::Backend(_) => ResultCode::Backend,
+            ForkError::Unavailable(_) => ResultCode::Unavailable,
             ForkError::Version { .. } => ResultCode::VersionSkew,
-            ForkError::NotLeader => ResultCode::Backend,
+            ForkError::NotLeader => ResultCode::Unavailable,
+        }
+    }
+}
+
+impl From<&GraphError> for ResultCode {
+    fn from(error: &GraphError) -> Self {
+        match error {
+            GraphError::Unsupported(_) => ResultCode::Unsupported,
+            GraphError::Unauthorized(_) => ResultCode::Forbidden,
+            GraphError::InvalidName(_) => ResultCode::InvalidArgument,
+            GraphError::NotFound(_) => ResultCode::NotFound,
+            GraphError::TooLarge { .. } => ResultCode::TooLarge,
+            GraphError::Backend(_) => ResultCode::Backend,
+            GraphError::Unavailable(_) => ResultCode::Unavailable,
+            GraphError::Version { .. } => ResultCode::VersionSkew,
         }
     }
 }
@@ -204,8 +244,9 @@ impl From<&AgentError> for ResultCode {
             AgentError::NotFound(_) => ResultCode::NotFound,
             AgentError::Invalid(_) => ResultCode::InvalidArgument,
             AgentError::Backend(_) => ResultCode::Backend,
+            AgentError::Unavailable(_) => ResultCode::Unavailable,
             AgentError::Version { .. } => ResultCode::VersionSkew,
-            AgentError::NotLeader => ResultCode::Backend,
+            AgentError::NotLeader => ResultCode::Unavailable,
         }
     }
 }
@@ -229,6 +270,7 @@ mod tests {
             ResultCode::Backend,
             ResultCode::Forbidden,
             ResultCode::StepUpRequired,
+            ResultCode::Unavailable,
         ] {
             assert_eq!(ResultCode::from_code(code.code()), code);
         }
@@ -259,12 +301,54 @@ mod tests {
             ResultCode::from(&ForkError::Conflict("open".to_owned())),
             ResultCode::Conflict
         );
-        assert_eq!(ResultCode::from(&KvError::NotLeader), ResultCode::Backend);
-        assert_eq!(ResultCode::from(&ForkError::NotLeader), ResultCode::Backend);
+        assert_eq!(
+            ResultCode::from(&KvError::NotLeader),
+            ResultCode::Unavailable
+        );
+        assert_eq!(
+            ResultCode::from(&ForkError::NotLeader),
+            ResultCode::Unavailable
+        );
         assert_eq!(
             ResultCode::from(&AgentError::NotLeader),
-            ResultCode::Backend
+            ResultCode::Unavailable
         );
+    }
+
+    // A transient outcome must be distinguishable from a fault without parsing
+    // the message, so a generic client can back off and retry exactly these.
+    #[test]
+    fn given_transient_outcomes_when_classified_then_should_be_the_only_retryable_codes() {
+        for surface in [
+            ResultCode::from(&QueryError::Unavailable("dropped".to_owned())),
+            ResultCode::from(&KvError::Unavailable("dropped".to_owned())),
+            ResultCode::from(&ForkError::Unavailable("dropped".to_owned())),
+            ResultCode::from(&AgentError::Unavailable("dropped".to_owned())),
+        ] {
+            assert_eq!(surface, ResultCode::Unavailable);
+        }
+        assert_eq!(ResultCode::Unavailable.http_status(), 503);
+        assert!(ResultCode::Unavailable.is_retryable());
+        assert!(ResultCode::Stale.is_retryable());
+        for code in [
+            ResultCode::Ok,
+            ResultCode::Unsupported,
+            ResultCode::NotFound,
+            ResultCode::InvalidArgument,
+            ResultCode::TooLarge,
+            ResultCode::Conflict,
+            ResultCode::VersionSkew,
+            ResultCode::Unauthenticated,
+            ResultCode::Backend,
+            ResultCode::Forbidden,
+            ResultCode::StepUpRequired,
+            ResultCode::Unrecognized(900),
+        ] {
+            assert!(
+                !code.is_retryable(),
+                "{code:?} must not invite a blind retry"
+            );
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@ Capability negotiation must match Rust and Python. `BackendAnnounce.ready !== tr
 
 `src/iggy/apache-iggy.ts` always constructs VSR and rejects an injected client configured for another protocol. LaserData hosts use TLS with the bundled root CA and explicit SNI. The Apache Iggy Node SDK supports VSR over TLS through its normal `getRawClient` path, with no Laser-side transport workaround. Synchronous client configuration failures must fail immediately and never enter the unlimited connection retry loop. This module is also the allocation boundary: a `Uint8Array` becomes a Node `Buffer` view over the same backing store rather than a copied buffer.
 
+Direct and fluent streaming sends return Apache Iggy's `SendMessagesResponse`. Re-export its confirmation types, preserve all confirmations through the transport layer, and allow an empty list when the server cannot report offsets. A confirmation is an in-memory commit position, not an fsync guarantee.
+
 Memory mirrors the Rust topology. `laser.memory(namespace)` uses the default audit topic, `laser.memoryOnTopic(topic, stream?)` opens an isolated existing topic, and `laser.memoryTopic(topic).stream(name).partitions(n).ttl(milliseconds).build()` configures one with message expiry. `noExpiry()` writes zero expiry. `laser.context(conversation).memory(handle)` must retain the exact topic-backed handle instead of substituting another namespace.
 
 ## Exports

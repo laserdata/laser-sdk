@@ -19,9 +19,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = "=0.0.2" # typed streaming plus provenance
+laser-sdk = "=0.1.0" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "=0.0.2", features = ["agent", "managed"] }
+laser-sdk = { version = "=0.1.0", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -46,12 +46,13 @@ let api_calls = laser
     .json::<ApiCall>();
 api_calls.topic().ensure(4).await?;
 
-api_calls.publish(&ApiCall {
+let committed = api_calls.publish(&ApiCall {
         endpoint:   "/v1/items".into(),
         status:     200,
         latency_ms: 42,
         user_id:    "alice".into(),
     })?.send().await?;
+println!("commit confirmations: {}", committed.confirmations.len());
 
 let mut records = api_calls.records("latency-dashboard")?; // your reader's name, offsets stay caller-owned
 while let Some(record) = records.next().await {
@@ -62,6 +63,8 @@ while let Some(record) = records.next().await {
 ```
 
 This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy.
+
+Direct producers, raw topic sends, and fluent publish terminals return `SendMessagesResponse`. Its confirmations identify the selected stream, topic, partition, and batch base offset. A server that cannot report offsets returns an empty list. The confirmation is an in-memory commit position, not an fsync guarantee, and the base offset is not unique without the other three coordinates.
 
 Apache Iggy TCP reconnection is enabled for both the initial handshake and a later dropped socket, with unlimited retries at one-second intervals by default. Tune it through `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` in the connection string. The client reapplies connection-string credentials after reconnecting, so a server restart does not leave the socket unauthenticated.
 
@@ -83,7 +86,8 @@ let mut batch = api_calls.publish_batch();
 for call in &window {
     batch = batch.add_json(call)?;        // or .add_payload(raw_bytes) for any format
 }
-batch.send().await?;                      // the whole window, one round-trip
+let committed = batch.send().await?;      // the whole window, one round-trip
+println!("commit confirmations: {}", committed.confirmations.len());
 # Ok(()) }
 ```
 

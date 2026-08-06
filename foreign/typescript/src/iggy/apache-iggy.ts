@@ -7,7 +7,13 @@ import {
   SimpleClient,
   getRawClient
 } from "apache-iggy"
-import type { ClientConfig, ClientCredentials, RawClient } from "apache-iggy"
+import type {
+  ClientConfig,
+  ClientCredentials,
+  RawClient,
+  SendMessagesConfirmation,
+  SendMessagesResponse
+} from "apache-iggy"
 import { readFileSync } from "node:fs"
 import { isIP } from "node:net"
 import { ConfigError, TransportError } from "../client/errors.js"
@@ -30,6 +36,7 @@ export interface PolledMessage {
 
 export type IggyClient = SimpleClient
 export type ClientOwnership = "owned" | "borrowed"
+export type { SendMessagesConfirmation, SendMessagesResponse }
 
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
@@ -96,7 +103,7 @@ export interface LaserTransport {
     topicId: string,
     payloads: readonly Uint8Array[],
     routing: Routing
-  ): Promise<void>
+  ): Promise<SendMessagesResponse>
   /** Sends one message with exact headers and optional key or partition routing. */
   sendMessageWithHeaders(
     streamId: string,
@@ -105,14 +112,14 @@ export interface LaserTransport {
     headers: ReadonlyMap<string, IggyHeaderValue>,
     partitionKey?: string | Uint8Array,
     partitionId?: number
-  ): Promise<void>
+  ): Promise<SendMessagesResponse>
   sendMessagesWithHeaders(
     streamId: string,
     topicId: string,
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number
-  ): Promise<void>
+  ): Promise<SendMessagesResponse>
   pollMessages(
     streamId: string,
     topicId: string,
@@ -802,9 +809,9 @@ export class ApacheIggyTransport implements LaserTransport {
     topicId: string,
     payloads: readonly Uint8Array[],
     routing: Routing
-  ): Promise<void> {
+  ): Promise<SendMessagesResponse> {
     const partitionId = await this.resolvePartition(streamId, topicId, routing)
-    await this.execute(
+    return this.execute(
       (client) =>
         client.message.send({
           streamId,
@@ -823,8 +830,8 @@ export class ApacheIggyTransport implements LaserTransport {
     headers: ReadonlyMap<string, IggyHeaderValue>,
     partitionKey?: string | Uint8Array,
     partitionId?: number
-  ): Promise<void> {
-    await this.sendMessagesWithHeaders(
+  ): Promise<SendMessagesResponse> {
+    return this.sendMessagesWithHeaders(
       streamId,
       topicId,
       [{ payload, headers }],
@@ -839,7 +846,7 @@ export class ApacheIggyTransport implements LaserTransport {
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number
-  ): Promise<void> {
+  ): Promise<SendMessagesResponse> {
     const resolvedPartition = await this.resolvePartition(
       streamId,
       topicId,
@@ -855,7 +862,7 @@ export class ApacheIggyTransport implements LaserTransport {
             }
           : { kind: "balanced" }
     )
-    await this.execute(
+    return this.execute(
       (client) =>
         client.message.send({
           streamId,

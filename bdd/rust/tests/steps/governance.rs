@@ -49,7 +49,7 @@ async fn send_governed(world: &mut LaserWorld, payload: String) {
         .expect("a governed laser")
         .send_agent(AgentTopic::Commands, payload.into_bytes(), &provenance)
         .await;
-    world.last_result = Some(result.map_err(|error| format!("{error:?}")));
+    world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
 
 #[when(regex = r#"^I publish a governed business record "([^"]+)"$"#)]
@@ -70,7 +70,7 @@ async fn publish_governed(world: &mut LaserWorld, payload: String) {
         .payload(payload.into_bytes())
         .send()
         .await;
-    world.last_result = Some(result.map_err(|error| format!("{error:?}")));
+    world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
 
 #[then("the send is rejected by policy")]

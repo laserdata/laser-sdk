@@ -10,7 +10,8 @@ export const ResultCodeName = {
   Unauthenticated: 8,
   Backend: 9,
   Forbidden: 10,
-  StepUpRequired: 11
+  StepUpRequired: 11,
+  Unavailable: 12
 } as const
 
 export type ResultCode =
@@ -56,5 +57,19 @@ export function resultCodeHttpStatus(value: ResultCode): number {
     case "Forbidden":
     case "StepUpRequired":
       return 403
+    // Retry-after territory, the same status a lagging read model gets.
+    case "Unavailable":
+      return 503
   }
+}
+
+/**
+ * Whether a caller may retry the identical request and reasonably expect a
+ * different outcome. True only for the two transient classes: the store was
+ * momentarily unreachable, or the read model had not caught up yet. Every other
+ * code needs the request, the credential, or the data to change first, so
+ * retrying it unchanged only wastes the attempt.
+ */
+export function resultCodeIsRetryable(value: ResultCode): boolean {
+  return value.kind === "known" && (value.name === "Unavailable" || value.name === "Stale")
 }

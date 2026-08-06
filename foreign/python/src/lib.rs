@@ -91,6 +91,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<typed::PyTypedRecord>()?;
     module.add_class::<reader::PyMessage>()?;
     module.add_class::<transport::PyProducer>()?;
+    module.add_class::<transport::PySendMessagesConfirmation>()?;
+    module.add_class::<transport::PySendMessagesResponse>()?;
     module.add_class::<transport::PyConsumer>()?;
     module.add_class::<transport::PyConsumerMessage>()?;
     module.add_class::<chunks::PyChunkAssembler>()?;

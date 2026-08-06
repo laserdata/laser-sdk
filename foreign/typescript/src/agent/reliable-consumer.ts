@@ -350,6 +350,11 @@ export function isRetryable(error: LaserError): boolean {
     case "presence-conflict":
     case "policy-blocked":
     case "step-up-required":
+    case "cancelled":
+    case "typed-decode":
+    case "authz":
+    case "signature":
+    case "budget-exceeded":
       return false
     case "transport":
       return error instanceof TransportError ? error.retryable : true
@@ -362,21 +367,16 @@ export function isRetryable(error: LaserError): boolean {
     case "query":
     case "kv":
     case "fork":
+    case "graph":
+    case "agent-workflow":
       return (
         "detail" in error &&
-        ["backend", "notLeader"].includes(
+        ["notLeader", "stale", "unavailable"].includes(
           String((error as { readonly detail?: { readonly kind?: unknown } }).detail?.kind)
         )
       )
     case "timeout":
-    case "cancelled":
-    case "typed-decode":
-    case "graph":
-    case "authz":
-    case "agent-workflow":
-    case "signature":
     case "handler":
-    case "budget-exceeded":
     case "policy-deferred":
       return true
   }

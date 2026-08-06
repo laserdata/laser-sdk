@@ -1,0 +1,58 @@
+schema_version = 1
+
+[[claim]]
+id = "C1"
+statement = "Raw Iggy single-node throughput and latency are reported for disclosed workload and durability profiles."
+evidence = ["L1", "L2-raw"]
+
+[[claim]]
+id = "C2"
+statement = "Laser direct publishing, partition consumption, and consumer-group consumption add no stable measurable overhead over the matched raw Iggy client paths."
+evidence = ["L2-paired", "allocation", "byte-path"]
+throughput_ratio_lower_bound = 0.99
+latency_ratio_upper_bound = 1.01
+
+[[claim]]
+id = "C3"
+statement = "Laser fluent, background, and batching paths have quantified incremental costs."
+evidence = ["L0", "L2"]
+
+[[claim]]
+id = "C4"
+statement = "AGDX envelope and provenance costs are quantified by payload size."
+evidence = ["L0", "L3"]
+
+[[claim]]
+id = "C5"
+statement = "AGDX request, reply, and chunk-stream latency are quantified under disclosed load."
+evidence = ["L3"]
+
+[[claim]]
+id = "C6"
+statement = "Reliable consumer features have quantified incremental cost and verified delivery behavior."
+evidence = ["L3"]
+
+[[claim]]
+id = "C7"
+statement = "Managed operation cost is quantified for every declared plane backend profile."
+evidence = ["L4"]
+
+[[claim]]
+id = "C8"
+statement = "Projection and durable-memory visibility, drain, and recovery are quantified."
+evidence = ["L4"]
+
+[[claim]]
+id = "C9"
+statement = "AGDX and MCP application wiring are compared with guarantees and total work disclosed."
+evidence = ["L5"]
+
+[[claim]]
+id = "C10"
+statement = "Rust steady-state client costs are quantified on the parity subset."
+evidence = ["L6"]
+
+[[claim]]
+id = "C11"
+statement = "Three-node VSR cost is quantified against a single-node control with matched semantics."
+evidence = ["L7"]

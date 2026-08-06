@@ -63,8 +63,8 @@ export class TopicSnapshotStore implements SnapshotStore {
     return latest?.snapshot
   }
 
-  save(snapshot: FoldSnapshot): Promise<void> {
-    return this.laser.topic(this.topic).send(encodeNamed(encodeFoldSnapshot(snapshot)), {
+  async save(snapshot: FoldSnapshot): Promise<void> {
+    await this.laser.topic(this.topic).send(encodeNamed(encodeFoldSnapshot(snapshot)), {
       key: new TextEncoder().encode(snapshot.conversation.toString())
     })
   }

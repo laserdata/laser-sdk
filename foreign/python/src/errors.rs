@@ -12,7 +12,7 @@ create_exception!(
     PyException,
     "Base class for every laser-sdk error. Catch it to handle any SDK failure. \
      Every instance carries `code`, `retryable`, `unsupported`, `not_found`, \
-     `version_skew`, `version_conflict`, `stale`, `permission_denied`, \
+     `version_skew`, `version_conflict`, `stale`, `unavailable`, `permission_denied`, \
      `stream_or_topic_not_found`, `no_capable_agent`, `lease_lost`, \
      `fence_violation`, `budget_exceeded`, `quarantined`, and `not_leader` attributes."
 );
@@ -197,6 +197,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
     let message = err.to_string();
     let code = format!("{:?}", err.code());
     let retryable = err.is_retryable();
+    let unavailable = err.is_unavailable();
     let unsupported = err.is_unsupported();
     let not_found = err.is_not_found();
     let version_skew = err.is_version_skew();
@@ -246,6 +247,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         let value = pyerr.value(py);
         let _ = value.setattr("code", code);
         let _ = value.setattr("retryable", retryable);
+        let _ = value.setattr("unavailable", unavailable);
         let _ = value.setattr("unsupported", unsupported);
         let _ = value.setattr("not_found", not_found);
         let _ = value.setattr("version_skew", version_skew);

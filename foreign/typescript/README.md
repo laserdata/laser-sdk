@@ -4,7 +4,7 @@ The native TypeScript client for LaserData over Apache Iggy. It provides typed s
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Initial release (`0.0.1`).** The wire contract and public API are versioned from this release. Future releases may include breaking changes under semantic versioning.
+> **Current pre-1.0 release (`0.1.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 ## Install
 
@@ -24,7 +24,8 @@ await using laser = await Laser.connect(
 )
 const topic = laser.stream("commerce").topic("orders")
 await topic.ensure(4)
-await topic.publish().json({ id: "order-1", total: 42 }).send()
+const committed = await topic.publish().json({ id: "order-1", total: 42 }).send()
+console.log(committed.confirmations)
 
 const records = await (await topic.replay()).poll()
 console.log(`read ${records.length} order(s)`)
@@ -34,7 +35,7 @@ Use the bare `user:password@host:port` connection string. The SDK supplies the A
 
 Owned connections retry the initial handshake and reconnect after a dropped socket, with unlimited retries at one-second intervals by default. Set `reconnection_retries` to a non-negative integer and `reconnection_interval` to `250ms`, `1s`, or `1m` in the connection string to tune the policy. An injected client remains under its caller's lifecycle and reconnect policy.
 
-The TypeScript SDK pins Apache Iggy `0.8.1-edge.3` and always constructs a VSR client. There is no protocol option in the Laser API. An injected Apache Iggy client must also use VSR and is rejected before use otherwise.
+The TypeScript SDK pins Apache Iggy `0.9.0-edge.1` and always constructs a VSR client. There is no protocol option in the Laser API. An injected Apache Iggy client must also use VSR and is rejected before use otherwise.
 
 ## Streaming model
 
@@ -47,6 +48,8 @@ The TypeScript SDK pins Apache Iggy `0.8.1-edge.3` and always constructs a VSR c
 - automatic or explicit offset commits, replay, cancellation, and bounded `nextWithin()` waits
 
 Delivery is at least once. Ordering is per selected partition. A handler should make external effects idempotent, or use the fenced managed coordination path when a monotonic holder token is required.
+
+Direct producers and fluent publish terminals return `SendMessagesResponse`. Each confirmation identifies the selected stream, topic, partition, and batch base offset. The list can be empty when a server cannot report offsets. A confirmation is an in-memory commit position, not an fsync guarantee.
 
 ## Runtime-checked records
 

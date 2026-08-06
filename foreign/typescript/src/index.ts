@@ -70,7 +70,12 @@ export { checkIn, resolveBody } from "./blob.js"
 export type { BlobStore, CheckedBody } from "./blob.js"
 export { Laser, LaserBuilder } from "./client/laser.js"
 export type { InjectedClientOptions } from "./client/laser.js"
-export type { ClientOwnership, IggyClient } from "./iggy/apache-iggy.js"
+export type {
+  ClientOwnership,
+  IggyClient,
+  SendMessagesConfirmation,
+  SendMessagesResponse
+} from "./iggy/apache-iggy.js"
 export type { Capabilities, CapabilitySurface } from "./client/capabilities.js"
 export { QueryRequest } from "./managed/query.js"
 export type { QueryResult, Row, Filter, Consistency } from "./wire/query.js"

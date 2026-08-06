@@ -65,6 +65,8 @@ __all__ = [
     "RunPage",
     "Runs",
     "ScopedMemory",
+    "SendMessagesConfirmation",
+    "SendMessagesResponse",
     "SigningKey",
     "SnapshotStore",
     "Stream",
@@ -477,7 +479,7 @@ class BackendDescriptor:
 class BatchPublishRequest:
     r"""
     Fluent builder for a batch publish, finished with `await .send()` returning
-    the number of records sent.
+    Apache Iggy's commit confirmations.
     """
     def inline_payload(self) -> BatchPublishRequest:
         r"""
@@ -2930,6 +2932,28 @@ class ScopedMemory:
         """
 
 @typing.final
+class SendMessagesConfirmation:
+    r"""
+    One committed partition range reported by Apache Iggy after a send.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def topic_id(self) -> builtins.int: ...
+    @property
+    def partition_id(self) -> builtins.int: ...
+    @property
+    def base_offset(self) -> builtins.int: ...
+
+@typing.final
+class SendMessagesResponse:
+    r"""
+    Commit confirmations returned by a successful Apache Iggy send.
+    """
+    @property
+    def confirmations(self) -> builtins.list[SendMessagesConfirmation]: ...
+
+@typing.final
 class SigningKey:
     r"""
     An Ed25519 signing key created from a 32-byte secret seed.
@@ -3398,6 +3422,7 @@ import asyncio
 class LaserError(Exception):
     code: builtins.str
     retryable: builtins.bool
+    unavailable: builtins.bool
     unsupported: builtins.bool
     not_found: builtins.bool
     version_skew: builtins.bool

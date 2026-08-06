@@ -1039,6 +1039,7 @@ impl<H> ReliableWorker<H> {
         self.laser
             .send_with_headers(&topic, payload, headers, Some(&partition_key))
             .await
+            .map(|_| ())
     }
 }
 

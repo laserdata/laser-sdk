@@ -520,6 +520,7 @@ impl AgdxStream {
             .laser
             .send_batch(&self.agdx.topic, batch, Some(&partition_key))
             .await
+            .map(|_| ())
     }
 
     /// Publish the terminal chunk (`last = true`) with the reason the stream

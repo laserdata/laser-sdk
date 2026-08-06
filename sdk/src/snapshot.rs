@@ -199,6 +199,7 @@ impl SnapshotStore for TopicSnapshotStore {
                 Some(&conversation),
             )
             .await
+            .map(|_| ())
     }
 }
 

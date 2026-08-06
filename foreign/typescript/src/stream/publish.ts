@@ -4,6 +4,7 @@ import { type BytesLike, ownedBytes } from "../client/bytes.js"
 import { InvalidError } from "../client/errors.js"
 import type { Provenance } from "../provenance/provenance.js"
 import type { CompiledSchema } from "../schema-codecs.js"
+import type { SendMessagesResponse } from "../iggy/apache-iggy.js"
 import { ContentType, type ContentType as ContentTypeValue } from "../wire/content.js"
 import { type Codec, jsonCodec, messagePackCodec } from "./codecs.js"
 import { mergeRecord, Record, recordHeaders } from "./record.js"
@@ -139,7 +140,7 @@ export class PublishRequest {
     return this
   }
 
-  async send(): Promise<void> {
+  async send(): Promise<SendMessagesResponse> {
     if (this.body === undefined) {
       throw new InvalidError(
         "publish() requires a body, call payload()/json()/msgpack()/rawBytes() before send()"
@@ -155,7 +156,7 @@ export class PublishRequest {
       payload = checked.payload
       if (checked.contentType !== undefined) this.record.contentType(checked.contentType)
     }
-    await this.topic.send(payload, {
+    return this.topic.send(payload, {
       ...(this.key !== undefined ? { key: this.key } : {}),
       ...(this.partitionId !== undefined ? { partition: this.partitionId } : {}),
       ...(this.provenanceValue !== undefined ? { provenance: this.provenanceValue } : {}),
@@ -365,8 +366,8 @@ export class BatchPublishRequest {
     return this
   }
 
-  async send(): Promise<number> {
-    if (this.entries.length === 0) return 0
+  async send(): Promise<SendMessagesResponse> {
+    if (this.entries.length === 0) return { confirmations: [] }
     const entries = this.entries.map(({ payload, record }, index) => {
       try {
         return { payload, headers: recordHeaders(mergeRecord(this.defaults, record)) }
@@ -374,7 +375,6 @@ export class BatchPublishRequest {
         throw new InvalidError(`record #${String(index)} is invalid`, { cause })
       }
     })
-    await this.topic.sendRecords(entries, this.key === undefined ? {} : { key: this.key })
-    return entries.length
+    return this.topic.sendRecords(entries, this.key === undefined ? {} : { key: this.key })
   }
 }

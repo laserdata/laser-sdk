@@ -1,0 +1,29 @@
+schema_version = 1
+name = "l1-native-smoke"
+authoritative = false
+
+[provisioning]
+mode = "source"
+cpu_target = "native"
+iggy_root = "/path/to/iggy-source"
+
+[environment]
+tier = "A"
+durability_profile = "release_default"
+cache_state = "warm"
+
+[[scenarios]]
+name = "iggy-pinned-producer"
+layer = "L1"
+arm = "raw_iggy"
+driver = "pinned_producer"
+transport = "tcp_vsr"
+repetitions = 1
+warmup_seconds = 1
+duration_seconds = 5
+payload_bytes = 64
+batch_size = 1
+partitions = 1
+producers = 1
+consumers = 1
+operations = 10

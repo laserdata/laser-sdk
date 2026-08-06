@@ -59,11 +59,12 @@ void test("given_a_typed_topic_when_publishing_a_batch_then_should_decode_every_
   try {
     const topic = await freshTopic(laser)
     const orders = topic.json(jsonCodec(decodeOrder))
-    const count = await orders.publishBatch([
+    const committed = await orders.publishBatch([
       { id: "o-1", total: 1 },
       { id: "o-2", total: 2 }
     ])
-    assert.equal(count, 2)
+    assert.equal(committed.confirmations.length, 1)
+    assert.equal(committed.confirmations[0]?.partitionId, 0)
 
     const records = await orders.records("orders-batch")
     const results = await records.poll()

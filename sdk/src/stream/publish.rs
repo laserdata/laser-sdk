@@ -1,7 +1,7 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::stream::{Codec, ContentType, Json, Msgpack, Record};
-use iggy::prelude::{HeaderKey, HeaderValue};
+use iggy::prelude::{HeaderKey, HeaderValue, SendMessagesResponse};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -249,7 +249,7 @@ impl<'a> PublishRequest<'a> {
     }
 
     /// Publish the message.
-    pub async fn send(self) -> Result<(), LaserError> {
+    pub async fn send(self) -> Result<SendMessagesResponse, LaserError> {
         #[cfg(feature = "agent")]
         let mut this = self;
         #[cfg(not(feature = "agent"))]
@@ -622,11 +622,13 @@ impl<'a> BatchPublishRequest<'a> {
         self.records.is_empty()
     }
 
-    /// Flush every queued record in a single Iggy `send_messages` call. An
-    /// empty batch is a no-op. Returns the number of records sent.
-    pub async fn send(self) -> Result<usize, LaserError> {
+    /// Flush every queued record in a single Iggy `send_messages` call.
+    /// An empty batch returns an empty confirmation list.
+    pub async fn send(self) -> Result<SendMessagesResponse, LaserError> {
         if self.records.is_empty() {
-            return Ok(0);
+            return Ok(SendMessagesResponse {
+                confirmations: Vec::new(),
+            });
         }
         let count = self.records.len();
         let mut iggy_messages = Vec::with_capacity(count);
@@ -693,7 +695,7 @@ impl<'a> BatchPublishRequest<'a> {
                     .build()?,
             );
         }
-        match self.stream {
+        let response = match self.stream {
             Some(stream) => {
                 self.laser
                     .send_batch_on(
@@ -709,7 +711,7 @@ impl<'a> BatchPublishRequest<'a> {
                     .send_batch(self.topic, iggy_messages, self.partition_key.as_deref())
                     .await?
             }
-        }
-        Ok(count)
+        };
+        Ok(response)
     }
 }

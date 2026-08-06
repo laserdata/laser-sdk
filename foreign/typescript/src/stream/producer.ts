@@ -1,6 +1,11 @@
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
 import { InvalidError, TransportError } from "../client/errors.js"
-import type { IggyHeaderValue, LaserTransport, MessageWithHeaders } from "../iggy/apache-iggy.js"
+import type {
+  IggyHeaderValue,
+  LaserTransport,
+  MessageWithHeaders,
+  SendMessagesResponse
+} from "../iggy/apache-iggy.js"
 import type { Routing } from "./routing.js"
 
 export interface ProducerOptions {
@@ -77,37 +82,43 @@ export class Producer implements AsyncDisposable {
     }
   }
 
-  async send(payload: BytesLike, options: ProducerSendOptions = {}): Promise<void> {
-    await this.sendMessage(
+  async send(payload: BytesLike, options: ProducerSendOptions = {}): Promise<SendMessagesResponse> {
+    return this.sendMessage(
       { payload, ...(options.headers !== undefined ? { headers: options.headers } : {}) },
       optionRouting(options, this.routing)
     )
   }
 
-  async sendMessage(message: ProducerMessage, routing: Routing = this.routing): Promise<void> {
+  async sendMessage(
+    message: ProducerMessage,
+    routing: Routing = this.routing
+  ): Promise<SendMessagesResponse> {
     this.throwIfClosed("sendMessage")
-    await this.sendWithRetry([lowerMessage(message)], routing)
+    return this.sendWithRetry([lowerMessage(message)], routing)
   }
 
-  async sendWithRouting(message: ProducerMessage, routing: Routing): Promise<void> {
-    await this.sendMessage(message, routing)
+  async sendWithRouting(message: ProducerMessage, routing: Routing): Promise<SendMessagesResponse> {
+    return this.sendMessage(message, routing)
   }
 
-  async sendKeyed(message: ProducerMessage, key: BytesLike): Promise<void> {
-    await this.sendMessage(message, { kind: "key", key: ownedBytes(key) })
+  async sendKeyed(message: ProducerMessage, key: BytesLike): Promise<SendMessagesResponse> {
+    return this.sendMessage(message, { kind: "key", key: ownedBytes(key) })
   }
 
-  async sendToPartition(message: ProducerMessage, partition: number): Promise<void> {
+  async sendToPartition(
+    message: ProducerMessage,
+    partition: number
+  ): Promise<SendMessagesResponse> {
     if (!Number.isSafeInteger(partition) || partition < 0) {
       throw new InvalidError("partition must be a non-negative safe integer")
     }
-    await this.sendMessage(message, { kind: "partition", partition })
+    return this.sendMessage(message, { kind: "partition", partition })
   }
 
   async sendBatch(
     messages: readonly (BytesLike | ProducerMessage)[],
     options: ProducerSendOptions = {}
-  ): Promise<number> {
+  ): Promise<SendMessagesResponse> {
     const lowered = messages.map((message) =>
       isProducerMessage(message)
         ? lowerMessage(message)
@@ -119,18 +130,17 @@ export class Producer implements AsyncDisposable {
   async sendBatchWithRouting(
     messages: readonly ProducerMessage[],
     routing: Routing = this.routing
-  ): Promise<number> {
+  ): Promise<SendMessagesResponse> {
     return this.sendLoweredBatch(messages.map(lowerMessage), routing)
   }
 
   private async sendLoweredBatch(
     messages: readonly MessageWithHeaders[],
     routing: Routing
-  ): Promise<number> {
+  ): Promise<SendMessagesResponse> {
     this.throwIfClosed("sendBatch")
-    if (messages.length === 0) return 0
-    await this.sendWithRetry(messages, routing)
-    return messages.length
+    if (messages.length === 0) return { confirmations: [] }
+    return this.sendWithRetry(messages, routing)
   }
 
   flush(): Promise<void> {
@@ -157,17 +167,16 @@ export class Producer implements AsyncDisposable {
   private async sendWithRetry(
     messages: readonly MessageWithHeaders[],
     routing: Routing
-  ): Promise<void> {
+  ): Promise<SendMessagesResponse> {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        await this.transport.sendMessagesWithHeaders(
+        return await this.transport.sendMessagesWithHeaders(
           this.streamName,
           this.topicName,
           messages,
           routing.kind === "key" ? routing.key : undefined,
           routing.kind === "partition" ? routing.partition : undefined
         )
-        return
       } catch (error) {
         if (!(error instanceof TransportError) || !error.retryable || attempt >= this.retries) {
           throw error

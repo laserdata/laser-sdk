@@ -1044,7 +1044,7 @@ mod tests {
 
         let backend = LaserError::from(KvError::Backend("boom".to_owned()));
         assert!(matches!(backend, LaserError::Kv(KvError::Backend(_))));
-        assert!(backend.is_retryable());
+        assert!(!backend.is_retryable());
 
         let skew = LaserError::from(KvError::Version {
             expected: 1,

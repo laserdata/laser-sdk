@@ -224,6 +224,7 @@ fn given_result_codes_when_compared_then_should_match_the_dictionary() {
     assert_eq!(ResultCode::Backend.code(), 9);
     assert_eq!(ResultCode::Forbidden.code(), 10);
     assert_eq!(ResultCode::StepUpRequired.code(), 11);
+    assert_eq!(ResultCode::Unavailable.code(), 12);
     assert_eq!(ResultCode::from_code(2), ResultCode::NotFound);
     assert_eq!(ResultCode::from_code(404), ResultCode::Unrecognized(404));
     assert_eq!(ResultCode::NotFound.http_status(), 404);

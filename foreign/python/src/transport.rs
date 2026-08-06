@@ -6,6 +6,7 @@ use iggy::prelude::{
     AutoCommit, AutoCommitWhen, ConsumerGroupClient, HeaderKey, HeaderKind, HeaderValue,
     Identifier, IggyConsumer, IggyConsumerBuilder, IggyDuration, IggyMessage, IggyProducer,
     IggyTimestamp, Partitioning, PollingStrategy, ReceivedMessage,
+    SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use laser_sdk::error::LaserError;
 use laser_sdk::laser::Laser;
@@ -25,6 +26,54 @@ pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
 
 pub(crate) fn duration_ms(value: u64) -> IggyDuration {
     IggyDuration::from(Duration::from_millis(value))
+}
+
+/// One committed partition range reported by Apache Iggy after a send.
+#[gen_stub_pyclass]
+#[pyclass(
+    name = "SendMessagesConfirmation",
+    frozen,
+    get_all,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PySendMessagesConfirmation {
+    pub stream_id: u32,
+    pub topic_id: u32,
+    pub partition_id: u32,
+    pub base_offset: u64,
+}
+
+impl From<SendMessagesConfirmationResponse> for PySendMessagesConfirmation {
+    fn from(confirmation: SendMessagesConfirmationResponse) -> Self {
+        Self {
+            stream_id: confirmation.stream_id,
+            topic_id: confirmation.topic_id,
+            partition_id: confirmation.partition_id,
+            base_offset: confirmation.base_offset,
+        }
+    }
+}
+
+/// Commit confirmations returned by a successful Apache Iggy send.
+#[gen_stub_pyclass]
+#[pyclass(name = "SendMessagesResponse", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PySendMessagesResponse {
+    #[pyo3(get)]
+    pub confirmations: Vec<PySendMessagesConfirmation>,
+}
+
+impl From<SendMessagesResponse> for PySendMessagesResponse {
+    fn from(response: SendMessagesResponse) -> Self {
+        Self {
+            confirmations: response
+                .confirmations
+                .into_iter()
+                .map(PySendMessagesConfirmation::from)
+                .collect(),
+        }
+    }
 }
 
 enum PollingMode {
@@ -445,6 +494,7 @@ impl PyProducer {
             producer
                 .send_with_partitioning(vec![message], partitioning)
                 .await
+                .map(PySendMessagesResponse::from)
                 .map_err(transport_error)
         })
     }
@@ -461,7 +511,6 @@ impl PyProducer {
         partition: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = messages(values)?;
-        let count = messages.len();
         let partitioning = match (key, partition) {
             (None, None) => None,
             _ => Some(Arc::new(partitioning(key, partition)?)),
@@ -472,8 +521,8 @@ impl PyProducer {
             producer
                 .send_with_partitioning(messages, partitioning)
                 .await
-                .map_err(transport_error)?;
-            Ok(count)
+                .map(PySendMessagesResponse::from)
+                .map_err(transport_error)
         })
     }
 

@@ -147,7 +147,7 @@ impl TestIggy {
         let message = IggyMessage::builder()
             .payload(Bytes::from_static(b"ready"))
             .build()?;
-        producer.send(vec![message]).await
+        producer.send(vec![message]).await.map(|_| ())
     }
 
     fn log_path(&self) -> PathBuf {

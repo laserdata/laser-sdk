@@ -162,6 +162,12 @@ pub enum ForkError {
     Conflict(String),
     #[error("fork backend error: {0}")]
     Backend(String),
+    /// The request could not be served right now and the identical request may
+    /// succeed later: the store was momentarily out of reach, a connection was
+    /// refused or dropped, or a concurrency conflict was aborted. Retry with
+    /// backoff rather than treating it as a fault.
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
     #[error("unsupported fork op version (expected {expected}, got {got})")]
     Version { expected: u32, got: u32 },
     /// This plane does not own the mutation partition for the fork.

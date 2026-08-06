@@ -22,10 +22,11 @@ machete:
 lint: fmt sort machete lint-detached
   cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# the same gates for the crates outside the workspace (bdd/rust, fuzz), which
+# the same gates for the crates outside the workspace (bdd/rust, bench, fuzz), which
 # `--workspace` does not reach. Apply mode, to mirror `lint`.
 lint-detached:
   cd bdd/rust && cargo fmt --all && cargo sort && cargo machete && cargo clippy --all-targets -- -D warnings
+  cd bench && cargo fmt --all && cargo sort && cargo machete && cargo clippy --locked --all-targets -- -D warnings
   cd fuzz && cargo fmt --all && cargo sort && cargo machete && cargo clippy -- -D warnings
 
 test: test-doc
@@ -90,6 +91,30 @@ down-clean:
 example NAME:
   cargo run --example {{NAME}}
 
+# run the complete bounded native benchmark campaign
+bench SECONDS="5" REPETITIONS="1" PARALLELISM="":
+  ./bench/scripts/quick.sh {{SECONDS}} {{REPETITIONS}} {{PARALLELISM}}
+
+# verify provisioning, execution, correctness, and evidence mechanics quickly
+bench-smoke:
+  LASER_BENCH_SMOKE=1 ./bench/scripts/quick.sh
+
+# run the exhaustive local benchmark matrix
+bench-full:
+  LASER_BENCH_FULL=1 ./bench/scripts/quick.sh
+
+# run a caller-defined immutable benchmark suite
+bench-suite SUITE OUTPUT:
+  cargo run --manifest-path bench/Cargo.toml --locked --release -- suite {{SUITE}} --output {{OUTPUT}}
+
+# render validated suite analysis and HTML from existing evidence
+bench-analyze OUTPUT:
+  cargo run --manifest-path bench/Cargo.toml --locked --release -- analyze {{OUTPUT}}
+
+# inspect one compressed HDR histogram sidecar directly
+bench-histogram PATH:
+  cargo run --manifest-path bench/Cargo.toml --locked --release -- histogram {{PATH}}
+
 # the full gate set CI runs, in the global Rust verification order. Needs Docker
 # (tests + bdd), the wasm32 target, cargo-deny, cargo-machete, and for fuzz a
 # nightly toolchain + cargo-fuzz.
@@ -99,6 +124,7 @@ ci:
   cargo machete
   cargo clippy --workspace --all-targets --all-features -- -D warnings
   cd bdd/rust && cargo fmt --all --check && cargo sort --check && cargo machete && cargo clippy --all-targets -- -D warnings
+  cd bench && cargo fmt --all --check && cargo sort --check && cargo machete && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked --all-targets && cargo test --locked --doc && cargo bench --locked --profile dev --bench micro --no-run
   cd fuzz && cargo fmt --all --check && cargo sort --check && cargo machete && cargo clippy -- -D warnings
   cargo build --workspace --all-targets --all-features
   cargo test --workspace --all-features

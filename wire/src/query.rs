@@ -670,6 +670,12 @@ pub enum QueryError {
     ForkNotFound(String),
     #[error("backend error: {0}")]
     Backend(String),
+    /// The request could not be served right now and the identical request may
+    /// succeed later: the store was momentarily out of reach, a connection was
+    /// refused or dropped, or a concurrency conflict was aborted. Retry with
+    /// backoff rather than treating it as a fault.
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
     /// The query asked for more than a single reply may carry: a `limit`
     /// above the page cap, or a result whose inline payloads exceed the
     /// LaserData Cloud's reply-byte budget. `what` names the bound hit ("limit" /

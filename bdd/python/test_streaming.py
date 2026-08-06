@@ -32,9 +32,8 @@ def publish_succeeds(world):
 @when(parsers.parse('I publish a batch of {count:d} JSON events to topic "{topic}"'))
 def publish_batch(world, count, topic):
     items = [{"i": index} for index in range(count)]
-    world.count = world.run(
-        lambda: world.laser.topic(topic).publish_batch().extend_json(items).send()
-    )
+    world.run(lambda: world.laser.topic(topic).publish_batch().extend_json(items).send())
+    world.count = count
 
 
 @then(parsers.parse("all {count:d} events are published"))

@@ -217,6 +217,7 @@ impl Inner {
                 self.partition_key.as_deref(),
             )
             .await
+            .map(|_| ())
     }
 }
 

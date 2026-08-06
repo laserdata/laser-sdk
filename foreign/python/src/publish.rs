@@ -3,6 +3,7 @@ use crate::async_bridge::future_into_py;
 use crate::convert::{payload_bytes, py_to_json};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::schema::PyCompiledSchema;
+use crate::transport::PySendMessagesResponse;
 use laser_sdk::laser::Laser;
 use laser_sdk::stream::Record;
 use laser_sdk::wire::content::ContentType;
@@ -252,13 +253,17 @@ impl PyPublish {
                 Body::Json(value) => request.json(&value).map_err(to_pyerr)?,
                 Body::Msgpack(value) => request.msgpack(&value).map_err(to_pyerr)?,
             };
-            request.send().await.map_err(to_pyerr)
+            request
+                .send()
+                .await
+                .map(PySendMessagesResponse::from)
+                .map_err(to_pyerr)
         })
     }
 }
 
 /// Fluent builder for a batch publish, finished with `await .send()` returning
-/// the number of records sent.
+/// Apache Iggy's commit confirmations.
 #[gen_stub_pyclass]
 #[pyclass(name = "BatchPublishRequest")]
 pub struct PyBatchPublish {
@@ -486,7 +491,11 @@ impl PyBatchPublish {
                     Body::Msgpack(value) => request.add_msgpack(&value).map_err(to_pyerr)?,
                 };
             }
-            request.send().await.map_err(to_pyerr)
+            request
+                .send()
+                .await
+                .map(PySendMessagesResponse::from)
+                .map_err(to_pyerr)
         })
     }
 }

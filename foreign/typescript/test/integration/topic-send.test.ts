@@ -33,7 +33,7 @@ void test("given_a_sent_message_when_polled_back_through_the_raw_client_then_sho
   }
 })
 
-void test("given_a_topic_batch_call_when_sent_then_should_deliver_every_message_and_return_the_count", async () => {
+void test("given_a_topic_batch_call_when_sent_then_should_deliver_every_message_and_return_the_commit", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const streamName = `laser-ts-test-${randomUUID()}`
@@ -41,12 +41,13 @@ void test("given_a_topic_batch_call_when_sent_then_should_deliver_every_message_
     await laser.stream(streamName).ensure()
     await topic.ensure(1)
 
-    const count = await topic.batch([
+    const committed = await topic.batch([
       new TextEncoder().encode("one"),
       new TextEncoder().encode("two"),
       new TextEncoder().encode("three")
     ])
-    assert.equal(count, 3)
+    assert.equal(committed.confirmations.length, 1)
+    assert.equal(committed.confirmations[0]?.partitionId, 0)
 
     const reply = await laser.iggyClient.message.poll({
       streamId: streamName,

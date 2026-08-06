@@ -158,8 +158,8 @@ void test("given_a_heterogeneous_publish_batch_when_sent_then_should_apply_defau
   try {
     const topic = await freshTopic(laser)
     const empty = await topic.publishBatch().send()
-    assert.equal(empty, 0)
-    const count = await topic
+    assert.equal(empty.confirmations.length, 0)
+    const committed = await topic
       .publishBatch()
       .contentType(ContentType.Json)
       .schemaId(7)
@@ -170,7 +170,8 @@ void test("given_a_heterogeneous_publish_batch_when_sent_then_should_apply_defau
         new Record().contentType(ContentType.Cbor).schemaId(9).index("tenant", "override")
       )
       .send()
-    assert.equal(count, 2)
+    assert.equal(committed.confirmations.length, 1)
+    assert.equal(committed.confirmations[0]?.partitionId, 0)
 
     const consumer = topic.consumer(0, { startFrom: { kind: "first" }, batchLength: 2 })
     const first = await consumer.nextWithin(1_000)

@@ -42,5 +42,6 @@ impl Laser {
             Some(CONTROL_PARTITION_KEY),
         )
         .await
+        .map(|_| ())
     }
 }

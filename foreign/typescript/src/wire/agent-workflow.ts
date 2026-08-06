@@ -257,6 +257,7 @@ export type AgentWorkflowError =
   | { readonly kind: "notFound"; readonly message: string }
   | { readonly kind: "invalid"; readonly message: string }
   | { readonly kind: "backend"; readonly message: string }
+  | { readonly kind: "unavailable"; readonly message: string }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
   | { readonly kind: "notLeader" }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
@@ -307,6 +308,8 @@ export function encodeAgentWorkflowError(error: AgentWorkflowError): unknown {
       return new Map([["Invalid", error.message]])
     case "backend":
       return new Map([["Backend", error.message]])
+    case "unavailable":
+      return new Map([["Unavailable", error.message]])
     case "version":
       return new Map([
         [
@@ -340,6 +343,8 @@ export function decodeAgentWorkflowError(value: unknown, context: string): Agent
       return { kind: "invalid", message: expectString(inner, context) }
     case "Backend":
       return { kind: "backend", message: expectString(inner, context) }
+    case "Unavailable":
+      return { kind: "unavailable", message: expectString(inner, context) }
     case "Version": {
       const versionMap = expectMap(inner, context)
       return {

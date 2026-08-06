@@ -38,9 +38,10 @@ When(
     const count = Number(countText)
     const target = this.requireLaser().topic(topic)
     await target.ensure(1)
-    this.published = await target
+    await target
       .json(jsonCodec(decodeEvent))
       .publishBatch(Array.from({ length: count }, (_, id) => ({ id })))
+    this.published = count
     this.lastTopic = topic
   }
 )

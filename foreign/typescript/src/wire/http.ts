@@ -124,7 +124,8 @@ const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
   ["unauthenticated", { kind: "known", name: "Unauthenticated" }],
   ["backend", { kind: "known", name: "Backend" }],
   ["forbidden", { kind: "known", name: "Forbidden" }],
-  ["step_up_required", { kind: "known", name: "StepUpRequired" }]
+  ["step_up_required", { kind: "known", name: "StepUpRequired" }],
+  ["unavailable", { kind: "known", name: "Unavailable" }]
 ])
 
 const RESULT_WORDS: Readonly<Record<string, string>> = {
@@ -139,7 +140,8 @@ const RESULT_WORDS: Readonly<Record<string, string>> = {
   Unauthenticated: "unauthenticated",
   Backend: "backend",
   Forbidden: "forbidden",
-  StepUpRequired: "step_up_required"
+  StepUpRequired: "step_up_required",
+  Unavailable: "unavailable"
 }
 
 function parseJson(text: string, context: string): unknown {
