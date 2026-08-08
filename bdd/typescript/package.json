@@ -9,7 +9,7 @@
     "test:run": "cucumber-js --config cucumber.js"
   },
   "dependencies": {
-    "@cucumber/cucumber": "13.2.0",
+    "@cucumber/cucumber": "13.2.1",
     "@laserdata/laser-sdk": "file:../../foreign/typescript"
   },
   "devDependencies": {

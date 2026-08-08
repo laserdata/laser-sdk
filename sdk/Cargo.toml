@@ -1,6 +1,6 @@
 [package]
 name = "laser-sdk"
-description = "Open data-platform SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+description = "LaserData SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
 categories = ["asynchronous", "network-programming"]
 keywords = ["iggy", "agents", "streaming", "provenance", "messaging"]
 readme = "README.md"

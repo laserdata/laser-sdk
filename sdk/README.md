@@ -1,4 +1,4 @@
-# Laser SDK
+# LaserData - Laser SDK
 
 [![crates.io](https://img.shields.io/crates/v/laser-sdk.svg)](https://crates.io/crates/laser-sdk) [![docs.rs](https://docs.rs/laser-sdk/badge.svg)](https://docs.rs/laser-sdk)
 
@@ -19,9 +19,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = "=0.1.0" # typed streaming plus provenance
+laser-sdk = "=0.1.1" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "=0.1.0", features = ["agent", "managed"] }
+laser-sdk = { version = "=0.1.1", features = ["agent", "managed"] }
 ```
 
 ## Quick example

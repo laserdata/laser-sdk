@@ -330,7 +330,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.1.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.1.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 
