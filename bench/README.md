@@ -1,4 +1,4 @@
-# Laser SDK Benchmarks
+# LaserData SDK Benchmarks
 
 `bench/` measures Apache Iggy, Laser streaming, AGDX, managed data surfaces, recovery, and MCP interoperability with native release binaries. The harness is a detached Rust workspace, so its dependencies never enter the published SDK crates.
 

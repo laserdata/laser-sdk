@@ -1,10 +1,10 @@
-# Laser SDK for TypeScript
+# LaserData - Laser SDK
 
-The native TypeScript client for LaserData over Apache Iggy. It provides typed streaming, declared projections and query, key-value state, copy-on-write forks, a knowledge graph, and an optional agent runtime over one connection.
+The native TypeScript client for [LaserData, Inc.](https://laserdata.com) SDK over Apache Iggy. It provides typed streaming, declared projections and query, key-value state, copy-on-write forks, a knowledge graph, and an optional agent runtime over one connection.
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Current pre-1.0 release (`0.1.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.1.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 ## Install
 

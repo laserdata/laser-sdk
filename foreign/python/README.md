@@ -1,10 +1,10 @@
-# laser-sdk (Python)
+# LaserData - Laser SDK
 
-The LaserData SDK for Python: an open data-platform SDK over Apache Iggy. Native bindings to the Rust SDK via PyO3, so the wire contract, codecs, and runtime are the same ones the Rust client uses.
+The [LaserData, Inc.](https://laserdata.com) SDK for Python: an open data-platform SDK over Apache Iggy. Native bindings to the Rust SDK via PyO3, so the wire contract, codecs, and runtime are the same ones the Rust client uses.
 
 Rust and Python are one v1 contract. Every public primitive, builder option, validation rule, error classification, capability, and transport limitation ships in both SDKs with matched examples and shared BDD coverage where the behavior is language-neutral.
 
-> **Current pre-1.0 release (`0.1.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.1.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` keeps logical identity separate from Iggy replica topology. The group defaults to the agent id spelling, set it explicitly when deployment grouping differs.
 

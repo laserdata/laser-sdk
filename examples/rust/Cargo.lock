@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "laser-examples"
-version = "0.1.0"
+version = "0.1.1"

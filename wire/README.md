@@ -1,4 +1,4 @@
-# Laser Wire
+# LaserData - Laser Wire
 
 [![crates.io](https://img.shields.io/crates/v/laser-wire.svg)](https://crates.io/crates/laser-wire) [![docs.rs](https://docs.rs/laser-wire/badge.svg)](https://docs.rs/laser-wire)
 
