@@ -1,4 +1,4 @@
-# Laser SDK
+# LaserData - Laser SDK
 
 **Build agents and data-driven systems on one durable log.** Ultra-low-latency **streaming**, a **query** layer, **key-value** state, copy-on-write **forks**, a **knowledge graph**, and a full **agent fabric** (memory, discovery, contracts, workflows), all over a single [Apache Iggy](https://iggy.apache.org) connection. By [LaserData, Inc.](https://laserdata.com)
 
