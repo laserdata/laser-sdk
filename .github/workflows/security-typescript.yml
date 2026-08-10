@@ -8,6 +8,7 @@ on:
       - ".agents/**"
       - ".claude/**"
       - ".codex/**"
+      - ".github/**"
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
@@ -20,6 +21,7 @@ on:
       - ".agents/**"
       - ".claude/**"
       - ".codex/**"
+      - ".github/**"
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
@@ -108,7 +110,7 @@ jobs:
     if: github.event_name != 'pull_request'
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.8
     with:
-      scan-args: ./
+      scan-args: ./foreign/typescript
     permissions:
       actions: read
       contents: read
@@ -119,7 +121,7 @@ jobs:
     if: github.event_name == 'pull_request'
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.3.8
     with:
-      scan-args: ./
+      scan-args: ./foreign/typescript
     permissions:
       actions: read
       contents: read

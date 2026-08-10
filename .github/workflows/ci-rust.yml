@@ -4,30 +4,12 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - ".agents/**"
-      - ".claude/**"
-      - ".codex/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "docs/**"
-      - "foreign/python/pyproject.toml"
-      - "scripts/**"
   push:
     branches:
       - main
     tags:
       - "rust-v*"
       - "wire-v*"
-    paths-ignore:
-      - ".agents/**"
-      - ".claude/**"
-      - ".codex/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "docs/**"
-      - "foreign/python/pyproject.toml"
-      - "scripts/**"
   workflow_dispatch:
 
 # Least privilege by default. Only the tag-gated publish job can mint an OIDC token.
@@ -59,15 +41,23 @@ jobs:
   flags:
     runs-on: ubuntu-latest
     outputs:
+      run_ci: ${{ steps.decide.outputs.run_ci }}
       server_tests: ${{ steps.decide.outputs.server_tests }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Decide the server-backed test mode
         id: decide
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
+          run_ci=run
           mode=run
           if [[ "${GITHUB_REF}" == refs/tags/wire-v* ]]; then
             mode=skip
@@ -77,13 +67,33 @@ jobs:
                 mode=skip
               fi
             done
+
+            if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "push" ]] &&
+              git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              meaningful_paths="$(
+                git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
+                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$' || true
+              )"
+              pyproject_changes="$(
+                git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- foreign/python/pyproject.toml |
+                  grep -E '^[+-]' |
+                  grep -Ev '^(---|\+\+\+|[+-]description = )' || true
+              )"
+              if [[ -z "${meaningful_paths}" && -z "${pyproject_changes}" ]]; then
+                run_ci=skip
+              fi
+            fi
           fi
+          echo "rust CI: ${run_ci}"
           echo "server-backed suites: ${mode}"
+          echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
           echo "server_tests=${mode}" >> "${GITHUB_OUTPUT}"
 
   # fmt, sort, unused-deps, and clippy: the static gates, in the order the
   # global Rust verification rule enforces them.
   lint:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +117,8 @@ jobs:
   # and fuzz), which `--workspace` does not reach. Kept a separate job so it runs in
   # parallel and its heavier dependency builds do not slow the workspace lint.
   lint-detached:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -145,6 +157,8 @@ jobs:
 
   # The whole workspace must build at every target with every feature on.
   build:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -161,6 +175,8 @@ jobs:
   # only prints such warnings, so each combination is linted with clippy and
   # warnings are denied.
   wire-feature-matrix:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -184,6 +200,8 @@ jobs:
       - run: cargo clippy -p laser-wire ${{ matrix.features }} -- -D warnings
 
   feature-matrix:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -216,6 +234,8 @@ jobs:
   # The gate that makes the wasm guarantee real: the wire crate's portable
   # surface must compile for wasm32-unknown-unknown. Omits `bson` (native-only).
   wasm:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -232,6 +252,8 @@ jobs:
   # ulid, dashmap, tracing, and getrandom. The whole workspace is scanned for
   # vulnerability and unmaintained advisories.
   deny:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -253,6 +275,7 @@ jobs:
   # server release does not exist yet) while every server-free test still runs.
   test:
     needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -284,6 +307,8 @@ jobs:
   # in-tree robustness suite (run by `test`) covers the same entry points every
   # run. This is the deeper, nightly-only pass.
   fuzz:
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -303,7 +328,7 @@ jobs:
   # Query DSL semantics run through the pure reference engine, with no managed backend.
   bdd:
     needs: [flags]
-    if: needs.flags.outputs.server_tests == 'run'
+    if: needs.flags.outputs.run_ci == 'run' && needs.flags.outputs.server_tests == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -342,6 +367,7 @@ jobs:
     steps:
       - name: Verify every required job result
         env:
+          RUN_CI: ${{ needs.flags.outputs.run_ci }}
           SERVER_TESTS: ${{ needs.flags.outputs.server_tests }}
           FLAGS_RESULT: ${{ needs.flags.result }}
           LINT_RESULT: ${{ needs.lint.result }}
@@ -355,8 +381,16 @@ jobs:
           FUZZ_RESULT: ${{ needs.fuzz.result }}
           BDD_RESULT: ${{ needs.bdd.result }}
         run: |
+          if [[ "${FLAGS_RESULT}" != success ]]; then
+            echo "flags concluded ${FLAGS_RESULT}" >&2
+            exit 1
+          fi
+          if [[ "${RUN_CI}" == skip ]]; then
+            echo "expensive Rust jobs skipped for non-code changes"
+            exit 0
+          fi
+
           for result in \
-            "${FLAGS_RESULT}" \
             "${LINT_RESULT}" \
             "${LINT_DETACHED_RESULT}" \
             "${BUILD_RESULT}" \

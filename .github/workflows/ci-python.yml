@@ -4,27 +4,11 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - ".agents/**"
-      - ".claude/**"
-      - ".codex/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "docs/**"
-      - "scripts/**"
   push:
     branches:
       - main
     tags:
       - "py-v*"
-    paths-ignore:
-      - ".agents/**"
-      - ".claude/**"
-      - ".codex/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "docs/**"
-      - "scripts/**"
   workflow_dispatch:
 
 permissions:
@@ -87,7 +71,7 @@ jobs:
               git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               meaningful_paths="$(
                 git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^foreign/python/pyproject\.toml$' || true
+                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$' || true
               )"
               pyproject_changes="$(
                 git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- foreign/python/pyproject.toml |

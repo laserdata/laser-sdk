@@ -4,29 +4,11 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - ".agents/**"
-      - ".claude/**"
-      - ".codex/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "docs/**"
-      - "foreign/python/pyproject.toml"
-      - "scripts/**"
   push:
     branches:
       - main
     tags:
       - "ts-v*"
-    paths-ignore:
-      - ".agents/**"
-      - ".claude/**"
-      - ".codex/**"
-      - "**/*.md"
-      - "**/*.mdx"
-      - "docs/**"
-      - "foreign/python/pyproject.toml"
-      - "scripts/**"
   workflow_dispatch:
 
 permissions:
@@ -51,14 +33,24 @@ jobs:
     defaults:
       run:
         working-directory: ${{ github.workspace }}
+    outputs:
+      run_ci: ${{ steps.decide.outputs.run_ci }}
+      server_tests: ${{ steps.decide.outputs.server_tests }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Decide the server-backed test mode
         id: decide
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
+          run_ci=run
           mode=run
           if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
             for text in "${PR_TITLE}" "${PR_BODY}" "${COMMIT_MESSAGE}"; do
@@ -66,14 +58,32 @@ jobs:
                 mode=skip
               fi
             done
+
+            if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "push" ]] &&
+              git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              meaningful_paths="$(
+                git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
+                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$' || true
+              )"
+              pyproject_changes="$(
+                git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- foreign/python/pyproject.toml |
+                  grep -E '^[+-]' |
+                  grep -Ev '^(---|\+\+\+|[+-]description = )' || true
+              )"
+              if [[ -z "${meaningful_paths}" && -z "${pyproject_changes}" ]]; then
+                run_ci=skip
+              fi
+            fi
           fi
+          echo "TypeScript CI: ${run_ci}"
           echo "server-backed suites: ${mode}"
+          echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
           echo "server_tests=${mode}" >> "${GITHUB_OUTPUT}"
-    outputs:
-      server_tests: ${{ steps.decide.outputs.server_tests }}
 
   quality:
     name: quality
+    needs: [flags]
+    if: needs.flags.outputs.run_ci == 'run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -258,6 +268,7 @@ jobs:
     name: ci-typescript-complete
     if: always()
     needs:
+      - flags
       - quality
       - unit-node
       - integration-iggy
