@@ -1,4 +1,4 @@
-# Laser SDK examples
+# LaserData - Laser SDK examples
 
 Runnable examples of the Laser SDK, an open data-platform SDK over Apache Iggy. They come in two groups:
 

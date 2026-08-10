@@ -1,4 +1,4 @@
-# Laser SDK examples - TypeScript
+# LaserData -Laser SDK examples - TypeScript
 
 The TypeScript examples mirror the Rust and Python catalog: eight tiny primitive examples plus the nine non-benchmark deep-dive scenarios. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
 

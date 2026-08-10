@@ -1,4 +1,4 @@
-# Laser SDK tutorial
+# LaserData - Laser SDK tutorial
 
 A progressive, hands-on guide to the SDK. Each chapter builds on the last using one running scenario: a real-time agent/LLM observability pipeline capturing every model call your agents make, queryable by latency, outcome, model, and user. By Chapter 8 you can publish a heterogeneous batch in one network round-trip, query it by user/model/outcome, range-aggregate latency and tokens, and recall the nearest past incidents by embedding similarity, all over the same Iggy connection. Chapter 9 layers the agentic runtime on top of the same substrate.
 

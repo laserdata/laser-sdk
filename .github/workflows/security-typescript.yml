@@ -5,17 +5,25 @@ on:
     branches:
       - main
     paths-ignore:
+      - ".agents/**"
+      - ".claude/**"
+      - ".codex/**"
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
+      - "foreign/python/pyproject.toml"
       - "scripts/**"
   push:
     branches:
       - main
     paths-ignore:
+      - ".agents/**"
+      - ".claude/**"
+      - ".codex/**"
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
+      - "foreign/python/pyproject.toml"
       - "scripts/**"
   schedule:
     - cron: "23 4 * * 1"
