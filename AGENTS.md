@@ -1,4 +1,4 @@
-# Laser SDK Agent Guidelines
+# LaserData - Laser SDK Agent Guidelines
 
 This repo is one workspace holding two published crates. **laser-wire** is the LaserData wire contract (types, codes, envelopes, dictionaries, caps, the golden fixture corpus, and the Agent Data Exchange Protocol envelope), runtime-free and wasm-portable, consumed by LaserData Cloud, Iggy server, and the SDK alike. **laser-sdk** is the open, customer-facing **data-platform SDK** over [Apache Iggy](https://iggy.apache.org) built on top of it: typed publish/consume, declared projections with a query DSL, a key-value store, and copy-on-write forks over one connection, plus an optional agent layer (provenance-tagged messages, a conversation/causality spine, agent topic routing, a reliable consumer, context assembly, a memory seam, and an `Agent` builder). It carries `gen_ai.*` provenance describing LLM calls but never makes them: it only moves and coordinates messages.
 

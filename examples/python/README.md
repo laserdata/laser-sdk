@@ -1,4 +1,4 @@
-# Laser SDK examples - Python
+# LaserData - Laser SDK examples - Python
 
 The Python examples share one connection helper. They run against Apache Iggy, Laser Stack, or LaserData Cloud. A managed phase runs only when the connected deployment advertises its capability.
 

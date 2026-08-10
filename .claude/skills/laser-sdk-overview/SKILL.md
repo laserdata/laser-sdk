@@ -3,7 +3,7 @@ name: laser-sdk-overview
 description: Entry point for the Rust reference SDK, Python bindings, native TypeScript SDK, and laser-wire contract over Apache Iggy. Load this first for changes under wire, sdk, foreign, bdd, or examples, then route to the focused area skill.
 ---
 
-# Laser SDK - Overview
+# LaserData - Laser SDK - Overview
 
 Repo-wide rules (verification order, idiomatic-traits, no `cargo install`, no em dashes, BDD test naming) live in [AGENTS.md](../../../AGENTS.md). This file owns SDK-specific routing and the shared mental model.
 

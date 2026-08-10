@@ -5,9 +5,13 @@ on:
     branches:
       - main
     paths-ignore:
+      - ".agents/**"
+      - ".claude/**"
+      - ".codex/**"
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
+      - "foreign/python/pyproject.toml"
       - "scripts/**"
   push:
     branches:
@@ -15,9 +19,13 @@ on:
     tags:
       - "ts-v*"
     paths-ignore:
+      - ".agents/**"
+      - ".claude/**"
+      - ".codex/**"
       - "**/*.md"
       - "**/*.mdx"
       - "docs/**"
+      - "foreign/python/pyproject.toml"
       - "scripts/**"
   workflow_dispatch:
 
