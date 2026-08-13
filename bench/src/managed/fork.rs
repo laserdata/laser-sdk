@@ -368,8 +368,8 @@ fn validate_overlay(result: &QueryResult, expected: &str) -> Result<(), String> 
     result
         .rows
         .first()
-        .and_then(|row| row.headers.get(ID_FIELD))
-        .filter(|value| value.as_str() == expected)
+        .and_then(|row| result.value_text(row, ID_FIELD))
+        .filter(|value| value == expected)
         .map(|_| ())
         .ok_or_else(|| "fork overlay query returned the wrong row".to_owned())
 }

@@ -11,7 +11,13 @@ export const ResultCodeName = {
   Backend: 9,
   Forbidden: 10,
   StepUpRequired: 11,
-  Unavailable: 12
+  Unavailable: 12,
+  ResourceLimit: 13,
+  Cancelled: 14,
+  DeadlineExceeded: 15,
+  ExpiredSnapshot: 16,
+  StaleGeneration: 17,
+  TargetUnavailable: 18
 } as const
 
 export type ResultCode =
@@ -59,7 +65,17 @@ export function resultCodeHttpStatus(value: ResultCode): number {
       return 403
     // Retry-after territory, the same status a lagging read model gets.
     case "Unavailable":
+    case "TargetUnavailable":
       return 503
+    case "ResourceLimit":
+      return 429
+    case "Cancelled":
+    case "StaleGeneration":
+      return 409
+    case "DeadlineExceeded":
+      return 408
+    case "ExpiredSnapshot":
+      return 410
   }
 }
 
@@ -71,5 +87,8 @@ export function resultCodeHttpStatus(value: ResultCode): number {
  * retrying it unchanged only wastes the attempt.
  */
 export function resultCodeIsRetryable(value: ResultCode): boolean {
-  return value.kind === "known" && (value.name === "Unavailable" || value.name === "Stale")
+  return (
+    value.kind === "known" &&
+    (value.name === "Unavailable" || value.name === "Stale" || value.name === "TargetUnavailable")
+  )
 }

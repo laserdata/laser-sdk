@@ -148,7 +148,7 @@ mod tests {
                     .source("shop", "orders")
                     .allow("order.v1")
                     .default_projection("order.v1")
-                    .target_table("orders_rows")
+                    .index("orders_rows")
                     .build(),
             ],
         };
@@ -161,9 +161,7 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].projection.id.as_str(), "order.v1");
         assert_eq!(list[0].projection.extraction.fields.len(), 2);
-        let targets = &list[0].bindings[0].targets;
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].table, "orders_rows");
+        assert_eq!(list[0].bindings[0].index, "orders_rows");
     }
 
     #[test]

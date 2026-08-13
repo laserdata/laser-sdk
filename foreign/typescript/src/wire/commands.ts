@@ -55,6 +55,24 @@ import {
 } from "./browse.js"
 import { decodeOne, encodeNamed, expectMap } from "./cbor.js"
 import {
+  type CheckpointReadReply,
+  type CheckpointReply,
+  type CheckpointRequestEnvelope,
+  type DestinationGetRequest,
+  type DestinationListRequest,
+  type QueryRouteListRequest,
+  decodeCheckpointReadReply,
+  decodeCheckpointReply,
+  encodeCheckpointRequestFrame,
+  encodeDestinationGetRequest,
+  encodeDestinationListRequest,
+  encodeQueryRouteListRequest,
+  validateCheckpointRequest,
+  validateDestinationGetRequest,
+  validateDestinationListRequest,
+  validateQueryRouteListRequest
+} from "./checkpoint.js"
+import {
   AGDX_AGENT_CANCEL_CODE,
   AGDX_AGENT_LIST_CODE,
   AGDX_AGENT_STATUS_CODE,
@@ -68,6 +86,9 @@ import {
   AGDX_AUTHZ_LIST_ROLES_CODE,
   AGDX_AUTHZ_WHOAMI_CODE,
   AGDX_BATCH_CODE,
+  AGDX_CHECKPOINT_CODE,
+  AGDX_DESTINATION_GET_CODE,
+  AGDX_DESTINATION_LIST_CODE,
   AGDX_DECODE_RECORD_CODE,
   AGDX_FORK_CREATE_CODE,
   AGDX_FORK_DELETE_CODE,
@@ -97,7 +118,12 @@ import {
   AGDX_LIST_PROJECTIONS_CODE,
   AGDX_LIST_SCHEMAS_CODE,
   AGDX_QUERY_CODE,
+  AGDX_QUERY_CANCEL_CODE,
+  AGDX_QUERY_PAGE_CODE,
+  AGDX_QUERY_ROUTE_LIST_CODE,
+  AGDX_QUERY_STATUS_CODE,
   AGDX_REGISTER_SCHEMA_CODE,
+  CHECKPOINT_OP_VERSION,
   FORK_OP_VERSION,
   GRAPH_OP_VERSION,
   KV_OP_VERSION,
@@ -160,13 +186,29 @@ import {
   encodeKvSet
 } from "./kv.js"
 import {
+  type QueryCancelEnvelope,
+  type QueryCancelReply,
   type QueryEnvelope,
+  type QueryPageEnvelope,
   type QueryReply,
+  type QueryStatusEnvelope,
+  type QueryStatusReply,
   decodeQueryReply,
-  encodeQueryEnvelopeFrame
+  decodeQueryStatusReply,
+  encodeQueryCancelEnvelopeFrame,
+  encodeQueryEnvelopeFrame,
+  encodeQueryPageEnvelopeFrame,
+  encodeQueryStatusEnvelopeFrame,
+  validateQueryCancelEnvelope,
+  validateQueryEnvelope,
+  validateQueryPageEnvelope,
+  validateQueryStatusEnvelope
 } from "./query.js"
 
-export type VersionSurface = keyof Pick<OpVersions, "query" | "control" | "kv" | "fork" | "graph">
+export type VersionSurface = keyof Pick<
+  OpVersions,
+  "query" | "control" | "kv" | "fork" | "graph" | "checkpoint"
+>
 
 export interface ManagedCommand<Request, Reply> {
   readonly code: number
@@ -198,6 +240,7 @@ const queryVersion = { surface: "query", expected: QUERY_OP_VERSION } as const
 const kvVersion = { surface: "kv", expected: KV_OP_VERSION } as const
 const forkVersion = { surface: "fork", expected: FORK_OP_VERSION } as const
 const graphVersion = { surface: "graph", expected: GRAPH_OP_VERSION } as const
+const checkpointVersion = { surface: "checkpoint", expected: CHECKPOINT_OP_VERSION } as const
 
 export const WhoamiCommand = framed<undefined, AuthzReply>(
   AGDX_AUTHZ_WHOAMI_CODE,
@@ -253,7 +296,73 @@ export const QueryCommand: ManagedCommand<QueryEnvelope, QueryReply> = {
   surface: "query",
   version: queryVersion,
   encode: encodeQueryEnvelopeFrame,
-  decode: (reply) => decodeQueryReply(decodeOne(reply, "query reply"), "query reply")
+  decode: (reply) => decodeQueryReply(decodeOne(reply, "query reply"), "query reply"),
+  validate: validateQueryEnvelope
+}
+
+export const QueryPageCommand: ManagedCommand<QueryPageEnvelope, QueryReply> = {
+  code: AGDX_QUERY_PAGE_CODE,
+  surface: "query",
+  version: queryVersion,
+  encode: encodeQueryPageEnvelopeFrame,
+  decode: (reply) => decodeQueryReply(decodeOne(reply, "query page reply"), "query page reply"),
+  validate: validateQueryPageEnvelope
+}
+
+export const QueryCancelCommand: ManagedCommand<QueryCancelEnvelope, QueryCancelReply> = {
+  code: AGDX_QUERY_CANCEL_CODE,
+  surface: "query",
+  version: queryVersion,
+  encode: encodeQueryCancelEnvelopeFrame,
+  decode: (reply) =>
+    decodeQueryStatusReply(decodeOne(reply, "query cancel reply"), "query cancel reply"),
+  validate: validateQueryCancelEnvelope
+}
+
+export const QueryStatusCommand: ManagedCommand<QueryStatusEnvelope, QueryStatusReply> = {
+  code: AGDX_QUERY_STATUS_CODE,
+  surface: "query",
+  version: queryVersion,
+  encode: encodeQueryStatusEnvelopeFrame,
+  decode: (reply) =>
+    decodeQueryStatusReply(decodeOne(reply, "query status reply"), "query status reply"),
+  validate: validateQueryStatusEnvelope
+}
+
+export const CheckpointCommand: ManagedCommand<CheckpointRequestEnvelope, CheckpointReply> = {
+  code: AGDX_CHECKPOINT_CODE,
+  surface: "destinations",
+  version: checkpointVersion,
+  encode: encodeCheckpointRequestFrame,
+  decode: decodeCheckpointReply,
+  validate: validateCheckpointRequest
+}
+
+export const DestinationGetCommand: ManagedCommand<DestinationGetRequest, CheckpointReadReply> = {
+  code: AGDX_DESTINATION_GET_CODE,
+  surface: "destinations",
+  version: checkpointVersion,
+  encode: (request) => encodeNamed(encodeDestinationGetRequest(request)),
+  decode: decodeCheckpointReadReply,
+  validate: validateDestinationGetRequest
+}
+
+export const DestinationListCommand: ManagedCommand<DestinationListRequest, CheckpointReadReply> = {
+  code: AGDX_DESTINATION_LIST_CODE,
+  surface: "destinations",
+  version: checkpointVersion,
+  encode: (request) => encodeNamed(encodeDestinationListRequest(request)),
+  decode: decodeCheckpointReadReply,
+  validate: validateDestinationListRequest
+}
+
+export const QueryRouteListCommand: ManagedCommand<QueryRouteListRequest, CheckpointReadReply> = {
+  code: AGDX_QUERY_ROUTE_LIST_CODE,
+  surface: "destinations",
+  version: checkpointVersion,
+  encode: (request) => encodeNamed(encodeQueryRouteListRequest(request)),
+  decode: decodeCheckpointReadReply,
+  validate: validateQueryRouteListRequest
 }
 
 export const GetProjectionCommand = framed<GetProjection, BrowseReply>(
@@ -507,6 +616,13 @@ export const MANAGED_COMMANDS = [
   DeleteRoleCommand,
   BindRolesCommand,
   QueryCommand,
+  QueryPageCommand,
+  QueryCancelCommand,
+  QueryStatusCommand,
+  CheckpointCommand,
+  DestinationGetCommand,
+  DestinationListCommand,
+  QueryRouteListCommand,
   GetProjectionCommand,
   ListProjectionsCommand,
   GetSchemaCommand,

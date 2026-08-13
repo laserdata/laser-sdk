@@ -20,7 +20,7 @@ This repo is one workspace holding two published crates. **laser-wire** is the L
 
 These change the on-the-wire or public contract and break data or downstreams:
 
-- Editing ANYTHING in `wire/src/` that alters encoded payload: command codes, op versions, header keys (`wire/src/headers.rs`), topic names, envelope field names or serde attributes, the content-type / task-state / error-code u8 dictionaries, or the caps. Every message already on the log and every consumer (LaserData Cloud, Iggy server) is pinned to those bytes. The golden corpus under `wire/fixtures/` will fail on drift, and an intentional change needs the fixtures regenerated and the op version bumped.
+- Editing ANYTHING in `wire/src/` that alters encoded payload: command codes, op versions, header keys (`wire/src/headers.rs`), topic names, envelope field names or serde attributes, the content-type / task-state / error-code u8 dictionaries, or the caps. Every message already on the log and every consumer (LaserData Cloud, Iggy server) is pinned to those bytes. The golden corpus under `wire/fixtures/` will fail on drift. During the pre-1.0 package line an intentional breaking change keeps operation versions at 1 and must update fixtures plus every consumer and implementation as one release unit.
 - Changing `ConversationId::derive` (the FNV-1a algorithm in `sdk/src/types/ids.rs`) without bumping `DERIVE_VERSION` - silently remaps every `SessionPolicy::PerUser` conversation. (`AgentId::wire_id` is no longer a hash: the wire agent id is the name string verbatim.)
 - Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`) - repoints live topics.
 - Changing `Provenance::partition_key` (currently `conversation_id`) - breaks the per-conversation ordering guarantee.
@@ -32,7 +32,7 @@ These change the on-the-wire or public contract and break data or downstreams:
 
 Enforced by CI (`.github/workflows/ci-rust.yml`: jobs `lint`, `lint-detached`, `build`, `wire-feature-matrix`, `feature-matrix`, `wasm`, `deny`, `test`, `fuzz`, `bdd`). `ci-python.yml` additionally gates publication on artifact-only jobs (`wheel-install` on every platform at Python 3.10 and 3.13, `sdist-install` from a checkout-free directory). `ci-typescript.yml` builds the npm tarball and installs it into a clean consumer before publication. Managed end-to-end validation belongs to Laser Stack's `scripts/smoke`, which accepts a local SDK tarball. The `bdd/rust` and `fuzz` crates sit OUTSIDE the workspace, so `--workspace` does not reach them. `lint-detached` (and `just lint`) run fmt/sort/machete/clippy inside each.
 
-**Release lanes and breaking wire changes.** A `rust-v*` tag publishes both crates behind the full gate. A `wire-v*` tag publishes `laser-wire` alone behind every server-free gate, so a breaking wire change ships the contract crate first and the matching server release builds against it. A pull request or push whose title, body, or commit message carries `[wire-break]` runs every server-free gate and skips only the suites that need the released server binary (the integration, BDD, and live example jobs across the three workflows). The follow-up change that bumps the pinned server version in `scripts/resolve-test-iggy-server.sh` runs the full pipeline again. Release tags always run everything and never honor the marker.
+**Release lanes and breaking wire changes.** A `rust-v*` tag publishes both crates behind the full gate. A `wire-v*` tag publishes `laser-wire` alone behind every server-free gate, so a breaking wire change ships the contract crate first and the matching server release builds against it. A pull request or push whose title, body, or commit message carries `[wire-break]` runs every server-free gate and skips only the suites that need the released server binary (the integration, BDD, and live example jobs across the three workflows). The follow-up change that bumps the pinned server version in `scripts/resolve-test-iggy-server.sh` runs the full pipeline again. Rust, Python, and TypeScript package release tags run their full pipelines and never honor the marker. The wire-only tag intentionally remains server-free.
 
 Run locally in this exact order, do not skip:
 
@@ -43,8 +43,8 @@ cargo fmt --all            # 1. formats, auto-applies
 cargo sort --workspace     # 2. sorts Cargo.toml deps + feature arrays
 cargo machete              # 3. no unused dependencies
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # 4.
-cargo test --workspace --all-features                   # 5. unit + wire fixtures/robustness, VSR-only
-just test-it                                              # 6. VSR fork integration suite
+cargo test --workspace --all-features                   # 5. unit + wire fixtures/robustness
+just test-it                                              # 6. Iggy integration suite
 cargo test --workspace --all-features --doc             # 7. doctests (Docker-free)
 just wasm                  # 8. laser-wire on wasm32-unknown-unknown (needs the target)
 just deny-wire             # 9. laser-wire dependency bans (needs cargo-deny)
@@ -55,7 +55,7 @@ just bdd                   # 12. cross-SDK BDD conformance, Rust runner
 
 **Doctests are a required gate, not optional.** `clippy --all-targets` (step 4) does **not** compile doctests, and a bare `cargo test --workspace` runs them only for crates whose default features are on, so a doctest behind `kv` / `query` / any non-default feature is silently never built. Step 7 (`--all-features --doc`) is what actually compiles + runs every doc example. Skipping it means a broken `///` example ships green. It is Docker-free (doctests do not touch Apache Iggy), so there is no reason to skip it. The same `--all-features --doc` gate runs in CI.
 
-**VSR is mandatory.** Laser SDK does not expose a protocol feature and no supported build can select classic framing. Every Rust and Python build enables `iggy/vsr`, and TypeScript always constructs a VSR client and rejects an injected client using another protocol. Integration and BDD suites run the versioned Iggy binary. Managed reads use the non-replicated extension path, and the three managed-authorization writes use dedicated replicated operations.
+**VSR is native to Iggy.** Laser SDK does not expose a transport feature or alternate framing option. Rust, Python, and TypeScript use the same Iggy transport. Integration and BDD suites run the versioned Iggy binary. Managed reads use the non-replicated extension path, and the three managed-authorization writes use dedicated replicated operations.
 
 **The wasm and deny gates are what make laser-wire's portability guarantee real**: the wire crate must compile for `wasm32-unknown-unknown` with `cbor,codecs,fixtures,builders,http-client` (never `bson`, which is native-only by design), and its portable graph must never contain iggy, tokio, bytes, ulid, dashmap, tracing, or getrandom (`deny-wire.toml`). The `builders` (bon's `Query::builder`) and `http-client` (typed `/agdx/*` client + serde_urlencoded) features are wasm-facing and included in both gates. If either tool is missing locally, CI still enforces both.
 
@@ -133,8 +133,7 @@ sdk/src/
                       SendMessagesResponse commit positions, replay() -> Cursor,
                       ensure(partitions), producer/consumer/consumer_group, plus the raw
                       iggy_producer/iggy_consumer/iggy_consumer_group escape hatch)
-                      Iggy VSR is unconditional. Standard Iggy
-                      commands switch protocols with no API change, managed reads use the
+                      Iggy provides the VSR transport. Standard Iggy commands and managed reads use the
                       non-replicated extension path, and authorization writes use dedicated
                       replicated operations
   stream/             publish.rs (publish builders) and record.rs (Record lowering, Vec<u8>
@@ -262,17 +261,17 @@ sdk/src/
     session.rs        SessionPolicy (PerCall / PerUser)
     state.rs          ConversationState::load (fold the log)
 sdk/tests/integration/  one shared Apache Iggy, one stream per test, BDD-named cases
-  support/test_iggy.rs Native VSR fork process harness (test-only, not shipped)
+  support/test_iggy.rs Native Iggy process harness (test-only, not shipped)
   query/              test-only query worker + backends (Memory, durable SQL)
 foreign/python/         the Python SDK (outside the workspace): PyO3 bindings over the
                         laser-sdk crate (cdylib lib laser_sdk_py, import name laser_sdk),
                         src/ one module per area + bin/stub_gen.rs, tests/ pytest
-                        (offline + native VSR fork), maturin packaging. sign.rs binds
+                        (offline + native Iggy), maturin packaging. sign.rs binds
                         SigningKey + KeyRegistry so both SDKs share signing,
                         verification, principal routing, and reply identity. transport.rs binds
                         the Laser Producer/Consumer/ConsumerMessage surface with direct batching,
                         partitioning, group polling, auto/manual commits, and offset control.
-                        Every build enables iggy/vsr. No protocol feature is exposed. See the
+                        Every build uses Iggy's native VSR transport. No transport feature is exposed. See the
                         python-bindings skill.
 foreign/typescript/     the native Node SDK: strict ESM, native wire codecs, Apache Iggy
                         transport, streaming, managed clients, agents, memory, governance,
@@ -330,11 +329,11 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.1.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.2.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 
-**Core (Phase 1, Apache Iggy):** provenance + causality, reliable consumer (graceful drain, `ConcurrencyPolicy::SerialPerPartition` lanes, `AgentMiddleware` + `DeadLetterSink` seams, `Agent::builder` retry/verifier/dedup_window, the `laser_sdk::testing` handler-test seam), context seam, memory seam, builder/router/session/state, the `respond_on` + `AgentCtx` handler seam. Isolation is an Iggy stream boundary (one connection drives any number of streams), not a per-message header. The open streaming layer gives ordinary services a Laser-native direct producer and live async partition/consumer-group reader with exact headers, routing, polling/replay, group lifecycle, retries, configurable automatic commits, explicit commit-after-success, and server offsets. The exact Apache Iggy builders remain an escape hatch. Python exposes the same VSR-only operational surface.
+**Core (Phase 1, Apache Iggy):** provenance + causality, reliable consumer (graceful drain, `ConcurrencyPolicy::SerialPerPartition` lanes, `AgentMiddleware` + `DeadLetterSink` seams, `Agent::builder` retry/verifier/dedup_window, the `laser_sdk::testing` handler-test seam), context seam, memory seam, builder/router/session/state, the `respond_on` + `AgentCtx` handler seam. Isolation is an Iggy stream boundary (one connection drives any number of streams), not a per-message header. The open streaming layer gives ordinary services a Laser-native direct producer and live async partition/consumer-group reader with exact headers, routing, polling/replay, group lifecycle, retries, configurable automatic commits, explicit commit-after-success, and server offsets. The exact Apache Iggy builders remain an escape hatch. Python exposes the same operational surface.
 
 **Action governance** (`sdk/src/govern.rs`, `agent` feature): the `ActionGovernor` pre-effect hook decides before an agent send, a typed or raw topic publish, an AGDX verb, or a memory write, returning a `Verdict` (`Allow`/`Observe`/`Block`/`StepUp`/`Modify`/`Defer`). Enrolled with `Laser::with_governor` under a `GovernorMode` (`Observe` shadow-runs and only warns on an evidence-write failure, `Enforce` applies the verdict and fails closed if the evidence cannot be recorded). Every decision is a digest-chained `PolicyEvidence` event on the audit topic (BLAKE3 receipt over the canonical encoding, `previous_digest` linking to the prior decision in the same conversation, so a dropped or reordered local record is detectable). `QuorumGovernor` runs named voters concurrently under `All`/`Any`/`AtLeast(n)`. Every `mandatory` voter must return an affirmative `Allow`/`Observe`/`Modify`. Its denial or error cannot be bypassed by another voter. Empty voter sets, zero or oversized thresholds, duplicate voter names, and conflicting `Modify` bodies block. A non-mandatory error abstains. Pure in-process composition, no durable log or protocol of its own. `SwappableGovernor` holds a hot-swappable active policy behind a lock: `swap` returns the replaced policy, `current` reads the active one, and `decide` uses whichever policy was active at that moment without reinterpreting older evidence.
 

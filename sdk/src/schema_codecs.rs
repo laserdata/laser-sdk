@@ -132,8 +132,10 @@ impl CompiledSchema {
         match self {
             Self::Avro(schema) => {
                 let mut cursor = payload;
-                let value =
-                    apache_avro::from_avro_datum(schema, &mut cursor, None).map_err(|error| {
+                let value = apache_avro::reader::datum::GenericDatumReader::builder(schema)
+                    .build()
+                    .and_then(|reader| reader.read_value(&mut cursor))
+                    .map_err(|error| {
                         LaserError::Codec(format!("payload does not decode as Avro: {error}"))
                     })?;
                 apache_avro::from_value::<serde_json::Value>(&value).map_err(|error| {
@@ -175,12 +177,20 @@ impl CompiledSchema {
                 "encode_avro requires an Avro schema".to_owned(),
             ));
         };
-        let value = apache_avro::to_value(body)
-            .map_err(|error| LaserError::Codec(format!("body does not lower to Avro: {error}")))?;
-        let resolved = value.resolve(schema).map_err(|error| {
-            LaserError::Codec(format!("body does not match the Avro schema: {error}"))
-        })?;
-        apache_avro::to_avro_datum(schema, resolved)
+        // Lower through JSON, not serde-direct: apache-avro's serde treats a
+        // `u64` (every non-negative integer arriving as a `serde_json::Value`)
+        // as its 8-byte Fixed marker type and refuses a `long` schema, while
+        // the JSON conversion maps integers to Int/Long.
+        let json = serde_json::to_value(body)
+            .map_err(|error| LaserError::Codec(format!("body does not lower to JSON: {error}")))?;
+        let resolved = apache_avro::types::Value::try_from(json)
+            .and_then(|value| value.resolve(schema))
+            .map_err(|error| {
+                LaserError::Codec(format!("body does not match the Avro schema: {error}"))
+            })?;
+        apache_avro::writer::datum::GenericDatumWriter::builder(schema)
+            .build()
+            .and_then(|writer| writer.write_value_to_vec(resolved))
             .map_err(|error| LaserError::Codec(format!("Avro datum encode failed: {error}")))
     }
 }

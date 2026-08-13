@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import decimal
 import time
 import uuid
 
@@ -208,6 +210,40 @@ async def test_query_against_raw_iggy_is_unsupported(laser):
     with pytest.raises(ls.UnsupportedError) as caught:
         await laser.query("orders").where_eq("customer_id", "alice").fetch()
     assert caught.value.unsupported is True
+
+
+async def test_query_values_accept_the_full_typed_input_surface(laser):
+    request = (
+        laser.query("orders")
+        .where_eq("flag", True)
+        .where_eq("count", 7)
+        .where_eq("ratio", 1.5)
+        .where_eq("name", "alice")
+        .where_eq("payload", b"\x00\xff")
+        .where_eq("order_id", uuid.UUID("00112233-4455-6677-8899-aabbccddeeff"))
+        .where_eq("price", decimal.Decimal("123.45"))
+        .where_eq("day", datetime.date(2026, 8, 13))
+        .where_eq("at", datetime.time(23, 59, 59, 999999))
+        .where_eq("created", datetime.datetime(2026, 8, 13, 12, 0, 0))
+        .where_eq(
+            "created_utc",
+            datetime.datetime(2026, 8, 13, 12, 0, 0, tzinfo=datetime.timezone.utc),
+        )
+    )
+    with pytest.raises(ls.UnsupportedError):
+        await request.fetch()
+
+
+async def test_query_values_reject_non_canonical_typed_input(laser):
+    request = laser.query("orders")
+    with pytest.raises(ls.InvalidError):
+        request.where_eq("price", decimal.Decimal("NaN"))
+    with pytest.raises(ls.InvalidError):
+        request.where_eq("price", decimal.Decimal(10) ** 40)
+    with pytest.raises(ls.InvalidError):
+        request.where_eq("at", datetime.time(1, 2, 3, tzinfo=datetime.timezone.utc))
+    with pytest.raises(ls.InvalidError):
+        request.where_eq("value", {"nested": 1})
 
 
 async def test_kv_against_raw_iggy_is_unsupported(laser):

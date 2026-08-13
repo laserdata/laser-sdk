@@ -1,5 +1,6 @@
 export const CONTENT_TYPE = "agdx.ct"
 export const SCHEMA_ID = "agdx.sid"
+export const LOGICAL_SCHEMA_FINGERPRINT = "agdx.sfp"
 export const IDX_PREFIX = "agdx.idx."
 export const INLINE_PAYLOAD = "agdx.inline"
 export const PROJECTION_REF = "agdx.ref"

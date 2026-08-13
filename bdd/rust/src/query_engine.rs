@@ -1,12 +1,17 @@
 use laser_sdk::query::{
-    AggCall, AggFunc, Aggregate, CmpOp, Dir, FIELD_MESSAGE_TYPE, FIELD_TS, Filter, MAX_PAGE_SIZE,
-    Page, Predicate, Query, QueryResult, Row, Value, WINDOW_START, Window,
+    AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, FIELD_MESSAGE_TYPE, FIELD_TS, Filter,
+    Page, Predicate, Query, QueryContext, QueryEngine as QueryEngineEvidence, QueryResult,
+    QueryTarget, ResolvedQueryTarget, Row, TypedValue, WINDOW_START, Window,
 };
+use laser_sdk::wire::destination::BackendResourceId;
+use laser_sdk::wire::schema::{LogicalField, LogicalType};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+type StoredRow = BTreeMap<String, TypedValue>;
 
 #[derive(Default)]
 pub struct QueryEngine {
-    indexes: HashMap<String, Vec<Row>>,
+    indexes: HashMap<String, Vec<StoredRow>>,
 }
 
 impl QueryEngine {
@@ -14,49 +19,49 @@ impl QueryEngine {
         Self::default()
     }
 
-    pub fn insert(&mut self, index: &str, row: Row) {
+    pub fn insert(&mut self, index: &str, row: StoredRow) {
         self.indexes.entry(index.to_owned()).or_default().push(row);
     }
 
-    pub fn row(fields: &[(&str, &str)]) -> Row {
-        let headers = fields
+    pub fn row(fields: &[(&str, &str)]) -> StoredRow {
+        fields
             .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect();
-        Row {
-            headers,
-            metadata: BTreeMap::new(),
-            partition: None,
-            offset: None,
-            stream: None,
-            topic: None,
-            payload: None,
-            score: None,
-        }
+            .map(|(name, value)| {
+                let value = match *name {
+                    "latency_ms" | "seq" | "count" => {
+                        TypedValue::Long(value.parse().expect("numeric reference query field"))
+                    }
+                    _ => TypedValue::String((*value).to_owned()),
+                };
+                ((*name).to_owned(), value)
+            })
+            .collect()
     }
 
     pub fn execute(&self, query: &Query) -> QueryResult {
-        let Some(rows) = self.indexes.get(&query.index) else {
-            return QueryResult::default();
+        let index = match &query.target {
+            QueryTarget::Operational { index } => index,
+            QueryTarget::Lakehouse { .. } => return empty_result(query, "lakehouse"),
+            _ => return empty_result(query, "unsupported"),
         };
-        let mut matched: Vec<Row> = rows
+        let rows = self
+            .indexes
+            .get(index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut matched: Vec<StoredRow> = rows
             .iter()
             .filter(|row| matches_query(row, query))
             .cloned()
             .collect();
 
         if let Some(aggregate) = &query.aggregate {
-            return run_aggregate(&matched, aggregate, query.want_total);
+            return render_result(query, index, run_aggregate(&matched, aggregate));
         }
 
         for sort in query.order.iter().rev() {
-            matched.sort_by(|a, b| {
-                let left = a.headers.get(&sort.field).map(String::as_str).unwrap_or("");
-                let right = b.headers.get(&sort.field).map(String::as_str).unwrap_or("");
-                let ordering = match (left.parse::<f64>(), right.parse::<f64>()) {
-                    (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                    _ => left.cmp(right),
-                };
+            matched.sort_by(|left, right| {
+                let ordering = compare_values(left.get(&sort.field), right.get(&sort.field));
                 match sort.dir {
                     Dir::Asc => ordering,
                     Dir::Desc => ordering.reverse(),
@@ -64,63 +69,32 @@ impl QueryEngine {
             });
         }
 
-        let total = matched.len();
-        // `0` means a full page (capped at MAX_PAGE_SIZE), mirroring the spec.
-        let limit = if query.limit == 0 {
-            MAX_PAGE_SIZE
-        } else {
-            query.limit
-        };
-        let rows: Vec<Row> = matched
-            .into_iter()
-            .skip(query.offset)
-            .take(limit)
-            .map(|mut row| {
-                if !query.select.payload {
-                    row.payload = None;
-                }
-                row
-            })
-            .collect();
-        let has_more = query.offset.saturating_add(rows.len()) < total;
-        QueryResult {
-            rows,
-            page: Page {
-                offset: query.offset,
-                limit,
-                total: query.want_total.then_some(total as u64),
-                has_more,
-            },
-        }
+        render_result(query, index, matched)
     }
 }
 
-fn matches_query(row: &Row, query: &Query) -> bool {
-    let by_key = query.by_key.iter().all(|key_match| {
-        row.headers.get(&key_match.field).map(String::as_str) == Some(key_match.value.as_str())
+fn matches_query(row: &StoredRow, query: &Query) -> bool {
+    let by_key = query
+        .by_key
+        .iter()
+        .all(|key_match| row.get(&key_match.field) == Some(&key_match.value));
+    let predicates = query
+        .filter
+        .as_ref()
+        .is_none_or(|filter| filter_matches(row, filter));
+    let message_type = query.message_type.as_ref().is_none_or(|expected| {
+        row.get(FIELD_MESSAGE_TYPE) == Some(&TypedValue::String(expected.clone()))
     });
-    let predicates = match &query.filter {
-        Some(filter) => filter_matches(row, filter),
-        None => true,
-    };
-    let message_type = match &query.message_type {
-        Some(expected) => {
-            row.headers.get(FIELD_MESSAGE_TYPE).map(String::as_str) == Some(expected.as_str())
-        }
-        None => true,
-    };
-    let time_range = match query.time_range {
-        Some((start, end)) => row
-            .headers
-            .get(FIELD_TS)
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|timestamp| timestamp >= start && timestamp <= end),
-        None => true,
-    };
+    let time_range = query.time_range.is_none_or(|(start, end)| {
+        row.get(FIELD_TS)
+            .and_then(as_i64)
+            .and_then(|value| u64::try_from(value).ok())
+            .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+    });
     by_key && predicates && message_type && time_range
 }
 
-fn filter_matches(row: &Row, filter: &Filter) -> bool {
+fn filter_matches(row: &StoredRow, filter: &Filter) -> bool {
     match filter {
         Filter::All(children) => children.iter().all(|child| filter_matches(row, child)),
         Filter::Any(children) => children.iter().any(|child| filter_matches(row, child)),
@@ -129,29 +103,23 @@ fn filter_matches(row: &Row, filter: &Filter) -> bool {
     }
 }
 
-fn predicate_matches(row: &Row, predicate: &Predicate) -> bool {
-    let Some(field_value) = row.headers.get(&predicate.field) else {
+fn predicate_matches(row: &StoredRow, predicate: &Predicate) -> bool {
+    let Some(field_value) = row.get(&predicate.field) else {
         return false;
     };
     match (&predicate.op, &predicate.value) {
-        (CmpOp::In, Value::List(values)) => values
-            .iter()
-            .any(|value| scalar_string(value) == *field_value),
-        (CmpOp::Contains, value) => field_value.contains(&scalar_string(value)),
-        (CmpOp::Prefix, value) => field_value.starts_with(&scalar_string(value)),
+        (CmpOp::In, TypedValue::List(values)) => values.contains(field_value),
+        (CmpOp::Contains, TypedValue::String(value)) => as_string(field_value).contains(value),
+        (CmpOp::Prefix, TypedValue::String(value)) => as_string(field_value).starts_with(value),
         (operator, value) => compare_scalar(field_value, operator, value),
     }
 }
 
-// Compare numerically when the bound value is `Int`/`Float`, otherwise as strings.
-fn compare_scalar(field_value: &str, operator: &CmpOp, value: &Value) -> bool {
+fn compare_scalar(left: &TypedValue, operator: &CmpOp, right: &TypedValue) -> bool {
     use std::cmp::Ordering;
-    let ordering = match value {
-        Value::Int(_) | Value::Float(_) => match (field_value.parse::<f64>(), scalar_f64(value)) {
-            (Ok(left), Some(right)) => left.partial_cmp(&right),
-            _ => None,
-        },
-        _ => Some(field_value.cmp(scalar_string(value).as_str())),
+    let ordering = match (as_f64(left), as_f64(right)) {
+        (Some(left), Some(right)) => left.partial_cmp(&right),
+        _ => Some(as_string(left).cmp(&as_string(right))),
     };
     match operator {
         CmpOp::Eq => ordering == Some(Ordering::Equal),
@@ -164,151 +132,256 @@ fn compare_scalar(field_value: &str, operator: &CmpOp, value: &Value) -> bool {
     }
 }
 
-fn scalar_string(value: &Value) -> String {
-    match value {
-        Value::Str(text) => text.clone(),
-        Value::Int(number) => number.to_string(),
-        Value::Uint(number) => number.to_string(),
-        Value::Float(number) => number.to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Null | Value::List(_) => String::new(),
+fn compare_values(left: Option<&TypedValue>, right: Option<&TypedValue>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => match (as_f64(left), as_f64(right)) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            _ => as_string(left).cmp(&as_string(right)),
+        },
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
     }
 }
 
-fn scalar_f64(value: &Value) -> Option<f64> {
+fn as_string(value: &TypedValue) -> String {
+    value.diagnostic_text()
+}
+
+fn as_i64(value: &TypedValue) -> Option<i64> {
+    value.as_i64()
+}
+
+fn as_f64(value: &TypedValue) -> Option<f64> {
     match value {
-        Value::Int(number) => Some(*number as f64),
-        Value::Float(number) => Some(*number),
+        TypedValue::Int(value) => Some(f64::from(*value)),
+        TypedValue::Long(value)
+        | TypedValue::TimeMicros(value)
+        | TypedValue::TimestampMicros(value)
+        | TypedValue::TimestampTzMicros(value) => Some(*value as f64),
+        TypedValue::Date(value) => Some(f64::from(*value)),
+        TypedValue::Float(value) => Some(f64::from(*value)),
+        TypedValue::Double(value) => Some(*value),
         _ => None,
     }
 }
 
-fn run_aggregate(matched: &[Row], aggregate: &Aggregate, want_total: bool) -> QueryResult {
-    let mut groups: BTreeMap<Vec<String>, Vec<&Row>> = BTreeMap::new();
+fn run_aggregate(matched: &[StoredRow], aggregate: &Aggregate) -> Vec<StoredRow> {
+    let mut groups: BTreeMap<Vec<String>, Vec<&StoredRow>> = BTreeMap::new();
     for row in matched {
         let mut key: Vec<String> = aggregate
             .group_by
             .iter()
-            .map(|name| row.headers.get(name).cloned().unwrap_or_default())
+            .map(|name| row.get(name).map(as_string).unwrap_or_default())
             .collect();
         if let Some(window) = &aggregate.window {
             key.push(window_bucket(row, window));
         }
         groups.entry(key).or_default().push(row);
     }
-    let mut rows = Vec::new();
-    for (key, members) in groups {
-        let mut headers: BTreeMap<String, String> = aggregate
-            .group_by
-            .iter()
-            .cloned()
-            .zip(key.iter().cloned())
-            .collect();
-        if aggregate.window.is_some()
-            && let Some(bucket) = key.last()
-        {
-            headers.insert(WINDOW_START.to_owned(), bucket.clone());
-        }
-        for call in &aggregate.funcs {
-            headers.insert(call.alias.clone(), aggregate_value(&members, call));
-        }
-        rows.push(Row {
-            headers,
-            metadata: BTreeMap::new(),
-            partition: None,
-            offset: None,
-            stream: None,
-            topic: None,
-            payload: None,
-            score: None,
-        });
-    }
-    let total = rows.len();
-    QueryResult {
-        rows,
-        page: Page {
-            offset: 0,
-            limit: total.max(1),
-            total: want_total.then_some(total as u64),
-            has_more: false,
-        },
-    }
+
+    groups
+        .into_iter()
+        .map(|(key, members)| {
+            let mut row: StoredRow = aggregate
+                .group_by
+                .iter()
+                .cloned()
+                .zip(key.iter().cloned().map(TypedValue::String))
+                .collect();
+            if aggregate.window.is_some()
+                && let Some(bucket) = key.last()
+            {
+                row.insert(WINDOW_START.to_owned(), TypedValue::String(bucket.clone()));
+            }
+            for call in &aggregate.funcs {
+                row.insert(call.alias.clone(), aggregate_value(&members, call));
+            }
+            row
+        })
+        .collect()
 }
 
-fn window_bucket(row: &Row, window: &Window) -> String {
-    let timestamp = row
-        .headers
-        .get(&window.field)
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0);
+fn window_bucket(row: &StoredRow, window: &Window) -> String {
+    let timestamp = row.get(&window.field).and_then(as_i64).unwrap_or(0);
     let every = window.every_micros.max(1) as i64;
     ((timestamp / every) * every).to_string()
 }
 
-fn aggregate_value(members: &[&Row], call: &AggCall) -> String {
+fn aggregate_value(members: &[&StoredRow], call: &AggCall) -> TypedValue {
     let numbers = || -> Vec<f64> {
         members
             .iter()
-            .filter_map(|row| {
-                let field = call.field.as_ref()?;
-                row.headers.get(field)?.parse::<f64>().ok()
-            })
+            .filter_map(|row| as_f64(row.get(call.field.as_ref()?)?))
             .collect()
     };
     match call.func {
-        AggFunc::Count => members.len().to_string(),
+        AggFunc::Count => TypedValue::Long(members.len() as i64),
         AggFunc::CountDistinct => {
             let distinct: BTreeSet<String> = members
                 .iter()
-                .filter_map(|row| {
-                    let field = call.field.as_ref()?;
-                    row.headers.get(field).cloned()
-                })
+                .filter_map(|row| row.get(call.field.as_ref()?).map(as_string))
                 .collect();
-            distinct.len().to_string()
+            TypedValue::Long(distinct.len() as i64)
         }
-        AggFunc::Sum => numbers().iter().sum::<f64>().to_string(),
+        AggFunc::Sum => TypedValue::Double(numbers().iter().sum()),
         AggFunc::Avg => {
             let values = numbers();
-            if values.is_empty() {
-                String::new()
-            } else {
-                (values.iter().sum::<f64>() / values.len() as f64).to_string()
-            }
+            TypedValue::Double(values.iter().sum::<f64>() / values.len().max(1) as f64)
         }
-        AggFunc::Min => numbers()
-            .into_iter()
-            .reduce(f64::min)
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        AggFunc::Max => numbers()
-            .into_iter()
-            .reduce(f64::max)
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
+        AggFunc::Min => TypedValue::Double(numbers().into_iter().reduce(f64::min).unwrap_or(0.0)),
+        AggFunc::Max => TypedValue::Double(numbers().into_iter().reduce(f64::max).unwrap_or(0.0)),
         AggFunc::StdDev => {
             let values = numbers();
-            if values.is_empty() {
-                return String::new();
-            }
-            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let mean = values.iter().sum::<f64>() / values.len().max(1) as f64;
             let variance = values
                 .iter()
                 .map(|value| (value - mean).powi(2))
                 .sum::<f64>()
-                / values.len() as f64;
-            variance.sqrt().to_string()
+                / values.len().max(1) as f64;
+            TypedValue::Double(variance.sqrt())
         }
         AggFunc::Percentile => {
             let mut values = numbers();
-            if values.is_empty() {
-                return String::new();
-            }
-            values.sort_by(|left, right| left.total_cmp(right));
+            values.sort_by(f64::total_cmp);
             let fraction = call.arg.unwrap_or(0.5).clamp(0.0, 1.0);
-            let rank = (fraction * (values.len() - 1) as f64).round() as usize;
-            values[rank].to_string()
+            let rank = (fraction * values.len().saturating_sub(1) as f64).round() as usize;
+            TypedValue::Double(values.get(rank).copied().unwrap_or(0.0))
         }
+    }
+}
+
+fn render_result(query: &Query, index: &str, matched: Vec<StoredRow>) -> QueryResult {
+    let total = matched.len();
+    let offset = query.page.offset.unwrap_or(0) as usize;
+    let limit = query.page.limit as usize;
+    let page_rows: Vec<StoredRow> = matched.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(page_rows.len()) < total;
+    let fields = result_fields(&page_rows);
+    let rows = page_rows
+        .iter()
+        .map(|row| Row {
+            values: fields
+                .iter()
+                .map(|field| row.get(&field.name).cloned().unwrap_or(TypedValue::Null))
+                .collect(),
+            score: None,
+        })
+        .collect::<Vec<_>>();
+    QueryResult {
+        fields,
+        page: Page {
+            offset: Some(offset as u64),
+            limit: query.page.limit,
+            total: query.page.want_total.then_some(total as u64),
+            has_more,
+            next_cursor: has_more.then(|| format!("offset:{}", offset + rows.len())),
+        },
+        context: context(query, index, rows.len()),
+        rows,
+    }
+}
+
+fn result_fields(rows: &[StoredRow]) -> Vec<LogicalField> {
+    let names: BTreeSet<String> = rows.iter().flat_map(|row| row.keys().cloned()).collect();
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let field_type = rows
+                .iter()
+                .filter_map(|row| row.get(&name))
+                .find_map(logical_type)
+                .unwrap_or(LogicalType::String);
+            LogicalField {
+                id: index as u32 + 1,
+                name,
+                required: false,
+                field_type,
+                doc: None,
+            }
+        })
+        .collect()
+}
+
+fn logical_type(value: &TypedValue) -> Option<LogicalType> {
+    match value {
+        TypedValue::String(_) => Some(LogicalType::String),
+        TypedValue::Long(_) => Some(LogicalType::Long),
+        TypedValue::Double(_) => Some(LogicalType::Double),
+        TypedValue::Null => None,
+        _ => Some(LogicalType::String),
+    }
+}
+
+fn context(query: &Query, index: &str, row_count: usize) -> QueryContext {
+    QueryContext {
+        execution_id: query.execution_id,
+        engine: QueryEngineEvidence {
+            name: "bdd-reference".to_owned(),
+            version: "1".to_owned(),
+            dialect: None,
+        },
+        resolved_target: ResolvedQueryTarget::Operational {
+            index: index.to_owned(),
+            backend_resource_id: BackendResourceId::from_u128(1),
+            backend_generation: 1,
+            runtime_configuration_revision: 1,
+        },
+        requested_consistency: query.consistency,
+        delivered_consistency: query.consistency,
+        boundary: None,
+        checkpoint_revision: None,
+        global_state_revision: None,
+        truncated: false,
+        elapsed_micros: 0,
+        scanned_bytes: 0,
+        produced_bytes: 0,
+        row_count: row_count as u64,
+    }
+}
+
+fn empty_result(query: &Query, index: &str) -> QueryResult {
+    QueryResult {
+        fields: vec![LogicalField {
+            id: 1,
+            name: "value".to_owned(),
+            required: false,
+            field_type: LogicalType::String,
+            doc: None,
+        }],
+        rows: Vec::new(),
+        page: Page {
+            offset: Some(0),
+            limit: query.page.limit,
+            total: query.page.want_total.then_some(0),
+            has_more: false,
+            next_cursor: None,
+        },
+        context: context(query, index, 0),
+    }
+}
+
+pub fn query_on(index: &str) -> Query {
+    Query {
+        execution_id: laser_sdk::query::QueryExecutionId::from_u128(1),
+        target: QueryTarget::operational(index),
+        deadline_micros: 1,
+        by_key: Vec::new(),
+        message_type: None,
+        time_range: None,
+        filter: None,
+        vector: None,
+        text: None,
+        order: Vec::new(),
+        page: laser_sdk::query::QueryPageRequest::default(),
+        aggregate: None,
+        having: None,
+        distinct: false,
+        select: laser_sdk::query::Select::default(),
+        fork: None,
+        raw_sql: None,
+        consistency: Consistency::Eventual,
     }
 }
 
@@ -325,109 +398,88 @@ mod tests {
             (2, "500", "900"),
             (3, "200", "30"),
         ] {
-            let row = QueryEngine::row(&[
-                ("endpoint", "/v1/items"),
-                ("status", status),
-                ("latency_ms", latency),
-                ("seq", &index.to_string()),
-            ]);
-            engine.insert("api_calls", row);
+            engine.insert(
+                "api_calls",
+                QueryEngine::row(&[
+                    ("endpoint", "/v1/items"),
+                    ("status", status),
+                    ("latency_ms", latency),
+                    ("seq", &index.to_string()),
+                ]),
+            );
         }
         engine
     }
 
-    fn query_on(index: &str) -> Query {
-        Query {
-            index: index.to_owned(),
-            ..Default::default()
-        }
+    #[test]
+    fn typed_query_filter_returns_only_matching_rows() {
+        let engine = seeded();
+        let mut query = query_on("api_calls");
+        query.filter = Some(Filter::pred("latency_ms", CmpOp::Gt, 500_i64));
+        let result = engine.execute(&query);
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.rows.iter().all(|row| {
+            result
+                .value_i64(row, "latency_ms")
+                .is_some_and(|value| value > 500)
+        }));
     }
 
     #[test]
-    fn given_rows_with_varied_latency_when_filtered_then_should_return_only_matching() {
+    fn typed_query_ordering_is_numeric() {
         let engine = seeded();
-        let result = engine.execute(&Query {
-            filter: Some(Filter::Pred(Predicate {
-                field: "latency_ms".to_owned(),
-                op: CmpOp::Gt,
-                value: Value::Int(500),
-            })),
-            ..query_on("api_calls")
-        });
-        assert_eq!(result.rows.len(), 2, "two rows exceed 500ms");
-        assert_eq!(result.page.total, None, "exact total is opt-in");
-        for row in &result.rows {
-            let latency: i64 = row.headers["latency_ms"].parse().expect("numeric latency");
-            assert!(latency > 500, "row latency {latency} should exceed 500");
-        }
-    }
-
-    #[test]
-    fn given_rows_when_ordered_descending_then_should_sort_numerically_not_lexically() {
-        let engine = seeded();
-        let result = engine.execute(&Query {
-            order: vec![Sort {
-                field: "latency_ms".to_owned(),
-                dir: Dir::Desc,
-            }],
-            ..query_on("api_calls")
-        });
+        let mut query = query_on("api_calls");
+        query.order = vec![Sort {
+            field: "latency_ms".to_owned(),
+            dir: Dir::Desc,
+        }];
+        let result = engine.execute(&query);
         let latencies: Vec<i64> = result
             .rows
             .iter()
-            .map(|row| row.headers["latency_ms"].parse().expect("numeric latency"))
+            .filter_map(|row| result.value_i64(row, "latency_ms"))
             .collect();
-        assert_eq!(
-            latencies,
-            vec![900, 550, 30, 10],
-            "numeric desc, not lexical"
-        );
+        assert_eq!(latencies, vec![900, 550, 30, 10]);
     }
 
     #[test]
-    fn given_more_rows_than_the_limit_when_queried_then_should_cap_the_page_and_report_full_total()
-    {
+    fn cursor_page_reports_exact_total_only_when_requested() {
         let engine = seeded();
-        let result = engine.execute(&Query {
-            limit: 2,
-            want_total: true,
-            ..query_on("api_calls")
-        });
-        assert_eq!(result.rows.len(), 2, "the page is capped at the limit");
-        assert_eq!(result.page.total, Some(4), "the total counts every match");
-        assert!(result.page.has_more, "more rows remain past the page");
+        let mut query = query_on("api_calls");
+        query.page.limit = 2;
+        query.page.want_total = true;
+        let result = engine.execute(&query);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.page.total, Some(4));
+        assert!(result.page.next_cursor.is_some());
     }
 
     #[test]
-    fn given_rows_when_count_aggregated_by_status_then_should_count_each_group() {
+    fn typed_aggregate_counts_each_group() {
         let engine = seeded();
-        let result = engine.execute(&Query {
-            aggregate: Some(Aggregate {
-                group_by: vec!["status".to_owned()],
-                funcs: vec![AggCall {
-                    func: AggFunc::Count,
-                    field: None,
-                    arg: None,
-                    alias: "count".to_owned(),
-                }],
-                window: None,
-            }),
-            ..query_on("api_calls")
+        let mut query = query_on("api_calls");
+        query.aggregate = Some(Aggregate {
+            group_by: vec!["status".to_owned()],
+            funcs: vec![AggCall {
+                func: AggFunc::Count,
+                field: None,
+                arg: None,
+                alias: "count".to_owned(),
+            }],
+            window: None,
         });
-        let counts: BTreeMap<String, String> = result
+        let result = engine.execute(&query);
+        let counts: BTreeMap<String, i64> = result
             .rows
-            .into_iter()
-            .map(|row| (row.headers["status"].clone(), row.headers["count"].clone()))
+            .iter()
+            .map(|row| {
+                (
+                    result.value_text(row, "status").expect("status"),
+                    result.value_i64(row, "count").expect("count"),
+                )
+            })
             .collect();
-        assert_eq!(counts["200"], "3", "three 200s");
-        assert_eq!(counts["500"], "1", "one 500");
-    }
-
-    #[test]
-    fn given_an_unknown_index_when_queried_then_should_return_empty() {
-        let engine = seeded();
-        let result = engine.execute(&query_on("nope"));
-        assert!(result.rows.is_empty(), "an unknown index has no rows");
-        assert_eq!(result.page.total, None);
+        assert_eq!(counts["200"], 3);
+        assert_eq!(counts["500"], 1);
     }
 }

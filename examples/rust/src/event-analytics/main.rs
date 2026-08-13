@@ -359,8 +359,12 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
         .await?;
     info!("events by kind:");
     for row in &by_kind.rows {
-        let kind = row.headers.get(MESSAGE_TYPE).map_or("?", String::as_str);
-        let count = row.headers.get(COUNT_RESULT).map_or("0", String::as_str);
+        let kind = by_kind
+            .value_text(row, MESSAGE_TYPE)
+            .unwrap_or_else(|| "?".to_owned());
+        let count = by_kind
+            .value_text(row, COUNT_RESULT)
+            .unwrap_or_else(|| "0".to_owned());
         info!("  {kind:<12} {count}");
     }
 
@@ -373,8 +377,12 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
         .await?;
     info!("slowest 3 routes:");
     for row in &slowest.rows {
-        let route = row.headers.get(ROUTE).map_or("?", String::as_str);
-        let latency = row.headers.get(LATENCY_MS).map_or("?", String::as_str);
+        let route = slowest
+            .value_text(row, ROUTE)
+            .unwrap_or_else(|| "?".to_owned());
+        let latency = slowest
+            .value_text(row, LATENCY_MS)
+            .unwrap_or_else(|| "?".to_owned());
         info!("  {latency:>5}ms  {route}");
     }
 
@@ -406,8 +414,12 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
         .await?;
     info!("events per minute:");
     for row in &per_minute.rows {
-        let bucket = row.headers.get(WINDOW_START).map_or("?", String::as_str);
-        let count = row.headers.get(COUNT_RESULT).map_or("0", String::as_str);
+        let bucket = per_minute
+            .value_text(row, WINDOW_START)
+            .unwrap_or_else(|| "?".to_owned());
+        let count = per_minute
+            .value_text(row, COUNT_RESULT)
+            .unwrap_or_else(|| "0".to_owned());
         info!("  bucket {bucket}: {count}");
     }
 
@@ -422,12 +434,15 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
         .await?;
     info!("avg latency and distinct routes by kind:");
     for row in &by_kind_metrics.rows {
-        let kind = row.headers.get(MESSAGE_TYPE).map_or("?", String::as_str);
-        let avg = row.headers.get("avg").map_or("?", String::as_str);
-        let routes = row
-            .headers
-            .get("count_distinct")
-            .map_or("?", String::as_str);
+        let kind = by_kind_metrics
+            .value_text(row, MESSAGE_TYPE)
+            .unwrap_or_else(|| "?".to_owned());
+        let avg = by_kind_metrics
+            .value_text(row, "avg")
+            .unwrap_or_else(|| "?".to_owned());
+        let routes = by_kind_metrics
+            .value_text(row, "count_distinct")
+            .unwrap_or_else(|| "?".to_owned());
         info!("  {kind:<12} avg={avg}ms routes={routes}");
     }
     Ok(())
@@ -438,8 +453,7 @@ fn scalar(result: &QueryResult) -> i64 {
     result
         .rows
         .first()
-        .and_then(|row| row.headers.get(COUNT_RESULT))
-        .and_then(|value| value.parse().ok())
+        .and_then(|row| result.value_i64(row, COUNT_RESULT))
         .unwrap_or(0)
 }
 
@@ -527,7 +541,7 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
                 .source(stream_for("event-analytics"), GUARDED_TOPIC)
                 .allow(GUARDED_PROJECTION)
                 .default_projection(GUARDED_PROJECTION)
-                .target_table(GUARDED_TOPIC)
+                .index(GUARDED_TOPIC)
                 .build(),
         )
         .await?;

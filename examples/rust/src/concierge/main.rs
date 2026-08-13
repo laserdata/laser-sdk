@@ -422,14 +422,13 @@ async fn backlog_snapshot(laser: &Laser) -> Result<(), LaserError> {
         .fetch()
         .await?;
     for row in &by_severity.rows {
-        info!(
-            "  open {} tickets: {}",
-            row.headers
-                .get("severity")
-                .map(String::as_str)
-                .unwrap_or("?"),
-            row.headers.get("count").map(String::as_str).unwrap_or("?"),
-        );
+        let severity = by_severity
+            .value_text(row, "severity")
+            .unwrap_or_else(|| "?".to_owned());
+        let count = by_severity
+            .value_text(row, "count")
+            .unwrap_or_else(|| "?".to_owned());
+        info!("  open {} tickets: {}", severity, count,);
     }
     Ok(())
 }
@@ -479,8 +478,7 @@ fn scalar(result: &QueryResult) -> String {
     result
         .rows
         .first()
-        .and_then(|row| row.headers.get("count"))
-        .cloned()
+        .and_then(|row| result.value_text(row, "count"))
         .unwrap_or_else(|| "0".to_owned())
 }
 
@@ -920,7 +918,11 @@ async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
     let _ = fork.squash().await;
     fork.create().continuous().send().await?;
     for row in &criticals.rows {
-        let (Some(partition), Some(offset)) = (row.partition, row.offset) else {
+        let partition = criticals
+            .value_u64(row, laser_sdk::wire::schema::PARTITION_ID_FIELD_NAME)
+            .and_then(|value| u32::try_from(value).ok());
+        let offset = criticals.value_u64(row, laser_sdk::wire::schema::OFFSET_FIELD_NAME);
+        let (Some(partition), Some(offset)) = (partition, offset) else {
             continue;
         };
         fork.put_row(TICKETS_TOPIC, partition, offset)

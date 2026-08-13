@@ -224,6 +224,10 @@ Operation **identity and semantics** are core. Operation **encoding** is binding
 | `authz.define_role` / `delete_role` / `bind_roles` | governance | define/replace, delete, and bind roles, journalled. Role names must pass `validate_role_name` (64-byte charset safelist, B1.4). `bind_roles` takes an optional `expect_revision` compare-and-swap precondition (a mismatch is a `conflict`). Requires `authz:admin` or the near-root server-management permission (B1.4) |  |
 | `authz.history` | governance | read the authorization change log for a role, a user's bindings, or all, paged by revision (who granted what, when). Requires `authz:read` |  |
 | `query` | views | run a query IR, return rows or aggregates |  |
+| `query.page` / `cancel` / `status` | views | continue one execution from an opaque cursor, request cancellation, or inspect execution state |  |
+| `checkpoint.mutate` | views | apply one revision-guarded public destination or query-route mutation. Replicated worker transitions are a separate internal envelope |  |
+| `destination.get` / `list` | views | read destination declarations and checkpoint state at an explicit read consistency |  |
+| `query_route.list` | views | read explicit operational and lakehouse query routes |  |
 | `registry.get_projection` / `list_projections` | views | browse projections |  |
 | `registry.get_schema` / `list_schemas` | views | browse writer schemas |  |
 | `registry.register_schema` | views | allocate a writer-schema id |  |
@@ -238,7 +242,7 @@ Operation **identity and semantics** are core. Operation **encoding** is binding
 | `graph.query` / `neighbors` / `upsert` | views | knowledge-graph traversal, one-hop neighbors, node/edge upsert (A13). The graph name is at most 128 B, non-empty, control-character-free (`validate_graph_name`), enforced by the SDK edge and the serving plane |  |
 | `batch` | control | the mixed-operation batch: up to `MAX_BATCH_OPS` (64) managed requests in one round trip, each item carrying its own command code and encoded request, each result that op's own reply bytes in order. Amortizes the round trip and nothing else: items execute independently, a failed item fails alone (explicitly NOT atomic), a nested batch is rejected. An old backend answers the unknown code with the surface-agnostic `CommandError`, decoded client-side as the typed unsupported, so no capability bit is needed |  |
 | `agent.submit` / `cancel` / `status` / `list` | coordination | the run registry: submit records intent and mints the run identity (content-addressed, so a retried submit converges), delivery stays the envelope the SDK publishes, transitions are folded from the status records a registered run stamps with the `run` metadata key (A9.6), cancel records an intent flag the engine observes at a step boundary. `submit` MAY carry a multi-dimensional `RunBudget` (events, model calls, tool calls, patches, recursion depth, wall-clock, cost) the run fold accumulates, failing the run when a cap is crossed. It is a governance governor, not a grant. A managed read model over the log, never a second source of truth |  |
-| change feed (no request op) | views | change notification over the read model: a projection binding opts in with `notify`, the projector publishes one change record per committed batch on the changes channel (A11.5, B1.1), and a consumer reads it by offset like any topic. Gated by the `watch` feature bit (A12), it adds no request op, so there is no `watch`/`unwatch` verb to register |
+| change feed (no request op) | views | change notification over the read model: a projection binding opts in with `notify`, the projector publishes one change record per committed batch on the changes channel (A11.8, B1.1), and a consumer reads it by offset like any topic. Gated by the `watch` feature bit (A12), it adds no request op, so there is no `watch`/`unwatch` verb to register |  |
 
 The four-verb agentic-memory API (`remember` / `recall` / `improve` / `forget`) is **not** a registry operation: it is an SDK facade that composes `publish`, `query`, and the `graph` ops above (A13), so it adds no wire op of its own.
 
@@ -294,16 +298,23 @@ One logical result code spans every managed surface (query, key-value, fork, bro
 | --- | --- | --- | --- |
 | ok | 0 | 200 | success (no error to classify) |
 | unsupported | 1 | 501 | the op, or the managed surface, is not available here |
-| not-found | 2 | 404 | a named index, fork, or key does not exist |
-| invalid-argument | 3 | 400 | malformed request or an out-of-range field |
-| too-large | 4 | 413 | a result or value exceeded a cap |
+| not_found | 2 | 404 | a named index, fork, key, destination, or route does not exist |
+| invalid_argument | 3 | 400 | malformed request or an out-of-range field |
+| too_large | 4 | 413 | a result or value exceeded a cap |
 | conflict | 5 | 409 | a precondition lost a race (compare-and-swap mismatch, fork conflict) |
 | stale | 6 | 503 | a consistency level could not be met in time (the read model is catching up) |
-| version-skew | 7 | 400 | the wire op version is not accepted |
+| version_skew | 7 | 400 | the wire op version is not accepted |
 | unauthenticated | 8 | 401 | no credential, or an invalid one: the caller is not authenticated |
 | backend | 9 | 502 | the managed backend failed or was unreachable |
 | forbidden | 10 | 403 | authenticated, but the grant needed for the operation is missing |
-| step-up-required | 11 | 403 | authenticated, but a stronger authentication (a step-up) is needed |
+| step_up_required | 11 | 403 | authenticated, but a stronger authentication step is needed |
+| unavailable | 12 | 503 | the operation may succeed later without changing the request |
+| resource_limit | 13 | 429 | the query exceeded a server-enforced resource budget |
+| cancelled | 14 | 409 | the query was cancelled through its execution identity |
+| deadline_exceeded | 15 | 408 | the query did not finish before its absolute deadline |
+| expired_snapshot | 16 | 410 | the requested historical snapshot is no longer retained |
+| stale_generation | 17 | 409 | the requested destination or backend generation is no longer current |
+| target_unavailable | 18 | 503 | the resolved target is not ready to serve the request |
 
 An unknown code from a newer peer rides through as `unrecognized(code)` and re-encodes byte-for-byte, the same forward-compat shape the growable u8 dictionaries use, so an old build relays it rather than failing. Each binding maps the logical code to its own carriage (the HTTP binding to a status, B4).
 
@@ -566,7 +577,7 @@ A projection turns a payload into a queryable row. It is global and reusable. Bi
 | `IndexField` | name (the index key), pointer (RFC 6901 into the payload), optional field-type hint (`text` / `int` / `float` / `bool`) |
 | `IndexSchema` | fields, optional vector-field pointer (default `/embedding`), inline-payload flag |
 | `EntitySchema` | node/edge extraction for a `graph` projection: node rules (label + RFC 6901 value pointer + optional embedding pointer) and edge rules (edge type + source/target pointers + optional valid-from/valid-to pointers for a bitemporal extracted edge). Pointer-based and deterministic, so building the graph needs no model call (A13) |
-| `ProjectionBinding` | source (stream, topic), allowed projection refs, default projection, target tables, `notify` flag (default off, skipped on the wire when false, so a pre-feed binding encodes byte-identically): opt this binding's committed batches into the change feed (A11.5), optional `retention` policy overriding the fleet-wide default for these rows, independent of the source topic's own retention |
+| `ProjectionBinding` | source (stream, topic), allowed projection refs, default projection, one operational index, optional exact backend resource generation, `notify` flag, and optional retention policy. No target list, delivery mode, role, or required mirror metadata remains |
 | `SchemaDef` | id (u32, permanent), source, optional name, optional version |
 | `SchemaSource` | internally tagged on `kind`: `{kind: avro, schema}` \| `{kind: json_schema, schema}` \| `{kind: protobuf, descriptor_set, message_type}`. `descriptor_set` is a byte string. An unknown `kind` from a newer peer decodes to a forward-compatible `unknown` rather than failing the whole reply (the same shape `RetentionPolicy` uses), so an old client still reads a registry holding a source kind it cannot decode against. It must not re-register an `unknown`. |
 
@@ -586,50 +597,82 @@ A backend-neutral logical IR, compiled per backend on the managed side.
 
 | Field | Meaning |
 | --- | --- |
-| `index` | the materialized index name |
+| `execution_id` | a nonzero 128-bit identity shared by execution, paging, status, cancellation, and errors |
+| `target` | `operational { index }` or `lakehouse { destination_id, destination_generation, snapshot? }` |
+| `deadline_micros` | one absolute deadline for the complete execution, never extended by page retrieval |
 | `by_key` | exact-match key constraints, AND-composed |
-| `message_type`, `time_range` | sugar for equality on the type field and a closed range on the timestamp |
+| `message_type`, `time_range` | sugar for equality on the type field and a nonempty half-open range on the timestamp |
 | `filter` | a predicate tree (`all` / `any` / `not` / `pred`) |
 | `vector` | nearest-neighbour search (field, embedding, top_k), distance in the row score |
 | `text` | lexical relevance search (the query text, optionally one indexed field), relevance in the row score, text capped at 1024 bytes. Capability-gated (`keyword_search`): an unaware backend would silently drop the additive field, so a client refuses an unadvertised `text` before sending, and a backend without a lexical index answers unsupported rather than a contains approximation |
 | `order` | sort clauses (field, direction) |
-| `limit`, `offset` | paging, limit capped at 1000, 0 means a full page |
+| `page` | bounded limit, optional offset, optional opaque cursor, and optional exact-total request |
 | `aggregate` | group-by keys, aggregate calls, optional tumbling window |
 | `having` | a filter on aggregate output |
 | `distinct` | distinct over the selected fields |
 | `select` | projected fields and an inline-payload flag |
 | `fork` | resolve against a fork's overlay |
-| `raw_sql` | an opt-in escape hatch, SQL backends only, read-only single select |
+| `raw_sql` | explicit dialect, read-only SQL text, and ordered typed parameters. The server never guesses a dialect |
 | `consistency` | read-consistency level, absent on the wire for the default `eventual` |
 
 | Vocabulary | Values |
 | --- | --- |
 | comparison op | `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `contains`, `prefix` |
 | aggregate func | `count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `percentile`, `std_dev` |
-| scalar value | string, int, uint, float, bool, null, list (untagged, variant order chosen so integers never become lossy floats) |
+| typed value | tagged null, boolean, int, long, float, double, decimal, date, time, timestamp, timestamp with timezone, string, UUID, fixed, binary, struct, list, or map |
 | consistency | `eventual` (serve as-is, the default), `read_your_writes` (wait for the projector to reach the source log head, else `stale`), `strong` (linearizable cross-replica). `read_your_writes` and `strong` are backend-gated |
 
 ### A11.4 Query reply
 
-`Ok(QueryResult)` or `Err(QueryError)`. The error is one of `Unsupported`, `IndexNotFound`, `ForkNotFound`, `Backend`, `TooLarge { what, size, cap }`, `Version { expected, got }`, `Stale { what, applied, required }`, `Unauthorized`. `TooLarge` is raised when a query asks for more than one reply can carry. A reply rides a single 64 MiB socket frame and is bounded by it, so larger result sets page via `limit` and `offset` rather than a bigger reply. `Stale` is raised when a `read_your_writes` (or `strong`) query cannot be served at the requested freshness within the deadline: the projector's applied offset (`applied`) had not reached what the level required (`required`), so the caller retries rather than reading older data. `Unauthorized` is the per-source DSL check refusing the query (the resource the filter names is outside the caller's grants, B1.4). Every one of these errors also classifies into the unified result code (A7).
+`Ok(QueryResult)` or `Err(QueryError)`. Errors cover unsupported operations, authorization, missing indexes and forks, backend faults, version skew, stale reads, size limits, cancellation, deadline expiry, expired snapshots, stale generations, unavailable targets, and resource budgets. Every typed error projects into the unified result code in A7.
 
-`QueryResult` carries a `Page { offset, limit, total, has_more }`. The default reply costs one page: the server fetches `limit + 1` rows and sets `has_more` exactly from whether the probe row was there, never counting the rest. `total` is an optional exact match count present only when the request set `want_total`, which runs a real `COUNT(*)` over the filter, unbounded work on a large index. A caller paginating or driving a progress loop reads `has_more` (always exact, always free) and the rows seen so far, and asks for `total` only when the exact number itself is the point (rendering "page 3 of 12"). Because an unrequested total is absent rather than a page-bounded number, a caller can never mistake one for a real count.
+`QueryResult.fields` is the ordered logical schema for the page. Every `Row.values` entry is a canonical tagged `TypedValue` at the same position. A vector or lexical query additionally returns its backend-native finite distance or rank in `Row.score`. The maximum page is 1,000 rows. Bulk columnar interchange uses Arrow IPC rather than the query page contract.
+
+`Page` carries an optional offset, limit, optional exact total, `has_more`, and an optional opaque next cursor. `has_more` and `next_cursor` must agree. A caller retrieves another page through the same execution identity. It does not reconstruct the query or extend the deadline.
+
+Every result carries `QueryContext`. The context records the engine and version, resolved operational or lakehouse target, backend resource and observed generations, runtime-configuration revision, requested and delivered consistency, truncation and resource metrics. A lakehouse result additionally identifies the destination generation, table UUID, snapshot, schema, partition spec, materialization-boundary digest, checkpoint revision, and global state revision.
 
 For example, the ten most recent high-latency calls for one model, newest first:
 
 ```
 query {
-  index:  "inferences",
+  execution_id: "01...",
+  target: { kind: "operational", index: "inferences" },
+  deadline_micros: 1717171747000000,
   filter: { all: [ { pred: { field: "model", op: eq, value: "gpt-4o" } },
                    { pred: { field: "latency_ms", op: gt, value: 500 } } ] },
   order:  [ { field: "ts", dir: desc } ],
-  limit:  10,
+  page: { limit: 10 },
   select: { fields: ["model", "latency_ms", "user_id"], payload: false }
 }
-   -> Ok(QueryResult { rows: [ { fields, score, payload? }, ... ] })
+   -> Ok(QueryResult { fields, rows: [ { values: [...] }, ... ], page, context })
 ```
 
-### A11.5 The change feed
+### A11.5 Logical schema and canonical values
+
+A logical schema has a nonzero 128-bit ID, nonzero version, 32-byte canonical fingerprint, and ordered fields. Field IDs are positive and unique across the complete nested tree. Names are compared exactly after rejecting control characters. Duplicate sibling names, reserved provenance names, and reserved provenance field IDs are invalid.
+
+Logical types cover boolean, int, long, float, double, decimal, date, time in microseconds since midnight, timestamp in UTC microseconds, timestamp with timezone as a UTC instant, string, UUID, fixed bytes, binary, struct, list, and map. Decimal precision is 1 through 38. Scale cannot exceed precision. UUID uses RFC 4122 network byte order. Floats reject NaN, infinity, and negative zero. Map keys are limited to boolean, int, long, decimal, date, time, timestamp, timestamp with timezone, string, UUID, fixed, and binary. Canonical map ordering uses encoded key bytes.
+
+The reserved provenance fields use the `__laser_` namespace and fixed IDs from `PROVENANCE_FIELD_ID_START`. They include source and destination identity, original payload and content type, and source position. Users cannot declare those names or IDs.
+
+### A11.6 Destinations, query routes, and checkpoints
+
+A `MaterializationDestination` declares one immutable generation. It binds a source scope and partition-recreation policy to a projection version, logical schema fingerprint, backend resource generation, physical table identity, Parquet, Iceberg v2, start policy, new-partition policy, blocking error policy, and desired state. It does not carry runtime ownership or observed progress.
+
+A `QueryRoute` independently names an operational index or one lakehouse destination generation. Query routing never follows a projection target role.
+
+Checkpoint mutations use two disjoint envelopes. `CheckpointRequestEnvelope` is the bounded public form. It carries the operation version, request ID, expected global state revision, a public mutation, and optional signed supervisor assertion. `ReplicatedCheckpointMutation` is server-stamped after authentication. It adds the primary timestamp, authenticated Iggy actor, and verified supervisor actor evidence. The two forms have different fixtures and do not decode as each other.
+
+Destination status records the declaration and checkpoint revisions, desired and effective state, backend and schema binding, table UUID, owner lease, ordered partition boundaries, optional prepared attempt, last completion, retention gap, block, repair, and read consistency. Lease ownership is fenced by owner, epoch, sequence, and a bounded deadline. Prepared attempts freeze exact source ranges, resulting boundary, Iceberg commit requirements, manifest and object digests, schema and projection identity, table base state, and credential generations.
+
+### A11.7 Arrow IPC input
+
+Arrow content is one self-contained IPC stream per Iggy message. The message contains its schema, dictionaries, and record batches with no continuation state shared across messages. It carries the logical schema fingerprint in `agdx.sfp` and validates encoded bytes, field count, batch count, row count, and dictionary count against `ArrowIpcPolicy`.
+
+Only microsecond time and timestamp units are accepted. Dense and sparse unions, extension types, unsupported dictionary arrangements, decimals wider than 128 bits, missing schema messages, trailing bytes, shared stream state, and policy-limit violations are rejected with a stable `ArrowIpcRejectionCode`. Arrow dependencies remain outside `laser-wire`.
+
+### A11.8 The change feed
 
 "Query after my data landed" should be await-then-query, not sleep-and-retry. The change feed is the log-native answer: a projection binding opts in with `notify` (A11.1), and after each committed projector batch that advanced a notifying binding's table the projector publishes one **change record** per advanced table on the changes channel of the ops stream (B1.1). A consumer reads the channel by offset like any topic, resumes from persisted offsets, and there is no server-push, subscription, or broker watch.
 
@@ -643,13 +686,15 @@ The record is a **wakeup, not truth**: it says the view advanced past an offset 
 
 A single connection negotiates what is available. A managed feature works against a managed implementation or returns `unsupported`.
 
-- At connect the client runs the `hello` operation and may run it again through its capability-refresh API. The reply advertises per-surface op versions (`query`, `control`, `kv`, `fork`, and optional `agent` and `graph` versions where 0 means not advertised) plus an optional `features` bitset for managed sub-capabilities that vary independently of the base surface: compare-and-swap, read-your-writes, strong consistency, fenced compare-and-swap, the agent-workflow run registry, lexical keyword search, the change feed (`watch`, A11.5), and the authorization control band (`authz`, B1.4). The `authz` bit is the one the streaming server itself adds (authorization is server-side, journalled and enforced there), OR-ing it into the relayed announce rather than reading it from the backend. Every other bit is the backend's own truth. The `graph` op version is what gates the knowledge-graph surface (A13). A `0` bitset (skipped on the wire) means none advertised, so a pre-feature reply stays byte-identical and an old client simply lights up no extra capability. The capabilities reply additionally lists the materialization backends the server currently exposes: each is a descriptor of a stable `id` and an opaque engine `kind`, with optional advisory `label` and `version` strings for display and a set of opaque `capabilities` tags the backend declares about itself, identity only with no settings or secrets, so a client can show what it may route to and a new engine is advertised by name without a wire change. The `capabilities` tags let a consumer reason about what a backend is good for (e.g. `ingest`, `query`, a particular query-surface feature) and gate a decision before attempting an op: the wire pins no meaning to a tag, a producer emits what it supports and a consumer matches the tags it understands and ignores the rest, so a new capability is advertised by name with no wire change. An empty list (the default, skipped on the wire) means none advertised, and an absent `label`/`version`/`capabilities` (also skipped) means the client derives a label from `id`/`kind`, shows no version, and assumes no declared tags. The binary `hello` reply carries the same backend list as the HTTP capabilities surface: it is a `BackendAnnounce` that decodes byte-identically from a pre-backends versions-only reply, so an older server's reply still parses with an empty backend list.
-- The SDK capability set is grouped by where a capability lives and what it depends on, not a flat list. A root `managed` flag says a managed plane is connected at all. The managed surfaces served off the log are `query`, `kv`, `graph`, `forks`, and the A2A gateway. The platform-native ones are `sessions` and `durable_dedup`. A surface's sub-features nest under it so a dependent feature cannot be advertised apart from its surface: `query.consistency` is the strongest read-consistency level the query surface serves (the `eventual < read_your_writes < strong` ladder, so a level implies the weaker ones, which makes the impossible "strong-but-not-read-your-writes" state unrepresentable), and `kv.cas` is the key-value conditional-write feature, with `kv.cas_fenced` the fenced sibling that gates a write on a live fence sequence. Agentic memory composes the query and graph surfaces, so it has no capability of its own. On an open substrate with no managed surface every capability is off and the matching call returns unsupported. The wire `hello` reply still carries the flat `features` bitset (`kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`, `keyword_search`, `watch`, `authz`). The SDK folds those bits into the grouped form (the consistency bits become the served level), and the HTTP capabilities reply mirrors the grouped shape (B4).
+- At connect the client runs the `hello` operation and may run it again through capability refresh. The reply advertises per-surface op versions for query, control, checkpoint, key-value, fork, agent, and graph plus the managed feature bits. Every shipped operation surface uses version 1. A zero slot means the surface is not advertised.
+- Each `BackendDescriptor` is structured, versioned, and secret-free. It carries stable backend resource identity, mode, label, implementation kind and version, observed backend and runtime-configuration revisions, desired and observed state, readiness, materialization capabilities, query dialects and typed-value coverage, time travel, consistency, paging and cancellation, schema and maintenance support, and numeric limits. It never carries endpoint URLs, credentials, secret values, or mutable configuration submissions.
+- Backend readiness is an observation with stable reason codes. A configured backend can be unavailable or degraded without losing its identity and capabilities. Clients refresh capabilities after startup races, runtime failover, or backend restart rather than treating the connect-time view as permanent.
+- The SDK capability set is grouped by where a capability lives and what it depends on, not a flat list. A root `managed` flag says a managed plane is connected at all. The managed surfaces served off the log are `query`, `destinations`, `kv`, `graph`, `forks`, and the A2A gateway. The platform-native ones are `sessions` and `durable_dedup`. A surface's sub-features nest under it so a dependent feature cannot be advertised apart from its surface: `query.consistency` is the strongest read-consistency level the query surface serves (the `eventual < read_your_writes < strong` ladder, so a level implies the weaker ones, which makes the impossible "strong-but-not-read-your-writes" state unrepresentable), and `kv.cas` is the key-value conditional-write feature, with `kv.cas_fenced` the fenced sibling that gates a write on a live fence sequence. Agentic memory composes the query and graph surfaces, so it has no capability of its own. On an open substrate with no managed surface every capability is off and the matching call returns unsupported. The wire `hello` reply still carries the flat `features` bitset (`kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`, `keyword_search`, `watch`, `authz`, `destinations`). The SDK folds those bits into the grouped form (the consistency bits become the served level), and the HTTP capabilities reply mirrors the grouped shape (B4).
 - When the advertised op version is not the SDK's pinned version, the call fails fast with the surface's typed version error before a round trip.
 - A feature carried as an additive request field, rather than its own operation, is refused locally when unadvertised. A compare-and-swap rides its own command code, so an unaware server rejects it cleanly even without a local check, but a read-your-writes (or strong) query rides the additive `consistency` field that an unaware server silently drops, so the client refuses an unadvertised level before sending. This is what keeps fail-not-downgrade honest (A8).
 - A server MUST keep its two capability carriages in agreement: the binary `hello` `features` bit and the HTTP capabilities boolean for the same feature say the same thing. The contract carries both because the two bindings are separate, and a divergence would let a feature look available on one surface and not the other.
 - Every sub-feature defaults to **not advertised**: the HTTP `Capabilities` constructor leaves `kv.cas` off, `query.consistency` at `eventual`, and `graph` off, and a server opts each up only when it serves it, mirroring the skip-when-zero `features` bitset and the zero `graph` op version. A backend that advertised a feature it cannot honor would turn the clean unsupported error into a silent wrong answer, so the safe default is off and opt-in.
-- When the streaming server and the managed backend are separate processes, the backend is the single source of its own capability truth. The streaming server requests a live `BackendAnnounce` (`AGDX_BACKEND_HELLO_CODE`) over their private socket whenever it answers a binary client `hello` or the HTTP capabilities route. The backend reply carries its `OpVersions` (versions plus feature bits) and the materialization backends it currently exposes (each a stable `id`, an opaque engine `kind`, and its opaque `capabilities` tags). The streaming server remembers the last answered metadata only so a failed later probe can relay it demoted to not ready. This keeps both client carriages honest without hardcoded backend feature bits, and a backend that gains a feature lights it up everywhere through one reply.
+- When the streaming server and the managed backend are separate processes, the backend is the source of its own capability and readiness truth. The streaming server requests a live `BackendAnnounce` over their private socket whenever it answers a client hello or the HTTP capabilities route. It may retain the last descriptor only to relay it demoted to unavailable when a later probe fails.
 - The announce carries a `ready` flag (skipped on the wire when true, so a ready announce stays byte-identical with the pre-readiness form). Readiness is distinct from configuration: a backend that is configured but has never answered announces the pinned op versions with `ready` false, and a cached announce whose backend has stopped answering is relayed **demoted to not ready** rather than verbatim, keeping its known feature bits and topology as information while withdrawing the claim that they are served right now. A client MUST NOT treat a not-ready announce as available managed surfaces, and MUST be able to re-probe (a capability refresh) so a startup race or a backend restart resolves without reconnecting.
 - The announce optionally carries the deployment's `WireTopology`: the ops stream plus the control, dead-letter, change-feed, and the four managed mutation topic names (`kv`, `fork`, `run`, `graph`), so a client adopts the deployment's resolved names instead of hardcoding the defaults. Explicit client configuration always wins over an announced name. The field is skipped when absent, so a pre-topology announce stays byte-identical and an older reader falls back to the pinned default names. Every topology field has its own default, so a partial announce from an older peer still decodes to real names, never empty strings.
 - **Managed mutation identity.** Every managed mutation carries one stable operation identity minted once at the logical SDK operation boundary, outside every transport retry loop. The client wraps the mutation request in a `ManagedRequestEnvelope { v, operation_id, payload }` where `operation_id` is a mandatory nonzero u128 (ULID-valued). The streaming server unwraps it, refuses a bare or zero-identity mutation as invalid, and carries the identity on the forwarded frame, and the deployment appends the mutation to its topic as a `MutationCommandEnvelope { v, operation_id, timestamp_micros, command_code, payload }` record. The log is the sole ordering authority (log-first), each mutation topic is single-partition until the protocol defines cross-partition transactions, and only the deployment's own plane may publish to them. The deployment persists each completed mutation outcome atomically with its effect, keyed by the identity, and answers a duplicate identity with the persisted outcome instead of applying again. Retry safety follows from the identity: a read may reconnect and retry freely, a mutation may retry only under its original identity, a deterministic rejection (an over-cap reply, a validation failure) is never retried, and a peer that cannot carry the identity is refused rather than silently retried into an ambiguous outcome.
@@ -718,13 +763,13 @@ A binding owns exactly the substrate-specific concerns: the mapping from logical
 | managed ops | a reserved command range against the connection (B1.4), not a topic |
 | `cause_at` locator packing | the four-level (stream, topic, partition, offset) address as 20 big-endian bytes in the opaque locator slot |
 
-The Iggy binding uses the `_agdx` ops stream with `control.commands`, `dlq`, and `changes` topics for projection control, dead-letter capsules, and the change feed (A11.5). These four names are wire constants a consumer uses from the shared dictionary rather than redeclaring literals. The reference SDK's `Laser` exposes a builder override for each (`ops_stream`, `control_topic`, `dlq_topic`, `changes_topic`). Managed deployments use the shared constants, while the overrides provide per-test isolation against Apache Iggy without a managed backend. Query and the other managed operations are not topics: they ride the reserved command range (B1.4), off the log.
+The Iggy binding uses the `_agdx` ops stream with `control.commands`, `dlq`, and `changes` topics for projection control, dead-letter capsules, and the change feed (A11.8). These four names are wire constants a consumer uses from the shared dictionary rather than redeclaring literals. The reference SDK's `Laser` exposes a builder override for each (`ops_stream`, `control_topic`, `dlq_topic`, `changes_topic`). Managed deployments use the shared constants, while the overrides provide per-test isolation against Apache Iggy without a managed backend. Query and the other managed operations are not topics: they ride the reserved command range (B1.4), off the log.
 
 Connection bootstrap and environment variables are SDK concerns documented in the tutorial, not part of this binding.
 
 The reference SDK always uses Apache Iggy's VSR client framing without changing any AGDX envelope or header bytes. Standard append, poll, consumer-group, and offset commands share the connection with unknown non-replicated managed codes. The fork promotes the dedicated role-definition, role-deletion, and role-binding codes to replicated operations server-side, so the client does not carry a second capability registry.
 
-The deployed LaserData Apache Iggy fork uses `server-ng` as its server process. It terminates the VSR connection, authenticates the caller, stamps the trusted user and client identity, classifies authorization at the command edge, and either handles a fork-native command or forwards it to `laser-plane`. The capability probe reports only the surfaces announced by the connected plane. Laser Stack packages this fork and `laser-plane` for local development and deployment. LaserData Cloud uses the same data path and adds Warden, deployment services, and proprietary interfaces around it.
+The deployed LaserData Apache Iggy fork uses `iggy-server` as its server process. It terminates the VSR connection, authenticates the caller, stamps the trusted user and client identity, classifies authorization at the command edge, and either handles a fork-native command or forwards it to `laser-plane`. The capability probe reports only the surfaces announced by the connected plane. Laser Stack packages this fork and `laser-plane` for local development and deployment. LaserData Cloud uses the same data path and adds Warden, deployment services, and proprietary interfaces around it.
 
 Partitioning and isolation are separate concerns on Iggy. Agent provenance uses the conversation id as the partition key, which buys total order within a conversation and lets independent conversations run in parallel across a topic's partitions. A single very high-throughput conversation is therefore bounded by one partition and, on a shard-per-core server, one core. Generic streaming does not acquire this rule: it uses balanced, explicit, or caller-keyed partitioning and preserves order within the selected partition. Partitions are a throughput-and-ordering tool, never an access boundary. Iggy RBAC is enforced at the stream and topic level, not the partition level.
 
@@ -772,11 +817,11 @@ There is no duplication between these headers and the typed envelope when an age
 
 The durable agentic record carries its wire version as the `agdx.av` header, never a body field. The managed request envelopes carry a `v` first field, but the binding also negotiates version at connect through the `hello` reply (A12), which fails fast before a round trip. The in-band `v` is therefore redundant defense, not the primary mechanism.
 
-Each surface is versioned by exactly one mechanism, named here so an implementer knows where to look. Every op version is `1` in this era (the RC policy breaks shapes in place rather than bumping), so the `hello`-negotiated slots advertise a single accepted version today. When simultaneous versions are ever needed they become a min/max range on the same slot rather than a flag day.
+Each surface is versioned by exactly one mechanism, named here so an implementer knows where to look. Every shipped operation surface uses version 1. When simultaneous versions are needed they become a min and max range on the same slot rather than a flag day.
 
 | Surface | Mechanism | Carrier |
 | --- | --- | --- |
-| `query`, `control`, `kv`, `fork`, `agent`, `graph` | hello-negotiated | the `OpVersions` slot in the `hello` reply (A12), `0`/absent means not advertised |
+| `query`, `control`, `checkpoint`, `kv`, `fork`, `agent`, `graph` | hello-negotiated | the `OpVersions` slot in the `hello` reply (A12), `0` or absent means not advertised |
 | compare-and-swap, read-your-writes, strong consistency, fenced CAS, agent-workflow, keyword search, watch, authz | feature-gated | a bit in the `hello` `features` bitset (A12), not a version |
 | `batch`, `authz`, `client-metadata`, `presence`, `change` | body-versioned | the request/reply's own `v` first field, checked on decode (no hello slot) |
 | the agent envelope | header-versioned | the `agdx.av` header, read before decode to select the decoder |
@@ -792,10 +837,12 @@ The operation registry (A5) is realized as a `u32` command code. Raw Apache Iggy
 | `backend_hello` (internal: the managed backend announces its `OpVersions` to the streaming server, not client-facing) | 1_000_001 |
 | `set_client_metadata` / `get_clients_metadata` (the connection-scoped discovery channel: a connection advertises an opaque metadata blob, an `AgentPresence` for an agent, and a filtered, paginated read lists live connections with their metadata) | 1_000_002 / 1_000_003 |
 | `batch` (mixed-operation, A5) | 1_000_020 |
+| checkpoint mutation / destination get / destination list / query-route list | 1_000_021 .. 1_000_024 |
 | `authz.whoami` / `list_roles` / `get_role` / `get_bindings` | 1_000_100 .. 1_000_103 |
 | `authz.define_role` / `delete_role` / `bind_roles` | 1_000_104 .. 1_000_106 |
 | `authz.history` | 1_000_107 |
 | `query` | 1_000_200 |
+| query page / cancel / status | 1_000_201 / 1_000_202 / 1_000_203 |
 | `registry.get_projection` / `list_projections` | 1_000_210 / 1_000_211 |
 | `registry.get_schema` / `list_schemas` | 1_000_220 / 1_000_221 |
 | `registry.register_schema` / `decode_record` | 1_000_222 / 1_000_223 |
@@ -845,12 +892,21 @@ The payload, the envelope, the dictionaries, the validity matrix, and the result
 
 ## B4. The HTTP binding (management and UI)
 
-A management and UI surface that maps the same operation registry (A5) onto REST routes, for a browser or wasm client that has no binary substrate connection. It is a thin translation, not a second source of truth: a read forwards over the managed channel, a write publishes to the control topic, exactly as the binary binding does, so the two never diverge. There is no binary-SDK HTTP client.
+A management and UI surface maps the same operation registry onto REST routes for a browser or wasm client. It is a thin translation, not a second source of truth. `laser-wire` provides a runtime-agnostic typed HTTP client over a caller-supplied transport.
 
 | Operation | Route |
 | --- | --- |
 | capabilities probe (`hello`) | `GET /capabilities`, never gated, answers the managed flags and per-surface versions for UI feature-detection |
 | `query` | `POST /query` (a `Query` JSON body) |
+| query execution status, page, cancel | `GET /query/{execution_id}` / `POST /query/{execution_id}/pages` / `POST /query/{execution_id}/cancel` |
+| destination list, detail, create | `GET /destinations` / `GET /destinations/{id}` / `POST /destinations` |
+| destination enable and disable | `POST /destinations/{id}/enable` / `POST /destinations/{id}/disable` |
+| accepted destination operation | `GET /destinations/operations/{operation_id}` |
+| destination checkpoint and issues | `GET /destinations/{id}/status` / `GET /destinations/{id}/checkpoint` / `GET /destinations/{id}/retention-gap` / `GET /destinations/{id}/prepared-attempt` |
+| query routes | `GET /query-routes` |
+| physical table and schema | `GET /destinations/{id}/table` / `GET /destinations/{id}/table/schema` |
+| snapshots | `GET /destinations/{id}/table/current-snapshot` / `GET /destinations/{id}/table/snapshots` / `GET /destinations/{id}/table/snapshots/{snapshot_id}` |
+| files and metrics | `GET /destinations/{id}/table/files` / `GET /destinations/{id}/table/metrics` |
 | `registry.list_projections` / `get_projection` | `GET /projections?topic=&name_contains=&id_prefix=&search=` / `GET /projections/{id}` (the projection listing narrowed to row-kind, non-graph projections, the mirror of `/graphs`) |
 | register / drop projection | `POST /projections` / `DELETE /projections/{id}` (control envelope) |
 | `registry.list_schemas` / `get_schema` / `register_schema` / `decode_record` | `GET /schemas?name_contains=` / `GET /schemas/{id}` / `POST /schemas` / `POST /schemas/{id}/decode` |
@@ -884,7 +940,9 @@ Each wire error maps to a precise status, the same mapping on every surface, so 
 
 The reply contract is uniform: a `2xx` carries the bare `Ok` payload, and every non-`2xx` carries a canonical **error body** `{ code, message, detail? }`. Bare means the inner value, never the binary band's reply wrapper. The browse routes serve a JSON array (`GET /projections`, `GET /schemas`) or a single object (`GET /projections/{id}`, `GET /schemas/{id}`, with `404` for absent), not the `BrowseReply`/`BrowseOutcome` envelope the CBOR socket multiplexes its ops through. A registration replies the bare allocated id. `code` is the unified `ResultCode` (A7) so a client dispatches on the classification rather than parsing the message text. `message` is human-facing, and `detail` is optional structured context (e.g. the conflicting version on a compare-and-swap miss). The status line is derived from `code` via the table above, so the two never disagree. The route constants, the path builders, the typed query-parameter structs (one field per parameter name above), this error body, and a typed client over a caller-injected transport (`gloo-net` on wasm, `reqwest` natively) are all owned in the wire crate's `http` / `http_client` modules, so a browser or native client carries no hand-rolled route, base64url, or query-string glue, and any drift is a compile or doc-test failure rather than a production `404`.
 
-The capabilities reply carries the grouped shape (A12): `managed`, a `query` object (`available`, `projections`, `schemas`, the served `consistency` level, and `keyword` for lexical search), a `kv` object (`available`, `cas`, `cas_fenced`), `graph`, `fork`, `agent_workflow`, `watch`, `authz`, the op `versions`, and the materialization `backends`. The sub-features default off (`kv.cas` and `kv.cas_fenced` off, `query.consistency` at `eventual`, `query.keyword` off, `graph`/`agent_workflow`/`watch`/`authz` off), and a server advertises one only when it genuinely serves it: over-advertising would turn a clean unsupported error into a silent wrong answer. Graph nodes and edges ride the JSON views (`GraphNodeView` / `GraphEdgeView` / `GraphResultView`) with ids as strings, since the CBOR id is bytes a JSON string cannot carry raw.
+The capabilities reply carries the grouped shape from A12. Query additionally advertises cursor paging, cancellation, and execution status. Destinations advertise lifecycle, checkpoint status, query routes, table schema, snapshots, files, metrics, and strongest checkpoint-read consistency. The sub-features default off and a server advertises one only when it genuinely serves it.
+
+Mutation bodies carry a bounded public checkpoint request with a request ID and expected revisions. Asynchronous work returns `AcceptedOperationView` with an operation ID, request ID, state, timestamps, and optional typed error. A `2xx` response never implies that asynchronous work completed unless its state says `succeeded`.
 
 ---
 
@@ -995,7 +1053,7 @@ Governance validation is split by ownership. `laser-wire` pins the authz bytes a
 
 **Status-code map.** The draft's statuses project onto the unified result-code space (A7): `CREATED`/`OK`/`NO_CONTENT` to `ok`, `VERSION_CONFLICT`/`ALREADY_EXISTS`/`LEASE_LOST`/`TXN_CONFLICT` to `conflict`, `NOT_FOUND` to `not-found`, `NOT_IMPLEMENTED` to `unsupported`, `RESOURCE_EXHAUSTED`/backend faults to `backend`, `INVALID_ARGUMENT` to `invalid-argument`, `PARTIAL` to the paging cursor rather than a status.
 
-**Deliberately not adopted (broker semantics the log does not have).** The draft's push messaging (`SUBSCRIBE` / `DELIVER` / `ACK` / `NACK` / per-subscription `ACK_MODE`) is **not** implemented: Apache Iggy is an offset log, not a queue, so delivery guarantees (at-least-once, redelivery, dead-lettering, delivery-count) come from log replay plus idempotent dedup (A1.5, the reliable consumer and the dead-letter capsule A9.5), not from broker settlement ops. `WATCH` / `NOTIFY` change-capture ships as the log-native change feed (A11.5): records on a change topic consumed by offset, not a broker watch.
+**Deliberately not adopted (broker semantics the log does not have).** The draft's push messaging (`SUBSCRIBE` / `DELIVER` / `ACK` / `NACK` / per-subscription `ACK_MODE`) is **not** implemented: Apache Iggy is an offset log, not a queue, so delivery guarantees (at-least-once, redelivery, dead-lettering, delivery-count) come from log replay plus idempotent dedup (A1.5, the reliable consumer and the dead-letter capsule A9.5), not from broker settlement ops. `WATCH` / `NOTIFY` change-capture ships as the log-native change feed (A11.8): records on a change topic consumed by offset, not a broker watch.
 
 ---
 

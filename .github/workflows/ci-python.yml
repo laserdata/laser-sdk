@@ -135,7 +135,7 @@ jobs:
         # the whole stub unparseable, so every user silently loses typing. Parse
         # it here so that regression fails the build, not the user's editor.
         run: uv run python -c "import ast; ast.parse(open('laser_sdk.pyi').read()); print('laser_sdk.pyi parses')"
-      - name: Verify the VSR-only extension
+      - name: Verify the extension
         run: uv run cargo check --locked
       - name: Lint (ruff)
         run: |

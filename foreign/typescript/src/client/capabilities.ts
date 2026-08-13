@@ -8,6 +8,14 @@ export interface QueryCapabilities {
   readonly available: boolean
   readonly consistency: Consistency
   readonly keyword: boolean
+  readonly cursorPaging: boolean
+  readonly cancellation: boolean
+  readonly executionStatus: boolean
+}
+
+export interface DestinationCapabilities {
+  readonly available: boolean
+  readonly checkpointVersion: number
 }
 
 export interface KvCapabilities {
@@ -19,6 +27,7 @@ export interface KvCapabilities {
 export interface Capabilities {
   readonly managed: boolean
   readonly query: QueryCapabilities
+  readonly destinations: DestinationCapabilities
   readonly kv: KvCapabilities
   readonly graph: boolean
   readonly forks: boolean
@@ -36,6 +45,7 @@ export interface Capabilities {
 export type CapabilitySurface =
   | "managed"
   | "query"
+  | "destinations"
   | "kv"
   | "kvCas"
   | "kvCasFenced"
@@ -47,7 +57,15 @@ export type CapabilitySurface =
 
 export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   managed: false,
-  query: Object.freeze({ available: false, consistency: "eventual", keyword: false }),
+  query: Object.freeze({
+    available: false,
+    consistency: "eventual",
+    keyword: false,
+    cursorPaging: false,
+    cancellation: false,
+    executionStatus: false
+  }),
+  destinations: Object.freeze({ available: false, checkpointVersion: 0 }),
   kv: Object.freeze({ available: false, cas: false, casFenced: false }),
   graph: false,
   forks: false,
@@ -80,14 +98,26 @@ export function managedCapabilitiesFrom(announce: BackendAnnounce): Capabilities
   const consistency: Consistency = opVersionsHasFeature(versions, Feature.STRONG_CONSISTENCY)
     ? "strong"
     : opVersionsHasFeature(versions, Feature.READ_YOUR_WRITES)
-      ? "readYourWrites"
+      ? "read_your_writes"
       : "eventual"
+  const readyBackends = ready ? announce.backends.filter((backend) => backend.readiness.ready) : []
+  const queryCapabilities = readyBackends.flatMap((backend) => backend.query ?? [])
   return {
     ...(ready ? managedBase() : OPEN_CAPABILITIES),
     query: {
       available: ready && versions.query > 0,
       consistency: ready ? consistency : "eventual",
-      keyword: ready && opVersionsHasFeature(versions, Feature.KEYWORD_SEARCH)
+      keyword: ready && opVersionsHasFeature(versions, Feature.KEYWORD_SEARCH),
+      cursorPaging: queryCapabilities.some((query) => query.paging.includes("cursor")),
+      cancellation: queryCapabilities.some((query) => query.cancellation),
+      executionStatus: queryCapabilities.some((query) => query.executionStatus)
+    },
+    destinations: {
+      available:
+        ready &&
+        (versions.checkpoint ?? 0) > 0 &&
+        opVersionsHasFeature(versions, Feature.DESTINATIONS),
+      checkpointVersion: versions.checkpoint ?? 0
     },
     kv: {
       available: ready && versions.kv > 0,
@@ -107,7 +137,7 @@ export function managedCapabilitiesFrom(announce: BackendAnnounce): Capabilities
 
 const CONSISTENCY_RANK: Readonly<Record<Consistency, number>> = {
   eventual: 0,
-  readYourWrites: 1,
+  read_your_writes: 1,
   strong: 2
 }
 
@@ -121,7 +151,17 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
     query: {
       available: configured.query.available || announced.query.available,
       consistency,
-      keyword: configured.query.keyword || announced.query.keyword
+      keyword: configured.query.keyword || announced.query.keyword,
+      cursorPaging: configured.query.cursorPaging || announced.query.cursorPaging,
+      cancellation: configured.query.cancellation || announced.query.cancellation,
+      executionStatus: configured.query.executionStatus || announced.query.executionStatus
+    },
+    destinations: {
+      available: configured.destinations.available || announced.destinations.available,
+      checkpointVersion: Math.max(
+        configured.destinations.checkpointVersion,
+        announced.destinations.checkpointVersion
+      )
     },
     kv: {
       available: configured.kv.available || announced.kv.available,
@@ -160,21 +200,23 @@ export function requireCapability(capabilities: Capabilities, surface: Capabilit
       ? capabilities.managed
       : surface === "query"
         ? capabilities.query.available
-        : surface === "kv"
-          ? capabilities.kv.available
-          : surface === "kvCas"
-            ? capabilities.kv.available && capabilities.kv.cas
-            : surface === "kvCasFenced"
-              ? capabilities.kv.available && capabilities.kv.casFenced
-              : surface === "graph"
-                ? capabilities.graph
-                : surface === "forks"
-                  ? capabilities.forks
-                  : surface === "agentWorkflow"
-                    ? capabilities.agentWorkflow
-                    : surface === "watch"
-                      ? capabilities.watch
-                      : capabilities.authz
+        : surface === "destinations"
+          ? capabilities.destinations.available
+          : surface === "kv"
+            ? capabilities.kv.available
+            : surface === "kvCas"
+              ? capabilities.kv.available && capabilities.kv.cas
+              : surface === "kvCasFenced"
+                ? capabilities.kv.available && capabilities.kv.casFenced
+                : surface === "graph"
+                  ? capabilities.graph
+                  : surface === "forks"
+                    ? capabilities.forks
+                    : surface === "agentWorkflow"
+                      ? capabilities.agentWorkflow
+                      : surface === "watch"
+                        ? capabilities.watch
+                        : capabilities.authz
   if (!available) {
     throw new UnsupportedError(`${surface} is not served by this deployment`, {
       cause: { surface }

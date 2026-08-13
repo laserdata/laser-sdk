@@ -30,7 +30,7 @@ impl ArtifactKind {
 
     fn manifest_name(self) -> &'static str {
         match self {
-            Self::IggyServer => "iggy-server-ng",
+            Self::IggyServer => "iggy-server",
             Self::IggyBench => "iggy-bench",
             Self::Plane => "plane",
         }

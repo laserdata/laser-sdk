@@ -175,7 +175,7 @@ def default_llm():
 
 def _scalar(result) -> str:
     # First aggregate value of a single-aggregate result, as text.
-    return result.rows[0].headers.get("count", "0") if result.rows else "0"
+    return (result.value_text(result.rows[0], "count") or "0") if result.rows else "0"
 
 
 async def _read_u64(store, key: str) -> int:
@@ -384,7 +384,9 @@ async def backlog_snapshot(laser) -> None:
         .fetch()
     )
     for row in by_severity.rows:
-        print(f"  open {row.headers.get('severity', '?')} tickets: {row.headers.get('count', '?')}")
+        severity = by_severity.value_text(row, "severity") or "?"
+        count = by_severity.value_text(row, "count") or "?"
+        print(f"  open {severity} tickets: {count}")
 
 
 async def seed_memory(semantic) -> None:
@@ -495,10 +497,12 @@ async def speculative_bulk_resolve(laser) -> None:
         pass
     await fork.create()
     for row in criticals.rows:
-        if row.partition is None or row.offset is None:
+        partition = criticals.value_text(row, "__laser_partition_id")
+        offset = criticals.value_text(row, "__laser_offset")
+        if partition is None or offset is None:
             continue
         await (
-            fork.put_row(TICKETS_TOPIC, row.partition, row.offset)
+            fork.put_row(TICKETS_TOPIC, int(partition), int(offset))
             .field("status", "resolved")
             .send()
         )

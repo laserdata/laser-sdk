@@ -527,6 +527,14 @@ impl MintUlid for laser_wire::agent::RecordId {}
 impl MintUlid for laser_wire::agent::ConversationId {}
 impl MintUlid for laser_wire::agent::CorrelationId {}
 impl MintUlid for laser_wire::agent::ChannelId {}
+impl MintUlid for laser_wire::query::QueryExecutionId {}
+impl MintUlid for laser_wire::destination::DestinationId {}
+impl MintUlid for laser_wire::destination::DestinationOperationId {}
+impl MintUlid for laser_wire::destination::BackendResourceId {}
+impl MintUlid for laser_wire::destination::QueryRouteId {}
+impl MintUlid for laser_wire::checkpoint::CheckpointOwnerId {}
+impl MintUlid for laser_wire::checkpoint::PreparedAttemptId {}
+impl MintUlid for laser_wire::checkpoint::CheckpointRequestId {}
 
 impl ConversationId {
     /// The raw 128-bit ULID value.

@@ -4,7 +4,7 @@ The native TypeScript client for [LaserData, Inc.](https://laserdata.com) SDK ov
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Current pre-1.0 release (`0.1.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.2.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 ## Install
 
@@ -35,7 +35,7 @@ Use the bare `user:password@host:port` connection string. The SDK supplies the A
 
 Owned connections retry the initial handshake and reconnect after a dropped socket, with unlimited retries at one-second intervals by default. Set `reconnection_retries` to a non-negative integer and `reconnection_interval` to `250ms`, `1s`, or `1m` in the connection string to tune the policy. An injected client remains under its caller's lifecycle and reconnect policy.
 
-The TypeScript SDK pins Apache Iggy `0.9.0-edge.1` and always constructs a VSR client. There is no protocol option in the Laser API. An injected Apache Iggy client must also use VSR and is rejected before use otherwise.
+The TypeScript SDK uses Iggy's native VSR transport for owned and injected clients.
 
 ## Streaming model
 
@@ -89,9 +89,13 @@ LaserData Cloud and Laser Stack announce their capabilities during connection se
 The root client exposes query, projections, bindings, schemas, key-value and CAS, forks, graph traversal, RBAC, runs, watch feeds, and independent managed command batches. Query uses the managed command path, not a request topic. Every command is encoded through the same Rust-owned AGDX fixtures consumed by the other SDKs.
 
 ```ts
-import { graphNodeEntity } from "@laserdata/laser-sdk"
+import { graphNodeEntity, queryResultValue, typedValueDiagnosticText } from "@laserdata/laser-sdk"
 
 const paid = await laser.query("orders_v1").whereEq("status", "paid").limit(20).fetch()
+for (const row of paid.rows) {
+  const total = queryResultValue(paid, row, "total")
+  console.log(total === undefined ? "missing" : typedValueDiagnosticText(total))
+}
 
 const key = new TextEncoder().encode("user:42")
 const session = { cart: ["sku-1"] }
@@ -101,6 +105,62 @@ const stored = await laser.kv("sessions").get(key)
 const checkout = graphNodeEntity("Service", "checkout")
 const nearby = await laser.graph("ops").neighbors(checkout.id, "out", undefined, 2)
 ```
+
+Query results are schema-first. `result.fields` defines the ordered logical fields and each `row.values` array is positionally aligned with it. Tagged values preserve integer widths, decimal precision, timestamps, UUIDs, bytes, nested values, and nullability. `queryResultValue()` performs the field-name lookup and `typedValueDiagnosticText()` provides stable display output.
+
+The initial page may use an offset. Every continuation follows the opaque `nextCursor` returned by the server. `hasMore` is true exactly when that cursor is present. `fetchAll()` follows cursors automatically, while each inline page remains capped at 1000 rows.
+
+A query has a stable execution identity and absolute deadline. `status()` and `cancel()` use dedicated managed commands and fail locally when the deployment does not advertise those capabilities:
+
+```ts
+const request = laser.query("orders_v1").filterGte("total", 100).deadlineMicros(deadlineMicros)
+const page = await request.fetch()
+const status = await request.status()
+if (status.state === "running") await request.cancel()
+```
+
+Lakehouse queries name one destination generation and may select a retained snapshot:
+
+```ts
+const historical = await laser
+  .queryLakehouse(destinationId, destinationGeneration)
+  .atSnapshot(snapshotId)
+  .filterEq("customer_id", "alice")
+  .limit(100)
+  .fetch()
+
+console.log(historical.context.resolvedTarget, historical.context.boundary)
+```
+
+The result context proves the resolved engine and target. Lakehouse pages also prove destination and backend generations, table UUID, snapshot, schema and partition-spec IDs, materialization boundary, checkpoint revision, and global-state revision.
+
+Destination declarations and explicit query routes use `laser.destinations()`. Reads choose potentially stale or linearizable checkpoint state, while writes compare the expected global and definition revisions:
+
+```ts
+const destinations = laser.destinations()
+const page = await destinations.list({}, undefined, 50, "linearizable")
+const routes = await destinations.queryRoutes("orders", undefined, 50)
+const current = await destinations.get(destinationId, "linearizable")
+```
+
+For analytical batches, publish one complete self-contained Arrow IPC stream per message. The SDK validates the metadata and exact byte length before transport I/O:
+
+```ts
+await topic
+  .publish()
+  .arrowIpc(arrowStream, {
+    contractVersion: 1,
+    schemaFingerprint,
+    encodedBytes: BigInt(arrowStream.length),
+    fieldCount: 8,
+    recordBatchCount: 1,
+    rowCount: 10_000n,
+    dictionaryCount: 0
+  })
+  .send()
+```
+
+Arrow input must use stream format, be self-contained, use microsecond timestamps, avoid dictionary replacements and deltas, keep decimals within 128 bits, and contain no unions or extension types.
 
 Accessors are cheap to construct. I/O happens at terminal verbs such as `send()`, `fetch()`, `poll()`, and `nextWithin()`.
 

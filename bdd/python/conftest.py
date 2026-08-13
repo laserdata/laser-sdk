@@ -118,6 +118,7 @@ class Bench:
         self.memory_engine = None
         self.memory_ids = {}
         self.graph_engine = None
+        self.data_stack = None
 
 
 @pytest.fixture

@@ -8,6 +8,7 @@ mod client;
 mod context;
 mod convert;
 mod crash_context;
+mod destinations;
 mod errors;
 mod fork;
 mod govern;
@@ -57,6 +58,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<query::PyQuery>()?;
     module.add_class::<query::PyRow>()?;
     module.add_class::<query::PyQueryResult>()?;
+    module.add_class::<destinations::PyDestinations>()?;
     module.add_class::<kv::PyKv>()?;
     module.add_class::<kv::PyKvEntry>()?;
     module.add_class::<kv::PyKvPage>()?;

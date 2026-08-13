@@ -42,7 +42,10 @@ void test("given_a_connected_client_when_reaching_the_managed_surfaces_then_shou
   assert.equal(laser.kv("profiles").namespace, "profiles")
   assert.equal(laser.fork("experiment-1").forkId, "experiment-1")
   assert.ok(laser.graph("kg"))
-  assert.ok(laser.query("orders_v1").intoQuery().index === "orders_v1")
+  assert.deepEqual(laser.query("orders_v1").intoQuery().target, {
+    kind: "operational",
+    index: "orders_v1"
+  })
   assert.ok(laser.projections())
   assert.ok(laser.bindings())
   assert.ok(laser.schemas())

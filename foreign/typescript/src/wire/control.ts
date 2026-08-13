@@ -1,6 +1,7 @@
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { ContentType, type ContentType as ContentTypeValue } from "./content.js"
+import { type BackendBinding, decodeBackendBinding, encodeBackendBinding } from "./destination.js"
 
 export type FieldType = "text" | "int" | "float" | "bool"
 
@@ -75,22 +76,12 @@ export interface SourceSelector {
   readonly topic: string
 }
 
-export type TargetRole = "readWrite" | "writeOnly"
-export type Delivery = "effectivelyOnce" | "atMostOnce"
-
-export interface Target {
-  readonly backend: string
-  readonly table: string
-  readonly role: TargetRole
-  readonly delivery: Delivery
-  readonly required: boolean
-}
-
 export interface ProjectionBinding {
   readonly source: SourceSelector
   readonly allowedProjections: readonly ProjectionId[]
   readonly defaultProjection?: ProjectionId
-  readonly targets: readonly Target[]
+  readonly backend?: BackendBinding
+  readonly index: string
   readonly notify: boolean
   readonly retention?: RetentionPolicy
 }
@@ -369,55 +360,14 @@ export function decodeSourceSelector(map: CborMap, context: string): SourceSelec
   }
 }
 
-function targetRoleToWord(role: TargetRole): string {
-  return role === "readWrite" ? "read_write" : "write_only"
-}
-
-function parseTargetRole(word: string, context: string): TargetRole {
-  if (word === "read_write") return "readWrite"
-  if (word === "write_only") return "writeOnly"
-  throw new CodecError(`\`${word}\` is not a recognized target role`, context, "role")
-}
-
-function deliveryToWord(delivery: Delivery): string {
-  return delivery === "effectivelyOnce" ? "effectively_once" : "at_most_once"
-}
-
-function parseDelivery(word: string, context: string): Delivery {
-  if (word === "effectively_once") return "effectivelyOnce"
-  if (word === "at_most_once") return "atMostOnce"
-  throw new CodecError(`\`${word}\` is not a recognized delivery mode`, context, "delivery")
-}
-
-export function encodeTarget(target: Target): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["backend", target.backend],
-    ["table", target.table],
-    ["role", targetRoleToWord(target.role)],
-    ["delivery", deliveryToWord(target.delivery)],
-    ["required", target.required]
-  ])
-}
-
-export function decodeTarget(map: CborMap, context: string): Target {
-  const role = field.optionalString(map, "role", context)
-  const delivery = field.optionalString(map, "delivery", context)
-  return {
-    backend: field.requiredString(map, "backend", context),
-    table: field.requiredString(map, "table", context),
-    role: role !== undefined ? parseTargetRole(role, context) : "readWrite",
-    delivery: delivery !== undefined ? parseDelivery(delivery, context) : "effectivelyOnce",
-    required: field.optionalBoolean(map, "required", context) ?? false
-  }
-}
-
 export function encodeProjectionBinding(binding: ProjectionBinding): Map<string, unknown> {
   const map = new Map<string, unknown>([
     ["source", encodeSourceSelector(binding.source)],
     ["allowed_projections", [...binding.allowedProjections]],
-    ["default_projection", binding.defaultProjection ?? null],
-    ["targets", binding.targets.map((target) => encodeTarget(target))]
+    ["default_projection", binding.defaultProjection ?? null]
   ])
+  if (binding.backend !== undefined) map.set("backend", encodeBackendBinding(binding.backend))
+  map.set("index", binding.index)
   if (binding.notify) map.set("notify", true)
   if (binding.retention !== undefined)
     map.set("retention", encodeRetentionPolicy(binding.retention))
@@ -426,6 +376,7 @@ export function encodeProjectionBinding(binding: ProjectionBinding): Map<string,
 
 export function decodeProjectionBinding(map: CborMap, context: string): ProjectionBinding {
   const defaultProjection = decodeOptionalNullableString(map, "default_projection", context)
+  const backend = field.optionalMap(map, "backend", context)
   const retention = field.optionalMap(map, "retention", context)
   return {
     source: decodeSourceSelector(field.requiredMap(map, "source", context), `${context}.source`),
@@ -435,12 +386,10 @@ export function decodeProjectionBinding(map: CborMap, context: string): Projecti
     ...(defaultProjection !== undefined
       ? { defaultProjection: projectionIdFromWire(defaultProjection) }
       : {}),
-    targets: field.requiredArray(map, "targets", context, (item, index) =>
-      decodeTarget(
-        expectMap(item, `${context}.targets[${String(index)}]`),
-        `${context}.targets[${String(index)}]`
-      )
-    ),
+    ...(backend !== undefined
+      ? { backend: decodeBackendBinding(backend, `${context}.backend`) }
+      : {}),
+    index: field.requiredString(map, "index", context),
     notify: field.optionalBoolean(map, "notify", context) ?? false,
     ...(retention !== undefined
       ? { retention: decodeRetentionPolicy(retention, `${context}.retention`) }

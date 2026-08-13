@@ -52,6 +52,7 @@ import { Fork } from "../managed/forks.js"
 import { Kv } from "../managed/kv.js"
 import { Bindings, Projections, Schemas } from "../managed/projections.js"
 import { QueryRequest } from "../managed/query.js"
+import { Destinations } from "../managed/destinations.js"
 import {
   authzHistory,
   bindRoles,
@@ -70,14 +71,16 @@ import type { BatchItem } from "../wire/batch.js"
 import {
   AGDX_HELLO_CODE,
   AGDX_SET_CLIENT_METADATA_CODE,
-  CONTROL_OP_VERSION
+  CONTROL_OP_VERSION,
+  QUERY_OP_VERSION
 } from "../wire/codes.js"
-import { QueryCommand } from "../wire/commands.js"
+import { QueryCancelCommand, QueryCommand, QueryStatusCommand } from "../wire/commands.js"
 import { encodeControlEnvelope, type ControlCommand } from "../wire/control.js"
 import type { ForkInfo } from "../wire/fork.js"
 import { decodeBackendAnnounce } from "../wire/hello.js"
 import type { KvNamespaceInfo } from "../wire/kv.js"
-import type { Query, QueryResult } from "../wire/query.js"
+import type { Query, QueryExecutionStatus, QueryResult, QueryTarget } from "../wire/query.js"
+import type { DestinationId, QueryExecutionId } from "../wire/ids.js"
 import { AgentId, ConversationId } from "../types/ids.js"
 import { ownedBytes, type BytesLike } from "./bytes.js"
 import {
@@ -112,7 +115,6 @@ import {
   ConfigError,
   NoStreamError,
   PresenceConflictError,
-  ProtocolError,
   QueryExecutionError,
   InvalidError,
   UnsupportedError
@@ -1226,7 +1228,24 @@ export class Laser implements AsyncDisposable {
   }
 
   query(index: string): QueryRequest {
-    return new QueryRequest(index, (query) => this.executeQuery(query))
+    return this.queryTarget({ kind: "operational", index })
+  }
+
+  queryTarget(target: QueryTarget): QueryRequest {
+    return new QueryRequest(
+      target,
+      (query) => this.executeQuery(query),
+      (executionId) => this.queryStatus(executionId),
+      (executionId) => this.cancelQuery(executionId)
+    )
+  }
+
+  queryLakehouse(destinationId: DestinationId, destinationGeneration: bigint): QueryRequest {
+    return this.queryTarget({ kind: "lakehouse", destinationId, destinationGeneration })
+  }
+
+  destinations(): Destinations {
+    return new Destinations(this.managedTransport(), () => this.capabilities())
   }
 
   kv(namespace: string): Kv {
@@ -1367,18 +1386,40 @@ export class Laser implements AsyncDisposable {
       )
     }
     const reply = await executeManaged(this.managedTransport(), capabilities, QueryCommand, {
+      v: QUERY_OP_VERSION,
       query
     })
     if (reply.kind === "ok") return reply.result
-    if (reply.kind === "unrecognized") {
-      throw new ProtocolError(`query returned unknown reply variant \`${reply.tag}\``, {
-        commandCode: QueryCommand.code
-      })
-    }
     if (reply.error.kind === "unsupported") {
       throw new UnsupportedError(reply.error.message)
     }
     throw new QueryExecutionError(`query failed: ${reply.error.kind}`, reply.error)
+  }
+
+  private async queryStatus(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
+    const capabilities = await this.capabilities()
+    if (!capabilities.query.executionStatus) {
+      throw new UnsupportedError("query execution status is not served by this deployment")
+    }
+    const reply = await executeManaged(this.managedTransport(), capabilities, QueryStatusCommand, {
+      v: QUERY_OP_VERSION,
+      executionId
+    })
+    if (reply.kind === "ok") return reply.status
+    throw new QueryExecutionError(`query status failed: ${reply.error.kind}`, reply.error)
+  }
+
+  private async cancelQuery(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
+    const capabilities = await this.capabilities()
+    if (!capabilities.query.cancellation) {
+      throw new UnsupportedError("query cancellation is not served by this deployment")
+    }
+    const reply = await executeManaged(this.managedTransport(), capabilities, QueryCancelCommand, {
+      v: QUERY_OP_VERSION,
+      executionId
+    })
+    if (reply.kind === "ok") return reply.status
+    throw new QueryExecutionError(`query cancellation failed: ${reply.error.kind}`, reply.error)
   }
 
   /** Closes owned transport resources. Safe to call more than once. */

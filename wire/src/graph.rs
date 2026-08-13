@@ -1,11 +1,7 @@
-use crate::agent::{IdParseError, crockford_decode, crockford_encode};
 use crate::error::InvalidError;
 use crate::limits::MAX_GRAPH_NAME_BYTES;
 use crate::query::{Consistency, Filter, Value};
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
-use std::str::FromStr;
+use serde::{Deserialize, Serialize};
 
 crate::agent::wire_id!(
     /// A graph node's identity. Content-addressed (the hash of the node's label

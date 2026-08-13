@@ -14,6 +14,8 @@ pub const CONTENT_TYPE: &str = "agdx.ct";
 /// its schema registry to decode the body. A bridge that lives in LaserData Cloud
 /// until Iggy gains native schema dispatch.
 pub const SCHEMA_ID: &str = "agdx.sid";
+/// Header key carrying the 32-byte logical schema fingerprint for an Arrow IPC stream.
+pub const LOGICAL_SCHEMA_FINGERPRINT: &str = "agdx.sfp";
 /// Prefix marking an indexed-field header (`agdx.idx.<name>`).
 pub const IDX_PREFIX: &str = "agdx.idx.";
 /// Header key: per-record inline-payload override (`bool` typed value).

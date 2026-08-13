@@ -18,7 +18,7 @@ pub enum LocalBinary {
 impl LocalBinary {
     fn package(self) -> &'static str {
         match self {
-            Self::IggyServer => "server-ng",
+            Self::IggyServer => "server",
             Self::IggyBench => "iggy-bench",
             Self::Plane => "plane",
         }
@@ -26,7 +26,7 @@ impl LocalBinary {
 
     fn binary(self) -> &'static str {
         match self {
-            Self::IggyServer => "iggy-server-ng",
+            Self::IggyServer => "iggy-server",
             Self::IggyBench => "iggy-bench",
             Self::Plane => "plane",
         }
@@ -34,7 +34,7 @@ impl LocalBinary {
 
     fn cargo_manifest(self) -> &'static str {
         match self {
-            Self::IggyServer => "core/server-ng/Cargo.toml",
+            Self::IggyServer => "core/server/Cargo.toml",
             Self::IggyBench => "core/bench/Cargo.toml",
             Self::Plane => "plane/Cargo.toml",
         }
@@ -316,7 +316,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_native_iggy_build_when_planned_then_should_be_locked_release_server_ng() {
+    fn given_native_iggy_build_when_planned_then_should_be_locked_release_server() {
         let build = LocalBuild {
             source_root: PathBuf::from("/path/to/iggy-source"),
             target_root: PathBuf::from("/path/to/iggy-source/target"),
@@ -325,24 +325,24 @@ mod tests {
         let command = build
             .command(LocalBinary::IggyServer)
             .expect("build command should be valid");
-        assert!(command.windows(2).any(|pair| pair == ["-p", "server-ng"]));
+        assert!(command.windows(2).any(|pair| pair == ["-p", "server"]));
         assert!(
             command
                 .windows(2)
-                .any(|pair| pair == ["--bin", "iggy-server-ng"])
+                .any(|pair| pair == ["--bin", "iggy-server"])
         );
         assert!(command.contains(&"--locked".to_owned()));
         assert!(command.contains(&"--release".to_owned()));
     }
 
     #[test]
-    fn given_classic_server_name_when_selecting_local_binary_then_should_have_no_variant() {
+    fn given_removed_server_name_when_selecting_local_binary_then_should_have_no_variant() {
         let supported = [
             LocalBinary::IggyServer.binary(),
             LocalBinary::IggyBench.binary(),
             LocalBinary::Plane.binary(),
         ];
-        assert!(!supported.contains(&"iggy-server"));
+        assert!(!supported.contains(&"iggy-server-ng"));
     }
 
     #[cfg(unix)]
@@ -353,7 +353,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary build directory should exist");
         let release = directory.path().join("release");
         fs::create_dir(&release).expect("release directory should exist");
-        let binary_path = release.join("iggy-server-ng");
+        let binary_path = release.join("iggy-server");
         fs::write(&binary_path, b"original").expect("fixture binary should write");
         fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o755))
             .expect("fixture binary should be executable");
@@ -372,7 +372,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let manifest = BinaryManifest::inspect(
-            "iggy-server-ng",
+            "iggy-server",
             &binary_path,
             "source",
             "fixture",

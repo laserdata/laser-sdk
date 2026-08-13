@@ -2,6 +2,7 @@ use crate::capabilities::Capabilities;
 use crate::error::LaserError;
 #[cfg(any(
     feature = "fork",
+    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",
@@ -15,6 +16,7 @@ use dashmap::DashMap;
 use iggy::prelude::*;
 #[cfg(any(
     feature = "fork",
+    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",
@@ -23,6 +25,17 @@ use iggy::prelude::*;
     feature = "runs"
 ))]
 use laser_wire::framing::decode_named;
+#[cfg(any(
+    feature = "fork",
+    feature = "destinations",
+    feature = "graph",
+    feature = "kv",
+    feature = "projections",
+    feature = "query",
+    feature = "rbac",
+    feature = "runs"
+))]
+use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -1199,6 +1212,7 @@ impl LaserBuilder {
 // checks.
 #[cfg(any(
     feature = "fork",
+    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",
@@ -1212,7 +1226,9 @@ async fn probe_managed_host(client: &IggyClient) -> Option<laser_wire::hello::Ba
         .await
     {
         Ok(reply) if !reply.is_empty() => {
-            decode_named::<laser_wire::hello::BackendAnnounce>(&reply).ok()
+            decode_named::<laser_wire::hello::BackendAnnounce>(&reply)
+                .ok()
+                .filter(|announce| announce.validate().is_ok())
         }
         Ok(_) | Err(_) => None,
     }
@@ -1220,6 +1236,7 @@ async fn probe_managed_host(client: &IggyClient) -> Option<laser_wire::hello::Ba
 
 #[cfg(any(
     feature = "fork",
+    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",
@@ -1236,12 +1253,41 @@ fn merge_announcement(
     capabilities.authz |= versions.has_feature(laser_wire::hello::feature::AUTHZ);
     if announce.ready {
         capabilities.managed = true;
-        capabilities.query.available |= versions.query > 0;
         capabilities.kv.available |= versions.kv > 0;
         capabilities.forks |= versions.fork > 0;
         capabilities.graph |= versions.graph > 0;
+        capabilities.destinations.available |= versions.checkpoint > 0
+            && versions.has_feature(laser_wire::hello::feature::DESTINATIONS);
         capabilities.backends.clone_from(&announce.backends);
         capabilities.merge_features(&versions);
+        for backend in announce
+            .backends
+            .iter()
+            .filter(|backend| backend.readiness.ready)
+        {
+            if let Some(query) = &backend.query {
+                capabilities.query.available |= versions.query > 0;
+                capabilities.query.cursor_paging |= query
+                    .paging
+                    .contains(&laser_wire::hello::QueryPagingCapability::Cursor);
+                capabilities.query.cancellation |= query.cancellation;
+                capabilities.query.execution_status |= query.execution_status;
+                if query
+                    .consistency
+                    .contains(&laser_wire::query::Consistency::Strong)
+                {
+                    capabilities.query.consistency = laser_wire::query::Consistency::Strong;
+                } else if query
+                    .consistency
+                    .contains(&laser_wire::query::Consistency::ReadYourWrites)
+                {
+                    capabilities.query.consistency = capabilities
+                        .query
+                        .consistency
+                        .max(laser_wire::query::Consistency::ReadYourWrites);
+                }
+            }
+        }
     }
 }
 
@@ -1259,7 +1305,54 @@ fn merge_announcement(
 ))]
 mod announcement_tests {
     use super::*;
-    use laser_wire::hello::{BackendAnnounce, BackendDescriptor, OpVersions, feature};
+    use laser_wire::destination::BackendResourceId;
+    use laser_wire::hello::{
+        BackendAnnounce, BackendDescriptor, BackendDesiredState, BackendImplementation,
+        BackendMode, BackendObservedState, BackendReadiness, OpVersions, QueryCapabilities,
+        QueryPagingCapability, feature,
+    };
+
+    fn backend(id: u128, ready: bool) -> BackendDescriptor {
+        let backend = BackendDescriptor::new(
+            BackendResourceId::from_u128(id),
+            BackendMode::Operational,
+            "Embedded",
+            BackendImplementation {
+                kind: "embedded".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            1,
+            1,
+        );
+        if !ready {
+            return backend;
+        }
+        backend
+            .with_state(
+                BackendDesiredState::Enabled,
+                BackendObservedState::Ready,
+                BackendReadiness::ready(1),
+            )
+            .with_query(QueryCapabilities {
+                dialects: vec![laser_wire::query::SqlDialect::Sqlite],
+                time_travel: Vec::new(),
+                consistency: vec![laser_wire::query::Consistency::Eventual],
+                logical_types: vec![laser_wire::schema::LogicalTypeKind::String],
+                paging: vec![QueryPagingCapability::Cursor],
+                cancellation: true,
+                execution_status: true,
+                raw_sql: true,
+            })
+            .with_limits(laser_wire::hello::BackendLimits {
+                max_query_rows: 1_000,
+                max_query_bytes: 1_000_000,
+                max_scan_bytes: 10_000_000,
+                max_query_micros: 30_000_000,
+                max_concurrent_queries: 8,
+                max_schema_fields: 0,
+                max_materialization_file_bytes: 0,
+            })
+    }
 
     #[test]
     fn given_an_unavailable_backend_when_merged_then_should_not_enable_plane_surfaces() {
@@ -1277,7 +1370,7 @@ mod announcement_tests {
                         | feature::AUTHZ,
                 ),
         )
-        .with_backends(vec![BackendDescriptor::new("stale", "embedded")])
+        .with_backends(vec![backend(1, false)])
         .unavailable();
         let mut capabilities = Capabilities::OPEN;
 
@@ -1317,7 +1410,7 @@ mod announcement_tests {
                 .with_graph(1)
                 .with_features(feature::KV_CAS | feature::AGENT_WORKFLOW),
         )
-        .with_backends(vec![BackendDescriptor::new("embedded", "embedded")]);
+        .with_backends(vec![backend(1, true)]);
         let mut capabilities = Capabilities::OPEN;
 
         merge_announcement(&mut capabilities, &announce);

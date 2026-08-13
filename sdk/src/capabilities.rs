@@ -1,6 +1,12 @@
+use laser_wire::checkpoint::CheckpointReadConsistency;
 use laser_wire::query::Consistency;
 
-pub use laser_wire::hello::{BackendDescriptor, OpVersions};
+pub use laser_wire::hello::{
+    BackendDescriptor, BackendDesiredState, BackendImplementation, BackendLimits, BackendMode,
+    BackendObservedState, BackendReadiness, BackendReadinessCode, BackendReadinessReason,
+    MaintenanceCapabilities, MaterializationCapability, OpVersions, QueryCapabilities,
+    QueryPagingCapability, SchemaCapabilities, TimeTravelCapability,
+};
 
 /// What the connected infrastructure serves beyond the open SDK surface. The open
 /// SDK works on Apache Iggy with everything off (`OPEN`). LaserData Cloud
@@ -27,6 +33,8 @@ pub struct Capabilities {
     /// The managed query surface (`Laser::query`) and the read-consistency it
     /// serves.
     pub query: QueryCaps,
+    /// Materialization destination declarations and VSR checkpoint lifecycle.
+    pub destinations: DestinationCaps,
     /// The managed key-value surface (`Laser::kv`) and its conditional-write
     /// support.
     pub kv: KvCaps,
@@ -56,9 +64,7 @@ pub struct Capabilities {
     /// SDK fails fast with the surface's typed `Version` error before a round-trip
     /// whenever its pinned op version is not the advertised one.
     pub versions: Option<OpVersions>,
-    /// The materialization backends the server exposes, advertised at connect.
-    /// Identity only (a stable `id` and an opaque engine `kind`), never settings
-    /// or secrets. Empty against Apache Iggy and servers that advertise none.
+    /// Structured, versioned, secret-free backend observations advertised at connect.
     pub backends: Vec<BackendDescriptor>,
 }
 
@@ -77,6 +83,18 @@ pub struct QueryCaps {
     /// sending, since an unaware server would silently drop the additive field
     /// and answer wider than asked.
     pub keyword: bool,
+    /// Whether an executing query can continue through opaque cursor pages.
+    pub cursor_paging: bool,
+    /// Whether query cancellation is served.
+    pub cancellation: bool,
+    /// Whether query execution status is served.
+    pub execution_status: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DestinationCaps {
+    pub available: bool,
+    pub consistency: CheckpointReadConsistency,
 }
 
 /// The managed key-value surface and its conditional-write support.
@@ -103,6 +121,13 @@ impl Capabilities {
             available: false,
             consistency: Consistency::Eventual,
             keyword: false,
+            cursor_paging: false,
+            cancellation: false,
+            execution_status: false,
+        },
+        destinations: DestinationCaps {
+            available: false,
+            consistency: CheckpointReadConsistency::PotentiallyStale,
         },
         kv: KvCaps {
             available: false,
@@ -156,6 +181,26 @@ impl Capabilities {
     #[must_use]
     pub fn with_query_keyword(mut self, value: bool) -> Self {
         self.query.keyword = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_execution(mut self, paging: bool, cancellation: bool, status: bool) -> Self {
+        self.query.cursor_paging = paging;
+        self.query.cancellation = cancellation;
+        self.query.execution_status = status;
+        self
+    }
+
+    #[must_use]
+    pub fn with_destinations(mut self, value: bool) -> Self {
+        self.destinations.available = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_destination_consistency(mut self, value: CheckpointReadConsistency) -> Self {
+        self.destinations.consistency = value;
         self
     }
 
@@ -229,8 +274,7 @@ impl Capabilities {
         self
     }
 
-    /// Returns a copy advertising the materialization `backends` the server
-    /// exposes (identity only: a stable `id` and an opaque engine `kind`).
+    /// Returns a copy advertising the structured backend observations.
     #[must_use]
     pub fn with_backends(mut self, value: Vec<BackendDescriptor>) -> Self {
         self.backends = value;
@@ -244,6 +288,7 @@ impl Capabilities {
     /// advertise stays off.
     #[cfg(any(
         feature = "fork",
+        feature = "destinations",
         feature = "graph",
         feature = "kv",
         feature = "projections",
@@ -260,6 +305,11 @@ impl Capabilities {
         self.query.keyword |= versions.has_feature(feature::KEYWORD_SEARCH);
         self.watch |= versions.has_feature(feature::WATCH);
         self.authz |= versions.has_feature(feature::AUTHZ);
+        self.destinations.available |=
+            versions.checkpoint > 0 && versions.has_feature(feature::DESTINATIONS);
+        if self.destinations.available {
+            self.destinations.consistency = CheckpointReadConsistency::Linearizable;
+        }
         if versions.has_feature(feature::STRONG_CONSISTENCY) {
             self.query.consistency = self.query.consistency.max(Consistency::Strong);
         } else if versions.has_feature(feature::READ_YOUR_WRITES) {
@@ -351,11 +401,31 @@ mod tests {
     fn given_advertised_backends_when_set_then_should_expose_them_and_open_has_none() {
         assert!(Capabilities::OPEN.backends.is_empty());
         let caps = Capabilities::OPEN.with_backends(vec![
-            BackendDescriptor::new("embedded", "embedded"),
-            BackendDescriptor::new("warehouse", "columnar").with_version("2.1.0"),
+            BackendDescriptor::new(
+                laser_wire::destination::BackendResourceId::from_u128(1),
+                BackendMode::Operational,
+                "Embedded",
+                BackendImplementation {
+                    kind: "embedded".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                1,
+                1,
+            ),
+            BackendDescriptor::new(
+                laser_wire::destination::BackendResourceId::from_u128(2),
+                BackendMode::Lakehouse,
+                "Warehouse",
+                BackendImplementation {
+                    kind: "columnar".to_owned(),
+                    version: "2.1.0".to_owned(),
+                },
+                1,
+                1,
+            ),
         ]);
         assert_eq!(caps.backends.len(), 2);
-        assert_eq!(caps.backends[1].id, "warehouse");
+        assert_eq!(caps.backends[1].label, "Warehouse");
         assert!(!caps.is_open_only() && !caps.managed);
     }
 }

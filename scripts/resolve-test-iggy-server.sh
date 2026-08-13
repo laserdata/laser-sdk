@@ -3,9 +3,12 @@ set -euo pipefail
 
 # Resolve the Iggy server binary the test harnesses run. An explicit
 # LASER_TEST_IGGY_SERVER binary wins, otherwise the pinned release is
-# downloaded once and cached. LASER_TEST_IGGY_VERSION overrides the pin and
-# LASER_TEST_IGGY_SHA256, when set, pins the downloaded bytes.
-readonly FORK_VERSION="${LASER_TEST_IGGY_VERSION:-0.8.104-ld}"
+# downloaded once and cached. A wire-breaking pull request pins the matching
+# future server release and carries `[wire-break]`, which skips only the jobs
+# that resolve this artifact. Local release-candidate validation supplies the
+# same server through LASER_TEST_IGGY_SERVER. LASER_TEST_IGGY_VERSION overrides
+# the pin and LASER_TEST_IGGY_SHA256, when set, pins the downloaded bytes.
+readonly FORK_VERSION="${LASER_TEST_IGGY_VERSION:-0.8.108-ld}"
 readonly RELEASES_URL="${LASER_TEST_IGGY_RELEASES_URL:-https://artifacts.laserdata.com}"
 
 if [[ "${1:-}" == "--version" ]]; then

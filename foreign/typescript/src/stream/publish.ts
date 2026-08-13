@@ -5,6 +5,7 @@ import { InvalidError } from "../client/errors.js"
 import type { Provenance } from "../provenance/provenance.js"
 import type { CompiledSchema } from "../schema-codecs.js"
 import type { SendMessagesResponse } from "../iggy/apache-iggy.js"
+import { type ArrowIpcMessageMetadata, validateArrowIpcMetadata } from "../wire/arrow.js"
 import { ContentType, type ContentType as ContentTypeValue } from "../wire/content.js"
 import { type Codec, jsonCodec, messagePackCodec } from "./codecs.js"
 import { mergeRecord, Record, recordHeaders } from "./record.js"
@@ -87,6 +88,19 @@ export class PublishRequest {
   rawBytes(bytes: BytesLike, contentType: ContentTypeValue): this {
     this.body = ownedBytes(bytes)
     this.record.contentType(contentType)
+    return this
+  }
+
+  arrowIpc(bytes: BytesLike, metadata: ArrowIpcMessageMetadata): this {
+    validateArrowIpcMetadata(metadata)
+    const payload = ownedBytes(bytes)
+    if (BigInt(payload.length) !== metadata.encodedBytes) {
+      throw new InvalidError(
+        `Arrow IPC payload is ${String(payload.length)} bytes, metadata declares ${metadata.encodedBytes.toString()}`
+      )
+    }
+    this.body = payload
+    this.record.contentType(ContentType.Arrow).logicalSchemaFingerprint(metadata.schemaFingerprint)
     return this
   }
 
@@ -233,6 +247,23 @@ export class BatchPublishRequest {
     this.entries.push({
       payload: ownedBytes(payload),
       record: new Record().contentType(contentType)
+    })
+    return this
+  }
+
+  addArrowIpc(payload: BytesLike, metadata: ArrowIpcMessageMetadata): this {
+    validateArrowIpcMetadata(metadata)
+    const bytes = ownedBytes(payload)
+    if (BigInt(bytes.length) !== metadata.encodedBytes) {
+      throw new InvalidError(
+        `Arrow IPC payload is ${String(bytes.length)} bytes, metadata declares ${metadata.encodedBytes.toString()}`
+      )
+    }
+    this.entries.push({
+      payload: bytes,
+      record: new Record()
+        .contentType(ContentType.Arrow)
+        .logicalSchemaFingerprint(metadata.schemaFingerprint)
     })
     return this
   }

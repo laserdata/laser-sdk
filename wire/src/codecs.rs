@@ -1,7 +1,6 @@
 use crate::content::ContentType;
 use crate::error::DecodeError;
 use crate::kv::KvEntry;
-use crate::query::Row;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -153,38 +152,6 @@ impl<T: DeserializeOwned> Decoder<T> for Bson {
     }
 }
 
-const NO_ROW_PAYLOAD: &str = "row has no payload, the publisher must call .inline_payload() and the query must call .with_payload()";
-
-impl Row {
-    /// Decodes the row's payload as JSON into `T`. Errors if no payload was
-    /// returned (publisher did not inline it, or the query did not request
-    /// it), or if the bytes fail to deserialize.
-    pub fn decode_json<T: DeserializeOwned>(&self) -> Result<T, DecodeError> {
-        self.decode_with::<Json, T>()
-    }
-
-    /// Decodes the row's payload as MessagePack into `T`. Same prerequisites
-    /// as [`decode_json`](Self::decode_json).
-    pub fn decode_msgpack<T: DeserializeOwned>(&self) -> Result<T, DecodeError> {
-        self.decode_with::<Msgpack, T>()
-    }
-
-    /// Decode the row's payload with any [`Decoder`] (`Json`, `Msgpack`, or
-    /// your own). `decode_json` and `decode_msgpack` are sugar for the
-    /// built-ins. Reach for this with a custom codec. Same prerequisites: the
-    /// publisher inlined the payload and the query requested it.
-    pub fn decode_with<C, T>(&self) -> Result<T, DecodeError>
-    where
-        C: Decoder<T>,
-    {
-        let payload = self
-            .payload
-            .as_deref()
-            .ok_or(DecodeError::MissingPayload(NO_ROW_PAYLOAD))?;
-        C::decode(payload)
-    }
-}
-
 impl KvEntry {
     /// Decode the value as JSON into `T`. Sugar for `decode_value_with::<Json, _>`.
     pub fn decode_value<T: DeserializeOwned>(&self) -> Result<T, DecodeError> {
@@ -218,35 +185,24 @@ mod tests {
     }
 
     #[test]
-    fn given_a_row_payload_when_decoded_with_each_codec_then_should_round_trip() {
-        let json_row = Row {
-            payload: Some(Json::encode(&body()).expect("json encode")),
-            ..Default::default()
-        };
-        assert_eq!(json_row.decode_with::<Json, Body>().expect("json"), body());
-        let msgpack_row = Row {
-            payload: Some(Msgpack::encode(&body()).expect("msgpack encode")),
-            ..Default::default()
-        };
-        assert_eq!(
-            msgpack_row.decode_with::<Msgpack, Body>().expect("msgpack"),
-            body()
-        );
-        let cbor_row = Row {
-            payload: Some(Cbor::encode(&body()).expect("cbor encode")),
-            ..Default::default()
-        };
-        assert_eq!(cbor_row.decode_with::<Cbor, Body>().expect("cbor"), body());
+    fn given_a_body_when_encoded_with_each_codec_then_should_round_trip() {
+        let json = Json::encode(&body()).expect("json encode");
+        let decoded: Body = Json::decode(&json).expect("json");
+        assert_eq!(decoded, body());
+        let msgpack = Msgpack::encode(&body()).expect("msgpack encode");
+        let decoded: Body = Msgpack::decode(&msgpack).expect("msgpack");
+        assert_eq!(decoded, body());
+        let cbor = Cbor::encode(&body()).expect("cbor encode");
+        let decoded: Body = Cbor::decode(&cbor).expect("cbor");
+        assert_eq!(decoded, body());
     }
 
     #[cfg(feature = "bson")]
     #[test]
     fn given_a_bson_payload_when_decoded_then_should_round_trip() {
-        let bson_row = Row {
-            payload: Some(Bson::encode(&body()).expect("bson encode")),
-            ..Default::default()
-        };
-        assert_eq!(bson_row.decode_with::<Bson, Body>().expect("bson"), body());
+        let bson = Bson::encode(&body()).expect("bson encode");
+        let decoded: Body = Bson::decode(&bson).expect("bson");
+        assert_eq!(decoded, body());
         assert_eq!(<Bson as Codec<Body>>::content_type(), ContentType::Bson);
     }
 
@@ -258,15 +214,6 @@ mod tests {
             ContentType::Msgpack
         );
         assert_eq!(<Cbor as Codec<str>>::content_type(), ContentType::Cbor);
-    }
-
-    #[test]
-    fn given_a_row_without_payload_when_decoded_then_should_error() {
-        let row = Row::default();
-        assert!(matches!(
-            row.decode_with::<Json, String>(),
-            Err(DecodeError::MissingPayload(_))
-        ));
     }
 
     #[test]

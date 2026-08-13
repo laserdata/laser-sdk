@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "laser-sdk"
-description = "LaserData SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+description = "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"

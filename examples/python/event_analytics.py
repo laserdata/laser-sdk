@@ -199,12 +199,16 @@ async def run_analytics(laser: ls.Laser) -> None:
     by_kind = await laser.query(TOPIC).count().group_by([MESSAGE_TYPE]).fetch()
     print("events by kind:")
     for row in by_kind.rows:
-        print(f"  {row.headers.get(MESSAGE_TYPE, '?'):<12} {row.headers.get('count', '0')}")
+        kind = by_kind.value_text(row, MESSAGE_TYPE) or "?"
+        count = by_kind.value_text(row, "count") or "0"
+        print(f"  {kind:<12} {count}")
 
     slowest = await laser.query(TOPIC).order_desc(LATENCY_MS).limit(3).fetch()
     print("slowest 3 routes:")
     for row in slowest.rows:
-        print(f"  {row.headers.get(LATENCY_MS, '?'):>5}ms  {row.headers.get(ROUTE, '?')}")
+        latency = slowest.value_text(row, LATENCY_MS) or "?"
+        route = slowest.value_text(row, ROUTE) or "?"
+        print(f"  {latency:>5}ms  {route}")
 
     checkouts = await laser.query(TOPIC).message_type("checkout").count().fetch()
     print(f"checkouts: {scalar(checkouts)}")
@@ -217,7 +221,9 @@ async def run_analytics(laser: ls.Laser) -> None:
     per_minute = await laser.query(TOPIC).count().window(TS, ONE_MINUTE_US).fetch()
     print("events per minute:")
     for row in per_minute.rows:
-        print(f"  bucket {row.headers.get('window_start', '?')}: {row.headers.get('count', '0')}")
+        bucket = per_minute.value_text(row, "window_start") or "?"
+        count = per_minute.value_text(row, "count") or "0"
+        print(f"  bucket {bucket}: {count}")
 
     by_kind_metrics = (
         await laser.query(TOPIC)
@@ -228,9 +234,9 @@ async def run_analytics(laser: ls.Laser) -> None:
     )
     print("avg latency and distinct routes by kind:")
     for row in by_kind_metrics.rows:
-        kind = row.headers.get(MESSAGE_TYPE, "?")
-        avg = row.headers.get("avg", "?")
-        routes = row.headers.get("count_distinct", "?")
+        kind = by_kind_metrics.value_text(row, MESSAGE_TYPE) or "?"
+        avg = by_kind_metrics.value_text(row, "avg") or "?"
+        routes = by_kind_metrics.value_text(row, "count_distinct") or "?"
         print(f"  {kind:<12} avg={avg}ms routes={routes}")
 
 
@@ -238,7 +244,7 @@ def scalar(result: ls.QueryResult) -> int:
     """Read a single aggregate (count/sum with no group) off its one result row."""
     if not result.rows:
         return 0
-    return int(result.rows[0].headers.get("count", "0"))
+    return int(result.value_text(result.rows[0], "count") or "0")
 
 
 async def run_resumable_export(laser: ls.Laser) -> None:

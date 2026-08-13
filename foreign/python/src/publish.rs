@@ -1,11 +1,12 @@
 use crate::agent::PyProvenance;
 use crate::async_bridge::future_into_py;
-use crate::convert::{payload_bytes, py_to_json};
+use crate::convert::{payload_bytes, py_to_de, py_to_json};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::schema::PyCompiledSchema;
 use crate::transport::PySendMessagesResponse;
 use laser_sdk::laser::Laser;
 use laser_sdk::stream::Record;
+use laser_sdk::wire::arrow::ArrowIpcMessageMetadata;
 use laser_sdk::wire::content::ContentType;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -31,6 +32,10 @@ enum Body {
     },
     Json(serde_json::Value),
     Msgpack(serde_json::Value),
+    Arrow {
+        payload: Vec<u8>,
+        metadata: ArrowIpcMessageMetadata,
+    },
 }
 
 /// Fluent builder for a single-record publish, finished with `await .send()`.
@@ -85,7 +90,7 @@ impl PyPublish {
         slf
     }
 
-    /// Attach a non-indexed metadata header, surfaced as `Row.metadata`.
+    /// Attach a non-indexed metadata header to the Iggy record.
     fn header<'py>(
         mut slf: PyRefMut<'py, Self>,
         key: String,
@@ -174,6 +179,19 @@ impl PyPublish {
         Ok(slf)
     }
 
+    /// Publish one complete self-contained Arrow IPC stream with validated metadata.
+    fn arrow_ipc<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+        metadata: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Arrow {
+            payload: payload_bytes(value)?,
+            metadata: py_to_de(metadata)?,
+        };
+        Ok(slf)
+    }
+
     /// Encode `value` as a raw Avro datum under a compiled writer schema and
     /// stamp `agdx.ct=avro` + `agdx.sid`. Compile the schema once with
     /// `CompiledSchema.compile(..)` and reuse it. Encoding fails client-side
@@ -252,6 +270,9 @@ impl PyPublish {
                 }
                 Body::Json(value) => request.json(&value).map_err(to_pyerr)?,
                 Body::Msgpack(value) => request.msgpack(&value).map_err(to_pyerr)?,
+                Body::Arrow { payload, metadata } => {
+                    request.arrow_ipc(payload, metadata).map_err(to_pyerr)?
+                }
             };
             request
                 .send()
@@ -382,6 +403,19 @@ impl PyBatchPublish {
         Ok(slf)
     }
 
+    /// Append one complete self-contained Arrow IPC stream with validated metadata.
+    fn add_arrow_ipc<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+        metadata: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.bodies.push(Body::Arrow {
+            payload: payload_bytes(value)?,
+            metadata: py_to_de(metadata)?,
+        });
+        Ok(slf)
+    }
+
     /// Append one record encoded as a raw Avro datum under a compiled writer
     /// schema, stamped with `agdx.ct=avro` + `agdx.sid`. The batch counterpart
     /// of `PublishRequest.avro`. Each record carries its own schema id, so a
@@ -489,6 +523,9 @@ impl PyBatchPublish {
                     ),
                     Body::Json(value) => request.add_json(&value).map_err(to_pyerr)?,
                     Body::Msgpack(value) => request.add_msgpack(&value).map_err(to_pyerr)?,
+                    Body::Arrow { payload, metadata } => {
+                        request.add_arrow_ipc(payload, metadata).map_err(to_pyerr)?
+                    }
                 };
             }
             request

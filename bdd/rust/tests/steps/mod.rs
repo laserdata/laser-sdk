@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod bridges;
 pub mod capabilities;
+pub mod data_stack;
 pub mod governance;
 pub mod graph;
 pub mod kv;

@@ -1,6 +1,6 @@
 [package]
 name = "laser-sdk"
-description = "LaserData SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+description = "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
 categories = ["asynchronous", "network-programming"]
 keywords = ["iggy", "agents", "streaming", "provenance", "messaging"]
 readme = "README.md"
@@ -54,7 +54,19 @@ kv = ["streaming"]
 # The managed tier in one word: everything laser-plane serves over the
 # command band. `--features managed` instead of remembering which per-surface
 # features compose it.
-managed = ["fork", "graph", "kv", "projections", "query", "rbac", "runs", "watch"]
+managed = [
+    "destinations",
+    "fork",
+    "graph",
+    "kv",
+    "projections",
+    "query",
+    "rbac",
+    "runs",
+    "watch",
+]
+# Materialization destinations, query routes, checkpoint lifecycle, and status.
+destinations = ["streaming"]
 # The MCP bridge ADAPTER: map MCP tool calls / results onto AGDX commands /
 # responses, plus the tool / resource / prompt catalog. No HTTP deps.
 mcp-bridge = ["agent", "dep:serde_json"]

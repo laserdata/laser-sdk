@@ -1,0 +1,8 @@
+{
+  "snapshot_id": 42,
+  "data_file_count": 1,
+  "delete_file_count": 0,
+  "total_rows": 100,
+  "total_bytes": 4096,
+  "partition_count": 1
+}

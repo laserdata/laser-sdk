@@ -276,7 +276,7 @@ impl NativeIggy {
         }
     }
 
-    /// Start the resolved `server-ng` binary with TCP VSR as its only public transport.
+    /// Start the resolved `iggy-server` binary with TCP VSR as its only public transport.
     ///
     /// # Errors
     ///
@@ -287,9 +287,9 @@ impl NativeIggy {
         plane_socket: Option<&Path>,
         environment: &Environment,
     ) -> Result<Self, BenchError> {
-        if manifest.name != "iggy-server-ng" {
+        if manifest.name != "iggy-server" {
             return Err(BenchError::Invalid(format!(
-                "only server-ng is supported, resolved `{}`",
+                "only iggy-server is supported, resolved `{}`",
                 manifest.name
             )));
         }
@@ -345,7 +345,7 @@ impl NativeIggy {
                 .env("IGGY_PLANE_REQUEST_TIMEOUT", "5s");
         }
         let child = command.spawn().map_err(|error| {
-            BenchError::Invalid(format!("failed to start iggy-server-ng: {error}"))
+            BenchError::Invalid(format!("failed to start iggy-server: {error}"))
         })?;
         if let Some(host) = environment.host.as_ref() {
             pin_process(
@@ -465,12 +465,12 @@ impl NativeIggy {
                 .map_err(|error| BenchError::Invalid(format!("failed to inspect Iggy: {error}")))?
             {
                 return Err(BenchError::Invalid(format!(
-                    "iggy-server-ng exited before readiness with {status}"
+                    "iggy-server exited before readiness with {status}"
                 )));
             }
             if Instant::now() >= deadline {
                 return Err(BenchError::Invalid(format!(
-                    "iggy-server-ng did not listen on {} within {timeout:?}",
+                    "iggy-server did not listen on {} within {timeout:?}",
                     self.address
                 )));
             }

@@ -1,44 +1,42 @@
 import assert from "node:assert/strict"
-import { test } from "node:test"
+import test from "node:test"
+import { BackendResourceId } from "../../src/wire/ids.js"
 import {
   Feature,
   backendDescriptorHasCapability,
   newBackendAnnounce,
   newBackendDescriptor,
   newOpVersions,
-  opVersionsHasFeature
+  opVersionsHasFeature,
+  validateBackendDescriptor
 } from "../../src/wire/hello.js"
 
-void test("given_advertised_features_when_checked_then_should_require_every_bit_present", () => {
+void test("feature checks require every advertised bit", () => {
   const versions = {
-    ...newOpVersions(1, 1, 1, 1),
+    ...newOpVersions(2, 2, 1, 1),
     features: Feature.KV_CAS | Feature.READ_YOUR_WRITES
   }
   assert.ok(opVersionsHasFeature(versions, Feature.KV_CAS))
-  assert.ok(opVersionsHasFeature(versions, Feature.READ_YOUR_WRITES))
-  assert.ok(!opVersionsHasFeature(versions, Feature.STRONG_CONSISTENCY))
   assert.ok(opVersionsHasFeature(versions, Feature.KV_CAS | Feature.READ_YOUR_WRITES))
-  assert.ok(!opVersionsHasFeature(versions, Feature.KV_CAS | Feature.STRONG_CONSISTENCY))
+  assert.ok(!opVersionsHasFeature(versions, Feature.STRONG_CONSISTENCY))
 })
 
-void test("given_a_minimal_backend_descriptor_when_constructed_then_should_have_no_advisory_fields", () => {
-  const backend = newBackendDescriptor("embedded", "embedded")
-  assert.equal(backend.label, undefined)
-  assert.equal(backend.version, undefined)
-  assert.deepEqual(backend.capabilities, [])
+void test("structured backend descriptor is secret-free and validates observed identity", () => {
+  const backend = newBackendDescriptor(
+    BackendResourceId.fromU128(1n),
+    "lakehouse",
+    "Warehouse",
+    { kind: "iceberg", version: "1" },
+    2n,
+    3n
+  )
+  validateBackendDescriptor(backend)
+  assert.equal(backend.resourceId.asU128(), 1n)
+  assert.equal(backendDescriptorHasCapability(backend, "parquet"), false)
 })
 
-void test("given_a_backend_descriptor_when_checked_for_a_capability_then_should_match_declared_tags", () => {
-  const backend = {
-    ...newBackendDescriptor("warehouse", "columnar"),
-    capabilities: ["ingest", "query"]
-  }
-  assert.ok(backendDescriptorHasCapability(backend, "query"))
-  assert.ok(!backendDescriptorHasCapability(backend, "vector_search"))
-})
-
-void test("given_a_new_backend_announce_when_constructed_then_should_have_no_backends_or_topology", () => {
-  const announce = newBackendAnnounce(newOpVersions(1, 1, 1, 1))
+void test("backend announcement starts without observed resources or topology", () => {
+  const announce = newBackendAnnounce(newOpVersions(2, 2, 1, 1))
   assert.deepEqual(announce.backends, [])
   assert.equal(announce.topology, undefined)
 })

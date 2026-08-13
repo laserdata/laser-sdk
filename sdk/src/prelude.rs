@@ -15,6 +15,8 @@ pub use crate::capabilities::Capabilities;
 pub use crate::context_scope::{ContextScope, ScopedMemory};
 #[cfg(feature = "streaming")]
 pub use crate::cursor::Cursor;
+#[cfg(feature = "destinations")]
+pub use crate::destinations::Destinations;
 #[cfg(feature = "fork")]
 pub use crate::fork::ForkHandle;
 #[cfg(feature = "kv")]
@@ -111,11 +113,11 @@ pub mod full {
     pub use crate::provenance::{LlmUsage, ProvenanceError, keys};
     #[cfg(feature = "query")]
     pub use crate::query::{
-        AggCall, AggFunc, Aggregate, CmpOp, Delivery, Dir, EdgeExtract, EntitySchema, FieldType,
-        Filter, IndexField, IndexSchema, KeyMatch, NodeExtract, Page, Predicate, Projection,
+        AggCall, AggFunc, Aggregate, CmpOp, Dir, EdgeExtract, EntitySchema, FieldType, Filter,
+        IndexField, IndexSchema, KeyMatch, NodeExtract, Page, Predicate, Projection,
         ProjectionBinding, ProjectionId, ProjectionInfo, ProjectionKind, Query, QueryError,
         QueryRequest, RawSql, RetentionPolicy, SchemaDef, SchemaInfo, SchemaSource, Select, Sort,
-        SourceSelector, Target, TargetRole, Value, VectorQuery, Window,
+        SourceSelector, Value, VectorQuery, Window,
     };
     #[cfg(feature = "runs")]
     pub use crate::runs::RunListRequest;
@@ -131,9 +133,38 @@ pub mod full {
     };
     #[cfg(feature = "runs")]
     pub use laser_wire::agent_workflow::{AgentRunInfo, RunPage};
+    #[cfg(feature = "destinations")]
+    pub use laser_wire::checkpoint::{
+        AttemptColumnMetrics, AttemptObject, CheckpointError, CheckpointMutationResult,
+        CheckpointOwnerId, CheckpointOwnerLease, CheckpointReadConsistency,
+        CheckpointRequestEnvelope, CheckpointRequestId, CompletedAttempt, CredentialGeneration,
+        DestinationBlock, DestinationBlockCode, DestinationCheckpointPage,
+        DestinationCheckpointStatus, DestinationCheckpointView, DestinationEffectiveState,
+        DestinationListFilter, IcebergCommitRequirement, PartitionCheckpoint,
+        PartitionLifecycleChange, PartitionLifecycleState, PreparedAttempt, PreparedAttemptId,
+        PreparedAttemptSummary, PreparedTableRequirements, PublicCheckpointMutation,
+        QueryRoutePage, RepairAction, RepairRecord, RetentionGap, SourceOffsetRange,
+    };
+    #[cfg(feature = "destinations")]
+    pub use laser_wire::destination::{
+        BackendBinding, BackendResourceId, DestinationDesiredState, DestinationErrorPolicy,
+        DestinationId, DestinationOperationId, FileFormat, MaterializationDestination,
+        NewPartitionPolicy, PartitionStart, PhysicalTable, ProjectionRef, QueryRoute, QueryRouteId,
+        QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
+    };
     #[cfg(feature = "graph")]
     pub use laser_wire::graph::{
         EdgeId, GraphEdge, GraphNode, GraphResult, GraphReturn, NodeId, SourceRef,
+    };
+    #[cfg(feature = "destinations")]
+    pub use laser_wire::schema::{
+        BinaryValue, DecimalValue, Digest32, FieldValue, LogicalField, LogicalSchema,
+        LogicalSchemaId, LogicalSchemaRef, LogicalType, LogicalTypeKind, MapEntry,
+        SchemaFingerprint, TypedValue, UuidValue,
+    };
+    #[cfg(feature = "destinations")]
+    pub use laser_wire::source::{
+        PhysicalClusterIncarnation, SourceCut, SourceIncarnation, SourcePartitionCut, SourceScope,
     };
     // `Json` and `Msgpack` are codec marker types, intentionally NOT here
     // because the short names collide too easily with user code

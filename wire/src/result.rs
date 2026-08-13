@@ -8,6 +8,7 @@
 // u8 dictionaries use.
 
 use crate::agent_workflow::AgentError;
+use crate::checkpoint::CheckpointError;
 use crate::fork::ForkError;
 use crate::graph::GraphError;
 use crate::kv::KvError;
@@ -56,10 +57,22 @@ pub enum ResultCode {
     /// client may safely retry with backoff, so it never has to parse a message
     /// to decide (see [`is_retryable`](Self::is_retryable)).
     Unavailable,
+    /// The query exceeded a server-enforced resource budget.
+    ResourceLimit,
+    /// The query was cancelled through its execution identity.
+    Cancelled,
+    /// The query did not finish before its absolute deadline.
+    DeadlineExceeded,
+    /// The requested historical snapshot is no longer retained.
+    ExpiredSnapshot,
+    /// The requested destination or backend generation is no longer current.
+    StaleGeneration,
+    /// The resolved target is not ready to serve queries.
+    TargetUnavailable,
     /// A code from a newer peer this build does not name. Decodes and re-encodes
     /// byte-for-byte so an old build relays it rather than failing. Only a value
-    /// outside the named range (13 and up) should ever appear here: `from_code`
-    /// never produces `Unrecognized` for `0..=12`, which map to the named
+    /// outside the named range (19 and up) should ever appear here: `from_code`
+    /// never produces `Unrecognized` for `0..=18`, which map to the named
     /// variants.
     Unrecognized(u16),
 }
@@ -81,6 +94,12 @@ impl ResultCode {
             ResultCode::Forbidden => 10,
             ResultCode::StepUpRequired => 11,
             ResultCode::Unavailable => 12,
+            ResultCode::ResourceLimit => 13,
+            ResultCode::Cancelled => 14,
+            ResultCode::DeadlineExceeded => 15,
+            ResultCode::ExpiredSnapshot => 16,
+            ResultCode::StaleGeneration => 17,
+            ResultCode::TargetUnavailable => 18,
             ResultCode::Unrecognized(code) => code,
         }
     }
@@ -102,6 +121,12 @@ impl ResultCode {
             10 => ResultCode::Forbidden,
             11 => ResultCode::StepUpRequired,
             12 => ResultCode::Unavailable,
+            13 => ResultCode::ResourceLimit,
+            14 => ResultCode::Cancelled,
+            15 => ResultCode::DeadlineExceeded,
+            16 => ResultCode::ExpiredSnapshot,
+            17 => ResultCode::StaleGeneration,
+            18 => ResultCode::TargetUnavailable,
             other => ResultCode::Unrecognized(other),
         }
     }
@@ -127,6 +152,12 @@ impl ResultCode {
             ResultCode::StepUpRequired => 403,
             // Retry-after territory, the same status a lagging read model gets.
             ResultCode::Unavailable => 503,
+            ResultCode::ResourceLimit => 429,
+            ResultCode::Cancelled => 409,
+            ResultCode::DeadlineExceeded => 408,
+            ResultCode::ExpiredSnapshot => 410,
+            ResultCode::StaleGeneration => 409,
+            ResultCode::TargetUnavailable => 503,
             ResultCode::Unrecognized(_) => 500,
         }
     }
@@ -137,7 +168,10 @@ impl ResultCode {
     /// other code needs the request, the credential, or the data to change first,
     /// so retrying it unchanged only wastes the attempt.
     pub const fn is_retryable(self) -> bool {
-        matches!(self, ResultCode::Unavailable | ResultCode::Stale)
+        matches!(
+            self,
+            ResultCode::Unavailable | ResultCode::Stale | ResultCode::TargetUnavailable
+        )
     }
 }
 
@@ -185,6 +219,12 @@ impl From<&QueryError> for ResultCode {
             QueryError::TooLarge { .. } => ResultCode::TooLarge,
             QueryError::Version { .. } => ResultCode::VersionSkew,
             QueryError::Stale { .. } => ResultCode::Stale,
+            QueryError::Cancelled { .. } => ResultCode::Cancelled,
+            QueryError::DeadlineExceeded { .. } => ResultCode::DeadlineExceeded,
+            QueryError::ExpiredSnapshot { .. } => ResultCode::ExpiredSnapshot,
+            QueryError::StaleGeneration { .. } => ResultCode::StaleGeneration,
+            QueryError::TargetUnavailable { .. } => ResultCode::TargetUnavailable,
+            QueryError::ResourceLimit { .. } => ResultCode::ResourceLimit,
         }
     }
 }
@@ -247,6 +287,19 @@ impl From<&AgentError> for ResultCode {
             AgentError::Unavailable(_) => ResultCode::Unavailable,
             AgentError::Version { .. } => ResultCode::VersionSkew,
             AgentError::NotLeader => ResultCode::Unavailable,
+        }
+    }
+}
+
+impl From<&CheckpointError> for ResultCode {
+    fn from(error: &CheckpointError) -> Self {
+        match error {
+            CheckpointError::Invalid(_) => ResultCode::InvalidArgument,
+            CheckpointError::NotFound => ResultCode::NotFound,
+            CheckpointError::Conflict { .. } | CheckpointError::LeaseLost => ResultCode::Conflict,
+            CheckpointError::Unauthorized => ResultCode::Forbidden,
+            CheckpointError::Unavailable(_) => ResultCode::Unavailable,
+            CheckpointError::Version { .. } => ResultCode::VersionSkew,
         }
     }
 }

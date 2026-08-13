@@ -8,15 +8,16 @@ The golden fixture corpus in the wire crate (`wire/fixtures/`, the `.bin` and `.
 
 ## Layer 2: behavior (actions)
 
-The Gherkin scenarios in `scenarios/` describe end-to-end behavior. Rust, Python, and TypeScript run against the versioned VSR Apache Iggy server:
+The Gherkin scenarios in `scenarios/` describe end-to-end behavior. Rust, Python, and TypeScript run against the versioned Apache Iggy server:
 
-```
+```text
 bdd/
 ├── scenarios/
 │   ├── agent.feature                  the AGDX agent envelope + conversation threading
 │   ├── agent_must_understand.feature  the must-understand feature-bit rejection rule
 │   ├── capabilities.feature           negotiation + the Unsupported boundary
 │   ├── capabilities_injected.feature  the read-consistency pre-gate under injected caps
+│   ├── data_stack.feature              schemas, typed query, destinations, checkpoints, and Arrow
 │   ├── governance.feature             action governance at the effect boundary
 │   ├── graph.feature                  knowledge graph traversal semantics (reference engine)
 │   ├── kv_cas.feature                 compare-and-swap semantics (reference engine)
@@ -46,12 +47,12 @@ So: a new SDK is conformant when it passes the fixture corpus (bytes, all surfac
 just bdd                       # or: cd bdd/rust && cargo test
 ```
 
-All three runners resolve the versioned Iggy binary by default. Set `LASER_TEST_IGGY_SERVER=/path/to/iggy-server` for a local build, or `LASER_BDD_ADDR=host:port` for an already-running VSR server.
+All three runners resolve the versioned Iggy binary by default. Set `LASER_TEST_IGGY_SERVER=/path/to/iggy-server` for a local build, or `LASER_BDD_ADDR=host:port` for an already-running Iggy server.
 
 The Python runner executes the complete scenario inventory:
 
 ```sh
-cd bdd/python && pytest -q     # needs the VSR-only laser-sdk wheel installed
+cd bdd/python && pytest -q     # needs the laser-sdk wheel installed
 ```
 
 It runs Iggy-backed scenarios against the shared server and uses the Python reference engines for transport-free managed semantics. Must-understand and injected-capability scenarios run in process in all three languages.

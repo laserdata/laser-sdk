@@ -2,11 +2,14 @@ import {
   ContentType,
   InMemoryStore,
   parseProjectionId,
+  queryResultValue,
+  typedValueDiagnosticText,
   type Codec,
   type Laser,
   type Projection,
   type ProjectionBinding,
   type QueryResult,
+  type Row,
   type TypedRecords
 } from "@laserdata/laser-sdk"
 import {
@@ -153,15 +156,7 @@ async function registerProjection(
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    targets: [
-      {
-        backend: "embedded",
-        table: topic,
-        role: "readWrite",
-        delivery: "effectivelyOnce",
-        required: true
-      }
-    ],
+    index: topic,
     notify: true
   }
   await laser.projections().register(projection)
@@ -226,7 +221,13 @@ async function guardedIngest(laser: Laser, sample: ClickEvent): Promise<void> {
 }
 
 function scalar(result: QueryResult): string {
-  return result.rows[0]?.headers.get(COUNT) ?? "0"
+  const row = result.rows[0]
+  return row === undefined ? "0" : (valueText(result, row, COUNT) ?? "0")
+}
+
+function valueText(result: QueryResult, row: Row, field: string): string | undefined {
+  const value = queryResultValue(result, row, field)
+  return value === undefined ? undefined : typedValueDiagnosticText(value)
 }
 
 async function runAnalytics(laser: Laser): Promise<void> {
@@ -234,8 +235,8 @@ async function runAnalytics(laser: Laser): Promise<void> {
   printTable([
     ["event", "count"],
     ...byKind.rows.map((row) => [
-      row.headers.get(MESSAGE_TYPE) ?? "?",
-      row.headers.get(COUNT) ?? "0"
+      valueText(byKind, row, MESSAGE_TYPE) ?? "?",
+      valueText(byKind, row, COUNT) ?? "0"
     ])
   ])
 
@@ -244,8 +245,8 @@ async function runAnalytics(laser: Laser): Promise<void> {
   printTable([
     ["route", "latency"],
     ...slowest.rows.map((row) => [
-      row.headers.get(ROUTE) ?? "?",
-      `${row.headers.get(LATENCY_MS) ?? "?"}ms`
+      valueText(slowest, row, ROUTE) ?? "?",
+      `${valueText(slowest, row, LATENCY_MS) ?? "?"}ms`
     ])
   ])
 
@@ -265,8 +266,8 @@ async function runAnalytics(laser: Laser): Promise<void> {
   printTable([
     ["window start", "count"],
     ...perMinute.rows.map((row) => [
-      row.headers.get(WINDOW_START) ?? "?",
-      row.headers.get(COUNT) ?? "0"
+      valueText(perMinute, row, WINDOW_START) ?? "?",
+      valueText(perMinute, row, COUNT) ?? "0"
     ])
   ])
 
@@ -280,9 +281,9 @@ async function runAnalytics(laser: Laser): Promise<void> {
   printTable([
     ["event", "avg latency", "routes"],
     ...metrics.rows.map((row) => [
-      row.headers.get(MESSAGE_TYPE) ?? "?",
-      `${row.headers.get("avg") ?? "?"}ms`,
-      row.headers.get("count_distinct") ?? "?"
+      valueText(metrics, row, MESSAGE_TYPE) ?? "?",
+      `${valueText(metrics, row, "avg") ?? "?"}ms`,
+      valueText(metrics, row, "count_distinct") ?? "?"
     ])
   ])
 

@@ -1,15 +1,18 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::convert::{json_to_py, py_to_de, py_to_value, ser_to_py};
+use crate::convert::{json_to_py, py_to_de, py_to_typed_value, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use laser_sdk::laser::Laser;
 use laser_sdk::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, ProjectionBinding,
-    Query, QueryResult, RawSql, Row, Sort, SourceSelector, TextQuery, VectorQuery, Window,
+    Query, QueryResult, QueryTarget, RawSql, Row, SnapshotSelector, Sort, SourceSelector,
+    SqlDialect, TextQuery, TypedValue, VectorQuery, Window,
 };
+use laser_sdk::types::MintUlid;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use std::collections::BTreeMap;
+use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn parse_consistency(level: &str) -> PyResult<Consistency> {
     match level {
@@ -30,7 +33,30 @@ impl PyLaser {
     /// `fetch_one`). Query is a managed feature: against Apache Iggy it raises
     /// `UnsupportedError`.
     fn query(&self, index: String) -> PyQuery {
-        PyQuery::new(self.inner.clone(), index)
+        PyQuery::new(self.inner.clone(), QueryTarget::operational(index))
+    }
+
+    /// Start a query against an explicit operational or lakehouse target dict.
+    fn query_target(&self, target: &Bound<'_, PyAny>) -> PyResult<PyQuery> {
+        Ok(PyQuery::new(self.inner.clone(), py_to_de(target)?))
+    }
+
+    /// Start a query against one materialization destination generation.
+    fn query_lakehouse(
+        &self,
+        destination_id: String,
+        destination_generation: u64,
+    ) -> PyResult<PyQuery> {
+        let destination_id = laser_sdk::wire::destination::DestinationId::from_str(&destination_id)
+            .map_err(|error| InvalidError::new_err(error.to_string()))?;
+        Ok(PyQuery::new(
+            self.inner.clone(),
+            QueryTarget::Lakehouse {
+                destination_id,
+                destination_generation,
+                snapshot: None,
+            },
+        ))
     }
 
     /// Register a projection from a Python dict matching the projection schema.
@@ -187,69 +213,40 @@ impl PyLaser {
     }
 }
 
-/// One materialized query row: indexed fields, ride-along metadata, log position,
-/// optional inlined payload, and vector score.
+/// One typed query row. Values are positionally aligned with `QueryResult.fields`.
 #[gen_stub_pyclass]
 #[pyclass(name = "Row", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyRow {
-    #[pyo3(get)]
-    pub headers: BTreeMap<String, String>,
-    #[pyo3(get)]
-    pub metadata: BTreeMap<String, String>,
-    #[pyo3(get)]
-    pub partition: Option<u32>,
-    #[pyo3(get)]
-    pub offset: Option<u64>,
-    #[pyo3(get)]
-    pub stream: Option<u32>,
-    #[pyo3(get)]
-    pub topic: Option<u32>,
-    #[pyo3(get)]
-    pub payload: Option<Vec<u8>>,
-    #[pyo3(get)]
-    pub score: Option<f32>,
+    inner: Row,
 }
 
 impl From<Row> for PyRow {
     fn from(row: Row) -> Self {
-        Self {
-            headers: row.headers,
-            metadata: row.metadata,
-            partition: row.partition,
-            offset: row.offset,
-            stream: row.stream,
-            topic: row.topic,
-            payload: row.payload,
-            score: row.score,
-        }
+        Self { inner: row }
     }
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyRow {
-    /// Decode the inlined payload as JSON into a Python value, or `None` when the
-    /// row carries no payload.
-    fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        match &self.payload {
-            Some(payload) => {
-                let value: serde_json::Value = serde_json::from_slice(payload)
-                    .map_err(|error| crate::errors::CodecError::new_err(error.to_string()))?;
-                json_to_py(py, &value)
-            }
-            None => Ok(py.None()),
-        }
+    /// Tagged values in result-field order. Binary, decimal, UUID, and temporal values stay typed.
+    #[getter]
+    fn values(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.inner.values)
+    }
+
+    /// Backend-native vector distance or lexical rank.
+    #[getter]
+    fn score(&self) -> Option<f32> {
+        self.inner.score
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "Row(headers={} fields, partition={:?}, offset={:?}, has_payload={}, score={:?})",
-            self.headers.len(),
-            self.partition,
-            self.offset,
-            self.payload.is_some(),
-            self.score
+            "Row(values={} fields, score={:?})",
+            self.inner.values.len(),
+            self.inner.score
         )
     }
 }
@@ -261,14 +258,18 @@ pub struct PyQueryResult {
     #[pyo3(get)]
     pub rows: Vec<PyRow>,
     #[pyo3(get)]
-    pub offset: usize,
+    pub offset: Option<u64>,
     #[pyo3(get)]
-    pub limit: usize,
+    pub limit: u32,
     /// Exact match count, present only when the query used `with_total()`.
     #[pyo3(get)]
     pub total: Option<u64>,
     #[pyo3(get)]
     pub has_more: bool,
+    #[pyo3(get)]
+    pub next_cursor: Option<String>,
+    fields: Vec<laser_sdk::wire::schema::LogicalField>,
+    context: laser_sdk::query::QueryContext,
 }
 
 impl From<QueryResult> for PyQueryResult {
@@ -279,6 +280,9 @@ impl From<QueryResult> for PyQueryResult {
             limit: result.page.limit,
             total: result.page.total,
             has_more: result.page.has_more,
+            next_cursor: result.page.next_cursor,
+            fields: result.fields,
+            context: result.context,
         }
     }
 }
@@ -286,6 +290,40 @@ impl From<QueryResult> for PyQueryResult {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyQueryResult {
+    /// Ordered logical field metadata for every row.
+    #[getter]
+    fn fields(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.fields)
+    }
+
+    /// Engine, resolved target, consistency, checkpoint, and resource evidence.
+    #[getter]
+    fn context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.context)
+    }
+
+    /// Read one tagged value by logical field name.
+    fn value(&self, py: Python<'_>, row: &PyRow, field: &str) -> PyResult<Py<PyAny>> {
+        match self
+            .fields
+            .iter()
+            .position(|candidate| candidate.name == field)
+            .and_then(|index| row.inner.values.get(index))
+        {
+            Some(value) => ser_to_py(py, value),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// Read one value by logical field name in its stable diagnostic form.
+    fn value_text(&self, row: &PyRow, field: &str) -> Option<String> {
+        self.fields
+            .iter()
+            .position(|candidate| candidate.name == field)
+            .and_then(|index| row.inner.values.get(index))
+            .map(TypedValue::diagnostic_text)
+    }
+
     fn __len__(&self) -> usize {
         self.rows.len()
     }
@@ -301,10 +339,19 @@ pub struct PyQuery {
 }
 
 impl PyQuery {
-    fn new(laser: Laser, index: String) -> Self {
-        // The wire builder defaults the page size to 50, matching the Rust SDK's
-        // QueryRequest (a serde-default 0 would mean "a full page" managed-side).
-        let query = Query::builder().index(index).build();
+    fn new(laser: Laser, target: QueryTarget) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        let deadline_micros = u64::try_from(now)
+            .unwrap_or(u64::MAX)
+            .saturating_add(30_000_000);
+        let query = Query::builder()
+            .execution_id(laser_sdk::query::QueryExecutionId::mint())
+            .target(target)
+            .deadline_micros(deadline_micros)
+            .build();
         Self { laser, query }
     }
 
@@ -340,10 +387,12 @@ impl PyQuery {
     fn where_eq<'py>(
         mut slf: PyRefMut<'py, Self>,
         field: String,
-        value: String,
-    ) -> PyRefMut<'py, Self> {
-        slf.query.by_key.push(KeyMatch::new(field, value));
-        slf
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.query
+            .by_key
+            .push(KeyMatch::new(field, py_to_typed_value(value)?));
+        Ok(slf)
     }
 
     /// Narrow to the rows a single conversation produced (the conversation
@@ -367,12 +416,43 @@ impl PyQuery {
         slf
     }
 
+    /// Replace the absolute execution deadline in epoch microseconds.
+    fn deadline_micros(mut slf: PyRefMut<'_, Self>, value: u64) -> PyRefMut<'_, Self> {
+        slf.query.deadline_micros = value;
+        slf
+    }
+
+    /// Select one exact Iceberg snapshot for a lakehouse target.
+    fn at_snapshot(mut slf: PyRefMut<'_, Self>, snapshot_id: i64) -> PyResult<PyRefMut<'_, Self>> {
+        let QueryTarget::Lakehouse { snapshot, .. } = &mut slf.query.target else {
+            return Err(InvalidError::new_err(
+                "snapshot selection requires a lakehouse query target",
+            ));
+        };
+        *snapshot = Some(SnapshotSelector::SnapshotId(snapshot_id));
+        Ok(slf)
+    }
+
+    /// Select the retained Iceberg snapshot current at an epoch timestamp.
+    fn at_timestamp_micros(
+        mut slf: PyRefMut<'_, Self>,
+        timestamp_micros: i64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let QueryTarget::Lakehouse { snapshot, .. } = &mut slf.query.target else {
+            return Err(InvalidError::new_err(
+                "timestamp selection requires a lakehouse query target",
+            ));
+        };
+        *snapshot = Some(SnapshotSelector::TimestampMicros(timestamp_micros));
+        Ok(slf)
+    }
+
     fn filter_eq<'py>(
         mut slf: PyRefMut<'py, Self>,
         field: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(value)?;
+        let value = py_to_typed_value(value)?;
         slf.and_filter(Filter::pred(field, CmpOp::Eq, value));
         Ok(slf)
     }
@@ -382,7 +462,7 @@ impl PyQuery {
         field: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(value)?;
+        let value = py_to_typed_value(value)?;
         slf.and_filter(Filter::pred(field, CmpOp::Ne, value));
         Ok(slf)
     }
@@ -392,7 +472,7 @@ impl PyQuery {
         field: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(value)?;
+        let value = py_to_typed_value(value)?;
         slf.and_filter(Filter::pred(field, CmpOp::Gt, value));
         Ok(slf)
     }
@@ -402,7 +482,7 @@ impl PyQuery {
         field: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(value)?;
+        let value = py_to_typed_value(value)?;
         slf.and_filter(Filter::pred(field, CmpOp::Gte, value));
         Ok(slf)
     }
@@ -412,7 +492,7 @@ impl PyQuery {
         field: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(value)?;
+        let value = py_to_typed_value(value)?;
         slf.and_filter(Filter::pred(field, CmpOp::Lt, value));
         Ok(slf)
     }
@@ -422,7 +502,7 @@ impl PyQuery {
         field: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(value)?;
+        let value = py_to_typed_value(value)?;
         slf.and_filter(Filter::pred(field, CmpOp::Lte, value));
         Ok(slf)
     }
@@ -432,7 +512,7 @@ impl PyQuery {
         field: String,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let value = py_to_value(values)?;
+        let value = py_to_typed_value(values)?;
         slf.and_filter(Filter::pred(field, CmpOp::In, value));
         Ok(slf)
     }
@@ -484,12 +564,20 @@ impl PyQuery {
     }
 
     fn limit(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
-        slf.query.limit = n;
+        slf.query.page.limit = u32::try_from(n).unwrap_or(u32::MAX);
         slf
     }
 
-    fn offset(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
-        slf.query.offset = n;
+    fn offset(mut slf: PyRefMut<'_, Self>, n: u64) -> PyRefMut<'_, Self> {
+        slf.query.page.offset = Some(n);
+        slf.query.page.cursor = None;
+        slf
+    }
+
+    /// Resume from an opaque cursor returned by the server.
+    fn cursor<'py>(mut slf: PyRefMut<'py, Self>, value: String) -> PyRefMut<'py, Self> {
+        slf.query.page.cursor = Some(value);
+        slf.query.page.offset = None;
         slf
     }
 
@@ -504,7 +592,7 @@ impl PyQuery {
     /// exact. Ask for this only when the exact count itself matters, it costs
     /// a full scan on a wide filter.
     fn with_total(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
-        slf.query.want_total = true;
+        slf.query.page.want_total = true;
         slf
     }
 
@@ -651,13 +739,42 @@ impl PyQuery {
         slf
     }
 
-    /// Raw-SQL escape hatch (single read-only SELECT, SQL backends only).
-    fn raw_sql<'py>(mut slf: PyRefMut<'py, Self>, sql: String) -> PyRefMut<'py, Self> {
+    /// Raw-SQL escape hatch with an explicit backend dialect and typed parameters.
+    #[pyo3(signature = (sql, params=None, *, dialect="data_fusion"))]
+    fn raw_sql<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        sql: String,
+        params: Option<&Bound<'_, PyAny>>,
+        dialect: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let dialect = match dialect {
+            "data_fusion" => SqlDialect::DataFusion,
+            "postgres" => SqlDialect::Postgres,
+            "my_sql" => SqlDialect::MySql,
+            "sqlite" => SqlDialect::Sqlite,
+            other => {
+                return Err(InvalidError::new_err(format!(
+                    "unknown SQL dialect '{other}'"
+                )));
+            }
+        };
+        let params = match params {
+            Some(values) => match py_to_typed_value(values)? {
+                TypedValue::List(values) => values,
+                _ => {
+                    return Err(InvalidError::new_err(
+                        "raw SQL params must be a list or tuple",
+                    ));
+                }
+            },
+            None => Vec::new(),
+        };
         slf.query.raw_sql = Some(RawSql {
+            dialect,
             sql,
-            params: Vec::new(),
+            params,
         });
-        slf
+        Ok(slf)
     }
 
     /// Approximate nearest-neighbour search on `field` (default "embedding").
@@ -665,7 +782,7 @@ impl PyQuery {
     fn nearest<'py>(
         mut slf: PyRefMut<'py, Self>,
         embedding: Vec<f32>,
-        top_k: usize,
+        top_k: u32,
         field: Option<String>,
     ) -> PyRefMut<'py, Self> {
         let field = field.unwrap_or_else(|| laser_sdk::query::VECTOR_FIELD.to_owned());
@@ -704,7 +821,7 @@ impl PyQuery {
         query.select.payload = true;
         future_into_py(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
-            decode_rows_json(result.rows)
+            decode_rows_json(result)
         })
     }
 
@@ -713,13 +830,33 @@ impl PyQuery {
         let laser = self.laser.clone();
         let mut query = self.query.clone();
         query.select.payload = true;
-        query.limit = 1;
+        query.page.limit = 1;
         future_into_py(py, async move {
             let result = laser.execute_query(query).await.map_err(to_pyerr)?;
             Python::attach(|py| match result.rows.into_iter().next() {
-                Some(row) => decode_one_json(py, &row),
+                Some(row) => decode_one_json(py, &result.fields, &row),
                 None => Ok(py.None()),
             })
+        })
+    }
+
+    /// Read the current execution state for this query identity.
+    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let execution_id = self.query.execution_id;
+        future_into_py(py, async move {
+            let status = laser.query_status(execution_id).await.map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &status))
+        })
+    }
+
+    /// Request cancellation for this query identity and return its observed state.
+    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let execution_id = self.query.execution_id;
+        future_into_py(py, async move {
+            let status = laser.cancel_query(execution_id).await.map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &status))
         })
     }
 
@@ -739,44 +876,59 @@ fn agg_call(func: AggFunc, field: Option<String>, arg: Option<f64>, alias: &str)
 }
 
 // Walk every page of `query`, mirroring the SDK's `QueryStream`: aggregate /
-// vector queries are single-page, everything else advances `offset` until the
-// page reports no more (or comes back empty).
+// vector queries are single-page, while other queries follow opaque cursors.
 async fn collect_all(laser: &Laser, mut query: Query) -> Result<Vec<Row>, laser_sdk::LaserError> {
-    if query.limit == 0 {
-        query.limit = 100;
+    if query.page.limit == 0 {
+        query.page.limit = 100;
     }
     let single_page = query.aggregate.is_some() || query.vector.is_some();
     let mut rows = Vec::new();
+    let mut page = laser.execute_query(query.clone()).await?;
     loop {
-        let page = laser.execute_query(query.clone()).await?;
-        let fetched = page.rows.len();
+        let cursor = page.page.next_cursor.clone();
+        let done = single_page || page.rows.is_empty() || !page.page.has_more;
         rows.extend(page.rows);
-        let done = single_page || fetched == 0 || !page.page.has_more;
         if done {
             break;
         }
-        query.offset = query.offset.saturating_add(fetched);
+        let Some(cursor) = cursor else {
+            break;
+        };
+        query.page.offset = None;
+        query.page.cursor = Some(cursor);
+        page = laser.execute_query(query.clone()).await?;
     }
     Ok(rows)
 }
 
-fn decode_rows_json(rows: Vec<Row>) -> PyResult<Py<PyAny>> {
+fn decode_rows_json(result: QueryResult) -> PyResult<Py<PyAny>> {
     Python::attach(|py| {
-        let mut decoded = Vec::with_capacity(rows.len());
-        for row in &rows {
-            decoded.push(decode_one_json(py, row)?);
+        let mut decoded = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            decoded.push(decode_one_json(py, &result.fields, row)?);
         }
         Ok(decoded.into_pyobject(py)?.unbind().into_any())
     })
 }
 
-fn decode_one_json(py: Python<'_>, row: &Row) -> PyResult<Py<PyAny>> {
-    match &row.payload {
-        Some(payload) => {
-            let value: serde_json::Value = serde_json::from_slice(payload)
+fn decode_one_json(
+    py: Python<'_>,
+    fields: &[laser_sdk::wire::schema::LogicalField],
+    row: &Row,
+) -> PyResult<Py<PyAny>> {
+    let payload = fields
+        .iter()
+        .position(|field| field.name == laser_sdk::wire::schema::ORIGINAL_PAYLOAD_FIELD_NAME)
+        .and_then(|index| row.values.get(index));
+    match payload {
+        Some(TypedValue::Binary(payload)) => {
+            let value: serde_json::Value = serde_json::from_slice(&payload.0)
                 .map_err(|error| crate::errors::CodecError::new_err(error.to_string()))?;
             json_to_py(py, &value)
         }
+        Some(_) => Err(InvalidError::new_err(
+            "query original payload field is not binary",
+        )),
         None => Ok(py.None()),
     }
 }

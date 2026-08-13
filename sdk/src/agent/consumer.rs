@@ -163,14 +163,14 @@ impl AgentMessage {
     fn from_received(
         received: ReceivedMessage,
         understood_features: u64,
-    ) -> Result<DecodedAgentMessage, (LaserError, Vec<u8>)> {
+    ) -> Result<DecodedAgentMessage, (Box<LaserError>, Vec<u8>)> {
         // The message's own offset, not `received.current_offset` (the partition
         // high-water, shared across a polled batch).
         let id = MessageId::new(received.partition_id, received.message.header.offset);
         let payload = received.message.payload.to_vec();
         let decoded = match decode_agent_record(&received.message, understood_features) {
             Ok(decoded) => decoded,
-            Err(error) => return Err((error, payload)),
+            Err(error) => return Err((Box::new(error), payload)),
         };
         Ok(DecodedAgentMessage {
             message: Self {

@@ -19,6 +19,10 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_SET_CLIENT_METADATA_CODE, 1_000_002);
     assert_eq!(AGDX_GET_CLIENTS_METADATA_CODE, 1_000_003);
     assert_eq!(AGDX_BATCH_CODE, 1_000_020);
+    assert_eq!(AGDX_CHECKPOINT_CODE, 1_000_021);
+    assert_eq!(AGDX_DESTINATION_GET_CODE, 1_000_022);
+    assert_eq!(AGDX_DESTINATION_LIST_CODE, 1_000_023);
+    assert_eq!(AGDX_QUERY_ROUTE_LIST_CODE, 1_000_024);
     assert_eq!(AGDX_AUTHZ_BASE, 1_000_100);
     assert_eq!(AGDX_AUTHZ_WHOAMI_CODE, 1_000_100);
     assert_eq!(AGDX_AUTHZ_LIST_ROLES_CODE, 1_000_101);
@@ -27,8 +31,12 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_AUTHZ_DEFINE_ROLE_CODE, 1_000_104);
     assert_eq!(AGDX_AUTHZ_DELETE_ROLE_CODE, 1_000_105);
     assert_eq!(AGDX_AUTHZ_BIND_ROLES_CODE, 1_000_106);
+    assert_eq!(AGDX_AUTHZ_HISTORY_CODE, 1_000_107);
     assert_eq!(AGDX_QUERY_BASE, 1_000_200);
     assert_eq!(AGDX_QUERY_CODE, 1_000_200);
+    assert_eq!(AGDX_QUERY_PAGE_CODE, 1_000_201);
+    assert_eq!(AGDX_QUERY_CANCEL_CODE, 1_000_202);
+    assert_eq!(AGDX_QUERY_STATUS_CODE, 1_000_203);
     assert_eq!(AGDX_GET_PROJECTION_CODE, 1_000_210);
     assert_eq!(AGDX_LIST_PROJECTIONS_CODE, 1_000_211);
     assert_eq!(AGDX_GET_SCHEMA_CODE, 1_000_220);
@@ -75,11 +83,13 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(CONTROL_OP_VERSION, 1);
     assert_eq!(KV_OP_VERSION, 1);
     assert_eq!(FORK_OP_VERSION, 1);
+    assert_eq!(GRAPH_OP_VERSION, 1);
     assert_eq!(AGENT_OP_VERSION, 1);
     assert_eq!(AGENT_WORKFLOW_OP_VERSION, 1);
     assert_eq!(BATCH_OP_VERSION, 1);
     assert_eq!(CHANGE_OP_VERSION, 1);
     assert_eq!(CLIENT_METADATA_OP_VERSION, 1);
+    assert_eq!(CHECKPOINT_OP_VERSION, 1);
     assert_eq!(PRESENCE_OP_VERSION, 1);
 }
 
@@ -97,6 +107,7 @@ fn given_capability_feature_bits_when_compared_then_should_match_the_dictionary(
     assert_eq!(feature::KEYWORD_SEARCH, 1 << 5);
     assert_eq!(feature::WATCH, 1 << 6);
     assert_eq!(feature::AUTHZ, 1 << 7);
+    assert_eq!(feature::DESTINATIONS, 1 << 8);
 }
 
 #[test]
@@ -106,6 +117,7 @@ fn given_header_keys_when_compared_then_should_match_the_dictionary() {
     assert_eq!(headers::IDX_PREFIX, "agdx.idx.");
     assert_eq!(headers::INLINE_PAYLOAD, "agdx.inline");
     assert_eq!(headers::PROJECTION_REF, "agdx.ref");
+    assert_eq!(headers::LOGICAL_SCHEMA_FINGERPRINT, "agdx.sfp");
     assert_eq!(headers::CORRELATION_ID, "agdx.corr");
     assert_eq!(headers::FIELD_MESSAGE_TYPE, "message_type");
     assert_eq!(headers::FIELD_TS, "ts");

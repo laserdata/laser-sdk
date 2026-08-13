@@ -26,6 +26,7 @@ __all__ = [
     "CrashContext",
     "Cursor",
     "Decision",
+    "Destinations",
     "FileStore",
     "ForkHandle",
     "ForkPutRequest",
@@ -453,26 +454,42 @@ class AuthzHistoryPage:
 @typing.final
 class BackendDescriptor:
     r"""
-    One materialization backend the connected server exposes: identity only, a
-    stable `id` and an opaque engine `kind`, with optional advisory `label` and
-    `version` and a set of opaque `capabilities` tags the backend declares about
-    itself (e.g. "ingest", "query", a query-surface feature). A consumer routes
-    only to an advertised `id` and matches the tags it understands.
+    One structured, versioned backend observation from the connected server.
     """
     @property
-    def id(self) -> builtins.str: ...
+    def descriptor_version(self) -> builtins.int: ...
+    @property
+    def resource_id(self) -> builtins.str: ...
+    @property
+    def mode(self) -> builtins.str: ...
+    @property
+    def label(self) -> builtins.str: ...
     @property
     def kind(self) -> builtins.str: ...
     @property
-    def label(self) -> typing.Optional[builtins.str]: ...
+    def version(self) -> builtins.str: ...
     @property
-    def version(self) -> typing.Optional[builtins.str]: ...
+    def observed_backend_generation(self) -> builtins.int: ...
     @property
-    def capabilities(self) -> builtins.list[builtins.str]: ...
-    def has_capability(self, tag: builtins.str) -> builtins.bool:
-        r"""
-        Whether the backend declared the opaque capability `tag`.
-        """
+    def observed_runtime_configuration_revision(self) -> builtins.int: ...
+    @property
+    def desired_state(self) -> builtins.str: ...
+    @property
+    def observed_state(self) -> builtins.str: ...
+    @property
+    def ready(self) -> builtins.bool: ...
+    @property
+    def readiness(self) -> typing.Any: ...
+    @property
+    def materialization(self) -> typing.Any: ...
+    @property
+    def query(self) -> typing.Any: ...
+    @property
+    def schema(self) -> typing.Any: ...
+    @property
+    def maintenance(self) -> typing.Any: ...
+    @property
+    def limits(self) -> typing.Any: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -521,6 +538,10 @@ class BatchPublishRequest:
         r"""
         Append one already-encoded record plus its content type (e.g. "avro",
         "protobuf", "cbor"). Use it for bodies you encoded with another library.
+        """
+    def add_arrow_ipc(self, value: typing.Any, metadata: typing.Any) -> BatchPublishRequest:
+        r"""
+        Append one complete self-contained Arrow IPC stream with validated metadata.
         """
     def add_avro(self, schema: CompiledSchema, schema_id: builtins.int, value: typing.Any) -> BatchPublishRequest:
         r"""
@@ -572,6 +593,18 @@ class Capabilities:
     def query_keyword(self) -> builtins.bool:
         r"""
         The query surface serves lexical keyword search (`Query.text(...)`).
+        """
+    @property
+    def destinations(self) -> builtins.bool:
+        r"""
+        Materialization destination declarations and the checkpoint lifecycle
+        are served.
+        """
+    @property
+    def destinations_consistency(self) -> builtins.str:
+        r"""
+        The checkpoint read consistency the destination surface serves
+        (`linearizable` / `potentially_stale`).
         """
     @property
     def kv(self) -> builtins.bool:
@@ -1016,6 +1049,41 @@ class Decision:
     def __laser_json__(self) -> typing.Any: ...
     @staticmethod
     def __laser_from_json__(value: typing.Any) -> Decision: ...
+
+@typing.final
+class Destinations:
+    def mutate(self, expected_global_state_revision: builtins.int, mutation: typing.Any) -> typing.Any:
+        r"""
+        Submit one bounded public checkpoint mutation dict.
+        """
+    def register(self, expected_global_state_revision: builtins.int, destination: typing.Any) -> typing.Any:
+        r"""
+        Register one complete materialization destination declaration dict.
+        """
+    def set_desired_state(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_definition_revision: builtins.int, desired_state: builtins.str) -> typing.Any:
+        r"""
+        Enable or disable a destination with definition-revision compare-and-set.
+        """
+    def get(self, destination_id: builtins.str, *, consistency: builtins.str = 'potentially_stale') -> typing.Any:
+        r"""
+        Read one destination declaration and checkpoint status.
+        """
+    def list(self, *, filter: typing.Optional[typing.Any] = None, after: typing.Optional[builtins.str] = None, limit: builtins.int = 100, consistency: builtins.str = 'potentially_stale') -> typing.Any:
+        r"""
+        List destination declarations and checkpoint status using a bounded page.
+        """
+    def register_query_route(self, expected_global_state_revision: builtins.int, route: typing.Any) -> typing.Any:
+        r"""
+        Register one explicit logical query route declaration dict.
+        """
+    def remove_query_route(self, expected_global_state_revision: builtins.int, route_id: builtins.str, route_generation: builtins.int, expected_definition_revision: builtins.int) -> typing.Any:
+        r"""
+        Remove one query route generation with definition-revision compare-and-set.
+        """
+    def query_routes(self, *, name_contains: typing.Optional[builtins.str] = None, after: typing.Optional[builtins.str] = None, limit: builtins.int = 100, consistency: builtins.str = 'potentially_stale') -> typing.Any:
+        r"""
+        List explicit query routes using a bounded page.
+        """
 
 @typing.final
 class FileStore:
@@ -1828,7 +1896,7 @@ class Laser:
         A clone whose change-feed records publish to `changes_topic` on the ops
         stream instead of the default `changes`.
         """
-    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
+    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Return a clone with selected negotiated capabilities overridden. This is
         intended for bring-your-own backends and deterministic pre-gate tests.
@@ -1870,6 +1938,10 @@ class Laser:
         `append` publishes into the conversation, `fetch` reads it back bounded,
         and `memory` scopes a memory handle to the same conversation so recall
         and remember never repeat the id. Free and synchronous, IO at the verbs.
+        """
+    def destinations(self) -> Destinations:
+        r"""
+        Open the managed materialization destination and query-route surface.
         """
     def fork(self, fork_id: builtins.str) -> ForkHandle:
         r"""
@@ -1983,6 +2055,14 @@ class Laser:
         aggregates, then `await` a terminal (`fetch`, `fetch_all`, `fetch_typed`,
         `fetch_one`). Query is a managed feature: against Apache Iggy it raises
         `UnsupportedError`.
+        """
+    def query_target(self, target: typing.Any) -> QueryRequest:
+        r"""
+        Start a query against an explicit operational or lakehouse target dict.
+        """
+    def query_lakehouse(self, destination_id: builtins.str, destination_generation: builtins.int) -> QueryRequest:
+        r"""
+        Start a query against one materialization destination generation.
         """
     def register_projection(self, projection: typing.Any) -> typing.Any:
         r"""
@@ -2301,6 +2381,8 @@ class OpVersions:
     @property
     def graph(self) -> builtins.int: ...
     @property
+    def checkpoint(self) -> builtins.int: ...
+    @property
     def features(self) -> builtins.int: ...
     def __repr__(self) -> builtins.str: ...
 
@@ -2490,7 +2572,7 @@ class PublishRequest:
         """
     def header(self, key: builtins.str, value: builtins.str) -> PublishRequest:
         r"""
-        Attach a non-indexed metadata header, surfaced as `Row.metadata`.
+        Attach a non-indexed metadata header to the Iggy record.
         """
     def inline_payload(self) -> PublishRequest:
         r"""
@@ -2532,6 +2614,10 @@ class PublishRequest:
         "protobuf", "cbor"). Encode the body with whichever library you prefer,
         hand the bytes and the codec tag in one call.
         """
+    def arrow_ipc(self, value: typing.Any, metadata: typing.Any) -> PublishRequest:
+        r"""
+        Publish one complete self-contained Arrow IPC stream with validated metadata.
+        """
     def avro(self, schema: CompiledSchema, schema_id: builtins.int, value: typing.Any) -> PublishRequest:
         r"""
         Encode `value` as a raw Avro datum under a compiled writer schema and
@@ -2550,7 +2636,7 @@ class QueryRequest:
     Fluent query builder over a materialized index. Mutates an owned `Query` and
     executes it through the managed query command at a terminal.
     """
-    def where_eq(self, field: builtins.str, value: builtins.str) -> QueryRequest:
+    def where_eq(self, field: builtins.str, value: typing.Any) -> QueryRequest:
         r"""
         Exact-match on an indexed field (point lookup).
         """
@@ -2564,6 +2650,18 @@ class QueryRequest:
     def fork(self, fork_id: builtins.str) -> QueryRequest:
         r"""
         Resolve against a fork's copy-on-write view instead of the trunk.
+        """
+    def deadline_micros(self, value: builtins.int) -> QueryRequest:
+        r"""
+        Replace the absolute execution deadline in epoch microseconds.
+        """
+    def at_snapshot(self, snapshot_id: builtins.int) -> QueryRequest:
+        r"""
+        Select one exact Iceberg snapshot for a lakehouse target.
+        """
+    def at_timestamp_micros(self, timestamp_micros: builtins.int) -> QueryRequest:
+        r"""
+        Select the retained Iceberg snapshot current at an epoch timestamp.
         """
     def filter_eq(self, field: builtins.str, value: typing.Any) -> QueryRequest: ...
     def filter_ne(self, field: builtins.str, value: typing.Any) -> QueryRequest: ...
@@ -2586,6 +2684,10 @@ class QueryRequest:
     def order_desc(self, field: builtins.str) -> QueryRequest: ...
     def limit(self, n: builtins.int) -> QueryRequest: ...
     def offset(self, n: builtins.int) -> QueryRequest: ...
+    def cursor(self, value: builtins.str) -> QueryRequest:
+        r"""
+        Resume from an opaque cursor returned by the server.
+        """
     def with_payload(self) -> QueryRequest:
         r"""
         Return the opaque payload bytes on each row.
@@ -2639,9 +2741,9 @@ class QueryRequest:
         r"""
         Bucket the aggregate into tumbling windows of `every_micros` over `field`.
         """
-    def raw_sql(self, sql: builtins.str) -> QueryRequest:
+    def raw_sql(self, sql: builtins.str, params: typing.Optional[typing.Any] = None, *, dialect: builtins.str = 'data_fusion') -> QueryRequest:
         r"""
-        Raw-SQL escape hatch (single read-only SELECT, SQL backends only).
+        Raw-SQL escape hatch with an explicit backend dialect and typed parameters.
         """
     def nearest(self, embedding: typing.Sequence[builtins.float], top_k: builtins.int, *, field: typing.Optional[builtins.str] = None) -> QueryRequest:
         r"""
@@ -2663,6 +2765,14 @@ class QueryRequest:
         r"""
         Run the query capped at one row, decoding its JSON payload, or `None`.
         """
+    def status(self) -> typing.Any:
+        r"""
+        Read the current execution state for this query identity.
+        """
+    def cancel(self) -> typing.Any:
+        r"""
+        Request cancellation for this query identity and return its observed state.
+        """
     def to_dict(self) -> typing.Any:
         r"""
         The raw query as a dict (debugging).
@@ -2676,7 +2786,7 @@ class QueryResult:
     @property
     def rows(self) -> builtins.list[Row]: ...
     @property
-    def offset(self) -> builtins.int: ...
+    def offset(self) -> typing.Optional[builtins.int]: ...
     @property
     def limit(self) -> builtins.int: ...
     @property
@@ -2686,6 +2796,26 @@ class QueryResult:
         """
     @property
     def has_more(self) -> builtins.bool: ...
+    @property
+    def next_cursor(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def fields(self) -> typing.Any:
+        r"""
+        Ordered logical field metadata for every row.
+        """
+    @property
+    def context(self) -> typing.Any:
+        r"""
+        Engine, resolved target, consistency, checkpoint, and resource evidence.
+        """
+    def value(self, row: Row, field: builtins.str) -> typing.Any:
+        r"""
+        Read one tagged value by logical field name.
+        """
+    def value_text(self, row: Row, field: builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        Read one value by logical field name in its stable diagnostic form.
+        """
     def __len__(self) -> builtins.int: ...
 
 @typing.final
@@ -2758,29 +2888,17 @@ class Role:
 @typing.final
 class Row:
     r"""
-    One materialized query row: indexed fields, ride-along metadata, log position,
-    optional inlined payload, and vector score.
+    One typed query row. Values are positionally aligned with `QueryResult.fields`.
     """
     @property
-    def headers(self) -> builtins.dict[builtins.str, builtins.str]: ...
-    @property
-    def metadata(self) -> builtins.dict[builtins.str, builtins.str]: ...
-    @property
-    def partition(self) -> typing.Optional[builtins.int]: ...
-    @property
-    def offset(self) -> typing.Optional[builtins.int]: ...
-    @property
-    def stream(self) -> typing.Optional[builtins.int]: ...
-    @property
-    def topic(self) -> typing.Optional[builtins.int]: ...
-    @property
-    def payload(self) -> typing.Optional[builtins.list[builtins.int]]: ...
-    @property
-    def score(self) -> typing.Optional[builtins.float]: ...
-    def json(self) -> typing.Any:
+    def values(self) -> typing.Any:
         r"""
-        Decode the inlined payload as JSON into a Python value, or `None` when the
-        row carries no payload.
+        Tagged values in result-field order. Binary, decimal, UUID, and temporal values stay typed.
+        """
+    @property
+    def score(self) -> typing.Optional[builtins.float]:
+        r"""
+        Backend-native vector distance or lexical rank.
         """
     def __repr__(self) -> builtins.str: ...
 

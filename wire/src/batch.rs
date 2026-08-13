@@ -39,7 +39,7 @@ pub struct BatchReply {
     pub results: Vec<Vec<u8>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
     use crate::framing::{decode_named, encode_named};

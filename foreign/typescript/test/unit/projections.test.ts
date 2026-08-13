@@ -186,7 +186,7 @@ void test("given_open_capabilities_when_get_is_called_then_should_reject_before_
 
 void test("given_an_err_reply_when_get_fails_then_should_wrap_it_as_a_query_execution_error", async () => {
   const transport = fakeTransport([
-    replyFrame({ kind: "err", error: { kind: "indexNotFound", message: "no such projection" } })
+    replyFrame({ kind: "err", error: { kind: "index_not_found", message: "no such projection" } })
   ])
   const projections = new Projections(
     transport,
@@ -202,7 +202,7 @@ void test("given_a_binding_when_applied_and_removed_then_should_publish_the_righ
   const binding = {
     source: { stream: "orders", topic: "events" },
     allowedProjections: [ROW_PROJECTION.id],
-    targets: [],
+    index: "events",
     notify: false
   }
   await bindings.apply(binding)

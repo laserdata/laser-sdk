@@ -9,7 +9,7 @@ The TypeScript peer lives under `foreign/typescript/src/context*`, `conversation
 
 These modules reconstruct state from the durable log: assemble an ordered window of a conversation, fold it into state, or recall scoped memory items. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
 
-Feature `vsr` changes the underlying Iggy framing and enables the fork's AGDX classifier. Context assembly, cursors, conversation-state replay, topic snapshots, and folded `LogMemory` use standard append and poll commands and keep the same behavior. KV-backed recall, query, graph, and other managed memory composition use the non-replicated extension path. Callers must still keep capability and `Unsupported` handling for a broker that does not serve AGDX.
+Iggy provides the VSR transport and AGDX command classifier. Context assembly, cursors, conversation-state replay, topic snapshots, and folded `LogMemory` use standard append and poll commands. KV-backed recall, query, graph, and other managed memory composition use the non-replicated extension path. Callers must keep capability and `Unsupported` handling for an Iggy server that does not serve AGDX.
 
 ## STOP and ask the user before
 

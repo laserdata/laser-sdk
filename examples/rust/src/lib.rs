@@ -296,7 +296,7 @@ pub async fn ensure_view(
         )
         .allow(projection_id.clone())
         .default_projection(projection_id)
-        .target_table(index)
+        .index(index)
         // Opt into the change feed so a reader can await the view's advance
         // (`laser.watch()`) instead of re-querying blind.
         .notify()

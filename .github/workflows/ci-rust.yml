@@ -37,7 +37,7 @@ jobs:
   # its title, body, or commit message is a breaking wire change whose
   # matching server release does not exist yet: both run every server-free
   # gate and skip only the suites that need the released server binary. The
-  # follow-up that bumps the pinned server version runs the full pipeline.
+  # unchanged revision runs the full pipeline after the pinned server exists.
   flags:
     runs-on: ubuntu-latest
     outputs:
@@ -324,7 +324,7 @@ jobs:
           cargo +nightly fuzz run decode_envelope -- -max_total_time=30
 
   # Cross-SDK BDD conformance: the Rust reference runner executes the shared
-  # Gherkin scenarios against the released VSR-only Iggy fork.
+  # Gherkin scenarios against the released Iggy binary.
   # Query DSL semantics run through the pure reference engine, with no managed backend.
   bdd:
     needs: [flags]

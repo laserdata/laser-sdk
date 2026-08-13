@@ -1,0 +1,114 @@
+{
+  "table_uuid": [
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9
+  ],
+  "iceberg_schema_id": 3,
+  "logical_schema": {
+    "schema": {
+      "id": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        100
+      ],
+      "version": 2,
+      "fingerprint": [
+        92,
+        114,
+        229,
+        92,
+        196,
+        56,
+        207,
+        143,
+        39,
+        18,
+        198,
+        218,
+        59,
+        167,
+        55,
+        194,
+        123,
+        11,
+        55,
+        145,
+        114,
+        189,
+        188,
+        213,
+        173,
+        105,
+        60,
+        33,
+        165,
+        118,
+        177,
+        48
+      ]
+    },
+    "fields": [
+      {
+        "id": 1,
+        "name": "order_id",
+        "required": true,
+        "field_type": {
+          "kind": "uuid"
+        },
+        "doc": "Stable order identity"
+      },
+      {
+        "id": 2,
+        "name": "line_items",
+        "required": true,
+        "field_type": {
+          "kind": "list",
+          "element_id": 3,
+          "element_required": true,
+          "element": {
+            "kind": "struct",
+            "fields": [
+              {
+                "id": 4,
+                "name": "amount",
+                "required": true,
+                "field_type": {
+                  "kind": "decimal",
+                  "precision": 18,
+                  "scale": 2
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

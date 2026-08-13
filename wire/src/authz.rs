@@ -1,6 +1,7 @@
 use crate::codes::*;
 use crate::error::InvalidError;
 use crate::limits::MAX_ROLE_NAME_BYTES;
+use crate::{checkpoint::CheckpointRequestId, destination::DestinationId};
 use serde::{Deserialize, Serialize};
 
 /// Whether a grant permits or forbids. `Deny` always wins over `Allow`.
@@ -53,6 +54,8 @@ pub enum Feature {
     Query,
     Agent,
     Workflow,
+    Destination,
+    Checkpoint,
     /// Administration of the authorization layer itself (defining roles and
     /// binding them). Gated by `authz:admin`, never derived from a command code.
     Authz,
@@ -65,6 +68,85 @@ pub enum Feature {
     /// into this same deny sink.
     #[serde(other)]
     Unrecognized,
+}
+
+pub const SUPERVISOR_ASSERTION_VERSION: u32 = 1;
+pub const SUPERVISOR_ASSERTION_DOMAIN: &[u8] = b"agdx.supervisor-actor.v1";
+pub const MAX_SUPERVISOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
+pub const SUPERVISOR_ASSERTION_KEY_ID_BYTES: usize = 8;
+pub const SUPERVISOR_ASSERTION_SIGNATURE_BYTES: usize = 64;
+
+/// Canonical claims signed by supervisor for one high-risk Iggy mutation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorActorClaims {
+    pub v: u32,
+    pub request_id: CheckpointRequestId,
+    pub deployment_id: u32,
+    pub cloud_user_id: u32,
+    pub action: SupervisorAssertionAction,
+    pub destination_id: DestinationId,
+    pub destination_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    pub issued_at_micros: u64,
+    pub expires_at_micros: u64,
+}
+
+/// Signed cloud-user evidence accepted only for the exact action and destination.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorActorAssertion {
+    pub claims: SupervisorActorClaims,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key_id: Vec<u8>,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SupervisorAssertionAction {
+    AcceptRetentionGap,
+    SupersedeGeneration,
+    RecordRepair,
+}
+
+impl SupervisorActorAssertion {
+    pub fn validate(&self) -> Result<(), InvalidError> {
+        let claims = &self.claims;
+        if claims.v != SUPERVISOR_ASSERTION_VERSION {
+            return Err(InvalidError::new(format!(
+                "supervisor assertion version must be {SUPERVISOR_ASSERTION_VERSION}"
+            )));
+        }
+        if claims.request_id.as_u128() == 0
+            || claims.deployment_id == 0
+            || claims.cloud_user_id == 0
+            || claims.destination_id.as_u128() == 0
+            || claims.destination_generation == 0
+        {
+            return Err(InvalidError::new(
+                "supervisor assertion identities must be nonzero",
+            ));
+        }
+        if claims.issued_at_micros == 0
+            || claims.expires_at_micros <= claims.issued_at_micros
+            || claims.expires_at_micros - claims.issued_at_micros
+                > MAX_SUPERVISOR_ASSERTION_TTL_MICROS
+        {
+            return Err(InvalidError::new(
+                "supervisor assertion validity window is invalid",
+            ));
+        }
+        if self.key_id.len() != SUPERVISOR_ASSERTION_KEY_ID_BYTES
+            || self.signature.len() != SUPERVISOR_ASSERTION_SIGNATURE_BYTES
+        {
+            return Err(InvalidError::new(
+                "supervisor assertion key id or signature length is invalid",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The verb a grant permits, derived from the command code by [`feature_action`].
@@ -208,7 +290,14 @@ pub fn validate_role_name(name: &str) -> Result<(), InvalidError> {
 /// batch, and the authz band itself), which is gated another way.
 pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
     let pair = match code {
-        AGDX_QUERY_CODE => (Feature::Query, Action::Read),
+        AGDX_QUERY_CODE | AGDX_QUERY_PAGE_CODE | AGDX_QUERY_STATUS_CODE => {
+            (Feature::Query, Action::Read)
+        }
+        AGDX_QUERY_CANCEL_CODE => (Feature::Query, Action::Delete),
+        AGDX_DESTINATION_GET_CODE | AGDX_DESTINATION_LIST_CODE | AGDX_QUERY_ROUTE_LIST_CODE => {
+            (Feature::Destination, Action::Read)
+        }
+        AGDX_CHECKPOINT_CODE => (Feature::Checkpoint, Action::Write),
         AGDX_GET_PROJECTION_CODE
         | AGDX_LIST_PROJECTIONS_CODE
         | AGDX_GET_SCHEMA_CODE

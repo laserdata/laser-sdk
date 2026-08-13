@@ -2,13 +2,20 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::query::{
     AGDX_QUERY_CODE, AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch,
-    MAX_PAGE_SIZE, QUERY_OP_VERSION, Query, QueryEnvelope, QueryError, QueryReply, QueryResult,
-    RawSql, Row, Sort, TextQuery, VECTOR_FIELD, Value, VectorQuery, Window,
+    MAX_PAGE_SIZE, QUERY_OP_VERSION, Query, QueryCancelEnvelope, QueryCancelReply, QueryEnvelope,
+    QueryError, QueryExecutionId, QueryExecutionStatus, QueryPageEnvelope, QueryReply, QueryResult,
+    QueryStatusEnvelope, QueryStatusReply, QueryTarget, RawSql, Row, SnapshotSelector, Sort,
+    SqlDialect, TextQuery, TypedValue, VECTOR_FIELD, VectorQuery, Window,
 };
 use crate::stream::Decoder;
-use crate::types::ConversationId;
+use crate::types::{ConversationId, MintUlid};
 use laser_wire::framing::encode_named;
+use laser_wire::schema::ORIGINAL_PAYLOAD_FIELD_NAME;
+use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
 
 impl Laser {
     /// Start a query over `index`. Returns a fluent builder, finished with
@@ -30,7 +37,25 @@ impl Laser {
     /// # Ok(()) }
     /// ```
     pub fn query<'a>(&'a self, index: &'a str) -> QueryRequest<'a> {
-        QueryRequest::new(self, index)
+        QueryRequest::new(self, QueryTarget::operational(index))
+    }
+
+    /// Start a query against an explicit operational or lakehouse target.
+    pub fn query_target(&self, target: QueryTarget) -> QueryRequest<'_> {
+        QueryRequest::new(self, target)
+    }
+
+    /// Start a query against one destination generation.
+    pub fn query_lakehouse(
+        &self,
+        destination_id: laser_wire::destination::DestinationId,
+        destination_generation: u64,
+    ) -> QueryRequest<'_> {
+        self.query_target(QueryTarget::Lakehouse {
+            destination_id,
+            destination_generation,
+            snapshot: None,
+        })
     }
 
     /// Lower-level: execute a pre-built `Query` and return the raw paged result.
@@ -40,6 +65,8 @@ impl Laser {
     /// Apache Iggy without a managed backend (`query.available` false), this
     /// returns `LaserError::Unsupported`.
     pub async fn execute_query(&self, query: Query) -> Result<QueryResult, LaserError> {
+        query.validate()?;
+        let execution_id = query.execution_id;
         let capabilities = self.capabilities().await;
         if !capabilities.query.available {
             return Err(LaserError::unsupported(
@@ -87,26 +114,23 @@ impl Laser {
             }
             .into());
         }
-        // Fail fast on an over-cap page before the round trip: LaserData Cloud would
-        // reject it with the same `TooLarge`, so spend the error locally. `0`
-        // means "a full page" (LaserData Cloud defaults it to `MAX_PAGE_SIZE`), so only
-        // an explicit over-cap value is rejected here. `top_k` on a vector query
-        // is the same page bound under a different name.
-        if query.limit > MAX_PAGE_SIZE {
+        // Fail fast on an over-cap page before the round trip. `top_k` on a
+        // vector query is the same page bound under a different name.
+        if query.page.limit > MAX_PAGE_SIZE as u32 {
             return Err(QueryError::TooLarge {
                 what: "limit".to_owned(),
-                size: query.limit,
-                cap: MAX_PAGE_SIZE,
+                size: u64::from(query.page.limit),
+                cap: MAX_PAGE_SIZE as u64,
             }
             .into());
         }
         if let Some(vector) = &query.vector
-            && vector.top_k > MAX_PAGE_SIZE
+            && vector.top_k > MAX_PAGE_SIZE as u32
         {
             return Err(QueryError::TooLarge {
                 what: "top_k".to_owned(),
-                size: vector.top_k,
-                cap: MAX_PAGE_SIZE,
+                size: u64::from(vector.top_k),
+                cap: MAX_PAGE_SIZE as u64,
             }
             .into());
         }
@@ -120,13 +144,126 @@ impl Laser {
             .send_raw_with_response(AGDX_QUERY_CODE, payload)
             .await?;
         match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
-            QueryReply::Ok(result) => Ok(result),
+            QueryReply::Ok(result) => validate_query_result(*result, execution_id),
             QueryReply::Err(error) => Err(error.into()),
             _ => Err(LaserError::Protocol(
                 "query: unknown reply variant".to_owned(),
             )),
         }
     }
+
+    /// Retrieve the next cursor page for an executing query.
+    pub async fn query_page(
+        &self,
+        execution_id: QueryExecutionId,
+        cursor: impl Into<String>,
+        deadline_micros: u64,
+    ) -> Result<QueryResult, LaserError> {
+        let capabilities = self.capabilities().await;
+        if !capabilities.query.cursor_paging {
+            return Err(LaserError::unsupported_feature(
+                "query",
+                "cursor_paging",
+                "query cursor paging is not advertised by this deployment",
+            ));
+        }
+        let request = QueryPageEnvelope::new(execution_id, cursor, deadline_micros);
+        request.validate()?;
+        let payload = encode_named(&request)
+            .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
+        let payload = self
+            .send_raw_with_response(crate::query::AGDX_QUERY_PAGE_CODE, payload)
+            .await?;
+        match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
+            QueryReply::Ok(result) => validate_query_result(*result, execution_id),
+            QueryReply::Err(error) => Err(error.into()),
+            _ => Err(LaserError::Protocol(
+                "query page: unknown reply variant".to_owned(),
+            )),
+        }
+    }
+
+    /// Cancel an executing query by its unguessable identity.
+    pub async fn cancel_query(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<QueryExecutionStatus, LaserError> {
+        if !self.capabilities().await.query.cancellation {
+            return Err(LaserError::unsupported_feature(
+                "query",
+                "cancellation",
+                "query cancellation is not advertised by this deployment",
+            ));
+        }
+        let request = QueryCancelEnvelope::new(execution_id);
+        request.validate()?;
+        let payload = encode_named(&request)
+            .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
+        let payload = self
+            .send_raw_with_response(crate::query::AGDX_QUERY_CANCEL_CODE, payload)
+            .await?;
+        match crate::error::decode_managed_reply::<QueryCancelReply>(&payload)? {
+            QueryCancelReply::Ok(status) => validate_query_status(status, execution_id),
+            QueryCancelReply::Err(error) => Err(error.into()),
+            _ => Err(LaserError::Protocol(
+                "query cancellation: unknown reply variant".to_owned(),
+            )),
+        }
+    }
+
+    /// Read the current state of an executing or recently completed query.
+    pub async fn query_status(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<QueryExecutionStatus, LaserError> {
+        if !self.capabilities().await.query.execution_status {
+            return Err(LaserError::unsupported_feature(
+                "query",
+                "execution_status",
+                "query execution status is not advertised by this deployment",
+            ));
+        }
+        let request = QueryStatusEnvelope::new(execution_id);
+        request.validate()?;
+        let payload = encode_named(&request)
+            .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
+        let payload = self
+            .send_raw_with_response(crate::query::AGDX_QUERY_STATUS_CODE, payload)
+            .await?;
+        match crate::error::decode_managed_reply::<QueryStatusReply>(&payload)? {
+            QueryStatusReply::Ok(status) => validate_query_status(status, execution_id),
+            QueryStatusReply::Err(error) => Err(error.into()),
+            _ => Err(LaserError::Protocol(
+                "query status: unknown reply variant".to_owned(),
+            )),
+        }
+    }
+}
+
+fn validate_query_result(
+    result: QueryResult,
+    execution_id: QueryExecutionId,
+) -> Result<QueryResult, LaserError> {
+    result.validate()?;
+    if result.context.execution_id != execution_id {
+        return Err(LaserError::Protocol(
+            "query reply execution id does not match the request".to_owned(),
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_query_status(
+    status: QueryExecutionStatus,
+    execution_id: QueryExecutionId,
+) -> Result<QueryExecutionStatus, LaserError> {
+    status.validate()?;
+    if status.execution_id != execution_id {
+        return Err(LaserError::Protocol(
+            "query status execution id does not match the request".to_owned(),
+        ));
+    }
+    Ok(status)
 }
 
 /// Fluent builder for `Laser::query`. Accumulates a `Query`, then `.fetch()`
@@ -140,16 +277,64 @@ pub struct QueryRequest<'a> {
 }
 
 impl<'a> QueryRequest<'a> {
-    fn new(laser: &'a Laser, index: &'a str) -> Self {
+    fn new(laser: &'a Laser, target: QueryTarget) -> Self {
         Self {
             laser,
-            query: Query::builder().index(index).build(),
+            query: Query::builder()
+                .execution_id(crate::query::QueryExecutionId::mint())
+                .target(target)
+                .deadline_micros(query_deadline(DEFAULT_QUERY_DEADLINE))
+                .build(),
             max_rows: None,
         }
     }
 
+    /// Set the absolute execution budget from now. The deadline applies to all
+    /// pages under this query identity and is never extended by the server.
+    pub fn deadline(mut self, timeout: Duration) -> Self {
+        self.query.deadline_micros = query_deadline(timeout);
+        self
+    }
+
+    /// The identity shared by execution, cursor pages, status, and cancellation.
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.query.execution_id
+    }
+
+    /// Read the current execution state for this query identity.
+    pub async fn status(&self) -> Result<QueryExecutionStatus, LaserError> {
+        self.laser.query_status(self.query.execution_id).await
+    }
+
+    /// Request cancellation for this query identity and return its observed state.
+    pub async fn cancel(&self) -> Result<QueryExecutionStatus, LaserError> {
+        self.laser.cancel_query(self.query.execution_id).await
+    }
+
+    /// Select one exact Iceberg snapshot for a lakehouse query.
+    pub fn at_snapshot(mut self, snapshot_id: i64) -> Result<Self, LaserError> {
+        let QueryTarget::Lakehouse { snapshot, .. } = &mut self.query.target else {
+            return Err(LaserError::Invalid(
+                "snapshot selection requires a lakehouse query target".to_owned(),
+            ));
+        };
+        *snapshot = Some(SnapshotSelector::SnapshotId(snapshot_id));
+        Ok(self)
+    }
+
+    /// Select the retained Iceberg snapshot current at a timestamp.
+    pub fn at_timestamp_micros(mut self, timestamp_micros: i64) -> Result<Self, LaserError> {
+        let QueryTarget::Lakehouse { snapshot, .. } = &mut self.query.target else {
+            return Err(LaserError::Invalid(
+                "timestamp selection requires a lakehouse query target".to_owned(),
+            ));
+        };
+        *snapshot = Some(SnapshotSelector::TimestampMicros(timestamp_micros));
+        Ok(self)
+    }
+
     /// Exact-match on an indexed field (point lookup).
-    pub fn where_eq(mut self, field: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn where_eq(mut self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.query.by_key.push(KeyMatch::new(field, value));
         self
     }
@@ -176,53 +361,53 @@ impl<'a> QueryRequest<'a> {
     }
 
     /// Filter rows where `field == value`.
-    pub fn filter_eq(self, field: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn filter_eq(self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.predicate(field, CmpOp::Eq, value)
     }
 
     /// Filter rows where `field != value`.
-    pub fn filter_ne(self, field: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn filter_ne(self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.predicate(field, CmpOp::Ne, value)
     }
 
     /// Filter rows where `field > value` (numeric if both parse as numbers, else lexical).
-    pub fn filter_gt(self, field: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn filter_gt(self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.predicate(field, CmpOp::Gt, value)
     }
 
     /// Filter rows where `field >= value`.
-    pub fn filter_gte(self, field: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn filter_gte(self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.predicate(field, CmpOp::Gte, value)
     }
 
     /// Filter rows where `field < value`.
-    pub fn filter_lt(self, field: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn filter_lt(self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.predicate(field, CmpOp::Lt, value)
     }
 
     /// Filter rows where `field <= value`.
-    pub fn filter_lte(self, field: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn filter_lte(self, field: impl Into<String>, value: impl Into<TypedValue>) -> Self {
         self.predicate(field, CmpOp::Lte, value)
     }
 
     /// Filter rows where `field` is one of the given values.
-    pub fn filter_in<T: Into<Value>>(
+    pub fn filter_in<T: Into<TypedValue>>(
         self,
         field: impl Into<String>,
         values: impl IntoIterator<Item = T>,
     ) -> Self {
-        let list = Value::List(values.into_iter().map(Into::into).collect());
+        let list = TypedValue::List(values.into_iter().map(Into::into).collect());
         self.predicate(field, CmpOp::In, list)
     }
 
     /// Filter rows where `field` contains `value` (substring).
     pub fn filter_contains(self, field: impl Into<String>, value: impl Into<String>) -> Self {
-        self.predicate(field, CmpOp::Contains, Value::Str(value.into()))
+        self.predicate(field, CmpOp::Contains, TypedValue::String(value.into()))
     }
 
     /// Filter rows where `field` starts with `value`.
     pub fn filter_prefix(self, field: impl Into<String>, value: impl Into<String>) -> Self {
-        self.predicate(field, CmpOp::Prefix, Value::Str(value.into()))
+        self.predicate(field, CmpOp::Prefix, TypedValue::String(value.into()))
     }
 
     /// Filter on `agdx.idx.message_type`.
@@ -256,15 +441,16 @@ impl<'a> QueryRequest<'a> {
     }
 
     /// Limit the page to `n` rows. Above `MAX_PAGE_SIZE` is rejected with
-    /// `QueryError::TooLarge`. `0` means a full page.
+    /// `QueryError::TooLarge`. Zero is invalid.
     pub fn limit(mut self, n: usize) -> Self {
-        self.query.limit = n;
+        self.query.page.limit = u32::try_from(n).unwrap_or(u32::MAX);
         self
     }
 
     /// Skip the first `n` matching rows.
     pub fn offset(mut self, n: usize) -> Self {
-        self.query.offset = n;
+        self.query.page.offset = Some(n as u64);
+        self.query.page.cursor = None;
         self
     }
 
@@ -279,7 +465,7 @@ impl<'a> QueryRequest<'a> {
     /// exact. Ask for this only when the exact count itself matters (e.g.
     /// rendering "page 3 of 12"), it costs a full-table scan on a wide filter.
     pub fn with_total(mut self) -> Self {
-        self.query.want_total = true;
+        self.query.page.want_total = true;
         self
     }
 
@@ -322,38 +508,38 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
-    /// Project only the named indexed fields into each row's headers.
+    /// Project only the named indexed fields into each result row.
     pub fn select_fields<S: Into<String>>(mut self, fields: impl IntoIterator<Item = S>) -> Self {
         self.query.select.fields = fields.into_iter().map(Into::into).collect();
         self
     }
 
-    /// Aggregate: row count, output under the header `count`.
+    /// Aggregate: row count, output in the `count` result field.
     pub fn count(self) -> Self {
         self.push_agg(agg_call(AggFunc::Count, None, None, "count"))
     }
 
-    /// Aggregate: sum of `field`, output under the header `sum`.
+    /// Aggregate: sum of `field`, output in the `sum` result field.
     pub fn sum(self, field: impl Into<String>) -> Self {
         self.push_agg(agg_call(AggFunc::Sum, Some(field.into()), None, "sum"))
     }
 
-    /// Aggregate: arithmetic mean of `field`, output under the header `avg`.
+    /// Aggregate: arithmetic mean of `field`, output in the `avg` result field.
     pub fn avg(self, field: impl Into<String>) -> Self {
         self.push_agg(agg_call(AggFunc::Avg, Some(field.into()), None, "avg"))
     }
 
-    /// Aggregate: minimum of `field`, output under the header `min`.
+    /// Aggregate: minimum of `field`, output in the `min` result field.
     pub fn min(self, field: impl Into<String>) -> Self {
         self.push_agg(agg_call(AggFunc::Min, Some(field.into()), None, "min"))
     }
 
-    /// Aggregate: maximum of `field`, output under the header `max`.
+    /// Aggregate: maximum of `field`, output in the `max` result field.
     pub fn max(self, field: impl Into<String>) -> Self {
         self.push_agg(agg_call(AggFunc::Max, Some(field.into()), None, "max"))
     }
 
-    /// Aggregate: distinct count of `field`, output under the header
+    /// Aggregate: distinct count of `field`, output in the result field
     /// `count_distinct`.
     pub fn count_distinct(self, field: impl Into<String>) -> Self {
         self.push_agg(agg_call(
@@ -364,8 +550,8 @@ impl<'a> QueryRequest<'a> {
         ))
     }
 
-    /// Aggregate: population standard deviation of `field`, output under the
-    /// header `stddev`. Backend-gated (columnar backends only).
+    /// Aggregate: population standard deviation of `field`, output in the
+    /// `stddev` result field. Backend-gated (columnar backends only).
     pub fn stddev(self, field: impl Into<String>) -> Self {
         self.push_agg(agg_call(
             AggFunc::StdDev,
@@ -376,7 +562,7 @@ impl<'a> QueryRequest<'a> {
     }
 
     /// Aggregate: the `fraction` quantile of `field` (e.g. 0.95 for p95), output
-    /// under the header `percentile`. Backend-gated (columnar backends only).
+    /// in the `percentile` result field. Backend-gated (columnar backends only).
     pub fn percentile(self, field: impl Into<String>, fraction: f64) -> Self {
         self.push_agg(agg_call(
             AggFunc::Percentile,
@@ -457,9 +643,10 @@ impl<'a> QueryRequest<'a> {
 
     /// Opt-in raw-SQL escape hatch: run `sql` (a single read-only SELECT) on the
     /// index's backend. SQL backends only, not portable. Result columns come
-    /// back as row headers keyed by column name.
-    pub fn raw_sql(mut self, sql: impl Into<String>) -> Self {
+    /// back as typed positional values aligned with the result fields.
+    pub fn raw_sql(mut self, dialect: SqlDialect, sql: impl Into<String>) -> Self {
         self.query.raw_sql = Some(RawSql {
+            dialect,
             sql: sql.into(),
             params: Vec::new(),
         });
@@ -467,12 +654,14 @@ impl<'a> QueryRequest<'a> {
     }
 
     /// Like [`raw_sql`](Self::raw_sql) but with positional bind params.
-    pub fn raw_sql_with<V: Into<Value>>(
+    pub fn raw_sql_with<V: Into<TypedValue>>(
         mut self,
+        dialect: SqlDialect,
         sql: impl Into<String>,
         params: impl IntoIterator<Item = V>,
     ) -> Self {
         self.query.raw_sql = Some(RawSql {
+            dialect,
             sql: sql.into(),
             params: params.into_iter().map(Into::into).collect(),
         });
@@ -497,7 +686,7 @@ impl<'a> QueryRequest<'a> {
         self.query.vector = Some(VectorQuery {
             field: field.into(),
             embedding,
-            top_k,
+            top_k: u32::try_from(top_k).unwrap_or(u32::MAX),
         });
         self
     }
@@ -516,17 +705,17 @@ impl<'a> QueryRequest<'a> {
         result
             .rows
             .iter()
-            .map(|row| row.decode_json::<T>().map_err(LaserError::from))
+            .map(|row| decode_row::<crate::stream::Json, T>(&result.fields, row))
             .collect()
     }
 
     /// Like `fetch_typed` but caps the result at one row.
     pub async fn fetch_one<T: DeserializeOwned>(mut self) -> Result<Option<T>, LaserError> {
         self.query.select.payload = true;
-        self.query.limit = 1;
+        self.query.page.limit = 1;
         let result = self.laser.execute_query(self.query).await?;
         match result.rows.first() {
-            Some(row) => row.decode_json::<T>().map(Some).map_err(LaserError::from),
+            Some(row) => decode_row::<crate::stream::Json, T>(&result.fields, row).map(Some),
             None => Ok(None),
         }
     }
@@ -553,7 +742,7 @@ impl<'a> QueryRequest<'a> {
         result
             .rows
             .iter()
-            .map(|row| row.decode_with::<C, T>().map_err(LaserError::from))
+            .map(|row| decode_row::<C, T>(&result.fields, row))
             .collect()
     }
 
@@ -564,13 +753,10 @@ impl<'a> QueryRequest<'a> {
         C: Decoder<T>,
     {
         self.query.select.payload = true;
-        self.query.limit = 1;
+        self.query.page.limit = 1;
         let result = self.laser.execute_query(self.query).await?;
         match result.rows.first() {
-            Some(row) => row
-                .decode_with::<C, T>()
-                .map(Some)
-                .map_err(LaserError::from),
+            Some(row) => decode_row::<C, T>(&result.fields, row).map(Some),
             None => Ok(None),
         }
     }
@@ -583,8 +769,8 @@ impl<'a> QueryRequest<'a> {
     // Aggregate and vector queries are single-page by construction: `offset`
     // is not a meaningful cursor for either shape.
     fn page_stream(mut self) -> QueryStream<'a> {
-        if self.query.limit == 0 {
-            self.query.limit = crate::query::DEFAULT_STREAM_PAGE_SIZE;
+        if self.query.page.limit == 0 {
+            self.query.page.limit = crate::query::DEFAULT_STREAM_PAGE_SIZE as u32;
         }
         let single_page = self.query.aggregate.is_some() || self.query.vector.is_some();
         QueryStream::new(self.laser, self.query, single_page)
@@ -595,8 +781,8 @@ impl<'a> QueryRequest<'a> {
     // `.inline_payload()` for the bytes to be there.
     fn typed_page_stream<T: DeserializeOwned>(mut self) -> TypedQueryStream<'a, T> {
         self.query.select.payload = true;
-        if self.query.limit == 0 {
-            self.query.limit = crate::query::DEFAULT_STREAM_PAGE_SIZE;
+        if self.query.page.limit == 0 {
+            self.query.page.limit = crate::query::DEFAULT_STREAM_PAGE_SIZE as u32;
         }
         let single_page = self.query.aggregate.is_some() || self.query.vector.is_some();
         TypedQueryStream::new(self.laser, self.query, single_page)
@@ -682,7 +868,7 @@ impl<'a> QueryRequest<'a> {
         self.query
     }
 
-    fn predicate(self, field: impl Into<String>, op: CmpOp, value: impl Into<Value>) -> Self {
+    fn predicate(self, field: impl Into<String>, op: CmpOp, value: impl Into<TypedValue>) -> Self {
         self.and_filter(Filter::pred(field, op, value))
     }
 
@@ -737,9 +923,44 @@ impl<'a> From<QueryRequest<'a>> for Query {
     }
 }
 
+fn query_deadline(timeout: Duration) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.saturating_add(timeout)
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn decode_row<C, T>(fields: &[laser_wire::schema::LogicalField], row: &Row) -> Result<T, LaserError>
+where
+    C: Decoder<T>,
+{
+    let payload_index = fields
+        .iter()
+        .position(|field| field.name == ORIGINAL_PAYLOAD_FIELD_NAME)
+        .ok_or_else(|| {
+            LaserError::from(laser_wire::error::DecodeError::MissingPayload(
+                "query result does not contain the original payload field",
+            ))
+        })?;
+    let value = row.values.get(payload_index).ok_or_else(|| {
+        LaserError::Protocol("query row is shorter than its declared result schema".to_owned())
+    })?;
+    match value {
+        TypedValue::Binary(value) => C::decode(&value.0).map_err(LaserError::from),
+        TypedValue::Null => Err(LaserError::from(
+            laser_wire::error::DecodeError::MissingPayload("query row has no original payload"),
+        )),
+        _ => Err(LaserError::Protocol(
+            "query original payload field is not binary".to_owned(),
+        )),
+    }
+}
+
 /// The auto-paginating row walk behind [`QueryRequest::rows`] and
 /// [`QueryRequest::fetch_all`]. Holds the `Query` and refills its buffer by
-/// re-issuing it with an advanced `offset` each time the local page drains,
+/// continuing it with the server-issued opaque cursor when a local page drains,
 /// until the worker reports `has_more = false` (or returns an empty page,
 /// whichever comes first). The empty-page guard rules out an infinite loop if
 /// the worker ever skews on the `has_more` flag.
@@ -747,9 +968,10 @@ struct QueryStream<'a> {
     laser: &'a Laser,
     query: Query,
     finished: bool,
-    // Aggregate / vector queries do not have a meaningful offset cursor, so the
+    // Aggregate / vector queries do not support cursor continuation, so the
     // stream fetches once and stops regardless of `has_more`.
     single_page: bool,
+    fields: Vec<laser_wire::schema::LogicalField>,
     buffer: std::vec::IntoIter<Row>,
 }
 
@@ -760,6 +982,7 @@ impl<'a> QueryStream<'a> {
             query,
             finished: false,
             single_page,
+            fields: Vec::new(),
             buffer: Vec::new().into_iter(),
         }
     }
@@ -778,7 +1001,9 @@ impl<'a> QueryStream<'a> {
         // Empty page always terminates: belt-and-braces against a worker that
         // mis-reports `has_more` and would otherwise wedge the loop.
         self.finished = self.single_page || fetched == 0 || !page.page.has_more;
-        self.query.offset = self.query.offset.saturating_add(fetched);
+        self.query.page.cursor = page.page.next_cursor.clone();
+        self.query.page.offset = None;
+        self.fields = page.fields;
         self.buffer = page.rows.into_iter();
         Ok(self.buffer.next())
     }
@@ -825,7 +1050,7 @@ impl<'a, T: DeserializeOwned> TypedQueryStream<'a, T> {
     // Yield the next decoded value, or `Ok(None)` after the last page.
     async fn next(&mut self) -> Result<Option<T>, LaserError> {
         match self.inner.next().await? {
-            Some(row) => row.decode_json::<T>().map(Some).map_err(LaserError::from),
+            Some(row) => decode_row::<crate::stream::Json, T>(&self.inner.fields, &row).map(Some),
             None => Ok(None),
         }
     }

@@ -1,0 +1,15 @@
+{
+  "retention_gap": {
+    "incarnation": {
+      "cluster": "00000000000000000000000068",
+      "stream_id": 2,
+      "topic_id": 3,
+      "partition_id": 0,
+      "partition_created_revision": 4
+    },
+    "required_next_offset": 10,
+    "retained_start": 20
+  },
+  "checkpoint_revision": 4,
+  "consistency": "linearizable"
+}

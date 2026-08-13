@@ -223,11 +223,11 @@ async def audit_tape(laser: ls.Laser, trades: list[dict]) -> None:
 
 def group_totals(result: ls.QueryResult) -> dict[str, int]:
     """Collect a sum(..).group_by([SYMBOL]) result into symbol -> total. Each row
-    carries the group key under headers[SYMBOL] and the sum under headers[sum]."""
+    carries positional typed values described by the result fields."""
     totals: dict[str, int] = {}
     for row in result.rows:
-        symbol = row.headers.get(SYMBOL)
-        total = row.headers.get(SUM_RESULT)
+        symbol = result.value_text(row, SYMBOL)
+        total = result.value_text(row, SUM_RESULT)
         if symbol is not None and total is not None:
             totals[symbol] = int(total)
     return totals

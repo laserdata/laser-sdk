@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/laser-wire.svg)](https://crates.io/crates/laser-wire) [![docs.rs](https://docs.rs/laser-wire/badge.svg)](https://docs.rs/laser-wire)
 
-The wire contract by [LaserData, Inc.](https://laserdata.com) for [Apache Iggy](https://iggy.apache.org), as one typed, runtime-free crate: the managed command codes, the CBOR envelopes, the query IR, projections and schemas, the key-value, fork, and knowledge-graph surfaces, the agent envelope (the Agent Data Exchange Protocol, AGDX), the HTTP views and routes, the header and topic dictionaries, the caps, and the golden fixture corpus that pins every byte.
+The wire contract by [LaserData, Inc.](https://laserdata.com) for [Apache Iggy](https://iggy.apache.org), as one typed, runtime-free crate: managed command codes, CBOR envelopes, logical schemas and tagged values, operational and lakehouse query IR, destination and checkpoint declarations, Arrow IPC policy, key-value, fork, knowledge-graph, and agent surfaces, HTTP views and routes, dictionaries, caps, and the golden fixture corpus that pins every byte.
 
 The Rust SDK re-exports this crate as `laser_sdk::wire`, Python binds the same types, and the native TypeScript client round-trips every file in this crate's fixture corpus. LaserData Cloud consumes the definitions directly. No IO, async runtime, clock, or randomness is required, so the crate compiles unchanged for native servers and `wasm32-unknown-unknown`.
 
@@ -26,13 +26,18 @@ Modules carve the API surface. Features gate dependencies. No wire-contract type
 | `codes` | managed command codes + per-surface op versions |
 | `headers` | the `agdx.*` / `gen_ai.*` header dictionaries + header caps + `CONVERSATION_FIELD` (the auto-projected `conversation_id` field name the conversation lens filters on) |
 | `topics` | the `_agdx` ops stream + topic names |
-| `limits` | page, KV, frame, and agent-envelope caps |
+| `limits` | page, query, KV, frame, and agent-envelope caps |
 | `content` | `ContentType` + the `agdx.ct` u8 code dictionary |
-| `hello` | `HelloReply` / `OpVersions` (the capability-handshake body) + `BackendAnnounce` (the backend's capability announcement to the streaming server), incl. the `features` capability bitset (`feature::KV_CAS`/`READ_YOUR_WRITES`/`STRONG_CONSISTENCY`/`KV_CAS_FENCED`/`AGENT_WORKFLOW`/`KEYWORD_SEARCH`/`WATCH`/`AUTHZ`) |
+| `hello` | `HelloReply`, independently negotiated `OpVersions`, structured backend descriptors and capabilities, and the backend announcement consumed during capability negotiation |
 | `authz` | the capability layer: `Effect`/`Feature`/`Action`/`ResourcePattern`/`Grant`/`Role`/`RoleBinding`, the `feature_action(code)` classifier + `action_index` coarse-bitmask layout, the whoami/role/binding/history request+reply types, revision-guarded binding writes, and `AuthzReply`/`AuthzError`. Orthogonal to the substrate's own permissions, the fork-native authorization band (`AGDX_AUTHZ_*`) |
 | `batch` | the mixed-operation batch (`BatchRequest`/`BatchItem`/`BatchReply`, `MAX_BATCH_OPS = 64`): several managed requests in one round trip, per-op results, never a transaction |
 | `change` | `ChangeRecord`, the change-feed frame the projector publishes per committed notifying batch (a wakeup carrying the index and its committed offset window, never the rows) |
-| `query` | the query IR (incl. the `Consistency` level + the `ConsistencyGate` server helper), `QueryEnvelope`/`QueryReply`, `Row`, `QueryError` (incl. `Stale`) |
+| `schema` | logical schemas, canonical SHA-256 fingerprints, all logical type and tagged value variants, reserved provenance fields, and value-to-schema validation |
+| `source` | stable source scope and source-incarnation identity used by destinations and checkpoints |
+| `destination` | materialization destination declarations, backend and physical-table bindings, start policy, and explicit operational or lakehouse query routes |
+| `checkpoint` | revision-guarded public destination mutations, separately typed replicated transitions, checkpoint reads, lifecycle, progress, repair, and snapshot evidence |
+| `arrow` | Arrow IPC stream metadata, acceptance policy, limits, and typed rejection codes |
+| `query` | Queries with explicit operational or lakehouse targets, typed predicates and SQL parameters, cursor paging, status and cancellation, positional typed results, execution evidence, consistency, and errors |
 | `result` | the unified `ResultCode` space + HTTP status mapping with `From` projections off every surface error, and `CommandError` (the surface-agnostic fallback reply) |
 | `browse` | registry browse requests + `BrowseReply`, including `DecodeRecord` |
 | `control` | `Projection` (incl. `ProjectionKind::Graph` + the `EntitySchema` node/edge extraction plan), `ProjectionBinding`, `SchemaDef`, `ControlEnvelope` |
@@ -45,14 +50,20 @@ Modules carve the API surface. Features gate dependencies. No wire-contract type
 | `mutation` | the managed mutation identity contract: `ManagedRequestEnvelope` (the client wrapper carrying one nonzero `operation_id` per logical mutation) and `MutationCommandEnvelope` (the durable record a deployment appends and folds). Which codes must carry the identity is the `codes` module's shared `is_idempotent_managed_request` classifier |
 | `keys` | the versioned managed key record (`KeyRecord`, `KeyKind`, `KEY_RECORD_VERSION`): the one storage representation every port's managed key registry reads and writes |
 | `commands` | the `Command` trait pairing each code with its request/reply types |
-| `http` | `/agdx/*` route constants, path builders, typed query-parameter structs (`PARAM_*` + `KvScanQuery`/`ProjectionListQuery`/...), JSON view types, and the canonical `ErrorBody` reply contract |
-| `http_client` | (feature `http-client`) a typed `/agdx/*` client over an injected `Transport`, owning routes, base64url, query strings, and the bare-`Ok`-or-`ErrorBody` unwrap, including the `authz` whoami/roles/bindings routes |
-| `validate` | the `Validate` trait: the cap and shape checks a request enforces on itself, so the SDK spends the failure locally and a deployment re-runs the identical check after decode. Implemented for the batch, key-value set/scan, graph query and upsert (recursing into nodes, edges, and `SourceRef`), text and vector queries, memory records, and client metadata |
+| `http` | `/agdx/*` route constants, path builders, typed query parameters, JSON views for query, destinations, snapshots, schemas, files and metrics, and the canonical `ErrorBody` reply contract |
+| `http_client` | feature `http-client`, a typed `/agdx/*` client over an injected runtime-agnostic `Transport`, available on native and wasm targets |
+| `validate` | the `Validate` trait used both before client I/O and after server decode, including recursive logical schemas and values, query requests and replies, destinations, checkpoints, Arrow metadata, batch, key-value, graph, memory, and client metadata |
 | `framing` | `encode_named`/`decode_named` + `frame_encode`/`frame_decode` |
 | `codecs` | the payload codec traits and marker types |
 | `fixtures` | the embedded golden corpus |
 
 ## Compatibility rules
+
+Query results are schema-first. `QueryResult.fields` defines one ordered logical schema and every `Row.values` array aligns positionally with it. Use the language SDK accessors to read a value by field name. Inline query pages stay bounded at 1000 rows. Publish a self-contained Arrow IPC stream when transferring analytical batches.
+
+Operational and lakehouse targets are different variants. An operational result proves its backend resource generation and runtime configuration revision. A lakehouse result additionally proves destination generation, table UUID, snapshot, schema and partition-spec IDs, materialization boundary, checkpoint revision, and global state revision.
+
+Destination declarations are public desired state. Public checkpoint mutations carry bounded client intent and worker evidence, while replicated transitions add authenticated actors, primary time, authoritative source cuts, absolute lease deadlines, lifecycle evidence, and server-certified repair records. Their types and decoders remain separate so a client body cannot be mistaken for a consensus mutation.
 
 Named-field CBOR ignores unknown fields, so additive optional fields are compatible. Enum growth rides the per-surface op versions advertised by the capability handshake. The reply, outcome, and error enums are `#[non_exhaustive]`, so a consumer keeps compiling when a variant is added. The u8-code dictionaries (task state, agent error code, dead-letter reason) go further: an unknown code decodes to an `Unrecognized(u8)` variant and re-encodes byte-for-byte, so an old build relays a newer peer's code instead of failing. The internally tagged config enums that cross the JSON HTTP surface (`SchemaSource`, `RetentionPolicy`) carry a unit `Unknown` `#[serde(other)]` catch-all in the same spirit (lossy and read-only, so never re-apply an `Unknown`). A few executor-dispatched vocabularies (the query comparison and aggregate operators) are deliberately exhaustive, so adding one is a compile error that forces every backend to implement it rather than silently mis-handling it.
 

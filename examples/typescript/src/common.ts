@@ -273,15 +273,7 @@ export async function ensureView(
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    targets: [
-      {
-        backend: "embedded",
-        table: index,
-        role: "readWrite",
-        delivery: "effectivelyOnce",
-        required: true
-      }
-    ],
+    index,
     notify: true
   }
   await laser.projections().register(projection)
@@ -462,6 +454,8 @@ function surfaceAvailable(capabilities: Capabilities, feature: CapabilitySurface
       return capabilities.managed
     case "query":
       return capabilities.query.available
+    case "destinations":
+      return capabilities.destinations.available
     case "kv":
       return capabilities.kv.available
     case "kvCas":

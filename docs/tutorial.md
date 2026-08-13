@@ -116,7 +116,7 @@ A published record lives in up to three places, controlled by the projection:
 
 The body may carry fields that are NOT indexed. Only the declared fields are queryable. Everything else is retrievable through the inline body (when on) or by Iggy replay (when off).
 
-> _With `.index_only()`, `fetch_typed::<T>()` cannot decode rows because their `payload` is `None`. Callers either use `.fetch()` and decode indexed columns directly off `Row.headers` / `Row.metadata`, or replay from Iggy log. Plan the trade-off when you declare the projection, not at query time._
+> _With `.index_only()`, `fetch_typed::<T>()` cannot decode rows because the reserved original-payload field is absent. Callers either use `.fetch()` and read typed positional values through `QueryResult::value`, or replay from Iggy log. Plan the trade-off when you declare the projection, not at query time._
 
 Now query it:
 
@@ -389,13 +389,13 @@ laser.stream("agent-telemetry").topic("inferences").publish()
     .send().await?;
 ```
 
-Reading is symmetric. `Codec` encodes. `Decoder` decodes. All four built-in codecs (`Json`, `Msgpack`, `Cbor`, `Bson`) implement both halves. `fetch_typed` defaults to JSON. `fetch_typed_with::<C, _>` (and `fetch_one_with`, `Row::decode_with`) takes any codec, so a topic written with MessagePack reads back with MessagePack:
+Reading is symmetric. `Codec` encodes. `Decoder` decodes. All four built-in codecs (`Json`, `Msgpack`, `Cbor`, `Bson`) implement both halves. `fetch_typed` defaults to JSON. `fetch_typed_with::<C, _>` and `fetch_one_with` take any codec, so a topic written with MessagePack reads back with MessagePack:
 
 ```rust
 let traces: Vec<Inference> = laser.query("inferences").fetch_typed_with::<Msgpack, _>().await?;
 ```
 
-Payload bytes come back out of the public API as `Vec<u8>` (`Row.payload`, `Message.payload`, `MemoryItem.payload`). Raw byte inputs on the hot chain take `Vec<u8>`, `String`, `&'static [u8]`, all satisfy it.
+Payload bytes come back out of the public API as `Vec<u8>` for streaming messages and memory items. Queries return positional tagged values. When payload selection is enabled, `fetch_typed` and `fetch_typed_with` read the reserved original-payload field from the result schema. Raw byte inputs on the hot chain accept `Vec<u8>`, `String`, and `&'static [u8]`.
 
 ### One typed handle instead of per-call codecs
 

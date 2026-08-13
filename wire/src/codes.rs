@@ -50,6 +50,14 @@ pub const AGDX_GET_CLIENTS_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 3;
 /// decoded client-side as the typed unsupported, so no capability bit is
 /// needed.
 pub const AGDX_BATCH_CODE: u32 = AGDX_COMMAND_BASE + 20;
+/// Fork-native command code: submit one public checkpoint mutation to Iggy metadata.
+pub const AGDX_CHECKPOINT_CODE: u32 = AGDX_COMMAND_BASE + 21;
+/// Fork-native command code: read one destination and its checkpoint status.
+pub const AGDX_DESTINATION_GET_CODE: u32 = AGDX_COMMAND_BASE + 22;
+/// Fork-native command code: list destinations and their checkpoint status.
+pub const AGDX_DESTINATION_LIST_CODE: u32 = AGDX_COMMAND_BASE + 23;
+/// Fork-native command code: list explicit query-route declarations.
+pub const AGDX_QUERY_ROUTE_LIST_CODE: u32 = AGDX_COMMAND_BASE + 24;
 
 // Authorization and system-management band (1_000_100..=1_000_199). Handled by
 // the streaming server itself, not forwarded to the plane, the same class as
@@ -81,6 +89,12 @@ pub const AGDX_QUERY_BASE: u32 = AGDX_COMMAND_BASE + 200;
 // `QueryReply`, off the log over the managed command channel.
 /// Managed command code: execute a query.
 pub const AGDX_QUERY_CODE: u32 = AGDX_QUERY_BASE;
+/// Managed command code: retrieve the next page of an executing query.
+pub const AGDX_QUERY_PAGE_CODE: u32 = AGDX_QUERY_BASE + 1;
+/// Managed command code: cancel an executing query.
+pub const AGDX_QUERY_CANCEL_CODE: u32 = AGDX_QUERY_BASE + 2;
+/// Managed command code: read query execution status.
+pub const AGDX_QUERY_STATUS_CODE: u32 = AGDX_QUERY_BASE + 3;
 // Browse the projection registry (read-only). Get one projection by id (request
 // `GetProjection`) or list them all (request `ListProjections`), reply a CBOR
 // `BrowseReply`.
@@ -229,6 +243,8 @@ pub const CHANGE_OP_VERSION: u32 = 1;
 /// Wire version of the client-metadata discovery request and reply
 /// ([`crate::clients`]).
 pub const CLIENT_METADATA_OP_VERSION: u32 = 1;
+/// Wire version of public checkpoint mutation requests and status replies.
+pub const CHECKPOINT_OP_VERSION: u32 = 1;
 /// Wire version of the agent presence body ([`crate::agent::AgentPresence`]) an
 /// agent advertises in its connection metadata. Carried in the body's own `v`
 /// field, not out-of-band, because presence rides the opaque connection-metadata
@@ -263,5 +279,6 @@ pub const fn is_idempotent_managed_request(code: u32) -> bool {
             | AGDX_GRAPH_UPSERT_CODE
             | AGDX_AGENT_SUBMIT_CODE
             | AGDX_AGENT_CANCEL_CODE
+            | AGDX_CHECKPOINT_CODE
     )
 }

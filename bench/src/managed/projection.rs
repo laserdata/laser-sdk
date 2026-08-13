@@ -282,18 +282,19 @@ impl ProjectionOperationContext {
         let expected = format!("item_{operation:016x}");
         let deadline = Instant::now() + Duration::from_millis(self.case.timeout_millis);
         loop {
-            let visible = self
+            let result = self
                 .laser
                 .query(&self.names.index)
                 .where_eq("id", &expected)
                 .limit(1)
                 .fetch()
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            let visible = result
                 .rows
                 .first()
-                .and_then(|row| row.headers.get("id"))
-                == Some(&expected);
+                .and_then(|row| result.value_text(row, "id"))
+                .is_some_and(|value| value == expected);
             if visible {
                 return Ok(());
             }

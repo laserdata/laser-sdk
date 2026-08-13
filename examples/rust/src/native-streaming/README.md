@@ -17,10 +17,10 @@ Run from `examples/rust`:
 just up && cargo run --example native-streaming
 ```
 
-The SDK always uses VSR. Point it at the desired fork deployment:
+The SDK uses Iggy's native VSR transport. Point it at the desired Iggy deployment:
 
 ```sh
-LASER_CONNECTION_STRING='user:pwd@vsr-host:3000' \
+LASER_CONNECTION_STRING='user:pwd@iggy-host:8090' \
   cargo run --example native-streaming
 ```
 

@@ -18,23 +18,15 @@ just bench 15 3 8
 
 `LASER_BENCH_PARALLELISM` provides the same parallelism override for scripts and CI. `just bench-smoke` always uses one lane because it validates mechanics rather than capacity.
 
-Until plane `0.14.0` is available from the artifact service, local managed runs need three existing native release binaries. Put their paths in the ignored `bench/.env` file:
-
-```bash
-LASER_BENCH_IGGY_SERVER_BINARY=/absolute/path/to/iggy-server-ng
-LASER_BENCH_IGGY_BENCH_BINARY=/absolute/path/to/iggy-bench
-LASER_BENCH_PLANE_BINARY=/absolute/path/to/plane
-```
-
-All three overrides select local path mode. With no overrides, the harness downloads signed CPU-targeted artifacts. A partial set fails immediately. `just bench` compiles only `laser-bench` and runs the supplied service binaries without rebuilding them.
+The harness downloads signed CPU-targeted artifacts for the maintained binary versions. `just bench` compiles only `laser-bench` and runs those service binaries without rebuilding them.
 
 The maintained artifact versions are:
 
 | Binary | Version |
 | --- | --- |
-| Iggy `server-ng` | `0.8.104-ld` |
-| `iggy-bench` | `0.6.0-edge.1` |
-| plane | `0.14.0` |
+| Iggy server | `0.8.108-ld` |
+| `iggy-bench` | `0.6.0-edge.2` |
+| plane | `0.15.0` |
 
 ## Default Campaign
 
@@ -94,7 +86,7 @@ Smoke results validate mechanics only. Default local results support development
 
 ## Measurement Rules
 
-- Iggy uses `server-ng` with TCP VSR.
+- Iggy uses `iggy-server` with TCP VSR.
 - Timed service paths use native release binaries.
 - Raw Iggy and Laser streaming arms use identical payloads, batches, partitions, concurrency, routing, retries, server, and schedule.
 - Maintained capacity cells pin producer lane `i` to partition `i`. Caller-defined suites with different producer and partition counts use balanced routing and record that choice.
@@ -129,9 +121,9 @@ Artifact mode downloads binaries and adjacent Minisign signatures from `https://
 [provisioning]
 mode = "artifact"
 cpu_target = "skylake"
-iggy_server_version = "0.8.104-ld"
-iggy_bench_version = "0.6.0-edge.1"
-plane_version = "0.14.0"
+iggy_server_version = "0.8.108-ld"
+iggy_bench_version = "0.6.0-edge.2"
+plane_version = "0.15.0"
 ```
 
 Path mode runs caller-provided native binaries and records their digests:
@@ -140,7 +132,7 @@ Path mode runs caller-provided native binaries and records their digests:
 [provisioning]
 mode = "path"
 cpu_target = "skylake"
-iggy_server = "/absolute/path/to/iggy-server-ng"
+iggy_server = "/absolute/path/to/iggy-server"
 iggy_bench = "/absolute/path/to/iggy-bench"
 plane = "/absolute/path/to/plane"
 ```

@@ -20,7 +20,13 @@ const EXPECTED_CODE_AND_STATUS: readonly (readonly [string, number, number])[] =
   ["Backend", 9, 502],
   ["Forbidden", 10, 403],
   ["StepUpRequired", 11, 403],
-  ["Unavailable", 12, 503]
+  ["Unavailable", 12, 503],
+  ["ResourceLimit", 13, 429],
+  ["Cancelled", 14, 409],
+  ["DeadlineExceeded", 15, 408],
+  ["ExpiredSnapshot", 16, 410],
+  ["StaleGeneration", 17, 409],
+  ["TargetUnavailable", 18, 503]
 ]
 
 void test("given_known_result_codes_when_mapped_then_should_match_the_pinned_dictionary", () => {
@@ -33,11 +39,11 @@ void test("given_known_result_codes_when_mapped_then_should_match_the_pinned_dic
 })
 
 void test("given_transient_result_codes_when_classified_then_should_be_the_only_retryable_ones", () => {
-  for (const name of ["Unavailable", "Stale"] as const) {
+  for (const name of ["Unavailable", "Stale", "TargetUnavailable"] as const) {
     assert.equal(resultCodeIsRetryable({ kind: "known", name }), true)
   }
   for (const [name] of EXPECTED_CODE_AND_STATUS) {
-    if (name === "Unavailable" || name === "Stale") continue
+    if (name === "Unavailable" || name === "Stale" || name === "TargetUnavailable") continue
     assert.equal(
       resultCodeIsRetryable({ kind: "known", name: name as "Ok" }),
       false,
