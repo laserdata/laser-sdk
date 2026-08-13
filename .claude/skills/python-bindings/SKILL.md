@@ -9,7 +9,7 @@ The Python SDK is a PyO3 binding crate that wraps the Rust `laser-sdk` crate. It
 
 ## Layout
 
-- `foreign/python/Cargo.toml` - the binding crate (`laser_sdk_py` lib, `cdylib`), depends on `laser-sdk` with the managed and agent surfaces and unconditionally enables `iggy/vsr`. Wheels and source builds are VSR-only. Python exposes no protocol switch. The crate is excluded from the root workspace and has its own lock.
+- `foreign/python/Cargo.toml` - the binding crate (`laser_sdk_py` lib, `cdylib`), depends on `laser-sdk` with the managed and agent surfaces, and the pinned iggy crate compiles VSR unconditionally. Wheels and source builds are VSR-only. Python exposes no protocol switch. The crate is excluded from the root workspace and has its own lock.
 - `pyproject.toml` - maturin build, PyPI name `laser-sdk`, import name `laser_sdk` (set via `tool.maturin.module-name`, since the cdylib lib name is `laser_sdk_py` to avoid clashing with the Rust crate's `laser_sdk` lib).
 - `src/client.rs` and `src/stream.rs` bind `Laser`, capabilities, the stream/topic accessor grammar, typed topics, publish/batch/replay/ensure, and `producer`/`consumer`/`consumer_group`.
 - `src/transport.rs` binds the Laser `Producer`/`Consumer`/`ConsumerMessage` surface over Apache Iggy: direct batch/linger/retry/topology and key/partition writes, first/last/next/offset/timestamp reads, group lifecycle, polling/init retry, typed headers, automatic commits, `commit(message)`, offset inspection/deletion, and async iteration and shutdown.
@@ -41,7 +41,7 @@ Read-side coverage is the resumable `Cursor` (`laser.topic(name).replay()`) and 
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- The Python package version tracks the Rust workspace release train: one version across laser-wire, laser-sdk, and the Python SDK (`0.1.1`), with the dependency pin binding the exact Rust `laser-sdk` it wraps (`=0.1.1`).
+- The Python package version tracks the Rust workspace release train: one version across laser-wire, laser-sdk, and the Python SDK (`0.2.0`), with the dependency pin binding the exact Rust `laser-sdk` it wraps (`=0.2.0`).
 
 ## Working on it
 

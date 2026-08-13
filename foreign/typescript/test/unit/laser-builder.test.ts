@@ -4,29 +4,18 @@ import { test } from "node:test"
 import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
 import { ConfigError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
-import type { Protocol } from "apache-iggy"
 import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 import type { LaserObserver } from "../../src/observe.js"
 
-function fakeClient(onDestroy: () => void, protocol: Protocol = "vsr"): IggyClient {
+function fakeClient(onDestroy: () => void): IggyClient {
   return {
-    clientProvider: () =>
-      Promise.resolve({
-        protocol
-      }),
+    clientProvider: () => Promise.resolve({}),
     destroy(): Promise<void> {
       onDestroy()
       return Promise.resolve()
     }
   } as unknown as IggyClient
 }
-
-void test("given_a_classic_iggy_client_when_connecting_then_should_reject_before_use", async () => {
-  await assert.rejects(
-    Laser.fromIggyClient(fakeClient(() => undefined, "classic")),
-    new ConfigError("Laser requires an Apache Iggy VSR client")
-  )
-})
 
 void test("given_conflicting_builder_modes_when_connected_then_should_reject_before_io", () => {
   const client = fakeClient(() => undefined)

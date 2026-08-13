@@ -55,7 +55,7 @@ just bdd                   # 12. cross-SDK BDD conformance, Rust runner
 
 **Doctests are a required gate, not optional.** `clippy --all-targets` (step 4) does **not** compile doctests, and a bare `cargo test --workspace` runs them only for crates whose default features are on, so a doctest behind `kv` / `query` / any non-default feature is silently never built. Step 7 (`--all-features --doc`) is what actually compiles + runs every doc example. Skipping it means a broken `///` example ships green. It is Docker-free (doctests do not touch Apache Iggy), so there is no reason to skip it. The same `--all-features --doc` gate runs in CI.
 
-**VSR is mandatory.** Laser SDK does not expose a protocol feature and no supported build can select classic framing. Every Rust and Python build enables `iggy/vsr`, and TypeScript always constructs a VSR client and rejects an injected client using another protocol. Integration and BDD suites run the versioned Iggy binary. Managed reads use the non-replicated extension path, and the three managed-authorization writes use dedicated replicated operations.
+**VSR is mandatory.** Laser SDK does not expose a protocol feature and no supported build can select classic framing. The pinned iggy crate (`0.11.0-edge.2`) and Apache Iggy Node SDK (`0.10.0-edge.2`) compile VSR unconditionally with no protocol option, so every Rust, Python, and TypeScript client is VSR by construction. Integration and BDD suites run the versioned Iggy binary. Managed reads use the non-replicated extension path, and the three managed-authorization writes use dedicated replicated operations.
 
 **The wasm and deny gates are what make laser-wire's portability guarantee real**: the wire crate must compile for `wasm32-unknown-unknown` with `cbor,codecs,fixtures,builders,http-client` (never `bson`, which is native-only by design), and its portable graph must never contain iggy, tokio, bytes, ulid, dashmap, tracing, or getrandom (`deny-wire.toml`). The `builders` (bon's `Query::builder`) and `http-client` (typed `/agdx/*` client + serde_urlencoded) features are wasm-facing and included in both gates. If either tool is missing locally, CI still enforces both.
 
@@ -330,7 +330,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.1.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.2.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 

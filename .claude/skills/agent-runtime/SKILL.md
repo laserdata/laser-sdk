@@ -9,7 +9,7 @@ The native TypeScript peer is `foreign/typescript/src/agent`, with contracts, wo
 
 `agent/` is the customer-facing runtime: how you send, consume reliably, route, and spawn agents. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
 
-Feature `vsr` changes the underlying Iggy framing and enables the fork's AGDX classifier. Agent publish, poll, consumer-group, replay, retry, and dead-letter paths use standard Iggy commands and keep the same API and delivery rules. Managed presence, registry enrichment, fenced workflows, and run-registry commands use the non-replicated extension path and remain capability-gated by the connected broker.
+Iggy's VSR framing is always compiled in (no feature flag since iggy `0.11.0-edge.2`) and enables the fork's AGDX classifier. Agent publish, poll, consumer-group, replay, retry, and dead-letter paths use standard Iggy commands and keep the same API and delivery rules. Managed presence, registry enrichment, fenced workflows, and run-registry commands use the non-replicated extension path and remain capability-gated by the connected broker.
 
 ## STOP and ask the user before
 

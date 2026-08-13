@@ -44,7 +44,7 @@ if [[ ! "$parallelism_override" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-readonly DEFAULT_IGGY_BENCH_VERSION="0.6.0-edge.1"
+readonly DEFAULT_IGGY_BENCH_VERSION="0.6.0-edge.2"
 readonly DEFAULT_PLANE_VERSION="0.14.0"
 
 server_version="${LASER_BENCH_IGGY_SERVER_VERSION:-$(./scripts/resolve-test-iggy-server.sh --version)}"

@@ -4,7 +4,7 @@ The native TypeScript client for [LaserData, Inc.](https://laserdata.com) SDK ov
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Current pre-1.0 release (`0.1.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.2.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 ## Install
 
@@ -35,7 +35,7 @@ Use the bare `user:password@host:port` connection string. The SDK supplies the A
 
 Owned connections retry the initial handshake and reconnect after a dropped socket, with unlimited retries at one-second intervals by default. Set `reconnection_retries` to a non-negative integer and `reconnection_interval` to `250ms`, `1s`, or `1m` in the connection string to tune the policy. An injected client remains under its caller's lifecycle and reconnect policy.
 
-The TypeScript SDK pins Apache Iggy `0.9.0-edge.1` and always constructs a VSR client. There is no protocol option in the Laser API. An injected Apache Iggy client must also use VSR and is rejected before use otherwise.
+The TypeScript SDK pins Apache Iggy `0.10.0-edge.2` and always constructs a VSR client. There is no protocol option in the Laser API or the pinned Apache Iggy Node SDK, so an injected client is VSR by construction.
 
 ## Streaming model
 

@@ -5,7 +5,7 @@ set -euo pipefail
 # LASER_TEST_IGGY_SERVER binary wins, otherwise the pinned release is
 # downloaded once and cached. LASER_TEST_IGGY_VERSION overrides the pin and
 # LASER_TEST_IGGY_SHA256, when set, pins the downloaded bytes.
-readonly FORK_VERSION="${LASER_TEST_IGGY_VERSION:-0.8.104-ld}"
+readonly FORK_VERSION="${LASER_TEST_IGGY_VERSION:-0.8.106-ld}"
 readonly RELEASES_URL="${LASER_TEST_IGGY_RELEASES_URL:-https://artifacts.laserdata.com}"
 
 if [[ "${1:-}" == "--version" ]]; then

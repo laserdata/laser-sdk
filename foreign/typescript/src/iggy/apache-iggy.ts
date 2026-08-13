@@ -462,7 +462,6 @@ interface RawClientConnection {
 async function connectSimpleClient(parsed: ParsedConnectionString): Promise<ConnectedClient> {
   const config: ClientConfig = parsed.tls
     ? {
-        protocol: "vsr",
         heartbeatInterval: VSR_HEARTBEAT_INTERVAL_MS,
         transport: "TLS",
         options: {
@@ -475,7 +474,6 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
         reconnect: { enabled: false, interval: 0, maxRetries: 0 }
       }
     : {
-        protocol: "vsr",
         heartbeatInterval: VSR_HEARTBEAT_INTERVAL_MS,
         transport: "TCP",
         options: { port: parsed.port, host: parsed.host },
@@ -594,10 +592,7 @@ export class ApacheIggyTransport implements LaserTransport {
     client: SimpleClient,
     ownership: ClientOwnership = "borrowed"
   ): Promise<ApacheIggyTransport> {
-    const raw = await client.clientProvider()
-    if (raw.protocol !== "vsr") {
-      throw new ConfigError("Laser requires an Apache Iggy VSR client")
-    }
+    await client.clientProvider()
     return new ApacheIggyTransport(client, undefined, ownership)
   }
 

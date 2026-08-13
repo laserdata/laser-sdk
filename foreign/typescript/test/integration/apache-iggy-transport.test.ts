@@ -12,7 +12,7 @@ void test("given_running_iggy_when_connecting_then_should_authenticate_before_re
   const transport = await ApacheIggyTransport.connect(CONNECTION_STRING)
   try {
     const raw = await transport.iggyClient.clientProvider()
-    assert.equal(raw.protocol, "vsr")
+    assert.equal(raw.isAuthenticated, true)
     const reply = await transport.sendManaged(PING_CODE, new Uint8Array())
     assert.equal(reply.byteLength, 0)
   } finally {
