@@ -13,10 +13,17 @@ use crate::browse::{
     BrowseReply, DecodeRecord, GetProjection, GetSchema, ListProjections, ListSchemas,
     RegisterSchema,
 };
+use crate::checkpoint::{
+    CheckpointReadReply, CheckpointReply, CheckpointRequestEnvelope, DestinationGetRequest,
+    DestinationListRequest, QueryRouteListRequest,
+};
 use crate::codes::*;
 use crate::fork::{ForkCreate, ForkDelete, ForkList, ForkPromote, ForkPut, ForkReply};
 use crate::kv::{KvDelete, KvDeleteMany, KvGet, KvNamespaces, KvReply, KvScan, KvSet};
-use crate::query::{QueryEnvelope, QueryReply};
+use crate::query::{
+    QueryCancelEnvelope, QueryCancelReply, QueryEnvelope, QueryPageEnvelope, QueryReply,
+    QueryStatusEnvelope, QueryStatusReply,
+};
 
 /// A managed command: the request type, its wire code, and the reply type the
 /// other end answers with.
@@ -44,6 +51,37 @@ command!(DefineRoleReq, AGDX_AUTHZ_DEFINE_ROLE_CODE, AuthzReply);
 command!(DeleteRoleReq, AGDX_AUTHZ_DELETE_ROLE_CODE, AuthzReply);
 command!(BindRolesReq, AGDX_AUTHZ_BIND_ROLES_CODE, AuthzReply);
 command!(QueryEnvelope, AGDX_QUERY_CODE, QueryReply);
+command!(QueryPageEnvelope, AGDX_QUERY_PAGE_CODE, QueryReply);
+command!(
+    QueryCancelEnvelope,
+    AGDX_QUERY_CANCEL_CODE,
+    QueryCancelReply
+);
+command!(
+    QueryStatusEnvelope,
+    AGDX_QUERY_STATUS_CODE,
+    QueryStatusReply
+);
+command!(
+    CheckpointRequestEnvelope,
+    AGDX_CHECKPOINT_CODE,
+    CheckpointReply
+);
+command!(
+    DestinationGetRequest,
+    AGDX_DESTINATION_GET_CODE,
+    CheckpointReadReply
+);
+command!(
+    DestinationListRequest,
+    AGDX_DESTINATION_LIST_CODE,
+    CheckpointReadReply
+);
+command!(
+    QueryRouteListRequest,
+    AGDX_QUERY_ROUTE_LIST_CODE,
+    CheckpointReadReply
+);
 command!(GetProjection, AGDX_GET_PROJECTION_CODE, BrowseReply);
 command!(ListProjections, AGDX_LIST_PROJECTIONS_CODE, BrowseReply);
 command!(GetSchema, AGDX_GET_SCHEMA_CODE, BrowseReply);
@@ -80,6 +118,13 @@ mod tests {
         assert_eq!(<DeleteRoleReq as Command>::CODE, 1_000_105);
         assert_eq!(<BindRolesReq as Command>::CODE, 1_000_106);
         assert_eq!(<QueryEnvelope as Command>::CODE, 1_000_200);
+        assert_eq!(<QueryPageEnvelope as Command>::CODE, 1_000_201);
+        assert_eq!(<QueryCancelEnvelope as Command>::CODE, 1_000_202);
+        assert_eq!(<QueryStatusEnvelope as Command>::CODE, 1_000_203);
+        assert_eq!(<CheckpointRequestEnvelope as Command>::CODE, 1_000_021);
+        assert_eq!(<DestinationGetRequest as Command>::CODE, 1_000_022);
+        assert_eq!(<DestinationListRequest as Command>::CODE, 1_000_023);
+        assert_eq!(<QueryRouteListRequest as Command>::CODE, 1_000_024);
         assert_eq!(<GetProjection as Command>::CODE, 1_000_210);
         assert_eq!(<ListProjections as Command>::CODE, 1_000_211);
         assert_eq!(<GetSchema as Command>::CODE, 1_000_220);

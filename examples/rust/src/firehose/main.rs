@@ -325,7 +325,7 @@ async fn register_index(laser: &Laser, stream_name: &str, topic: &str) -> Result
         .source(stream_name, topic)
         .allow(projection_id.clone())
         .default_projection(projection_id)
-        .target_table(topic)
+        .index(topic)
         .build();
     laser.bindings().apply(binding).await?;
     Ok(())
@@ -522,8 +522,12 @@ async fn run_sample_queries(laser: &Laser, topics: &[String]) {
     {
         info!("`{topic}` events by severity:");
         for row in &by_severity.rows {
-            let severity = row.headers.get("severity").map_or("?", String::as_str);
-            let count = row.headers.get(COUNT_RESULT).map_or("0", String::as_str);
+            let severity = by_severity
+                .value_text(row, "severity")
+                .unwrap_or_else(|| "?".to_owned());
+            let count = by_severity
+                .value_text(row, COUNT_RESULT)
+                .unwrap_or_else(|| "0".to_owned());
             info!("  {severity:<6} {count}");
         }
     }
@@ -537,8 +541,12 @@ async fn run_sample_queries(laser: &Laser, topics: &[String]) {
     {
         info!("`{topic}` slowest 5 requests:");
         for row in &slowest.rows {
-            let route = row.headers.get("route").map_or("?", String::as_str);
-            let latency = row.headers.get("latency_ms").map_or("?", String::as_str);
+            let route = slowest
+                .value_text(row, "route")
+                .unwrap_or_else(|| "?".to_owned());
+            let latency = slowest
+                .value_text(row, "latency_ms")
+                .unwrap_or_else(|| "?".to_owned());
             info!("  {latency:>5}ms  {route}");
         }
     }

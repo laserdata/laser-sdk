@@ -4,7 +4,7 @@ Repo-wide agent guidelines live in [AGENTS.md](AGENTS.md). Read it first.
 
 This workspace holds the `wire/` and `sdk/` Rust crates, Python bindings under `foreign/python/`, and the native Node client under `foreign/typescript/`. All three SDKs consume the Rust-owned wire contract and shared BDD scenarios.
 
-The open streaming layer exposes Laser-native direct producers and live async consumers with server-managed offsets, while keeping the exact Apache Iggy builders, client, and types available as an escape hatch. Rust and Python always compile Iggy's VSR transport. Unknown managed codes use the non-replicated extension path, and authorization mutations are classified as replicated by the fork server.
+The open streaming layer exposes Laser-native direct producers and live async consumers with server-managed offsets, while keeping the exact Apache Iggy builders, client, and types available as an escape hatch. All SDKs use Iggy's native VSR transport. Unknown managed codes use the non-replicated extension path, and authorization mutations are classified as replicated by the Iggy server.
 
 Area skills are under `.claude/skills/`. Start with [laser-sdk-overview](.claude/skills/laser-sdk-overview/SKILL.md). TypeScript work also loads [typescript-sdk](.claude/skills/typescript-sdk/SKILL.md).
 

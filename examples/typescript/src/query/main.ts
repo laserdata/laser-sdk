@@ -1,4 +1,4 @@
-import type { Laser } from "@laserdata/laser-sdk"
+import { queryResultValue, typedValueDiagnosticText, type Laser } from "@laserdata/laser-sdk"
 import {
   PARTITIONS,
   ensureView,
@@ -48,9 +48,11 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   console.log(`  ${String(paid.rows.length)} of ${String(ORDERS.length)} orders are paid`)
   for (const row of paid.rows) {
-    const id = row.headers.get("id") ?? "?"
-    const total = row.headers.get("total") ?? "?"
-    console.log(`    order #${id} total ${total}`)
+    const id = queryResultValue(paid, row, "id")
+    const total = queryResultValue(paid, row, "total")
+    console.log(
+      `    order #${id === undefined ? "?" : typedValueDiagnosticText(id)} total ${total === undefined ? "?" : typedValueDiagnosticText(total)}`
+    )
   }
 }
 

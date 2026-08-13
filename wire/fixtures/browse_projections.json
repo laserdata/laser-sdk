@@ -36,22 +36,11 @@
           "order.v1"
         ],
         "default_projection": "order.v1",
-        "targets": [
-          {
-            "backend": "embedded",
-            "table": "orders_rows",
-            "role": "read_write",
-            "delivery": "effectively_once",
-            "required": true
-          },
-          {
-            "backend": "warehouse",
-            "table": "orders_mirror",
-            "role": "write_only",
-            "delivery": "at_most_once",
-            "required": false
-          }
-        ],
+        "backend": {
+          "resource_id": "00000000000000000000000004",
+          "generation": 2
+        },
+        "index": "orders_rows",
         "retention": {
           "kind": "time_to_live",
           "ttl_micros": 3600000000

@@ -7,8 +7,9 @@ use crate::kv::{KvScan, KvSet};
 use crate::limits::{
     MAX_BATCH_OPS, MAX_CLIENT_METADATA, MAX_FRAME_BYTES, MAX_GRAPH_NODE_LABELS,
     MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH, MAX_KEY_BYTES, MAX_MEMORY_BODY_BYTES,
-    MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_PAGE_SIZE, MAX_SCAN_LIMIT,
-    MAX_SOURCE_REF_BYTES, MAX_TEXT_QUERY_BYTES, MAX_VALUE_BYTES,
+    MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_PAGE_SIZE, MAX_QUERY_NAME_BYTES,
+    MAX_SCAN_LIMIT, MAX_SOURCE_REF_BYTES, MAX_TEXT_QUERY_BYTES, MAX_VALUE_BYTES,
+    MAX_VECTOR_DIMENSIONS,
 };
 use crate::memory::MemoryRecord;
 use crate::query::{TextQuery, Value, VectorQuery};
@@ -225,11 +226,21 @@ impl Validate for GraphUpsert {
 
 impl Validate for TextQuery {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.query.len() > MAX_TEXT_QUERY_BYTES {
+        if self.query.trim().is_empty() || self.query.len() > MAX_TEXT_QUERY_BYTES {
             return Err(InvalidError::new(format!(
-                "text query is {}B, exceeds cap {MAX_TEXT_QUERY_BYTES}B",
+                "text query is {}B, expected 1..={MAX_TEXT_QUERY_BYTES}B",
                 self.query.len()
             )));
+        }
+        if self.query.chars().any(char::is_control) {
+            return Err(InvalidError::new("text query contains a control character"));
+        }
+        if let Some(field) = &self.field
+            && (field.is_empty()
+                || field.len() > MAX_QUERY_NAME_BYTES
+                || field.chars().any(char::is_control))
+        {
+            return Err(InvalidError::new("text query field is invalid"));
         }
         Ok(())
     }
@@ -237,9 +248,29 @@ impl Validate for TextQuery {
 
 impl Validate for VectorQuery {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.top_k > MAX_PAGE_SIZE {
+        if self.field.is_empty()
+            || self.field.len() > MAX_QUERY_NAME_BYTES
+            || self.field.chars().any(char::is_control)
+        {
+            return Err(InvalidError::new("vector field is invalid"));
+        }
+        if self.embedding.is_empty() || self.embedding.len() > MAX_VECTOR_DIMENSIONS {
             return Err(InvalidError::new(format!(
-                "vector top_k {} exceeds cap {MAX_PAGE_SIZE}",
+                "vector dimensions must be in 1..={MAX_VECTOR_DIMENSIONS}"
+            )));
+        }
+        if self
+            .embedding
+            .iter()
+            .any(|value| !value.is_finite() || (*value == 0.0 && value.is_sign_negative()))
+        {
+            return Err(InvalidError::new(
+                "vector values must be finite canonical floats",
+            ));
+        }
+        if self.top_k == 0 || self.top_k > MAX_PAGE_SIZE as u32 {
+            return Err(InvalidError::new(format!(
+                "vector top_k {} is outside 1..={MAX_PAGE_SIZE}",
                 self.top_k
             )));
         }
@@ -458,7 +489,7 @@ mod tests {
         let over = VectorQuery {
             field: "embedding".to_owned(),
             embedding: vec![0.0; 4],
-            top_k: MAX_PAGE_SIZE + 1,
+            top_k: MAX_PAGE_SIZE as u32 + 1,
         };
         assert!(over.validate().is_err());
         let ok = VectorQuery {

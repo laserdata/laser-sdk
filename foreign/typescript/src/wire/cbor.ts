@@ -46,8 +46,14 @@ export function encodeNamed(
   )
 }
 
-export function encodeOne(value: unknown): Uint8Array {
-  return cborgEncode(value, ENCODE_OPTIONS)
+export function encodeOne(
+  value: unknown,
+  options?: { readonly forceFloatNumbers?: boolean }
+): Uint8Array {
+  return cborgEncode(
+    value,
+    options?.forceFloatNumbers === true ? FORCE_FLOAT_ENCODE_OPTIONS : ENCODE_OPTIONS
+  )
 }
 
 export function decodeOne(bytes: Uint8Array, context: string): unknown {
@@ -149,6 +155,24 @@ export const field = {
   requiredU8(map: CborMap, key: string, context: string): number {
     const value = requireField(map, key, context)
     return coerceUint(value, key, context, 0xff)
+  },
+
+  requiredI64(map: CborMap, key: string, context: string): bigint {
+    return coerceI64(requireField(map, key, context), key, context)
+  },
+
+  optionalI64(map: CborMap, key: string, context: string): bigint | undefined {
+    if (!map.has(key)) return undefined
+    return coerceI64(map.get(key), key, context)
+  },
+
+  requiredI32(map: CborMap, key: string, context: string): number {
+    return coerceI32(requireField(map, key, context), key, context)
+  },
+
+  optionalI32(map: CborMap, key: string, context: string): number | undefined {
+    if (!map.has(key)) return undefined
+    return coerceI32(map.get(key), key, context)
   },
 
   optionalU8(map: CborMap, key: string, context: string): number | undefined {
@@ -260,6 +284,17 @@ export function expectU32(value: unknown, context: string): number {
   return coerceU32(value, "value", context)
 }
 
+export function expectI64(value: unknown, context: string): bigint {
+  return coerceI64(value, "value", context)
+}
+
+export function expectBytes(value: unknown, context: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw new CodecError(`expected bytes in ${context}`, context, "value")
+  }
+  return value
+}
+
 const U32_MAX = 2 ** 32 - 1
 
 function coerceU32(value: unknown, key: string, context: string): number {
@@ -294,4 +329,24 @@ function coerceU128(value: unknown, key: string, context: string): bigint {
   if (typeof value === "bigint" && value >= 0n && value <= (1n << 128n) - 1n) return value
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value)
   throw new CodecError(`field \`${key}\` in ${context} must fit u128`, context, key)
+}
+
+function coerceI32(value: unknown, key: string, context: string): number {
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= -(2 ** 31) &&
+    value <= 2 ** 31 - 1
+  ) {
+    return value
+  }
+  throw new CodecError(`field \`${key}\` in ${context} must fit i32`, context, key)
+}
+
+function coerceI64(value: unknown, key: string, context: string): bigint {
+  const min = -(1n << 63n)
+  const max = (1n << 63n) - 1n
+  if (typeof value === "bigint" && value >= min && value <= max) return value
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value)
+  throw new CodecError(`field \`${key}\` in ${context} must fit i64`, context, key)
 }

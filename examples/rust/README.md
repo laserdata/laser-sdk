@@ -6,7 +6,7 @@ Run the commands below from this directory (`examples/rust/`).
 
 ## Run locally
 
-Start the repository's pinned VSR Apache Iggy service, then run an example.
+Start Apache Iggy, then run an example.
 
 ```sh
 just up                              # start a server on 127.0.0.1:8090
@@ -16,10 +16,10 @@ just down                            # stop it
 
 With no environment set, `laser()` uses `iggy:iggy@127.0.0.1:8090`.
 
-All examples use VSR. Point the same connection setting at Apache Iggy deployment. No protocol feature is exposed.
+All examples use Iggy's native VSR transport. Point the same connection setting at an Apache Iggy deployment.
 
 ```sh
-LASER_CONNECTION_STRING='user:pwd@vsr-host:8090' \
+LASER_CONNECTION_STRING='user:pwd@iggy-host:8090' \
   cargo run --example order-book
 ```
 

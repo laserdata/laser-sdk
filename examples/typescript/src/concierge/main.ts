@@ -150,15 +150,7 @@ async function registerTickets(laser: Laser): Promise<void> {
     source: { stream: laser.defaultStream ?? "", topic: TICKETS },
     allowedProjections: [id],
     defaultProjection: id,
-    targets: [
-      {
-        backend: "embedded",
-        table: TICKETS,
-        role: "readWrite",
-        delivery: "effectivelyOnce",
-        required: true
-      }
-    ],
+    index: TICKETS,
     notify: false
   }
   await laser.projections().register(projection)

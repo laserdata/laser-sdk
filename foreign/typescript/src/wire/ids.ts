@@ -231,3 +231,157 @@ export class ChannelId extends WireId<"ChannelId"> {
     }
   }
 }
+
+function dataStackIdValue(name: string, value: bigint): bigint {
+  return checkedU128(name, value)
+}
+
+export class LogicalSchemaId extends WireId<"LogicalSchemaId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): LogicalSchemaId {
+    return new LogicalSchemaId(dataStackIdValue("LogicalSchemaId", value))
+  }
+  static fromBytes(bytes: Uint8Array): LogicalSchemaId {
+    return LogicalSchemaId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): LogicalSchemaId {
+    return LogicalSchemaId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class PhysicalClusterIncarnation extends WireId<"PhysicalClusterIncarnation"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): PhysicalClusterIncarnation {
+    return new PhysicalClusterIncarnation(dataStackIdValue("PhysicalClusterIncarnation", value))
+  }
+  static fromBytes(bytes: Uint8Array): PhysicalClusterIncarnation {
+    return PhysicalClusterIncarnation.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): PhysicalClusterIncarnation {
+    return PhysicalClusterIncarnation.fromU128(crockfordDecode(text))
+  }
+}
+
+export class DestinationId extends WireId<"DestinationId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): DestinationId {
+    return new DestinationId(dataStackIdValue("DestinationId", value))
+  }
+  static fromBytes(bytes: Uint8Array): DestinationId {
+    return DestinationId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): DestinationId {
+    return DestinationId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class BackendResourceId extends WireId<"BackendResourceId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): BackendResourceId {
+    return new BackendResourceId(dataStackIdValue("BackendResourceId", value))
+  }
+  static fromBytes(bytes: Uint8Array): BackendResourceId {
+    return BackendResourceId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): BackendResourceId {
+    return BackendResourceId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class QueryRouteId extends WireId<"QueryRouteId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): QueryRouteId {
+    return new QueryRouteId(dataStackIdValue("QueryRouteId", value))
+  }
+  static fromBytes(bytes: Uint8Array): QueryRouteId {
+    return QueryRouteId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): QueryRouteId {
+    return QueryRouteId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class DestinationOperationId extends WireId<"DestinationOperationId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): DestinationOperationId {
+    return new DestinationOperationId(dataStackIdValue("DestinationOperationId", value))
+  }
+  static fromBytes(bytes: Uint8Array): DestinationOperationId {
+    return DestinationOperationId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): DestinationOperationId {
+    return DestinationOperationId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class CheckpointOwnerId extends WireId<"CheckpointOwnerId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): CheckpointOwnerId {
+    return new CheckpointOwnerId(dataStackIdValue("CheckpointOwnerId", value))
+  }
+  static fromBytes(bytes: Uint8Array): CheckpointOwnerId {
+    return CheckpointOwnerId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): CheckpointOwnerId {
+    return CheckpointOwnerId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class PreparedAttemptId extends WireId<"PreparedAttemptId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): PreparedAttemptId {
+    return new PreparedAttemptId(dataStackIdValue("PreparedAttemptId", value))
+  }
+  static fromBytes(bytes: Uint8Array): PreparedAttemptId {
+    return PreparedAttemptId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): PreparedAttemptId {
+    return PreparedAttemptId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class CheckpointRequestId extends WireId<"CheckpointRequestId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): CheckpointRequestId {
+    return new CheckpointRequestId(dataStackIdValue("CheckpointRequestId", value))
+  }
+  static fromBytes(bytes: Uint8Array): CheckpointRequestId {
+    return CheckpointRequestId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): CheckpointRequestId {
+    return CheckpointRequestId.fromU128(crockfordDecode(text))
+  }
+}
+
+export class QueryExecutionId extends WireId<"QueryExecutionId"> {
+  private constructor(value: bigint) {
+    super(value)
+  }
+  static fromU128(value: bigint): QueryExecutionId {
+    return new QueryExecutionId(dataStackIdValue("QueryExecutionId", value))
+  }
+  static fromBytes(bytes: Uint8Array): QueryExecutionId {
+    return QueryExecutionId.fromU128(bytes16ToBigInt(bytes))
+  }
+  static parse(text: string): QueryExecutionId {
+    return QueryExecutionId.fromU128(crockfordDecode(text))
+  }
+}

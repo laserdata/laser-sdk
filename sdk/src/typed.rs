@@ -168,7 +168,7 @@ impl<T: DeserializeOwned> TypedRecords<T> {
                 Err(error) => {
                     return Some(Err(TypedDecodeError {
                         position: None,
-                        source: error,
+                        source: Box::new(error),
                     }));
                 }
             }
@@ -236,7 +236,7 @@ pub struct TypedDecodeError {
     pub position: Option<MessageId>,
     /// What went wrong: a codec failure for a positioned record, the transport
     /// error for a failed poll.
-    pub source: LaserError,
+    pub source: Box<LaserError>,
 }
 
 /// Folds into the codec family so `records.next()` composes with `?` in a
@@ -245,7 +245,7 @@ impl From<TypedDecodeError> for LaserError {
     fn from(error: TypedDecodeError) -> Self {
         match error.position {
             Some(_) => LaserError::Codec(error.to_string()),
-            None => error.source,
+            None => *error.source,
         }
     }
 }
@@ -275,7 +275,7 @@ fn decode_message<T: DeserializeOwned>(
         }),
         Err(source) => Err(TypedDecodeError {
             position: Some(message.id),
-            source,
+            source: Box::new(source),
         }),
     }
 }
@@ -462,7 +462,7 @@ mod tests {
     fn given_a_positioned_failure_when_displayed_then_should_name_the_record() {
         let error = TypedDecodeError {
             position: Some(MessageId::new(2, 17)),
-            source: LaserError::Codec("bad".to_owned()),
+            source: Box::new(LaserError::Codec("bad".to_owned())),
         };
         assert!(error.to_string().contains("2:17"));
     }

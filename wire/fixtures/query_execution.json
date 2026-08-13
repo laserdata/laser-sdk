@@ -1,0 +1,74 @@
+{
+  "status": {
+    "execution_id": "000000000000000000000000FM",
+    "state": "completed",
+    "started_at_micros": 1717171717000000,
+    "finished_at_micros": 1717171717001000,
+    "scanned_bytes": 4096,
+    "produced_bytes": 256,
+    "row_count": 2
+  },
+  "result": {
+    "fields": [
+      {
+        "id": 1,
+        "name": "amount",
+        "required": true,
+        "field_type": {
+          "kind": "long"
+        }
+      },
+      {
+        "id": 2,
+        "name": "customer",
+        "required": true,
+        "field_type": {
+          "kind": "string"
+        }
+      }
+    ],
+    "rows": [
+      {
+        "values": [
+          {
+            "kind": "long",
+            "value": 42
+          },
+          {
+            "kind": "string",
+            "value": "alice"
+          }
+        ],
+        "score": 0.25
+      }
+    ],
+    "page": {
+      "offset": 0,
+      "limit": 50,
+      "total": 1,
+      "has_more": false
+    },
+    "context": {
+      "execution_id": "00000000000000000000000001",
+      "engine": {
+        "name": "datafusion",
+        "version": "50.0.0",
+        "dialect": "data_fusion"
+      },
+      "resolved_target": {
+        "kind": "operational",
+        "index": "orders",
+        "backend_resource_id": "0000000000000000000000000A",
+        "backend_generation": 4,
+        "runtime_configuration_revision": 9
+      },
+      "requested_consistency": "eventual",
+      "delivered_consistency": "eventual",
+      "truncated": false,
+      "elapsed_micros": 12000,
+      "scanned_bytes": 4096,
+      "produced_bytes": 128,
+      "row_count": 1
+    }
+  }
+}

@@ -58,7 +58,7 @@ async def main() -> None:
 
     print(f"  {len(paid.rows)} of {len(ORDERS)} orders are paid")
     for row in paid.rows:
-        print(f"    order #{row.headers.get('id')} total {row.headers.get('total')}")
+        print(f"    order #{paid.value_text(row, 'id')} total {paid.value_text(row, 'total')}")
 
 
 if __name__ == "__main__":

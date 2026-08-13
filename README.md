@@ -1,6 +1,6 @@
 # LaserData - Laser SDK
 
-**Build agents and data-driven systems on one durable log.** Ultra-low-latency **streaming**, a **query** layer, **key-value** state, copy-on-write **forks**, a **knowledge graph**, and a full **agent fabric** (memory, discovery, contracts, workflows), all over a single [Apache Iggy](https://iggy.apache.org) connection. By [LaserData, Inc.](https://laserdata.com)
+**Build agents and data-driven systems on one durable log.** Ultra-low-latency **streaming**, typed operational and lakehouse **query**, materialization **destinations**, **key-value** state, copy-on-write **forks**, a **knowledge graph**, and a full **agent fabric** (memory, discovery, contracts, workflows), all over a single [Apache Iggy](https://iggy.apache.org) connection. By [LaserData, Inc.](https://laserdata.com)
 
 **One connection replaces four systems.** The stream you already publish to becomes the store you query, the state you coordinate on, and the fabric your agents discover, route, and reason over. No second database, no cache, no orchestration server, nothing to keep in sync. The **log is the single source of truth**, and every other surface is a read model you can rebuild from offset 0. A support task, say, streams its messages, keeps its working memory, and resolves the dependencies between them, all in one place.
 
@@ -18,7 +18,7 @@ Choose where to run:
 
 - **LaserData Cloud:** [create a Free deployment](https://laserdata.cloud), copy its connection string from the Console's Credentials tab, and export it as `LASER_CONNECTION_STRING`.
 - **Laser Stack:** run `./scripts/up` in the [Laser Stack](https://github.com/laserdata/laser-stack) checkout. It starts the complete local SDK surface and prints a copyable `LASER_CONNECTION_STRING` export.
-- **Apache Iggy:** use a VSR-enabled server for the open streaming path, then set `LASER_CONNECTION_STRING` to its connection string.
+- **Apache Iggy:** run the server for the open streaming path, then set `LASER_CONNECTION_STRING` to its connection string.
 
 The repository examples read `LASER_CONNECTION_STRING`. Export it once or set it for one command:
 
@@ -27,7 +27,7 @@ export LASER_CONNECTION_STRING='<connection string>'
 LASER_CONNECTION_STRING='<connection string>' cargo run --example log
 ```
 
-The snippets below connect to local Apache Iggy. `:8090` is the default TCP port and can be omitted. Laser SDK always uses VSR and has no protocol flag.
+The snippets below connect to local Apache Iggy. `:8090` is the default TCP port and can be omitted. Laser SDK uses Iggy's native VSR transport.
 
 **Rust** ([crates.io](https://crates.io/crates/laser-sdk))
 
@@ -104,7 +104,8 @@ Every feature is a **primitive** you reach by one accessor on the connected clie
 | Accessor | Primitive | Reach for it to |
 | --- | --- | --- |
 | `laser.stream(name).topic(name)` | **Log** | publish and consume records, replay by offset, batch |
-| `laser.query(index)` | **Views** | filter, aggregate, page, vector-search declared projections |
+| `laser.query(index)` / `laser.query_lakehouse(destination, generation)` | **Views** | filter, aggregate, page, inspect or cancel operational and lakehouse queries |
+| `laser.destinations()` | **Destinations** | declare materialization targets, change desired state, inspect checkpoints and query routes |
 | `laser.graph(name)` | **Graph** | link entities, traverse, find neighbors and nearest vectors |
 | `laser.watch()` | **Change feed** | consume advancement records instead of re-querying blind |
 | `laser.kv(namespace)` / `laser.fork(id)` | **State** | point reads and writes, CAS, leases, copy-on-write branches |

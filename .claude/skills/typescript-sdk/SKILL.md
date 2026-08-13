@@ -20,11 +20,23 @@ Public bytes are `Uint8Array`. Wire-sized u64 and u128 values are `bigint`. Publ
 
 Capability negotiation must match Rust and Python. `BackendAnnounce.ready !== true` cannot enable plane-served surfaces or expose stale backends. `refreshCapabilities()` and the one-second unavailable retry re-probe without reconnecting, preserve the builder's configured capability seed, and adopt announced topology except where the builder explicitly overrode a topology field. `withCapabilities()` remains an authoritative handle-local override and refresh must not replace it.
 
-`src/iggy/apache-iggy.ts` always constructs VSR. The pinned Apache Iggy Node SDK (`0.10.0-edge.2`) has no protocol option, so injected clients are VSR by construction and `fromClient` only probes the injected client for liveness. LaserData hosts use TLS with the bundled root CA and explicit SNI. The Apache Iggy Node SDK supports VSR over TLS through its normal `getRawClient` path, with no Laser-side transport workaround. Synchronous client configuration failures must fail immediately and never enter the unlimited connection retry loop. This module is also the allocation boundary: a `Uint8Array` becomes a Node `Buffer` view over the same backing store rather than a copied buffer.
+`src/iggy/apache-iggy.ts` uses Iggy's native VSR transport. Injected clients use the same transport, and `fromClient` only probes the injected client for liveness. LaserData hosts use TLS with the bundled root CA and explicit SNI. The Apache Iggy Node SDK supports VSR over TLS through its normal `getRawClient` path, with no Laser-side transport workaround. Synchronous client configuration failures must fail immediately and never enter the unlimited connection retry loop. This module is also the allocation boundary: a `Uint8Array` becomes a Node `Buffer` view over the same backing store rather than a copied buffer.
 
 Direct and fluent streaming sends return Apache Iggy's `SendMessagesResponse`. Re-export its confirmation types, preserve all confirmations through the transport layer, and allow an empty list when the server cannot report offsets. A confirmation is an in-memory commit position, not an fsync guarantee.
 
 Memory mirrors the Rust topology. `laser.memory(namespace)` uses the default audit topic, `laser.memoryOnTopic(topic, stream?)` opens an isolated existing topic, and `laser.memoryTopic(topic).stream(name).partitions(n).ttl(milliseconds).build()` configures one with message expiry. `noExpiry()` writes zero expiry. `laser.context(conversation).memory(handle)` must retain the exact topic-backed handle instead of substituting another namespace.
+
+## Data stack parity
+
+The native modules `wire/schema.ts`, `source.ts`, `destination.ts`, `checkpoint.ts`, `arrow.ts`, and Query in `wire/query.ts` mirror Rust field-for-field. Successful query replies must validate result fields, positional row width, tagged values against logical types, page cursor agreement, delivered consistency, and operational or lakehouse evidence before reaching application code.
+
+`Laser.query()` and `queryLakehouse()` build explicit targets. `QueryRequest` supports snapshot selection, typed raw SQL parameters, cursor continuation, status, and cancellation. `Laser.destinations()` exposes public checkpoint mutations and bounded destination and route reads. Public checkpoint decoding must never accept replicated transitions.
+
+Every managed command descriptor carries its capability surface and correct `OpVersions` field. Query commands use `versions.query`. Destination and checkpoint commands use `versions.checkpoint`. Cursor paging, execution status, and cancellation also check their dedicated query capability flags.
+
+`PublishRequest.arrowIpc` and the batch peer validate metadata and exact payload length before I/O. Use `Uint8Array` for bytes and `bigint` for wire u64 and u128 values.
+
+Any public change updates root and full exports, both API reports, unit and wire tests, robustness tests, fixture manifest, README examples, and the shared `data_stack.feature` steps. Run `build:test` before test runners so they execute the current source.
 
 ## Exports
 

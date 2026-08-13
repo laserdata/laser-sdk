@@ -31,6 +31,7 @@ export class LaserWorld {
   readonly memoryIds = new Map<string, MemoryId>()
   query = new QueryEngine()
   queryResult?: QueryResult
+  dataStack = new DataStackModel()
   kv = new KvEngine()
   cas?: CasResult
   graph = new GraphEngine()
@@ -73,6 +74,127 @@ export class LaserWorld {
   async close(): Promise<void> {
     this.abort.abort("scenario cleanup")
     if (this.laser !== undefined) await this.laser.close()
+  }
+}
+
+interface DestinationState {
+  definitionRevision: number
+  checkpointRevision: number
+  effectiveState: "disabled" | "running" | "blocked"
+  nextOffset: number
+}
+
+export type DataStackError =
+  | { readonly kind: "conflict"; readonly observedRevision: number }
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "notFound" }
+
+export class DataStackModel {
+  private globalRevision = 0
+  private readonly destinations = new Map<string, DestinationState>()
+  private queryRows: readonly string[] = []
+  private queryCursor = 0
+  private cancelled = false
+  operation?: { readonly id: string }
+  error?: DataStackError
+  queryPage?: { readonly rows: readonly string[]; readonly cursor?: number }
+
+  register(name: string, expectedGlobalRevision: number): void {
+    if (!this.requireGlobal(expectedGlobalRevision)) return
+    this.globalRevision += 1
+    this.destinations.set(name, {
+      definitionRevision: 1,
+      checkpointRevision: 0,
+      effectiveState: "disabled",
+      nextOffset: 0
+    })
+    this.operation = { id: `operation-${String(this.globalRevision)}` }
+  }
+
+  enable(name: string, expectedGlobalRevision: number, expectedDefinitionRevision: number): void {
+    if (!this.requireGlobal(expectedGlobalRevision)) return
+    const destination = this.destinations.get(name)
+    if (destination === undefined) {
+      this.error = { kind: "notFound" }
+      return
+    }
+    if (destination.definitionRevision !== expectedDefinitionRevision) {
+      this.error = { kind: "conflict", observedRevision: this.globalRevision }
+      return
+    }
+    this.globalRevision += 1
+    destination.definitionRevision += 1
+    destination.checkpointRevision += 1
+    destination.effectiveState = "running"
+    this.operation = { id: `operation-${String(this.globalRevision)}` }
+  }
+
+  recordGap(name: string): void {
+    const destination = this.destinations.get(name)
+    if (destination === undefined) {
+      this.error = { kind: "notFound" }
+      return
+    }
+    this.globalRevision += 1
+    destination.checkpointRevision += 1
+    destination.effectiveState = "blocked"
+  }
+
+  acceptGap(name: string, nextOffset: number, expectedCheckpointRevision: number): void {
+    const destination = this.destinations.get(name)
+    if (destination === undefined) {
+      this.error = { kind: "notFound" }
+      return
+    }
+    if (destination.checkpointRevision !== expectedCheckpointRevision) {
+      this.error = { kind: "conflict", observedRevision: this.globalRevision }
+      return
+    }
+    this.globalRevision += 1
+    destination.checkpointRevision += 1
+    destination.effectiveState = "running"
+    destination.nextOffset = nextOffset
+  }
+
+  destination(name: string): Readonly<DestinationState> | undefined {
+    return this.destinations.get(name)
+  }
+
+  seedQuery(rows: readonly string[]): void {
+    this.queryRows = rows
+    this.queryCursor = 0
+    this.cancelled = false
+  }
+
+  readPage(limit: number): void {
+    if (this.cancelled) {
+      this.error = { kind: "cancelled" }
+      return
+    }
+    const start = this.queryCursor
+    const end = Math.min(start + limit, this.queryRows.length)
+    this.queryCursor = end
+    this.queryPage = {
+      rows: this.queryRows.slice(start, end),
+      ...(end < this.queryRows.length ? { cursor: end } : {})
+    }
+  }
+
+  cancelQuery(): void {
+    this.cancelled = true
+  }
+
+  queryIsCancelled(): boolean {
+    return this.cancelled
+  }
+
+  private requireGlobal(expected: number): boolean {
+    if (expected === this.globalRevision) {
+      delete this.error
+      return true
+    }
+    this.error = { kind: "conflict", observedRevision: this.globalRevision }
+    return false
   }
 }
 

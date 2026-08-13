@@ -1,5 +1,11 @@
+use crate::destination::{BackendResourceId, FileFormat, TableFormat};
+use crate::error::InvalidError;
+use crate::query::{Consistency, SqlDialect};
+use crate::schema::LogicalTypeKind;
 use crate::topology::WireTopology;
+use crate::validate::Validate;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Capability feature bits advertised in [`OpVersions::features`]. Each constant
 /// names one managed sub-feature a server serves beyond the base surface, so a
@@ -25,6 +31,8 @@ pub mod feature {
     pub const WATCH: u64 = 1 << 6;
     /// The streaming server serves the authorization control band (`AGDX_AUTHZ_*`).
     pub const AUTHZ: u64 = 1 << 7;
+    /// The deployment serves destination and checkpoint lifecycle operations.
+    pub const DESTINATIONS: u64 = 1 << 8;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability
@@ -48,6 +56,9 @@ pub struct OpVersions {
     /// query surface, so it has no op version of its own.)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub graph: u32,
+    /// Destination and checkpoint operation version. Zero means not served.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub checkpoint: u32,
     /// Capability feature bits (see [`feature`]): managed sub-features served
     /// beyond the base surface (compare-and-swap, read-your-writes, strong
     /// consistency). `0` (the default) is skipped on encode, so a pre-feature
@@ -76,6 +87,7 @@ impl OpVersions {
             fork,
             agent: 0,
             graph: 0,
+            checkpoint: 0,
             features: 0,
         }
     }
@@ -91,6 +103,13 @@ impl OpVersions {
     #[must_use]
     pub fn with_graph(mut self, graph: u32) -> Self {
         self.graph = graph;
+        self
+    }
+
+    /// Returns a copy advertising the destination and checkpoint version.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: u32) -> Self {
+        self.checkpoint = checkpoint;
         self
     }
 
@@ -126,80 +145,394 @@ impl HelloReply {
     }
 }
 
-/// One materialization backend a server exposes, advertised so a client can see
-/// what it may route to. `id` is the stable handle a binding references, `kind`
-/// is the engine family as an opaque string, so a new engine is advertised by
-/// name without any wire change. Carries identity only, never settings or
-/// secrets. Integration-agnostic: the wire pins no specific engine.
+pub const BACKEND_DESCRIPTOR_VERSION: u32 = 1;
+
+/// One observed backend resource and its structured, secret-free capabilities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct BackendDescriptor {
-    pub id: String,
-    pub kind: String,
-    /// Human-friendly display name for a UI, when the server has one. Advisory.
-    /// Absent (the default, skipped on the wire) means a client derives a label
-    /// from `id` or `kind`.
+    pub descriptor_version: u32,
+    pub resource_id: BackendResourceId,
+    pub mode: BackendMode,
+    pub label: String,
+    pub implementation: BackendImplementation,
+    pub observed_backend_generation: u64,
+    pub runtime_configuration_revision: u64,
+    pub desired_state: BackendDesiredState,
+    pub observed_state: BackendObservedState,
+    pub readiness: BackendReadiness,
+    pub materialization: Vec<MaterializationCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// Engine or build version string, opaque to the wire. Advisory, for display
-    /// and compatibility hints. Absent (the default, skipped on the wire) means
-    /// the server did not report one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// Opaque capability tags the backend declares about itself, so a consumer
-    /// can reason about what this backend is good for (e.g. ingest, query, a
-    /// particular query-surface feature, or a storage trait) and gate a decision
-    /// before attempting an op. Each tag is an opaque string the wire pins no
-    /// meaning to: a producer emits what it supports and a consumer matches the
-    /// tags it understands, ignoring the rest, so a new capability is advertised
-    /// by name with no wire change. Integration-agnostic. Empty (the default,
-    /// skipped on the wire) means none declared.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
+    pub query: Option<QueryCapabilities>,
+    pub schema: SchemaCapabilities,
+    pub maintenance: MaintenanceCapabilities,
+    pub limits: BackendLimits,
 }
 
 impl BackendDescriptor {
-    /// A descriptor for the backend at `id` of engine family `kind`.
-    pub fn new(id: impl Into<String>, kind: impl Into<String>) -> Self {
+    pub fn new(
+        resource_id: BackendResourceId,
+        mode: BackendMode,
+        label: impl Into<String>,
+        implementation: BackendImplementation,
+        observed_backend_generation: u64,
+        runtime_configuration_revision: u64,
+    ) -> Self {
         Self {
-            id: id.into(),
-            kind: kind.into(),
-            label: None,
-            version: None,
-            capabilities: Vec::new(),
+            descriptor_version: BACKEND_DESCRIPTOR_VERSION,
+            resource_id,
+            mode,
+            label: label.into(),
+            implementation,
+            observed_backend_generation,
+            runtime_configuration_revision,
+            desired_state: BackendDesiredState::Disabled,
+            observed_state: BackendObservedState::Disabled,
+            readiness: BackendReadiness::not_ready(BackendReadinessCode::Disabled),
+            materialization: Vec::new(),
+            query: None,
+            schema: SchemaCapabilities::default(),
+            maintenance: MaintenanceCapabilities::default(),
+            limits: BackendLimits::default(),
         }
     }
 
-    /// Returns a copy with a human-friendly display label.
     #[must_use]
-    pub fn with_label(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(label.into());
+    pub fn with_state(
+        mut self,
+        desired_state: BackendDesiredState,
+        observed_state: BackendObservedState,
+        readiness: BackendReadiness,
+    ) -> Self {
+        self.desired_state = desired_state;
+        self.observed_state = observed_state;
+        self.readiness = readiness;
         self
     }
 
-    /// Returns a copy advertising an engine or build version.
     #[must_use]
-    pub fn with_version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
+    pub fn with_materialization(mut self, capabilities: Vec<MaterializationCapability>) -> Self {
+        self.materialization = capabilities;
         self
     }
 
-    /// Returns a copy advertising the opaque `capabilities` tags this backend
-    /// declares about itself.
     #[must_use]
-    pub fn with_capabilities<I, S>(mut self, capabilities: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.capabilities = capabilities.into_iter().map(Into::into).collect();
+    pub fn with_query(mut self, capabilities: QueryCapabilities) -> Self {
+        self.query = Some(capabilities);
         self
     }
 
-    /// Whether the backend declared the opaque capability `tag`.
-    pub fn has_capability(&self, tag: &str) -> bool {
-        self.capabilities.iter().any(|c| c == tag)
+    #[must_use]
+    pub fn with_schema(mut self, capabilities: SchemaCapabilities) -> Self {
+        self.schema = capabilities;
+        self
     }
+
+    #[must_use]
+    pub fn with_maintenance(mut self, capabilities: MaintenanceCapabilities) -> Self {
+        self.maintenance = capabilities;
+        self
+    }
+
+    #[must_use]
+    pub fn with_limits(mut self, limits: BackendLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+}
+
+impl Validate for BackendDescriptor {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.descriptor_version != BACKEND_DESCRIPTOR_VERSION {
+            return Err(InvalidError::new(format!(
+                "backend descriptor version must be {BACKEND_DESCRIPTOR_VERSION}"
+            )));
+        }
+        if self.resource_id.as_u128() == 0
+            || self.observed_backend_generation == 0
+            || self.runtime_configuration_revision == 0
+        {
+            return Err(InvalidError::new(
+                "backend identity and observed revisions must be nonzero",
+            ));
+        }
+        validate_descriptor_text("backend label", &self.label)?;
+        validate_descriptor_text("backend implementation kind", &self.implementation.kind)?;
+        validate_descriptor_text(
+            "backend implementation version",
+            &self.implementation.version,
+        )?;
+        self.readiness.validate()?;
+        if self.readiness.ready && self.observed_state != BackendObservedState::Ready {
+            return Err(InvalidError::new(
+                "ready backend must report the ready observed state",
+            ));
+        }
+        let mut materialization = BTreeSet::new();
+        for capability in &self.materialization {
+            let key = (capability.file_format as u8, capability.table_format as u8);
+            if !materialization.insert(key) {
+                return Err(InvalidError::new(
+                    "backend repeats a materialization capability",
+                ));
+            }
+        }
+        if let Some(query) = &self.query {
+            query.validate()?;
+        }
+        if self.readiness.ready {
+            if self.schema.logical_schema && self.limits.max_schema_fields == 0 {
+                return Err(InvalidError::new(
+                    "ready logical-schema backend must advertise a schema-field limit",
+                ));
+            }
+            if !self.materialization.is_empty() && self.limits.max_materialization_file_bytes == 0 {
+                return Err(InvalidError::new(
+                    "ready materialization backend must advertise a file-size limit",
+                ));
+            }
+            if self.query.is_some()
+                && (self.limits.max_query_rows == 0
+                    || self.limits.max_query_bytes == 0
+                    || self.limits.max_scan_bytes == 0
+                    || self.limits.max_query_micros == 0
+                    || self.limits.max_concurrent_queries == 0)
+            {
+                return Err(InvalidError::new(
+                    "ready query backend must advertise nonzero query limits",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BackendMode {
+    Operational,
+    Lakehouse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendImplementation {
+    pub kind: String,
+    pub version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BackendDesiredState {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BackendObservedState {
+    Disabled,
+    Starting,
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendReadiness {
+    pub ready: bool,
+    pub reasons: Vec<BackendReadinessReason>,
+    pub observed_at_micros: u64,
+}
+
+impl BackendReadiness {
+    pub fn not_ready(code: BackendReadinessCode) -> Self {
+        Self {
+            ready: false,
+            reasons: vec![BackendReadinessReason { code, detail: None }],
+            observed_at_micros: 0,
+        }
+    }
+
+    pub fn ready(observed_at_micros: u64) -> Self {
+        Self {
+            ready: true,
+            reasons: Vec::new(),
+            observed_at_micros,
+        }
+    }
+}
+
+impl Validate for BackendReadiness {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.ready {
+            if !self.reasons.is_empty() || self.observed_at_micros == 0 {
+                return Err(InvalidError::new(
+                    "ready backend requires an observation time and no failure reasons",
+                ));
+            }
+            return Ok(());
+        }
+        if self.reasons.is_empty() {
+            return Err(InvalidError::new(
+                "not-ready backend requires at least one stable reason",
+            ));
+        }
+        if self.reasons.len() > 32 {
+            return Err(InvalidError::new(
+                "backend readiness reason count exceeds cap 32",
+            ));
+        }
+        for reason in &self.reasons {
+            if let Some(detail) = &reason.detail {
+                validate_descriptor_text("backend readiness detail", detail)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendReadinessReason {
+    pub code: BackendReadinessCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BackendReadinessCode {
+    Disabled,
+    ConfigurationPending,
+    ConfigurationRejected,
+    CredentialUnavailable,
+    ObjectStoreUnavailable,
+    CatalogUnavailable,
+    QueryRuntimeUnavailable,
+    GenerationMismatch,
+    ProbeFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializationCapability {
+    pub file_format: FileFormat,
+    pub table_format: TableFormat,
+    pub create_table: bool,
+    pub append: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCapabilities {
+    pub dialects: Vec<SqlDialect>,
+    pub time_travel: Vec<TimeTravelCapability>,
+    pub consistency: Vec<Consistency>,
+    pub logical_types: Vec<LogicalTypeKind>,
+    pub paging: Vec<QueryPagingCapability>,
+    pub cancellation: bool,
+    pub execution_status: bool,
+    pub raw_sql: bool,
+}
+
+impl Validate for QueryCapabilities {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.dialects.is_empty()
+            || self.consistency.is_empty()
+            || self.logical_types.is_empty()
+            || self.paging.is_empty()
+        {
+            return Err(InvalidError::new(
+                "query capabilities require dialect, consistency, and logical-type coverage",
+            ));
+        }
+        ensure_unique(
+            "query dialect",
+            self.dialects.iter().map(|value| *value as u8),
+        )?;
+        ensure_unique(
+            "query time-travel capability",
+            self.time_travel.iter().map(|value| *value as u8),
+        )?;
+        ensure_unique(
+            "query consistency",
+            self.consistency.iter().map(|value| *value as u8),
+        )?;
+        ensure_unique(
+            "query logical type",
+            self.logical_types.iter().map(|value| *value as u8),
+        )?;
+        ensure_unique(
+            "query paging capability",
+            self.paging.iter().map(|value| *value as u8),
+        )?;
+        if self.raw_sql && self.dialects.is_empty() {
+            return Err(InvalidError::new(
+                "raw SQL capability requires an explicit dialect",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn ensure_unique(label: &str, values: impl IntoIterator<Item = u8>) -> Result<(), InvalidError> {
+    let mut seen = BTreeSet::new();
+    if values.into_iter().all(|value| seen.insert(value)) {
+        Ok(())
+    } else {
+        Err(InvalidError::new(format!("backend repeats a {label}")))
+    }
+}
+
+fn validate_descriptor_text(label: &str, value: &str) -> Result<(), InvalidError> {
+    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+        return Err(InvalidError::new(format!(
+            "{label} must contain 1..=4096 bytes without control characters"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TimeTravelCapability {
+    SnapshotId,
+    TimestampMicros,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum QueryPagingCapability {
+    Offset,
+    Cursor,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaCapabilities {
+    pub logical_schema: bool,
+    pub arrow_ipc_stream: bool,
+    pub schema_evolution: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceCapabilities {
+    pub expire_snapshots: bool,
+    pub remove_orphan_files: bool,
+    pub compact_data_files: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendLimits {
+    pub max_query_rows: u64,
+    pub max_query_bytes: u64,
+    pub max_scan_bytes: u64,
+    pub max_query_micros: u64,
+    pub max_concurrent_queries: u32,
+    pub max_schema_fields: u32,
+    pub max_materialization_file_bytes: u64,
 }
 
 /// The managed backend's capability announcement to the streaming server, sent over their
@@ -274,11 +607,48 @@ impl BackendAnnounce {
     }
 }
 
+impl Validate for BackendAnnounce {
+    fn validate(&self) -> Result<(), InvalidError> {
+        let mut resources = BTreeSet::new();
+        for backend in &self.backends {
+            backend.validate()?;
+            if !resources.insert(backend.resource_id) {
+                return Err(InvalidError::new(
+                    "backend announcement repeats a resource id",
+                ));
+            }
+        }
+        if self.ready
+            && !self.backends.is_empty()
+            && !self.backends.iter().any(|backend| backend.readiness.ready)
+        {
+            return Err(InvalidError::new(
+                "ready backend announcement must contain a ready backend",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
     use crate::codes::{CONTROL_OP_VERSION, FORK_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION};
     use crate::framing::{decode_named, encode_named};
+
+    fn backend(resource_id: u128, mode: BackendMode, label: &str, kind: &str) -> BackendDescriptor {
+        BackendDescriptor::new(
+            BackendResourceId::from_u128(resource_id),
+            mode,
+            label,
+            BackendImplementation {
+                kind: kind.to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            1,
+            1,
+        )
+    }
 
     #[test]
     fn given_a_hello_reply_when_round_tripped_then_should_preserve_versions() {
@@ -342,36 +712,19 @@ mod tests {
             FORK_OP_VERSION,
         ))
         .with_backends(vec![
-            BackendDescriptor::new("embedded", "embedded"),
-            BackendDescriptor::new("warehouse", "columnar")
-                .with_label("Analytics warehouse")
-                .with_version("2.1.0")
-                .with_capabilities(["ingest", "query", "percentile"]),
+            backend(1, BackendMode::Operational, "Embedded", "embedded"),
+            backend(2, BackendMode::Lakehouse, "Analytics warehouse", "columnar"),
         ]);
         let bytes = encode_named(&announce).expect("encodes");
         let back: BackendAnnounce = decode_named(&bytes).expect("decodes");
         assert_eq!(back, announce);
         assert_eq!(back.backends.len(), 2);
-        assert_eq!(back.backends[1].id, "warehouse");
-        assert_eq!(back.backends[1].kind, "columnar");
         assert_eq!(
-            back.backends[1].label.as_deref(),
-            Some("Analytics warehouse")
+            back.backends[1].resource_id,
+            BackendResourceId::from_u128(2)
         );
-        assert_eq!(back.backends[1].version.as_deref(), Some("2.1.0"));
-        assert!(back.backends[1].has_capability("query"));
-        assert!(!back.backends[1].has_capability("vector_search"));
-        // The minimal descriptor omits the advisory fields on the wire.
-        assert_eq!(back.backends[0].label, None);
-        assert_eq!(back.backends[0].version, None);
-        assert!(back.backends[0].capabilities.is_empty());
-        let minimal_json = serde_json::to_string(&back.backends[0]).expect("json");
-        assert!(
-            !minimal_json.contains("label")
-                && !minimal_json.contains("version")
-                && !minimal_json.contains("capabilities"),
-            "absent advisory fields omitted: {minimal_json}"
-        );
+        assert_eq!(back.backends[1].implementation.kind, "columnar");
+        assert_eq!(back.backends[1].label, "Analytics warehouse");
 
         // No advertised backends (the default) is omitted on the wire, so a
         // pre-backends announce stays byte-identical.

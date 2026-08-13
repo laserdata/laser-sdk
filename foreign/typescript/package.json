@@ -1,7 +1,7 @@
 {
   "name": "@laserdata/laser-sdk",
   "version": "0.2.0",
-  "description": "LaserData SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX).",
+  "description": "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX).",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -87,17 +87,17 @@
     "apache-iggy": "0.10.0-edge.2",
     "avsc": "5.7.9",
     "cborg": "^6.1.1",
-    "protobufjs": "8.7.2"
+    "protobufjs": "8.7.1"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@microsoft/api-extractor": "^7.58.12",
     "@typescript/native": "npm:typescript@^7.0.2",
     "c8": "^12.0.0",
-    "eslint": "10.8.1",
-    "globals": "17.11.0",
+    "eslint": "10.8.0",
+    "globals": "17.9.0",
     "prettier": "3.9.6",
     "typescript": "^6.0.3",
-    "typescript-eslint": "8.67.0"
+    "typescript-eslint": "8.66.0"
   }
 }

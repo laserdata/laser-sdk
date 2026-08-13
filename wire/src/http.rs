@@ -1,9 +1,16 @@
+use crate::checkpoint::{
+    CheckpointRequestEnvelope, DestinationCheckpointStatus, PreparedAttemptSummary, RetentionGap,
+};
+use crate::destination::{
+    DestinationId, DestinationOperationId, MaterializationDestination, QueryRoute,
+};
 use crate::fork::{ForkError, ForkKind};
 use crate::graph::SourceRef;
 use crate::hello::{BackendDescriptor, OpVersions};
 use crate::kv::KvError;
-use crate::query::{Consistency, QueryError};
+use crate::query::{Consistency, QueryError, QueryExecutionId, QueryExecutionStatus, QueryResult};
 use crate::result::ResultCode;
+use crate::schema::{Digest32, LogicalSchema, TypedValue, UuidValue};
 use crate::topology::WireTopology;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -12,6 +19,10 @@ use std::collections::BTreeMap;
 pub const CAPABILITIES_PATH: &str = "/agdx/capabilities";
 /// `POST /agdx/query` (and `GET` with the query as a parameter).
 pub const QUERY_PATH: &str = "/agdx/query";
+/// `GET` and `POST /agdx/destinations`.
+pub const DESTINATIONS_PATH: &str = "/agdx/destinations";
+/// `GET /agdx/query-routes`.
+pub const QUERY_ROUTES_PATH: &str = "/agdx/query-routes";
 /// `GET /agdx/projections` to list, `POST` to register.
 pub const PROJECTIONS_PATH: &str = "/agdx/projections";
 /// `POST /agdx/bindings` to apply, `DELETE` to remove.
@@ -36,6 +47,272 @@ pub const RUNS_PATH: &str = "/agdx/runs";
 pub const AUTHZ_WHOAMI_PATH: &str = "/agdx/authz/whoami";
 /// `GET /agdx/authz/roles`: list governance roles.
 pub const AUTHZ_ROLES_PATH: &str = "/agdx/authz/roles";
+
+pub fn destination_path(id: DestinationId) -> String {
+    format!("{DESTINATIONS_PATH}/{id}")
+}
+
+pub fn destination_enable_path(id: DestinationId) -> String {
+    format!("{}/{id}/enable", DESTINATIONS_PATH)
+}
+
+pub fn destination_disable_path(id: DestinationId) -> String {
+    format!("{}/{id}/disable", DESTINATIONS_PATH)
+}
+
+pub fn destination_status_path(id: DestinationId) -> String {
+    format!("{}/{id}/status", DESTINATIONS_PATH)
+}
+
+pub fn destination_checkpoint_path(id: DestinationId) -> String {
+    format!("{}/{id}/checkpoint", DESTINATIONS_PATH)
+}
+
+pub fn destination_retention_gap_path(id: DestinationId) -> String {
+    format!("{}/{id}/retention-gap", DESTINATIONS_PATH)
+}
+
+pub fn destination_prepared_attempt_path(id: DestinationId) -> String {
+    format!("{}/{id}/prepared-attempt", DESTINATIONS_PATH)
+}
+
+pub fn destination_table_path(id: DestinationId) -> String {
+    format!("{}/{id}/table", DESTINATIONS_PATH)
+}
+
+pub fn destination_table_schema_path(id: DestinationId) -> String {
+    format!("{}/{id}/table/schema", DESTINATIONS_PATH)
+}
+
+pub fn destination_snapshots_path(id: DestinationId) -> String {
+    format!("{}/{id}/table/snapshots", DESTINATIONS_PATH)
+}
+
+pub fn destination_current_snapshot_path(id: DestinationId) -> String {
+    format!("{}/{id}/table/current-snapshot", DESTINATIONS_PATH)
+}
+
+pub fn destination_snapshot_path(id: DestinationId, snapshot_id: i64) -> String {
+    format!("{}/{id}/table/snapshots/{snapshot_id}", DESTINATIONS_PATH)
+}
+
+pub fn destination_files_path(id: DestinationId) -> String {
+    format!("{}/{id}/table/files", DESTINATIONS_PATH)
+}
+
+pub fn destination_metrics_path(id: DestinationId) -> String {
+    format!("{}/{id}/table/metrics", DESTINATIONS_PATH)
+}
+
+pub fn query_execution_path(id: QueryExecutionId) -> String {
+    format!("{QUERY_PATH}/{id}")
+}
+
+pub fn query_page_path(id: QueryExecutionId) -> String {
+    format!("{QUERY_PATH}/{id}/pages")
+}
+
+pub fn query_cancel_path(id: QueryExecutionId) -> String {
+    format!("{QUERY_PATH}/{id}/cancel")
+}
+
+pub fn destination_operation_path(id: DestinationOperationId) -> String {
+    format!("{DESTINATIONS_PATH}/operations/{id}")
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_stream: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationPageView {
+    pub destinations: Vec<DestinationView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub global_state_revision: u64,
+    pub consistency: crate::checkpoint::CheckpointReadConsistency,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationView {
+    pub destination: MaterializationDestination,
+    pub status: DestinationCheckpointStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DestinationMutationBody {
+    pub checkpoint: CheckpointRequestEnvelope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedOperationView {
+    pub operation_id: DestinationOperationId,
+    pub request_id: crate::checkpoint::CheckpointRequestId,
+    pub state: OperationState,
+    pub submitted_at_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<OperationErrorView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationErrorView {
+    pub code: ResultCode,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OperationState {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryRouteListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryRoutePageView {
+    pub routes: Vec<QueryRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub definition_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableView {
+    pub table_uuid: UuidValue,
+    pub destination_id: DestinationId,
+    pub destination_generation: u64,
+    pub namespace: Vec<String>,
+    pub table: String,
+    pub current_snapshot_id: i64,
+    pub current_schema_id: i32,
+    pub current_partition_spec_id: i32,
+    pub metadata_identity: String,
+    pub properties: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSchemaView {
+    pub table_uuid: UuidValue,
+    pub iceberg_schema_id: i32,
+    pub logical_schema: LogicalSchema,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_snapshot_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPageView {
+    pub snapshots: Vec<TableSnapshotView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_snapshot_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSnapshotView {
+    pub snapshot_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_snapshot_id: Option<i64>,
+    pub sequence_number: i64,
+    pub committed_at_micros: u64,
+    pub schema_id: i32,
+    pub partition_spec_id: i32,
+    pub materialization_boundary_digest: Digest32,
+    pub checkpoint_revision: u64,
+    pub summary: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableFileListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TableFilePageView {
+    pub files: Vec<TableFileView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TableFileView {
+    pub object_identity: String,
+    pub file_size_bytes: u64,
+    pub row_count: u64,
+    pub partition: BTreeMap<String, TypedValue>,
+    pub lower_bounds: BTreeMap<u32, TypedValue>,
+    pub upper_bounds: BTreeMap<u32, TypedValue>,
+    pub null_value_counts: BTreeMap<u32, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableMetricsView {
+    pub snapshot_id: i64,
+    pub data_file_count: u64,
+    pub delete_file_count: u64,
+    pub total_rows: u64,
+    pub total_bytes: u64,
+    pub partition_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPageBody {
+    pub cursor: String,
+    pub deadline_micros: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QueryExecutionView {
+    pub status: QueryExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<QueryResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationIssueView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_gap: Option<RetentionGap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_attempt: Option<PreparedAttemptSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<crate::checkpoint::DestinationBlock>,
+    pub checkpoint_revision: u64,
+    pub consistency: crate::checkpoint::CheckpointReadConsistency,
+}
 
 /// `GET`/`PUT`/`DELETE /agdx/authz/roles/{name}`.
 pub fn authz_role_path(name: &str) -> String {
@@ -140,6 +417,8 @@ pub struct Capabilities {
     /// The managed query surface, its registry browse views, and the strongest
     /// read-consistency it serves.
     pub query: QueryCapsView,
+    /// Destination declarations, checkpoint status, and table inspection.
+    pub destinations: DestinationCapsView,
     /// The managed key-value surface and its conditional-write support.
     pub kv: KvCapsView,
     /// Whether the knowledge-graph ops (traversal, neighbors) are served. The
@@ -198,6 +477,36 @@ pub struct QueryCapsView {
     /// unsupported into a silent wrong answer.
     #[serde(default)]
     pub keyword: bool,
+    /// Whether opaque cursor page retrieval is served.
+    #[serde(default)]
+    pub cursor_paging: bool,
+    /// Whether an executing query can be cancelled by its execution identity.
+    #[serde(default)]
+    pub cancellation: bool,
+    /// Whether execution status can be polled independently of the first page.
+    #[serde(default)]
+    pub execution_status: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationCapsView {
+    pub available: bool,
+    #[serde(default)]
+    pub lifecycle: bool,
+    #[serde(default)]
+    pub checkpoint_status: bool,
+    #[serde(default)]
+    pub query_routes: bool,
+    #[serde(default)]
+    pub table_schema: bool,
+    #[serde(default)]
+    pub snapshots: bool,
+    #[serde(default)]
+    pub files: bool,
+    #[serde(default)]
+    pub metrics: bool,
+    #[serde(default)]
+    pub strongest_consistency: crate::checkpoint::CheckpointReadConsistency,
 }
 
 /// The managed key-value surface on the HTTP capabilities reply.
@@ -233,6 +542,21 @@ impl Capabilities {
                 schemas: enabled,
                 consistency: Consistency::Eventual,
                 keyword: false,
+                cursor_paging: false,
+                cancellation: false,
+                execution_status: false,
+            },
+            destinations: DestinationCapsView {
+                available: false,
+                lifecycle: false,
+                checkpoint_status: false,
+                query_routes: false,
+                table_schema: false,
+                snapshots: false,
+                files: false,
+                metrics: false,
+                strongest_consistency:
+                    crate::checkpoint::CheckpointReadConsistency::PotentiallyStale,
             },
             kv: KvCapsView {
                 available: enabled,
@@ -270,6 +594,20 @@ impl Capabilities {
     #[must_use]
     pub fn with_query_keyword(mut self, value: bool) -> Self {
         self.query.keyword = value;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_execution(mut self, paging: bool, cancellation: bool, status: bool) -> Self {
+        self.query.cursor_paging = paging;
+        self.query.cancellation = cancellation;
+        self.query.execution_status = status;
+        self
+    }
+
+    #[must_use]
+    pub fn with_destinations(mut self, destinations: DestinationCapsView) -> Self {
+        self.destinations = destinations;
         self
     }
 
@@ -341,6 +679,8 @@ impl Capabilities {
         } else {
             Consistency::Eventual
         };
+        let destinations_available =
+            enabled && versions.checkpoint > 0 && versions.has_feature(feature::DESTINATIONS);
         Self::new(enabled, versions)
             .with_kv_cas(versions.has_feature(feature::KV_CAS))
             .with_kv_cas_fenced(versions.has_feature(feature::KV_CAS_FENCED))
@@ -349,6 +689,18 @@ impl Capabilities {
             .with_watch(versions.has_feature(feature::WATCH))
             .with_authz(versions.has_feature(feature::AUTHZ))
             .with_query_consistency(consistency)
+            .with_destinations(DestinationCapsView {
+                available: destinations_available,
+                lifecycle: destinations_available,
+                checkpoint_status: destinations_available,
+                query_routes: destinations_available,
+                table_schema: false,
+                snapshots: false,
+                files: false,
+                metrics: false,
+                strongest_consistency:
+                    crate::checkpoint::CheckpointReadConsistency::PotentiallyStale,
+            })
             // The graph surface needs a backend that serves it, advertised as a
             // non-zero graph op version, so it is gated on that rather than implied.
             .with_graph(enabled && versions.graph > 0)
@@ -838,17 +1190,58 @@ mod tests {
     }
 
     #[test]
+    fn given_destination_versions_when_building_capabilities_then_the_core_surface_is_available() {
+        use crate::codes::CHECKPOINT_OP_VERSION;
+        use crate::hello::feature;
+
+        let versions = OpVersions::new(2, 2, 1, 1)
+            .with_checkpoint(CHECKPOINT_OP_VERSION)
+            .with_features(feature::DESTINATIONS);
+        let caps = Capabilities::from_versions(true, versions);
+
+        assert!(caps.destinations.available);
+        assert!(caps.destinations.lifecycle);
+        assert!(caps.destinations.checkpoint_status);
+        assert!(caps.destinations.query_routes);
+        assert!(!caps.destinations.table_schema);
+    }
+
+    #[test]
     fn given_capabilities_backends_when_json_round_tripped_then_should_preserve_and_omit_empty() {
-        use crate::hello::BackendDescriptor;
+        use crate::destination::BackendResourceId;
+        use crate::hello::{BackendDescriptor, BackendImplementation, BackendMode};
         let caps = Capabilities::new(true, OpVersions::new(1, 1, 1, 1)).with_backends(vec![
-            BackendDescriptor::new("embedded", "embedded"),
-            BackendDescriptor::new("warehouse", "columnar"),
+            BackendDescriptor::new(
+                BackendResourceId::from_u128(1),
+                BackendMode::Operational,
+                "Embedded",
+                BackendImplementation {
+                    kind: "embedded".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                1,
+                1,
+            ),
+            BackendDescriptor::new(
+                BackendResourceId::from_u128(2),
+                BackendMode::Lakehouse,
+                "Warehouse",
+                BackendImplementation {
+                    kind: "columnar".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                1,
+                1,
+            ),
         ]);
         let json = serde_json::to_string(&caps).expect("serializes");
         let back: Capabilities = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back.backends.len(), 2);
-        assert_eq!(back.backends[1].id, "warehouse");
-        assert_eq!(back.backends[1].kind, "columnar");
+        assert_eq!(
+            back.backends[1].resource_id,
+            BackendResourceId::from_u128(2)
+        );
+        assert_eq!(back.backends[1].implementation.kind, "columnar");
 
         // No advertised backends is omitted on the wire, so a pre-backends
         // capabilities reply stays byte-identical.

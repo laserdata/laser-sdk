@@ -1,0 +1,52 @@
+{
+  "snapshots": [
+    {
+      "snapshot_id": 42,
+      "parent_snapshot_id": 41,
+      "sequence_number": 5,
+      "committed_at_micros": 1717171717000000,
+      "schema_id": 3,
+      "partition_spec_id": 1,
+      "materialization_boundary_digest": [
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7,
+        7
+      ],
+      "checkpoint_revision": 3,
+      "summary": {
+        "added-data-files": "1",
+        "added-records": "100"
+      }
+    }
+  ],
+  "next_before_snapshot_id": 41
+}

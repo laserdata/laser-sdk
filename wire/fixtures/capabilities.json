@@ -5,7 +5,21 @@
     "projections": true,
     "schemas": true,
     "consistency": "read_your_writes",
-    "keyword": false
+    "keyword": false,
+    "cursor_paging": true,
+    "cancellation": true,
+    "execution_status": true
+  },
+  "destinations": {
+    "available": true,
+    "lifecycle": true,
+    "checkpoint_status": true,
+    "query_routes": true,
+    "table_schema": true,
+    "snapshots": true,
+    "files": true,
+    "metrics": true,
+    "strongest_consistency": "linearizable"
   },
   "kv": {
     "available": true,
@@ -21,28 +35,143 @@
     "query": 1,
     "control": 1,
     "kv": 1,
-    "fork": 1
+    "fork": 1,
+    "checkpoint": 1,
+    "features": 259
   },
   "backends": [
     {
-      "id": "embedded",
-      "kind": "embedded",
-      "capabilities": [
-        "ingest",
-        "query",
-        "vector_search"
-      ]
+      "descriptor_version": 1,
+      "resource_id": "0000000000000000000000000A",
+      "mode": "operational",
+      "label": "Embedded",
+      "implementation": {
+        "kind": "embedded",
+        "version": "2.1.0"
+      },
+      "observed_backend_generation": 4,
+      "runtime_configuration_revision": 9,
+      "desired_state": "enabled",
+      "observed_state": "ready",
+      "readiness": {
+        "ready": true,
+        "reasons": [],
+        "observed_at_micros": 1717171717000000
+      },
+      "materialization": [],
+      "query": {
+        "dialects": [
+          "data_fusion"
+        ],
+        "time_travel": [
+          "snapshot_id",
+          "timestamp_micros"
+        ],
+        "consistency": [
+          "eventual",
+          "read_your_writes"
+        ],
+        "logical_types": [
+          "long",
+          "string"
+        ],
+        "paging": [
+          "offset",
+          "cursor"
+        ],
+        "cancellation": true,
+        "execution_status": true,
+        "raw_sql": true
+      },
+      "schema": {
+        "logical_schema": true,
+        "arrow_ipc_stream": true,
+        "schema_evolution": true
+      },
+      "maintenance": {
+        "expire_snapshots": false,
+        "remove_orphan_files": false,
+        "compact_data_files": false
+      },
+      "limits": {
+        "max_query_rows": 100000,
+        "max_query_bytes": 8388608,
+        "max_scan_bytes": 1073741824,
+        "max_query_micros": 30000000,
+        "max_concurrent_queries": 16,
+        "max_schema_fields": 4096,
+        "max_materialization_file_bytes": 536870912
+      }
     },
     {
-      "id": "warehouse",
-      "kind": "columnar",
+      "descriptor_version": 1,
+      "resource_id": "0000000000000000000000000B",
+      "mode": "lakehouse",
       "label": "Analytics warehouse",
-      "version": "2.1.0",
-      "capabilities": [
-        "ingest",
-        "query",
-        "percentile"
-      ]
+      "implementation": {
+        "kind": "columnar",
+        "version": "2.1.0"
+      },
+      "observed_backend_generation": 4,
+      "runtime_configuration_revision": 9,
+      "desired_state": "enabled",
+      "observed_state": "ready",
+      "readiness": {
+        "ready": true,
+        "reasons": [],
+        "observed_at_micros": 1717171717000000
+      },
+      "materialization": [
+        {
+          "file_format": "parquet",
+          "table_format": "iceberg_v2",
+          "create_table": true,
+          "append": true
+        }
+      ],
+      "query": {
+        "dialects": [
+          "data_fusion"
+        ],
+        "time_travel": [
+          "snapshot_id",
+          "timestamp_micros"
+        ],
+        "consistency": [
+          "eventual",
+          "read_your_writes"
+        ],
+        "logical_types": [
+          "long",
+          "string"
+        ],
+        "paging": [
+          "offset",
+          "cursor"
+        ],
+        "cancellation": true,
+        "execution_status": true,
+        "raw_sql": true
+      },
+      "schema": {
+        "logical_schema": true,
+        "arrow_ipc_stream": true,
+        "schema_evolution": true
+      },
+      "maintenance": {
+        "expire_snapshots": false,
+        "remove_orphan_files": false,
+        "compact_data_files": false
+      },
+      "limits": {
+        "max_query_rows": 100000,
+        "max_query_bytes": 8388608,
+        "max_scan_bytes": 1073741824,
+        "max_query_micros": 30000000,
+        "max_concurrent_queries": 16,
+        "max_schema_fields": 4096,
+        "max_materialization_file_bytes": 536870912
+      }
     }
   ]
 }

@@ -18,7 +18,7 @@ pub use iggy::prelude::{
 pub use laser_wire::codecs::{Cbor, Codec, Decoder, Json, Msgpack};
 pub use laser_wire::content::ContentType;
 pub use laser_wire::headers::{
-    CONTENT_TYPE, IDX_PREFIX, INLINE_PAYLOAD, PROJECTION_REF, SCHEMA_ID,
+    CONTENT_TYPE, IDX_PREFIX, INLINE_PAYLOAD, LOGICAL_SCHEMA_FINGERPRINT, PROJECTION_REF, SCHEMA_ID,
 };
 pub use laser_wire::limits::MAX_INDEX_ENTRIES_PER_RECORD;
 

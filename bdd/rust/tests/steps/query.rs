@@ -1,9 +1,7 @@
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
-use laser_bdd::query_engine::QueryEngine;
-use laser_sdk::query::{
-    AggCall, AggFunc, Aggregate, CmpOp, Dir, Filter, Predicate, Query, QueryResult, Sort, Value,
-};
+use laser_bdd::query_engine::{QueryEngine, query_on};
+use laser_sdk::query::{AggCall, AggFunc, Aggregate, CmpOp, Dir, Filter, QueryResult, Sort};
 
 fn engine(world: &LaserWorld) -> &QueryEngine {
     world.query_engine.as_ref().expect("a seeded query index")
@@ -27,58 +25,42 @@ async fn seed_index(world: &mut LaserWorld, index: String) {
 
 #[when(regex = r#"^I query "([^"]+)" for latency_ms greater than (\d+)$"#)]
 async fn query_filter(world: &mut LaserWorld, index: String, bound: i64) {
-    let query = Query {
-        index,
-        filter: Some(Filter::Pred(Predicate {
-            field: "latency_ms".to_owned(),
-            op: CmpOp::Gt,
-            value: Value::Int(bound),
-        })),
-        ..Default::default()
-    };
+    let mut query = query_on(&index);
+    query.filter = Some(Filter::pred("latency_ms", CmpOp::Gt, bound));
     world.last_query = Some(engine(world).execute(&query));
 }
 
 #[when(regex = r#"^I query "([^"]+)" ordered by latency_ms descending$"#)]
 async fn query_ordered(world: &mut LaserWorld, index: String) {
-    let query = Query {
-        index,
-        order: vec![Sort {
-            field: "latency_ms".to_owned(),
-            dir: Dir::Desc,
-        }],
-        ..Default::default()
-    };
+    let mut query = query_on(&index);
+    query.order = vec![Sort {
+        field: "latency_ms".to_owned(),
+        dir: Dir::Desc,
+    }];
     world.last_query = Some(engine(world).execute(&query));
 }
 
 #[when(regex = r#"^I query "([^"]+)" with limit (\d+)$"#)]
 async fn query_limited(world: &mut LaserWorld, index: String, limit: usize) {
-    let query = Query {
-        index,
-        limit,
-        want_total: true,
-        ..Default::default()
-    };
+    let mut query = query_on(&index);
+    query.page.limit = u32::try_from(limit).expect("BDD page limit fits u32");
+    query.page.want_total = true;
     world.last_query = Some(engine(world).execute(&query));
 }
 
 #[when(regex = r#"^I count "([^"]+)" grouped by status$"#)]
 async fn query_count(world: &mut LaserWorld, index: String) {
-    let query = Query {
-        index,
-        aggregate: Some(Aggregate {
-            group_by: vec!["status".to_owned()],
-            funcs: vec![AggCall {
-                func: AggFunc::Count,
-                field: None,
-                arg: None,
-                alias: "count".to_owned(),
-            }],
-            window: None,
-        }),
-        ..Default::default()
-    };
+    let mut query = query_on(&index);
+    query.aggregate = Some(Aggregate {
+        group_by: vec!["status".to_owned()],
+        funcs: vec![AggCall {
+            func: AggFunc::Count,
+            field: None,
+            arg: None,
+            alias: "count".to_owned(),
+        }],
+        window: None,
+    });
     world.last_query = Some(engine(world).execute(&query));
 }
 
@@ -90,7 +72,9 @@ async fn then_returns_rows(world: &mut LaserWorld, expected: usize) {
 #[then("every returned row has latency_ms greater than 500")]
 async fn then_rows_exceed_bound(world: &mut LaserWorld) {
     for row in &result(world).rows {
-        let latency: i64 = row.headers["latency_ms"].parse().expect("numeric latency");
+        let latency = result(world)
+            .value_i64(row, "latency_ms")
+            .expect("numeric latency");
         assert!(latency > 500, "row latency {latency} should exceed 500");
     }
 }
@@ -100,7 +84,12 @@ async fn then_values_in_order(world: &mut LaserWorld, expected: String) {
     let got: Vec<String> = result(world)
         .rows
         .iter()
-        .map(|row| row.headers["latency_ms"].clone())
+        .map(|row| {
+            result(world)
+                .value_i64(row, "latency_ms")
+                .expect("numeric latency")
+                .to_string()
+        })
         .collect();
     let want: Vec<String> = expected.split(", ").map(str::to_owned).collect();
     assert_eq!(got, want, "ordered latency values");
@@ -120,7 +109,11 @@ async fn then_group_count(world: &mut LaserWorld, status: String, count: usize) 
     let row = result(world)
         .rows
         .iter()
-        .find(|row| row.headers.get("status") == Some(&status))
+        .find(|row| result(world).value_text(row, "status").as_deref() == Some(&status))
         .expect("a group row for the status");
-    assert_eq!(row.headers["count"], count.to_string(), "group count");
+    assert_eq!(
+        result(world).value_i64(row, "count"),
+        Some(count as i64),
+        "group count"
+    );
 }

@@ -1,7 +1,7 @@
 use crate::error::LaserError;
 use crate::stream::{
-    CONTENT_TYPE, ContentType, IDX_PREFIX, INLINE_PAYLOAD, MAX_INDEX_ENTRIES_PER_RECORD,
-    PROJECTION_REF, SCHEMA_ID,
+    CONTENT_TYPE, ContentType, IDX_PREFIX, INLINE_PAYLOAD, LOGICAL_SCHEMA_FINGERPRINT,
+    MAX_INDEX_ENTRIES_PER_RECORD, PROJECTION_REF, SCHEMA_ID,
 };
 use iggy::prelude::{HeaderKey, HeaderValue};
 use laser_wire::headers::{HEADER_FRAMING_BYTES, HEADER_SOFT_CAP, HEADER_VALUE_MAX};
@@ -48,6 +48,8 @@ pub struct Record {
     // `agdx.sid`. laser-plane resolves it against the schema registry. It does
     // not select materialization routing, which uses `projection_ref`.
     pub schema_id: Option<u32>,
+    /// Logical schema fingerprint required for an Arrow IPC record.
+    pub logical_schema_fingerprint: Option<laser_wire::schema::SchemaFingerprint>,
 }
 
 impl<S: record_builder::State> RecordBuilder<S> {
@@ -98,6 +100,22 @@ impl TryFrom<&Record> for BTreeMap<HeaderKey, HeaderValue> {
                 HeaderValue::from(schema_id),
             );
         }
+        if record.content_type == Some(ContentType::Arrow) {
+            let fingerprint = record.logical_schema_fingerprint.as_ref().ok_or_else(|| {
+                LaserError::Invalid(
+                    "Arrow IPC records require a logical schema fingerprint".to_owned(),
+                )
+            })?;
+            laser_wire::validate::Validate::validate(fingerprint)?;
+            map.insert(
+                HeaderKey::from_str(LOGICAL_SCHEMA_FINGERPRINT)?,
+                HeaderValue::try_from(fingerprint.as_bytes())?,
+            );
+        } else if record.logical_schema_fingerprint.is_some() {
+            return Err(LaserError::Invalid(
+                "a logical schema fingerprint is valid only for Arrow IPC records".to_owned(),
+            ));
+        }
         if record.inline_payload {
             map.insert(
                 HeaderKey::from_str(INLINE_PAYLOAD)?,
@@ -131,7 +149,11 @@ impl TryFrom<&Record> for BTreeMap<HeaderKey, HeaderValue> {
             }
             if matches!(
                 key.as_str(),
-                CONTENT_TYPE | SCHEMA_ID | PROJECTION_REF | INLINE_PAYLOAD
+                CONTENT_TYPE
+                    | SCHEMA_ID
+                    | LOGICAL_SCHEMA_FINGERPRINT
+                    | PROJECTION_REF
+                    | INLINE_PAYLOAD
             ) {
                 return Err(LaserError::Invalid(format!(
                     "metadata header `{key}` is reserved - set it via the dedicated builder method"
@@ -274,6 +296,39 @@ mod tests {
     fn given_a_record_with_an_oversized_index_value_when_lowered_then_should_error() {
         let record = Record::builder()
             .index("blob", "x".repeat(HEADER_VALUE_MAX + 1))
+            .build();
+        let result: Result<BTreeMap<HeaderKey, HeaderValue>, _> = (&record).try_into();
+        assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
+
+    #[test]
+    fn given_an_arrow_record_when_lowered_then_should_stamp_the_raw_fingerprint() {
+        let fingerprint = laser_wire::schema::SchemaFingerprint::new([0xab; 32]);
+        let record = Record::builder()
+            .content_type(ContentType::Arrow)
+            .logical_schema_fingerprint(fingerprint.clone())
+            .build();
+        let headers: BTreeMap<HeaderKey, HeaderValue> = (&record)
+            .try_into()
+            .expect("the Arrow record lowers to headers");
+        let value = headers
+            .get(&HeaderKey::from_str(LOGICAL_SCHEMA_FINGERPRINT).expect("header key is valid"))
+            .expect("schema fingerprint is stamped");
+        assert_eq!(value.as_bytes(), fingerprint.as_bytes());
+    }
+
+    #[test]
+    fn given_arrow_content_without_a_fingerprint_when_lowered_then_should_error() {
+        let record = Record::builder().content_type(ContentType::Arrow).build();
+        let result: Result<BTreeMap<HeaderKey, HeaderValue>, _> = (&record).try_into();
+        assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
+
+    #[test]
+    fn given_non_arrow_content_with_a_fingerprint_when_lowered_then_should_error() {
+        let record = Record::builder()
+            .content_type(ContentType::Json)
+            .logical_schema_fingerprint(laser_wire::schema::SchemaFingerprint::new([1; 32]))
             .build();
         let result: Result<BTreeMap<HeaderKey, HeaderValue>, _> = (&record).try_into();
         assert!(matches!(result, Err(LaserError::Invalid(_))));

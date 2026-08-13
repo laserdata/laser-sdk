@@ -78,8 +78,30 @@ export type {
 } from "./iggy/apache-iggy.js"
 export type { Capabilities, CapabilitySurface } from "./client/capabilities.js"
 export { QueryRequest } from "./managed/query.js"
-export type { QueryResult, Row, Filter, Consistency } from "./wire/query.js"
-export { filterAll, filterAny, filterNegate, filterPred } from "./wire/query.js"
+export { Destinations } from "./managed/destinations.js"
+export type { QueryResult, Row, Filter, Consistency, QueryTarget } from "./wire/query.js"
+export { filterAll, filterAny, filterNegate, filterPred, queryResultValue } from "./wire/query.js"
+export { typedValueDiagnosticText } from "./wire/schema.js"
+export type {
+  CheckpointMutationResult,
+  CheckpointReadConsistency,
+  DestinationCheckpointPage,
+  DestinationCheckpointStatus,
+  DestinationCheckpointView,
+  PublicCheckpointMutation
+} from "./wire/checkpoint.js"
+export type {
+  MaterializationDestination,
+  QueryRoute,
+  QueryRouteTarget
+} from "./wire/destination.js"
+export type {
+  LogicalField,
+  LogicalSchema,
+  LogicalSchemaRef,
+  LogicalType,
+  TypedValue
+} from "./wire/schema.js"
 export type { Value } from "./wire/value.js"
 export {
   Kv,
@@ -121,10 +143,7 @@ export type {
   EntitySchema,
   NodeExtract,
   EdgeExtract,
-  RetentionPolicy,
-  Target,
-  TargetRole,
-  Delivery
+  RetentionPolicy
 } from "./wire/control.js"
 export { parseProjectionId } from "./wire/control.js"
 export type {

@@ -89,6 +89,22 @@ export interface A2aTask {
     };
 }
 
+// @public (undocumented)
+interface AcceptedOperationView {
+    // (undocumented)
+    readonly completedAtMicros?: bigint;
+    // (undocumented)
+    readonly error?: OperationErrorView;
+    // (undocumented)
+    readonly operationId: DestinationOperationId;
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
+    // (undocumented)
+    readonly state: OperationState;
+    // (undocumented)
+    readonly submittedAtMicros: bigint;
+}
+
 // Warning: (ae-forgotten-export) The symbol "FenceEntry" needs to be exported by the entry point full.d.ts
 // Warning: (ae-forgotten-export) The symbol "FenceSweepState" needs to be exported by the entry point full.d.ts
 //
@@ -242,10 +258,19 @@ const AGDX_BACKEND_HELLO_CODE: number;
 const AGDX_BATCH_CODE: number;
 
 // @public (undocumented)
+const AGDX_CHECKPOINT_CODE: number;
+
+// @public (undocumented)
 const AGDX_COMMAND_BASE = 1000000;
 
 // @public (undocumented)
 const AGDX_DECODE_RECORD_CODE: number;
+
+// @public (undocumented)
+const AGDX_DESTINATION_GET_CODE: number;
+
+// @public (undocumented)
+const AGDX_DESTINATION_LIST_CODE: number;
 
 // @public (undocumented)
 const AGDX_FORK_BASE: number;
@@ -347,7 +372,19 @@ const AGDX_LIST_SCHEMAS_CODE: number;
 const AGDX_QUERY_BASE: number;
 
 // @public (undocumented)
+const AGDX_QUERY_CANCEL_CODE: number;
+
+// @public (undocumented)
 const AGDX_QUERY_CODE: number;
+
+// @public (undocumented)
+const AGDX_QUERY_PAGE_CODE: number;
+
+// @public (undocumented)
+const AGDX_QUERY_ROUTE_LIST_CODE: number;
+
+// @public (undocumented)
+const AGDX_QUERY_STATUS_CODE: number;
 
 // @public (undocumented)
 const AGDX_REGISTER_SCHEMA_CODE: number;
@@ -1033,7 +1070,7 @@ interface AggCall {
 }
 
 // @public (undocumented)
-type AggFunc = "count" | "countDistinct" | "sum" | "avg" | "min" | "max" | "percentile" | "stdDev";
+type AggFunc = "count" | "count_distinct" | "sum" | "avg" | "min" | "max" | "percentile" | "std_dev";
 
 // @public (undocumented)
 interface Aggregate {
@@ -1115,7 +1152,89 @@ export function applyJsonPatch(document: unknown, patch: unknown): unknown;
 export function applyRoute(router: Router, provenance: Provenance): Provenance;
 
 // @public (undocumented)
+const ARROW_IPC_CONTRACT_VERSION = 1;
+
+// @public (undocumented)
+const ARROW_IPC_MEDIA_TYPE = "application/vnd.apache.arrow.stream";
+
+// @public (undocumented)
+interface ArrowIpcMessageMetadata {
+    // (undocumented)
+    readonly contractVersion: number;
+    // (undocumented)
+    readonly dictionaryCount: number;
+    // (undocumented)
+    readonly encodedBytes: bigint;
+    // (undocumented)
+    readonly fieldCount: number;
+    // (undocumented)
+    readonly recordBatchCount: number;
+    // (undocumented)
+    readonly rowCount: bigint;
+    // (undocumented)
+    readonly schemaFingerprint: Uint8Array;
+}
+
+// @public (undocumented)
+interface ArrowIpcPolicy {
+    // (undocumented)
+    readonly contractVersion: number;
+    // (undocumented)
+    readonly dictionaryDeltas: boolean;
+    // (undocumented)
+    readonly extensionTypes: boolean;
+    // (undocumented)
+    readonly maxDecimalBits: number;
+    // (undocumented)
+    readonly replacementDictionaries: boolean;
+    // (undocumented)
+    readonly selfContained: boolean;
+    // (undocumented)
+    readonly streamFormatOnly: boolean;
+    // (undocumented)
+    readonly timestampUnit: ArrowTimestampUnit;
+    // (undocumented)
+    readonly unions: boolean;
+}
+
+// @public (undocumented)
+type ArrowIpcRejectionCode = "file_format" | "missing_schema" | "missing_dictionary" | "dictionary_delta" | "dictionary_replacement" | "union" | "extension_type" | "timestamp_unit" | "decimal_width" | "schema_fingerprint" | "field_limit" | "batch_limit" | "row_limit" | "byte_limit" | "malformed_stream";
+
+// @public (undocumented)
+type ArrowTimestampUnit = "microsecond";
+
+// @public (undocumented)
 export function assertNever(value: never): never;
+
+// @public (undocumented)
+interface AttemptColumnMetrics {
+    // (undocumented)
+    readonly fieldId: number;
+    // (undocumented)
+    readonly lowerBound?: TypedValue;
+    // (undocumented)
+    readonly nanCount: bigint;
+    // (undocumented)
+    readonly nullCount: bigint;
+    // (undocumented)
+    readonly upperBound?: TypedValue;
+    // (undocumented)
+    readonly valueCount: bigint;
+}
+
+// @public (undocumented)
+interface AttemptObject {
+    // (undocumented)
+    readonly columns: readonly AttemptColumnMetrics[];
+    // (undocumented)
+    readonly identity: string;
+    // (undocumented)
+    readonly rowCount: bigint;
+    // (undocumented)
+    readonly sha256: Uint8Array;
+    // (undocumented)
+    readonly sizeBytes: bigint;
+}
 
 // @public (undocumented)
 export function authorizeEdge(claims: EdgeClaims, expectedAudience: string, requiredScope: string): EdgeDenial | undefined;
@@ -1331,6 +1450,9 @@ export type AuthzSubject = {
 const authzUserRolesPath: (userId: number) => string;
 
 // @public (undocumented)
+const BACKEND_DESCRIPTOR_VERSION = 1;
+
+// @public (undocumented)
 interface BackendAnnounce {
     // (undocumented)
     readonly backends: readonly BackendDescriptor[];
@@ -1343,21 +1465,115 @@ interface BackendAnnounce {
 }
 
 // @public (undocumented)
+interface BackendBinding {
+    // (undocumented)
+    readonly generation: bigint;
+    // (undocumented)
+    readonly resourceId: BackendResourceId;
+}
+
+// @public (undocumented)
 interface BackendDescriptor {
     // (undocumented)
-    readonly capabilities: readonly string[];
+    readonly descriptorVersion: number;
     // (undocumented)
-    readonly id: string;
+    readonly desiredState: BackendDesiredState;
     // (undocumented)
-    readonly kind: string;
+    readonly implementation: BackendImplementation;
     // (undocumented)
-    readonly label?: string;
+    readonly label: string;
     // (undocumented)
-    readonly version?: string;
+    readonly limits: BackendLimits;
+    // (undocumented)
+    readonly maintenance: MaintenanceCapabilities;
+    // (undocumented)
+    readonly materialization: readonly MaterializationCapability[];
+    // (undocumented)
+    readonly mode: BackendMode;
+    // (undocumented)
+    readonly observedBackendGeneration: bigint;
+    // (undocumented)
+    readonly observedState: BackendObservedState;
+    // (undocumented)
+    readonly query?: QueryCapabilities;
+    // (undocumented)
+    readonly readiness: BackendReadiness;
+    // (undocumented)
+    readonly resourceId: BackendResourceId;
+    // (undocumented)
+    readonly runtimeConfigurationRevision: bigint;
+    // (undocumented)
+    readonly schema: SchemaCapabilities;
 }
 
 // @public (undocumented)
 function backendDescriptorHasCapability(backend: BackendDescriptor, tag: string): boolean;
+
+// @public (undocumented)
+type BackendDesiredState = "disabled" | "enabled";
+
+// @public (undocumented)
+interface BackendImplementation {
+    // (undocumented)
+    readonly kind: string;
+    // (undocumented)
+    readonly version: string;
+}
+
+// @public (undocumented)
+interface BackendLimits {
+    // (undocumented)
+    readonly maxConcurrentQueries: number;
+    // (undocumented)
+    readonly maxMaterializationFileBytes: bigint;
+    // (undocumented)
+    readonly maxQueryBytes: bigint;
+    // (undocumented)
+    readonly maxQueryMicros: bigint;
+    // (undocumented)
+    readonly maxQueryRows: bigint;
+    // (undocumented)
+    readonly maxScanBytes: bigint;
+    // (undocumented)
+    readonly maxSchemaFields: number;
+}
+
+// @public (undocumented)
+type BackendMode = "operational" | "lakehouse";
+
+// @public (undocumented)
+type BackendObservedState = "disabled" | "starting" | "ready" | "degraded" | "unavailable";
+
+// @public (undocumented)
+interface BackendReadiness {
+    // (undocumented)
+    readonly observedAtMicros: bigint;
+    // (undocumented)
+    readonly ready: boolean;
+    // (undocumented)
+    readonly reasons: readonly BackendReadinessReason[];
+}
+
+// @public (undocumented)
+type BackendReadinessCode = "disabled" | "configuration_pending" | "configuration_rejected" | "credential_unavailable" | "object_store_unavailable" | "catalog_unavailable" | "query_runtime_unavailable" | "generation_mismatch" | "probe_failed";
+
+// @public (undocumented)
+interface BackendReadinessReason {
+    // (undocumented)
+    readonly code: BackendReadinessCode;
+    // (undocumented)
+    readonly detail?: string;
+}
+
+// @public (undocumented)
+class BackendResourceId extends WireId<"BackendResourceId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): BackendResourceId;
+    // (undocumented)
+    static fromU128(value: bigint): BackendResourceId;
+    // (undocumented)
+    static parse(text: string): BackendResourceId;
+}
 
 // @public (undocumented)
 const BATCH_OP_VERSION = 1;
@@ -1376,6 +1592,8 @@ interface BatchItem {
 // @public (undocumented)
 export class BatchPublishRequest {
     constructor(topic: Topic);
+    // (undocumented)
+    addArrowIpc(payload: BytesLike, metadata: ArrowIpcMessageMetadata): this;
     // (undocumented)
     addAvro(schema: CompiledSchema, schemaId: number, value: unknown): this;
     // (undocumented)
@@ -1521,6 +1739,9 @@ interface BodyRef {
 }
 
 // @public (undocumented)
+type BoundaryRelation = "current" | "historical" | "ahead_of_observed_checkpoint";
+
+// @public (undocumented)
 export function bridgeHopMetadata(hops: readonly string[]): {
     readonly kind: "list";
     readonly value: readonly {
@@ -1628,6 +1849,9 @@ const CanonicalHeaderKind: {
 type CanonicalHeaderKind = (typeof CanonicalHeaderKind)[keyof typeof CanonicalHeaderKind];
 
 // @public (undocumented)
+function canonicalSchemaBytes(schema: LogicalSchema): Uint8Array;
+
+// @public (undocumented)
 export interface Capabilities {
     // (undocumented)
     readonly a2aGateway: boolean;
@@ -1637,6 +1861,10 @@ export interface Capabilities {
     readonly authz: boolean;
     // (undocumented)
     readonly backends: readonly BackendDescriptor[];
+    // Warning: (ae-forgotten-export) The symbol "DestinationCapabilities" needs to be exported by the entry point full.d.ts
+    //
+    // (undocumented)
+    readonly destinations: DestinationCapabilities;
     // (undocumented)
     readonly durableDedup: boolean;
     // (undocumented)
@@ -1649,10 +1877,10 @@ export interface Capabilities {
     readonly kv: KvCapabilities;
     // (undocumented)
     readonly managed: boolean;
-    // Warning: (ae-forgotten-export) The symbol "QueryCapabilities" needs to be exported by the entry point full.d.ts
+    // Warning: (ae-forgotten-export) The symbol "QueryCapabilities_2" needs to be exported by the entry point full.d.ts
     //
     // (undocumented)
-    readonly query: QueryCapabilities;
+    readonly query: QueryCapabilities_2;
     // (undocumented)
     readonly sessions: boolean;
     // (undocumented)
@@ -1700,7 +1928,7 @@ export interface CapabilitySelector {
 export function capabilitySelector(skill: string, policy: RoutePolicy, principal?: PrincipalId): CapabilitySelector;
 
 // @public (undocumented)
-export type CapabilitySurface = "managed" | "query" | "kv" | "kvCas" | "kvCasFenced" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
+export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
 
 // @public (undocumented)
 export type CasExpect = {
@@ -1763,6 +1991,118 @@ export interface CheckedBody {
 
 // @public (undocumented)
 export function checkIn(store: BlobStore, thresholdBytes: number, payload: Uint8Array): Promise<CheckedBody>;
+
+// @public (undocumented)
+const CHECKPOINT_OP_VERSION = 1;
+
+// @public (undocumented)
+const CheckpointCommand: ManagedCommand<CheckpointRequestEnvelope, CheckpointReply>;
+
+// @public (undocumented)
+type CheckpointError = {
+    readonly kind: "invalid" | "unavailable";
+    readonly message: string;
+} | {
+    readonly kind: "not_found" | "lease_lost" | "unauthorized";
+} | {
+    readonly kind: "conflict";
+    readonly observedRevision: bigint;
+} | {
+    readonly kind: "version";
+    readonly expected: number;
+    readonly got: number;
+};
+
+// @public (undocumented)
+export interface CheckpointMutationResult {
+    // (undocumented)
+    readonly checkpointRevision: bigint;
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // (undocumented)
+    readonly lease?: CheckpointOwnerLease;
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
+}
+
+// @public (undocumented)
+class CheckpointOwnerId extends WireId<"CheckpointOwnerId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): CheckpointOwnerId;
+    // (undocumented)
+    static fromU128(value: bigint): CheckpointOwnerId;
+    // (undocumented)
+    static parse(text: string): CheckpointOwnerId;
+}
+
+// @public (undocumented)
+interface CheckpointOwnerLease {
+    // (undocumented)
+    readonly deadlineMicros: bigint;
+    // (undocumented)
+    readonly epoch: bigint;
+    // (undocumented)
+    readonly owner: CheckpointOwnerId;
+    // (undocumented)
+    readonly sequence: bigint;
+}
+
+// @public (undocumented)
+export type CheckpointReadConsistency = "linearizable" | "potentially_stale";
+
+// @public (undocumented)
+type CheckpointReadReply = {
+    readonly kind: "destination";
+    readonly destination?: DestinationCheckpointView;
+} | {
+    readonly kind: "destinations";
+    readonly page: DestinationCheckpointPage;
+} | {
+    readonly kind: "query_routes";
+    readonly page: QueryRoutePage;
+} | {
+    readonly kind: "err";
+    readonly error: CheckpointError;
+};
+
+// @public (undocumented)
+type CheckpointReply = {
+    readonly kind: "ok";
+    readonly result: CheckpointMutationResult;
+} | {
+    readonly kind: "err";
+    readonly error: CheckpointError;
+};
+
+// @public (undocumented)
+interface CheckpointRequestEnvelope {
+    // (undocumented)
+    readonly expectedGlobalStateRevision: bigint;
+    // (undocumented)
+    readonly mutation: PublicCheckpointMutation;
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
+    // (undocumented)
+    readonly supervisorAssertion?: SupervisorActorAssertion;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+class CheckpointRequestId extends WireId<"CheckpointRequestId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): CheckpointRequestId;
+    // (undocumented)
+    static fromU128(value: bigint): CheckpointRequestId;
+    // (undocumented)
+    static parse(text: string): CheckpointRequestId;
+}
 
 // @public (undocumented)
 export class ChunkAssembler {
@@ -1907,6 +2247,24 @@ export class CompiledSchema {
 export type CompiledSchemaKind = "avro" | "protobuf" | "jsonSchema";
 
 // @public (undocumented)
+interface CompletedAttempt {
+    // (undocumented)
+    readonly completionRevision: bigint;
+    // (undocumented)
+    readonly id: PreparedAttemptId;
+    // (undocumented)
+    readonly manifestDigest: Uint8Array;
+    // (undocumented)
+    readonly ranges: readonly SourceOffsetRange[];
+    // (undocumented)
+    readonly resultingBoundaryDigest: Uint8Array;
+    // (undocumented)
+    readonly snapshotId: bigint;
+    // (undocumented)
+    readonly tableUuid: Uint8Array;
+}
+
+// @public (undocumented)
 export type ConcurrencyPolicy = {
     readonly kind: "serial";
 } | {
@@ -1922,26 +2280,10 @@ export class ConfigError extends LaserError {
 }
 
 // @public (undocumented)
-export type Consistency = "eventual" | "readYourWrites" | "strong";
+export type Consistency = "eventual" | "read_your_writes" | "strong";
 
 // @public (undocumented)
-interface ConsistencyGate {
-    // (undocumented)
-    readonly applied: bigint;
-    // (undocumented)
-    readonly required: bigint;
-}
-
-// @public (undocumented)
-function consistencyGateCheck(gate: ConsistencyGate, level: Consistency, what: string): {
-    readonly ok: true;
-} | {
-    readonly ok: false;
-    readonly error: QueryError;
-};
-
-// @public (undocumented)
-function consistencyGateIsCaughtUp(gate: ConsistencyGate): boolean;
+function consistencyGateCheck(applied: bigint, required: bigint, consistency: Consistency, what: string): QueryError | undefined;
 
 // @public (undocumented)
 function consistencyToWord(value: Consistency): string;
@@ -2311,6 +2653,17 @@ export class CrashContext {
 }
 
 // @public (undocumented)
+function createLogicalSchema(id: LogicalSchemaId, version: number, fields: readonly LogicalField[]): LogicalSchema;
+
+// @public (undocumented)
+interface CredentialGeneration {
+    // (undocumented)
+    readonly generation: bigint;
+    // (undocumented)
+    readonly role: string;
+}
+
+// @public (undocumented)
 function crockfordDecode(text: string): bigint;
 
 // @public (undocumented)
@@ -2380,6 +2733,16 @@ const DEADLINE = "agdx.deadline";
 export function decide(intent: Intent, votes: readonly Vote[], nowMicros: bigint): Decision | undefined;
 
 // @public (undocumented)
+interface DecimalValue {
+    // (undocumented)
+    readonly precision: number;
+    // (undocumented)
+    readonly scale: number;
+    // (undocumented)
+    readonly unscaled: Uint8Array;
+}
+
+// @public (undocumented)
 export class Decision {
     constructor(intentId: IntentId, intentDigest: string, policyVersion: bigint, outcome: IntentOutcome, reason: string, votesConsidered: readonly (readonly [AgentId, VoteChoice])[], atMicros: bigint);
     // (undocumented)
@@ -2399,6 +2762,9 @@ export class Decision {
     // (undocumented)
     readonly votesConsidered: readonly (readonly [AgentId, VoteChoice])[];
 }
+
+// @public (undocumented)
+function decodeAcceptedOperationJson(text: string): AcceptedOperationView;
 
 // @public (undocumented)
 function decodeAgentCancel(map: CborMap, context: string): AgentCancel;
@@ -2445,10 +2811,10 @@ function decodeAgentSubmit(map: CborMap, context: string): AgentSubmit;
 function decodeAgentWorkflowError(value: unknown, context: string): AgentWorkflowError;
 
 // @public (undocumented)
-function decodeAggCall(map: CborMap, context: string): AggCall;
+function decodeArrowIpcMessageMetadata(map: CborMap, context: string): ArrowIpcMessageMetadata;
 
 // @public (undocumented)
-function decodeAggregate(map: CborMap, context: string): Aggregate;
+function decodeArrowIpcPolicy(map: CborMap, context: string): ArrowIpcPolicy;
 
 // @public (undocumented)
 function decodeAuthzError(value: unknown, context: string): AuthzError;
@@ -2473,6 +2839,9 @@ function decodeAuthzSubject(value: unknown, context: string): AuthzSubject;
 
 // @public (undocumented)
 function decodeBackendAnnounce(bytes: Uint8Array): BackendAnnounce;
+
+// @public (undocumented)
+function decodeBackendBinding(map: CborMap, context: string): BackendBinding;
 
 // @public (undocumented)
 function decodeBackendDescriptor(value: unknown, context: string): BackendDescriptor;
@@ -2517,6 +2886,18 @@ function decodeCasExpect(value: unknown, context: string): CasExpect;
 function decodeChangeRecord(map: CborMap, context: string): ChangeRecord;
 
 // @public (undocumented)
+function decodeCheckpointReadReply(bytes: Uint8Array): CheckpointReadReply;
+
+// @public (undocumented)
+function decodeCheckpointReply(bytes: Uint8Array): CheckpointReply;
+
+// @public (undocumented)
+function decodeCheckpointRequest(map: CborMap, context: string): CheckpointRequestEnvelope;
+
+// @public (undocumented)
+function decodeCheckpointRequestFrame(bytes: Uint8Array): CheckpointRequestEnvelope;
+
+// @public (undocumented)
 function decodeClientMetadata(map: CborMap, context: string): ClientMetadata;
 
 // @public (undocumented)
@@ -2554,6 +2935,18 @@ function decodeDefineRoleReq(map: CborMap, context: string): DefineRoleReq;
 
 // @public (undocumented)
 function decodeDeleteRoleReq(map: CborMap, context: string): DeleteRoleReq;
+
+// @public (undocumented)
+function decodeDestinationBlock(map: CborMap, context: string): DestinationBlock;
+
+// @public (undocumented)
+function decodeDestinationCheckpointStatus(map: CborMap, context: string): DestinationCheckpointStatus;
+
+// @public (undocumented)
+function decodeDestinationIssueJson(text: string): DestinationIssueView;
+
+// @public (undocumented)
+function decodeDestinationPageJson(text: string): DestinationPageView;
 
 // @public (undocumented)
 function decodeEntitySchema(map: CborMap, context: string): EntitySchema;
@@ -2655,9 +3048,6 @@ function decodeIndexField(map: CborMap, context: string): IndexField;
 function decodeIndexSchema(map: CborMap, context: string): IndexSchema;
 
 // @public (undocumented)
-function decodeKeyMatch(map: CborMap, context: string): KeyMatch;
-
-// @public (undocumented)
 function decodeKvCas(map: CborMap, context: string): KvCas;
 
 // @public (undocumented)
@@ -2736,7 +3126,22 @@ function decodeListRolesReq(map: CborMap, context: string): ListRolesReq;
 function decodeListSchemas(map: CborMap, context: string): ListSchemas;
 
 // @public (undocumented)
+function decodeLogicalField(map: CborMap, context: string): LogicalField;
+
+// @public (undocumented)
+function decodeLogicalSchema(map: CborMap, context: string): LogicalSchema;
+
+// @public (undocumented)
+function decodeLogicalSchemaRef(map: CborMap, context: string): LogicalSchemaRef;
+
+// @public (undocumented)
+function decodeLogicalType(map: CborMap, context: string): LogicalType;
+
+// @public (undocumented)
 function decodeManagedRequestEnvelope(map: CborMap, context: string): ManagedRequestEnvelope;
+
+// @public (undocumented)
+function decodeMaterializationDestination(map: CborMap, context: string): MaterializationDestination;
 
 // @public (undocumented)
 function decodeMemoryRecord(value: unknown, context: string): MemoryRecord;
@@ -2754,16 +3159,16 @@ function decodeOne(bytes: Uint8Array, context: string): unknown;
 function decodeOpVersions(map: CborMap, context: string): OpVersions;
 
 // @public (undocumented)
-function decodePage(map: CborMap, context: string): Page;
+function decodePath(map: CborMap, context: string): Path;
 
 // @public (undocumented)
-function decodePath(map: CborMap, context: string): Path;
+function decodePhysicalTable(map: CborMap, context: string): PhysicalTable;
 
 // @public (undocumented)
 export function decodePolicyEvidence(payload: Uint8Array): PolicyEvidence;
 
 // @public (undocumented)
-function decodePredicate(map: CborMap, context: string): Predicate;
+function decodePreparedAttemptSummary(map: CborMap, context: string): PreparedAttemptSummary;
 
 // @public (undocumented)
 function decodeProjection(map: CborMap, context: string): Projection;
@@ -2778,19 +3183,49 @@ function decodeProjectionInfo(map: CborMap, context: string): ProjectionInfo;
 const decodeProjectionListJson: (text: string) => ProjectionInfo[];
 
 // @public (undocumented)
+function decodeProjectionRef(map: CborMap, context: string): ProjectionRef;
+
+// @public (undocumented)
 export function decodeProvenanceHeaders(headers: ReadonlyMap<string, IggyHeaderValue>): Provenance;
+
+// @public (undocumented)
+function decodePublicCheckpointMutation(map: CborMap, context: string): PublicCheckpointMutation;
 
 // @public (undocumented)
 function decodeQuery(map: CborMap, context: string): Query;
 
 // @public (undocumented)
+function decodeQueryCancelEnvelope(map: CborMap, context: string): QueryCancelEnvelope;
+
+// @public (undocumented)
+function decodeQueryCancelEnvelopeFrame(bytes: Uint8Array): QueryCancelEnvelope;
+
+// @public (undocumented)
 function decodeQueryEnvelope(map: CborMap, context: string): QueryEnvelope;
+
+// @public (undocumented)
+function decodeQueryEnvelopeFrame(bytes: Uint8Array): QueryEnvelope;
 
 // @public (undocumented)
 function decodeQueryError(value: unknown, context: string): QueryError;
 
 // @public (undocumented)
+function decodeQueryExecutionJson(text: string): QueryExecutionView;
+
+// @public (undocumented)
+function decodeQueryExecutionStatus(map: CborMap, context: string): QueryExecutionStatus;
+
+// @public (undocumented)
+function decodeQueryPageEnvelope(map: CborMap, context: string): QueryPageEnvelope;
+
+// @public (undocumented)
+function decodeQueryPageEnvelopeFrame(bytes: Uint8Array): QueryPageEnvelope;
+
+// @public (undocumented)
 function decodeQueryReply(value: unknown, context: string): QueryReply;
+
+// @public (undocumented)
+function decodeQueryReplyFrame(bytes: Uint8Array): QueryReply;
 
 // @public (undocumented)
 function decodeQueryResult(map: CborMap, context: string): QueryResult;
@@ -2799,7 +3234,25 @@ function decodeQueryResult(map: CborMap, context: string): QueryResult;
 function decodeQueryResultJson(text: string): QueryResult;
 
 // @public (undocumented)
-function decodeRawSql(map: CborMap, context: string): RawSql;
+function decodeQueryRoute(map: CborMap, context: string): QueryRoute;
+
+// @public (undocumented)
+function decodeQueryRoutePageJson(text: string): QueryRoutePageView;
+
+// @public (undocumented)
+function decodeQueryStatusEnvelope(map: CborMap, context: string): QueryStatusEnvelope;
+
+// @public (undocumented)
+function decodeQueryStatusEnvelopeFrame(bytes: Uint8Array): QueryStatusEnvelope;
+
+// @public (undocumented)
+function decodeQueryStatusReply(value: unknown, context: string): QueryStatusReply;
+
+// @public (undocumented)
+function decodeQueryStatusReplyFrame(bytes: Uint8Array): QueryStatusReply;
+
+// @public (undocumented)
+function decodeQueryTarget(map: CborMap, context: string): QueryTarget;
 
 // @public (undocumented)
 interface DecodeRecord {
@@ -2821,13 +3274,13 @@ function decodeRegisterSchema(map: CborMap, context: string): RegisterSchema;
 function decodeResourcePattern(map: CborMap, context: string): ResourcePattern;
 
 // @public (undocumented)
+function decodeRetentionGap(map: CborMap, context: string): RetentionGap;
+
+// @public (undocumented)
 function decodeRetentionPolicy(map: CborMap, context: string): RetentionPolicy;
 
 // @public (undocumented)
 function decodeRole(map: CborMap, context: string): Role;
-
-// @public (undocumented)
-function decodeRow(map: CborMap, context: string): Row;
 
 // @public (undocumented)
 function decodeRunBudget(map: CborMap, context: string): RunBudget;
@@ -2851,34 +3304,55 @@ const decodeSchemaListJson: (text: string) => SchemaInfo[];
 function decodeSchemaSource(map: CborMap, context: string): SchemaSource;
 
 // @public (undocumented)
-function decodeSelect(map: CborMap, context: string): Select;
-
-// @public (undocumented)
 function decodeSignature(map: CborMap, context: string): Signature;
 
 // @public (undocumented)
 function decodeSignatureContext(map: CborMap, context: string): SignatureContext;
 
 // @public (undocumented)
-function decodeSort(map: CborMap, context: string): Sort;
+function decodeSnapshotPageJson(text: string): SnapshotPageView;
+
+// @public (undocumented)
+function decodeSourceCut(map: CborMap, context: string): SourceCut;
+
+// @public (undocumented)
+function decodeSourceIncarnation(map: CborMap, context: string): SourceIncarnation;
+
+// @public (undocumented)
+function decodeSourcePartitionCut(map: CborMap, context: string): SourcePartitionCut;
 
 // @public (undocumented)
 function decodeSourceRef(value: unknown, context: string): SourceRef;
 
 // @public (undocumented)
+function decodeSourceScope(map: CborMap, context: string): SourceScope;
+
+// @public (undocumented)
 function decodeSourceSelector(map: CborMap, context: string): SourceSelector;
+
+// @public (undocumented)
+function decodeStartPolicy(map: CborMap, context: string): StartPolicy;
 
 // @public (undocumented)
 function decodeStoredKeyRecord(map: CborMap, context: string): StoredKeyRecord;
 
 // @public (undocumented)
-function decodeTarget(map: CborMap, context: string): Target;
+function decodeTableFilePageJson(text: string): TableFilePageView;
 
 // @public (undocumented)
-function decodeTextQuery(map: CborMap, context: string): TextQuery;
+function decodeTableMetricsJson(text: string): TableMetricsView;
+
+// @public (undocumented)
+function decodeTableSchemaJson(text: string): TableSchemaView;
+
+// @public (undocumented)
+function decodeTableViewJson(text: string): TableView;
 
 // @public (undocumented)
 function decodeTokenUsage(map: CborMap, context: string): TokenUsage;
+
+// @public (undocumented)
+function decodeTypedValue(value: unknown, context: string): TypedValue;
 
 // @public (undocumented)
 function decodeValue(raw: unknown, context: string): Value;
@@ -2887,13 +3361,7 @@ function decodeValue(raw: unknown, context: string): Value;
 function decodeValueMap(map: CborMap, context: string): ReadonlyMap<string, Value>;
 
 // @public (undocumented)
-function decodeVectorQuery(map: CborMap, context: string): VectorQuery;
-
-// @public (undocumented)
 function decodeWhoamiReply(map: CborMap, context: string): WhoamiReply;
-
-// @public (undocumented)
-function decodeWindow(map: CborMap, context: string): Window;
 
 // @public (undocumented)
 function decodeWireTopology(map: CborMap, context: string): WireTopology;
@@ -2906,6 +3374,9 @@ export interface Deduplicator {
     // (undocumented)
     observe(key: string): Promise<boolean>;
 }
+
+// @public (undocumented)
+const DEFAULT_ARROW_IPC_POLICY: ArrowIpcPolicy;
 
 // @public (undocumented)
 export const DEFAULT_CHUNK_FLUSH_BYTES = 512;
@@ -2981,7 +3452,278 @@ interface DeleteRoleReq {
 }
 
 // @public (undocumented)
-export type Delivery = "effectivelyOnce" | "atMostOnce";
+interface DestinationBlock {
+    // (undocumented)
+    readonly code: DestinationBlockCode;
+    // (undocumented)
+    readonly incarnation?: SourceIncarnation;
+    // (undocumented)
+    readonly message: string;
+    // (undocumented)
+    readonly offset?: bigint;
+    // (undocumented)
+    readonly rowOrdinal?: number;
+}
+
+// @public (undocumented)
+type DestinationBlockCode = "decode" | "schema" | "projection" | "value" | "size" | "retention_gap" | "prepared_attempt" | "backend_generation" | "backend_unavailable" | "table_identity" | "catalog_outcome_unknown" | "source_incarnation" | "authorization";
+
+// @public (undocumented)
+interface DestinationCapsView {
+    // (undocumented)
+    readonly available: boolean;
+    // (undocumented)
+    readonly checkpointStatus: boolean;
+    // (undocumented)
+    readonly files: boolean;
+    // (undocumented)
+    readonly lifecycle: boolean;
+    // (undocumented)
+    readonly metrics: boolean;
+    // (undocumented)
+    readonly queryRoutes: boolean;
+    // (undocumented)
+    readonly snapshots: boolean;
+    // (undocumented)
+    readonly strongestConsistency: "potentially_stale" | "linearizable";
+    // (undocumented)
+    readonly tableSchema: boolean;
+}
+
+// @public (undocumented)
+export interface DestinationCheckpointPage {
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly destinations: readonly DestinationCheckpointView[];
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // (undocumented)
+    readonly nextAfter?: DestinationId;
+}
+
+// @public (undocumented)
+const destinationCheckpointPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+export interface DestinationCheckpointStatus {
+    // (undocumented)
+    readonly backend: BackendBinding;
+    // (undocumented)
+    readonly block?: DestinationBlock;
+    // (undocumented)
+    readonly checkpointRevision: bigint;
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly desiredState: DestinationDesiredState;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly effectiveState: DestinationEffectiveState;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // (undocumented)
+    readonly lastCompletion?: CompletedAttempt;
+    // (undocumented)
+    readonly lastRepair?: RepairRecord;
+    // (undocumented)
+    readonly owner?: CheckpointOwnerLease;
+    // (undocumented)
+    readonly partitions: readonly PartitionCheckpoint[];
+    // (undocumented)
+    readonly preparedAttempt?: PreparedAttemptSummary;
+    // (undocumented)
+    readonly projection: ProjectionRef;
+    // (undocumented)
+    readonly retentionGap?: RetentionGap;
+    // (undocumented)
+    readonly schema: LogicalSchemaRef;
+    // (undocumented)
+    readonly tableUuid?: Uint8Array;
+}
+
+// @public (undocumented)
+export interface DestinationCheckpointView {
+    // (undocumented)
+    readonly destination: MaterializationDestination;
+    // (undocumented)
+    readonly status: DestinationCheckpointStatus;
+}
+
+// @public (undocumented)
+const destinationCurrentSnapshotPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+type DestinationDesiredState = "disabled" | "enabled";
+
+// @public (undocumented)
+const destinationDisablePath: (id: DestinationId) => string;
+
+// @public (undocumented)
+type DestinationEffectiveState = "disabled" | "waiting_for_backend" | "ready" | "running" | "blocked";
+
+// @public (undocumented)
+const destinationEnablePath: (id: DestinationId) => string;
+
+// @public (undocumented)
+type DestinationErrorPolicy = "block";
+
+// @public (undocumented)
+const destinationFilesPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+const DestinationGetCommand: ManagedCommand<DestinationGetRequest, CheckpointReadReply>;
+
+// @public (undocumented)
+interface DestinationGetRequest {
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+class DestinationId extends WireId<"DestinationId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): DestinationId;
+    // (undocumented)
+    static fromU128(value: bigint): DestinationId;
+    // (undocumented)
+    static parse(text: string): DestinationId;
+}
+
+// @public (undocumented)
+interface DestinationIssueView {
+    // (undocumented)
+    readonly block?: DestinationBlock;
+    // (undocumented)
+    readonly checkpointRevision: bigint;
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly preparedAttempt?: PreparedAttemptSummary;
+    // (undocumented)
+    readonly retentionGap?: RetentionGap;
+}
+
+// @public (undocumented)
+const DestinationListCommand: ManagedCommand<DestinationListRequest, CheckpointReadReply>;
+
+// @public (undocumented)
+interface DestinationListFilter {
+    // (undocumented)
+    readonly nameContains?: string;
+    // (undocumented)
+    readonly sourceStream?: string;
+    // (undocumented)
+    readonly sourceTopic?: string;
+}
+
+// @public (undocumented)
+interface DestinationListRequest {
+    // (undocumented)
+    readonly after?: DestinationId;
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly filter: DestinationListFilter;
+    // (undocumented)
+    readonly limit: number;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+const destinationMetricsPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+class DestinationOperationId extends WireId<"DestinationOperationId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): DestinationOperationId;
+    // (undocumented)
+    static fromU128(value: bigint): DestinationOperationId;
+    // (undocumented)
+    static parse(text: string): DestinationOperationId;
+}
+
+// @public (undocumented)
+const destinationOperationPath: (id: DestinationOperationId) => string;
+
+// @public (undocumented)
+interface DestinationPageView {
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly destinations: readonly DestinationView[];
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // (undocumented)
+    readonly nextCursor?: string;
+}
+
+// @public (undocumented)
+const destinationPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+const destinationPreparedAttemptPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+const destinationRetentionGapPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+export class Destinations {
+    // Warning: (ae-forgotten-export) The symbol "ManagedTransport" needs to be exported by the entry point full.d.ts
+    constructor(transport: ManagedTransport, capabilities: () => Promise<Capabilities>);
+    // (undocumented)
+    get(destinationId: DestinationId, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointView | undefined>;
+    // (undocumented)
+    list(filter?: DestinationListFilter, after?: DestinationId, limit?: number, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointPage>;
+    // (undocumented)
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    queryRoutes(nameContains?: string, after?: QueryRouteId, limit?: number, consistency?: CheckpointReadConsistency): Promise<QueryRoutePage>;
+    // (undocumented)
+    register(expectedGlobalStateRevision: bigint, destination: MaterializationDestination): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    registerQueryRoute(expectedGlobalStateRevision: bigint, route: QueryRoute): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    removeQueryRoute(expectedGlobalStateRevision: bigint, routeId: QueryRouteId, routeGeneration: bigint, expectedDefinitionRevision: bigint): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
+}
+
+// @public (undocumented)
+const DESTINATIONS_PATH = "/agdx/destinations";
+
+// @public (undocumented)
+const destinationSnapshotPath: (id: DestinationId, snapshotId: bigint) => string;
+
+// @public (undocumented)
+const destinationSnapshotsPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+const destinationStatusPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+const destinationTablePath: (id: DestinationId) => string;
+
+// @public (undocumented)
+const destinationTableSchemaPath: (id: DestinationId) => string;
+
+// @public (undocumented)
+interface DestinationView {
+    // (undocumented)
+    readonly destination: MaterializationDestination;
+    // (undocumented)
+    readonly status: DestinationCheckpointStatus;
+}
 
 // @public (undocumented)
 type Dir = "asc" | "desc";
@@ -3054,6 +3796,9 @@ export interface Embedder {
 export function emptyGather(): Gather;
 
 // @public (undocumented)
+function encodeAcceptedOperationJson(value: AcceptedOperationView): string;
+
+// @public (undocumented)
 function encodeAgentCancel(cancel: AgentCancel): Map<string, unknown>;
 
 // @public (undocumented)
@@ -3093,10 +3838,10 @@ function encodeAgentSubmit(submit: AgentSubmit): Map<string, unknown>;
 function encodeAgentWorkflowError(error: AgentWorkflowError): unknown;
 
 // @public (undocumented)
-function encodeAggCall(call: AggCall): Map<string, unknown>;
+function encodeArrowIpcMessageMetadata(metadata: ArrowIpcMessageMetadata): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeAggregate(aggregate: Aggregate): Map<string, unknown>;
+function encodeArrowIpcPolicy(policy: ArrowIpcPolicy): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeAuthzError(error: AuthzError): unknown;
@@ -3120,10 +3865,13 @@ function encodeAuthzReply(reply: AuthzReply): unknown;
 function encodeAuthzSubject(subject: AuthzSubject): unknown;
 
 // @public (undocumented)
-function encodeBackendAnnounce(announce: BackendAnnounce): Uint8Array;
+function encodeBackendAnnounce(value: BackendAnnounce): Uint8Array;
 
 // @public (undocumented)
-function encodeBackendDescriptor(backend: BackendDescriptor): Map<string, unknown>;
+function encodeBackendBinding(value: BackendBinding): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeBackendDescriptor(value: BackendDescriptor): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeBatchReply(reply: BatchReply): Map<string, unknown>;
@@ -3162,6 +3910,12 @@ function encodeCasExpect(expect: CasExpect): unknown;
 function encodeChangeRecord(record: ChangeRecord): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeCheckpointRequest(value: CheckpointRequestEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeCheckpointRequestFrame(value: CheckpointRequestEnvelope): Uint8Array;
+
+// @public (undocumented)
 function encodeClientMetadata(metadata: ClientMetadata): Map<string, unknown>;
 
 // @public (undocumented)
@@ -3189,13 +3943,31 @@ function encodeDefineRoleReq(req: DefineRoleReq): Map<string, unknown>;
 function encodeDeleteRoleReq(req: DeleteRoleReq): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeDestinationBlock(value: DestinationBlock): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeDestinationCheckpointStatus(value: DestinationCheckpointStatus): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeDestinationGetRequest(value: DestinationGetRequest): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeDestinationIssueJson(value: DestinationIssueView): string;
+
+// @public (undocumented)
+function encodeDestinationListRequest(value: DestinationListRequest): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeDestinationPageJson(value: DestinationPageView): string;
+
+// @public (undocumented)
 function encodeEntitySchema(schema: EntitySchema): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeErrorBodyJson(value: ErrorBody): string;
 
 // @public (undocumented)
-function encodeFilter(filter: Filter): Map<string, unknown>;
+function encodeFilter(value: Filter): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeFoldSnapshot(snapshot: FoldSnapshot): Map<string, unknown>;
@@ -3306,9 +4078,6 @@ function encodeIndexField(indexField: IndexField): Map<string, unknown>;
 function encodeIndexSchema(schema: IndexSchema): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeKeyMatch(match: KeyMatch): Map<string, unknown>;
-
-// @public (undocumented)
 function encodeKvCas(cas: KvCas): Map<string, unknown>;
 
 // @public (undocumented)
@@ -3390,7 +4159,22 @@ function encodeListRolesReq(req: ListRolesReq): Map<string, unknown>;
 function encodeListSchemas(request: ListSchemas): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeLogicalField(value: LogicalField): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeLogicalSchema(value: LogicalSchema): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeLogicalSchemaRef(value: LogicalSchemaRef): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeLogicalType(value: LogicalType): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeManagedRequestEnvelope(envelope: ManagedRequestEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeMaterializationDestination(value: MaterializationDestination): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeMemoryRecord(record: MemoryRecord): Map<string, unknown>;
@@ -3410,22 +4194,24 @@ function encodeNamed(entries: ReadonlyMap<string, unknown>, options?: {
 }): Uint8Array;
 
 // @public (undocumented)
-function encodeOne(value: unknown): Uint8Array;
+function encodeOne(value: unknown, options?: {
+    readonly forceFloatNumbers?: boolean;
+}): Uint8Array;
 
 // @public (undocumented)
-function encodeOpVersions(versions: OpVersions): Map<string, unknown>;
-
-// @public (undocumented)
-function encodePage(page: Page): Map<string, unknown>;
+function encodeOpVersions(value: OpVersions): Map<string, unknown>;
 
 // @public (undocumented)
 function encodePath(path: Path): Map<string, unknown>;
 
 // @public (undocumented)
+function encodePhysicalTable(value: PhysicalTable): Map<string, unknown>;
+
+// @public (undocumented)
 export function encodePolicyEvidence(evidence: PolicyEvidence): Uint8Array;
 
 // @public (undocumented)
-function encodePredicate(predicate: Predicate): Map<string, unknown>;
+function encodePreparedAttemptSummary(value: PreparedAttemptSummary): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeProjection(projection: Projection): Map<string, unknown>;
@@ -3440,10 +4226,22 @@ function encodeProjectionInfo(info: ProjectionInfo): Map<string, unknown>;
 const encodeProjectionListJson: (items: readonly ProjectionInfo[]) => string;
 
 // @public (undocumented)
+function encodeProjectionRef(value: ProjectionRef): Map<string, unknown>;
+
+// @public (undocumented)
 export function encodeProvenanceHeaders(provenance: Provenance): ReadonlyMap<string, IggyHeaderValue>;
 
 // @public (undocumented)
+function encodePublicCheckpointMutation(value: PublicCheckpointMutation): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeQuery(query: Query): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryCancelEnvelope(value: QueryCancelEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryCancelEnvelopeFrame(value: QueryCancelEnvelope): Uint8Array;
 
 // @public (undocumented)
 function encodeQueryEnvelope(envelope: QueryEnvelope): Map<string, unknown>;
@@ -3452,22 +4250,49 @@ function encodeQueryEnvelope(envelope: QueryEnvelope): Map<string, unknown>;
 function encodeQueryEnvelopeFrame(envelope: QueryEnvelope): Uint8Array;
 
 // @public (undocumented)
-function encodeQueryError(error: QueryError): unknown;
+function encodeQueryError(error: QueryError): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeQueryReply(reply: QueryReply): Map<string, unknown>;
+function encodeQueryExecutionJson(value: QueryExecutionView): string;
+
+// @public (undocumented)
+function encodeQueryExecutionStatus(value: QueryExecutionStatus): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryPageEnvelope(value: QueryPageEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryPageEnvelopeFrame(value: QueryPageEnvelope): Uint8Array;
 
 // @public (undocumented)
 function encodeQueryReplyFrame(reply: QueryReply): Uint8Array;
 
 // @public (undocumented)
-function encodeQueryResult(result: QueryResult): Map<string, unknown>;
+function encodeQueryResult(value: QueryResult): Map<string, unknown>;
 
 // @public (undocumented)
 const encodeQueryResultJson: (result: QueryResult) => string;
 
 // @public (undocumented)
-function encodeRawSql(rawSql: RawSql): Map<string, unknown>;
+function encodeQueryRoute(value: QueryRoute): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryRouteListRequest(value: QueryRouteListRequest): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryRoutePageJson(value: QueryRoutePageView): string;
+
+// @public (undocumented)
+function encodeQueryStatusEnvelope(value: QueryStatusEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeQueryStatusEnvelopeFrame(value: QueryStatusEnvelope): Uint8Array;
+
+// @public (undocumented)
+function encodeQueryStatusReplyFrame(reply: QueryStatusReply): Uint8Array;
+
+// @public (undocumented)
+function encodeQueryTarget(target: QueryTarget): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeRegisterSchema(request: RegisterSchema): Map<string, unknown>;
@@ -3476,13 +4301,13 @@ function encodeRegisterSchema(request: RegisterSchema): Map<string, unknown>;
 function encodeResourcePattern(pattern: ResourcePattern): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeRetentionGap(value: RetentionGap): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeRetentionPolicy(policy: RetentionPolicy): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeRole(role: Role): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeRow(row: Row): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeRunBudget(budget: RunBudget): Map<string, unknown>;
@@ -3506,34 +4331,55 @@ const encodeSchemaListJson: (items: readonly SchemaInfo[]) => string;
 function encodeSchemaSource(source: SchemaSource): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeSelect(select: Select): Map<string, unknown>;
-
-// @public (undocumented)
 function encodeSignature(signature: Signature): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeSignatureContext(context: SignatureContext): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeSort(sort: Sort): Map<string, unknown>;
+function encodeSnapshotPageJson(value: SnapshotPageView): string;
+
+// @public (undocumented)
+function encodeSourceCut(value: SourceCut): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSourceIncarnation(value: SourceIncarnation): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeSourcePartitionCut(value: SourcePartitionCut): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeSourceRef(source: SourceRef): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeSourceScope(value: SourceScope): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeSourceSelector(source: SourceSelector): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeStartPolicy(value: StartPolicy): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeStoredKeyRecord(record: StoredKeyRecord): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeTarget(target: Target): Map<string, unknown>;
+function encodeTableFilePageJson(value: TableFilePageView): string;
 
 // @public (undocumented)
-function encodeTextQuery(text: TextQuery): Map<string, unknown>;
+function encodeTableMetricsJson(value: TableMetricsView): string;
+
+// @public (undocumented)
+function encodeTableSchemaJson(value: TableSchemaView): string;
+
+// @public (undocumented)
+function encodeTableViewJson(value: TableView): string;
 
 // @public (undocumented)
 function encodeTokenUsage(usage: TokenUsage): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeTypedValue(value: TypedValue): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeValue(value: Value): unknown;
@@ -3542,16 +4388,10 @@ function encodeValue(value: Value): unknown;
 function encodeValueMap(values: ReadonlyMap<string, Value>): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeVectorQuery(vector: VectorQuery): Map<string, unknown>;
-
-// @public (undocumented)
 function encodeWhoamiReply(reply: WhoamiReply): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeWhoamiReq(): Map<string, unknown>;
-
-// @public (undocumented)
-function encodeWindow(window: Window): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeWireTopology(topology: WireTopology): Map<string, unknown>;
@@ -3596,6 +4436,12 @@ function expectArray(value: unknown, context: string): readonly unknown[];
 function expectBoolean(value: unknown, context: string): boolean;
 
 // @public (undocumented)
+function expectBytes(value: unknown, context: string): Uint8Array;
+
+// @public (undocumented)
+function expectI64(value: unknown, context: string): bigint;
+
+// @public (undocumented)
 function expectMap(value: unknown, context: string): CborMap;
 
 // @public (undocumented)
@@ -3623,6 +4469,7 @@ const Feature_2: {
     readonly KEYWORD_SEARCH: bigint;
     readonly WATCH: bigint;
     readonly AUTHZ: bigint;
+    readonly DESTINATIONS: bigint;
 };
 
 // @public (undocumented)
@@ -3661,6 +4508,10 @@ const field: {
     requiredU32(map: CborMap, key: string, context: string): number;
     optionalU32(map: CborMap, key: string, context: string): number | undefined;
     requiredU8(map: CborMap, key: string, context: string): number;
+    requiredI64(map: CborMap, key: string, context: string): bigint;
+    optionalI64(map: CborMap, key: string, context: string): bigint | undefined;
+    requiredI32(map: CborMap, key: string, context: string): number;
+    optionalI32(map: CborMap, key: string, context: string): number | undefined;
     optionalU8(map: CborMap, key: string, context: string): number | undefined;
     optionalU16(map: CborMap, key: string, context: string): number | undefined;
     optionalF64(map: CborMap, key: string, context: string): number | undefined;
@@ -3678,6 +4529,17 @@ const FIELD_TS = "ts";
 
 // @public (undocumented)
 type FieldType = "text" | "int" | "float" | "bool";
+
+// @public (undocumented)
+interface FieldValue {
+    // (undocumented)
+    readonly fieldId: number;
+    // (undocumented)
+    readonly value: TypedValue;
+}
+
+// @public (undocumented)
+type FileFormat = "parquet";
 
 // @public (undocumented)
 export class FileStore implements StateStore {
@@ -3720,7 +4582,7 @@ export function filterCandidatesByPrincipal(candidates: readonly RegisteredCard[
 export function filterNegate(filter: Filter): Filter;
 
 // @public (undocumented)
-export function filterPred(fieldName: string, op: CmpOp, value: Value): Filter;
+export function filterPred(fieldName: string, op: CmpOp, value: TypedValue): Filter;
 
 // @public (undocumented)
 export const FINISH_REASON_ABANDONED = "abandoned";
@@ -4459,6 +5321,8 @@ interface HttpCapabilities {
     // (undocumented)
     readonly backends: readonly BackendDescriptor[];
     // (undocumented)
+    readonly destinations: DestinationCapsView;
+    // (undocumented)
     readonly fork: boolean;
     // (undocumented)
     readonly graph: boolean;
@@ -4475,6 +5339,24 @@ interface HttpCapabilities {
     // (undocumented)
     readonly watch: boolean;
 }
+
+// @public (undocumented)
+type IcebergCommitRequirement = {
+    readonly kind: "assert_table_uuid";
+    readonly tableUuid: Uint8Array;
+} | {
+    readonly kind: "assert_metadata_identity";
+    readonly identity: string;
+} | {
+    readonly kind: "assert_current_snapshot";
+    readonly snapshotId?: bigint;
+} | {
+    readonly kind: "assert_current_schema";
+    readonly schemaId: number;
+} | {
+    readonly kind: "assert_default_partition_spec";
+    readonly partitionSpecId: number;
+};
 
 // @public (undocumented)
 const IDEMPOTENCY_KEY = "agdx.idem";
@@ -4744,7 +5626,7 @@ interface KeyMatch {
     // (undocumented)
     readonly field: string;
     // (undocumented)
-    readonly value: string;
+    readonly value: TypedValue;
 }
 
 // @public (undocumented)
@@ -5348,6 +6230,9 @@ export class KvSnapshotStore implements SnapshotStore {
     save(snapshot: FoldSnapshot): Promise<void>;
 }
 
+// @public (undocumented)
+function lakehouseTarget(destinationId: DestinationId, destinationGeneration: bigint, snapshot?: SnapshotSelector): QueryTarget;
+
 // @public
 export class Laser implements AsyncDisposable {
     // (undocumented)
@@ -5413,6 +6298,8 @@ export class Laser implements AsyncDisposable {
     // (undocumented)
     deleteRole(name: string): Promise<void>;
     // (undocumented)
+    destinations(): Destinations;
+    // (undocumented)
     executeBatch(ops: readonly BatchItem[]): Promise<readonly Uint8Array[]>;
     // (undocumented)
     fork(forkId: string): Fork;
@@ -5465,6 +6352,10 @@ export class Laser implements AsyncDisposable {
     quarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void>;
     // (undocumented)
     query(index: string): QueryRequest;
+    // (undocumented)
+    queryLakehouse(destinationId: DestinationId, destinationGeneration: bigint): QueryRequest;
+    // (undocumented)
+    queryTarget(target: QueryTarget): QueryRequest;
     // (undocumented)
     reassembleChannel(conversation: ConversationId, topic: string, channel: ChannelId): Promise<readonly StreamEvent[]>;
     // (undocumented)
@@ -5655,6 +6546,81 @@ export interface LlmUsage {
 }
 
 // @public (undocumented)
+const LOGICAL_SCHEMA_FINGERPRINT = "agdx.sfp";
+
+// @public (undocumented)
+export interface LogicalField {
+    // (undocumented)
+    readonly doc?: string;
+    // (undocumented)
+    readonly fieldType: LogicalType;
+    // (undocumented)
+    readonly id: number;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly required: boolean;
+}
+
+// @public (undocumented)
+export interface LogicalSchema {
+    // (undocumented)
+    readonly fields: readonly LogicalField[];
+    // (undocumented)
+    readonly schema: LogicalSchemaRef;
+}
+
+// @public (undocumented)
+class LogicalSchemaId extends WireId<"LogicalSchemaId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): LogicalSchemaId;
+    // (undocumented)
+    static fromU128(value: bigint): LogicalSchemaId;
+    // (undocumented)
+    static parse(text: string): LogicalSchemaId;
+}
+
+// @public (undocumented)
+export interface LogicalSchemaRef {
+    // (undocumented)
+    readonly fingerprint: Uint8Array;
+    // (undocumented)
+    readonly id: LogicalSchemaId;
+    // (undocumented)
+    readonly version: number;
+}
+
+// @public (undocumented)
+export type LogicalType = {
+    readonly kind: "boolean" | "int" | "long" | "float" | "double" | "date" | "time_micros" | "timestamp_micros" | "timestamp_tz_micros" | "string" | "uuid" | "binary";
+} | {
+    readonly kind: "decimal";
+    readonly precision: number;
+    readonly scale: number;
+} | {
+    readonly kind: "fixed";
+    readonly length: number;
+} | {
+    readonly kind: "struct";
+    readonly fields: readonly LogicalField[];
+} | {
+    readonly kind: "list";
+    readonly elementId: number;
+    readonly elementRequired: boolean;
+    readonly element: LogicalType;
+} | {
+    readonly kind: "map";
+    readonly keyId: number;
+    readonly key: LogicalType;
+    readonly valueId: number;
+    readonly valueRequired: boolean;
+    readonly value: LogicalType;
+};
+
+// @public (undocumented)
+type LogicalTypeKind = LogicalType["kind"];
+
+// @public (undocumented)
 export class LogMemory implements Memory {
     constructor(laser: Laser, namespace: string, topic?: string, stream?: string | undefined);
     // (undocumented)
@@ -5703,7 +6669,17 @@ function logPositionFromBytes(bytes: Uint8Array): LogPosition;
 function logPositionToBytes(position: LogPosition): Uint8Array;
 
 // @public (undocumented)
-const MANAGED_COMMANDS: readonly [ManagedCommand<undefined, AuthzReply>, ManagedCommand<ListRolesReq, AuthzReply>, ManagedCommand<GetRoleReq, AuthzReply>, ManagedCommand<GetBindingsReq, AuthzReply>, ManagedCommand<DefineRoleReq, AuthzReply>, ManagedCommand<DeleteRoleReq, AuthzReply>, ManagedCommand<BindRolesReq, AuthzReply>, ManagedCommand<QueryEnvelope, QueryReply>, ManagedCommand<GetProjection, BrowseReply>, ManagedCommand<ListProjections, BrowseReply>, ManagedCommand<GetSchema, BrowseReply>, ManagedCommand<ListSchemas, BrowseReply>, ManagedCommand<RegisterSchema, BrowseReply>, ManagedCommand<DecodeRecord, BrowseReply>, ManagedCommand<KvGet, KvReply>, ManagedCommand<KvSet, KvReply>, ManagedCommand<KvScan, KvReply>, ManagedCommand<KvDelete, KvReply>, ManagedCommand<KvDeleteMany, KvReply>, ManagedCommand<undefined, KvReply>, ManagedCommand<ForkCreate, ForkReply>, ManagedCommand<ForkDelete, ForkReply>, ManagedCommand<ForkPromote, ForkReply>, ManagedCommand<undefined, ForkReply>, ManagedCommand<ForkPut, ForkReply>, ManagedCommand<AgentSubmit, AgentReply>, ManagedCommand<AgentCancel, AgentReply>, ManagedCommand<AgentStatusReq, AgentReply>, ManagedCommand<AgentList, AgentReply>];
+interface MaintenanceCapabilities {
+    // (undocumented)
+    readonly compactDataFiles: boolean;
+    // (undocumented)
+    readonly expireSnapshots: boolean;
+    // (undocumented)
+    readonly removeOrphanFiles: boolean;
+}
+
+// @public (undocumented)
+const MANAGED_COMMANDS: readonly [ManagedCommand<undefined, AuthzReply>, ManagedCommand<ListRolesReq, AuthzReply>, ManagedCommand<GetRoleReq, AuthzReply>, ManagedCommand<GetBindingsReq, AuthzReply>, ManagedCommand<DefineRoleReq, AuthzReply>, ManagedCommand<DeleteRoleReq, AuthzReply>, ManagedCommand<BindRolesReq, AuthzReply>, ManagedCommand<QueryEnvelope, QueryReply>, ManagedCommand<QueryPageEnvelope, QueryReply>, ManagedCommand<QueryCancelEnvelope, QueryStatusReply>, ManagedCommand<QueryStatusEnvelope, QueryStatusReply>, ManagedCommand<CheckpointRequestEnvelope, CheckpointReply>, ManagedCommand<DestinationGetRequest, CheckpointReadReply>, ManagedCommand<DestinationListRequest, CheckpointReadReply>, ManagedCommand<QueryRouteListRequest, CheckpointReadReply>, ManagedCommand<GetProjection, BrowseReply>, ManagedCommand<ListProjections, BrowseReply>, ManagedCommand<GetSchema, BrowseReply>, ManagedCommand<ListSchemas, BrowseReply>, ManagedCommand<RegisterSchema, BrowseReply>, ManagedCommand<DecodeRecord, BrowseReply>, ManagedCommand<KvGet, KvReply>, ManagedCommand<KvSet, KvReply>, ManagedCommand<KvScan, KvReply>, ManagedCommand<KvDelete, KvReply>, ManagedCommand<KvDeleteMany, KvReply>, ManagedCommand<undefined, KvReply>, ManagedCommand<ForkCreate, ForkReply>, ManagedCommand<ForkDelete, ForkReply>, ManagedCommand<ForkPromote, ForkReply>, ManagedCommand<undefined, ForkReply>, ManagedCommand<ForkPut, ForkReply>, ManagedCommand<AgentSubmit, AgentReply>, ManagedCommand<AgentCancel, AgentReply>, ManagedCommand<AgentStatusReq, AgentReply>, ManagedCommand<AgentList, AgentReply>];
 
 // @public (undocumented)
 const MANAGED_REQUEST_VERSION = 1;
@@ -5738,7 +6714,92 @@ interface ManagedRequestEnvelope {
 }
 
 // @public (undocumented)
+interface MapEntry {
+    // (undocumented)
+    readonly key: TypedValue;
+    // (undocumented)
+    readonly value: TypedValue;
+}
+
+// @public (undocumented)
+interface MaterializationBoundary {
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly relationToCurrent: BoundaryRelation;
+}
+
+// @public (undocumented)
+interface MaterializationCapability {
+    // (undocumented)
+    readonly append: boolean;
+    // (undocumented)
+    readonly createTable: boolean;
+    // (undocumented)
+    readonly fileFormat: "parquet";
+    // (undocumented)
+    readonly tableFormat: "iceberg_v2";
+}
+
+// @public (undocumented)
+export interface MaterializationDestination {
+    // (undocumented)
+    readonly backend: BackendBinding;
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly desiredState: DestinationDesiredState;
+    // (undocumented)
+    readonly errorPolicy: DestinationErrorPolicy;
+    // (undocumented)
+    readonly fileFormat: FileFormat;
+    // (undocumented)
+    readonly generation: bigint;
+    // (undocumented)
+    readonly id: DestinationId;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly newPartitionPolicy: NewPartitionPolicy;
+    // (undocumented)
+    readonly projection: ProjectionRef;
+    // (undocumented)
+    readonly recreatedPartitionPolicy: RecreatedPartitionPolicy;
+    // (undocumented)
+    readonly schema: LogicalSchemaRef;
+    // (undocumented)
+    readonly source: SourceScope;
+    // (undocumented)
+    readonly startPolicy: StartPolicy;
+    // (undocumented)
+    readonly table: PhysicalTable;
+    // (undocumented)
+    readonly tableFormat: TableFormat;
+}
+
+// @public (undocumented)
 const MAX_AGENT_STRING_BYTES = 256;
+
+// @public (undocumented)
+const MAX_ARROW_DECIMAL_BITS = 128;
+
+// @public (undocumented)
+const MAX_ARROW_IPC_BATCHES = 64;
+
+// @public (undocumented)
+const MAX_ARROW_IPC_DICTIONARIES = 4096;
+
+// @public (undocumented)
+const MAX_ARROW_IPC_FIELDS = 4096;
+
+// @public (undocumented)
+const MAX_ARROW_IPC_MESSAGE_BYTES: number;
+
+// @public (undocumented)
+const MAX_ARROW_IPC_ROWS = 1000000n;
+
+// @public (undocumented)
+const MAX_ATTEMPT_OBJECTS = 100000;
 
 // @public (undocumented)
 const MAX_BATCH_OPS = 64;
@@ -5750,10 +6811,40 @@ const MAX_BODY_REFERENCE_BYTES = 1024;
 const MAX_CARD_CAPABILITIES = 64;
 
 // @public (undocumented)
+const MAX_CHECKPOINT_ERROR_BYTES = 4096;
+
+// @public (undocumented)
+const MAX_CHECKPOINT_LEASE_DURATION_MICROS = 300000000n;
+
+// @public (undocumented)
+const MAX_CHECKPOINT_PARTITIONS = 65536;
+
+// @public (undocumented)
 export const MAX_CHUNK_BODY_BYTES: number;
 
 // @public (undocumented)
 const MAX_CLIENT_METADATA: number;
+
+// @public (undocumented)
+const MAX_CREDENTIAL_GENERATIONS = 32;
+
+// @public (undocumented)
+const MAX_DECIMAL_PRECISION = 38;
+
+// @public (undocumented)
+const MAX_DESTINATION_NAME_BYTES = 255;
+
+// @public (undocumented)
+const MAX_EXPLICIT_PARTITION_STARTS = 65536;
+
+// @public (undocumented)
+const MAX_FIELD_DOC_BYTES = 4096;
+
+// @public (undocumented)
+const MAX_FIELD_NAME_BYTES = 255;
+
+// @public (undocumented)
+const MAX_FIXED_BYTES = 1048576;
 
 // @public (undocumented)
 const MAX_FORK_ID_BYTES = 128;
@@ -5783,6 +6874,18 @@ const MAX_INDEX_ENTRIES_PER_RECORD = 32;
 const MAX_KEY_BYTES = 512;
 
 // @public (undocumented)
+const MAX_LOGICAL_SCHEMA_BYTES = 1048576;
+
+// @public (undocumented)
+const MAX_LOGICAL_SCHEMA_DEPTH = 16;
+
+// @public (undocumented)
+const MAX_LOGICAL_SCHEMA_FIELDS = 4096;
+
+// @public (undocumented)
+const MAX_MANIFEST_IDENTITY_BYTES = 4096;
+
+// @public (undocumented)
 const MAX_MEMORY_BODY_BYTES: number;
 
 // @public (undocumented)
@@ -5807,16 +6910,40 @@ const MAX_METADATA_VALUE_BYTES = 1024;
 const MAX_NAMESPACE_BYTES = 128;
 
 // @public (undocumented)
+const MAX_NAMESPACE_PARTS = 16;
+
+// @public (undocumented)
 const MAX_PAGE_SIZE = 1000;
 
 // @public (undocumented)
 const MAX_PROJECTOR_PAYLOAD_BYTES: number;
 
 // @public (undocumented)
+const MAX_QUERY_CURSOR_BYTES = 512;
+
+// @public (undocumented)
+const MAX_QUERY_FIELDS = 4096;
+
+// @public (undocumented)
+const MAX_QUERY_NAME_BYTES = 255;
+
+// @public (undocumented)
+const MAX_QUERY_PARAMETERS = 1024;
+
+// @public (undocumented)
+const MAX_QUERY_PREDICATES = 4096;
+
+// @public (undocumented)
 const MAX_QUERY_REPLY_BYTES: number;
 
 // @public (undocumented)
+const MAX_RAW_SQL_BYTES: number;
+
+// @public (undocumented)
 const MAX_RECALL_LIMIT = 1000;
+
+// @public (undocumented)
+const MAX_REPAIR_DETAIL_BYTES = 4096;
 
 // @public (undocumented)
 const MAX_ROLE_NAME_BYTES = 64;
@@ -5825,13 +6952,25 @@ const MAX_ROLE_NAME_BYTES = 64;
 const MAX_SCAN_LIMIT = 1000;
 
 // @public (undocumented)
+const MAX_SOURCE_PARTITIONS = 65536;
+
+// @public (undocumented)
 const MAX_SOURCE_REF_BYTES: number;
+
+// @public (undocumented)
+const MAX_SUPERVISOR_ASSERTION_TTL_MICROS = 300000000n;
+
+// @public (undocumented)
+const MAX_TABLE_NAME_BYTES = 255;
 
 // @public (undocumented)
 const MAX_TEXT_QUERY_BYTES = 1024;
 
 // @public (undocumented)
 const MAX_VALUE_BYTES: number;
+
+// @public (undocumented)
+const MAX_VECTOR_DIMENSIONS = 65536;
 
 // @public (undocumented)
 export const MCP_APP_ERROR_CODE = -32000;
@@ -6198,6 +7337,9 @@ const METADATA_SESSION_INTENT = "session_intent";
 const METADATA_TASK_CONTEXT = "task_context";
 
 // @public (undocumented)
+const MICROS_PER_DAY = 86400000000n;
+
+// @public (undocumented)
 interface MutationCommandEnvelope {
     // (undocumented)
     readonly commandCode: number;
@@ -6218,13 +7360,19 @@ function newAgentPresence(agent: AgentId_2, inbox?: string): AgentPresence;
 function newBackendAnnounce(versions: OpVersions): BackendAnnounce;
 
 // @public (undocumented)
-function newBackendDescriptor(id: string, kind: string): BackendDescriptor;
+function newBackendDescriptor(resourceId: BackendResourceId, mode: BackendMode, label: string, implementation: BackendImplementation, observedBackendGeneration: bigint, runtimeConfigurationRevision: bigint): BackendDescriptor;
 
 // @public (undocumented)
 function newBodyRef(reference: string, sizeBytes: bigint, sha256: Uint8Array): BodyRef;
 
 // @public (undocumented)
 function newOpVersions(query: number, control: number, kv: number, fork: number): OpVersions;
+
+// @public (undocumented)
+type NewPartitionPolicy = "beginning" | "captured_latest" | "reject";
+
+// @public (undocumented)
+function newQuery(target: QueryTarget, executionId: QueryExecutionId, deadlineMicros: bigint): Query;
 
 // @public (undocumented)
 export interface NodeExtract {
@@ -6295,12 +7443,28 @@ export const OPERATION_TOOL_ARGS = "tool_args";
 const OPERATION_UNQUARANTINE = "unquarantine";
 
 // @public (undocumented)
+function operationalTarget(index: string): QueryTarget;
+
+// @public (undocumented)
+interface OperationErrorView {
+    // (undocumented)
+    readonly code: ResultCode;
+    // (undocumented)
+    readonly message: string;
+}
+
+// @public (undocumented)
+type OperationState = "accepted" | "running" | "succeeded" | "failed" | "cancelled";
+
+// @public (undocumented)
 const OPS_STREAM = "_agdx";
 
 // @public (undocumented)
 interface OpVersions {
     // (undocumented)
     readonly agent: number;
+    // (undocumented)
+    readonly checkpoint?: number;
     // (undocumented)
     readonly control: number;
     // (undocumented)
@@ -6325,13 +7489,15 @@ interface Page {
     // (undocumented)
     readonly limit: number;
     // (undocumented)
-    readonly offset: number;
+    readonly nextCursor?: string;
+    // (undocumented)
+    readonly offset?: bigint;
     // (undocumented)
     readonly total?: bigint;
 }
 
 // @public (undocumented)
-function pageAtLeast(page: Page, rowsOnPage: number): number;
+function pageAtLeast(page: Page, rowsOnPage: number): bigint | undefined;
 
 // @public (undocumented)
 function pageTotalPages(page: Page): bigint | undefined;
@@ -6343,7 +7509,7 @@ const PARENT_CONVERSATION_ID = "agdx.parent_conv";
 function parseAgentKind(value: string, context: string): AgentKind;
 
 // @public (undocumented)
-function parseConsistency(word: string, context: string): Consistency;
+function parseConsistency(value: string, context: string): Consistency;
 
 // @public (undocumented)
 export function parseIdempotencyKey(value: string): IdempotencyKey;
@@ -6358,11 +7524,54 @@ export function parseProjectionId(value: string): ProjectionId;
 export function parseWireAgentId(value: string): AgentId_2;
 
 // @public (undocumented)
+interface PartitionCheckpoint {
+    // (undocumented)
+    readonly incarnation: SourceIncarnation;
+    // (undocumented)
+    readonly lifecycle: PartitionLifecycleState;
+    // (undocumented)
+    readonly nextOffset: bigint;
+    // (undocumented)
+    readonly startedAtOffset: bigint;
+}
+
+// @public (undocumented)
+type PartitionLifecycleState = "active" | "removed" | "recreated";
+
+// @public (undocumented)
+interface PartitionStart {
+    // (undocumented)
+    readonly incarnation: SourceIncarnation;
+    // (undocumented)
+    readonly nextOffset: bigint;
+}
+
+// @public (undocumented)
 export interface Path {
     // (undocumented)
     readonly edges: readonly EdgeId[];
     // (undocumented)
     readonly nodes: readonly NodeId[];
+}
+
+// @public (undocumented)
+class PhysicalClusterIncarnation extends WireId<"PhysicalClusterIncarnation"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): PhysicalClusterIncarnation;
+    // (undocumented)
+    static fromU128(value: bigint): PhysicalClusterIncarnation;
+    // (undocumented)
+    static parse(text: string): PhysicalClusterIncarnation;
+}
+
+// @public (undocumented)
+interface PhysicalTable {
+    // (undocumented)
+    readonly expectedTableUuid?: Uint8Array;
+    // (undocumented)
+    readonly namespace: readonly string[];
+    // (undocumented)
+    readonly table: string;
 }
 
 // @public (undocumented)
@@ -6456,7 +7665,99 @@ interface Predicate {
     // (undocumented)
     readonly op: CmpOp;
     // (undocumented)
-    readonly value: Value;
+    readonly value: TypedValue;
+}
+
+// @public (undocumented)
+interface PreparedAttempt {
+    // (undocumented)
+    readonly backend: BackendBinding;
+    // (undocumented)
+    readonly createdAtCheckpointRevision: bigint;
+    // (undocumented)
+    readonly credentialGenerations: readonly CredentialGeneration[];
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly epoch: bigint;
+    // (undocumented)
+    readonly id: PreparedAttemptId;
+    // (undocumented)
+    readonly manifestDigest: Uint8Array;
+    // (undocumented)
+    readonly manifestIdentity: string;
+    // (undocumented)
+    readonly objects: readonly AttemptObject[];
+    // (undocumented)
+    readonly owner: CheckpointOwnerId;
+    // (undocumented)
+    readonly projection: ProjectionRef;
+    // (undocumented)
+    readonly ranges: readonly SourceOffsetRange[];
+    // (undocumented)
+    readonly resultingBoundary: readonly PartitionCheckpoint[];
+    // (undocumented)
+    readonly resultingBoundaryDigest: Uint8Array;
+    // (undocumented)
+    readonly schemaFingerprint: Uint8Array;
+    // (undocumented)
+    readonly table: PreparedTableRequirements;
+}
+
+// @public (undocumented)
+class PreparedAttemptId extends WireId<"PreparedAttemptId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): PreparedAttemptId;
+    // (undocumented)
+    static fromU128(value: bigint): PreparedAttemptId;
+    // (undocumented)
+    static parse(text: string): PreparedAttemptId;
+}
+
+// @public (undocumented)
+interface PreparedAttemptSummary {
+    // (undocumented)
+    readonly credentialGenerations: readonly CredentialGeneration[];
+    // (undocumented)
+    readonly epoch: bigint;
+    // (undocumented)
+    readonly id: PreparedAttemptId;
+    // (undocumented)
+    readonly manifestDigest: Uint8Array;
+    // (undocumented)
+    readonly manifestIdentity: string;
+    // (undocumented)
+    readonly objectCount: number;
+    // (undocumented)
+    readonly owner: CheckpointOwnerId;
+    // (undocumented)
+    readonly projection: ProjectionRef;
+    // (undocumented)
+    readonly ranges: readonly SourceOffsetRange[];
+    // (undocumented)
+    readonly resultingBoundaryDigest: Uint8Array;
+    // (undocumented)
+    readonly schemaFingerprint: Uint8Array;
+    // (undocumented)
+    readonly table: PreparedTableRequirements;
+}
+
+// @public (undocumented)
+interface PreparedTableRequirements {
+    // (undocumented)
+    readonly baseMetadataIdentity: string;
+    // (undocumented)
+    readonly baseSnapshotId?: bigint;
+    // (undocumented)
+    readonly commitRequirements: readonly IcebergCommitRequirement[];
+    // (undocumented)
+    readonly partitionSpecId: number;
+    // (undocumented)
+    readonly schemaId: number;
+    // (undocumented)
+    readonly tableUuid: Uint8Array;
 }
 
 // @public (undocumented)
@@ -6570,15 +7871,17 @@ export interface ProjectionBinding {
     // (undocumented)
     readonly allowedProjections: readonly ProjectionId[];
     // (undocumented)
+    readonly backend?: BackendBinding;
+    // (undocumented)
     readonly defaultProjection?: ProjectionId;
+    // (undocumented)
+    readonly index: string;
     // (undocumented)
     readonly notify: boolean;
     // (undocumented)
     readonly retention?: RetentionPolicy;
     // (undocumented)
     readonly source: SourceSelector;
-    // (undocumented)
-    readonly targets: readonly Target[];
 }
 
 // @public (undocumented)
@@ -6612,6 +7915,14 @@ function projectionKindFromCode(code: number): ProjectionKind;
 
 // @public (undocumented)
 const projectionPath: (id: string) => string;
+
+// @public (undocumented)
+interface ProjectionRef {
+    // (undocumented)
+    readonly id: string;
+    // (undocumented)
+    readonly version: number;
+}
 
 // @public (undocumented)
 export class Projections {
@@ -6692,11 +8003,112 @@ export interface Provenance {
 }
 
 // @public (undocumented)
+const PROVENANCE_FIELD_ID_START = 2000000000;
+
+// @public (undocumented)
+const PROVENANCE_FIELDS: readonly (readonly [number, string])[];
+
+// @public (undocumented)
 export function provenancePartitionKey(provenance: Provenance): string;
+
+// @public (undocumented)
+export type PublicCheckpointMutation = {
+    readonly kind: "register_destination";
+    readonly destination: MaterializationDestination;
+} | {
+    readonly kind: "register_query_route";
+    readonly route: QueryRoute;
+} | {
+    readonly kind: "remove_query_route";
+    readonly routeId: QueryRouteId;
+    readonly routeGeneration: bigint;
+    readonly expectedDefinitionRevision: bigint;
+} | {
+    readonly kind: "bind_table";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedDefinitionRevision: bigint;
+    readonly tableUuid: Uint8Array;
+} | {
+    readonly kind: "set_desired_state";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedDefinitionRevision: bigint;
+    readonly desiredState: DestinationDesiredState;
+} | {
+    readonly kind: "add_partition" | "observe_partition_lifecycle";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly partitionId: number;
+} | {
+    readonly kind: "acquire_lease" | "takeover_lease";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly owner: CheckpointOwnerId;
+    readonly expectedLeaseSequence: bigint;
+    readonly leaseDurationMicros: bigint;
+} | {
+    readonly kind: "renew_lease";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly owner: CheckpointOwnerId;
+    readonly epoch: bigint;
+    readonly expectedLeaseSequence: bigint;
+    readonly leaseDurationMicros: bigint;
+} | {
+    readonly kind: "prepare";
+    readonly expectedCheckpointRevision: bigint;
+    readonly attempt: PreparedAttempt;
+} | {
+    readonly kind: "complete";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly owner: CheckpointOwnerId;
+    readonly epoch: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly completion: CompletedAttempt;
+} | {
+    readonly kind: "record_block";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly block: DestinationBlock;
+} | {
+    readonly kind: "clear_block";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly expectedCode: DestinationBlockCode;
+} | {
+    readonly kind: "record_retention_gap";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly gap: RetentionGap;
+} | {
+    readonly kind: "accept_retention_gap";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly nextOffset: bigint;
+} | {
+    readonly kind: "supersede_generation";
+    readonly expectedDefinitionRevision: bigint;
+    readonly replacement: MaterializationDestination;
+} | {
+    readonly kind: "record_repair";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly repair: RepairRecord;
+};
 
 // @public (undocumented)
 export class PublishRequest {
     constructor(topic: Topic);
+    // (undocumented)
+    arrowIpc(bytes: BytesLike, metadata: ArrowIpcMessageMetadata): this;
     // (undocumented)
     avro(schema: CompiledSchema, schemaId: number, value: unknown): this;
     // (undocumented)
@@ -6760,7 +8172,11 @@ interface Query {
     // (undocumented)
     readonly consistency: Consistency;
     // (undocumented)
+    readonly deadlineMicros: bigint;
+    // (undocumented)
     readonly distinct: boolean;
+    // (undocumented)
+    readonly executionId: QueryExecutionId;
     // (undocumented)
     readonly filter?: Filter;
     // (undocumented)
@@ -6768,27 +8184,23 @@ interface Query {
     // (undocumented)
     readonly having?: Filter;
     // (undocumented)
-    readonly index: string;
-    // (undocumented)
-    readonly limit: number;
-    // (undocumented)
     readonly messageType?: string;
     // (undocumented)
-    readonly offset: number;
-    // (undocumented)
     readonly order: readonly Sort[];
+    // (undocumented)
+    readonly page: QueryPageRequest;
     // (undocumented)
     readonly rawSql?: RawSql;
     // (undocumented)
     readonly select: Select;
+    // (undocumented)
+    readonly target: QueryTarget;
     // (undocumented)
     readonly text?: TextQuery;
     // (undocumented)
     readonly timeRange?: readonly [bigint, bigint];
     // (undocumented)
     readonly vector?: VectorQuery;
-    // (undocumented)
-    readonly wantTotal: boolean;
 }
 
 // @public (undocumented)
@@ -6798,11 +8210,57 @@ const QUERY_OP_VERSION = 1;
 const QUERY_PATH = "/agdx/query";
 
 // @public (undocumented)
+const QUERY_ROUTES_PATH = "/agdx/query-routes";
+
+// @public (undocumented)
+const QueryCancelCommand: ManagedCommand<QueryCancelEnvelope, QueryCancelReply>;
+
+// @public (undocumented)
+interface QueryCancelEnvelope {
+    // (undocumented)
+    readonly executionId: QueryExecutionId;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+const queryCancelPath: (id: QueryExecutionId) => string;
+
+// @public (undocumented)
+type QueryCancelReply = QueryStatusReply;
+
+// @public (undocumented)
+interface QueryCapabilities {
+    // (undocumented)
+    readonly cancellation: boolean;
+    // (undocumented)
+    readonly consistency: readonly Consistency[];
+    // (undocumented)
+    readonly dialects: readonly SqlDialect[];
+    // (undocumented)
+    readonly executionStatus: boolean;
+    // (undocumented)
+    readonly logicalTypes: readonly LogicalTypeKind[];
+    // (undocumented)
+    readonly paging: readonly QueryPagingCapability[];
+    // (undocumented)
+    readonly rawSql: boolean;
+    // (undocumented)
+    readonly timeTravel: readonly TimeTravelCapability[];
+}
+
+// @public (undocumented)
 interface QueryCapsView {
     // (undocumented)
     readonly available: boolean;
     // (undocumented)
+    readonly cancellation: boolean;
+    // (undocumented)
     readonly consistency: Consistency;
+    // (undocumented)
+    readonly cursorPaging: boolean;
+    // (undocumented)
+    readonly executionStatus: boolean;
     // (undocumented)
     readonly keyword: boolean;
     // (undocumented)
@@ -6815,35 +8273,62 @@ interface QueryCapsView {
 const QueryCommand: ManagedCommand<QueryEnvelope, QueryReply>;
 
 // @public (undocumented)
+interface QueryContext {
+    // (undocumented)
+    readonly boundary?: MaterializationBoundary;
+    // (undocumented)
+    readonly checkpointRevision?: bigint;
+    // (undocumented)
+    readonly deliveredConsistency: Consistency;
+    // (undocumented)
+    readonly elapsedMicros: bigint;
+    // (undocumented)
+    readonly engine: QueryEngine;
+    // (undocumented)
+    readonly executionId: QueryExecutionId;
+    // (undocumented)
+    readonly globalStateRevision?: bigint;
+    // (undocumented)
+    readonly producedBytes: bigint;
+    // (undocumented)
+    readonly requestedConsistency: Consistency;
+    // (undocumented)
+    readonly resolvedTarget: ResolvedQueryTarget;
+    // (undocumented)
+    readonly rowCount: bigint;
+    // (undocumented)
+    readonly scannedBytes: bigint;
+    // (undocumented)
+    readonly truncated: boolean;
+}
+
+// @public (undocumented)
+interface QueryEngine {
+    // (undocumented)
+    readonly dialect?: SqlDialect;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly version: string;
+}
+
+// @public (undocumented)
 interface QueryEnvelope {
     // (undocumented)
     readonly query: Query;
+    // (undocumented)
+    readonly v: number;
 }
 
 // @public (undocumented)
 type QueryError = {
-    readonly kind: "unsupported";
+    readonly kind: "unsupported" | "unauthorized" | "index_not_found" | "fork_not_found" | "backend" | "unavailable";
     readonly message: string;
 } | {
-    readonly kind: "unauthorized";
-    readonly message: string;
-} | {
-    readonly kind: "indexNotFound";
-    readonly message: string;
-} | {
-    readonly kind: "forkNotFound";
-    readonly message: string;
-} | {
-    readonly kind: "backend";
-    readonly message: string;
-} | {
-    readonly kind: "unavailable";
-    readonly message: string;
-} | {
-    readonly kind: "tooLarge";
+    readonly kind: "too_large";
     readonly what: string;
-    readonly size: number;
-    readonly cap: number;
+    readonly size: bigint;
+    readonly cap: bigint;
 } | {
     readonly kind: "version";
     readonly expected: number;
@@ -6854,10 +8339,28 @@ type QueryError = {
     readonly applied: bigint;
     readonly required: bigint;
 } | {
-    readonly kind: "unrecognized";
-    readonly tag: string;
-    readonly value: unknown;
+    readonly kind: "cancelled" | "deadline_exceeded";
+    readonly executionId: QueryExecutionId;
+} | {
+    readonly kind: "expired_snapshot";
+    readonly snapshotId: bigint;
+} | {
+    readonly kind: "stale_generation";
+    readonly what: string;
+    readonly requested: bigint;
+    readonly observed: bigint;
+} | {
+    readonly kind: "target_unavailable";
+    readonly reason: string;
+} | {
+    readonly kind: "resource_limit";
+    readonly resource: string;
+    readonly observed: bigint;
+    readonly limit: bigint;
 };
+
+// @public (undocumented)
+type QueryErrorCode = QueryError["kind"];
 
 // @public (undocumented)
 export class QueryExecutionError extends LaserError {
@@ -6869,22 +8372,96 @@ export class QueryExecutionError extends LaserError {
 }
 
 // @public (undocumented)
+class QueryExecutionId extends WireId<"QueryExecutionId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): QueryExecutionId;
+    // (undocumented)
+    static fromU128(value: bigint): QueryExecutionId;
+    // (undocumented)
+    static parse(text: string): QueryExecutionId;
+}
+
+// @public (undocumented)
+const queryExecutionPath: (id: QueryExecutionId) => string;
+
+// @public (undocumented)
+type QueryExecutionState = "queued" | "planning" | "running" | "completed" | "cancelled" | "failed" | "expired";
+
+// @public (undocumented)
+interface QueryExecutionStatus {
+    // (undocumented)
+    readonly error?: QueryError;
+    // (undocumented)
+    readonly executionId: QueryExecutionId;
+    // (undocumented)
+    readonly finishedAtMicros?: bigint;
+    // (undocumented)
+    readonly producedBytes: bigint;
+    // (undocumented)
+    readonly rowCount: bigint;
+    // (undocumented)
+    readonly scannedBytes: bigint;
+    // (undocumented)
+    readonly startedAtMicros: bigint;
+    // (undocumented)
+    readonly state: QueryExecutionState;
+}
+
+// @public (undocumented)
+interface QueryExecutionView {
+    // (undocumented)
+    readonly result?: QueryResult;
+    // (undocumented)
+    readonly status: QueryExecutionStatus;
+}
+
+// @public (undocumented)
+const QueryPageCommand: ManagedCommand<QueryPageEnvelope, QueryReply>;
+
+// @public (undocumented)
+interface QueryPageEnvelope {
+    // (undocumented)
+    readonly cursor: string;
+    // (undocumented)
+    readonly deadlineMicros: bigint;
+    // (undocumented)
+    readonly executionId: QueryExecutionId;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+const queryPagePath: (id: QueryExecutionId) => string;
+
+// @public (undocumented)
+interface QueryPageRequest {
+    // (undocumented)
+    readonly cursor?: string;
+    // (undocumented)
+    readonly limit: number;
+    // (undocumented)
+    readonly offset?: bigint;
+    // (undocumented)
+    readonly wantTotal: boolean;
+}
+
+// @public (undocumented)
+type QueryPagingCapability = "offset" | "cursor";
+
+// @public (undocumented)
 type QueryReply = {
     readonly kind: "ok";
     readonly result: QueryResult;
 } | {
     readonly kind: "err";
     readonly error: QueryError;
-} | {
-    readonly kind: "unrecognized";
-    readonly tag: string;
-    readonly value: unknown;
 };
 
 // @public (undocumented)
 export class QueryRequest {
     // Warning: (ae-forgotten-export) The symbol "QueryExecutor" needs to be exported by the entry point full.d.ts
-    constructor(index: string, execute: QueryExecutor);
+    // Warning: (ae-forgotten-export) The symbol "QueryStatusExecutor" needs to be exported by the entry point full.d.ts
+    constructor(indexOrTarget: string | QueryTarget, execute: QueryExecutor, readStatus?: QueryStatusExecutor, cancelExecution?: QueryStatusExecutor);
     // (undocumented)
     aggregateAs(func: AggFunc, alias: string, options?: {
         readonly field?: string;
@@ -6892,7 +8469,10 @@ export class QueryRequest {
     }): this;
     // (undocumented)
     avg(field: string, alias?: string): this;
-    byKey(field: string, value: string): this;
+    // (undocumented)
+    byKey(field: string, value: string | TypedValue): this;
+    // (undocumented)
+    cancel(): Promise<QueryExecutionStatus>;
     // (undocumented)
     consistency(level: Consistency): this;
     // (undocumented)
@@ -6902,7 +8482,13 @@ export class QueryRequest {
     // (undocumented)
     countDistinct(field: string, alias?: string): this;
     // (undocumented)
+    cursor(value: string): this;
+    // (undocumented)
+    deadlineMicros(value: bigint): this;
+    // (undocumented)
     distinct(): this;
+    // (undocumented)
+    executionId(value: QueryExecutionId): this;
     // (undocumented)
     fetch(): Promise<QueryResult>;
     // (undocumented)
@@ -6918,19 +8504,19 @@ export class QueryRequest {
     // (undocumented)
     filterContains(field: string, value: string): this;
     // (undocumented)
-    filterEq(field: string, value: Value): this;
+    filterEq(field: string, value: TypedValue): this;
     // (undocumented)
-    filterGt(field: string, value: Value): this;
+    filterGt(field: string, value: TypedValue): this;
     // (undocumented)
-    filterGte(field: string, value: Value): this;
+    filterGte(field: string, value: TypedValue): this;
     // (undocumented)
-    filterIn(field: string, values: readonly Value[]): this;
+    filterIn(field: string, values: readonly TypedValue[]): this;
     // (undocumented)
-    filterLt(field: string, value: Value): this;
+    filterLt(field: string, value: TypedValue): this;
     // (undocumented)
-    filterLte(field: string, value: Value): this;
+    filterLte(field: string, value: TypedValue): this;
     // (undocumented)
-    filterNe(field: string, value: Value): this;
+    filterNe(field: string, value: TypedValue): this;
     // (undocumented)
     filterPrefix(field: string, value: string): this;
     // (undocumented)
@@ -6956,7 +8542,7 @@ export class QueryRequest {
     // (undocumented)
     nearestIn(field: string, embedding: readonly number[], topK: number): this;
     // (undocumented)
-    offset(value: number): this;
+    offset(value: bigint | number): this;
     // (undocumented)
     orderAsc(field: string): this;
     // (undocumented)
@@ -6964,13 +8550,15 @@ export class QueryRequest {
     // (undocumented)
     percentile(field: string, fraction: number, alias?: string): this;
     // (undocumented)
-    rawSql(sql: string, params?: readonly Value[]): this;
+    rawSql(sql: string, params?: readonly TypedValue[], dialect?: SqlDialect): this;
     // (undocumented)
     readYourWrites(): this;
     // (undocumented)
     rows(): AsyncIterable<Row>;
     // (undocumented)
     selectFields(fields: readonly string[]): this;
+    // (undocumented)
+    status(): Promise<QueryExecutionStatus>;
     // (undocumented)
     stdDev(field: string, alias?: string): this;
     // (undocumented)
@@ -6981,7 +8569,8 @@ export class QueryRequest {
     textIn(field: string, query: string): this;
     // (undocumented)
     timeRange(startMicros: bigint, endMicros: bigint): this;
-    whereEq(field: string, value: string): this;
+    // (undocumented)
+    whereEq(field: string, value: string | TypedValue): this;
     // (undocumented)
     window(field: string, everyMicros: bigint): this;
     // (undocumented)
@@ -6993,10 +8582,123 @@ export class QueryRequest {
 // @public (undocumented)
 export interface QueryResult {
     // (undocumented)
+    readonly context: QueryContext;
+    // (undocumented)
+    readonly fields: readonly LogicalField[];
+    // (undocumented)
     readonly page: Page;
     // (undocumented)
     readonly rows: readonly Row[];
 }
+
+// @public (undocumented)
+export function queryResultValue(result: QueryResult, row: Row, name: string): TypedValue | undefined;
+
+// @public (undocumented)
+export interface QueryRoute {
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly desiredState: DestinationDesiredState;
+    // (undocumented)
+    readonly generation: bigint;
+    // (undocumented)
+    readonly id: QueryRouteId;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly target: QueryRouteTarget;
+}
+
+// @public (undocumented)
+class QueryRouteId extends WireId<"QueryRouteId"> {
+    // (undocumented)
+    static fromBytes(bytes: Uint8Array): QueryRouteId;
+    // (undocumented)
+    static fromU128(value: bigint): QueryRouteId;
+    // (undocumented)
+    static parse(text: string): QueryRouteId;
+}
+
+// @public (undocumented)
+const QueryRouteListCommand: ManagedCommand<QueryRouteListRequest, CheckpointReadReply>;
+
+// @public (undocumented)
+interface QueryRouteListRequest {
+    // (undocumented)
+    readonly after?: QueryRouteId;
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly limit: number;
+    // (undocumented)
+    readonly nameContains?: string;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+interface QueryRoutePage {
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // (undocumented)
+    readonly nextAfter?: QueryRouteId;
+    // (undocumented)
+    readonly routes: readonly QueryRoute[];
+}
+
+// @public (undocumented)
+interface QueryRoutePageView {
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly nextCursor?: string;
+    // (undocumented)
+    readonly routes: readonly QueryRoute[];
+}
+
+// @public (undocumented)
+export type QueryRouteTarget = {
+    readonly kind: "operational";
+    readonly index: string;
+} | {
+    readonly kind: "lakehouse";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+};
+
+// @public (undocumented)
+const QueryStatusCommand: ManagedCommand<QueryStatusEnvelope, QueryStatusReply>;
+
+// @public (undocumented)
+interface QueryStatusEnvelope {
+    // (undocumented)
+    readonly executionId: QueryExecutionId;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+type QueryStatusReply = {
+    readonly kind: "ok";
+    readonly status: QueryExecutionStatus;
+} | {
+    readonly kind: "err";
+    readonly error: QueryError;
+};
+
+// @public (undocumented)
+export type QueryTarget = {
+    readonly kind: "operational";
+    readonly index: string;
+} | {
+    readonly kind: "lakehouse";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly snapshot?: SnapshotSelector;
+};
 
 // @public (undocumented)
 export class QuorumGovernor implements ActionGovernor {
@@ -7016,7 +8718,9 @@ export function quorumSatisfied(policy: GatherPolicy, successes: number): boolea
 // @public (undocumented)
 interface RawSql {
     // (undocumented)
-    readonly params: readonly Value[];
+    readonly dialect: SqlDialect;
+    // (undocumented)
+    readonly params: readonly TypedValue[];
     // (undocumented)
     readonly sql: string;
 }
@@ -7093,6 +8797,8 @@ class Record_2 {
     // (undocumented)
     inlinePayload(): this;
     // (undocumented)
+    logicalSchemaFingerprint(value: Uint8Array): this;
+    // (undocumented)
     projectionRef(value: string): this;
     // (undocumented)
     schemaId(value: number): this;
@@ -7117,6 +8823,9 @@ export class RecordId extends WireId<"RecordId"> {
     // (undocumented)
     static tryParse(text: string): RecordId | undefined;
 }
+
+// @public (undocumented)
+type RecreatedPartitionPolicy = "reject";
 
 // @public (undocumented)
 export interface RegisteredCard {
@@ -7240,6 +8949,17 @@ export class RememberBuilder {
 }
 
 // @public (undocumented)
+type RepairAction = "reconciled_prepared_attempt" | "accepted_retention_gap" | "cleared_retryable_block" | "superseded_generation";
+
+// @public (undocumented)
+interface RepairRecord {
+    // (undocumented)
+    readonly action: RepairAction;
+    // (undocumented)
+    readonly detail: string;
+}
+
+// @public (undocumented)
 export type ReplayBound = {
     readonly kind: "from-offsets";
     readonly offsets: ReadonlyMap<number, bigint>;
@@ -7267,6 +8987,28 @@ export interface Reranker {
 
 // @public (undocumented)
 export function resolveBody(store: BlobStore, payload: Uint8Array): Promise<Uint8Array>;
+
+// @public (undocumented)
+type ResolvedQueryTarget = {
+    readonly kind: "operational";
+    readonly index: string;
+    readonly backendResourceId: BackendResourceId;
+    readonly backendGeneration: bigint;
+    readonly runtimeConfigurationRevision: bigint;
+} | {
+    readonly kind: "lakehouse";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly backendResourceId: BackendResourceId;
+    readonly backendGeneration: bigint;
+    readonly runtimeConfigurationRevision: bigint;
+    readonly tableUuid: Uint8Array;
+    readonly namespace: readonly string[];
+    readonly table: string;
+    readonly snapshotId: bigint;
+    readonly schemaId: number;
+    readonly partitionSpecId: number;
+};
 
 // @public (undocumented)
 export function resolveInboxRoute(route: InboxRoute, agent: AgentId, advertised: string | undefined): string;
@@ -7335,6 +9077,12 @@ const ResultCodeName: {
     readonly Forbidden: 10;
     readonly StepUpRequired: 11;
     readonly Unavailable: 12;
+    readonly ResourceLimit: 13;
+    readonly Cancelled: 14;
+    readonly DeadlineExceeded: 15;
+    readonly ExpiredSnapshot: 16;
+    readonly StaleGeneration: 17;
+    readonly TargetUnavailable: 18;
 };
 
 // @public (undocumented)
@@ -7342,6 +9090,16 @@ function resultCodeToCode(value: ResultCode): number;
 
 // @public (undocumented)
 export function resumeOffsets(snapshot: FoldSnapshot): ReadonlyMap<number, bigint>;
+
+// @public (undocumented)
+interface RetentionGap {
+    // (undocumented)
+    readonly incarnation: SourceIncarnation;
+    // (undocumented)
+    readonly requiredNextOffset: bigint;
+    // (undocumented)
+    readonly retainedStart: bigint;
+}
 
 // @public (undocumented)
 export type RetentionPolicy = {
@@ -7464,21 +9222,9 @@ export function routeToPrincipal(agent: AgentId, principal: PrincipalId): Router
 // @public (undocumented)
 export interface Row {
     // (undocumented)
-    readonly headers: ReadonlyMap<string, string>;
-    // (undocumented)
-    readonly metadata: ReadonlyMap<string, string>;
-    // (undocumented)
-    readonly offset?: bigint;
-    // (undocumented)
-    readonly partition?: number;
-    // (undocumented)
-    readonly payload?: Uint8Array;
-    // (undocumented)
     readonly score?: number;
     // (undocumented)
-    readonly stream?: number;
-    // (undocumented)
-    readonly topic?: number;
+    readonly values: readonly TypedValue[];
 }
 
 // @public (undocumented)
@@ -7586,6 +9332,16 @@ export class ScatterReport {
 
 // @public (undocumented)
 const SCHEMA_ID = "agdx.sid";
+
+// @public (undocumented)
+interface SchemaCapabilities {
+    // (undocumented)
+    readonly arrowIpcStream: boolean;
+    // (undocumented)
+    readonly logicalSchema: boolean;
+    // (undocumented)
+    readonly schemaEvolution: boolean;
+}
 
 // @public (undocumented)
 const schemaDecodePath: (id: number) => string;
@@ -7749,6 +9505,23 @@ export class SlidingWindow implements Deduplicator {
 }
 
 // @public (undocumented)
+interface SnapshotPageView {
+    // (undocumented)
+    readonly nextBeforeSnapshotId?: bigint;
+    // (undocumented)
+    readonly snapshots: readonly TableSnapshotView[];
+}
+
+// @public (undocumented)
+type SnapshotSelector = {
+    readonly kind: "snapshot_id";
+    readonly value: bigint;
+} | {
+    readonly kind: "timestamp_micros";
+    readonly value: bigint;
+};
+
+// @public (undocumented)
 export interface SnapshotStore {
     // (undocumented)
     latest(conversation: ConversationId): Promise<FoldSnapshot | undefined>;
@@ -7762,6 +9535,48 @@ interface Sort {
     readonly dir: Dir;
     // (undocumented)
     readonly field: string;
+}
+
+// @public (undocumented)
+interface SourceCut {
+    // (undocumented)
+    readonly metadataRevision: bigint;
+    // (undocumented)
+    readonly partitions: readonly SourcePartitionCut[];
+}
+
+// @public (undocumented)
+interface SourceIncarnation {
+    // (undocumented)
+    readonly cluster: PhysicalClusterIncarnation;
+    // (undocumented)
+    readonly partitionCreatedRevision: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topicId: number;
+}
+
+// @public (undocumented)
+interface SourceOffsetRange {
+    // (undocumented)
+    readonly endExclusive: bigint;
+    // (undocumented)
+    readonly incarnation: SourceIncarnation;
+    // (undocumented)
+    readonly start: bigint;
+}
+
+// @public (undocumented)
+interface SourcePartitionCut {
+    // (undocumented)
+    readonly endExclusive: bigint;
+    // (undocumented)
+    readonly incarnation: SourceIncarnation;
+    // (undocumented)
+    readonly retainedStart: bigint;
 }
 
 // @public (undocumented)
@@ -7782,6 +9597,14 @@ type SourceRef = {
 };
 
 // @public (undocumented)
+interface SourceScope {
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+}
+
+// @public (undocumented)
 export interface SourceSelector {
     // (undocumented)
     readonly stream: string;
@@ -7794,6 +9617,17 @@ export interface SpanScope {
     // (undocumented)
     end(error?: unknown): void;
 }
+
+// @public (undocumented)
+type SqlDialect = "data_fusion" | "postgres" | "my_sql" | "sqlite";
+
+// @public (undocumented)
+type StartPolicy = {
+    readonly kind: "beginning" | "captured_latest";
+} | {
+    readonly kind: "explicit";
+    readonly partitions: readonly PartitionStart[];
+};
 
 // @public (undocumented)
 export interface StateStore {
@@ -7925,6 +9759,36 @@ export interface SubmitOptions {
 }
 
 // @public (undocumented)
+const SUPERVISOR_ASSERTION_KEY_ID_BYTES = 8;
+
+// @public (undocumented)
+const SUPERVISOR_ASSERTION_SIGNATURE_BYTES = 64;
+
+// @public (undocumented)
+const SUPERVISOR_ASSERTION_VERSION = 1;
+
+// @public (undocumented)
+interface SupervisorActorAssertion {
+    // (undocumented)
+    readonly claims: {
+        readonly v: number;
+        readonly requestId: CheckpointRequestId;
+        readonly deploymentId: number;
+        readonly cloudUserId: number;
+        readonly action: "accept_retention_gap" | "supersede_generation" | "record_repair";
+        readonly destinationId: DestinationId;
+        readonly destinationGeneration: bigint;
+        readonly expectedRevision?: bigint;
+        readonly issuedAtMicros: bigint;
+        readonly expiresAtMicros: bigint;
+    };
+    // (undocumented)
+    readonly keyId: Uint8Array;
+    // (undocumented)
+    readonly signature: Uint8Array;
+}
+
+// @public (undocumented)
 export class SwappableGovernor implements ActionGovernor {
     constructor(current: ActionGovernor);
     // (undocumented)
@@ -7950,24 +9814,108 @@ export class SystemClock implements Clock {
 }
 
 // @public (undocumented)
-export interface Target {
+interface TableFilePageView {
     // (undocumented)
-    readonly backend: string;
+    readonly files: readonly TableFileView[];
     // (undocumented)
-    readonly delivery: Delivery;
+    readonly nextCursor?: string;
+}
+
+// @public (undocumented)
+interface TableFileView {
     // (undocumented)
-    readonly required: boolean;
+    readonly fileSizeBytes: bigint;
     // (undocumented)
-    readonly role: TargetRole;
+    readonly lowerBounds: ReadonlyMap<number, TypedValue>;
+    // (undocumented)
+    readonly nullValueCounts: ReadonlyMap<number, bigint>;
+    // (undocumented)
+    readonly objectIdentity: string;
+    // (undocumented)
+    readonly partition: ReadonlyMap<string, TypedValue>;
+    // (undocumented)
+    readonly rowCount: bigint;
+    // (undocumented)
+    readonly upperBounds: ReadonlyMap<number, TypedValue>;
+}
+
+// @public (undocumented)
+type TableFormat = "iceberg_v2";
+
+// @public (undocumented)
+interface TableMetricsView {
+    // (undocumented)
+    readonly dataFileCount: bigint;
+    // (undocumented)
+    readonly deleteFileCount: bigint;
+    // (undocumented)
+    readonly partitionCount: bigint;
+    // (undocumented)
+    readonly snapshotId: bigint;
+    // (undocumented)
+    readonly totalBytes: bigint;
+    // (undocumented)
+    readonly totalRows: bigint;
+}
+
+// @public (undocumented)
+interface TableSchemaView {
+    // (undocumented)
+    readonly icebergSchemaId: number;
+    // (undocumented)
+    readonly logicalSchema: LogicalSchema;
+    // (undocumented)
+    readonly tableUuid: Uint8Array;
+}
+
+// @public (undocumented)
+interface TableSnapshotView {
+    // (undocumented)
+    readonly checkpointRevision: bigint;
+    // (undocumented)
+    readonly committedAtMicros: bigint;
+    // (undocumented)
+    readonly materializationBoundaryDigest: Uint8Array;
+    // (undocumented)
+    readonly parentSnapshotId?: bigint;
+    // (undocumented)
+    readonly partitionSpecId: number;
+    // (undocumented)
+    readonly schemaId: number;
+    // (undocumented)
+    readonly sequenceNumber: bigint;
+    // (undocumented)
+    readonly snapshotId: bigint;
+    // (undocumented)
+    readonly summary: ReadonlyMap<string, string>;
+}
+
+// @public (undocumented)
+interface TableView {
+    // (undocumented)
+    readonly currentPartitionSpecId: number;
+    // (undocumented)
+    readonly currentSchemaId: number;
+    // (undocumented)
+    readonly currentSnapshotId: bigint;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly metadataIdentity: string;
+    // (undocumented)
+    readonly namespace: readonly string[];
+    // (undocumented)
+    readonly properties: ReadonlyMap<string, string>;
     // (undocumented)
     readonly table: string;
+    // (undocumented)
+    readonly tableUuid: Uint8Array;
 }
 
 // @public (undocumented)
 const TARGET_AGENT_ID = "agdx.to";
-
-// @public (undocumented)
-export type TargetRole = "readWrite" | "writeOnly";
 
 // @public (undocumented)
 export function taskFromEnvelope(taskId: string, envelope: AgentEnvelope): A2aTask;
@@ -8037,6 +9985,9 @@ export class TimeoutError extends LaserError {
         cause?: unknown;
     });
 }
+
+// @public (undocumented)
+type TimeTravelCapability = "snapshot_id" | "timestamp_micros";
 
 // @public (undocumented)
 export function toContextBlock(items: readonly MemoryItem[], tokenBudget?: number): string;
@@ -8215,6 +10166,47 @@ export class TypedTopic<T> {
 export type TypedTopicKind = "json" | "cbor" | "schema";
 
 // @public (undocumented)
+export type TypedValue = {
+    readonly kind: "null";
+} | {
+    readonly kind: "boolean";
+    readonly value: boolean;
+} | {
+    readonly kind: "int";
+    readonly value: number;
+} | {
+    readonly kind: "long" | "time_micros" | "timestamp_micros" | "timestamp_tz_micros";
+    readonly value: bigint;
+} | {
+    readonly kind: "date";
+    readonly value: number;
+} | {
+    readonly kind: "float" | "double";
+    readonly value: number;
+} | {
+    readonly kind: "decimal";
+    readonly value: DecimalValue;
+} | {
+    readonly kind: "string";
+    readonly value: string;
+} | {
+    readonly kind: "uuid" | "fixed" | "binary";
+    readonly value: Uint8Array;
+} | {
+    readonly kind: "struct";
+    readonly value: readonly FieldValue[];
+} | {
+    readonly kind: "list";
+    readonly value: readonly TypedValue[];
+} | {
+    readonly kind: "map";
+    readonly value: readonly MapEntry[];
+};
+
+// @public (undocumented)
+export function typedValueDiagnosticText(value: TypedValue): string;
+
+// @public (undocumented)
 export interface UlidSource {
     // (undocumented)
     fillRandom(bytes: Uint8Array): void;
@@ -8248,7 +10240,37 @@ function validateAgentEnvelope(envelope: AgentEnvelope): void;
 function validateAgentPresence(presence: AgentPresence): void;
 
 // @public (undocumented)
+function validateArrowIpcMetadata(metadata: ArrowIpcMessageMetadata): void;
+
+// @public (undocumented)
+function validateArrowIpcPolicy(policy: ArrowIpcPolicy): void;
+
+// @public (undocumented)
+function validateBackendDescriptor(value: BackendDescriptor): void;
+
+// @public (undocumented)
 function validateBodyRef(ref: BodyRef): void;
+
+// @public (undocumented)
+function validateCheckpointMutationResult(value: CheckpointMutationResult): void;
+
+// @public (undocumented)
+function validateCheckpointReadReply(value: CheckpointReadReply): void;
+
+// @public (undocumented)
+function validateCheckpointRequest(value: CheckpointRequestEnvelope): void;
+
+// @public (undocumented)
+function validateDestinationCheckpointStatus(value: DestinationCheckpointStatus): void;
+
+// @public (undocumented)
+function validateDestinationCheckpointView(value: DestinationCheckpointView): void;
+
+// @public (undocumented)
+function validateDestinationGetRequest(value: DestinationGetRequest): void;
+
+// @public (undocumented)
+function validateDestinationListRequest(value: DestinationListRequest): void;
 
 // @public (undocumented)
 function validateForkId(forkId: string): void;
@@ -8257,13 +10279,70 @@ function validateForkId(forkId: string): void;
 function validateGraphName(name: string): void;
 
 // @public (undocumented)
+function validateLogicalSchema(schema: LogicalSchema): void;
+
+// @public (undocumented)
+function validateMaterializationDestination(value: MaterializationDestination): void;
+
+// @public (undocumented)
 function validateNamespace(namespace: string): void;
+
+// @public (undocumented)
+function validatePublicCheckpointMutation(value: PublicCheckpointMutation): void;
+
+// @public (undocumented)
+function validateQuery(query: Query): void;
+
+// @public (undocumented)
+function validateQueryCancelEnvelope(envelope: QueryCancelEnvelope): void;
+
+// @public (undocumented)
+function validateQueryEnvelope(envelope: QueryEnvelope): void;
+
+// @public (undocumented)
+function validateQueryExecutionStatus(status: QueryExecutionStatus): void;
+
+// @public (undocumented)
+function validateQueryPageEnvelope(envelope: QueryPageEnvelope): void;
+
+// @public (undocumented)
+function validateQueryResult(result: QueryResult): void;
+
+// @public (undocumented)
+function validateQueryRoute(value: QueryRoute): void;
+
+// @public (undocumented)
+function validateQueryRouteListRequest(value: QueryRouteListRequest): void;
+
+// @public (undocumented)
+function validateQueryStatusEnvelope(envelope: QueryStatusEnvelope): void;
+
+// @public (undocumented)
+function validateResultFields(fields: readonly LogicalField[]): void;
 
 // @public (undocumented)
 export function validateRoleName(name: string): void;
 
 // @public (undocumented)
 function validateSignature(signature: Signature): void;
+
+// @public (undocumented)
+function validateSourceCut(value: SourceCut): void;
+
+// @public (undocumented)
+function validateSourceIncarnation(value: SourceIncarnation): void;
+
+// @public (undocumented)
+function validateSourceScope(value: SourceScope): void;
+
+// @public (undocumented)
+function validateSupervisorAssertion(value: SupervisorActorAssertion): void;
+
+// @public (undocumented)
+function validateTypedValue(value: TypedValue, depth?: number): void;
+
+// @public (undocumented)
+function validateTypedValueAgainst(value: TypedValue, logicalType: LogicalType, required: boolean): void;
 
 // @public (undocumented)
 export type Value = {
@@ -8358,7 +10437,7 @@ export function verifyEvidenceChain(evidence: readonly PolicyEvidence[]): boolea
 const VERIFYING_KEY_BYTES = 32;
 
 // @public (undocumented)
-type VersionSurface = keyof Pick<OpVersions, "query" | "control" | "kv" | "fork" | "graph">;
+type VersionSurface = keyof Pick<OpVersions, "query" | "control" | "kv" | "fork" | "graph" | "checkpoint">;
 
 // @public (undocumented)
 export class Vote {
@@ -8583,6 +10662,25 @@ declare namespace wire {
         METADATA_TASK_CONTEXT,
         METADATA_SESSION_INTENT,
         AgentEnvelope,
+        encodeArrowIpcMessageMetadata,
+        decodeArrowIpcMessageMetadata,
+        encodeArrowIpcPolicy,
+        decodeArrowIpcPolicy,
+        validateArrowIpcMetadata,
+        validateArrowIpcPolicy,
+        ARROW_IPC_CONTRACT_VERSION,
+        ARROW_IPC_MEDIA_TYPE,
+        MAX_ARROW_IPC_MESSAGE_BYTES,
+        MAX_ARROW_IPC_FIELDS,
+        MAX_ARROW_IPC_BATCHES,
+        MAX_ARROW_IPC_ROWS,
+        MAX_ARROW_IPC_DICTIONARIES,
+        MAX_ARROW_DECIMAL_BITS,
+        ArrowIpcMessageMetadata,
+        ArrowIpcPolicy,
+        ArrowTimestampUnit,
+        ArrowIpcRejectionCode,
+        DEFAULT_ARROW_IPC_POLICY,
         encodeBatchRequest,
         decodeBatchRequest,
         encodeBatchReply,
@@ -8630,11 +10728,87 @@ declare namespace wire {
         expectArray,
         expectU64,
         expectU32,
+        expectI64,
+        expectBytes,
         CborMap,
         field,
         encodeChangeRecord,
         decodeChangeRecord,
         ChangeRecord,
+        encodeRetentionGap,
+        encodeDestinationBlock,
+        encodePreparedAttemptSummary,
+        encodePublicCheckpointMutation,
+        decodePublicCheckpointMutation,
+        encodeCheckpointRequest,
+        decodeCheckpointRequest,
+        decodeCheckpointRequestFrame,
+        encodeCheckpointRequestFrame,
+        validateCheckpointRequest,
+        validatePublicCheckpointMutation,
+        validateSupervisorAssertion,
+        decodeCheckpointReply,
+        decodeRetentionGap,
+        decodeDestinationBlock,
+        decodePreparedAttemptSummary,
+        encodeDestinationCheckpointStatus,
+        decodeDestinationCheckpointStatus,
+        validateCheckpointMutationResult,
+        validateDestinationCheckpointStatus,
+        validateDestinationCheckpointView,
+        validateCheckpointReadReply,
+        decodeCheckpointReadReply,
+        encodeDestinationGetRequest,
+        encodeDestinationListRequest,
+        encodeQueryRouteListRequest,
+        validateDestinationGetRequest,
+        validateDestinationListRequest,
+        validateQueryRouteListRequest,
+        MAX_CHECKPOINT_PARTITIONS,
+        MAX_ATTEMPT_OBJECTS,
+        MAX_CREDENTIAL_GENERATIONS,
+        MAX_MANIFEST_IDENTITY_BYTES,
+        MAX_CHECKPOINT_ERROR_BYTES,
+        MAX_REPAIR_DETAIL_BYTES,
+        MAX_CHECKPOINT_LEASE_DURATION_MICROS,
+        SUPERVISOR_ASSERTION_VERSION,
+        MAX_SUPERVISOR_ASSERTION_TTL_MICROS,
+        SUPERVISOR_ASSERTION_KEY_ID_BYTES,
+        SUPERVISOR_ASSERTION_SIGNATURE_BYTES,
+        CheckpointReadConsistency,
+        DestinationEffectiveState,
+        PartitionLifecycleState,
+        DestinationBlockCode,
+        RepairAction,
+        PartitionCheckpoint,
+        SourceOffsetRange,
+        CheckpointOwnerLease,
+        CredentialGeneration,
+        AttemptColumnMetrics,
+        AttemptObject,
+        IcebergCommitRequirement,
+        PreparedTableRequirements,
+        PreparedAttempt,
+        PreparedAttemptSummary,
+        CompletedAttempt,
+        RetentionGap,
+        DestinationBlock,
+        RepairRecord,
+        DestinationCheckpointStatus,
+        SupervisorActorAssertion,
+        PublicCheckpointMutation,
+        CheckpointRequestEnvelope,
+        CheckpointMutationResult,
+        CheckpointError,
+        CheckpointReply,
+        DestinationGetRequest,
+        DestinationListFilter,
+        DestinationListRequest,
+        QueryRouteListRequest,
+        DestinationCheckpointView,
+        DestinationCheckpointPage,
+        QueryRoutePage,
+        CheckpointReadReply,
         encodeClientMetadataQuery,
         decodeClientMetadataQuery,
         encodeClientMetadata,
@@ -8651,6 +10825,10 @@ declare namespace wire {
         AGDX_SET_CLIENT_METADATA_CODE,
         AGDX_GET_CLIENTS_METADATA_CODE,
         AGDX_BATCH_CODE,
+        AGDX_CHECKPOINT_CODE,
+        AGDX_DESTINATION_GET_CODE,
+        AGDX_DESTINATION_LIST_CODE,
+        AGDX_QUERY_ROUTE_LIST_CODE,
         AGDX_AUTHZ_BASE,
         AGDX_AUTHZ_WHOAMI_CODE,
         AGDX_AUTHZ_LIST_ROLES_CODE,
@@ -8662,6 +10840,9 @@ declare namespace wire {
         AGDX_AUTHZ_HISTORY_CODE,
         AGDX_QUERY_BASE,
         AGDX_QUERY_CODE,
+        AGDX_QUERY_PAGE_CODE,
+        AGDX_QUERY_CANCEL_CODE,
+        AGDX_QUERY_STATUS_CODE,
         AGDX_GET_PROJECTION_CODE,
         AGDX_LIST_PROJECTIONS_CODE,
         AGDX_GET_SCHEMA_CODE,
@@ -8702,6 +10883,7 @@ declare namespace wire {
         AUTHZ_OP_VERSION,
         QUERY_OP_VERSION,
         CONTROL_OP_VERSION,
+        CHECKPOINT_OP_VERSION,
         KV_OP_VERSION,
         FORK_OP_VERSION,
         GRAPH_OP_VERSION,
@@ -8722,6 +10904,13 @@ declare namespace wire {
         BindRolesCommand,
         AuthzHistoryCommand,
         QueryCommand,
+        QueryPageCommand,
+        QueryCancelCommand,
+        QueryStatusCommand,
+        CheckpointCommand,
+        DestinationGetCommand,
+        DestinationListCommand,
+        QueryRouteListCommand,
         GetProjectionCommand,
         ListProjectionsCommand,
         GetSchemaCommand,
@@ -8762,6 +10951,38 @@ declare namespace wire {
         contentTypeCode,
         contentTypeFromCode,
         ContentType,
+        encodeProjectionRef,
+        decodeProjectionRef,
+        encodeBackendBinding,
+        decodeBackendBinding,
+        encodePhysicalTable,
+        decodePhysicalTable,
+        encodeStartPolicy,
+        decodeStartPolicy,
+        encodeMaterializationDestination,
+        decodeMaterializationDestination,
+        encodeQueryRoute,
+        decodeQueryRoute,
+        validateMaterializationDestination,
+        validateQueryRoute,
+        MAX_DESTINATION_NAME_BYTES,
+        MAX_NAMESPACE_PARTS,
+        MAX_TABLE_NAME_BYTES,
+        MAX_EXPLICIT_PARTITION_STARTS,
+        ProjectionRef,
+        BackendBinding,
+        PhysicalTable,
+        StartPolicy,
+        PartitionStart,
+        NewPartitionPolicy,
+        FileFormat,
+        TableFormat,
+        RecreatedPartitionPolicy,
+        DestinationErrorPolicy,
+        DestinationDesiredState,
+        MaterializationDestination,
+        QueryRouteTarget,
+        QueryRoute,
         parseProjectionId,
         encodeIndexField,
         decodeIndexField,
@@ -8777,8 +10998,6 @@ declare namespace wire {
         decodeRetentionPolicy,
         encodeSourceSelector,
         decodeSourceSelector,
-        encodeTarget,
-        decodeTarget,
         encodeProjectionBinding,
         decodeProjectionBinding,
         encodeSchemaSource,
@@ -8800,9 +11019,6 @@ declare namespace wire {
         Projection,
         RetentionPolicy,
         SourceSelector,
-        TargetRole,
-        Delivery,
-        Target,
         ProjectionBinding,
         SchemaSource,
         SchemaDef,
@@ -8895,6 +11111,7 @@ declare namespace wire {
         contentId,
         CONTENT_TYPE,
         SCHEMA_ID,
+        LOGICAL_SCHEMA_FINGERPRINT,
         IDX_PREFIX,
         INLINE_PAYLOAD,
         PROJECTION_REF,
@@ -8930,9 +11147,10 @@ declare namespace wire {
         decodeOpVersions,
         newBackendDescriptor,
         backendDescriptorHasCapability,
+        newBackendAnnounce,
         encodeBackendDescriptor,
         decodeBackendDescriptor,
-        newBackendAnnounce,
+        validateBackendDescriptor,
         encodeHelloReply,
         decodeHelloReply,
         encodeBackendAnnounce,
@@ -8940,11 +11158,46 @@ declare namespace wire {
         Feature_2 as Feature,
         OpVersions,
         HelloReply,
+        BACKEND_DESCRIPTOR_VERSION,
+        BackendMode,
+        BackendDesiredState,
+        BackendObservedState,
+        BackendReadinessCode,
+        BackendImplementation,
+        BackendReadinessReason,
+        BackendReadiness,
+        MaterializationCapability,
+        TimeTravelCapability,
+        QueryPagingCapability,
+        QueryCapabilities,
+        SchemaCapabilities,
+        MaintenanceCapabilities,
+        BackendLimits,
         BackendDescriptor,
         BackendAnnounce,
         decodeSchemaDefJson,
         decodeForkInfoJson,
         decodeQueryResultJson,
+        decodeDestinationPageJson,
+        encodeDestinationPageJson,
+        decodeQueryRoutePageJson,
+        encodeQueryRoutePageJson,
+        decodeTableViewJson,
+        encodeTableViewJson,
+        decodeTableSchemaJson,
+        encodeTableSchemaJson,
+        decodeSnapshotPageJson,
+        encodeSnapshotPageJson,
+        decodeTableFilePageJson,
+        encodeTableFilePageJson,
+        decodeTableMetricsJson,
+        encodeTableMetricsJson,
+        decodeAcceptedOperationJson,
+        encodeAcceptedOperationJson,
+        decodeQueryExecutionJson,
+        encodeQueryExecutionJson,
+        decodeDestinationIssueJson,
+        encodeDestinationIssueJson,
         decodeCapabilitiesJson,
         encodeCapabilitiesJson,
         decodeKvPageJson,
@@ -8953,6 +11206,8 @@ declare namespace wire {
         encodeErrorBodyJson,
         CAPABILITIES_PATH,
         QUERY_PATH,
+        DESTINATIONS_PATH,
+        QUERY_ROUTES_PATH,
         PROJECTIONS_PATH,
         BINDINGS_PATH,
         SCHEMAS_PATH,
@@ -8979,12 +11234,46 @@ declare namespace wire {
         forkRowsPath,
         runPath,
         runCancelPath,
+        destinationPath,
+        destinationEnablePath,
+        destinationDisablePath,
+        destinationStatusPath,
+        destinationCheckpointPath,
+        destinationRetentionGapPath,
+        destinationPreparedAttemptPath,
+        destinationTablePath,
+        destinationTableSchemaPath,
+        destinationSnapshotsPath,
+        destinationCurrentSnapshotPath,
+        destinationSnapshotPath,
+        destinationFilesPath,
+        destinationMetricsPath,
+        queryExecutionPath,
+        queryPagePath,
+        queryCancelPath,
+        destinationOperationPath,
         QueryCapsView,
+        DestinationCapsView,
         KvCapsView,
         HttpCapabilities,
         KvEntryView,
         KvPageView,
         ErrorBody,
+        DestinationView,
+        DestinationPageView,
+        QueryRoutePageView,
+        TableView,
+        TableSchemaView,
+        TableSnapshotView,
+        SnapshotPageView,
+        TableFileView,
+        TableFilePageView,
+        TableMetricsView,
+        OperationState,
+        OperationErrorView,
+        AcceptedOperationView,
+        QueryExecutionView,
+        DestinationIssueView,
         decodeProjectionListJson,
         encodeProjectionListJson,
         decodeSchemaListJson,
@@ -9004,6 +11293,16 @@ declare namespace wire {
         WireConversationId as ConversationId,
         CorrelationId,
         ChannelId,
+        LogicalSchemaId,
+        PhysicalClusterIncarnation,
+        DestinationId,
+        BackendResourceId,
+        QueryRouteId,
+        DestinationOperationId,
+        CheckpointOwnerId,
+        PreparedAttemptId,
+        CheckpointRequestId,
+        QueryExecutionId,
         encodeMemoryRowScope,
         decodeMemoryRowScope,
         encodeKvEntry,
@@ -9097,6 +11396,13 @@ declare namespace wire {
         MAX_ROLE_NAME_BYTES,
         MAX_FRAME_BYTES,
         MAX_QUERY_REPLY_BYTES,
+        MAX_QUERY_NAME_BYTES,
+        MAX_RAW_SQL_BYTES,
+        MAX_QUERY_PARAMETERS,
+        MAX_QUERY_CURSOR_BYTES,
+        MAX_QUERY_PREDICATES,
+        MAX_QUERY_FIELDS,
+        MAX_VECTOR_DIMENSIONS,
         MAX_BATCH_OPS,
         MAX_AGENT_STRING_BYTES,
         MAX_IDEMPOTENCY_KEY_BYTES,
@@ -9129,59 +11435,68 @@ declare namespace wire {
         MANAGED_REQUEST_VERSION,
         ManagedRequestEnvelope,
         MutationCommandEnvelope,
-        encodeKeyMatch,
-        decodeKeyMatch,
-        encodePredicate,
-        decodePredicate,
+        encodeQueryPageEnvelope,
+        encodeQueryCancelEnvelope,
+        encodeQueryStatusEnvelope,
+        decodeQueryPageEnvelope,
+        decodeQueryCancelEnvelope,
+        decodeQueryStatusEnvelope,
+        encodeQueryPageEnvelopeFrame,
+        encodeQueryCancelEnvelopeFrame,
+        encodeQueryStatusEnvelopeFrame,
+        decodeQueryPageEnvelopeFrame,
+        decodeQueryCancelEnvelopeFrame,
+        decodeQueryStatusEnvelopeFrame,
+        operationalTarget,
+        lakehouseTarget,
         filterAll,
         filterAny,
         filterNegate,
         filterPred,
+        newQuery,
+        encodeQueryTarget,
+        decodeQueryTarget,
         encodeFilter,
         decodeFilter,
-        encodeRawSql,
-        decodeRawSql,
-        encodeSort,
-        decodeSort,
-        encodeTextQuery,
-        decodeTextQuery,
-        encodeVectorQuery,
-        decodeVectorQuery,
-        encodeAggCall,
-        decodeAggCall,
-        encodeWindow,
-        decodeWindow,
-        encodeAggregate,
-        decodeAggregate,
-        encodeSelect,
-        decodeSelect,
-        parseConsistency,
-        consistencyToWord,
         encodeQuery,
         decodeQuery,
+        validateQuery,
+        validateQueryEnvelope,
+        validateQueryPageEnvelope,
+        validateQueryCancelEnvelope,
+        validateQueryStatusEnvelope,
         encodeQueryEnvelope,
         decodeQueryEnvelope,
         encodeQueryEnvelopeFrame,
-        encodePage,
-        decodePage,
-        pageAtLeast,
-        pageTotalPages,
-        encodeRow,
-        decodeRow,
+        decodeQueryEnvelopeFrame,
         encodeQueryResult,
         decodeQueryResult,
+        validateQueryResult,
+        queryResultValue,
         encodeQueryError,
         decodeQueryError,
-        encodeQueryReply,
-        decodeQueryReply,
         encodeQueryReplyFrame,
-        consistencyGateIsCaughtUp,
+        decodeQueryReply,
+        decodeQueryReplyFrame,
+        encodeQueryExecutionStatus,
+        decodeQueryExecutionStatus,
+        validateQueryExecutionStatus,
+        encodeQueryStatusReplyFrame,
+        decodeQueryStatusReply,
+        decodeQueryStatusReplyFrame,
+        parseConsistency,
+        consistencyToWord,
+        pageAtLeast,
+        pageTotalPages,
         consistencyGateCheck,
+        Consistency,
+        SqlDialect,
+        QueryTarget,
+        SnapshotSelector,
         KeyMatch,
         CmpOp,
         Predicate,
         Filter,
-        RawSql,
         Dir,
         Sort,
         TextQuery,
@@ -9191,21 +11506,86 @@ declare namespace wire {
         Window,
         Aggregate,
         Select,
-        Consistency,
+        RawSql,
+        QueryPageRequest,
         Query,
         QueryEnvelope,
-        Page,
+        QueryPageEnvelope,
+        QueryCancelEnvelope,
+        QueryStatusEnvelope,
         Row,
+        Page,
+        QueryEngine,
+        ResolvedQueryTarget,
+        BoundaryRelation,
+        MaterializationBoundary,
+        QueryContext,
         QueryResult,
         QueryError,
+        QueryErrorCode,
         QueryReply,
-        ConsistencyGate,
+        QueryExecutionState,
+        QueryExecutionStatus,
+        QueryStatusReply,
+        QueryCancelReply,
         resultCodeFromCode,
         resultCodeToCode,
         resultCodeHttpStatus,
         resultCodeIsRetryable,
         ResultCodeName,
         ResultCode,
+        encodeLogicalSchema,
+        decodeLogicalSchema,
+        encodeLogicalSchemaRef,
+        decodeLogicalSchemaRef,
+        encodeLogicalField,
+        decodeLogicalField,
+        encodeLogicalType,
+        decodeLogicalType,
+        encodeTypedValue,
+        decodeTypedValue,
+        typedValueDiagnosticText,
+        validateTypedValue,
+        validateTypedValueAgainst,
+        createLogicalSchema,
+        validateLogicalSchema,
+        validateResultFields,
+        canonicalSchemaBytes,
+        MAX_LOGICAL_SCHEMA_DEPTH,
+        MAX_LOGICAL_SCHEMA_FIELDS,
+        MAX_LOGICAL_SCHEMA_BYTES,
+        MAX_FIELD_NAME_BYTES,
+        MAX_FIELD_DOC_BYTES,
+        MAX_FIXED_BYTES,
+        MAX_DECIMAL_PRECISION,
+        MICROS_PER_DAY,
+        PROVENANCE_FIELD_ID_START,
+        PROVENANCE_FIELDS,
+        LogicalType,
+        LogicalTypeKind,
+        LogicalField,
+        LogicalSchemaRef,
+        LogicalSchema,
+        DecimalValue,
+        TypedValue,
+        FieldValue,
+        MapEntry,
+        encodeSourceIncarnation,
+        decodeSourceIncarnation,
+        encodeSourceScope,
+        decodeSourceScope,
+        encodeSourcePartitionCut,
+        decodeSourcePartitionCut,
+        encodeSourceCut,
+        decodeSourceCut,
+        validateSourceIncarnation,
+        validateSourceScope,
+        validateSourceCut,
+        MAX_SOURCE_PARTITIONS,
+        SourceIncarnation,
+        SourceScope,
+        SourcePartitionCut,
+        SourceCut,
         encodeFoldSnapshot,
         decodeFoldSnapshot,
         foldSnapshotResumeOffset,

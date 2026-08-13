@@ -2,6 +2,8 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::stream::{Codec, ContentType, Json, Msgpack, Record};
 use iggy::prelude::{HeaderKey, HeaderValue, SendMessagesResponse};
+use laser_wire::arrow::ArrowIpcMessageMetadata;
+use laser_wire::validate::Validate;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -126,9 +128,9 @@ impl<'a> PublishRequest<'a> {
     }
 
     /// Attach a non-indexed metadata header (trace id, user tag, source).
-    /// Rides through to the projector as a `metadata` map on each `Row`, free
-    /// to inspect without `with_payload()`. The `agdx.idx.` prefix is reserved,
-    /// so use `.index(...)` for queryable scalars.
+    /// The header remains on the Iggy record. It is not queryable and does not
+    /// appear in a typed query row unless a projection materializes it. The
+    /// `agdx.idx.` prefix is reserved, so use `.index(...)` for queryable scalars.
     ///
     /// String-valued by design: this and `.index(...)` cross into the managed
     /// query plane, where every caller-declared key must compare and filter
@@ -209,6 +211,27 @@ impl<'a> PublishRequest<'a> {
         self.record.content_type = Some(content_type);
         self.payload = payload.into();
         self
+    }
+
+    /// Publish one complete Arrow IPC stream with its logical schema fingerprint.
+    pub fn arrow_ipc(
+        mut self,
+        payload: impl Into<Vec<u8>>,
+        metadata: ArrowIpcMessageMetadata,
+    ) -> Result<Self, LaserError> {
+        metadata.validate()?;
+        let payload = payload.into();
+        if payload.len() as u64 != metadata.encoded_bytes {
+            return Err(LaserError::Invalid(format!(
+                "Arrow IPC payload is {} bytes, metadata declares {}",
+                payload.len(),
+                metadata.encoded_bytes
+            )));
+        }
+        self.record.content_type = Some(ContentType::Arrow);
+        self.record.logical_schema_fingerprint = Some(metadata.schema_fingerprint);
+        self.payload = payload;
+        Ok(self)
     }
 
     /// Claim-check the body against `store` when it is at or over
@@ -517,6 +540,29 @@ impl<'a> BatchPublishRequest<'a> {
         let record = Record::builder().content_type(content_type).build();
         self.records.push((payload.into(), record));
         self
+    }
+
+    /// Append one complete Arrow IPC stream with its logical schema fingerprint.
+    pub fn add_arrow_ipc(
+        mut self,
+        payload: impl Into<Vec<u8>>,
+        metadata: ArrowIpcMessageMetadata,
+    ) -> Result<Self, LaserError> {
+        metadata.validate()?;
+        let payload = payload.into();
+        if payload.len() as u64 != metadata.encoded_bytes {
+            return Err(LaserError::Invalid(format!(
+                "Arrow IPC payload is {} bytes, metadata declares {}",
+                payload.len(),
+                metadata.encoded_bytes
+            )));
+        }
+        let record = Record::builder()
+            .content_type(ContentType::Arrow)
+            .logical_schema_fingerprint(metadata.schema_fingerprint)
+            .build();
+        self.records.push((payload, record));
+        Ok(self)
     }
 
     /// Append a record encoded as a raw Avro datum under a registered writer

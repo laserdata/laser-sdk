@@ -1,4 +1,5 @@
 use crate::content::ContentType;
+use crate::destination::BackendBinding;
 use crate::error::InvalidError;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -560,8 +561,10 @@ pub enum RetentionPolicy {
 /// Declares where a `Projection` is allowed to materialize. Bindings, not
 /// projections, tell the worker what to consume. A binding pairs a source
 /// selector (stream and topic) with a set of allowed projection refs, an
-/// optional default, and the materialization target (which DB table to
-/// write rows into).
+/// optional default, and one operational index. The index uses the replica-local
+/// backend unless an exact backend resource generation is bound. Shared
+/// lakehouse materializations are independent `MaterializationDestination`
+/// declarations, never mirrors on this operational cursor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionBinding {
     pub source: SourceSelector,
@@ -574,12 +577,12 @@ pub struct ProjectionBinding {
     /// `None` means such records are skipped.
     #[serde(default)]
     pub default_projection: Option<ProjectionId>,
-    /// Where rows land: one or more targets. Exactly one is `read_write`, the
-    /// query-serving home. The rest are write-only mirrors. A single
-    /// `read_write` target is the common case (see [`target_table`]).
-    ///
-    /// [`target_table`]: ProjectionBindingBuilder::target_table
-    pub targets: Vec<Target>,
+    /// Exact operational backend resource generation. `None` selects the
+    /// replica-local backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendBinding>,
+    /// Operational index name served by `QueryTarget::Operational`.
+    pub index: String,
     /// Opt this binding into the change feed: after each committed projector
     /// batch the plane publishes one `ChangeRecord` on the changes topic.
     /// Default off and skipped on the wire, so a deployment that never opts in
@@ -607,7 +610,8 @@ pub struct ProjectionBindingBuilder {
     source: Option<SourceSelector>,
     allowed: Vec<ProjectionId>,
     default_projection: Option<ProjectionId>,
-    targets: Vec<Target>,
+    backend: Option<BackendBinding>,
+    index: Option<String>,
     notify: bool,
     retention: Option<RetentionPolicy>,
 }
@@ -638,10 +642,10 @@ impl ProjectionBindingBuilder {
         self
     }
 
-    /// Add a materialization target. The first `read_write` target serves
-    /// queries. Further targets are write-only mirrors.
-    pub fn add_target(mut self, target: Target) -> Self {
-        self.targets.push(target);
+    /// Bind the operational index to an exact backend resource generation.
+    /// Omit this for the replica-local backend.
+    pub fn backend(mut self, backend: BackendBinding) -> Self {
+        self.backend = Some(backend);
         self
     }
 
@@ -654,7 +658,7 @@ impl ProjectionBindingBuilder {
     /// let binding = ProjectionBinding::builder()
     ///     .source("_agdx", "telemetry")
     ///     .allow("telemetry.v1")
-    ///     .target_table("telemetry_rows")
+    ///     .index("telemetry_rows")
     ///     .retention(RetentionPolicy::Keep)
     ///     .build();
     /// ```
@@ -663,51 +667,11 @@ impl ProjectionBindingBuilder {
         self
     }
 
-    /// Materialize into a table of this name on the embedded backend: sugar for
-    /// a single `read_write`, `effectively_once` target. The common case.
-    pub fn target_table(self, table: impl Into<String>) -> Self {
-        self.target_on("embedded", table)
-    }
-
-    /// Materialize into `table` on a named backend: the `read_write`,
-    /// `effectively_once` query-serving home. This is how a binding routes one
-    /// index to a specific configured backend (e.g. an external warehouse
-    /// declared as `warehouse`) while other bindings stay on `embedded`, so
-    /// different topics materialize to and are served from different stores at
-    /// once.
-    ///
-    /// ```no_run
-    /// # use laser_wire::control::ProjectionBinding;
-    /// // orders -> external warehouse, events stay on the embedded engine.
-    /// let binding = ProjectionBinding::builder()
-    ///     .source("shop", "orders")
-    ///     .allow("orders.v1")
-    ///     .target_on("warehouse", "orders_rows")
-    ///     .build();
-    /// ```
-    pub fn target_on(self, backend: impl Into<String>, table: impl Into<String>) -> Self {
-        self.add_target(Target {
-            backend: backend.into(),
-            table: table.into(),
-            role: TargetRole::ReadWrite,
-            delivery: Delivery::EffectivelyOnce,
-            required: true,
-        })
-    }
-
-    /// Add a write-only mirror of this binding's rows into `table` on a named
-    /// backend. The mirror does not serve queries (exactly one `read_write`
-    /// target does) and is non-blocking, so one projection can fan the same rows
-    /// to several backends at once (e.g. the embedded engine for low-latency
-    /// reads plus an external warehouse for analytics).
-    pub fn mirror_to(self, backend: impl Into<String>, table: impl Into<String>) -> Self {
-        self.add_target(Target {
-            backend: backend.into(),
-            table: table.into(),
-            role: TargetRole::WriteOnly,
-            delivery: Delivery::EffectivelyOnce,
-            required: false,
-        })
+    /// Set the replica-local operational index name. Omit it to use the source
+    /// topic name. External lakehouse destinations use the destination API.
+    pub fn index(mut self, index: impl Into<String>) -> Self {
+        self.index = Some(index.into());
+        self
     }
 
     /// Opt into the change feed: one `ChangeRecord` per committed projector
@@ -732,24 +696,13 @@ impl ProjectionBindingBuilder {
         let source = self
             .source
             .ok_or_else(|| InvalidError::new("ProjectionBinding requires a source"))?;
-        let targets = if self.targets.is_empty() {
-            // Default: one read_write target on the embedded backend, named
-            // after the topic. Keeps the no-target builder path usable.
-            vec![Target {
-                backend: "embedded".to_owned(),
-                table: source.topic.clone(),
-                role: TargetRole::ReadWrite,
-                delivery: Delivery::EffectivelyOnce,
-                required: true,
-            }]
-        } else {
-            self.targets
-        };
+        let index = self.index.unwrap_or_else(|| source.topic.clone());
         Ok(ProjectionBinding {
             source,
             allowed_projections: self.allowed,
             default_projection: self.default_projection,
-            targets,
+            backend: self.backend,
+            index,
             notify: self.notify,
             retention: self.retention,
         })
@@ -774,68 +727,6 @@ impl SourceSelector {
             topic: topic.into(),
         }
     }
-}
-
-/// One materialization sink for a binding: a named backend and table, the role
-/// it plays, and its delivery guarantee. `backend` is a logical id LaserData
-/// Cloud resolves against its configured backend set (the embedded engine is
-/// `embedded`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Target {
-    pub backend: String,
-    pub table: String,
-    #[serde(default)]
-    pub role: TargetRole,
-    #[serde(default)]
-    pub delivery: Delivery,
-    #[serde(default)]
-    pub required: bool,
-}
-
-/// A target's role. Exactly one `read_write` target per binding serves
-/// queries. The rest are write-only mirrors.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    strum::Display,
-    strum::EnumString,
-    strum::VariantArray,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum TargetRole {
-    #[default]
-    ReadWrite,
-    WriteOnly,
-}
-
-/// A target's delivery guarantee. The `read_write` target is never
-/// `at_most_once`.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    strum::Display,
-    strum::EnumString,
-    strum::VariantArray,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Delivery {
-    #[default]
-    EffectivelyOnce,
-    AtMostOnce,
 }
 
 /// A registered writer schema, keyed by the `id` a producer stamps on
@@ -975,78 +866,43 @@ mod tests {
     }
 
     #[test]
-    fn given_target_table_sugar_when_built_then_should_be_single_read_write_target() {
+    fn given_an_explicit_operational_index_when_built_then_should_keep_one_index() {
         let binding = ProjectionBinding::builder()
             .source("shop", "orders")
             .allow("order.v1")
-            .target_table("orders_rows")
+            .index("orders_rows")
             .build();
-        assert_eq!(binding.targets.len(), 1);
-        assert_eq!(binding.targets[0].backend, "embedded");
-        assert_eq!(binding.targets[0].table, "orders_rows");
-        assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
-        assert_eq!(binding.targets[0].delivery, Delivery::EffectivelyOnce);
-        assert!(binding.targets[0].required);
+        assert_eq!(binding.index, "orders_rows");
+        assert_eq!(binding.backend, None);
     }
 
     #[test]
-    fn given_target_on_named_backend_when_built_then_should_route_read_write_to_it() {
+    fn given_an_operational_backend_when_built_then_should_keep_exact_generation() {
+        let backend = BackendBinding {
+            resource_id: crate::destination::BackendResourceId::from_u128(7),
+            generation: 3,
+        };
         let binding = ProjectionBinding::builder()
             .source("shop", "orders")
-            .allow("order.v1")
-            .target_on("warehouse", "orders_rows")
+            .backend(backend.clone())
             .build();
-        assert_eq!(binding.targets.len(), 1);
-        assert_eq!(binding.targets[0].backend, "warehouse");
-        assert_eq!(binding.targets[0].table, "orders_rows");
-        assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
-        assert!(binding.targets[0].required);
+        assert_eq!(binding.backend, Some(backend));
     }
 
     #[test]
-    fn given_target_on_and_mirror_to_when_built_then_should_fan_one_projection_to_two_backends() {
-        // Read-serve from the embedded engine, mirror the same rows into an
-        // external warehouse: one projection, two backends at once.
+    fn given_no_operational_index_when_built_then_should_use_the_topic_name() {
         let binding = ProjectionBinding::builder()
             .source("shop", "orders")
             .allow("order.v1")
-            .target_on("embedded", "orders_rows")
-            .mirror_to("warehouse", "orders_warehouse")
             .build();
-        assert_eq!(binding.targets.len(), 2);
-        assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
-        assert_eq!(binding.targets[0].backend, "embedded");
-        assert_eq!(binding.targets[1].role, TargetRole::WriteOnly);
-        assert_eq!(binding.targets[1].backend, "warehouse");
-        assert_eq!(binding.targets[1].table, "orders_warehouse");
-        assert!(!binding.targets[1].required, "a mirror is non-blocking");
-    }
-
-    #[test]
-    fn given_a_read_write_target_and_a_mirror_when_added_then_should_keep_both_in_order() {
-        let binding = ProjectionBinding::builder()
-            .source("shop", "orders")
-            .allow("order.v1")
-            .target_table("orders_rows")
-            .add_target(Target {
-                backend: "warehouse".to_owned(),
-                table: "orders_mirror".to_owned(),
-                role: TargetRole::WriteOnly,
-                delivery: Delivery::AtMostOnce,
-                required: false,
-            })
-            .build();
-        assert_eq!(binding.targets.len(), 2);
-        assert_eq!(binding.targets[0].role, TargetRole::ReadWrite);
-        assert_eq!(binding.targets[1].role, TargetRole::WriteOnly);
-        assert_eq!(binding.targets[1].backend, "warehouse");
+        assert_eq!(binding.index, "orders");
     }
 
     #[test]
     fn given_no_retention_when_built_then_should_default_to_none() {
         let binding = ProjectionBinding::builder()
             .source("shop", "orders")
-            .target_table("orders_rows")
+            .index("orders_rows")
             .build();
         assert_eq!(binding.retention, None);
     }
@@ -1112,19 +968,12 @@ mod wire_tests {
     use crate::framing::{decode_named, encode_named};
 
     #[test]
-    fn given_an_apply_binding_when_round_tripped_then_should_preserve_targets_and_version() {
+    fn given_an_apply_binding_when_round_tripped_then_should_preserve_index_and_version() {
         let binding = ProjectionBinding::builder()
             .source("shop", "orders")
             .allow("order.v1")
             .default_projection("order.v1")
-            .target_table("orders_rows")
-            .add_target(Target {
-                backend: "warehouse".to_owned(),
-                table: "orders_mirror".to_owned(),
-                role: TargetRole::WriteOnly,
-                delivery: Delivery::AtMostOnce,
-                required: false,
-            })
+            .index("orders_rows")
             .build();
         let envelope = ControlEnvelope {
             v: CONTROL_OP_VERSION,
@@ -1137,11 +986,8 @@ mod wire_tests {
         let ControlCommand::ApplyBinding(decoded) = back.command else {
             panic!("expected ApplyBinding");
         };
-        assert_eq!(decoded.targets.len(), 2);
-        assert_eq!(decoded.targets[0].table, "orders_rows");
-        assert_eq!(decoded.targets[0].role, TargetRole::ReadWrite);
-        assert_eq!(decoded.targets[1].table, "orders_mirror");
-        assert_eq!(decoded.targets[1].delivery, Delivery::AtMostOnce);
+        assert_eq!(decoded.index, "orders_rows");
+        assert_eq!(decoded.backend, None);
         // Retention left unset stays unset across the wire (inherits LaserData Cloud
         // default), and is omitted from the encoding entirely.
         assert_eq!(decoded.retention, None);
@@ -1198,7 +1044,7 @@ mod wire_tests {
             let binding = ProjectionBinding::builder()
                 .source("shop", "telemetry")
                 .allow("telemetry.v1")
-                .target_table("telemetry_rows")
+                .index("telemetry_rows")
                 .retention(policy)
                 .build();
             assert_eq!(binding.retention, Some(policy));

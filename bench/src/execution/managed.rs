@@ -10,7 +10,7 @@ pub(crate) async fn execute_managed(
     let processes = [
         ("client".to_owned(), std::process::id()),
         (
-            "iggy-server-ng".to_owned(),
+            "iggy-server".to_owned(),
             server
                 .pid()
                 .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,

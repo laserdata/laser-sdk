@@ -1,32 +1,35 @@
 {
+  "fields": [
+    {
+      "id": 1,
+      "name": "amount",
+      "required": true,
+      "field_type": {
+        "kind": "long"
+      }
+    },
+    {
+      "id": 2,
+      "name": "customer",
+      "required": true,
+      "field_type": {
+        "kind": "string"
+      }
+    }
+  ],
   "rows": [
     {
-      "headers": {
-        "amount": "42",
-        "customer": "alice"
-      },
-      "metadata": {
-        "agdx.ct": "1"
-      },
-      "partition": 2,
-      "offset": 17,
-      "stream": 5,
-      "topic": 3,
-      "payload": [
-        123,
-        34,
-        116,
-        111,
-        116,
-        97,
-        108,
-        34,
-        58,
-        52,
-        50,
-        125
+      "values": [
+        {
+          "kind": "long",
+          "value": 42
+        },
+        {
+          "kind": "string",
+          "value": "alice"
+        }
       ],
-      "score": 0.5
+      "score": 0.25
     }
   ],
   "page": {
@@ -34,5 +37,27 @@
     "limit": 50,
     "total": 1,
     "has_more": false
+  },
+  "context": {
+    "execution_id": "00000000000000000000000001",
+    "engine": {
+      "name": "datafusion",
+      "version": "50.0.0",
+      "dialect": "data_fusion"
+    },
+    "resolved_target": {
+      "kind": "operational",
+      "index": "orders",
+      "backend_resource_id": "0000000000000000000000000A",
+      "backend_generation": 4,
+      "runtime_configuration_revision": 9
+    },
+    "requested_consistency": "eventual",
+    "delivered_consistency": "eventual",
+    "truncated": false,
+    "elapsed_micros": 12000,
+    "scanned_bytes": 4096,
+    "produced_bytes": 128,
+    "row_count": 1
   }
 }

@@ -5,6 +5,7 @@ use crate::sign::PyKeyRegistry;
 use laser_sdk::capabilities::{BackendDescriptor, Capabilities, OpVersions};
 use laser_sdk::laser::Laser;
 use laser_sdk::wire::batch::BatchItem;
+use laser_sdk::wire::checkpoint::CheckpointReadConsistency;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -102,7 +103,7 @@ impl PyLaser {
     /// intended for bring-your-own backends and deterministic pre-gate tests.
     /// Omitted fields preserve the current capability set.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, kv=None, kv_cas=None, kv_cas_fenced=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
     fn with_capabilities<'py>(
         &self,
         py: Python<'py>,
@@ -110,6 +111,8 @@ impl PyLaser {
         query: Option<bool>,
         query_consistency: Option<String>,
         query_keyword: Option<bool>,
+        destinations: Option<bool>,
+        destinations_consistency: Option<String>,
         kv: Option<bool>,
         kv_cas: Option<bool>,
         kv_cas_fenced: Option<bool>,
@@ -145,6 +148,20 @@ impl PyLaser {
             }
             if let Some(value) = query_keyword {
                 capabilities.query.keyword = value;
+            }
+            if let Some(value) = destinations {
+                capabilities.destinations.available = value;
+            }
+            if let Some(value) = destinations_consistency {
+                capabilities.destinations.consistency = match value.as_str() {
+                    "linearizable" => CheckpointReadConsistency::Linearizable,
+                    "potentially_stale" => CheckpointReadConsistency::PotentiallyStale,
+                    _ => {
+                        return Err(InvalidError::new_err(
+                            "destinations_consistency must be linearizable or potentially_stale",
+                        ));
+                    }
+                };
             }
             if let Some(value) = kv {
                 capabilities.kv.available = value;
@@ -298,6 +315,12 @@ pub struct PyCapabilities {
     pub query_consistency: String,
     /// The query surface serves lexical keyword search (`Query.text(...)`).
     pub query_keyword: bool,
+    /// Materialization destination declarations and the checkpoint lifecycle
+    /// are served.
+    pub destinations: bool,
+    /// The checkpoint read consistency the destination surface serves
+    /// (`linearizable` / `potentially_stale`).
+    pub destinations_consistency: String,
     /// The managed key-value surface is served.
     pub kv: bool,
     /// The key-value store serves compare-and-swap.
@@ -343,6 +366,12 @@ impl From<Capabilities> for PyCapabilities {
             }
             .to_owned(),
             query_keyword: value.query.keyword,
+            destinations: value.destinations.available,
+            destinations_consistency: match value.destinations.consistency {
+                CheckpointReadConsistency::Linearizable => "linearizable",
+                _ => "potentially_stale",
+            }
+            .to_owned(),
             kv: value.kv.available,
             kv_cas: value.kv.cas,
             kv_cas_fenced: value.kv.cas_fenced,
@@ -369,9 +398,10 @@ impl From<Capabilities> for PyCapabilities {
 impl PyCapabilities {
     fn __repr__(&self) -> String {
         format!(
-            "Capabilities(managed={}, query={}, kv={}, graph={}, forks={}, kv_cas={}, backends={})",
+            "Capabilities(managed={}, query={}, destinations={}, kv={}, graph={}, forks={}, kv_cas={}, backends={})",
             self.managed,
             self.query,
+            self.destinations,
             self.kv,
             self.graph,
             self.forks,
@@ -392,6 +422,7 @@ pub struct PyOpVersions {
     pub fork: u32,
     pub agent: u32,
     pub graph: u32,
+    pub checkpoint: u32,
     pub features: u64,
 }
 
@@ -404,6 +435,7 @@ impl From<OpVersions> for PyOpVersions {
             fork: value.fork,
             agent: value.agent,
             graph: value.graph,
+            checkpoint: value.checkpoint,
             features: value.features,
         }
     }
@@ -414,36 +446,64 @@ impl From<OpVersions> for PyOpVersions {
 impl PyOpVersions {
     fn __repr__(&self) -> String {
         format!(
-            "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, features={})",
-            self.query, self.control, self.kv, self.fork, self.agent, self.graph, self.features
+            "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, checkpoint={}, features={})",
+            self.query,
+            self.control,
+            self.kv,
+            self.fork,
+            self.agent,
+            self.graph,
+            self.checkpoint,
+            self.features
         )
     }
 }
 
-/// One materialization backend the connected server exposes: identity only, a
-/// stable `id` and an opaque engine `kind`, with optional advisory `label` and
-/// `version` and a set of opaque `capabilities` tags the backend declares about
-/// itself (e.g. "ingest", "query", a query-surface feature). A consumer routes
-/// only to an advertised `id` and matches the tags it understands.
+/// One structured, versioned backend observation from the connected server.
 #[gen_stub_pyclass]
-#[pyclass(name = "BackendDescriptor", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "BackendDescriptor", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyBackendDescriptor {
-    pub id: String,
+    #[pyo3(get)]
+    pub descriptor_version: u32,
+    #[pyo3(get)]
+    pub resource_id: String,
+    #[pyo3(get)]
+    pub mode: String,
+    #[pyo3(get)]
+    pub label: String,
+    #[pyo3(get)]
     pub kind: String,
-    pub label: Option<String>,
-    pub version: Option<String>,
-    pub capabilities: Vec<String>,
+    #[pyo3(get)]
+    pub version: String,
+    #[pyo3(get)]
+    pub observed_backend_generation: u64,
+    #[pyo3(get)]
+    pub observed_runtime_configuration_revision: u64,
+    #[pyo3(get)]
+    pub desired_state: String,
+    #[pyo3(get)]
+    pub observed_state: String,
+    #[pyo3(get)]
+    pub ready: bool,
+    inner: BackendDescriptor,
 }
 
 impl From<BackendDescriptor> for PyBackendDescriptor {
     fn from(value: BackendDescriptor) -> Self {
         Self {
-            id: value.id,
-            kind: value.kind,
-            label: value.label,
-            version: value.version,
-            capabilities: value.capabilities,
+            descriptor_version: value.descriptor_version,
+            resource_id: value.resource_id.to_string(),
+            mode: serde_word(&value.mode),
+            label: value.label.clone(),
+            kind: value.implementation.kind.clone(),
+            version: value.implementation.version.clone(),
+            observed_backend_generation: value.observed_backend_generation,
+            observed_runtime_configuration_revision: value.runtime_configuration_revision,
+            desired_state: serde_word(&value.desired_state),
+            observed_state: serde_word(&value.observed_state),
+            ready: value.readiness.ready,
+            inner: value,
         }
     }
 }
@@ -451,15 +511,47 @@ impl From<BackendDescriptor> for PyBackendDescriptor {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyBackendDescriptor {
-    /// Whether the backend declared the opaque capability `tag`.
-    fn has_capability(&self, tag: &str) -> bool {
-        self.capabilities.iter().any(|c| c == tag)
+    #[getter]
+    fn readiness(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.readiness)
+    }
+
+    #[getter]
+    fn materialization(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.materialization)
+    }
+
+    #[getter]
+    fn query(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.query)
+    }
+
+    #[getter]
+    fn schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.schema)
+    }
+
+    #[getter]
+    fn maintenance(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.maintenance)
+    }
+
+    #[getter]
+    fn limits(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner.limits)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "BackendDescriptor(id={}, kind={}, capabilities={:?})",
-            self.id, self.kind, self.capabilities
+            "BackendDescriptor(resource_id={}, mode={}, kind={}, ready={})",
+            self.resource_id, self.mode, self.kind, self.ready
         )
     }
+}
+
+fn serde_word<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }

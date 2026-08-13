@@ -1,6 +1,8 @@
 import {
   ContentType,
   parseProjectionId,
+  queryResultValue,
+  typedValueDiagnosticText,
   type Laser,
   type Projection,
   type ProjectionBinding,
@@ -137,15 +139,7 @@ async function registerTape(
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    targets: [
-      {
-        backend: "embedded",
-        table: topic,
-        role: "readWrite",
-        delivery: "effectivelyOnce",
-        required: true
-      }
-    ],
+    index: topic,
     notify: false
   }
   await laser.projections().register(projection)
@@ -280,9 +274,11 @@ async function auditTape(
 function groupTotals(result: QueryResult): ReadonlyMap<string, bigint> {
   const totals = new Map<string, bigint>()
   for (const row of result.rows) {
-    const symbol = row.headers.get(SYMBOL)
-    const total = row.headers.get(SUM)
-    if (symbol !== undefined && total !== undefined) totals.set(symbol, BigInt(total))
+    const symbol = queryResultValue(result, row, SYMBOL)
+    const total = queryResultValue(result, row, SUM)
+    if (symbol !== undefined && total !== undefined) {
+      totals.set(typedValueDiagnosticText(symbol), BigInt(typedValueDiagnosticText(total)))
+    }
   }
   return totals
 }

@@ -15,13 +15,18 @@ use crate::agent_workflow::{AgentRunInfo, AgentSubmit};
 use crate::authz::{Role, WhoamiReply};
 use crate::browse::{ProjectionInfo, SchemaInfo};
 use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector};
+use crate::destination::{DestinationId, DestinationOperationId};
 use crate::fork::ForkInfo;
 use crate::graph::GraphQuery;
 use crate::http::{
-    self, Capabilities, CasCommittedView, ClientMetadataListView, ClientsQuery, DecodeRecordBody,
-    DeletedManyView, ErrorBody, ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView,
-    KvCasQuery, KvPageView, KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView,
-    RemoveBindingBody, RunPageView, RunsQuery, SchemaListQuery,
+    self, AcceptedOperationView, Capabilities, CasCommittedView, ClientMetadataListView,
+    ClientsQuery, DecodeRecordBody, DeletedManyView, DestinationIssueView, DestinationListQuery,
+    DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody, ForkCreateBody,
+    ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView, KvPutQuery,
+    KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
+    QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, RunPageView, RunsQuery,
+    SchemaListQuery, SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView,
+    TableMetricsView, TableSchemaView, TableSnapshotView, TableView,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
@@ -199,10 +204,168 @@ impl<T: Transport> HttpClient<T> {
         self.get(http::CAPABILITIES_PATH.to_owned()).await
     }
 
-    /// `POST /agdx/query`: run a query, get the result page back.
-    pub async fn query(&self, query: &Query) -> ClientResult<QueryResult, T::Error> {
+    /// `POST /agdx/query`: submit a query and return its current execution view.
+    pub async fn query(&self, query: &Query) -> ClientResult<QueryExecutionView, T::Error> {
         self.send_json(Method::Post, http::QUERY_PATH.to_owned(), query)
             .await
+    }
+
+    pub async fn query_page(
+        &self,
+        execution_id: crate::query::QueryExecutionId,
+        body: &QueryPageBody,
+    ) -> ClientResult<QueryResult, T::Error> {
+        self.send_json(Method::Post, http::query_page_path(execution_id), body)
+            .await
+    }
+
+    pub async fn query_status(
+        &self,
+        execution_id: crate::query::QueryExecutionId,
+    ) -> ClientResult<QueryExecutionView, T::Error> {
+        self.get(http::query_execution_path(execution_id)).await
+    }
+
+    pub async fn cancel_query(
+        &self,
+        execution_id: crate::query::QueryExecutionId,
+    ) -> ClientResult<crate::query::QueryExecutionStatus, T::Error> {
+        self.send_empty(Method::Post, http::query_cancel_path(execution_id))
+            .await
+    }
+
+    pub async fn list_destinations(
+        &self,
+        query: &DestinationListQuery,
+    ) -> ClientResult<DestinationPageView, T::Error> {
+        self.get(with_query(http::DESTINATIONS_PATH, query)?).await
+    }
+
+    pub async fn destination(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<Option<DestinationView>, T::Error> {
+        self.get_optional(http::destination_path(id)).await
+    }
+
+    pub async fn create_destination(
+        &self,
+        body: &DestinationMutationBody,
+    ) -> ClientResult<AcceptedOperationView, T::Error> {
+        self.send_json(Method::Post, http::DESTINATIONS_PATH.to_owned(), body)
+            .await
+    }
+
+    pub async fn enable_destination(
+        &self,
+        id: DestinationId,
+        body: &DestinationMutationBody,
+    ) -> ClientResult<AcceptedOperationView, T::Error> {
+        self.send_json(Method::Post, http::destination_enable_path(id), body)
+            .await
+    }
+
+    pub async fn disable_destination(
+        &self,
+        id: DestinationId,
+        body: &DestinationMutationBody,
+    ) -> ClientResult<AcceptedOperationView, T::Error> {
+        self.send_json(Method::Post, http::destination_disable_path(id), body)
+            .await
+    }
+
+    pub async fn destination_operation(
+        &self,
+        id: DestinationOperationId,
+    ) -> ClientResult<AcceptedOperationView, T::Error> {
+        self.get(http::destination_operation_path(id)).await
+    }
+
+    pub async fn destination_status(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<crate::checkpoint::DestinationCheckpointStatus, T::Error> {
+        self.get(http::destination_status_path(id)).await
+    }
+
+    pub async fn destination_checkpoint(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<crate::checkpoint::DestinationCheckpointStatus, T::Error> {
+        self.get(http::destination_checkpoint_path(id)).await
+    }
+
+    pub async fn destination_retention_gap(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<DestinationIssueView, T::Error> {
+        self.get(http::destination_retention_gap_path(id)).await
+    }
+
+    pub async fn destination_prepared_attempt(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<DestinationIssueView, T::Error> {
+        self.get(http::destination_prepared_attempt_path(id)).await
+    }
+
+    pub async fn query_routes(
+        &self,
+        query: &QueryRouteListQuery,
+    ) -> ClientResult<QueryRoutePageView, T::Error> {
+        self.get(with_query(http::QUERY_ROUTES_PATH, query)?).await
+    }
+
+    pub async fn destination_table(&self, id: DestinationId) -> ClientResult<TableView, T::Error> {
+        self.get(http::destination_table_path(id)).await
+    }
+
+    pub async fn destination_table_schema(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<TableSchemaView, T::Error> {
+        self.get(http::destination_table_schema_path(id)).await
+    }
+
+    pub async fn destination_current_snapshot(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<TableSnapshotView, T::Error> {
+        self.get(http::destination_current_snapshot_path(id)).await
+    }
+
+    pub async fn destination_snapshots(
+        &self,
+        id: DestinationId,
+        query: &SnapshotListQuery,
+    ) -> ClientResult<SnapshotPageView, T::Error> {
+        self.get(with_query(&http::destination_snapshots_path(id), query)?)
+            .await
+    }
+
+    pub async fn destination_snapshot(
+        &self,
+        id: DestinationId,
+        snapshot_id: i64,
+    ) -> ClientResult<TableSnapshotView, T::Error> {
+        self.get(http::destination_snapshot_path(id, snapshot_id))
+            .await
+    }
+
+    pub async fn destination_files(
+        &self,
+        id: DestinationId,
+        query: &TableFileListQuery,
+    ) -> ClientResult<TableFilePageView, T::Error> {
+        self.get(with_query(&http::destination_files_path(id), query)?)
+            .await
+    }
+
+    pub async fn destination_metrics(
+        &self,
+        id: DestinationId,
+    ) -> ClientResult<TableMetricsView, T::Error> {
+        self.get(http::destination_metrics_path(id)).await
     }
 
     /// `GET /agdx/projections`: list projections and their bindings, optionally

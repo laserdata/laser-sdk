@@ -112,6 +112,85 @@ let binding = ProjectionBinding::builder()
 
 `laser-plane` runs the projector in Laser Stack and LaserData Cloud. Against Apache Iggy without a managed backend, projection and query calls return `LaserError::Unsupported`. The open streaming path above continues to run unchanged.
 
+## Typed operational and lakehouse queries
+
+Query results carry one ordered logical field schema and positional tagged values. Read values through the result so field lookup and value typing remain explicit:
+
+```rust,ignore
+let result = laser
+    .query("orders_v1")
+    .where_eq("customer_id", "alice")
+    .filter_gte("total", 100_i64)
+    .limit(100)
+    .fetch()
+    .await?;
+
+for row in &result.rows {
+    println!("{}", result.value_text(row, "total").unwrap_or_default());
+}
+```
+
+`result.fields` defines the exact order and logical type of every `row.values` entry. Tagged values preserve integer widths, decimal precision, timestamps, UUIDs, bytes, structs, lists, maps, and nullability. Each inline page is capped at 1000 rows. Continuation follows the opaque `next_cursor` returned by the server, and `has_more` is true exactly when that cursor is present.
+
+Lakehouse queries name one destination generation and may select a retained snapshot:
+
+```rust,ignore
+let historical = laser
+    .query_lakehouse(destination_id, destination_generation)
+    .at_snapshot(snapshot_id)?
+    .filter_eq("customer_id", "alice")
+    .limit(100)
+    .fetch()
+    .await?;
+
+println!("{:?}", historical.context.resolved_target);
+```
+
+The result context proves the resolved engine and target. Lakehouse pages also prove destination and backend generations, table UUID, snapshot, schema and partition-spec IDs, materialization boundary, checkpoint revision, and global-state revision.
+
+Each query builder owns one execution identity. `execution_id()` exposes it for coordination, while `status()` and `cancel()` use the dedicated managed commands and reject locally when the deployment does not advertise those capabilities. `fetch_all()` and bounded row iteration follow server-issued cursors automatically.
+
+## Destinations and Arrow IPC
+
+Destination and explicit query-route state is available through `laser.destinations()`. Reads choose checkpoint consistency and remain bounded:
+
+```rust,ignore
+use laser_sdk::wire::checkpoint::{CheckpointReadConsistency, DestinationListFilter};
+
+let page = laser
+    .destinations()
+    .list(
+        DestinationListFilter::default(),
+        None,
+        50,
+        CheckpointReadConsistency::Linearizable,
+    )
+    .await?;
+println!("{} destination(s) at revision {}", page.destinations.len(), page.global_state_revision);
+```
+
+Registration and desired-state changes are revision-guarded. `register` takes one complete destination declaration. `set_desired_state` compares both global state and destination definition revisions before applying a change.
+
+For analytical batches, publish one complete self-contained Arrow IPC stream per Apache Iggy message:
+
+```rust,ignore
+use laser_sdk::wire::arrow::{ArrowIpcMessageMetadata, ARROW_IPC_CONTRACT_VERSION};
+use laser_sdk::wire::schema::SchemaFingerprint;
+
+let metadata = ArrowIpcMessageMetadata {
+    contract_version: ARROW_IPC_CONTRACT_VERSION,
+    schema_fingerprint: SchemaFingerprint::new(schema_fingerprint),
+    encoded_bytes: arrow_stream.len() as u64,
+    field_count: 8,
+    record_batch_count: 1,
+    row_count: 10_000,
+    dictionary_count: 0,
+};
+topic.publish().arrow_ipc(arrow_stream, metadata)?.send().await?;
+```
+
+The SDK validates metadata and exact payload length before I/O. Managed ingestion enforces stream format, self-containment, microsecond timestamps, stable dictionaries, decimals no wider than 128 bits, and no unions or extension types.
+
 ## Typed topics
 
 One handle binds a topic to one body type. The serde forms need no registry, encoding on the way in and decoding with the log position attached on the way out.
@@ -210,7 +289,7 @@ Writes climb the same way: `topic.send(..)` is the raw zero-overhead append, `pu
 ## Features
 
 - `default = ["streaming", "provenance"]`
-- `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs Apache Iggy VSR framing is mandatory and is not exposed as a Laser feature. Managed reads use the non-replicated extension path, and managed authorization writes use the fork's replicated operation codes.
+- `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. The SDK uses Iggy's native VSR transport. Managed reads use the non-replicated extension path, and managed authorization writes use dedicated replicated operation codes.
 - `provenance`, wire contract + provenance encoding/decoding
 - `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`

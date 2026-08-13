@@ -67,25 +67,25 @@ macro_rules! wire_id {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let encoded = crockford_encode(self.0);
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let encoded = $crate::agent::crockford_encode(self.0);
                 // The alphabet is ASCII, so the buffer is always valid UTF-8.
                 f.write_str(std::str::from_utf8(&encoded).expect("crockford output is ASCII"))
             }
         }
 
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 write!(f, "{}({})", stringify!($name), self)
             }
         }
 
-        impl FromStr for $name {
-            type Err = IdParseError;
+        impl std::str::FromStr for $name {
+            type Err = $crate::agent::IdParseError;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                crockford_decode(s).map(Self)
+                $crate::agent::crockford_decode(s).map(Self)
             }
         }
 
@@ -101,27 +101,83 @@ macro_rules! wire_id {
             }
         }
 
-        impl Serialize for $name {
-            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_bytes(&self.to_bytes())
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if serializer.is_human_readable() {
+                    serializer.serialize_str(&self.to_string())
+                } else {
+                    serializer.serialize_bytes(&self.to_bytes())
+                }
             }
         }
 
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                if deserializer.is_human_readable() {
+                    struct TextVisitor;
+
+                    impl<'de> serde::de::Visitor<'de> for TextVisitor {
+                        type Value = $name;
+
+                        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            f.write_str("a 26-character Crockford base32 id or 16 id bytes")
+                        }
+
+                        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                            value.parse().map_err(E::custom)
+                        }
+
+                        fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                            let payload: [u8; 16] = value
+                                .try_into()
+                                .map_err(|_| E::invalid_length(value.len(), &self))?;
+                            Ok($name::from_bytes(payload))
+                        }
+
+                        fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                            self.visit_bytes(&value)
+                        }
+                    }
+
+                    // Derived enum decoders buffer newtype payloads before replaying
+                    // them. Serde's buffered deserializer reports human-readable mode,
+                    // but preserves the original CBOR byte-string value.
+                    return deserializer.deserialize_any(TextVisitor);
+                }
+
                 struct BytesVisitor;
 
-                impl<'de> Visitor<'de> for BytesVisitor {
+                impl<'de> serde::de::Visitor<'de> for BytesVisitor {
                     type Value = $name;
 
-                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                         f.write_str("16 big-endian id bytes")
                     }
 
-                    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
                         let payload: [u8; 16] = v
                             .try_into()
                             .map_err(|_| E::invalid_length(v.len(), &self))?;
+                        Ok($name::from_bytes(payload))
+                    }
+
+                    fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                        self.visit_bytes(&v)
+                    }
+
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut sequence: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut payload = [0_u8; 16];
+                        for (index, byte) in payload.iter_mut().enumerate() {
+                            *byte = sequence
+                                .next_element()?
+                                .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                        }
+                        if sequence.next_element::<u8>()?.is_some() {
+                            return Err(serde::de::Error::invalid_length(17, &self));
+                        }
                         Ok($name::from_bytes(payload))
                     }
                 }
@@ -241,6 +297,26 @@ impl<'de> Deserialize<'de> for LogPosition {
                 let payload: [u8; LOG_POSITION_BYTES] = v
                     .try_into()
                     .map_err(|_| E::invalid_length(v.len(), &self))?;
+                Ok(LogPosition::from_bytes(payload))
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                self.visit_bytes(&v)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut payload = [0_u8; LOG_POSITION_BYTES];
+                for (index, byte) in payload.iter_mut().enumerate() {
+                    *byte = sequence
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+                }
+                if sequence.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::invalid_length(LOG_POSITION_BYTES + 1, &self));
+                }
                 Ok(LogPosition::from_bytes(payload))
             }
         }
@@ -1841,6 +1917,28 @@ mod tests {
             RecordId::from_u128(u128::MAX).to_string(),
             "7ZZZZZZZZZZZZZZZZZZZZZZZZZ"
         );
+    }
+
+    #[test]
+    fn given_an_id_in_json_when_encoded_then_should_use_readable_text() {
+        let id = RecordId::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        let json = serde_json::to_string(&id).expect("serializes");
+        assert_eq!(json, format!("\"{id}\""));
+        assert_eq!(
+            serde_json::from_str::<RecordId>(&json).expect("deserializes"),
+            id
+        );
+        let byte_array = serde_json::to_string(&[0_u8; 16]).expect("serializes byte array");
+        assert!(serde_json::from_str::<RecordId>(&byte_array).is_err());
+    }
+
+    #[cfg(feature = "cbor")]
+    #[test]
+    fn given_an_id_in_named_cbor_when_encoded_then_should_use_fixed_width_bytes() {
+        let id = RecordId::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        let encoded = crate::framing::encode_named(&id).expect("serializes");
+        let decoded = crate::framing::decode_named::<RecordId>(&encoded).expect("deserializes");
+        assert_eq!(decoded, id);
     }
 
     #[test]

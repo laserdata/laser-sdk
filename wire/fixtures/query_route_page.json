@@ -1,0 +1,18 @@
+{
+  "routes": [
+    {
+      "id": "0000000000000000000000009E",
+      "generation": 2,
+      "definition_revision": 8,
+      "name": "orders-history",
+      "target": {
+        "kind": "lakehouse",
+        "destination_id": "0000000000000000000000009C",
+        "destination_generation": 2
+      },
+      "desired_state": "enabled"
+    }
+  ],
+  "next_cursor": "route-2",
+  "definition_revision": 8
+}

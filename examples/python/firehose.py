@@ -290,12 +290,16 @@ async def run_sample_queries(laser: ls.Laser, topics: list[str]) -> None:
     by_severity = await laser.query(topic).count().group_by(["severity"]).fetch()
     print(f"'{topic}' events by severity:")
     for row in by_severity.rows:
-        print(f"  {row.headers.get('severity', '?'):<6} {row.headers.get('count', '0')}")
+        severity = by_severity.value_text(row, "severity") or "?"
+        count = by_severity.value_text(row, "count") or "0"
+        print(f"  {severity:<6} {count}")
 
     slowest = await laser.query(topic).order_desc("latency_ms").limit(5).fetch()
     print(f"'{topic}' slowest 5 requests:")
     for row in slowest.rows:
-        print(f"  {row.headers.get('latency_ms', '?'):>5}ms  {row.headers.get('route', '?')}")
+        latency = slowest.value_text(row, "latency_ms") or "?"
+        route = slowest.value_text(row, "route") or "?"
+        print(f"  {latency:>5}ms  {route}")
 
     grand_total = 0
     for index_topic in topics:

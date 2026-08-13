@@ -1,5 +1,6 @@
 use crate::common::test_iggy::TestIggy;
 use cucumber::World;
+use laser_bdd::data_stack::{AcceptedOperation, DataStackModel, ModelError};
 use laser_bdd::graph_engine::GraphEngine;
 use laser_bdd::kv_engine::KvEngine;
 use laser_bdd::memory_engine::MemoryEngine;
@@ -50,6 +51,10 @@ pub struct LaserWorld {
     /// for the query-semantics scenarios (no Iggy, no transport).
     pub query_engine: Option<QueryEngine>,
     pub last_query: Option<QueryResult>,
+    pub data_stack: Option<DataStackModel>,
+    pub data_stack_operation: Option<AcceptedOperation>,
+    pub data_stack_error: Option<ModelError>,
+    pub data_stack_page: Option<(Vec<String>, Option<usize>)>,
     /// The in-memory reference KV store and the outcome of the last
     /// compare-and-swap, for the CAS-semantics scenarios (no Iggy, no transport).
     pub kv_engine: Option<KvEngine>,

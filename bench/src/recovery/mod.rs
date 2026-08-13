@@ -367,7 +367,7 @@ fn iggy_recovery_summary(
         },
         configuration: serde_json::json!({
             "fault": "iggy_process_stop",
-            "server": "server-ng",
+            "server": "server",
             "transport": "tcp_vsr",
             "system_path_reused": true,
             "same_listen_address": true,
@@ -965,8 +965,7 @@ async fn validate_projection(
     let ids = result
         .rows
         .iter()
-        .filter_map(|row| row.headers.get("id"))
-        .map(|value| value.as_str().to_owned())
+        .filter_map(|row| result.value_text(row, "id"))
         .collect::<BTreeSet<_>>();
     let duplicates = result.rows.len().saturating_sub(ids.len()) as u64;
     if ids.len() != expected {
@@ -1065,7 +1064,7 @@ async fn start_telemetry(
         vec![
             ("laser-bench".to_owned(), std::process::id()),
             (
-                "iggy-server-ng".to_owned(),
+                "iggy-server".to_owned(),
                 server
                     .pid()
                     .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,
@@ -1096,7 +1095,7 @@ async fn start_iggy_telemetry(
         vec![
             ("laser-bench".to_owned(), std::process::id()),
             (
-                "iggy-server-ng".to_owned(),
+                "iggy-server".to_owned(),
                 server
                     .pid()
                     .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,

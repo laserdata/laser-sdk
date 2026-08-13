@@ -10,7 +10,7 @@ version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
-description = "LaserData SDK over Apache Iggy: typed streaming, declared projections and a query DSL, a key-value store, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
+description = "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
 publish = false
 
 # The cdylib is named `laser_sdk_py` to avoid clashing with the `laser_sdk`

@@ -38,7 +38,7 @@ void test("given_the_projection_control_fixture_when_decoded_then_should_preserv
 void test("given_the_binding_control_fixtures_when_decoded_then_should_preserve_routing", async () => {
   const applied = await assertControlRoundTrips("control_apply_binding.bin")
   if (applied.command.kind !== "applyBinding") throw new Error("wrong command")
-  assert.equal(applied.command.binding.targets[0]?.table, "orders_rows")
+  assert.equal(applied.command.binding.index, "orders_rows")
   assert.equal(applied.command.binding.retention?.kind, "timeToLive")
 
   const removed = await assertControlRoundTrips("control_remove_binding.bin")

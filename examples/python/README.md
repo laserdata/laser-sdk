@@ -27,7 +27,7 @@ uv run --project ../../foreign/python python log.py
 
 ## Run locally
 
-Start the root repository's pinned VSR Apache Iggy service, then run an example:
+Start Apache Iggy, then run an example:
 
 ```sh
 just up

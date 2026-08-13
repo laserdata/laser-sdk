@@ -194,7 +194,7 @@ pub(crate) async fn prepare_projection(
     laser: &Laser,
     case: &ManagedCase,
     names: &ProjectionNames,
-    profile: PlaneProfile,
+    _profile: PlaneProfile,
 ) -> Result<(Laser, laser_sdk::stream::Topic), BenchError> {
     let stream = laser.stream(&names.stream);
     stream
@@ -222,7 +222,7 @@ pub(crate) async fn prepare_projection(
         .source(&names.stream, &names.topic)
         .allow(names.projection.clone())
         .default_projection(names.projection.clone())
-        .target_on(profile.projection_backend(), &names.index)
+        .index(&names.index)
         .notify()
         .build();
     scoped
@@ -433,9 +433,14 @@ impl QueryOperationContext {
             .await
             .map_err(|error| setup_error("deep-validate query", &error))?;
         for row in &result.rows {
-            let payload = row.payload.as_ref().ok_or_else(|| {
-                BenchError::Invalid("payload_on deep validation omitted payload bytes".to_owned())
-            })?;
+            let payload = match result.value(row, laser_wire::schema::ORIGINAL_PAYLOAD_FIELD_NAME) {
+                Some(laser_wire::schema::TypedValue::Binary(value)) => &value.0,
+                _ => {
+                    return Err(BenchError::Invalid(
+                        "payload_on deep validation omitted payload bytes".to_owned(),
+                    ));
+                }
+            };
             serde_json::from_slice::<QueryDocument>(payload).map_err(|error| {
                 BenchError::Invalid(format!("query payload is invalid: {error}"))
             })?;
@@ -462,16 +467,16 @@ impl QueryOperationContext {
             QueryArm::PointPredicate => result
                 .rows
                 .first()
-                .and_then(|row| row.headers.get(ID_FIELD))
-                .filter(|id| id.as_str() == "item_0000000000000000")
+                .and_then(|row| result.value_text(row, ID_FIELD))
+                .filter(|id| id == "item_0000000000000000")
                 .map(|_| ())
                 .ok_or_else(|| "point query returned the wrong row".to_owned()),
             QueryArm::SelectiveFilter => result
                 .rows
                 .iter()
                 .all(|row| {
-                    row.headers
-                        .get(SELECTED_FIELD)
+                    result
+                        .value_text(row, SELECTED_FIELD)
                         .is_some_and(|value| value == SELECTED_VALUE)
                 })
                 .then_some(())
@@ -484,12 +489,12 @@ impl QueryOperationContext {
 fn validate_aggregate(result: &QueryResult, corpus_entries: u64) -> Result<(), String> {
     let mut total = 0_u64;
     for row in &result.rows {
-        if !row.headers.contains_key(BUCKET_FIELD) {
+        if result.value(row, BUCKET_FIELD).is_none() {
             return Err("aggregate query omitted its group key".to_owned());
         }
         total = total.saturating_add(
-            row.headers
-                .get(COUNT_FIELD)
+            result
+                .value_text(row, COUNT_FIELD)
                 .ok_or_else(|| "aggregate query omitted count".to_owned())?
                 .parse::<u64>()
                 .map_err(|error| format!("aggregate count is invalid: {error}"))?,
@@ -506,10 +511,14 @@ fn validate_aggregate(result: &QueryResult, corpus_entries: u64) -> Result<(), S
 
 fn validate_payload_presence(result: &QueryResult, expected: bool) -> Result<(), String> {
     for row in &result.rows {
-        match (&row.payload, expected) {
-            (Some(_), true) | (None, false) => {}
-            (Some(_), false) => return Err("payload_off query returned payload bytes".to_owned()),
-            (None, true) => return Err("payload_on query omitted payload bytes".to_owned()),
+        let present = matches!(
+            result.value(row, laser_wire::schema::ORIGINAL_PAYLOAD_FIELD_NAME),
+            Some(laser_wire::schema::TypedValue::Binary(_))
+        );
+        match (present, expected) {
+            (true, true) | (false, false) => {}
+            (true, false) => return Err("payload_off query returned payload bytes".to_owned()),
+            (false, true) => return Err("payload_on query omitted payload bytes".to_owned()),
         }
     }
     Ok(())

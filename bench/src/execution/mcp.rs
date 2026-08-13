@@ -21,7 +21,7 @@ pub(crate) async fn execute_mcp(
     let processes = [
         ("client".to_owned(), std::process::id()),
         (
-            "iggy-server-ng".to_owned(),
+            "iggy-server".to_owned(),
             server
                 .pid()
                 .ok_or_else(|| BenchError::Invalid("Iggy process has no PID".to_owned()))?,

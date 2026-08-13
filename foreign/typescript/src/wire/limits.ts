@@ -16,6 +16,13 @@ export const MAX_ROLE_NAME_BYTES = 64
 
 export const MAX_FRAME_BYTES = 64 * 1024 * 1024
 export const MAX_QUERY_REPLY_BYTES = MAX_FRAME_BYTES
+export const MAX_QUERY_NAME_BYTES = 255
+export const MAX_RAW_SQL_BYTES = 64 * 1024
+export const MAX_QUERY_PARAMETERS = 1024
+export const MAX_QUERY_CURSOR_BYTES = 512
+export const MAX_QUERY_PREDICATES = 4096
+export const MAX_QUERY_FIELDS = 4096
+export const MAX_VECTOR_DIMENSIONS = 65_536
 
 export const MAX_BATCH_OPS = 64
 

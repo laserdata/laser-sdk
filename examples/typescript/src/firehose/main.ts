@@ -86,15 +86,7 @@ async function registerOrg(laser: Laser, topic: string): Promise<void> {
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    targets: [
-      {
-        backend: "embedded",
-        table: topic,
-        role: "readWrite",
-        delivery: "effectivelyOnce",
-        required: true
-      }
-    ],
+    index: topic,
     notify: false
   }
   await laser.projections().register(projection)

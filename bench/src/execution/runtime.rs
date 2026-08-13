@@ -204,7 +204,7 @@ pub(crate) async fn execute_native_run(
         .stack
         .iggy_server
         .as_ref()
-        .ok_or_else(|| BenchError::Invalid("native run requires iggy-server-ng".to_owned()))?;
+        .ok_or_else(|| BenchError::Invalid("native run requires iggy-server".to_owned()))?;
     let plane_socket = if scenario_requires_plane(execution.scenario) {
         Some(plane_socket_path(execution.output)?)
     } else {
@@ -298,7 +298,7 @@ pub(crate) async fn execute_started_run(
     let mut telemetry_processes = vec![
         ("laser-bench".to_owned(), std::process::id()),
         (
-            "iggy-server-ng".to_owned(),
+            "iggy-server".to_owned(),
             server
                 .pid()
                 .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,
@@ -520,7 +520,7 @@ pub(crate) async fn execute_rust_client(
                 .ok_or_else(|| BenchError::Invalid("Iggy process has no PID".to_owned()))?;
             let processes = [
                 ("client".to_owned(), std::process::id()),
-                ("iggy-server-ng".to_owned(), server_pid),
+                ("iggy-server".to_owned(), server_pid),
             ];
             let summary = run_rust_client_startup(RustClientStartupRun {
                 connection_string: &server.connection_string,
@@ -593,7 +593,7 @@ pub(crate) async fn execute_direct(
         .ok_or_else(|| BenchError::Invalid("Iggy process has no PID".to_owned()))?;
     let processes = [
         ("client".to_owned(), std::process::id()),
-        ("iggy-server-ng".to_owned(), server_pid),
+        ("iggy-server".to_owned(), server_pid),
     ];
     let consumer_path = scenario.driver.parse::<StreamingConsumerPath>().ok();
     let pipeline_path = scenario.driver.parse::<StreamingPipelinePath>().ok();

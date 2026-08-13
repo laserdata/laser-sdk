@@ -1,0 +1,31 @@
+{
+  "files": [
+    {
+      "object_identity": "data/0001.parquet",
+      "file_size_bytes": 4096,
+      "row_count": 100,
+      "partition": {
+        "day": {
+          "kind": "date",
+          "value": 20000
+        }
+      },
+      "lower_bounds": {
+        "1": {
+          "kind": "long",
+          "value": 1
+        }
+      },
+      "upper_bounds": {
+        "1": {
+          "kind": "long",
+          "value": 100
+        }
+      },
+      "null_value_counts": {
+        "1": 0
+      }
+    }
+  ],
+  "next_cursor": "file-2"
+}

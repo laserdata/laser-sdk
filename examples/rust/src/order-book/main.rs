@@ -496,14 +496,14 @@ async fn report_volume_and_vwap(laser: &Laser) -> Result<(), LaserError> {
 }
 
 // Collect a `sum(..).group_by([SYMBOL])` result into `symbol -> total`. Each row
-// carries the group key in `headers[SYMBOL]` and the sum in `headers[SUM_RESULT]`.
+// carries the group key and aggregate in its typed result fields.
 fn group_totals(result: &QueryResult) -> BTreeMap<String, i64> {
     result
         .rows
         .iter()
         .filter_map(|row| {
-            let symbol = row.headers.get(SYMBOL)?.clone();
-            let total = row.headers.get(SUM_RESULT)?.parse().ok()?;
+            let symbol = result.value_text(row, SYMBOL)?;
+            let total = result.value_i64(row, SUM_RESULT)?;
             Some((symbol, total))
         })
         .collect()
@@ -587,7 +587,7 @@ async fn avro_tape(laser: &Laser, trades: &[Trade]) -> Result<(), LaserError> {
                 .source(stream_for("order-book"), AVRO_TAPE_TOPIC)
                 .allow(AVRO_PROJECTION)
                 .default_projection(AVRO_PROJECTION)
-                .target_table(AVRO_TAPE_TOPIC)
+                .index(AVRO_TAPE_TOPIC)
                 .build(),
         )
         .await?;
@@ -622,14 +622,13 @@ async fn avro_tape(laser: &Laser, trades: &[Trade]) -> Result<(), LaserError> {
         .await?;
     info!("notional per symbol, aggregated over columns decoded out of Avro bodies:");
     for row in &per_symbol.rows {
-        info!(
-            "  {:<6} {:>14}",
-            row.headers.get(SYMBOL).map(String::as_str).unwrap_or("?"),
-            row.headers
-                .get(SUM_RESULT)
-                .map(String::as_str)
-                .unwrap_or("0"),
-        );
+        let symbol = per_symbol
+            .value_text(row, SYMBOL)
+            .unwrap_or_else(|| "?".to_owned());
+        let total = per_symbol
+            .value_text(row, SUM_RESULT)
+            .unwrap_or_else(|| "0".to_owned());
+        info!("  {:<6} {:>14}", symbol, total,);
     }
     Ok(())
 }

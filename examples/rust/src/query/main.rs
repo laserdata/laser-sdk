@@ -51,10 +51,12 @@ async fn main() -> Result<(), LaserError> {
         .await?;
 
     println!("  {} of {} orders are paid", paid.rows.len(), orders.len());
-    for row in paid.rows {
+    for row in &paid.rows {
         println!(
             "    order #{} total {}",
-            row.headers["id"], row.headers["total"]
+            paid.value_text(row, "id").unwrap_or_else(|| "?".to_owned()),
+            paid.value_text(row, "total")
+                .unwrap_or_else(|| "?".to_owned())
         );
     }
     Ok(())

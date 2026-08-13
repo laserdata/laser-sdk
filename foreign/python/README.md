@@ -2,7 +2,7 @@
 
 The [LaserData, Inc.](https://laserdata.com) SDK for Python: an open data-platform SDK over Apache Iggy. Native bindings to the Rust SDK via PyO3, so the wire contract, codecs, and runtime are the same ones the Rust client uses.
 
-Rust and Python are one v1 contract. Every public primitive, builder option, validation rule, error classification, capability, and transport limitation ships in both SDKs with matched examples and shared BDD coverage where the behavior is language-neutral.
+Rust and Python share one contract. Every public primitive, builder option, validation rule, error classification, capability, and transport limitation ships in both SDKs with matched examples and shared BDD coverage where the behavior is language-neutral.
 
 > **Current pre-1.0 release (`0.2.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
@@ -14,13 +14,13 @@ Apache Iggy is the underlying streaming core. Projections, the query layer, the 
 
 ## Install
 
-```
+```bash
 pip install laser-sdk
 ```
 
 Wheels ship for Linux (x86_64, aarch64) and macOS (Intel, Apple Silicon), Python 3.10 through 3.13.
 
-Every wheel and source build uses Apache Iggy's VSR cluster protocol. Python exposes no protocol switch: standard streaming commands, LaserData's non-replicated managed command band, and dedicated replicated authorization operations all use VSR.
+Every wheel and source build uses Apache Iggy's native VSR transport. Standard streaming commands, LaserData's non-replicated managed command band, and dedicated replicated authorization operations use the same connection.
 
 ## Connect
 
@@ -161,25 +161,83 @@ await batch.send()
 ## Query (managed)
 
 ```python
-rows = await (
+result = await (
     laser.query("orders")
     .where_eq("customer_id", "alice")
     .filter_gte("total", 100)
     .order_desc("total")
     .limit(10)
-    .with_payload()
-    .fetch_all()
+    .fetch()
 )
-for row in rows:
-    print(row.headers, row.json())
+for row in result.rows:
+    print(result.value_text(row, "customer_id"), result.value(row, "total"))
 ```
 
-`fetch()` returns the page metadata. `page.has_more` is always exact. An exact match count is opt-in because it runs a separate count over the full filter:
+Query results are schema-first. `result.fields` describes the ordered logical fields and each row contains tagged values in that exact order. Use `value()` when the value kind matters and `value_text()` for stable diagnostic output. This preserves integer widths, decimal precision, timestamps, UUIDs, bytes, structs, lists, maps, and nullability without converting the row into strings.
+
+Filter and parameter values accept the matching Python types directly: `bool`, `int`, `float`, `str`, `bytes`, `uuid.UUID`, `decimal.Decimal`, `datetime.date`, `datetime.time`, `datetime.datetime` (tz-aware becomes a UTC-instant timestamp, naive a zone-less one), `None`, and lists of those. Non-canonical values (a non-finite float or decimal, an out-of-range integer, a `time` carrying `tzinfo`) raise `InvalidError` at the builder call.
+
+`fetch()` returns one bounded page. `has_more` is true exactly when `next_cursor` is present. The SDK follows that opaque cursor in `fetch_all()`. An exact match count is opt-in because it runs a separate count over the full filter:
 
 ```python
 result = await laser.query("orders").where_eq("customer_id", "alice").with_total().fetch()
 print(result.total, result.has_more)
 ```
+
+Each query has a stable execution identity and absolute deadline. A long-running request can be inspected or cancelled through the same builder:
+
+```python
+request = laser.query("orders").filter_gte("total", 100).deadline_micros(deadline_micros)
+result = await request.fetch()
+status = await request.status()
+if status["state"] == "running":
+    await request.cancel()
+```
+
+Lakehouse queries always name one destination generation and can select a retained snapshot explicitly:
+
+```python
+result = await (
+    laser.query_lakehouse(destination_id, destination_generation)
+    .at_snapshot(snapshot_id)
+    .filter_eq("customer_id", "alice")
+    .limit(100)
+    .fetch()
+)
+print(result.context)
+```
+
+The returned context proves the resolved engine and target. Lakehouse pages also carry destination, table, snapshot, schema, partition-spec, materialization-boundary, checkpoint, and global-state evidence.
+
+## Destinations and Arrow IPC
+
+Destination reads and query routes are available from one managed accessor. Reads choose potentially stale or linearizable checkpoint state explicitly:
+
+```python
+destinations = laser.destinations()
+page = await destinations.list(limit=50, consistency="linearizable")
+routes = await destinations.query_routes(name_contains="orders", limit=50)
+current = await destinations.get(destination_id, consistency="linearizable")
+```
+
+Registration and desired-state changes are revision-guarded. `register()` takes one complete destination declaration and `set_desired_state()` compares both the global state revision and destination definition revision before applying a change.
+
+For analytical batches, publish one complete self-contained Arrow IPC stream per message. The SDK validates the contract version, schema fingerprint, counts, bounds, and exact byte length before transport I/O:
+
+```python
+metadata = {
+    "contract_version": 1,
+    "schema_fingerprint": schema_fingerprint,
+    "encoded_bytes": len(arrow_stream),
+    "field_count": 8,
+    "record_batch_count": 1,
+    "row_count": 10_000,
+    "dictionary_count": 0,
+}
+await orders.publish().arrow_ipc(arrow_stream, metadata).send()
+```
+
+Arrow input must use stream format, be self-contained, use microsecond timestamps, avoid dictionary replacement and deltas, keep decimals within 128 bits, and contain no unions or extension types.
 
 Query, the key-value store, the knowledge graph, and forks are managed features served by LaserData Cloud or Laser Stack. Against Apache Iggy without a managed backend they raise `UnsupportedError`.
 

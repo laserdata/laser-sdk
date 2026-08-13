@@ -1,6 +1,6 @@
 [package]
 name = "laser-wire"
-description = "LaserData wire contract: managed command codes, CBOR envelopes including the Agent Data Exchange Protocol (AGDX) agent envelope, the query IR, projections, schemas, KV, forks, and the HTTP surface. Runtime-free, wasm-compatible."
+description = "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX)."
 categories = ["encoding", "api-bindings", "wasm"]
 keywords = ["iggy", "laserdata", "wire", "cbor", "wasm"]
 readme = "README.md"
@@ -45,6 +45,10 @@ builders = ["dep:bon"]
 # query strings.
 http-client = ["cbor", "dep:serde_urlencoded"]
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+bson = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+
 [dependencies]
 bon = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
@@ -52,12 +56,9 @@ rmp-serde = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true, optional = true }
+sha2.workspace = true
 strum = { workspace = true }
 thiserror = { workspace = true }
-
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-bson = { workspace = true, optional = true }
-time = { workspace = true, optional = true }
 
 [[test]]
 name = "robustness"

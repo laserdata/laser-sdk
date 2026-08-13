@@ -16,7 +16,7 @@ The examples require Node 22.14 or later. SDK resources implement `AsyncDisposab
 
 ## Run locally
 
-Start an Apache Iggy server with VSR support, then run any example.
+Start Apache Iggy, then run any example. The SDK uses Iggy's native VSR transport.
 
 ```sh
 npm run example:native-streaming

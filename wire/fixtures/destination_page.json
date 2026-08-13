@@ -1,0 +1,227 @@
+{
+  "destinations": [
+    {
+      "destination": {
+        "id": "0000000000000000000000009C",
+        "generation": 2,
+        "definition_revision": 7,
+        "name": "orders-lakehouse",
+        "source": {
+          "stream": "shop",
+          "topic": "orders"
+        },
+        "recreated_partition_policy": "reject",
+        "projection": {
+          "id": "order.v1",
+          "version": 3
+        },
+        "schema": {
+          "id": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100
+          ],
+          "version": 2,
+          "fingerprint": [
+            92,
+            114,
+            229,
+            92,
+            196,
+            56,
+            207,
+            143,
+            39,
+            18,
+            198,
+            218,
+            59,
+            167,
+            55,
+            194,
+            123,
+            11,
+            55,
+            145,
+            114,
+            189,
+            188,
+            213,
+            173,
+            105,
+            60,
+            33,
+            165,
+            118,
+            177,
+            48
+          ]
+        },
+        "backend": {
+          "resource_id": "0000000000000000000000009D",
+          "generation": 5
+        },
+        "table": {
+          "namespace": [
+            "shop",
+            "analytics"
+          ],
+          "table": "orders",
+          "expected_table_uuid": [
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9,
+            9
+          ]
+        },
+        "file_format": "parquet",
+        "table_format": "iceberg_v2",
+        "start_policy": {
+          "kind": "captured_latest"
+        },
+        "new_partition_policy": "captured_latest",
+        "error_policy": "block",
+        "desired_state": "enabled"
+      },
+      "status": {
+        "destination_id": "0000000000000000000000009C",
+        "destination_generation": 2,
+        "backend": {
+          "resource_id": "0000000000000000000000009D",
+          "generation": 5
+        },
+        "schema": {
+          "id": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100
+          ],
+          "version": 2,
+          "fingerprint": [
+            92,
+            114,
+            229,
+            92,
+            196,
+            56,
+            207,
+            143,
+            39,
+            18,
+            198,
+            218,
+            59,
+            167,
+            55,
+            194,
+            123,
+            11,
+            55,
+            145,
+            114,
+            189,
+            188,
+            213,
+            173,
+            105,
+            60,
+            33,
+            165,
+            118,
+            177,
+            48
+          ]
+        },
+        "projection": {
+          "id": "order.v1",
+          "version": 3
+        },
+        "global_state_revision": 11,
+        "definition_revision": 7,
+        "checkpoint_revision": 3,
+        "desired_state": "enabled",
+        "effective_state": "running",
+        "table_uuid": [
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9,
+          9
+        ],
+        "owner": {
+          "owner": "000000000000000000000000CH",
+          "epoch": 2,
+          "sequence": 4,
+          "deadline_micros": 1717171747000000
+        },
+        "partitions": [
+          {
+            "incarnation": {
+              "cluster": "00000000000000000000000068",
+              "stream_id": 2,
+              "topic_id": 3,
+              "partition_id": 0,
+              "partition_created_revision": 4
+            },
+            "started_at_offset": 100,
+            "next_offset": 150,
+            "lifecycle": "active"
+          }
+        ],
+        "consistency": "linearizable"
+      }
+    }
+  ],
+  "next_cursor": "cursor-2",
+  "global_state_revision": 11,
+  "consistency": "linearizable"
+}

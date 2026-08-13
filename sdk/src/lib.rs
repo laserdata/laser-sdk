@@ -31,6 +31,8 @@ mod control;
 pub mod crash_context;
 #[cfg(feature = "streaming")]
 pub mod cursor;
+#[cfg(feature = "destinations")]
+pub mod destinations;
 #[cfg(any(feature = "a2a-bridge", feature = "mcp-bridge"))]
 pub mod edge_auth;
 pub mod error;
@@ -46,6 +48,7 @@ pub mod kv;
 pub mod laser;
 #[cfg(any(
     feature = "fork",
+    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",

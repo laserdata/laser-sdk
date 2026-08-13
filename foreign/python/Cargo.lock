@@ -2138,6 +2138,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "strum",
  "thiserror",
  "time",

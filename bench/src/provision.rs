@@ -121,7 +121,7 @@ fn resolve_paths(manifest: &SuiteManifest) -> Result<ResolvedStack, BenchError> 
         "iggy_server",
     )?)?;
     let server = BinaryManifest::inspect(
-        "iggy-server-ng",
+        "iggy-server",
         &server_path,
         "path",
         "caller-provided",

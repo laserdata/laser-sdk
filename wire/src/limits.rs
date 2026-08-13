@@ -85,6 +85,20 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// `MAX_FRAME_BYTES` in lockstep across the server, LaserData Cloud, and the
 /// socket buffer, since it is the same frame.
 pub const MAX_QUERY_REPLY_BYTES: usize = MAX_FRAME_BYTES;
+/// Maximum UTF-8 bytes in an operational index name or query engine label.
+pub const MAX_QUERY_NAME_BYTES: usize = 255;
+/// Maximum UTF-8 bytes in one read-only raw SQL statement.
+pub const MAX_RAW_SQL_BYTES: usize = 64 * 1024;
+/// Maximum number of positional raw SQL parameters.
+pub const MAX_QUERY_PARAMETERS: usize = 1024;
+/// Maximum UTF-8 bytes in an opaque query page cursor.
+pub const MAX_QUERY_CURSOR_BYTES: usize = 512;
+/// Maximum predicate nodes in one structured filter tree.
+pub const MAX_QUERY_PREDICATES: usize = 4096;
+/// Maximum selected, grouped, sorted, or exact-match fields in one query.
+pub const MAX_QUERY_FIELDS: usize = 4096;
+/// Maximum vector dimensions accepted by the generic query contract.
+pub const MAX_VECTOR_DIMENSIONS: usize = 65_536;
 
 /// The most managed requests one mixed-operation batch
 /// ([`AGDX_BATCH_CODE`](crate::codes::AGDX_BATCH_CODE)) may carry. Bounds the

@@ -838,6 +838,10 @@ export type AuthzSubject = {
 // @public (undocumented)
 export class BatchPublishRequest {
     constructor(topic: Topic);
+    // Warning: (ae-forgotten-export) The symbol "ArrowIpcMessageMetadata" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    addArrowIpc(payload: BytesLike, metadata: ArrowIpcMessageMetadata): this;
     // (undocumented)
     addAvro(schema: CompiledSchema, schemaId: number, value: unknown): this;
     // (undocumented)
@@ -975,6 +979,10 @@ export interface Capabilities {
     //
     // (undocumented)
     readonly backends: readonly BackendDescriptor[];
+    // Warning: (ae-forgotten-export) The symbol "DestinationCapabilities" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly destinations: DestinationCapabilities;
     // (undocumented)
     readonly durableDedup: boolean;
     // (undocumented)
@@ -1043,7 +1051,7 @@ export interface CapabilitySelector {
 export function capabilitySelector(skill: string, policy: RoutePolicy, principal?: PrincipalId): CapabilitySelector;
 
 // @public (undocumented)
-export type CapabilitySurface = "managed" | "query" | "kv" | "kvCas" | "kvCasFenced" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
+export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
 
 // @public (undocumented)
 export type CasExpect = {
@@ -1096,6 +1104,33 @@ export interface CheckedBody {
 
 // @public (undocumented)
 export function checkIn(store: BlobStore, thresholdBytes: number, payload: Uint8Array): Promise<CheckedBody>;
+
+// @public (undocumented)
+export interface CheckpointMutationResult {
+    // (undocumented)
+    readonly checkpointRevision: bigint;
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // Warning: (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // Warning: (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly lease?: CheckpointOwnerLease;
+    // Warning: (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
+}
+
+// @public (undocumented)
+export type CheckpointReadConsistency = "linearizable" | "potentially_stale";
 
 // @public (undocumented)
 export class ChunkAssembler {
@@ -1218,7 +1253,7 @@ export class ConfigError extends LaserError {
 }
 
 // @public (undocumented)
-export type Consistency = "eventual" | "readYourWrites" | "strong";
+export type Consistency = "eventual" | "read_your_writes" | "strong";
 
 // @public (undocumented)
 export interface ConsolidationReport {
@@ -1617,7 +1652,114 @@ export const DEFAULT_SNAPSHOT_TOPIC = "agent.snapshots";
 export function delegatedAllow(agent: readonly Grant[], user: readonly Grant[], feature: Feature, action: Action, resource?: string): boolean;
 
 // @public (undocumented)
-export type Delivery = "effectivelyOnce" | "atMostOnce";
+export interface DestinationCheckpointPage {
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly destinations: readonly DestinationCheckpointView[];
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // (undocumented)
+    readonly nextAfter?: DestinationId;
+}
+
+// @public (undocumented)
+export interface DestinationCheckpointStatus {
+    // Warning: (ae-forgotten-export) The symbol "BackendBinding" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly backend: BackendBinding;
+    // Warning: (ae-forgotten-export) The symbol "DestinationBlock" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly block?: DestinationBlock;
+    // (undocumented)
+    readonly checkpointRevision: bigint;
+    // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // Warning: (ae-forgotten-export) The symbol "DestinationDesiredState" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly desiredState: DestinationDesiredState;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // Warning: (ae-forgotten-export) The symbol "DestinationEffectiveState" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly effectiveState: DestinationEffectiveState;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
+    // Warning: (ae-forgotten-export) The symbol "CompletedAttempt" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly lastCompletion?: CompletedAttempt;
+    // Warning: (ae-forgotten-export) The symbol "RepairRecord" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly lastRepair?: RepairRecord;
+    // (undocumented)
+    readonly owner?: CheckpointOwnerLease;
+    // Warning: (ae-forgotten-export) The symbol "PartitionCheckpoint" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly partitions: readonly PartitionCheckpoint[];
+    // Warning: (ae-forgotten-export) The symbol "PreparedAttemptSummary" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly preparedAttempt?: PreparedAttemptSummary;
+    // Warning: (ae-forgotten-export) The symbol "ProjectionRef" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly projection: ProjectionRef;
+    // Warning: (ae-forgotten-export) The symbol "RetentionGap" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly retentionGap?: RetentionGap;
+    // (undocumented)
+    readonly schema: LogicalSchemaRef;
+    // (undocumented)
+    readonly tableUuid?: Uint8Array;
+}
+
+// @public (undocumented)
+export interface DestinationCheckpointView {
+    // (undocumented)
+    readonly destination: MaterializationDestination;
+    // (undocumented)
+    readonly status: DestinationCheckpointStatus;
+}
+
+// @public (undocumented)
+export class Destinations {
+    // Warning: (ae-forgotten-export) The symbol "ManagedTransport" needs to be exported by the entry point index.d.ts
+    constructor(transport: ManagedTransport, capabilities: () => Promise<Capabilities>);
+    // (undocumented)
+    get(destinationId: DestinationId, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointView | undefined>;
+    // Warning: (ae-forgotten-export) The symbol "DestinationListFilter" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    list(filter?: DestinationListFilter, after?: DestinationId, limit?: number, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointPage>;
+    // (undocumented)
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation): Promise<CheckpointMutationResult>;
+    // Warning: (ae-forgotten-export) The symbol "QueryRoutePage" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    queryRoutes(nameContains?: string, after?: QueryRouteId, limit?: number, consistency?: CheckpointReadConsistency): Promise<QueryRoutePage>;
+    // (undocumented)
+    register(expectedGlobalStateRevision: bigint, destination: MaterializationDestination): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    registerQueryRoute(expectedGlobalStateRevision: bigint, route: QueryRoute): Promise<CheckpointMutationResult>;
+    // Warning: (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    removeQueryRoute(expectedGlobalStateRevision: bigint, routeId: QueryRouteId, routeGeneration: bigint, expectedDefinitionRevision: bigint): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
+}
 
 // @public (undocumented)
 export interface EdgeClaims {
@@ -1766,7 +1908,7 @@ export function filterNegate(filter: Filter): Filter;
 // Warning: (ae-forgotten-export) The symbol "CmpOp" needs to be exported by the entry point index.d.ts
 //
 // @public (undocumented)
-export function filterPred(fieldName: string, op: CmpOp, value: Value): Filter;
+export function filterPred(fieldName: string, op: CmpOp, value: TypedValue): Filter;
 
 // @public (undocumented)
 export const FINISH_REASON_ABANDONED = "abandoned";
@@ -2818,6 +2960,8 @@ export class Laser implements AsyncDisposable {
     defineRole(role: Role): Promise<void>;
     // (undocumented)
     deleteRole(name: string): Promise<void>;
+    // (undocumented)
+    destinations(): Destinations;
     // Warning: (ae-forgotten-export) The symbol "BatchItem" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
@@ -2873,6 +3017,10 @@ export class Laser implements AsyncDisposable {
     quarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void>;
     // (undocumented)
     query(index: string): QueryRequest;
+    // (undocumented)
+    queryLakehouse(destinationId: DestinationId, destinationGeneration: bigint): QueryRequest;
+    // (undocumented)
+    queryTarget(target: QueryTarget): QueryRequest;
     // (undocumented)
     reassembleChannel(conversation: ConversationId, topic: string, channel: ChannelId): Promise<readonly StreamEvent[]>;
     // (undocumented)
@@ -3018,6 +3166,67 @@ export interface LlmUsage {
 }
 
 // @public (undocumented)
+export interface LogicalField {
+    // (undocumented)
+    readonly doc?: string;
+    // (undocumented)
+    readonly fieldType: LogicalType;
+    // (undocumented)
+    readonly id: number;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly required: boolean;
+}
+
+// @public (undocumented)
+export interface LogicalSchema {
+    // (undocumented)
+    readonly fields: readonly LogicalField[];
+    // (undocumented)
+    readonly schema: LogicalSchemaRef;
+}
+
+// @public (undocumented)
+export interface LogicalSchemaRef {
+    // (undocumented)
+    readonly fingerprint: Uint8Array;
+    // Warning: (ae-forgotten-export) The symbol "LogicalSchemaId" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly id: LogicalSchemaId;
+    // (undocumented)
+    readonly version: number;
+}
+
+// @public (undocumented)
+export type LogicalType = {
+    readonly kind: "boolean" | "int" | "long" | "float" | "double" | "date" | "time_micros" | "timestamp_micros" | "timestamp_tz_micros" | "string" | "uuid" | "binary";
+} | {
+    readonly kind: "decimal";
+    readonly precision: number;
+    readonly scale: number;
+} | {
+    readonly kind: "fixed";
+    readonly length: number;
+} | {
+    readonly kind: "struct";
+    readonly fields: readonly LogicalField[];
+} | {
+    readonly kind: "list";
+    readonly elementId: number;
+    readonly elementRequired: boolean;
+    readonly element: LogicalType;
+} | {
+    readonly kind: "map";
+    readonly keyId: number;
+    readonly key: LogicalType;
+    readonly valueId: number;
+    readonly valueRequired: boolean;
+    readonly value: LogicalType;
+};
+
+// @public (undocumented)
 export class LogMemory implements Memory {
     constructor(laser: Laser, namespace: string, topic?: string, stream?: string | undefined);
     // (undocumented)
@@ -3045,6 +3254,58 @@ export class LogMemory implements Memory {
     readonly topic: string;
     // (undocumented)
     update(key: string, patch: Uint8Array): Promise<void>;
+}
+
+// @public (undocumented)
+export interface MaterializationDestination {
+    // (undocumented)
+    readonly backend: BackendBinding;
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly desiredState: DestinationDesiredState;
+    // Warning: (ae-forgotten-export) The symbol "DestinationErrorPolicy" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly errorPolicy: DestinationErrorPolicy;
+    // Warning: (ae-forgotten-export) The symbol "FileFormat" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly fileFormat: FileFormat;
+    // (undocumented)
+    readonly generation: bigint;
+    // (undocumented)
+    readonly id: DestinationId;
+    // (undocumented)
+    readonly name: string;
+    // Warning: (ae-forgotten-export) The symbol "NewPartitionPolicy" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly newPartitionPolicy: NewPartitionPolicy;
+    // (undocumented)
+    readonly projection: ProjectionRef;
+    // Warning: (ae-forgotten-export) The symbol "RecreatedPartitionPolicy" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly recreatedPartitionPolicy: RecreatedPartitionPolicy;
+    // (undocumented)
+    readonly schema: LogicalSchemaRef;
+    // Warning: (ae-forgotten-export) The symbol "SourceScope" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly source: SourceScope;
+    // Warning: (ae-forgotten-export) The symbol "StartPolicy" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly startPolicy: StartPolicy;
+    // Warning: (ae-forgotten-export) The symbol "PhysicalTable" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly table: PhysicalTable;
+    // Warning: (ae-forgotten-export) The symbol "TableFormat" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly tableFormat: TableFormat;
 }
 
 // @public (undocumented)
@@ -3622,15 +3883,17 @@ export interface ProjectionBinding {
     // (undocumented)
     readonly allowedProjections: readonly ProjectionId[];
     // (undocumented)
+    readonly backend?: BackendBinding;
+    // (undocumented)
     readonly defaultProjection?: ProjectionId;
+    // (undocumented)
+    readonly index: string;
     // (undocumented)
     readonly notify: boolean;
     // (undocumented)
     readonly retention?: RetentionPolicy;
     // (undocumented)
     readonly source: SourceSelector;
-    // (undocumented)
-    readonly targets: readonly Target[];
 }
 
 // @public (undocumented)
@@ -3730,8 +3993,103 @@ export interface Provenance {
 export function provenancePartitionKey(provenance: Provenance): string;
 
 // @public (undocumented)
+export type PublicCheckpointMutation = {
+    readonly kind: "register_destination";
+    readonly destination: MaterializationDestination;
+} | {
+    readonly kind: "register_query_route";
+    readonly route: QueryRoute;
+} | {
+    readonly kind: "remove_query_route";
+    readonly routeId: QueryRouteId;
+    readonly routeGeneration: bigint;
+    readonly expectedDefinitionRevision: bigint;
+} | {
+    readonly kind: "bind_table";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedDefinitionRevision: bigint;
+    readonly tableUuid: Uint8Array;
+} | {
+    readonly kind: "set_desired_state";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedDefinitionRevision: bigint;
+    readonly desiredState: DestinationDesiredState;
+} | {
+    readonly kind: "add_partition" | "observe_partition_lifecycle";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly partitionId: number;
+} | {
+    readonly kind: "acquire_lease" | "takeover_lease";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly owner: CheckpointOwnerId;
+    readonly expectedLeaseSequence: bigint;
+    readonly leaseDurationMicros: bigint;
+} | {
+    readonly kind: "renew_lease";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly owner: CheckpointOwnerId;
+    readonly epoch: bigint;
+    readonly expectedLeaseSequence: bigint;
+    readonly leaseDurationMicros: bigint;
+} | {
+    readonly kind: "prepare";
+    readonly expectedCheckpointRevision: bigint;
+    readonly attempt: PreparedAttempt;
+} | {
+    readonly kind: "complete";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly owner: CheckpointOwnerId;
+    readonly epoch: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly completion: CompletedAttempt;
+} | {
+    readonly kind: "record_block";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly block: DestinationBlock;
+} | {
+    readonly kind: "clear_block";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly expectedCode: DestinationBlockCode;
+} | {
+    readonly kind: "record_retention_gap";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly gap: RetentionGap;
+} | {
+    readonly kind: "accept_retention_gap";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly nextOffset: bigint;
+} | {
+    readonly kind: "supersede_generation";
+    readonly expectedDefinitionRevision: bigint;
+    readonly replacement: MaterializationDestination;
+} | {
+    readonly kind: "record_repair";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly expectedCheckpointRevision: bigint;
+    readonly repair: RepairRecord;
+};
+
+// @public (undocumented)
 export class PublishRequest {
     constructor(topic: Topic);
+    // (undocumented)
+    arrowIpc(bytes: BytesLike, metadata: ArrowIpcMessageMetadata): this;
     // (undocumented)
     avro(schema: CompiledSchema, schemaId: number, value: unknown): this;
     // (undocumented)
@@ -3798,7 +4156,8 @@ export class QueryExecutionError extends LaserError {
 // @public (undocumented)
 export class QueryRequest {
     // Warning: (ae-forgotten-export) The symbol "QueryExecutor" needs to be exported by the entry point index.d.ts
-    constructor(index: string, execute: QueryExecutor);
+    // Warning: (ae-forgotten-export) The symbol "QueryStatusExecutor" needs to be exported by the entry point index.d.ts
+    constructor(indexOrTarget: string | QueryTarget, execute: QueryExecutor, readStatus?: QueryStatusExecutor, cancelExecution?: QueryStatusExecutor);
     // Warning: (ae-forgotten-export) The symbol "AggFunc" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
@@ -3808,7 +4167,10 @@ export class QueryRequest {
     }): this;
     // (undocumented)
     avg(field: string, alias?: string): this;
-    byKey(field: string, value: string): this;
+    // (undocumented)
+    byKey(field: string, value: string | TypedValue): this;
+    // (undocumented)
+    cancel(): Promise<QueryExecutionStatus>;
     // (undocumented)
     consistency(level: Consistency): this;
     // (undocumented)
@@ -3818,7 +4180,15 @@ export class QueryRequest {
     // (undocumented)
     countDistinct(field: string, alias?: string): this;
     // (undocumented)
+    cursor(value: string): this;
+    // (undocumented)
+    deadlineMicros(value: bigint): this;
+    // (undocumented)
     distinct(): this;
+    // Warning: (ae-forgotten-export) The symbol "QueryExecutionId" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    executionId(value: QueryExecutionId): this;
     // (undocumented)
     fetch(): Promise<QueryResult>;
     // (undocumented)
@@ -3834,19 +4204,19 @@ export class QueryRequest {
     // (undocumented)
     filterContains(field: string, value: string): this;
     // (undocumented)
-    filterEq(field: string, value: Value): this;
+    filterEq(field: string, value: TypedValue): this;
     // (undocumented)
-    filterGt(field: string, value: Value): this;
+    filterGt(field: string, value: TypedValue): this;
     // (undocumented)
-    filterGte(field: string, value: Value): this;
+    filterGte(field: string, value: TypedValue): this;
     // (undocumented)
-    filterIn(field: string, values: readonly Value[]): this;
+    filterIn(field: string, values: readonly TypedValue[]): this;
     // (undocumented)
-    filterLt(field: string, value: Value): this;
+    filterLt(field: string, value: TypedValue): this;
     // (undocumented)
-    filterLte(field: string, value: Value): this;
+    filterLte(field: string, value: TypedValue): this;
     // (undocumented)
-    filterNe(field: string, value: Value): this;
+    filterNe(field: string, value: TypedValue): this;
     // (undocumented)
     filterPrefix(field: string, value: string): this;
     // (undocumented)
@@ -3874,21 +4244,27 @@ export class QueryRequest {
     // (undocumented)
     nearestIn(field: string, embedding: readonly number[], topK: number): this;
     // (undocumented)
-    offset(value: number): this;
+    offset(value: bigint | number): this;
     // (undocumented)
     orderAsc(field: string): this;
     // (undocumented)
     orderDesc(field: string): this;
     // (undocumented)
     percentile(field: string, fraction: number, alias?: string): this;
+    // Warning: (ae-forgotten-export) The symbol "SqlDialect" needs to be exported by the entry point index.d.ts
+    //
     // (undocumented)
-    rawSql(sql: string, params?: readonly Value[]): this;
+    rawSql(sql: string, params?: readonly TypedValue[], dialect?: SqlDialect): this;
     // (undocumented)
     readYourWrites(): this;
     // (undocumented)
     rows(): AsyncIterable<Row>;
     // (undocumented)
     selectFields(fields: readonly string[]): this;
+    // Warning: (ae-forgotten-export) The symbol "QueryExecutionStatus" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    status(): Promise<QueryExecutionStatus>;
     // (undocumented)
     stdDev(field: string, alias?: string): this;
     // (undocumented)
@@ -3899,7 +4275,8 @@ export class QueryRequest {
     textIn(field: string, query: string): this;
     // (undocumented)
     timeRange(startMicros: bigint, endMicros: bigint): this;
-    whereEq(field: string, value: string): this;
+    // (undocumented)
+    whereEq(field: string, value: string | TypedValue): this;
     // (undocumented)
     window(field: string, everyMicros: bigint): this;
     // (undocumented)
@@ -3910,6 +4287,12 @@ export class QueryRequest {
 
 // @public (undocumented)
 export interface QueryResult {
+    // Warning: (ae-forgotten-export) The symbol "QueryContext" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly context: QueryContext;
+    // (undocumented)
+    readonly fields: readonly LogicalField[];
     // Warning: (ae-forgotten-export) The symbol "Page" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
@@ -3917,6 +4300,46 @@ export interface QueryResult {
     // (undocumented)
     readonly rows: readonly Row[];
 }
+
+// @public (undocumented)
+export function queryResultValue(result: QueryResult, row: Row, name: string): TypedValue | undefined;
+
+// @public (undocumented)
+export interface QueryRoute {
+    // (undocumented)
+    readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly desiredState: DestinationDesiredState;
+    // (undocumented)
+    readonly generation: bigint;
+    // (undocumented)
+    readonly id: QueryRouteId;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly target: QueryRouteTarget;
+}
+
+// @public (undocumented)
+export type QueryRouteTarget = {
+    readonly kind: "operational";
+    readonly index: string;
+} | {
+    readonly kind: "lakehouse";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+};
+
+// @public (undocumented)
+export type QueryTarget = {
+    readonly kind: "operational";
+    readonly index: string;
+} | {
+    readonly kind: "lakehouse";
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly snapshot?: SnapshotSelector;
+};
 
 // @public (undocumented)
 export class QuorumGovernor implements ActionGovernor {
@@ -4004,6 +4427,8 @@ class Record_2 {
     index(key: string, value: string): this;
     // (undocumented)
     inlinePayload(): this;
+    // (undocumented)
+    logicalSchemaFingerprint(value: Uint8Array): this;
     // (undocumented)
     projectionRef(value: string): this;
     // (undocumented)
@@ -4305,21 +4730,9 @@ export function routeToPrincipal(agent: AgentId, principal: PrincipalId): Router
 // @public (undocumented)
 export interface Row {
     // (undocumented)
-    readonly headers: ReadonlyMap<string, string>;
-    // (undocumented)
-    readonly metadata: ReadonlyMap<string, string>;
-    // (undocumented)
-    readonly offset?: bigint;
-    // (undocumented)
-    readonly partition?: number;
-    // (undocumented)
-    readonly payload?: Uint8Array;
-    // (undocumented)
     readonly score?: number;
     // (undocumented)
-    readonly stream?: number;
-    // (undocumented)
-    readonly topic?: number;
+    readonly values: readonly TypedValue[];
 }
 
 // @public (undocumented)
@@ -4687,23 +5100,6 @@ export class SystemClock implements Clock {
 }
 
 // @public (undocumented)
-export interface Target {
-    // (undocumented)
-    readonly backend: string;
-    // (undocumented)
-    readonly delivery: Delivery;
-    // (undocumented)
-    readonly required: boolean;
-    // (undocumented)
-    readonly role: TargetRole;
-    // (undocumented)
-    readonly table: string;
-}
-
-// @public (undocumented)
-export type TargetRole = "readWrite" | "writeOnly";
-
-// @public (undocumented)
 export function taskFromEnvelope(taskId: string, envelope: AgentEnvelope): A2aTask;
 
 // @public (undocumented)
@@ -4929,6 +5325,47 @@ export class TypedTopic<T> {
 export type TypedTopicKind = "json" | "cbor" | "schema";
 
 // @public (undocumented)
+export type TypedValue = {
+    readonly kind: "null";
+} | {
+    readonly kind: "boolean";
+    readonly value: boolean;
+} | {
+    readonly kind: "int";
+    readonly value: number;
+} | {
+    readonly kind: "long" | "time_micros" | "timestamp_micros" | "timestamp_tz_micros";
+    readonly value: bigint;
+} | {
+    readonly kind: "date";
+    readonly value: number;
+} | {
+    readonly kind: "float" | "double";
+    readonly value: number;
+} | {
+    readonly kind: "decimal";
+    readonly value: DecimalValue;
+} | {
+    readonly kind: "string";
+    readonly value: string;
+} | {
+    readonly kind: "uuid" | "fixed" | "binary";
+    readonly value: Uint8Array;
+} | {
+    readonly kind: "struct";
+    readonly value: readonly FieldValue[];
+} | {
+    readonly kind: "list";
+    readonly value: readonly TypedValue[];
+} | {
+    readonly kind: "map";
+    readonly value: readonly MapEntry[];
+};
+
+// @public (undocumented)
+export function typedValueDiagnosticText(value: TypedValue): string;
+
+// @public (undocumented)
 export interface UlidSource {
     // (undocumented)
     fillRandom(bytes: Uint8Array): void;
@@ -5143,7 +5580,14 @@ export class ZeroEmbedder implements Embedder {
 // src/agent/reliable-consumer.ts:158:7 - (ae-forgotten-export) The symbol "SignatureContext" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:63:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:63:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
-// src/wire/query.ts:79:30 - (ae-forgotten-export) The symbol "Predicate" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:285:7 - (ae-forgotten-export) The symbol "CheckpointOwnerId" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:301:7 - (ae-forgotten-export) The symbol "PreparedAttempt" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:324:7 - (ae-forgotten-export) The symbol "DestinationBlockCode" needs to be exported by the entry point index.d.ts
+// src/wire/query.ts:44:7 - (ae-forgotten-export) The symbol "SnapshotSelector" needs to be exported by the entry point index.d.ts
+// src/wire/query.ts:64:30 - (ae-forgotten-export) The symbol "Predicate" needs to be exported by the entry point index.d.ts
+// src/wire/schema.ts:124:33 - (ae-forgotten-export) The symbol "DecimalValue" needs to be exported by the entry point index.d.ts
+// src/wire/schema.ts:127:32 - (ae-forgotten-export) The symbol "FieldValue" needs to be exported by the entry point index.d.ts
+// src/wire/schema.ts:129:29 - (ae-forgotten-export) The symbol "MapEntry" needs to be exported by the entry point index.d.ts
 
 // (No @packageDocumentation comment for this package)
 

@@ -1,6 +1,6 @@
 import { InvalidError } from "../client/errors.js"
 import type { IggyHeaderValue } from "../iggy/apache-iggy.js"
-import { contentTypeCode, type ContentType } from "../wire/content.js"
+import { ContentType, contentTypeCode } from "../wire/content.js"
 import {
   CONTENT_TYPE,
   HEADER_FRAMING_BYTES,
@@ -8,6 +8,7 @@ import {
   HEADER_VALUE_MAX,
   IDX_PREFIX,
   INLINE_PAYLOAD,
+  LOGICAL_SCHEMA_FINGERPRINT,
   PROJECTION_REF,
   SCHEMA_ID
 } from "../wire/headers.js"
@@ -19,6 +20,7 @@ interface RecordSnapshot {
   readonly contentType?: ContentType
   readonly projectionRef?: string
   readonly schemaId?: number
+  readonly logicalSchemaFingerprint?: Uint8Array
   readonly inlinePayload: boolean
   readonly index: readonly (readonly [string, string])[]
   readonly metadata: readonly (readonly [string, string])[]
@@ -28,6 +30,7 @@ export class Record {
   private contentTypeValue: ContentType | undefined
   private projectionRefValue: string | undefined
   private schemaIdValue: number | undefined
+  private logicalSchemaFingerprintValue: Uint8Array | undefined
   private shouldInlinePayload = false
   private readonly indexedValues: [string, string][] = []
   private readonly metadataValues: [string, string][] = []
@@ -47,6 +50,12 @@ export class Record {
       throw new InvalidError("schema id must be an unsigned 32-bit integer")
     }
     this.schemaIdValue = value
+    return this
+  }
+
+  logicalSchemaFingerprint(value: Uint8Array): this {
+    if (value.length !== 32) throw new InvalidError("logical schema fingerprint must be 32 bytes")
+    this.logicalSchemaFingerprintValue = value.slice()
     return this
   }
 
@@ -70,6 +79,9 @@ export class Record {
       ...(this.contentTypeValue !== undefined ? { contentType: this.contentTypeValue } : {}),
       ...(this.projectionRefValue !== undefined ? { projectionRef: this.projectionRefValue } : {}),
       ...(this.schemaIdValue !== undefined ? { schemaId: this.schemaIdValue } : {}),
+      ...(this.logicalSchemaFingerprintValue !== undefined
+        ? { logicalSchemaFingerprint: this.logicalSchemaFingerprintValue.slice() }
+        : {}),
       inlinePayload: this.shouldInlinePayload,
       index: this.indexedValues.map(([key, value]) => [key, value]),
       metadata: this.metadataValues.map(([key, value]) => [key, value])
@@ -124,6 +136,17 @@ export function recordHeaders(record: Record): ReadonlyMap<string, IggyHeaderVal
   if (value.schemaId !== undefined) {
     headers.set(SCHEMA_ID, { kind: "uint32", value: value.schemaId })
   }
+  if (value.contentType === ContentType.Arrow) {
+    if (value.logicalSchemaFingerprint === undefined) {
+      throw new InvalidError("Arrow IPC records require a logical schema fingerprint")
+    }
+    headers.set(LOGICAL_SCHEMA_FINGERPRINT, {
+      kind: "raw",
+      value: value.logicalSchemaFingerprint.slice()
+    })
+  } else if (value.logicalSchemaFingerprint !== undefined) {
+    throw new InvalidError("logical schema fingerprints are valid only for Arrow IPC records")
+  }
   if (value.inlinePayload) headers.set(INLINE_PAYLOAD, { kind: "bool", value: true })
   if (value.index.length > MAX_INDEX_ENTRIES_PER_RECORD) {
     throw new InvalidError(
@@ -145,7 +168,15 @@ export function recordHeaders(record: Record): ReadonlyMap<string, IggyHeaderVal
         `metadata header \`${key}\` collides with the \`${IDX_PREFIX}\` namespace, use index() instead`
       )
     }
-    if ([CONTENT_TYPE, SCHEMA_ID, PROJECTION_REF, INLINE_PAYLOAD].includes(key)) {
+    if (
+      [
+        CONTENT_TYPE,
+        SCHEMA_ID,
+        LOGICAL_SCHEMA_FINGERPRINT,
+        PROJECTION_REF,
+        INLINE_PAYLOAD
+      ].includes(key)
+    ) {
       throw new InvalidError(
         `metadata header \`${key}\` is reserved, use the dedicated builder method`
       )
@@ -171,9 +202,12 @@ export function mergeRecord(defaults: Record, override: Record): Record {
   const contentType = own.contentType ?? base.contentType
   const projectionRef = own.projectionRef ?? base.projectionRef
   const schemaId = own.schemaId ?? base.schemaId
+  const logicalSchemaFingerprint = own.logicalSchemaFingerprint ?? base.logicalSchemaFingerprint
   if (contentType !== undefined) merged.contentType(contentType)
   if (projectionRef !== undefined) merged.projectionRef(projectionRef)
   if (schemaId !== undefined) merged.schemaId(schemaId)
+  if (logicalSchemaFingerprint !== undefined)
+    merged.logicalSchemaFingerprint(logicalSchemaFingerprint)
   if (base.inlinePayload || own.inlinePayload) merged.inlinePayload()
   for (const [key, value] of base.index) merged.index(key, value)
   for (const [key, value] of own.index) merged.index(key, value)

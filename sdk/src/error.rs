@@ -67,6 +67,9 @@ pub enum LaserError {
     /// The streaming server answered an authorization op with a typed failure.
     #[error("authz: {0}")]
     Authz(#[from] laser_wire::authz::AuthzError),
+    /// Iggy answered a destination or checkpoint operation with a typed failure.
+    #[error("checkpoint: {0}")]
+    Checkpoint(Box<laser_wire::checkpoint::CheckpointError>),
     /// A client-side encode or decode failed (payload codec, wire envelope,
     /// reply bytes). Deterministic for a given input, so never retryable.
     #[error("codec: {0}")]
@@ -197,6 +200,12 @@ impl From<InvalidError> for LaserError {
     }
 }
 
+impl From<laser_wire::checkpoint::CheckpointError> for LaserError {
+    fn from(error: laser_wire::checkpoint::CheckpointError) -> Self {
+        Self::Checkpoint(Box::new(error))
+    }
+}
+
 // An envelope rejected by the AGDX validity matrix at publish time: validation,
 // so the caller fixes the envelope, never retries.
 impl From<laser_wire::agent::ValidateError> for LaserError {
@@ -233,6 +242,7 @@ impl From<CommandError> for LaserError {
 /// fallback never misfires on a genuine reply.
 #[cfg(any(
     feature = "fork",
+    feature = "destinations",
     feature = "graph",
     feature = "kv",
     feature = "projections",
@@ -317,6 +327,7 @@ impl LaserError {
             Self::Fork(error) => ResultCode::from(error).is_retryable(),
             Self::Agent(error) => ResultCode::from(error).is_retryable(),
             Self::Graph(error) => ResultCode::from(error).is_retryable(),
+            Self::Checkpoint(error) => ResultCode::from(error.as_ref()).is_retryable(),
             Self::Handler(_)
             | Self::Timeout(_)
             | Self::PolicyDeferred(_)
@@ -367,6 +378,10 @@ impl LaserError {
             self,
             Self::Query(QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_))
                 | Self::Fork(ForkError::NotFound(_))
+        ) || matches!(
+            self,
+            Self::Checkpoint(error)
+                if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::NotFound)
         )
     }
 
@@ -379,6 +394,10 @@ impl LaserError {
             Self::Query(QueryError::Version { .. })
                 | Self::Kv(KvError::Version { .. })
                 | Self::Fork(ForkError::Version { .. })
+        ) || matches!(
+            self,
+            Self::Checkpoint(error)
+                if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Version { .. })
         )
     }
 
@@ -407,6 +426,10 @@ impl LaserError {
             self,
             Self::Iggy(IggyError::Unauthorized | IggyError::Unauthenticated)
                 | Self::RoutePrincipalMismatch { .. }
+        ) || matches!(
+            self,
+            Self::Checkpoint(error)
+                if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Unauthorized)
         )
     }
 
@@ -468,6 +491,7 @@ impl LaserError {
             Self::Fork(error) => ResultCode::from(error),
             Self::Graph(error) => ResultCode::from(error),
             Self::Agent(error) => ResultCode::from(error),
+            Self::Checkpoint(error) => ResultCode::from(error.as_ref()),
             Self::Unsupported { .. } | Self::NoStream | Self::NoRespondTopic => {
                 ResultCode::Unsupported
             }

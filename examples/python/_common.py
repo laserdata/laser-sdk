@@ -208,15 +208,7 @@ async def start_projector(laser, topic, fields, *, index=None, content_type="jso
             # Opt into the change feed so a reader can await the view's advance
             # (laser.watch()) instead of re-querying blind.
             "notify": True,
-            "targets": [
-                {
-                    "backend": "embedded",
-                    "table": index,
-                    "role": "read_write",
-                    "delivery": "effectively_once",
-                    "required": True,
-                }
-            ],
+            "index": index,
         }
     )
     # The registration is applied asynchronously: a query errors until the table

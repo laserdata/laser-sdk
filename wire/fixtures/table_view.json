@@ -1,0 +1,35 @@
+{
+  "table_uuid": [
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9,
+    9
+  ],
+  "destination_id": "0000000000000000000000009C",
+  "destination_generation": 2,
+  "namespace": [
+    "shop",
+    "analytics"
+  ],
+  "table": "orders",
+  "current_snapshot_id": 42,
+  "current_schema_id": 3,
+  "current_partition_spec_id": 1,
+  "metadata_identity": "metadata/v2.json",
+  "properties": {
+    "format-version": "2",
+    "write.format.default": "parquet"
+  }
+}

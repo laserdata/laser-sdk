@@ -24,4 +24,4 @@ New to the SDK? Each primitive has its own tiny example (25-50 lines, one primit
 - **Python:** [`python/README.md`](python/README.md) - the Python ports, the same environment conventions, one runnable script per scenario.
 - **TypeScript:** [`typescript/README.md`](typescript/README.md) - the native Node ports and package-level smoke tests.
 
-Examples run on the repository's pinned VSR Apache Iggy service, Laser Stack, or LaserData Cloud with no code change. Laser Stack runs the complete managed examples locally. Against Apache Iggy without `laser-plane`, phases that need KV, query, forks, graph, RBAC, or the run registry print the missing capability and exit cleanly.
+Examples run on Apache Iggy, Laser Stack, or LaserData Cloud with no code change. Laser Stack runs the complete managed examples locally. Against Apache Iggy without `laser-plane`, phases that need KV, query, forks, graph, RBAC, or the run registry print the missing capability and exit cleanly.

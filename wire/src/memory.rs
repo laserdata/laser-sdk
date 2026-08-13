@@ -21,7 +21,7 @@ pub enum MemoryRecord {
     Feedback { target: String, weight: f32 },
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
     use crate::framing::{decode_named, encode_named};

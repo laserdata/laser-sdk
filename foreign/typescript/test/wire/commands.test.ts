@@ -73,6 +73,9 @@ import {
   encodeKvSet
 } from "../../src/wire/kv.js"
 import { encodeQueryEnvelopeFrame } from "../../src/wire/query.js"
+import { newQuery, operationalTarget } from "../../src/wire/query.js"
+import { QueryExecutionId } from "../../src/wire/ids.js"
+import { QUERY_OP_VERSION } from "../../src/wire/codes.js"
 
 function assertFramed<Request>(
   command: ManagedCommand<Request, unknown>,
@@ -88,12 +91,13 @@ void test("given_the_command_registry_when_checked_then_should_pin_every_rust_co
     MANAGED_COMMANDS.map((command) => command.code),
     [
       1_000_100, 1_000_101, 1_000_102, 1_000_103, 1_000_104, 1_000_105, 1_000_106, 1_000_200,
-      1_000_210, 1_000_211, 1_000_220, 1_000_221, 1_000_222, 1_000_223, 1_000_300, 1_000_301,
-      1_000_302, 1_000_303, 1_000_304, 1_000_305, 1_000_400, 1_000_401, 1_000_402, 1_000_403,
-      1_000_404, 1_000_700, 1_000_701, 1_000_702, 1_000_703
+      1_000_201, 1_000_202, 1_000_203, 1_000_021, 1_000_022, 1_000_023, 1_000_024, 1_000_210,
+      1_000_211, 1_000_220, 1_000_221, 1_000_222, 1_000_223, 1_000_300, 1_000_301, 1_000_302,
+      1_000_303, 1_000_304, 1_000_305, 1_000_400, 1_000_401, 1_000_402, 1_000_403, 1_000_404,
+      1_000_700, 1_000_701, 1_000_702, 1_000_703
     ]
   )
-  assert.equal(new Set(MANAGED_COMMANDS.map((command) => command.code)).size, 29)
+  assert.equal(new Set(MANAGED_COMMANDS.map((command) => command.code)).size, 36)
 })
 
 void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the_exact_wire_codec", () => {
@@ -106,17 +110,8 @@ void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the
   assertFramed(BindRolesCommand, { userId: 7, roles: ["reader"] }, encodeBindRolesReq)
 
   const query = {
-    query: {
-      index: "orders",
-      byKey: [],
-      order: [],
-      limit: 10,
-      offset: 0,
-      distinct: false,
-      select: { fields: [], payload: false },
-      consistency: "eventual" as const,
-      wantTotal: false
-    }
+    v: QUERY_OP_VERSION,
+    query: newQuery(operationalTarget("orders"), QueryExecutionId.fromU128(1n), 10_000n)
   }
   assert.deepEqual(QueryCommand.encode(query), encodeQueryEnvelopeFrame(query))
 
