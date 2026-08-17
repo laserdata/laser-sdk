@@ -3,6 +3,7 @@ export {
   ConfigError,
   NoStreamError,
   TimeoutError,
+  AmbiguousMutationError,
   CancelledError,
   UnsupportedError,
   InvalidError,
@@ -112,6 +113,7 @@ export {
   KvCopyRequest
 } from "./managed/kv.js"
 export type { Lease } from "./managed/kv.js"
+export type { MutationPosition } from "./wire/mutation.js"
 export type {
   KvEntry,
   KvPage,
@@ -261,7 +263,13 @@ export { Agent, AgentBuilder, AgentHandle } from "./agent/builder.js"
 export type { AgentConsolidator } from "./agent/builder.js"
 export { ContractBuilder, ScatterReport } from "./agent/contract.js"
 export type { Contract, ScatterOutcome } from "./agent/contract.js"
-export { Budget, StepBuilder, Workflow, topologicalOrder } from "./agent/workflow.js"
+export {
+  Budget,
+  StepBuilder,
+  WORKFLOW_FENCE_NAMESPACE,
+  Workflow,
+  topologicalOrder
+} from "./agent/workflow.js"
 export type {
   OnTimeout,
   StepContext,

@@ -243,6 +243,7 @@ impl From<&KvError> for ResultCode {
             KvError::LeaseLost => ResultCode::Conflict,
             KvError::NotFound => ResultCode::NotFound,
             KvError::NotLeader => ResultCode::Unavailable,
+            KvError::Stale { .. } => ResultCode::Stale,
         }
     }
 }

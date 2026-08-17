@@ -50,6 +50,27 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 /// so it is bounded and control-character-free, while its charset stays open
 /// (namespaces legitimately carry `/`-style hierarchy).
 pub const MAX_NAMESPACE_BYTES: usize = 128;
+/// Maximum lease holder identity length, in bytes. A holder id is a stable
+/// node or worker identifier that flows into lease matching and audit events,
+/// so it is required to be non-empty and length-bounded. Its charset is open.
+pub const MAX_HOLDER_ID_BYTES: usize = 128;
+/// Shortest lease (and renewal) lifetime a request may ask for, in
+/// microseconds. Unlike a scan limit, a lease TTL is not clamped up by the
+/// store: a grant is only ever shorter than the request, so a floor is the only
+/// place the contract can keep a lease long enough to survive one round trip
+/// plus the holder's own renewal cadence. Below it, a holder would trip its
+/// deadline before it could renew, which is a caller bug worth rejecting
+/// locally rather than a lease worth granting.
+pub const MIN_LEASE_TTL_MICROS: u64 = 1_000_000;
+/// Longest lease (and renewal) lifetime a request may ask for, in
+/// microseconds. A lease is a bounded-TTL lock whose whole purpose is that a
+/// dead holder's ownership expires; an unbounded request would let one crashed
+/// holder park a key for hours. The ceiling matches
+/// [`crate::authz::MAX_SUPERVISOR_ASSERTION_TTL_MICROS`]: the same "how long
+/// may one unattended grant outlive the process that asked for it" question.
+/// The store may still grant less (`granted_ttl_micros`), so this bounds the
+/// *request*, and a holder needing longer renews.
+pub const MAX_LEASE_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
 
 // Fork caps. A fork id is a caller-chosen name (e.g. `"experiment-2026-q2"`),
 // so its length is a validatable input cap like a KV key: the client rejects an

@@ -33,6 +33,14 @@ pub mod feature {
     pub const AUTHZ: u64 = 1 << 7;
     /// The deployment serves destination and checkpoint lifecycle operations.
     pub const DESTINATIONS: u64 = 1 << 8;
+    /// The key-value store serves the revocable fenced-lease contract at
+    /// `KV_LEASE_OP_VERSION`: holder-scoped acquire, renewal
+    /// (`AGDX_KV_LEASE_RENEW`), holder-and-fence-validated release, fenced
+    /// compare-and-swap requiring a live lease, and the barriered read
+    /// (`KvGet::min_position`). Subsumes [`KV_CAS_FENCED`]: a client must not
+    /// send the reshaped lease ops (or a barriered read) to a server without
+    /// this bit, which would silently decode them under the old contract.
+    pub const KV_FENCED_LEASES: u64 = 1 << 9;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability

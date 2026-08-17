@@ -48,6 +48,7 @@ export const AGDX_KV_RELEASE_CODE = AGDX_KV_BASE + 11
 export const AGDX_KV_CAS_FENCED_CODE = AGDX_KV_BASE + 12
 export const AGDX_KV_COPY_CODE = AGDX_KV_BASE + 13
 export const AGDX_KV_MOVE_CODE = AGDX_KV_BASE + 14
+export const AGDX_KV_LEASE_RENEW_CODE = AGDX_KV_BASE + 15
 
 export const AGDX_FORK_BASE = AGDX_COMMAND_BASE + 400
 export const AGDX_FORK_CREATE_CODE = AGDX_FORK_BASE
@@ -72,6 +73,9 @@ export const QUERY_OP_VERSION = 1
 export const CONTROL_OP_VERSION = 1
 export const CHECKPOINT_OP_VERSION = 1
 export const KV_OP_VERSION = 1
+// The fenced-lease op family (lease, renew, release, fenced CAS): bumped by
+// the holder-identity reshape so a v1 payload can never be mistaken for v2.
+export const KV_LEASE_OP_VERSION = 2
 export const FORK_OP_VERSION = 1
 export const GRAPH_OP_VERSION = 1
 export const AGENT_WORKFLOW_OP_VERSION = 1
@@ -91,6 +95,7 @@ const IDEMPOTENT_MANAGED_REQUESTS = new Set([
   AGDX_KV_EXPIRE_CODE,
   AGDX_KV_PATCH_CODE,
   AGDX_KV_LEASE_CODE,
+  AGDX_KV_LEASE_RENEW_CODE,
   AGDX_KV_RELEASE_CODE,
   AGDX_KV_CAS_FENCED_CODE,
   AGDX_KV_COPY_CODE,

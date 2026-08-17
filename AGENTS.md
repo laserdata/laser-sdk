@@ -71,12 +71,12 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
     topics.rs           _agdx ops stream + topic names
     limits.rs           page / KV / frame / agent-envelope caps
     content.rs          ContentType + the agdx.ct u8 dictionary
-    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
+    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
     query.rs            query IR (incl. Consistency level) + QueryEnvelope/QueryReply/Row/QueryError (incl. Stale)
     result.rs           unified ResultCode space + HTTP status, From projections off every surface error
     browse.rs           registry browse requests + BrowseReply (incl. DecodeRecord)
     control.rs          Projection / ProjectionBinding / SchemaDef / ControlEnvelope + builders
-    kv.rs               KV requests (incl. KvCas/CasExpect) + KvReply (incl. Committed) / KvError (incl. VersionConflict) + entry version
+    kv.rs               KV requests (incl. KvCas/CasExpect and the fenced-lease family KvLease/KvLeaseRenew/KvRelease/KvCasFenced at KV_LEASE_OP_VERSION 2: holder identity, delegated subject, coordination namespace, barriered KvGet.min_position) + KvReply (incl. Committed/Leased/Renewed) / KvError (incl. VersionConflict/LeaseLost/Stale) + entry version
     fork.rs             fork requests + ForkReply/ForkError
     agent.rs            the Agent Data Exchange Protocol: AgentEnvelope, machine ids (16-byte u128 + Crockford), agent ids (bounded name strings)
                         base32), AgentKind, TaskState/AgentErrorCode/DeadLetterReason u8
@@ -219,7 +219,13 @@ sdk/src/
   watch.rs            Laser::watch() -> Watch: the ChangeRecord feed a projection binding opts
                       into, await-then-query instead of poll-and-retry (feature = "watch")
   kv/                 mod.rs re-exports the wire KV surface, client.rs (Kv handle,
-                      get/set/delete/scan builders) behind feature = "kv"
+                      get/set/delete/scan builders, holder-scoped lease/renew_lease/release,
+                      barriered get_entry_at_least), coordination.rs (FencedLeaseClient: typed
+                      fenced-lease client over an injectable ManagedKvTransport, PreparedMutation
+                      minting one stable operation id per logical mutation and reusing the exact
+                      envelope across ambiguous retries, DedicatedKvTransport actively closing a
+                      retired connection before reconnect, DynManagedKvTransport/SharedKvTransport
+                      = Arc<dyn ..> for a runtime-selected transport), behind feature = "kv"
   fork/               mod.rs re-exports the wire fork surface, client.rs (ForkHandle,
                       create/promote/squash/put_row) behind feature = "fork"
   rbac/               mod.rs: Laser::whoami + list_roles/get_role/get_bindings/define_role/
@@ -329,7 +335,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.2.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.2.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 
@@ -356,7 +362,7 @@ These features exist to exercise the **seams** the paid tiers plug into: their p
 - Discovery: a capability card (`Laser::publish_card`, auto-published by the builder), a live inbox (`AgentPresence` over `set_client_metadata`), fused by `AgentRegistry` into a resolve-by-capability view (health-aware, excludes quarantined agents). `Laser::quarantine`/`unquarantine` are reversible registry facts, and `quarantine_signed`/`unquarantine_signed` (`sign` feature) fold only with a verified signature. `Laser::agent_registry` caches the fold per data-stream and resumes instead of re-reading from offset 0.
 - Routing: `Router::{To,Broadcast,ToCapable,AllCapable}` + `InboxRoute::{Advertised,Fixed}`, resolving to an advertised inbox, never a hard-coded shared topic.
 - Coordination: `Laser::contract` -> `Contract::{Completed,Failed,NotConsumed,TimedOut}` (ack-on-pickup `Working`), `AgentCtx::fan_out` + `Laser::scatter` (gather under `GatherPolicy::{RequireAll,Quorum,BestEffort}`), `AgentCtx::approval_gate`. With a verifier enrolled, the contract reply path verifies a reply's signature before accepting a terminal.
-- Workflow engine (`Laser::workflow`): topo-ordered steps, `Budget` (tokens/wall-clock/invocations), `verify_with` panels, saga `compensate_with`, crash-recovery journal/replay/resume, `all_capable` scatter steps, and a per-step `.exclusive()` claiming a fenced lease (`acquire_fence`, kv-gated, fails closed as `Unsupported` without the `KV_CAS_FENCED` capability). `StepHandle::on_timeout(OnTimeout::{Fail,Reassign})`: `Reassign` bumps the fence sequence to gate out the timed-out holder. The durable cross-holder at-most-once external effect is the handler's own fenced `Kv::cas_fenced` commit, and the engine only provides the token and the same-holder replay gate.
+- Workflow engine (`Laser::workflow`): topo-ordered steps, `Budget` (tokens/wall-clock/invocations), `verify_with` panels, saga `compensate_with`, crash-recovery journal/replay/resume, `all_capable` scatter steps, and a per-step `.exclusive()` claiming a fenced lease (`acquire_fence`, kv-gated, fails closed as `Unsupported` without the `KV_FENCED_LEASES` capability). Renewal stays in the race with contract completion and is bounded by expiry and workflow deadline. The lease remains held through verification and the completion journal append, then `StepHandle::on_timeout(OnTimeout::Reassign)` can release and reacquire under a fresh fence. The durable cross-holder at-most-once external effect is the handler's own fenced `Kv::cas_fenced` commit, and the engine only provides the token and the same-holder replay gate.
 - Bound in Python (`Laser.contract`/`scatter`/`quarantine`, `spawn_agent` capabilities/ack_on_pickup/health, `AgentCtx.fan_out`/`approval_gate`, and the `agent_message`/`agent_ctx` handler-test seam), matched by the `orchestra` example (Rust + Python).
 
 **Still planned, not present:**

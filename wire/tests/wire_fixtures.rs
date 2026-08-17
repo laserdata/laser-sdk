@@ -36,7 +36,8 @@ use laser_wire::clients::{ClientMetadata, ClientMetadataList, ClientMetadataQuer
 use laser_wire::codes::{
     AGDX_KV_SET_CODE, AGENT_OP_VERSION, AGENT_WORKFLOW_OP_VERSION, AUTHZ_OP_VERSION,
     BATCH_OP_VERSION, CHANGE_OP_VERSION, CHECKPOINT_OP_VERSION, CLIENT_METADATA_OP_VERSION,
-    CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
+    CONTROL_OP_VERSION, FORK_OP_VERSION, GRAPH_OP_VERSION, KV_LEASE_OP_VERSION, KV_OP_VERSION,
+    QUERY_OP_VERSION,
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
@@ -73,11 +74,11 @@ use laser_wire::http::{
 };
 use laser_wire::keys::{KEY_ID_BYTES, KeyKind, KeyRecord, VERIFYING_KEY_BYTES};
 use laser_wire::kv::{
-    CasExpect, KvCas, KvCasFenced, KvCopy, KvEntry, KvError, KvMove, KvNamespaceInfo, KvNamespaces,
-    KvOutcome, KvPage, KvReply, KvScan, KvSet,
+    CasExpect, KvCas, KvCasFenced, KvCopy, KvEntry, KvError, KvGet, KvLease, KvLeaseRenew, KvMove,
+    KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvRelease, KvReply, KvScan, KvSet,
 };
 use laser_wire::mutation::{
-    MANAGED_REQUEST_VERSION, ManagedRequestEnvelope, MutationCommandEnvelope,
+    MANAGED_REQUEST_VERSION, ManagedRequestEnvelope, MutationCommandEnvelope, MutationPosition,
 };
 use laser_wire::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Page, Query,
@@ -1589,15 +1590,97 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "kv_cas_fenced.bin",
         &KvCasFenced {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION,
             namespace: "effects".to_owned(),
             key: b"apply-credit:order-7".to_vec(),
             value: b"done".to_vec(),
             expires_at_micros: None,
             expect: CasExpect::Absent,
+            fence_namespace: "coordination".to_owned(),
             fence_key: b"task:order-7".to_vec(),
             fence_token: 3,
         },
+    );
+    assert_frame(
+        "kv_lease.bin",
+        &KvLease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "coordination".to_owned(),
+            key: b"task:order-7".to_vec(),
+            lease_ttl_micros: 30_000_000,
+            holder_id: "worker-1".to_owned(),
+            subject_user_id: Some(42),
+        },
+    );
+    assert_frame(
+        "kv_lease_renew.bin",
+        &KvLeaseRenew {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "coordination".to_owned(),
+            key: b"task:order-7".to_vec(),
+            holder_id: "worker-1".to_owned(),
+            subject_user_id: None,
+            lease_token: 3,
+            lease_ttl_micros: 30_000_000,
+        },
+    );
+    assert_frame(
+        "kv_release.bin",
+        &KvRelease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "coordination".to_owned(),
+            key: b"task:order-7".to_vec(),
+            lease_token: 3,
+            holder_id: "worker-1".to_owned(),
+        },
+    );
+    assert_frame(
+        "kv_get_barriered.bin",
+        &KvGet {
+            v: KV_OP_VERSION,
+            namespace: "state".to_owned(),
+            key: b"source_state/pg".to_vec(),
+            if_none_match: None,
+            min_position: Some(MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 512,
+            }),
+        },
+    );
+    assert_frame(
+        "kv_reply_leased.bin",
+        &KvReply::Ok(KvOutcome::Leased {
+            lease_token: 3,
+            granted_ttl_micros: 30_000_000,
+            position: MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 512,
+            },
+        }),
+    );
+    assert_frame(
+        "kv_reply_renewed.bin",
+        &KvReply::Ok(KvOutcome::Renewed {
+            lease_token: 3,
+            granted_ttl_micros: 30_000_000,
+            position: MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 513,
+            },
+        }),
+    );
+    assert_frame(
+        "kv_reply_stale.bin",
+        &KvReply::Err(KvError::Stale {
+            required: MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 512,
+            },
+        }),
     );
     assert_frame(
         "kv_copy.bin",

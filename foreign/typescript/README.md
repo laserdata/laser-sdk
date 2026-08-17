@@ -4,7 +4,7 @@ The native TypeScript client for [LaserData, Inc.](https://laserdata.com) SDK ov
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Current pre-1.0 release (`0.2.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.2.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 ## Install
 
@@ -176,7 +176,7 @@ TypeScript duration inputs use milliseconds. `noExpiry()` keeps the raw memory h
 
 ## Agents and coordination
 
-The agent layer adds provenance, typed AGDX commands and responses, chunked streams, registry and presence, routing, reliable commit-after-handle delivery, deduplication, retry and dead-letter handling, contracts, scatter, and workflow execution. Workflow journals support replay and resume, verifier panels, budgets, compensation, and fenced steps.
+The agent layer adds provenance, typed AGDX commands and responses, chunked streams, registry and presence, routing, reliable commit-after-handle delivery, deduplication, retry and dead-letter handling, contracts, scatter, and workflow execution. Workflow journals support replay and resume, verifier panels, budgets, compensation, and fenced steps. Lease acquisition is never replayed automatically after reconnect. An ambiguous acquire waits through its requested TTL before raising `AmbiguousMutationError`. Exclusive workflows keep the lease through verification and completion journaling, while renewal remains in the race with contract completion and is bounded before lease expiry.
 
 Context, snapshots, log and vector memory, action governance, replayable intent decisions, Ed25519 signing, delegation, A2A, MCP, AG-UI, and edge authorization are available from the root package. With a verifier enrolled, every correlated reply wait (contracts, the request/reply hub, `requestInput`) refuses unsigned or unverified responses, verification binds the observed record headers at the broker-stamped record time, and an agent built with a signing key signs its `respond` and `respondInput` answers. The managed `KvKeyRegistry` enrolls, revokes, and snapshots versioned key records through the platform. The SDK transports model provenance but does not invoke a model.
 
@@ -202,7 +202,7 @@ Waiting operations accept `AbortSignal` or an explicit timeout where their contr
 
 ## Errors and ownership
 
-All SDK failures extend `LaserError` and carry a stable `kind`. Configuration, timeout, cancellation, unsupported managed capability, codec, transport, policy, and signature failures have dedicated subclasses. Catch the narrow subclass when recovery differs, otherwise report the base error with its cause.
+All SDK failures extend `LaserError` and carry a stable `kind`. Configuration, timeout, cancellation, ambiguous mutation, unsupported managed capability, codec, transport, policy, and signature failures have dedicated subclasses. Catch the narrow subclass when recovery differs, otherwise report the base error with its cause.
 
 `Laser.connect*()` owns its Apache Iggy client. `Laser.builder()` can instead borrow or own an injected client explicitly. `Laser`, `Producer`, `Consumer`, and `AgentHandle` support `await using`. Their explicit `close()` and `shutdown()` methods remain idempotent. Closing a scoped view never closes the root connection.
 

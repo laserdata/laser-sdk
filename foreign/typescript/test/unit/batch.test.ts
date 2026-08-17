@@ -4,7 +4,7 @@ import { OPEN_CAPABILITIES, managedCapabilitiesFrom } from "../../src/client/cap
 import { InvalidError, UnsupportedError } from "../../src/client/errors.js"
 import { executeBatch } from "../../src/managed/batch.js"
 import { encodeBatchReply } from "../../src/wire/batch.js"
-import { AGDX_BATCH_CODE } from "../../src/wire/codes.js"
+import { AGDX_BATCH_CODE, AGDX_KV_CAS_FENCED_CODE } from "../../src/wire/codes.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import { MAX_BATCH_OPS } from "../../src/wire/limits.js"
 
@@ -73,6 +73,23 @@ void test("given_a_nested_batch_op_when_executed_then_should_reject_before_the_t
   await assert.rejects(
     executeBatch(transport, MANAGED, [{ code: AGDX_BATCH_CODE, payload: new Uint8Array() }]),
     InvalidError
+  )
+  assert.equal(sent, false)
+})
+
+void test("given_a_fenced_item_without_the_capability_when_batched_then_should_reject_before_transport", async () => {
+  let sent = false
+  const transport = {
+    sendManaged(): Promise<Uint8Array> {
+      sent = true
+      return Promise.resolve(new Uint8Array())
+    }
+  }
+  await assert.rejects(
+    executeBatch(transport, MANAGED, [
+      { code: AGDX_KV_CAS_FENCED_CODE, payload: new Uint8Array() }
+    ]),
+    UnsupportedError
   )
   assert.equal(sent, false)
 })

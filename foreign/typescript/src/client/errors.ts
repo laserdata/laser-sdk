@@ -2,6 +2,7 @@ export type LaserErrorKind =
   | "config"
   | "no-stream"
   | "timeout"
+  | "ambiguous-mutation"
   | "cancelled"
   | "unsupported"
   | "invalid"
@@ -53,6 +54,12 @@ export class NoStreamError extends LaserError {
 export class TimeoutError extends LaserError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, "timeout", options)
+  }
+}
+
+export class AmbiguousMutationError extends LaserError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, "ambiguous-mutation", options)
   }
 }
 

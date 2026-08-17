@@ -17,7 +17,7 @@ import { ADVERTISED_INBOX_ROUTE, type InboxRoute, type Router } from "./router.j
 const STEP_BUDGET_FLOOR_MS = 100
 const DEFAULT_STEP_DEADLINE_MS = 30_000
 const MAX_REASSIGNMENTS = 2
-const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence"
+export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence"
 const WORKFLOW_LEASE_TTL_MICROS = 60_000_000n
 
 export class Budget {
@@ -84,6 +84,7 @@ interface CompletedDispatch {
   readonly kind: "completed"
   readonly body: Uint8Array
   readonly tokens: bigint
+  readonly finalized?: true
 }
 
 type StepDispatch =
@@ -287,10 +288,9 @@ export class Workflow {
         const payload = ownedBytes(await step.build({ outputs }))
         const dispatched = await this.dispatch(source, step, payload, started, runId)
         tokensSpent += dispatched.tokens
-        if (step.verifier !== undefined && !(await step.verifier(dispatched.body))) {
-          throw new HandlerConfigError(`workflow step \`${step.label}\` failed verification`)
+        if (dispatched.finalized !== true) {
+          await this.finalizeStep(runId, step, dispatched.body)
         }
-        await this.journal(runId, step.label, dispatched.body)
         outputs.set(step.label, dispatched.body)
         completed.push(index)
         this.checkBudget(invocations, tokensSpent, started)
@@ -300,6 +300,13 @@ export class Workflow {
       }
     }
     return { outputs, runId }
+  }
+
+  private async finalizeStep(runId: ConversationId, step: Step, output: Uint8Array): Promise<void> {
+    if (step.verifier !== undefined && !(await step.verifier(output))) {
+      throw new HandlerConfigError(`workflow step \`${step.label}\` failed verification`)
+    }
+    await this.journal(runId, step.label, output)
   }
 
   private validateStep(step: Step): void {
@@ -374,28 +381,109 @@ export class Workflow {
     runId: ConversationId
   ): Promise<CompletedDispatch> {
     const capabilities = await this.laser.capabilities()
-    if (!capabilities.kv.casFenced) {
+    if (!capabilities.kv.fencedLeases) {
       throw new UnsupportedError("an exclusive step needs the plane's monotonic fence sequence")
     }
     const taskConversation = ConversationId.derive(`${runId.toString()}/${step.label}`)
     const attempts = step.onTimeout === "reassign" ? MAX_REASSIGNMENTS + 1 : 1
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const lease = await this.laser
-        .kv(step.fenceNamespace ?? WORKFLOW_FENCE_NAMESPACE)
-        .lease(new TextEncoder().encode(runId.toString()), WORKFLOW_LEASE_TTL_MICROS)
-      const outcome = stepDispatch(
-        await this.laser
-          .contract(step.target)
-          .from(source)
-          .payload(payload)
-          .inboxRoute(this.route)
-          .deadline(this.stepDeadline(started))
-          .fence(lease.token)
-          .conversation(taskConversation)
-          .send()
+      const kv = this.laser.kv(step.fenceNamespace ?? WORKFLOW_FENCE_NAMESPACE)
+      const key = new TextEncoder().encode(runId.toString())
+      const holder = `workflow:${runId.toString()}:${String(attempt + 1)}`
+      let lease = await kv.lease(key, holder, WORKFLOW_LEASE_TTL_MICROS)
+      let leaseExpiresAt = performance.now() + leaseDurationMs(lease.grantedTtlMicros)
+      const contract = this.laser
+        .contract(step.target)
+        .from(source)
+        .payload(payload)
+        .inboxRoute(this.route)
+        .deadline(this.stepDeadline(started))
+        .fence(lease.token)
+        .conversation(taskConversation)
+        .send()
+      const completed = contract.then(
+        async (outcome) => {
+          try {
+            const dispatch = stepDispatch(outcome)
+            if (dispatch.kind === "completed") {
+              await this.finalizeStep(runId, step, dispatch.body)
+            }
+            return { kind: "contract" as const, ok: true as const, dispatch }
+          } catch (error) {
+            return { kind: "contract" as const, ok: false as const, error }
+          }
+        },
+        (error: unknown) => ({ kind: "contract" as const, ok: false as const, error })
       )
-      if (outcome.kind === "completed") return outcome
-      if (outcome.kind !== "timedOut") break
+      let attemptResult:
+        | { readonly ok: true; readonly dispatch: StepDispatch }
+        | { readonly ok: false; readonly error: unknown }
+      try {
+        for (;;) {
+          const tick = renewalTick(renewalDelayMs(lease.grantedTtlMicros))
+          const next = await Promise.race([
+            completed,
+            tick.promise.then(() => ({ kind: "renew" as const }))
+          ])
+          tick.cancel()
+          if (next.kind === "contract") {
+            attemptResult = next.ok
+              ? { ok: true, dispatch: next.dispatch }
+              : { ok: false, error: next.error }
+            break
+          }
+          const renewalBound = Math.min(
+            leaseExpiresAt - performance.now(),
+            this.stepDeadline(started)
+          )
+          if (renewalBound < 1) {
+            throw new HandlerConfigError(
+              "the exclusive workflow lease cannot be renewed before expiry"
+            )
+          }
+          const renewal = kv.renewLease(key, holder, lease.token, WORKFLOW_LEASE_TTL_MICROS).then(
+            (value) => ({ kind: "renewed" as const, ok: true as const, value }),
+            (error: unknown) => ({ kind: "renewed" as const, ok: false as const, error })
+          )
+          const expiry = renewalTick(renewalBound)
+          const pending = await Promise.race([
+            completed,
+            renewal,
+            expiry.promise.then(() => ({ kind: "expired" as const }))
+          ])
+          if (pending.kind === "contract") {
+            const settled = await Promise.race([
+              renewal,
+              expiry.promise.then(() => ({ kind: "expired" as const }))
+            ])
+            expiry.cancel()
+            if (settled.kind === "expired") {
+              throw new HandlerConfigError("the exclusive workflow lease expired during renewal")
+            }
+            if (!settled.ok) throw settled.error
+            lease = settled.value
+            attemptResult = pending.ok
+              ? { ok: true, dispatch: pending.dispatch }
+              : { ok: false, error: pending.error }
+            break
+          }
+          expiry.cancel()
+          if (pending.kind === "expired") {
+            throw new HandlerConfigError("the exclusive workflow lease expired during renewal")
+          }
+          if (!pending.ok) throw pending.error
+          lease = pending.value
+          leaseExpiresAt = performance.now() + leaseDurationMs(lease.grantedTtlMicros)
+        }
+      } catch (error) {
+        attemptResult = { ok: false, error }
+      }
+      const released = await kv.release(key, holder, lease.token)
+      if (!released) throw new HandlerConfigError("the exclusive workflow lease was lost")
+      if (!attemptResult.ok) throw attemptResult.error
+      const dispatch = attemptResult.dispatch
+      if (dispatch.kind === "completed") return { ...dispatch, finalized: true }
+      if (dispatch.kind !== "timedOut") break
     }
     throw new HandlerConfigError("an exclusive workflow step did not complete")
   }
@@ -467,6 +555,30 @@ export class Workflow {
         BigInt(Math.trunc(wallClockLimitMs * 1000)),
         BigInt(Math.trunc(elapsed * 1000))
       )
+    }
+  }
+}
+
+function renewalDelayMs(grantedTtlMicros: bigint): number {
+  const halfMillis = grantedTtlMicros / 2_000n
+  return Number(
+    halfMillis > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : halfMillis
+  )
+}
+
+function leaseDurationMs(grantedTtlMicros: bigint): number {
+  const millis = (grantedTtlMicros + 999n) / 1_000n
+  return Number(millis > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : millis)
+}
+
+function renewalTick(milliseconds: number): { readonly promise: Promise<void>; cancel(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return {
+    promise: new Promise((resolve) => {
+      timer = setTimeout(resolve, milliseconds)
+    }),
+    cancel: () => {
+      if (timer !== undefined) clearTimeout(timer)
     }
   }
 }

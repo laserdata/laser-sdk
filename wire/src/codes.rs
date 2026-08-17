@@ -142,18 +142,22 @@ pub const AGDX_KV_EXPIRE_CODE: u32 = AGDX_KV_BASE + 8;
 /// Managed command code: apply a merge patch to a structured value (the formal
 /// `PATCH` primitive).
 pub const AGDX_KV_PATCH_CODE: u32 = AGDX_KV_BASE + 9;
-/// Managed command code: acquire an advisory lease on a key (the formal `LEASE`
-/// primitive). A backend that cannot serve it returns a clean unsupported error.
+/// Managed command code: acquire a revocable lease on a key (the formal `LEASE`
+/// primitive). Carries the stable holder identity and an optional delegated
+/// subject at [`KV_LEASE_OP_VERSION`]. Served only by a deployment advertising
+/// the `KV_FENCED_LEASES` feature bit; a backend that cannot serve it returns a
+/// clean unsupported error.
 pub const AGDX_KV_LEASE_CODE: u32 = AGDX_KV_BASE + 10;
-/// Managed command code: release an advisory lease early (the formal `RELEASE`
-/// primitive).
+/// Managed command code: release a held lease early (the formal `RELEASE`
+/// primitive). Requires the same holder and the current fence token, validated
+/// against the fence sequence, never the resetting lease-row version.
 pub const AGDX_KV_RELEASE_CODE: u32 = AGDX_KV_BASE + 11;
-/// Managed command code: fenced compare-and-swap. Applies the CAS only while the
-/// task's fence sequence still equals the presented token (the at-most-one
-/// effective-writer gate). Additive over [`KV_OP_VERSION`] 1: a backend or server
-/// that does not serve it rejects the code, which the client surfaces as an
-/// unsupported error. Whether it is served is advertised by the `kv_cas_fenced`
-/// capability flag.
+/// Managed command code: fenced compare-and-swap. Applies the CAS in one
+/// backend transaction that also requires a live lease at the request's
+/// coordination namespace and key plus a fence sequence equal to the presented
+/// token (the at-most-one effective-writer gate). Rides
+/// [`KV_LEASE_OP_VERSION`]; served only under the `KV_FENCED_LEASES` feature
+/// bit, which subsumes the older fence-only `kv_cas_fenced` flag.
 pub const AGDX_KV_CAS_FENCED_CODE: u32 = AGDX_KV_BASE + 12;
 /// Managed command code: copy the value at one key to another key (possibly in
 /// another namespace) in a single backend transaction. Reuses the kv outcomes:
@@ -162,6 +166,11 @@ pub const AGDX_KV_COPY_CODE: u32 = AGDX_KV_BASE + 13;
 /// Managed command code: move the value at one key to another key. Copy plus
 /// delete of the source, one backend transaction, the same outcomes.
 pub const AGDX_KV_MOVE_CODE: u32 = AGDX_KV_BASE + 14;
+/// Managed command code: extend a held lease without changing its token (the
+/// formal `RENEW` primitive). Requires the same holder and subject, a live
+/// lease, and the current fence token; never bumps the fence. Rides
+/// [`KV_LEASE_OP_VERSION`] under the `KV_FENCED_LEASES` feature bit.
+pub const AGDX_KV_LEASE_RENEW_CODE: u32 = AGDX_KV_BASE + 15;
 
 // Fork block (1_000_400..): agentic copy-on-write branches of the materialized
 // read model. Each op is its own managed command, forwarded over the same bridge.
@@ -223,6 +232,14 @@ pub const QUERY_OP_VERSION: u32 = 1;
 pub const CONTROL_OP_VERSION: u32 = 1;
 /// Wire version of the KV op envelopes.
 pub const KV_OP_VERSION: u32 = 1;
+/// Wire version of the fenced-lease op family: `KvLease`, `KvLeaseRenew`,
+/// `KvRelease`, and `KvCasFenced`. Bumped past [`KV_OP_VERSION`] by the
+/// holder-identity reshape so a v1 payload and a v2 payload can never be
+/// mistaken for each other: the reshaped fields are required with no serde
+/// defaults (an old payload fails decode) and [`crate::validate::Validate`]
+/// rejects any other `v` (a typed error, fail-closed). The rest of the KV
+/// surface stays at [`KV_OP_VERSION`].
+pub const KV_LEASE_OP_VERSION: u32 = 2;
 /// Wire version of the fork op envelopes.
 pub const FORK_OP_VERSION: u32 = 1;
 /// Wire version of the graph op envelopes.
@@ -268,6 +285,7 @@ pub const fn is_idempotent_managed_request(code: u32) -> bool {
             | AGDX_KV_EXPIRE_CODE
             | AGDX_KV_PATCH_CODE
             | AGDX_KV_LEASE_CODE
+            | AGDX_KV_LEASE_RENEW_CODE
             | AGDX_KV_RELEASE_CODE
             | AGDX_KV_CAS_FENCED_CODE
             | AGDX_KV_COPY_CODE

@@ -23,12 +23,13 @@ export async function executeManaged<Request, Reply>(
   transport: ManagedTransport,
   capabilities: Capabilities,
   command: ManagedCommand<Request, Reply>,
-  request: Request
+  request: Request,
+  options?: { readonly retryAfterReconnect?: boolean }
 ): Promise<Reply> {
   requireCapability(capabilities, command.surface)
   requireVersion(capabilities, command)
   command.validate?.(request)
   const payload = command.encode(request)
-  const reply = await transport.sendManaged(command.code, payload)
+  const reply = await transport.sendManaged(command.code, payload, options)
   return command.decode(reply)
 }

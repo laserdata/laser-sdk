@@ -2,6 +2,20 @@ use serde::{Deserialize, Serialize};
 
 pub const MANAGED_REQUEST_VERSION: u32 = 1;
 
+/// Position of one applied mutation on the KV mutation topic: the fold
+/// coordinate a barriered read waits for. A lease grant or renewal returns the
+/// position at which the answering fold applied it, and a
+/// [`crate::kv::KvGet`] carrying it as `min_position` must not be answered by
+/// a fold that has not applied that position yet. Positions compare only
+/// within one `topic_generation`: a generation mismatch is fail-closed
+/// ([`crate::kv::KvError::Stale`]), never an implicit reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationPosition {
+    pub topic_generation: u64,
+    pub partition: u32,
+    pub offset: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedRequestEnvelope {
     pub v: u32,

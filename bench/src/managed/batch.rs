@@ -160,6 +160,7 @@ impl BatchOperationContext {
                     namespace: self.namespace.clone(),
                     key: key(id),
                     if_none_match: None,
+                    min_position: None,
                 };
                 items.push(BatchItem {
                     code: AGDX_KV_GET_CODE,
@@ -172,6 +173,7 @@ impl BatchOperationContext {
                 namespace: self.namespace.clone(),
                 key: key(id),
                 if_none_match: None,
+                min_position: None,
             };
             items.push(BatchItem {
                 code: AGDX_KV_GET_CODE,

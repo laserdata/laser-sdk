@@ -24,7 +24,8 @@
   "kv": {
     "available": true,
     "cas": true,
-    "cas_fenced": false
+    "cas_fenced": false,
+    "fenced_leases": false
   },
   "graph": false,
   "fork": true,

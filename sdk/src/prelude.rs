@@ -5,6 +5,8 @@
 pub use crate::error::LaserError;
 pub use crate::types::{AgentId, ConsumerGroupName, ConversationId, MessageId, PrincipalId};
 
+#[cfg(all(feature = "agent", feature = "kv"))]
+pub use crate::agent::WORKFLOW_FENCE_NAMESPACE;
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,

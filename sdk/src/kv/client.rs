@@ -2,26 +2,33 @@ use crate::error::LaserError;
 use crate::kv::{
     AGDX_KV_CAS_CODE, AGDX_KV_CAS_FENCED_CODE, AGDX_KV_COPY_CODE, AGDX_KV_DELETE_CODE,
     AGDX_KV_DELETE_MANY_CODE, AGDX_KV_EXISTS_CODE, AGDX_KV_EXPIRE_CODE, AGDX_KV_GET_CODE,
-    AGDX_KV_LEASE_CODE, AGDX_KV_MOVE_CODE, AGDX_KV_NAMESPACES_CODE, AGDX_KV_PATCH_CODE,
+    AGDX_KV_LEASE_RENEW_CODE, AGDX_KV_MOVE_CODE, AGDX_KV_NAMESPACES_CODE, AGDX_KV_PATCH_CODE,
     AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE, AGDX_KV_SET_CODE, CasExpect, DEFAULT_SCAN_LIMIT,
-    KV_OP_VERSION, KvCas, KvCasFenced, KvCopy, KvDelete, KvDeleteMany, KvEntry, KvError, KvExists,
-    KvExpire, KvGet, KvLease, KvMetadata, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage,
-    KvPatch, KvRelease, KvReply, KvScan, KvSet, MAX_KEY_BYTES, MAX_VALUE_BYTES,
+    KV_LEASE_OP_VERSION, KV_OP_VERSION, KvCas, KvCasFenced, KvCopy, KvDelete, KvDeleteMany,
+    KvEntry, KvError, KvExists, KvExpire, KvGet, KvLease, KvLeaseRenew, KvMetadata,
+    KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvPatch, KvRelease, KvReply, KvScan, KvSet,
+    MAX_KEY_BYTES, MAX_VALUE_BYTES,
 };
 use crate::laser::Laser;
 use crate::stream::{Codec, Decoder};
 use crate::types::ConversationId;
 use laser_wire::framing::encode_named;
+use laser_wire::mutation::MutationPosition;
+use laser_wire::validate::Validate;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// A granted advisory lease: the fencing token to present on protected mutations
-/// and the TTL the store granted (which may be shorter than requested).
+/// A granted revocable lease: the fencing token to present on protected
+/// mutations, the TTL the store granted (which may be shorter than requested),
+/// and the mutation position at which the answering fold applied the grant or
+/// renewal (the barrier a takeover read passes to
+/// [`Kv::get_entry_at_least`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
     pub token: u64,
     pub granted_ttl: Duration,
+    pub position: MutationPosition,
 }
 
 impl Laser {
@@ -129,6 +136,39 @@ impl Kv {
             namespace: self.namespace.clone(),
             key,
             if_none_match: None,
+            min_position: None,
+        };
+        match self
+            .laser
+            .execute_kv(Some(&self.namespace), AGDX_KV_GET_CODE, &request)
+            .await?
+        {
+            KvOutcome::Value(entry) => Ok(entry),
+            other => Err(unexpected("get", &other)),
+        }
+    }
+
+    /// Barriered read: fetch the [`KvEntry`] at `key` only once the answering
+    /// fold has applied at least `min_position` (the position a [`Lease`]
+    /// grant or renewal returned), so a takeover reader cannot observe state
+    /// older than its own acquisition. A fold that does not catch up within
+    /// the server's wait surfaces as
+    /// [`KvError::Stale`](laser_wire::kv::KvError::Stale), a retryable
+    /// orchestration failure, never `None`. Requires the `kv_fenced_leases`
+    /// capability: a pre-fencing server would silently ignore the barrier.
+    pub async fn get_entry_at_least(
+        &self,
+        key: impl AsRef<[u8]>,
+        min_position: MutationPosition,
+    ) -> Result<Option<KvEntry>, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        self.require_fenced_leases("get_entry_at_least").await?;
+        let request = KvGet {
+            v: KV_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            if_none_match: None,
+            min_position: Some(min_position),
         };
         match self
             .laser
@@ -187,15 +227,18 @@ impl Kv {
         }
     }
 
-    /// Start a fenced compare-and-swap on `key`: the write applies only while the
-    /// task's fence sequence still equals `fence_token` (the value a
-    /// [`lease`](Self::lease) returned). Supply a value and a precondition
-    /// (`.expect_absent()` or `.expect_version(..)`), then `.commit().await`. The
-    /// at-most-one-effective-writer gate for an exclusive effect: a zombie holder
-    /// at an older token is rejected even if its lease was presumed lost.
+    /// Start a fenced compare-and-swap on `key`: the write applies in one
+    /// backend transaction that requires a live lease at (`fence_namespace`,
+    /// `fence_key`) and a fence sequence still equal to `fence_token` (the
+    /// values a [`lease`](Self::lease) returned). Supply a value and a
+    /// precondition (`.expect_absent()` or `.expect_version(..)`), then
+    /// `.commit().await`. The at-most-one-effective-writer gate for an
+    /// exclusive effect: a zombie holder at an older token, or one whose lease
+    /// expired or was released, is rejected before another holder acquires.
     pub fn cas_fenced(
         &self,
         key: impl AsRef<[u8]>,
+        fence_namespace: impl Into<String>,
         fence_key: impl AsRef<[u8]>,
         fence_token: u64,
     ) -> KvCasFencedRequest {
@@ -206,6 +249,7 @@ impl Kv {
             value: Vec::new(),
             expires_at_micros: None,
             expect: None,
+            fence_namespace: fence_namespace.into(),
             fence_key: fence_key.as_ref().to_vec(),
             fence_token,
         }
@@ -301,43 +345,107 @@ impl Kv {
         }
     }
 
-    /// Acquire an advisory lease (a bounded-TTL distributed lock) on `key`. The
-    /// returned [`Lease`] carries the fencing token to present on protected
-    /// mutations and the TTL the store granted.
-    pub async fn lease(&self, key: impl AsRef<[u8]>, ttl: Duration) -> Result<Lease, LaserError> {
+    /// Acquire a revocable lease (a bounded-TTL distributed lock) on `key` as
+    /// `holder` (a stable node or worker id, never a connection-scoped value).
+    /// The returned [`Lease`] carries the fencing token to present on protected
+    /// mutations, the TTL the store granted, and the grant's applied mutation
+    /// position. `ttl` is a requested maximum within
+    /// [`MIN_LEASE_TTL_MICROS`](laser_wire::limits::MIN_LEASE_TTL_MICROS)`..=`[`MAX_LEASE_TTL_MICROS`](laser_wire::limits::MAX_LEASE_TTL_MICROS);
+    /// the store may grant less and never more, so anything outside that range
+    /// is `LaserError::Invalid` before the round trip. A holder needing longer
+    /// renews. A live lease always conflicts: extend with
+    /// [`renew_lease`](Self::renew_lease), never by re-acquiring. Requires the
+    /// `kv_fenced_leases` capability, else `LaserError::Unsupported`. This path
+    /// uses the connection-backed client's dedicated coordination transport. If
+    /// the outcome is ambiguous, it actively retires that transport and waits the
+    /// requested TTL before returning `LaserError::AmbiguousMutation`, so a caller
+    /// cannot immediately retry under a fresh operation identity. Acquisitions
+    /// are serialized per client, and recovery continues if the calling future
+    /// is dropped.
+    pub async fn lease(
+        &self,
+        key: impl AsRef<[u8]>,
+        holder: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<Lease, LaserError> {
         let key = validated_key(key.as_ref())?;
+        self.require_fenced_leases("lease").await?;
         let request = KvLease {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION,
             namespace: self.namespace.clone(),
             key,
             lease_ttl_micros: duration_micros(ttl),
+            holder_id: holder.into(),
+            subject_user_id: None,
         };
+        request.validate()?;
+        self.laser.acquire_lease(request).await
+    }
+
+    /// Extend a held lease without changing its token, presenting the same
+    /// `holder` and the `token` the grant returned. The returned [`Lease`]
+    /// carries the unchanged token, the granted TTL, and the renewal's applied
+    /// mutation position. `ttl` obeys the same range as
+    /// [`lease`](Self::lease). An expired, released, or re-acquired lease surfaces
+    /// as [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost): stop the
+    /// protected work, a new epoch needs a fresh [`lease`](Self::lease).
+    pub async fn renew_lease(
+        &self,
+        key: impl AsRef<[u8]>,
+        holder: impl Into<String>,
+        token: u64,
+        ttl: Duration,
+    ) -> Result<Lease, LaserError> {
+        let key = validated_key(key.as_ref())?;
+        self.require_fenced_leases("renew_lease").await?;
+        let request = KvLeaseRenew {
+            v: KV_LEASE_OP_VERSION,
+            namespace: self.namespace.clone(),
+            key,
+            holder_id: holder.into(),
+            subject_user_id: None,
+            lease_token: token,
+            lease_ttl_micros: duration_micros(ttl),
+        };
+        request.validate()?;
         match self
             .laser
-            .execute_kv(Some(&self.namespace), AGDX_KV_LEASE_CODE, &request)
+            .execute_kv(Some(&self.namespace), AGDX_KV_LEASE_RENEW_CODE, &request)
             .await?
         {
-            KvOutcome::Leased {
+            KvOutcome::Renewed {
                 lease_token,
                 granted_ttl_micros,
+                position,
             } => Ok(Lease {
                 token: lease_token,
                 granted_ttl: Duration::from_micros(granted_ttl_micros),
+                position,
             }),
-            other => Err(unexpected("lease", &other)),
+            other => Err(unexpected("renew_lease", &other)),
         }
     }
 
-    /// Release a held lease early, presenting the `token` the grant returned.
-    /// Returns `true` when a held lease was released.
-    pub async fn release(&self, key: impl AsRef<[u8]>, token: u64) -> Result<bool, LaserError> {
+    /// Release a held lease early, presenting the same `holder` and the `token`
+    /// the grant returned. Returns `true` when a held lease was released,
+    /// `false` when none was held (idempotent); a stale token surfaces as
+    /// [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost).
+    pub async fn release(
+        &self,
+        key: impl AsRef<[u8]>,
+        holder: impl Into<String>,
+        token: u64,
+    ) -> Result<bool, LaserError> {
         let key = validated_key(key.as_ref())?;
+        self.require_fenced_leases("release").await?;
         let request = KvRelease {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION,
             namespace: self.namespace.clone(),
             key,
             lease_token: token,
+            holder_id: holder.into(),
         };
+        request.validate()?;
         match self
             .laser
             .execute_kv(Some(&request.namespace), AGDX_KV_RELEASE_CODE, &request)
@@ -345,6 +453,21 @@ impl Kv {
         {
             KvOutcome::Released(released) => Ok(released),
             other => Err(unexpected("release", &other)),
+        }
+    }
+
+    // A server without the fenced-lease bit would decode the reshaped lease
+    // ops under the old contract instead of rejecting them, so every lease
+    // path fails fast client-side before the round-trip.
+    async fn require_fenced_leases(&self, what: &'static str) -> Result<(), LaserError> {
+        if self.laser.capabilities().await.kv.fenced_leases {
+            Ok(())
+        } else {
+            Err(LaserError::unsupported_feature(
+                "kv",
+                what,
+                "the fenced-lease contract is not advertised by this deployment",
+            ))
         }
     }
 
@@ -387,6 +510,7 @@ impl Kv {
                 namespace: self.namespace.clone(),
                 key: validated_key(key.as_ref())?,
                 if_none_match: None,
+                min_position: None,
             };
             ops.push(laser_wire::batch::BatchItem {
                 code: AGDX_KV_GET_CODE,
@@ -639,6 +763,7 @@ pub struct KvCasFencedRequest {
     value: Vec<u8>,
     expires_at_micros: Option<u64>,
     expect: Option<CasExpect>,
+    fence_namespace: String,
     fence_key: Vec<u8>,
     fence_token: u64,
 }
@@ -695,13 +820,14 @@ impl KvCasFencedRequest {
     }
 
     /// Apply the fenced compare-and-swap, returning the entry's new version. A
-    /// stale fence surfaces as
-    /// [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost) (a newer holder
-    /// bumped the sequence), a precondition miss as
+    /// stale fence, or a lease that expired or was released, surfaces as
+    /// [`KvError::LeaseLost`](laser_wire::kv::KvError::LeaseLost), a
+    /// precondition miss as
     /// [`KvError::VersionConflict`](laser_wire::kv::KvError::VersionConflict).
     /// Returns `LaserError::Invalid` if no precondition was set, and
     /// `LaserError::Unsupported` when the deployment does not advertise the
-    /// `kv_cas_fenced` capability.
+    /// `kv_fenced_leases` capability (a pre-fencing server would apply the
+    /// old fence-only contract instead of rejecting the reshaped payload).
     pub async fn commit(self) -> Result<u64, LaserError> {
         let Some(expect) = self.expect else {
             return Err(LaserError::Invalid(
@@ -709,29 +835,31 @@ impl KvCasFencedRequest {
                     .to_owned(),
             ));
         };
-        // Fail fast when the deployment does not advertise fenced compare-and-swap,
-        // turning the unaware-server code rejection into the documented
+        // Fail fast when the deployment does not advertise the fenced-lease
+        // contract, turning the unaware-server misdecode into the documented
         // `Unsupported` before the round-trip.
-        if !self.laser.capabilities().await.kv.cas_fenced {
+        if !self.laser.capabilities().await.kv.fenced_leases {
             return Err(LaserError::unsupported_feature(
                 "kv",
                 "cas_fenced",
-                "fenced compare-and-swap is not advertised by this deployment",
+                "the fenced-lease contract is not advertised by this deployment",
             ));
         }
         let key = validated_key(&self.key)?;
         let fence_key = validated_key(&self.fence_key)?;
         validated_value(&self.value)?;
         let request = KvCasFenced {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION,
             namespace: self.namespace,
             key,
             value: self.value,
             expires_at_micros: self.expires_at_micros,
             expect,
+            fence_namespace: self.fence_namespace,
             fence_key,
             fence_token: self.fence_token,
         };
+        request.validate()?;
         match self
             .laser
             .execute_kv(Some(&request.namespace), AGDX_KV_CAS_FENCED_CODE, &request)
@@ -1011,6 +1139,15 @@ fn duration_micros(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capabilities::Capabilities;
+
+    fn fenced_laser() -> Laser {
+        let mut capabilities = Capabilities::OPEN;
+        capabilities.kv.available = true;
+        capabilities.kv.fenced_leases = true;
+        Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_capabilities(capabilities)
+    }
 
     #[test]
     fn given_an_empty_key_when_validated_then_should_error() {
@@ -1031,6 +1168,55 @@ mod tests {
     #[test]
     fn given_an_extreme_duration_when_converted_then_should_saturate() {
         assert_eq!(duration_micros(Duration::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn given_invalid_lease_inputs_when_called_then_should_reject_before_transport() {
+        let kv = fenced_laser().kv("coordination");
+        assert!(matches!(
+            kv.lease("key", "", Duration::from_secs(1)).await,
+            Err(LaserError::Invalid(_))
+        ));
+        assert!(matches!(
+            kv.lease("key", "holder", Duration::ZERO).await,
+            Err(LaserError::Invalid(_))
+        ));
+        assert!(matches!(
+            kv.lease("key", "x".repeat(129), Duration::from_secs(1))
+                .await,
+            Err(LaserError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_invalid_renew_release_when_called_then_should_reject_before_transport() {
+        let kv = fenced_laser().kv("coordination");
+        assert!(matches!(
+            kv.renew_lease("key", "holder", 1, Duration::ZERO).await,
+            Err(LaserError::Invalid(_))
+        ));
+        assert!(matches!(
+            kv.renew_lease("key", "holder", 0, Duration::from_secs(1))
+                .await,
+            Err(LaserError::Invalid(_))
+        ));
+        assert!(matches!(
+            kv.release("key", "holder", 0).await,
+            Err(LaserError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_an_invalid_fence_namespace_when_committing_then_should_reject_before_transport()
+    {
+        let result = fenced_laser()
+            .kv("state")
+            .cas_fenced("key", "", "lease", 1)
+            .bytes(b"value")
+            .expect_absent()
+            .commit()
+            .await;
+        assert!(matches!(result, Err(LaserError::Invalid(_))));
     }
 
     #[test]

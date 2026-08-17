@@ -26,6 +26,13 @@ def test_conversation_ids():
     assert ls.derive_conversation_id("seed") == ls.derive_conversation_id("seed")
 
 
+def test_mutation_position_preserves_the_barrier_coordinates():
+    position = ls.MutationPosition(3, 1, 42)
+    assert position.topic_generation == 3
+    assert position.partition == 1
+    assert position.offset == 42
+
+
 def test_provenance_round_trips_fields():
     provenance = ls.Provenance(agent="planner", idempotency_key="k1", input_tokens=10, cost_usd=0.5)
     assert provenance.agent == "planner"

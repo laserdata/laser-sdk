@@ -1,8 +1,10 @@
 import type { Capabilities } from "../client/capabilities.js"
 import {
+  AmbiguousMutationError,
   InvalidError,
   KvExecutionError,
   ProtocolError,
+  TransportError,
   UnsupportedError
 } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
@@ -20,6 +22,7 @@ import {
   KvExpireCommand,
   KvGetCommand,
   KvLeaseCommand,
+  KvLeaseRenewCommand,
   KvMoveCommand,
   KvNamespacesCommand,
   KvPatchCommand,
@@ -39,11 +42,15 @@ import {
   validateNamespace
 } from "../wire/kv.js"
 import { DEFAULT_SCAN_LIMIT, MAX_KEY_BYTES, MAX_VALUE_BYTES } from "../wire/limits.js"
+import type { MutationPosition } from "../wire/mutation.js"
 
-/** A granted advisory lease with its fencing token and effective TTL. */
+/** A granted revocable lease: the fencing token, the TTL the store granted,
+ * and the mutation position at which the answering fold applied the grant or
+ * renewal (the barrier a takeover read passes to `getEntryAtLeast`). */
 export interface Lease {
   readonly token: bigint
   readonly grantedTtlMicros: bigint
+  readonly position: MutationPosition
 }
 
 export type KvBackend = ManagedTransport
@@ -53,10 +60,11 @@ async function executeKv<Request>(
   capabilities: Capabilities,
   namespace: string | undefined,
   command: ManagedCommand<Request, KvReply>,
-  request: Request
+  request: Request,
+  options?: { readonly retryAfterReconnect?: boolean }
 ): Promise<KvOutcome> {
   if (namespace !== undefined) validateNamespace(namespace)
-  const reply = await executeManaged(backend, capabilities, command, request)
+  const reply = await executeManaged(backend, capabilities, command, request, options)
   if (reply.kind === "ok") return reply.outcome
   if (reply.kind === "err") {
     if (reply.error.kind === "unsupported") throw new UnsupportedError(reply.error.message)
@@ -65,6 +73,17 @@ async function executeKv<Request>(
   throw new ProtocolError(`kv: unrecognized reply variant \`${reply.tag}\``, {
     commandCode: command.code
   })
+}
+
+const MAX_TIMER_MILLIS = 2_147_483_647n
+
+async function waitForLeaseExpiry(leaseTtlMicros: bigint): Promise<void> {
+  let millis = (leaseTtlMicros + 999n) / 1_000n
+  while (millis > 0n) {
+    const chunk = millis > MAX_TIMER_MILLIS ? MAX_TIMER_MILLIS : millis
+    await new Promise((resolve) => setTimeout(resolve, Number(chunk)))
+    millis -= chunk
+  }
 }
 
 function unexpected(op: string, outcome: KvOutcome): ProtocolError {
@@ -129,6 +148,28 @@ export class Kv {
     throw unexpected("get", outcome)
   }
 
+  /** Barriered read: resolves only once the answering fold has applied at
+   * least `minPosition` (the position a `Lease` grant or renewal returned). A
+   * fold that does not catch up fails with the typed `stale` error, never an
+   * absent value. Needs the `kvFencedLeases` capability: a pre-fencing server
+   * would silently ignore the barrier. */
+  async getEntryAtLeast(
+    key: Uint8Array,
+    minPosition: MutationPosition
+  ): Promise<KvEntry | undefined> {
+    const capabilities = await this.getCapabilities()
+    if (!capabilities.kv.fencedLeases) {
+      throw new UnsupportedError("the fenced-lease contract is not advertised by this deployment")
+    }
+    const outcome = await executeKv(this.backend, capabilities, this.namespace, KvGetCommand, {
+      namespace: this.namespace,
+      key: validatedKey(key),
+      minPosition
+    })
+    if (outcome.kind === "value") return outcome.entry
+    throw unexpected("get", outcome)
+  }
+
   /** Decodes a value with the supplied codec, or returns undefined. */
   async getAs<T>(key: Uint8Array, codec: Codec<T>): Promise<T | undefined> {
     const value = await this.get(key)
@@ -144,13 +185,22 @@ export class Kv {
     return new KvSetRequest(this.backend, this.getCapabilities, this.namespace, validatedKey(key))
   }
 
-  /** Starts a compare-and-swap protected by a lease fencing token. */
-  casFenced(key: Uint8Array, fenceKey: Uint8Array, fenceToken: bigint): KvCasFencedRequest {
+  /** Starts a compare-and-swap that requires a live lease at
+   * (`fenceNamespace`, `fenceKey`) and a fence sequence still equal to
+   * `fenceToken`. */
+  casFenced(
+    key: Uint8Array,
+    fenceNamespace: string,
+    fenceKey: Uint8Array,
+    fenceToken: bigint
+  ): KvCasFencedRequest {
+    validateNamespace(fenceNamespace)
     return new KvCasFencedRequest(
       this.backend,
       this.getCapabilities,
       this.namespace,
       validatedKey(key),
+      fenceNamespace,
       validatedKey(fenceKey),
       fenceToken
     )
@@ -200,25 +250,96 @@ export class Kv {
     throw unexpected("patch", outcome)
   }
 
-  async lease(key: Uint8Array, leaseTtlMicros: bigint): Promise<Lease> {
+  /** Acquires a revocable lease as `holderId` (a stable node or worker id). A
+   * live lease always conflicts: extend with `renewLease`, never by
+   * re-acquiring. `leaseTtlMicros` is a requested maximum within
+   * `MIN_LEASE_TTL_MICROS`..=`MAX_LEASE_TTL_MICROS`. The store may grant less and
+   * never more, so anything outside that range throws `InvalidError` before the
+   * round trip, and a holder needing longer renews. Needs the `kvFencedLeases`
+   * capability. */
+  async lease(key: Uint8Array, holderId: string, leaseTtlMicros: bigint): Promise<Lease> {
     const capabilities = await this.getCapabilities()
-    const outcome = await executeKv(this.backend, capabilities, this.namespace, KvLeaseCommand, {
-      namespace: this.namespace,
-      key: validatedKey(key),
-      leaseTtlMicros
-    })
+    let outcome: KvOutcome
+    try {
+      outcome = await executeKv(
+        this.backend,
+        capabilities,
+        this.namespace,
+        KvLeaseCommand,
+        {
+          namespace: this.namespace,
+          key: validatedKey(key),
+          leaseTtlMicros,
+          holderId
+        },
+        { retryAfterReconnect: false }
+      )
+    } catch (error) {
+      if (
+        !(error instanceof AmbiguousMutationError) &&
+        !(error instanceof TransportError && error.retryable)
+      ) {
+        throw error
+      }
+      await waitForLeaseExpiry(leaseTtlMicros)
+      throw new AmbiguousMutationError(
+        "lease acquisition outcome is unknown; its requested TTL elapsed before retry was allowed",
+        { cause: error }
+      )
+    }
     if (outcome.kind === "leased") {
-      return { token: outcome.leaseToken, grantedTtlMicros: outcome.grantedTtlMicros }
+      return {
+        token: outcome.leaseToken,
+        grantedTtlMicros: outcome.grantedTtlMicros,
+        position: outcome.position
+      }
     }
     throw unexpected("lease", outcome)
   }
 
-  async release(key: Uint8Array, token: bigint): Promise<boolean> {
+  /** Extends a held lease without changing its token. `leaseTtlMicros` obeys the
+   * same range as `lease`. An expired, released, or re-acquired lease fails with
+   * the typed lease-lost error: stop the protected work, a new epoch needs a
+   * fresh `lease`. */
+  async renewLease(
+    key: Uint8Array,
+    holderId: string,
+    token: bigint,
+    leaseTtlMicros: bigint
+  ): Promise<Lease> {
+    const capabilities = await this.getCapabilities()
+    const outcome = await executeKv(
+      this.backend,
+      capabilities,
+      this.namespace,
+      KvLeaseRenewCommand,
+      {
+        namespace: this.namespace,
+        key: validatedKey(key),
+        holderId,
+        leaseToken: token,
+        leaseTtlMicros
+      }
+    )
+    if (outcome.kind === "renewed") {
+      return {
+        token: outcome.leaseToken,
+        grantedTtlMicros: outcome.grantedTtlMicros,
+        position: outcome.position
+      }
+    }
+    throw unexpected("renewLease", outcome)
+  }
+
+  /** Releases a held lease early, presenting the same `holderId` and its
+   * token. Resolves `true` when a held lease was released. */
+  async release(key: Uint8Array, holderId: string, token: bigint): Promise<boolean> {
     const capabilities = await this.getCapabilities()
     const outcome = await executeKv(this.backend, capabilities, this.namespace, KvReleaseCommand, {
       namespace: this.namespace,
       key: validatedKey(key),
-      leaseToken: token
+      leaseToken: token,
+      holderId
     })
     if (outcome.kind === "released") return outcome.wasHeld
     throw unexpected("release", outcome)
@@ -375,6 +496,7 @@ export class KvCasFencedRequest {
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly namespace: string,
     private readonly key: Uint8Array,
+    private readonly fenceNamespace: string,
     private readonly fenceKey: Uint8Array,
     private readonly fenceToken: bigint
   ) {}
@@ -424,8 +546,8 @@ export class KvCasFencedRequest {
       )
     }
     const capabilities = await this.getCapabilities()
-    if (!capabilities.kv.casFenced) {
-      throw new UnsupportedError("fenced compare-and-swap is not advertised by this deployment")
+    if (!capabilities.kv.fencedLeases) {
+      throw new UnsupportedError("the fenced-lease contract is not advertised by this deployment")
     }
     validatedValue(this.value)
     const outcome = await executeKv(
@@ -438,6 +560,7 @@ export class KvCasFencedRequest {
         key: this.key,
         value: this.value,
         expect: this.expect,
+        fenceNamespace: this.fenceNamespace,
         fenceKey: this.fenceKey,
         fenceToken: this.fenceToken,
         ...(this.expiresAtMicros !== undefined ? { expiresAtMicros: this.expiresAtMicros } : {})

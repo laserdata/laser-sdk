@@ -14,7 +14,8 @@ export const Feature = {
   KEYWORD_SEARCH: 1n << 5n,
   WATCH: 1n << 6n,
   AUTHZ: 1n << 7n,
-  DESTINATIONS: 1n << 8n
+  DESTINATIONS: 1n << 8n,
+  KV_FENCED_LEASES: 1n << 9n
 } as const
 
 export interface OpVersions {

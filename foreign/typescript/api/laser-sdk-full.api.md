@@ -115,7 +115,7 @@ export function acceptFence(highWater: Map<string, FenceEntry>, sweepState: Fenc
 export type Action = "read" | "write" | "delete" | "admin" | "unrecognized";
 
 // @public (undocumented)
-const ACTION_COUNT: number;
+const ACTION_COUNT = 5;
 
 // @public (undocumented)
 export interface ActionCounters {
@@ -343,6 +343,9 @@ const AGDX_KV_GET_CODE: number;
 
 // @public (undocumented)
 const AGDX_KV_LEASE_CODE: number;
+
+// @public (undocumented)
+const AGDX_KV_LEASE_RENEW_CODE: number;
 
 // @public (undocumented)
 const AGDX_KV_MOVE_CODE: number;
@@ -1143,6 +1146,13 @@ export type AgUiEvent = {
 export function aguiEvents(laser: Laser, conversation: ConversationId, topic: string): Promise<readonly AgUiEvent[]>;
 
 // @public (undocumented)
+export class AmbiguousMutationError extends LaserError {
+    constructor(message: string, options?: {
+        cause?: unknown;
+    });
+}
+
+// @public (undocumented)
 export const ANY_ROUTE_POLICY: RoutePolicy;
 
 // @public (undocumented)
@@ -1928,7 +1938,7 @@ export interface CapabilitySelector {
 export function capabilitySelector(skill: string, policy: RoutePolicy, principal?: PrincipalId): CapabilitySelector;
 
 // @public (undocumented)
-export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
+export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "kvFencedLeases" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
 
 // @public (undocumented)
 export type CasExpect = {
@@ -3081,6 +3091,9 @@ function decodeKvGet(map: CborMap, context: string): KvGet;
 function decodeKvLease(map: CborMap, context: string): KvLease;
 
 // @public (undocumented)
+function decodeKvLeaseRenew(map: CborMap, context: string): KvLeaseRenew;
+
+// @public (undocumented)
 function decodeKvMetadata(map: CborMap, context: string): KvMetadata;
 
 // @public (undocumented)
@@ -3151,6 +3164,9 @@ function decodeMemoryRowScope(map: CborMap, context: string): MemoryRowScope;
 
 // @public (undocumented)
 function decodeMutationCommandEnvelope(map: CborMap, context: string): MutationCommandEnvelope;
+
+// @public (undocumented)
+function decodeMutationPosition(map: CborMap, context: string): MutationPosition;
 
 // @public (undocumented)
 function decodeOne(bytes: Uint8Array, context: string): unknown;
@@ -4111,6 +4127,9 @@ function encodeKvGet(get: KvGet): Map<string, unknown>;
 function encodeKvLease(lease: KvLease): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeKvLeaseRenew(renew: KvLeaseRenew): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeKvMetadata(meta: KvMetadata): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4187,6 +4206,9 @@ function encodeMemoryRowScope(scope: MemoryRowScope): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeMutationCommandEnvelope(envelope: MutationCommandEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeMutationPosition(position: MutationPosition): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeNamed(entries: ReadonlyMap<string, unknown>, options?: {
@@ -4454,10 +4476,10 @@ function expectU32(value: unknown, context: string): number;
 function expectU64(value: unknown, context: string): bigint;
 
 // @public (undocumented)
-const EXTRA_MANAGED_COMMANDS: readonly [ManagedCommand<KvCas, KvReply>, ManagedCommand<KvCasFenced, KvReply>, ManagedCommand<KvExists, KvReply>, ManagedCommand<KvExpire, KvReply>, ManagedCommand<KvPatch, KvReply>, ManagedCommand<KvLease, KvReply>, ManagedCommand<KvRelease, KvReply>, ManagedCommand<KvCopy, KvReply>, ManagedCommand<KvMove, KvReply>, ManagedCommand<BatchRequest, BatchReply>, ManagedCommand<AuthzHistoryReq, AuthzReply>, ManagedCommand<GraphQuery, GraphReply>, ManagedCommand<GraphNeighbors, GraphReply>, ManagedCommand<GraphUpsert, GraphReply>];
+const EXTRA_MANAGED_COMMANDS: readonly [ManagedCommand<KvCas, KvReply>, ManagedCommand<KvCasFenced, KvReply>, ManagedCommand<KvExists, KvReply>, ManagedCommand<KvExpire, KvReply>, ManagedCommand<KvPatch, KvReply>, ManagedCommand<KvLease, KvReply>, ManagedCommand<KvLeaseRenew, KvReply>, ManagedCommand<KvRelease, KvReply>, ManagedCommand<KvCopy, KvReply>, ManagedCommand<KvMove, KvReply>, ManagedCommand<BatchRequest, BatchReply>, ManagedCommand<AuthzHistoryReq, AuthzReply>, ManagedCommand<GraphQuery, GraphReply>, ManagedCommand<GraphNeighbors, GraphReply>, ManagedCommand<GraphUpsert, GraphReply>];
 
 // @public (undocumented)
-type Feature = "kv" | "memory" | "projection" | "fork" | "graph" | "query" | "agent" | "workflow" | "authz" | "unrecognized";
+type Feature = "kv" | "memory" | "projection" | "fork" | "graph" | "query" | "agent" | "workflow" | "destination" | "checkpoint" | "authz" | "kv_lease" | "kv_fence" | "unrecognized";
 
 // @public (undocumented)
 const Feature_2: {
@@ -4470,6 +4492,7 @@ const Feature_2: {
     readonly WATCH: bigint;
     readonly AUTHZ: bigint;
     readonly DESTINATIONS: bigint;
+    readonly KV_FENCED_LEASES: bigint;
 };
 
 // @public (undocumented)
@@ -5674,7 +5697,7 @@ export class KeyRegistry {
 export class Kv {
     // Warning: (ae-forgotten-export) The symbol "KvBackend" needs to be exported by the entry point full.d.ts
     constructor(backend: KvBackend, getCapabilities: () => Promise<Capabilities>, namespace: string);
-    casFenced(key: Uint8Array, fenceKey: Uint8Array, fenceToken: bigint): KvCasFencedRequest;
+    casFenced(key: Uint8Array, fenceNamespace: string, fenceKey: Uint8Array, fenceToken: bigint): KvCasFencedRequest;
     copyTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
     // (undocumented)
     delete(key: Uint8Array): Promise<boolean>;
@@ -5687,11 +5710,11 @@ export class Kv {
     getAs<T>(key: Uint8Array, codec: Codec<T>): Promise<T | undefined>;
     // (undocumented)
     getEntry(key: Uint8Array): Promise<KvEntry | undefined>;
+    getEntryAtLeast(key: Uint8Array, minPosition: MutationPosition): Promise<KvEntry | undefined>;
     getMany(keys: readonly Uint8Array[]): Promise<readonly (Uint8Array | undefined)[]>;
     // (undocumented)
     getTyped<T>(key: Uint8Array, decodeValue: (value: unknown) => T): Promise<T | undefined>;
-    // (undocumented)
-    lease(key: Uint8Array, leaseTtlMicros: bigint): Promise<Lease>;
+    lease(key: Uint8Array, holderId: string, leaseTtlMicros: bigint): Promise<Lease>;
     // (undocumented)
     moveTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
     // (undocumented)
@@ -5699,12 +5722,15 @@ export class Kv {
     // (undocumented)
     static namespaces(backend: KvBackend, getCapabilities: () => Promise<Capabilities>): Promise<readonly KvNamespaceInfo[]>;
     patch(key: Uint8Array, patch: Uint8Array): Promise<bigint>;
-    // (undocumented)
-    release(key: Uint8Array, token: bigint): Promise<boolean>;
+    release(key: Uint8Array, holderId: string, token: bigint): Promise<boolean>;
+    renewLease(key: Uint8Array, holderId: string, token: bigint, leaseTtlMicros: bigint): Promise<Lease>;
     // (undocumented)
     scan(): KvScanRequest;
     set(key: Uint8Array): KvSetRequest;
 }
+
+// @public (undocumented)
+const KV_LEASE_OP_VERSION = 2;
 
 // @public (undocumented)
 const KV_OP_VERSION = 1;
@@ -5720,6 +5746,8 @@ interface KvCapsView {
     readonly cas: boolean;
     // (undocumented)
     readonly casFenced: boolean;
+    // (undocumented)
+    readonly fencedLeases: boolean;
 }
 
 // @public (undocumented)
@@ -5747,6 +5775,7 @@ interface KvCasFenced {
     readonly expiresAtMicros?: bigint;
     // (undocumented)
     readonly fenceKey: Uint8Array;
+    readonly fenceNamespace: string;
     // (undocumented)
     readonly fenceToken: bigint;
     // (undocumented)
@@ -5762,7 +5791,7 @@ const KvCasFencedCommand: ManagedCommand<KvCasFenced, KvReply>;
 
 // @public
 export class KvCasFencedRequest {
-    constructor(backend: KvBackend, getCapabilities: () => Promise<Capabilities>, namespace: string, key: Uint8Array, fenceKey: Uint8Array, fenceToken: bigint);
+    constructor(backend: KvBackend, getCapabilities: () => Promise<Capabilities>, namespace: string, key: Uint8Array, fenceNamespace: string, fenceKey: Uint8Array, fenceToken: bigint);
     // (undocumented)
     bytes(payload: Uint8Array): this;
     commit(): Promise<bigint>;
@@ -5924,6 +5953,9 @@ export type KvError = {
 } | {
     readonly kind: "notLeader";
 } | {
+    readonly kind: "stale";
+    readonly required: MutationPosition;
+} | {
     readonly kind: "unrecognized";
     readonly tag: string;
     readonly value: unknown;
@@ -5968,6 +6000,7 @@ interface KvGet {
     readonly ifNoneMatch?: bigint;
     // (undocumented)
     readonly key: Uint8Array;
+    readonly minPosition?: MutationPosition;
     // (undocumented)
     readonly namespace: string;
 }
@@ -5992,16 +6025,37 @@ export class KvKeyRegistry {
 
 // @public (undocumented)
 interface KvLease {
+    readonly holderId: string;
     // (undocumented)
     readonly key: Uint8Array;
     // (undocumented)
     readonly leaseTtlMicros: bigint;
     // (undocumented)
     readonly namespace: string;
+    readonly subjectUserId?: number;
 }
 
 // @public (undocumented)
 const KvLeaseCommand: ManagedCommand<KvLease, KvReply>;
+
+// @public (undocumented)
+interface KvLeaseRenew {
+    // (undocumented)
+    readonly holderId: string;
+    // (undocumented)
+    readonly key: Uint8Array;
+    // (undocumented)
+    readonly leaseToken: bigint;
+    // (undocumented)
+    readonly leaseTtlMicros: bigint;
+    // (undocumented)
+    readonly namespace: string;
+    // (undocumented)
+    readonly subjectUserId?: number;
+}
+
+// @public (undocumented)
+const KvLeaseRenewCommand: ManagedCommand<KvLeaseRenew, KvReply>;
 
 // @public (undocumented)
 export interface KvMetadata {
@@ -6075,6 +6129,12 @@ export type KvOutcome = {
     readonly kind: "leased";
     readonly leaseToken: bigint;
     readonly grantedTtlMicros: bigint;
+    readonly position: MutationPosition;
+} | {
+    readonly kind: "renewed";
+    readonly leaseToken: bigint;
+    readonly grantedTtlMicros: bigint;
+    readonly position: MutationPosition;
 } | {
     readonly kind: "released";
     readonly wasHeld: boolean;
@@ -6117,6 +6177,7 @@ const KvPatchCommand: ManagedCommand<KvPatch, KvReply>;
 
 // @public (undocumented)
 interface KvRelease {
+    readonly holderId: string;
     // (undocumented)
     readonly key: Uint8Array;
     // (undocumented)
@@ -6454,7 +6515,7 @@ export class LaserError extends Error {
 }
 
 // @public (undocumented)
-export type LaserErrorKind = "config" | "no-stream" | "timeout" | "cancelled" | "unsupported" | "invalid" | "codec" | "typed-decode" | "protocol" | "transport" | "query" | "kv" | "fork" | "graph" | "authz" | "agent-workflow" | "routing" | "presence-conflict" | "signature" | "handler" | "handler-config" | "state-store" | "integrity" | "rejected" | "budget-exceeded" | "policy-blocked" | "step-up-required" | "policy-deferred";
+export type LaserErrorKind = "config" | "no-stream" | "timeout" | "ambiguous-mutation" | "cancelled" | "unsupported" | "invalid" | "codec" | "typed-decode" | "protocol" | "transport" | "query" | "kv" | "fork" | "graph" | "authz" | "agent-workflow" | "routing" | "presence-conflict" | "signature" | "handler" | "handler-config" | "state-store" | "integrity" | "rejected" | "budget-exceeded" | "policy-blocked" | "step-up-required" | "policy-deferred";
 
 // @public (undocumented)
 export interface LaserObserver {
@@ -6477,6 +6538,8 @@ export class LastN implements ContextPolicy {
 export interface Lease {
     // (undocumented)
     readonly grantedTtlMicros: bigint;
+    // (undocumented)
+    readonly position: MutationPosition;
     // (undocumented)
     readonly token: bigint;
 }
@@ -6865,6 +6928,9 @@ const MAX_GRAPH_RESULT_ELEMENTS = 10000;
 const MAX_GRAPH_TRAVERSE_DEPTH = 8;
 
 // @public (undocumented)
+const MAX_HOLDER_ID_BYTES = 128;
+
+// @public (undocumented)
 const MAX_IDEMPOTENCY_KEY_BYTES = 64;
 
 // @public (undocumented)
@@ -6872,6 +6938,9 @@ const MAX_INDEX_ENTRIES_PER_RECORD = 32;
 
 // @public (undocumented)
 const MAX_KEY_BYTES = 512;
+
+// @public (undocumented)
+const MAX_LEASE_TTL_MICROS = 300000000;
 
 // @public (undocumented)
 const MAX_LOGICAL_SCHEMA_BYTES = 1048576;
@@ -7340,6 +7409,9 @@ const METADATA_TASK_CONTEXT = "task_context";
 const MICROS_PER_DAY = 86400000000n;
 
 // @public (undocumented)
+const MIN_LEASE_TTL_MICROS = 1000000;
+
+// @public (undocumented)
 interface MutationCommandEnvelope {
     // (undocumented)
     readonly commandCode: number;
@@ -7351,6 +7423,16 @@ interface MutationCommandEnvelope {
     readonly timestampMicros: bigint;
     // (undocumented)
     readonly v: number;
+}
+
+// @public
+export interface MutationPosition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partition: number;
+    // (undocumented)
+    readonly topicGeneration: bigint;
 }
 
 // @public (undocumented)
@@ -9416,7 +9498,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.2.0";
+export const SDK_VERSION = "0.2.1";
 
 // @public (undocumented)
 interface Select {
@@ -10865,6 +10947,7 @@ declare namespace wire {
         AGDX_KV_CAS_FENCED_CODE,
         AGDX_KV_COPY_CODE,
         AGDX_KV_MOVE_CODE,
+        AGDX_KV_LEASE_RENEW_CODE,
         AGDX_FORK_BASE,
         AGDX_FORK_CREATE_CODE,
         AGDX_FORK_DELETE_CODE,
@@ -10885,6 +10968,7 @@ declare namespace wire {
         CONTROL_OP_VERSION,
         CHECKPOINT_OP_VERSION,
         KV_OP_VERSION,
+        KV_LEASE_OP_VERSION,
         FORK_OP_VERSION,
         GRAPH_OP_VERSION,
         AGENT_WORKFLOW_OP_VERSION,
@@ -10929,6 +11013,7 @@ declare namespace wire {
         KvExpireCommand,
         KvPatchCommand,
         KvLeaseCommand,
+        KvLeaseRenewCommand,
         KvReleaseCommand,
         KvCopyCommand,
         KvMoveCommand,
@@ -11334,6 +11419,8 @@ declare namespace wire {
         decodeKvMove,
         encodeKvLease,
         decodeKvLease,
+        encodeKvLeaseRenew,
+        decodeKvLeaseRenew,
         encodeKvRelease,
         decodeKvRelease,
         encodeKvMetadata,
@@ -11367,6 +11454,7 @@ declare namespace wire {
         KvCopy,
         KvMove,
         KvLease,
+        KvLeaseRenew,
         KvRelease,
         KvMetadata,
         KvNamespaceInfo,
@@ -11392,6 +11480,9 @@ declare namespace wire {
         DEFAULT_SCAN_LIMIT,
         DEFAULT_NAMESPACE,
         MAX_NAMESPACE_BYTES,
+        MAX_HOLDER_ID_BYTES,
+        MIN_LEASE_TTL_MICROS,
+        MAX_LEASE_TTL_MICROS,
         MAX_FORK_ID_BYTES,
         MAX_ROLE_NAME_BYTES,
         MAX_FRAME_BYTES,
@@ -11430,10 +11521,13 @@ declare namespace wire {
         MemoryRecord,
         encodeManagedRequestEnvelope,
         decodeManagedRequestEnvelope,
+        encodeMutationPosition,
+        decodeMutationPosition,
         encodeMutationCommandEnvelope,
         decodeMutationCommandEnvelope,
         MANAGED_REQUEST_VERSION,
         ManagedRequestEnvelope,
+        MutationPosition,
         MutationCommandEnvelope,
         encodeQueryPageEnvelope,
         encodeQueryCancelEnvelope,
@@ -11712,6 +11806,9 @@ export class Workflow {
     // (undocumented)
     step(label: string, target: Router, build: StepFn): StepBuilder;
 }
+
+// @public (undocumented)
+export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence";
 
 // @public (undocumented)
 export interface WorkflowOutcome {

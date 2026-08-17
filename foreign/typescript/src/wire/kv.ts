@@ -10,9 +10,21 @@ import {
   field,
   singleVariantTag
 } from "./cbor.js"
-import { KV_OP_VERSION } from "./codes.js"
+import { KV_LEASE_OP_VERSION, KV_OP_VERSION } from "./codes.js"
 import { decodeSourceRef, encodeSourceRef, type SourceRef } from "./graph.js"
-import { MAX_NAMESPACE_BYTES } from "./limits.js"
+import {
+  MAX_HOLDER_ID_BYTES,
+  MAX_KEY_BYTES,
+  MAX_LEASE_TTL_MICROS,
+  MAX_NAMESPACE_BYTES,
+  MAX_VALUE_BYTES,
+  MIN_LEASE_TTL_MICROS
+} from "./limits.js"
+import {
+  decodeMutationPosition,
+  encodeMutationPosition,
+  type MutationPosition
+} from "./mutation.js"
 
 export interface MemoryRowScope {
   readonly kind?: string
@@ -130,6 +142,10 @@ export interface KvGet {
   readonly namespace: string
   readonly key: Uint8Array
   readonly ifNoneMatch?: bigint
+  /** Barriered read: the answering fold must have applied at least this
+   * position, else the reply is the typed `stale` error, never an absent
+   * value. Send only when the server advertises `KV_FENCED_LEASES`. */
+  readonly minPosition?: MutationPosition
 }
 
 export function encodeKvGet(get: KvGet): Map<string, unknown> {
@@ -138,15 +154,21 @@ export function encodeKvGet(get: KvGet): Map<string, unknown> {
   map.set("namespace", get.namespace)
   map.set("key", get.key)
   if (get.ifNoneMatch !== undefined) map.set("if_none_match", get.ifNoneMatch)
+  if (get.minPosition !== undefined)
+    map.set("min_position", encodeMutationPosition(get.minPosition))
   return map
 }
 
 export function decodeKvGet(map: CborMap, context: string): KvGet {
   const ifNoneMatch = field.optionalU64(map, "if_none_match", context)
+  const minPositionMap = field.optionalMap(map, "min_position", context)
   return {
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
-    ...(ifNoneMatch !== undefined ? { ifNoneMatch } : {})
+    ...(ifNoneMatch !== undefined ? { ifNoneMatch } : {}),
+    ...(minPositionMap !== undefined
+      ? { minPosition: decodeMutationPosition(minPositionMap, `${context}.min_position`) }
+      : {})
   }
 }
 
@@ -232,34 +254,100 @@ export interface KvCasFenced {
   readonly value: Uint8Array
   readonly expiresAtMicros?: bigint
   readonly expect: CasExpect
+  /** The coordination namespace holding the lease and fence rows, authorized
+   * separately from the target namespace. */
+  readonly fenceNamespace: string
   readonly fenceKey: Uint8Array
   readonly fenceToken: bigint
 }
 
+function validateKeyShape(key: Uint8Array, label: string): void {
+  if (key.byteLength === 0) throw new InvalidError(`${label} must not be empty`)
+  if (key.byteLength > MAX_KEY_BYTES) {
+    throw new InvalidError(
+      `${label} is ${String(key.byteLength)}B, exceeds cap ${String(MAX_KEY_BYTES)}B`
+    )
+  }
+}
+
+function validateHolderId(holderId: string): void {
+  const bytes = new TextEncoder().encode(holderId)
+  if (bytes.byteLength === 0) throw new InvalidError("lease holder id must not be empty")
+  if (bytes.byteLength > MAX_HOLDER_ID_BYTES) {
+    throw new InvalidError(
+      `lease holder id is ${String(bytes.byteLength)}B, exceeds cap ${String(MAX_HOLDER_ID_BYTES)}B`
+    )
+  }
+}
+
+function validateKvCasFenced(cas: KvCasFenced): void {
+  validateNamespace(cas.namespace)
+  validateNamespace(cas.fenceNamespace)
+  validateKeyShape(cas.key, "key-value key")
+  validateKeyShape(cas.fenceKey, "fence key")
+  if (cas.value.byteLength > MAX_VALUE_BYTES) {
+    throw new InvalidError(
+      `value is ${String(cas.value.byteLength)}B, exceeds cap ${String(MAX_VALUE_BYTES)}B`
+    )
+  }
+  if (cas.fenceToken === 0n) throw new InvalidError("fence token must not be zero")
+}
+
+function requireLeaseVersion(map: CborMap, context: string): void {
+  const version = field.requiredU32(map, "v", context)
+  if (version !== KV_LEASE_OP_VERSION) {
+    throw new CodecError(
+      `unsupported fenced-lease op version (expected ${String(KV_LEASE_OP_VERSION)}, got ${String(version)})`,
+      context,
+      "v"
+    )
+  }
+}
+
+function decodeValidated<T>(value: T, validate: (value: T) => void, context: string): T {
+  try {
+    validate(value)
+    return value
+  } catch (error) {
+    if (error instanceof InvalidError) {
+      throw new CodecError(error.message, context, "shape", { cause: error })
+    }
+    throw error
+  }
+}
+
 export function encodeKvCasFenced(cas: KvCasFenced): Map<string, unknown> {
+  validateKvCasFenced(cas)
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", KV_LEASE_OP_VERSION)
   map.set("namespace", cas.namespace)
   map.set("key", cas.key)
   map.set("value", cas.value)
   if (cas.expiresAtMicros !== undefined) map.set("expires_at_micros", cas.expiresAtMicros)
   map.set("expect", encodeCasExpect(cas.expect))
+  map.set("fence_namespace", cas.fenceNamespace)
   map.set("fence_key", cas.fenceKey)
   map.set("fence_token", cas.fenceToken)
   return map
 }
 
 export function decodeKvCasFenced(map: CborMap, context: string): KvCasFenced {
+  requireLeaseVersion(map, context)
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
-  return {
-    namespace: field.requiredString(map, "namespace", context),
-    key: field.requiredBytes(map, "key", context),
-    value: field.requiredBytes(map, "value", context),
-    ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
-    expect: decodeCasExpect(map.get("expect"), context),
-    fenceKey: field.requiredBytes(map, "fence_key", context),
-    fenceToken: field.requiredU64(map, "fence_token", context)
-  }
+  return decodeValidated(
+    {
+      namespace: field.requiredString(map, "namespace", context),
+      key: field.requiredBytes(map, "key", context),
+      value: field.requiredBytes(map, "value", context),
+      ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {}),
+      expect: decodeCasExpect(map.get("expect"), context),
+      fenceNamespace: field.requiredString(map, "fence_namespace", context),
+      fenceKey: field.requiredBytes(map, "fence_key", context),
+      fenceToken: field.requiredU64(map, "fence_token", context)
+    },
+    validateKvCasFenced,
+    context
+  )
 }
 
 export interface KvDelete {
@@ -415,46 +503,152 @@ export interface KvLease {
   readonly namespace: string
   readonly key: Uint8Array
   readonly leaseTtlMicros: bigint
+  /** Stable identity of the acquiring holder (a node or worker id). Renewal
+   * and release must present the same holder. */
+  readonly holderId: string
+  /** Delegated acquisition for another user (requires the `kv_lease:admin`
+   * grant). Absent leases for the authenticated caller. */
+  readonly subjectUserId?: number
+}
+
+function validateLeaseShape(namespace: string, key: Uint8Array, holderId: string): void {
+  validateNamespace(namespace)
+  validateKeyShape(key, "lease key")
+  validateHolderId(holderId)
+}
+
+/** The requested lifetime is bounded on both sides by the contract, not by each
+ * backend: a floor so a grant survives one round trip plus the holder's renewal
+ * cadence, a ceiling so a crashed holder's ownership always expires. The store
+ * may grant less and never grants more, so the range is checked on the request
+ * rather than clamped. */
+function validateLeaseTtl(ttlMicros: bigint): void {
+  const min = BigInt(MIN_LEASE_TTL_MICROS)
+  const max = BigInt(MAX_LEASE_TTL_MICROS)
+  if (ttlMicros < min || ttlMicros > max) {
+    throw new InvalidError(
+      `lease ttl is ${String(ttlMicros)}µs, outside the supported range ` +
+        `${String(min)}..=${String(max)}µs`
+    )
+  }
+}
+
+function validateKvLease(lease: KvLease): void {
+  validateLeaseShape(lease.namespace, lease.key, lease.holderId)
+  validateLeaseTtl(lease.leaseTtlMicros)
 }
 
 export function encodeKvLease(lease: KvLease): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["v", KV_OP_VERSION],
+  validateKvLease(lease)
+  const map = new Map<string, unknown>([
+    ["v", KV_LEASE_OP_VERSION],
     ["namespace", lease.namespace],
     ["key", lease.key],
-    ["lease_ttl_micros", lease.leaseTtlMicros]
-  ])
+    ["lease_ttl_micros", lease.leaseTtlMicros],
+    ["holder_id", lease.holderId]
+  ] as readonly [string, unknown][])
+  if (lease.subjectUserId !== undefined) map.set("subject_user_id", BigInt(lease.subjectUserId))
+  return map
 }
 
 export function decodeKvLease(map: CborMap, context: string): KvLease {
-  return {
-    namespace: field.requiredString(map, "namespace", context),
-    key: field.requiredBytes(map, "key", context),
-    leaseTtlMicros: field.requiredU64(map, "lease_ttl_micros", context)
-  }
+  requireLeaseVersion(map, context)
+  const subjectUserId = field.optionalU32(map, "subject_user_id", context)
+  return decodeValidated(
+    {
+      namespace: field.requiredString(map, "namespace", context),
+      key: field.requiredBytes(map, "key", context),
+      leaseTtlMicros: field.requiredU64(map, "lease_ttl_micros", context),
+      holderId: field.requiredString(map, "holder_id", context),
+      ...(subjectUserId !== undefined ? { subjectUserId } : {})
+    },
+    validateKvLease,
+    context
+  )
+}
+
+export interface KvLeaseRenew {
+  readonly namespace: string
+  readonly key: Uint8Array
+  readonly holderId: string
+  readonly subjectUserId?: number
+  readonly leaseToken: bigint
+  readonly leaseTtlMicros: bigint
+}
+
+function validateKvLeaseRenew(renew: KvLeaseRenew): void {
+  validateLeaseShape(renew.namespace, renew.key, renew.holderId)
+  validateLeaseTtl(renew.leaseTtlMicros)
+  if (renew.leaseToken === 0n) throw new InvalidError("lease token must not be zero")
+}
+
+export function encodeKvLeaseRenew(renew: KvLeaseRenew): Map<string, unknown> {
+  validateKvLeaseRenew(renew)
+  const map = new Map<string, unknown>([
+    ["v", KV_LEASE_OP_VERSION],
+    ["namespace", renew.namespace],
+    ["key", renew.key],
+    ["holder_id", renew.holderId]
+  ] as readonly [string, unknown][])
+  if (renew.subjectUserId !== undefined) map.set("subject_user_id", BigInt(renew.subjectUserId))
+  map.set("lease_token", renew.leaseToken)
+  map.set("lease_ttl_micros", renew.leaseTtlMicros)
+  return map
+}
+
+export function decodeKvLeaseRenew(map: CborMap, context: string): KvLeaseRenew {
+  requireLeaseVersion(map, context)
+  const subjectUserId = field.optionalU32(map, "subject_user_id", context)
+  return decodeValidated(
+    {
+      namespace: field.requiredString(map, "namespace", context),
+      key: field.requiredBytes(map, "key", context),
+      holderId: field.requiredString(map, "holder_id", context),
+      ...(subjectUserId !== undefined ? { subjectUserId } : {}),
+      leaseToken: field.requiredU64(map, "lease_token", context),
+      leaseTtlMicros: field.requiredU64(map, "lease_ttl_micros", context)
+    },
+    validateKvLeaseRenew,
+    context
+  )
 }
 
 export interface KvRelease {
   readonly namespace: string
   readonly key: Uint8Array
   readonly leaseToken: bigint
+  /** The same stable holder identity the grant carried. */
+  readonly holderId: string
+}
+
+function validateKvRelease(release: KvRelease): void {
+  validateLeaseShape(release.namespace, release.key, release.holderId)
+  if (release.leaseToken === 0n) throw new InvalidError("lease token must not be zero")
 }
 
 export function encodeKvRelease(release: KvRelease): Map<string, unknown> {
+  validateKvRelease(release)
   return new Map<string, unknown>([
-    ["v", KV_OP_VERSION],
+    ["v", KV_LEASE_OP_VERSION],
     ["namespace", release.namespace],
     ["key", release.key],
-    ["lease_token", release.leaseToken]
-  ])
+    ["lease_token", release.leaseToken],
+    ["holder_id", release.holderId]
+  ] as readonly [string, unknown][])
 }
 
 export function decodeKvRelease(map: CborMap, context: string): KvRelease {
-  return {
-    namespace: field.requiredString(map, "namespace", context),
-    key: field.requiredBytes(map, "key", context),
-    leaseToken: field.requiredU64(map, "lease_token", context)
-  }
+  requireLeaseVersion(map, context)
+  return decodeValidated(
+    {
+      namespace: field.requiredString(map, "namespace", context),
+      key: field.requiredBytes(map, "key", context),
+      leaseToken: field.requiredU64(map, "lease_token", context),
+      holderId: field.requiredString(map, "holder_id", context)
+    },
+    validateKvRelease,
+    context
+  )
 }
 
 export interface KvMetadata {
@@ -595,7 +789,18 @@ export type KvOutcome =
   | { readonly kind: "notModified" }
   | { readonly kind: "metadata"; readonly metadata?: KvMetadata }
   | { readonly kind: "versioned"; readonly version: bigint }
-  | { readonly kind: "leased"; readonly leaseToken: bigint; readonly grantedTtlMicros: bigint }
+  | {
+      readonly kind: "leased"
+      readonly leaseToken: bigint
+      readonly grantedTtlMicros: bigint
+      readonly position: MutationPosition
+    }
+  | {
+      readonly kind: "renewed"
+      readonly leaseToken: bigint
+      readonly grantedTtlMicros: bigint
+      readonly position: MutationPosition
+    }
   | { readonly kind: "released"; readonly wasHeld: boolean }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
 
@@ -631,7 +836,19 @@ export function encodeKvOutcome(outcome: KvOutcome): unknown {
           "Leased",
           new Map<string, unknown>([
             ["lease_token", outcome.leaseToken],
-            ["granted_ttl_micros", outcome.grantedTtlMicros]
+            ["granted_ttl_micros", outcome.grantedTtlMicros],
+            ["position", encodeMutationPosition(outcome.position)]
+          ])
+        ]
+      ])
+    case "renewed":
+      return new Map([
+        [
+          "Renewed",
+          new Map<string, unknown>([
+            ["lease_token", outcome.leaseToken],
+            ["granted_ttl_micros", outcome.grantedTtlMicros],
+            ["position", encodeMutationPosition(outcome.position)]
           ])
         ]
       ])
@@ -696,7 +913,23 @@ export function decodeKvOutcome(value: unknown, context: string): KvOutcome {
       return {
         kind: "leased",
         leaseToken: field.requiredU64(leasedMap, "lease_token", context),
-        grantedTtlMicros: field.requiredU64(leasedMap, "granted_ttl_micros", context)
+        grantedTtlMicros: field.requiredU64(leasedMap, "granted_ttl_micros", context),
+        position: decodeMutationPosition(
+          field.requiredMap(leasedMap, "position", context),
+          `${context}.position`
+        )
+      }
+    }
+    case "Renewed": {
+      const renewedMap = expectMap(inner, context)
+      return {
+        kind: "renewed",
+        leaseToken: field.requiredU64(renewedMap, "lease_token", context),
+        grantedTtlMicros: field.requiredU64(renewedMap, "granted_ttl_micros", context),
+        position: decodeMutationPosition(
+          field.requiredMap(renewedMap, "position", context),
+          `${context}.position`
+        )
       }
     }
     case "Released":
@@ -723,6 +956,7 @@ export type KvError =
   | { readonly kind: "leaseLost" }
   | { readonly kind: "notFound" }
   | { readonly kind: "notLeader" }
+  | { readonly kind: "stale"; readonly required: MutationPosition }
   | { readonly kind: "unrecognized"; readonly tag: string; readonly value: unknown }
 
 export function encodeKvError(error: KvError): unknown {
@@ -768,6 +1002,10 @@ export function encodeKvError(error: KvError): unknown {
       return "NotFound"
     case "notLeader":
       return "NotLeader"
+    case "stale":
+      return new Map([
+        ["Stale", new Map<string, unknown>([["required", encodeMutationPosition(error.required)]])]
+      ])
     case "unrecognized":
       return new Map([[error.tag, error.value]])
   }
@@ -813,6 +1051,16 @@ export function decodeKvError(value: unknown, context: string): KvError {
       const conflictMap = expectMap(inner, context)
       const current = field.optionalU64(conflictMap, "current", context)
       return { kind: "versionConflict", ...(current !== undefined ? { current } : {}) }
+    }
+    case "Stale": {
+      const staleMap = expectMap(inner, context)
+      return {
+        kind: "stale",
+        required: decodeMutationPosition(
+          field.requiredMap(staleMap, "required", context),
+          `${context}.required`
+        )
+      }
     }
     default:
       return { kind: "unrecognized", tag, value: inner }

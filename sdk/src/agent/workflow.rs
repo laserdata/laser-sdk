@@ -2,6 +2,8 @@ use crate::agent::contract::Contract;
 use crate::agent::router::{CapabilitySelector, InboxRoute, Router};
 use crate::context::ContextAssembler;
 use crate::error::LaserError;
+#[cfg(feature = "kv")]
+use crate::kv::{KV_LEASE_OP_VERSION, KvLeaseRenew};
 use crate::laser::Laser;
 use crate::provenance::{AgentTopic, Provenance};
 use crate::types::{AgentId, ConversationId};
@@ -25,7 +27,7 @@ enum WorkflowJournalEntry {
 /// The key-value namespace holding the workflow run's fenced lease, the
 /// orchestrator-fence an exclusive step claims.
 #[cfg(feature = "kv")]
-const WORKFLOW_FENCE_NAMESPACE: &str = "agdx.workflow.fence";
+pub const WORKFLOW_FENCE_NAMESPACE: &str = "agdx.workflow.fence";
 
 /// How long an exclusive step's fenced lease is held before it must be renewed.
 #[cfg(feature = "kv")]
@@ -133,9 +135,9 @@ pub enum OnTimeout {
     /// Fail the step and run compensations (the default).
     #[default]
     Fail,
-    /// Hand the task to a fresh holder, re-acquiring the lease so the fence bumps
-    /// and the timed-out holder is gated out at the sink. Needs an exclusive step,
-    /// since the fence is what makes reassignment safe from double-execution.
+    /// Hand the task to a fresh holder after releasing the timed-out assignment's
+    /// lease. The fresh acquisition bumps the fence and gates the old holder out at
+    /// the sink. Needs an exclusive step so reassignment cannot double-commit.
     Reassign,
 }
 
@@ -457,19 +459,21 @@ impl<'a> Workflow<'a> {
             // holder). An all-capable step scatters to every capable agent and
             // folds their replies. All return the step output and reply tokens.
             let dispatched = match &step.target {
-                Router::AllCapable(selector) => {
-                    self.scatter(&source, selector, &payload, started).await
-                }
-                _ if step.exclusive => {
-                    self.dispatch_exclusive(&source, step, &payload, started, run_id)
-                        .await
-                }
+                Router::AllCapable(selector) => self
+                    .scatter(&source, selector, &payload, started)
+                    .await
+                    .map(|(output, tokens)| (output, tokens, false)),
+                _ if step.exclusive => self
+                    .dispatch_exclusive(&source, step, &payload, started, run_id)
+                    .await
+                    .map(|(output, tokens)| (output, tokens, true)),
                 _ => self
                     .dispatch_one(&source, step.target.clone(), payload, started)
                     .await
-                    .and_then(|outcome| outcome.completed("a workflow step did not complete")),
+                    .and_then(|outcome| outcome.completed("a workflow step did not complete"))
+                    .map(|(output, tokens)| (output, tokens, false)),
             };
-            let (output, step_tokens) = match dispatched {
+            let (output, step_tokens, finalized) = match dispatched {
                 Ok(result) => result,
                 Err(error) => {
                     self.compensate(&completed, &outputs).await;
@@ -478,24 +482,10 @@ impl<'a> Workflow<'a> {
             };
             tokens_spent = tokens_spent.saturating_add(step_tokens);
 
-            if let Some(verifier) = &step.verifier {
-                let verified = match verifier.verify(&output).await {
-                    Ok(verified) => verified,
-                    Err(error) => {
-                        self.compensate(&completed, &outputs).await;
-                        return Err(error);
-                    }
-                };
-                if !verified {
-                    self.compensate(&completed, &outputs).await;
-                    return Err(LaserError::HandlerConfig(format!(
-                        "workflow step `{}` failed verification",
-                        step.label
-                    )));
-                }
+            if !finalized && let Err(error) = self.finalize_step(run_id, step, &output).await {
+                self.compensate(&completed, &outputs).await;
+                return Err(error);
             }
-
-            self.journal(run_id, &step.label, &output).await?;
             outputs.insert(step.label.clone(), output);
             completed.push(index);
             if let Err(error) = self.check_budget(invocations, tokens_spent, started) {
@@ -505,6 +495,23 @@ impl<'a> Workflow<'a> {
         }
 
         Ok(WorkflowOutcome { outputs, run_id })
+    }
+
+    async fn finalize_step(
+        &self,
+        run_id: ConversationId,
+        step: &Step,
+        output: &[u8],
+    ) -> Result<(), LaserError> {
+        if let Some(verifier) = &step.verifier
+            && !verifier.verify(output).await?
+        {
+            return Err(LaserError::HandlerConfig(format!(
+                "workflow step `{}` failed verification",
+                step.label
+            )));
+        }
+        self.journal(run_id, &step.label, output).await
     }
 
     /// Dispatch a directed step as one contract. A completion returns its body and
@@ -531,10 +538,11 @@ impl<'a> Workflow<'a> {
 
     /// Dispatch an exclusive step: claim a fenced lease, stamp its token on a
     /// command pinned to a task conversation stable across re-dispatch, and send.
-    /// On a timeout with [`OnTimeout::Reassign`], re-acquire the lease (which bumps
-    /// the plane's fence sequence, so the new token is strictly greater and the
-    /// timed-out holder is gated out) and re-dispatch, up to a bounded number of
-    /// reassignments. Returns the completing reply's body and tokens.
+    /// The lease is renewed through verification and completion journaling, then
+    /// released on every exit. On a timeout with [`OnTimeout::Reassign`], a new
+    /// holder then acquires the lease, bumping the fence before re-dispatch, up to
+    /// a bounded number of assignments. Returns the completing reply's body and
+    /// tokens after its journal record is durable.
     async fn dispatch_exclusive(
         &self,
         source: &AgentId,
@@ -551,19 +559,18 @@ impl<'a> Workflow<'a> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let fence = self.acquire_fence(step, run_id).await?;
             let outcome = self
-                .laser
-                .contract(step.target.clone())
-                .from(source.clone())
-                .payload(payload.to_vec())
-                .inbox_route(self.inbox_route.clone())
-                .deadline(self.step_deadline(started))
-                .fence(fence)
-                .conversation(task_conversation)
-                .send()
+                .dispatch_exclusive_attempt(
+                    source,
+                    step,
+                    payload,
+                    started,
+                    run_id,
+                    task_conversation,
+                    attempt,
+                )
                 .await?;
-            match StepDispatch::from(outcome) {
+            match outcome {
                 StepDispatch::Completed { body, tokens } => return Ok((body, tokens)),
                 StepDispatch::TimedOut if attempt < max_attempts => continue,
                 _ => {
@@ -575,21 +582,27 @@ impl<'a> Workflow<'a> {
         }
     }
 
-    /// Claim a fenced lease on the workflow run and return its monotonic fence
-    /// token. The lease grant bumps the never-expiring fence sequence plane-side
-    /// and returns the new value, so an exclusive step's command carries a token
-    /// strictly greater than any prior holder's, and a worker fences out the
-    /// stale one. The token's monotonicity is the plane's contract: a server must
-    /// back it with the dedicated fence sequence of the protocol, not a lease
-    /// version that resets on re-acquire. The SDK fails closed when the server has
-    /// not advertised the fenced compare-and-swap capability that the same
-    /// sequence underpins, rather than trust a token that may not be monotonic.
+    /// Claim, maintain, and release one assignment's lease. Renewal runs at half
+    /// of the granted TTL while the contract, verification, and completion journal
+    /// are active. Every exit releases the lease, so a timeout reassignment can
+    /// acquire immediately under a fresh holder and bump the fence sequence before
+    /// the stale task can commit.
     #[cfg(feature = "kv")]
-    async fn acquire_fence(&self, step: &Step, run_id: ConversationId) -> Result<u64, LaserError> {
-        if !self.laser.current_capabilities().kv.cas_fenced {
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_exclusive_attempt(
+        &self,
+        source: &AgentId,
+        step: &Step,
+        payload: &[u8],
+        started: Instant,
+        run_id: ConversationId,
+        task_conversation: ConversationId,
+        attempt: u32,
+    ) -> Result<StepDispatch, LaserError> {
+        if !self.laser.current_capabilities().kv.fenced_leases {
             return Err(LaserError::unsupported_feature(
                 "workflow",
-                "kv_cas_fenced",
+                "kv_fenced_leases",
                 "an exclusive step needs the plane's monotonic fence sequence",
             ));
         }
@@ -597,25 +610,107 @@ impl<'a> Workflow<'a> {
             .fence_namespace
             .as_deref()
             .unwrap_or(WORKFLOW_FENCE_NAMESPACE);
-        let lease = self
-            .laser
-            .kv(namespace)
-            .lease(run_id.to_string(), WORKFLOW_LEASE_TTL)
-            .await?;
-        Ok(lease.token)
+        let key = run_id.to_string();
+        let holder = workflow_lease_holder(run_id, attempt);
+        let kv = self.laser.kv(namespace);
+        let coordination = self.laser.coordination_client().await?;
+        let mut lease = kv.lease(&key, holder.clone(), WORKFLOW_LEASE_TTL).await?;
+        let fence_token = lease.token;
+        let mut completion = Box::pin(async {
+            let outcome = self
+                .laser
+                .contract(step.target.clone())
+                .from(source.clone())
+                .payload(payload.to_vec())
+                .inbox_route(self.inbox_route.clone())
+                .deadline(self.step_deadline(started))
+                .fence(fence_token)
+                .conversation(task_conversation)
+                .send()
+                .await?;
+            let dispatch = StepDispatch::from(outcome);
+            if let StepDispatch::Completed { body, .. } = &dispatch {
+                self.finalize_step(run_id, step, body).await?;
+            }
+            Ok::<_, LaserError>(dispatch)
+        });
+        let mut lease_expires_at = Instant::now() + lease.granted_ttl;
+        let outcome = 'maintain: loop {
+            let renewal_delay = workflow_renewal_delay(lease.granted_ttl)
+                .ok_or_else(|| LaserError::from(laser_wire::kv::KvError::LeaseLost))?;
+            tokio::select! {
+                result = &mut completion => break result,
+                () = tokio::time::sleep(renewal_delay) => {
+                    let request = KvLeaseRenew {
+                        v: KV_LEASE_OP_VERSION,
+                        namespace: namespace.to_owned(),
+                        key: key.as_bytes().to_vec(),
+                        holder_id: holder.clone(),
+                        subject_user_id: None,
+                        lease_token: lease.token,
+                        lease_ttl_micros: WORKFLOW_LEASE_TTL.as_micros() as u64,
+                    };
+                    let prepared = coordination.prepare_renew(&request)?;
+                    let renewal_bound = lease_expires_at
+                        .saturating_duration_since(Instant::now())
+                        .min(self.step_deadline(started));
+                    if renewal_bound.is_zero() {
+                        break Err(laser_wire::kv::KvError::LeaseLost.into());
+                    }
+                    let mut renewal = Box::pin(
+                        coordination.renew_with_timeout(&prepared, renewal_bound),
+                    );
+                    let renewed = tokio::select! {
+                        result = &mut completion => {
+                            let renewal_result = (&mut renewal).await;
+                            if let Err(error) = renewal_result {
+                                break 'maintain Err(error);
+                            }
+                            break 'maintain result;
+                        }
+                        result = &mut renewal => result,
+                    };
+                    match renewed {
+                        Ok(next) => {
+                            lease = next;
+                            lease_expires_at = Instant::now() + lease.granted_ttl;
+                        }
+                        Err(error) => break Err(error),
+                    }
+                }
+            }
+        };
+        let released = kv.release(&key, holder, lease.token).await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = released;
+                return Err(error);
+            }
+        };
+        if !released? {
+            return Err(laser_wire::kv::KvError::LeaseLost.into());
+        }
+        Ok(outcome)
     }
 
     /// Without the managed key-value store there is no lease to fence with, so an
     /// exclusive step cannot run.
     #[cfg(not(feature = "kv"))]
-    async fn acquire_fence(
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_exclusive_attempt(
         &self,
+        _source: &AgentId,
         _step: &Step,
+        _payload: &[u8],
+        _started: Instant,
         _run_id: ConversationId,
-    ) -> Result<u64, LaserError> {
+        _task_conversation: ConversationId,
+        _attempt: u32,
+    ) -> Result<StepDispatch, LaserError> {
         Err(LaserError::unsupported_feature(
             "workflow",
-            "kv_cas_fenced",
+            "kv_fenced_leases",
             "exclusive workflow steps need the managed lease and fence",
         ))
     }
@@ -776,6 +871,17 @@ impl<'a> Workflow<'a> {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "kv")]
+fn workflow_lease_holder(run_id: ConversationId, attempt: u32) -> String {
+    format!("workflow:{run_id}:{attempt}")
+}
+
+#[cfg(feature = "kv")]
+fn workflow_renewal_delay(granted_ttl: Duration) -> Option<Duration> {
+    let delay = granted_ttl / 2;
+    (!delay.is_zero()).then_some(delay)
 }
 
 /// A step under construction, returned by [`Workflow::step`]. Refines the step it
@@ -1017,6 +1123,27 @@ mod tests {
         let steps = vec![step("a", &["b"]), step("b", &["a"])];
         let error = topological_order(&steps).unwrap_err();
         assert!(matches!(error, LaserError::Invalid(message) if message.contains("cycle")));
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn given_reassignments_when_holders_are_derived_then_should_use_distinct_bounded_identities() {
+        let run_id = ConversationId::new();
+        let first = workflow_lease_holder(run_id, 1);
+        let second = workflow_lease_holder(run_id, 2);
+        assert_ne!(first, second);
+        assert!(first.len() <= laser_wire::limits::MAX_HOLDER_ID_BYTES);
+        assert!(second.len() <= laser_wire::limits::MAX_HOLDER_ID_BYTES);
+    }
+
+    #[cfg(feature = "kv")]
+    #[test]
+    fn given_a_short_granted_ttl_when_scheduling_renewal_then_should_fail_before_expiry() {
+        assert_eq!(workflow_renewal_delay(Duration::from_nanos(1)), None);
+        assert_eq!(
+            workflow_renewal_delay(Duration::from_secs(60)),
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[test]

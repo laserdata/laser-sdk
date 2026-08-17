@@ -42,6 +42,8 @@ pub use router::{
 pub use scope::AgentScope;
 pub use session::SessionPolicy;
 pub use state::{ConversationState, ReplayBound, resume_offsets};
+#[cfg(feature = "kv")]
+pub use workflow::WORKFLOW_FENCE_NAMESPACE;
 pub use workflow::{
     Budget, OnTimeout, StepContext, StepFn, StepHandle, Verifier, Workflow, WorkflowOutcome,
 };

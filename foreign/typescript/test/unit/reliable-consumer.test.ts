@@ -19,6 +19,7 @@ import {
 } from "../../src/agent/reliable-consumer.js"
 import {
   AgentWorkflowExecutionError,
+  AmbiguousMutationError,
   AuthzExecutionError,
   GraphExecutionError,
   QueryExecutionError,
@@ -188,6 +189,7 @@ void test("given_an_undecodable_payload_when_decoding_an_agent_message_then_shou
 
 void test("given_permanent_and_transient_errors_when_classified_then_should_retry_only_transient_failures", () => {
   assert.equal(isRetryable(new RejectedError("no")), false)
+  assert.equal(isRetryable(new AmbiguousMutationError("unknown")), false)
   assert.equal(isRetryable(new TransportError("temporary", true)), true)
   assert.equal(isRetryable(new TransportError("permanent", false)), false)
   assert.equal(isRetryable(new QueryExecutionError("busy", { kind: "unavailable" })), true)

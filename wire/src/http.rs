@@ -524,6 +524,10 @@ pub struct KvCapsView {
     /// fence sequence.
     #[serde(default)]
     pub cas_fenced: bool,
+    /// Whether the full revocable fenced-lease contract is served: holder-scoped
+    /// acquire, renewal, release, live-lease fenced CAS, and barriered reads.
+    #[serde(default)]
+    pub fenced_leases: bool,
 }
 
 impl Capabilities {
@@ -562,6 +566,7 @@ impl Capabilities {
                 available: enabled,
                 cas: false,
                 cas_fenced: false,
+                fenced_leases: false,
             },
             graph: false,
             fork: enabled,
@@ -658,6 +663,15 @@ impl Capabilities {
         self
     }
 
+    /// Advertise the full revocable fenced-lease contract. This subsumes the
+    /// older fence-only `cas_fenced` capability.
+    #[must_use]
+    pub fn with_kv_fenced_leases(mut self, on: bool) -> Self {
+        self.kv.fenced_leases = on;
+        self.kv.cas_fenced |= on;
+        self
+    }
+
     /// Advertise the strongest read-consistency the query surface serves.
     #[must_use]
     pub fn with_query_consistency(mut self, level: Consistency) -> Self {
@@ -684,6 +698,7 @@ impl Capabilities {
         Self::new(enabled, versions)
             .with_kv_cas(versions.has_feature(feature::KV_CAS))
             .with_kv_cas_fenced(versions.has_feature(feature::KV_CAS_FENCED))
+            .with_kv_fenced_leases(versions.has_feature(feature::KV_FENCED_LEASES))
             .with_agent_workflow(versions.has_feature(feature::AGENT_WORKFLOW))
             .with_query_keyword(versions.has_feature(feature::KEYWORD_SEARCH))
             .with_watch(versions.has_feature(feature::WATCH))
@@ -1180,13 +1195,28 @@ mod tests {
             "core surfaces track enabled"
         );
         assert!(
-            !caps.kv.cas && caps.query.consistency == Consistency::Eventual,
+            !caps.kv.cas
+                && !caps.kv.cas_fenced
+                && !caps.kv.fenced_leases
+                && caps.query.consistency == Consistency::Eventual,
             "sub-features must be opt-in, never on by default"
         );
         let opted = caps
             .with_kv_cas(true)
             .with_query_consistency(Consistency::ReadYourWrites);
         assert!(opted.kv.cas && opted.query.consistency == Consistency::ReadYourWrites);
+    }
+
+    #[test]
+    fn given_the_fenced_lease_bit_when_building_http_capabilities_then_should_advertise_it() {
+        let versions =
+            OpVersions::new(1, 1, 1, 1).with_features(crate::hello::feature::KV_FENCED_LEASES);
+        let caps = Capabilities::from_versions(true, versions);
+        assert!(caps.kv.fenced_leases);
+        assert!(
+            caps.kv.cas_fenced,
+            "the full fenced-lease contract subsumes fenced CAS"
+        );
     }
 
     #[test]

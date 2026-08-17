@@ -59,6 +59,17 @@ pub enum Feature {
     /// Administration of the authorization layer itself (defining roles and
     /// binding them). Gated by `authz:admin`, never derived from a command code.
     Authz,
+    /// Lease lifecycle in a coordination namespace: acquire, renew, and release
+    /// (`kv_lease:admin`), including delegated acquisition for another subject.
+    /// Split from [`Feature::Kv`] so a state writer's `kv:write` grant never
+    /// implies lease control; the action vocabulary stays the shared
+    /// read/write/delete/admin set (every action widens the coarse mask by one
+    /// bit per feature, so features split, actions do not grow).
+    KvLease,
+    /// Presenting a fence on a fenced compare-and-swap (`kv_fence:read`): the
+    /// right to validate against a coordination namespace's lease and fence
+    /// rows without any right to mutate them.
+    KvFence,
     /// A feature name a newer peer used that this build does not know. An unknown
     /// `feature` string decodes here instead of failing the whole grant set, and
     /// it matches no request (requests only ever carry a known feature), so an
@@ -307,15 +318,25 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
         AGDX_KV_GET_CODE | AGDX_KV_SCAN_CODE | AGDX_KV_NAMESPACES_CODE | AGDX_KV_EXISTS_CODE => {
             (Feature::Kv, Action::Read)
         }
+        // A fenced CAS additionally requires `kv_fence:read` on its
+        // coordination namespace ([`crate::kv::KvCasFenced::fence_namespace`]);
+        // this map carries the primary target-namespace grant and the enforcer
+        // checks the fence grant beside it.
         AGDX_KV_SET_CODE
         | AGDX_KV_CAS_CODE
         | AGDX_KV_CAS_FENCED_CODE
         | AGDX_KV_PATCH_CODE
         | AGDX_KV_EXPIRE_CODE
         | AGDX_KV_COPY_CODE
-        | AGDX_KV_MOVE_CODE
-        | AGDX_KV_LEASE_CODE
-        | AGDX_KV_RELEASE_CODE => (Feature::Kv, Action::Write),
+        | AGDX_KV_MOVE_CODE => (Feature::Kv, Action::Write),
+        // Lease lifecycle is its own feature: a `kv:write` grant on a
+        // namespace must never imply acquiring, renewing, or releasing the
+        // lease that fences it. `admin` is the house action for a surface's
+        // privileged op (`projection:admin`, `fork:admin`), so lease control
+        // is `kv_lease:admin`, distinct from `kv:admin` by the feature alone.
+        AGDX_KV_LEASE_CODE | AGDX_KV_LEASE_RENEW_CODE | AGDX_KV_RELEASE_CODE => {
+            (Feature::KvLease, Action::Admin)
+        }
         AGDX_KV_DELETE_CODE | AGDX_KV_DELETE_MANY_CODE => (Feature::Kv, Action::Delete),
         AGDX_FORK_LIST_CODE => (Feature::Fork, Action::Read),
         AGDX_FORK_CREATE_CODE | AGDX_FORK_PUT_CODE => (Feature::Fork, Action::Write),
@@ -334,7 +355,9 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
 /// The number of [`Action`] variants (including the `Unrecognized` catch-all):
 /// the stride of the shared coarse-capability bitmask layout ([`action_index`]).
 /// The stride must cover every action so one feature's last action bit never
-/// collides with the next feature's first.
+/// collides with the next feature's first. Keep the action set minimal: every
+/// added action costs one mask bit per feature, so new capability semantics
+/// split into a feature (a fresh row) rather than an action (a wider stride).
 pub const ACTION_COUNT: usize = 5;
 
 /// The bit index of a `(feature, action)` in the coarse-capability bitmask, a
@@ -345,19 +368,21 @@ pub fn action_index(feature: Feature, action: Action) -> usize {
     feature as usize * ACTION_COUNT + action as usize
 }
 
-// The coarse-capability bitmask every enforcer shares is a `u64`, so every
-// `(feature, action)` bit index must fit in 64 bits. Adding features or actions
-// past that ceiling is a compile error here, not a silent runtime aliasing of two
-// distinct capabilities onto one bit. `ACTION_COUNT` must also stay the true
-// `Action` variant count, or `action_index`'s stride would skip or overlap rows.
+// The coarse-capability bitmask every enforcer shares is a `u128` (widened
+// from `u64` when the kv_lease/kv_fence feature split pushed the grid past 64),
+// so every `(feature, action)` bit index must fit in 128 bits. Adding features
+// or actions past that ceiling is a compile error here, not a silent runtime
+// aliasing of two distinct capabilities onto one bit. `ACTION_COUNT` must also
+// stay the true `Action` variant count, or `action_index`'s stride would skip
+// or overlap rows.
 const _: () = {
     assert!(
         <Action as strum::VariantArray>::VARIANTS.len() == ACTION_COUNT,
         "ACTION_COUNT must equal the number of Action variants"
     );
     assert!(
-        <Feature as strum::VariantArray>::VARIANTS.len() * ACTION_COUNT <= 64,
-        "authz coarse-capability bitmask overflow: Feature count * ACTION_COUNT exceeds 64 bits"
+        <Feature as strum::VariantArray>::VARIANTS.len() * ACTION_COUNT <= 128,
+        "authz coarse-capability bitmask overflow: Feature count * ACTION_COUNT exceeds 128 bits"
     );
 };
 
@@ -691,6 +716,24 @@ mod tests {
             feature_action(AGDX_KV_DELETE_CODE),
             Some((Feature::Kv, Action::Delete))
         );
+        // Lease lifecycle is its own feature at the shared admin action, so a
+        // `kv:write` grant can never acquire, renew, or release.
+        assert_eq!(
+            feature_action(AGDX_KV_LEASE_CODE),
+            Some((Feature::KvLease, Action::Admin))
+        );
+        assert_eq!(
+            feature_action(AGDX_KV_LEASE_RENEW_CODE),
+            Some((Feature::KvLease, Action::Admin))
+        );
+        assert_eq!(
+            feature_action(AGDX_KV_RELEASE_CODE),
+            Some((Feature::KvLease, Action::Admin))
+        );
+        assert_eq!(
+            feature_action(AGDX_KV_CAS_FENCED_CODE),
+            Some((Feature::Kv, Action::Write))
+        );
         assert_eq!(
             feature_action(AGDX_REGISTER_SCHEMA_CODE),
             Some((Feature::Projection, Action::Admin))
@@ -710,13 +753,13 @@ mod tests {
     }
 
     #[test]
-    fn given_feature_action_pairs_when_indexed_then_should_fit_a_u64_mask() {
+    fn given_feature_action_pairs_when_indexed_then_should_fit_a_u128_mask() {
         use strum::VariantArray;
         let mut seen = std::collections::HashSet::new();
         for &feature in Feature::VARIANTS {
             for &action in Action::VARIANTS {
                 let index = action_index(feature, action);
-                assert!(index < 64, "index {index} must fit a u64 mask");
+                assert!(index < 128, "index {index} must fit a u128 mask");
                 assert!(seen.insert(index), "index {index} collided");
             }
         }

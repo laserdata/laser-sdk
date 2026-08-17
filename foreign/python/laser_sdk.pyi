@@ -46,10 +46,12 @@ __all__ = [
     "KvScanRequest",
     "KvSetRequest",
     "Laser",
+    "Lease",
     "McpBridge",
     "Memory",
     "MemoryItem",
     "Message",
+    "MutationPosition",
     "OpVersions",
     "PolicyEvidence",
     "Producer",
@@ -621,6 +623,14 @@ class Capabilities:
         r"""
         The key-value store serves fenced compare-and-swap (the monotonic fence an
         exclusive workflow step needs for an at-most-once effect).
+        """
+    @property
+    def kv_fenced_leases(self) -> builtins.bool:
+        r"""
+        The key-value store serves the revocable fenced-lease contract:
+        holder-scoped acquire, renewal, fence-validated release, fenced
+        compare-and-swap requiring a live lease, and the barriered read. The
+        lease, renew, release, and `cas_fenced` calls all gate on this.
         """
     @property
     def graph(self) -> builtins.bool:
@@ -1505,6 +1515,13 @@ class Kv:
         r"""
         Fetch the full entry (key, value, version, expiry) at `key`, or `None`.
         """
+    def get_entry_at_least(self, key: typing.Any, min_position: MutationPosition) -> typing.Any:
+        r"""
+        Barriered read: wait until the answering fold has applied at least
+        `min_position`, normally the position returned by `lease` or
+        `renew_lease`. A fold that cannot catch up raises a stale `KvError`, never
+        returns an absent value. Needs the `kv_fenced_leases` capability.
+        """
     def get_typed(self, key: typing.Any) -> typing.Any:
         r"""
         Fetch and JSON-decode the value at `key` into a Python value, or `None`.
@@ -1515,16 +1532,18 @@ class Kv:
         `ttl` / `expires_at` / `expect_*`, then `await .send()` (or `.commit()`
         for a compare-and-swap).
         """
-    def cas_fenced(self, key: typing.Any, fence_key: typing.Any, fence_token: builtins.int, value: typing.Any, *, expect_version: typing.Optional[builtins.int] = None, expect_absent: builtins.bool = False, ttl_secs: typing.Optional[builtins.float] = None) -> typing.Any:
+    def cas_fenced(self, key: typing.Any, fence_namespace: builtins.str, fence_key: typing.Any, fence_token: builtins.int, value: typing.Any, *, expect_version: typing.Optional[builtins.int] = None, expect_absent: builtins.bool = False, ttl_secs: typing.Optional[builtins.float] = None) -> typing.Any:
         r"""
-        Fenced compare-and-swap: write `value` (payload) to `key` only while the
-        task's fence sequence still equals `fence_token` (from a prior `lease`),
-        and the precondition holds. Give exactly one of `expect_version=` (apply
-        only if the key holds that version) or `expect_absent=True` (create only if
-        absent). Returns the new version. A stale fence raises `KvError`
-        (`is_version_conflict()` is false, a newer holder bumped the sequence). A
-        precondition miss raises `KvError` with `is_version_conflict()` true. The
-        at-most-one-effective-writer gate for an exclusive external effect.
+        Fenced compare-and-swap: write `value` (payload) to `key` in one backend
+        transaction that requires a live lease at (`fence_namespace`,
+        `fence_key`) with a fence sequence still equal to `fence_token` (both
+        from a prior `lease`), and the precondition. Give exactly one of
+        `expect_version=` (apply only if the key holds that version) or
+        `expect_absent=True` (create only if absent). Returns the new version. A
+        stale fence, or a lease that expired or was released, raises `KvError`
+        (`is_version_conflict()` is false). A precondition miss raises `KvError`
+        with `is_version_conflict()` true. The at-most-one-effective-writer gate
+        for an exclusive external effect.
         """
     def delete(self, key: typing.Any) -> typing.Any:
         r"""
@@ -1545,15 +1564,32 @@ class Kv:
         Apply a merge `patch` (payload) to a structured value, returning the new
         version.
         """
-    def lease(self, key: typing.Any, ttl_secs: builtins.float) -> typing.Any:
+    def lease(self, key: typing.Any, holder: builtins.str, ttl_secs: builtins.float) -> typing.Any:
         r"""
-        Acquire an advisory lease on `key` for `ttl_secs`. Returns
-        `(lease_token, granted_ttl_secs)`.
+        Acquire a revocable lease on `key` for `ttl_secs` as `holder` (a stable
+        node or worker id). Returns a `Lease` with `token`, `granted_ttl_secs`,
+        and the `position` to pass to `get_entry_at_least`. A live
+        lease always conflicts: extend with `renew_lease`, never by
+        re-acquiring. `ttl_secs` is a requested maximum between 1 second and 5
+        minutes; the store may grant less and never more, so a value outside that
+        range raises before the round trip and a holder needing longer renews.
+        Needs the `kv_fenced_leases` capability. If acquisition is
+        ambiguous, the SDK closes the dedicated coordination connection and waits
+        `ttl_secs` before raising the non-retryable ambiguous-mutation error.
         """
-    def release(self, key: typing.Any, token: builtins.int) -> typing.Any:
+    def renew_lease(self, key: typing.Any, holder: builtins.str, token: builtins.int, ttl_secs: builtins.float) -> typing.Any:
         r"""
-        Release a held lease early, presenting its `token`. Returns `True` when a
-        held lease was released.
+        Extend a held lease without changing its token, presenting the same
+        `holder` and the `token` the grant returned. Returns
+        a `Lease` with the unchanged token, fresh TTL, and renewal position.
+        `ttl_secs` obeys the same range as `lease`. An expired, released, or
+        re-acquired lease raises `KvError`: stop the protected work, a new epoch
+        needs a fresh `lease`.
+        """
+    def release(self, key: typing.Any, holder: builtins.str, token: builtins.int) -> typing.Any:
+        r"""
+        Release a held lease early, presenting the same `holder` and its
+        `token`. Returns `True` when a held lease was released.
         """
     def copy_to(self, key: typing.Any, to_key: typing.Any, *, to_namespace: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
@@ -1896,7 +1932,7 @@ class Laser:
         A clone whose change-feed records publish to `changes_topic` on the ops
         stream instead of the default `changes`.
         """
-    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
+    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Return a clone with selected negotiated capabilities overridden. This is
         intended for bring-your-own backends and deterministic pre-gate tests.
@@ -2200,6 +2236,19 @@ class Laser:
         """
 
 @typing.final
+class Lease:
+    r"""
+    A revocable lease grant and the mutation barrier it established.
+    """
+    @property
+    def token(self) -> builtins.int: ...
+    @property
+    def granted_ttl_secs(self) -> builtins.float: ...
+    @property
+    def position(self) -> MutationPosition: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class McpBridge:
     r"""
     An MCP bridge: serve tools / resources / prompts over the log and route
@@ -2361,6 +2410,20 @@ class Message:
         r"""
         Decode the payload as JSON into a Python value.
         """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class MutationPosition:
+    r"""
+    The durable managed-mutation position used as a barrier for takeover reads.
+    """
+    @property
+    def topic_generation(self) -> builtins.int: ...
+    @property
+    def partition(self) -> builtins.int: ...
+    @property
+    def offset(self) -> builtins.int: ...
+    def __new__(cls, topic_generation: builtins.int, partition: builtins.int, offset: builtins.int) -> MutationPosition: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -3545,6 +3608,7 @@ class LaserError(Exception):
     not_found: builtins.bool
     version_skew: builtins.bool
     version_conflict: builtins.bool
+    ambiguous_mutation: builtins.bool
     stale: builtins.bool
     permission_denied: builtins.bool
     stream_or_topic_not_found: builtins.bool

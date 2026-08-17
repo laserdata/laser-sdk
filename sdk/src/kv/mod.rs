@@ -5,19 +5,30 @@
 pub use laser_wire::codes::{
     AGDX_KV_BASE, AGDX_KV_CAS_CODE, AGDX_KV_CAS_FENCED_CODE, AGDX_KV_COPY_CODE,
     AGDX_KV_DELETE_CODE, AGDX_KV_DELETE_MANY_CODE, AGDX_KV_EXISTS_CODE, AGDX_KV_EXPIRE_CODE,
-    AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE, AGDX_KV_MOVE_CODE, AGDX_KV_NAMESPACES_CODE,
-    AGDX_KV_PATCH_CODE, AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE, AGDX_KV_SET_CODE, KV_OP_VERSION,
+    AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE, AGDX_KV_LEASE_RENEW_CODE, AGDX_KV_MOVE_CODE,
+    AGDX_KV_NAMESPACES_CODE, AGDX_KV_PATCH_CODE, AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE,
+    AGDX_KV_SET_CODE, KV_LEASE_OP_VERSION, KV_OP_VERSION,
 };
 pub use laser_wire::kv::{
     CasExpect, KvCas, KvCasFenced, KvCopy, KvDelete, KvDeleteMany, KvEntry, KvError, KvExists,
-    KvExpire, KvGet, KvLease, KvMetadata, KvMove, KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage,
-    KvPatch, KvRelease, KvReply, KvScan, KvSet,
+    KvExpire, KvGet, KvLease, KvLeaseRenew, KvMetadata, KvMove, KvNamespaceInfo, KvNamespaces,
+    KvOutcome, KvPage, KvPatch, KvRelease, KvReply, KvScan, KvSet,
 };
 pub use laser_wire::limits::{
-    DEFAULT_NAMESPACE, DEFAULT_SCAN_LIMIT, MAX_KEY_BYTES, MAX_SCAN_LIMIT, MAX_VALUE_BYTES,
+    DEFAULT_NAMESPACE, DEFAULT_SCAN_LIMIT, MAX_HOLDER_ID_BYTES, MAX_KEY_BYTES,
+    MAX_LEASE_TTL_MICROS, MAX_SCAN_LIMIT, MAX_VALUE_BYTES, MIN_LEASE_TTL_MICROS,
 };
+pub use laser_wire::mutation::MutationPosition;
 
 #[cfg(feature = "kv")]
 mod client;
 #[cfg(feature = "kv")]
+mod coordination;
+#[cfg(feature = "kv")]
 pub use client::{Kv, KvCopyRequest, KvDeleteManyRequest, KvScanRequest, KvSetRequest, Lease};
+#[cfg(feature = "kv")]
+pub use coordination::{
+    AmbiguousMutationRecovery, DEFAULT_ATTEMPT_TIMEOUT, DedicatedKvTransport,
+    DynManagedKvTransport, FencedLeaseClient, LocalManagedKvTransport, ManagedKvTransport,
+    PreparedMutation, SharedKvTransport,
+};

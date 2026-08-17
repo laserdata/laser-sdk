@@ -12,7 +12,8 @@ create_exception!(
     PyException,
     "Base class for every laser-sdk error. Catch it to handle any SDK failure. \
      Every instance carries `code`, `retryable`, `unsupported`, `not_found`, \
-     `version_skew`, `version_conflict`, `stale`, `unavailable`, `permission_denied`, \
+     `version_skew`, `version_conflict`, `ambiguous_mutation`, `stale`, `unavailable`, \
+     `permission_denied`, \
      `stream_or_topic_not_found`, `no_capable_agent`, `lease_lost`, \
      `fence_violation`, `budget_exceeded`, `quarantined`, and `not_leader` attributes."
 );
@@ -202,6 +203,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
     let not_found = err.is_not_found();
     let version_skew = err.is_version_skew();
     let version_conflict = err.is_version_conflict();
+    let ambiguous_mutation = err.is_ambiguous_mutation();
     let stale = err.is_stale();
     let permission_denied = err.is_permission_denied();
     let stream_or_topic_not_found = err.is_stream_or_topic_not_found();
@@ -252,6 +254,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         let _ = value.setattr("not_found", not_found);
         let _ = value.setattr("version_skew", version_skew);
         let _ = value.setattr("version_conflict", version_conflict);
+        let _ = value.setattr("ambiguous_mutation", ambiguous_mutation);
         let _ = value.setattr("stale", stale);
         let _ = value.setattr("permission_denied", permission_denied);
         let _ = value.setattr("stream_or_topic_not_found", stream_or_topic_not_found);
