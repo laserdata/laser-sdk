@@ -9,6 +9,9 @@ use std::time::Duration;
 const NAMESPACE: &str = "profiles";
 const KEY: &str = "user:42";
 const FORK: &str = "experiment-1";
+const LEASE_KEY: &str = "lease:user:42";
+const HOLDER: &str = "worker-a";
+const LEASE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Profile {
@@ -56,6 +59,63 @@ async fn main() -> Result<(), LaserError> {
             entry.version,
             plan_of(upgraded.as_ref())
         );
+    }
+
+    if capabilities.kv.fenced_leases {
+        phase("lease and fenced write: at most one effective writer");
+        let lease = kv.lease(LEASE_KEY, HOLDER, LEASE_TTL).await?;
+        println!("  {HOLDER} holds {LEASE_KEY} at fence {}", lease.token);
+        // Barriered read: the answering fold has applied at least the grant, so
+        // a holder that just took over never plans against its predecessor's
+        // state.
+        let held = kv
+            .get_entry_at_least(KEY, lease.position)
+            .await?
+            .ok_or_else(|| LaserError::Invalid(format!("{KEY} vanished")))?;
+        let fenced = kv
+            .cas_fenced(KEY, NAMESPACE, LEASE_KEY, lease.token)
+            .json(&Profile {
+                plan: "enterprise-plus".to_owned(),
+            })?
+            .ttl(Duration::from_secs(86_400))
+            .expect_version(held.version)
+            .commit()
+            .await?;
+        let seen: Profile = serde_json::from_slice(&held.value)
+            .map_err(|error| LaserError::Invalid(error.to_string()))?;
+        println!(
+            "  barriered read saw {}, the fenced write landed as version {fenced}",
+            plan_of(Some(&seen))
+        );
+        let renewed = kv
+            .renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL)
+            .await?;
+        kv.release(LEASE_KEY, HOLDER, renewed.token).await?;
+        println!(
+            "  lease renewed at the same fence {}, then released",
+            renewed.token
+        );
+        // The gate holds without waiting for a successor: a released fence is
+        // already dead, so a zombie holder cannot commit through it.
+        let zombie = kv
+            .cas_fenced(KEY, NAMESPACE, LEASE_KEY, lease.token)
+            .json(&Profile {
+                plan: "zombie".to_owned(),
+            })?
+            .expect_version(fenced)
+            .commit()
+            .await;
+        match zombie {
+            Err(error) if error.is_lease_lost() => {
+                println!("  after release the same fence is refused: lease-lost");
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(LaserError::Invalid(
+                    "a released fence was accepted".to_owned(),
+                ));
+            }
+        }
     }
 
     if capabilities.forks {
