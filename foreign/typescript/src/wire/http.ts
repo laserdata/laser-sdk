@@ -168,6 +168,7 @@ export interface KvCapsView {
   readonly available: boolean
   readonly cas: boolean
   readonly casFenced: boolean
+  readonly fencedLeases: boolean
 }
 
 export interface HttpCapabilities {
@@ -1099,6 +1100,12 @@ export function decodeCapabilitiesJson(text: string): HttpCapabilities {
           field.requiredMap(map, "kv", context),
           "cas_fenced",
           `${context}.kv`
+        ) ?? false,
+      fencedLeases:
+        field.optionalBoolean(
+          field.requiredMap(map, "kv", context),
+          "fenced_leases",
+          `${context}.kv`
         ) ?? false
     },
     graph: field.optionalBoolean(map, "graph", context) ?? false,
@@ -1126,7 +1133,8 @@ export function encodeCapabilitiesJson(value: HttpCapabilities): string {
       new Map([
         ["available", value.kv.available],
         ["cas", value.kv.cas],
-        ["cas_fenced", value.kv.casFenced]
+        ["cas_fenced", value.kv.casFenced],
+        ["fenced_leases", value.kv.fencedLeases]
       ])
     ],
     ["graph", value.graph],

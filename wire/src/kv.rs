@@ -1,5 +1,6 @@
 use crate::error::InvalidError;
 use crate::limits::MAX_NAMESPACE_BYTES;
+use crate::mutation::MutationPosition;
 use serde::{Deserialize, Serialize};
 
 /// The memory scope a read-view row carries, stamped by the fold from the
@@ -95,6 +96,15 @@ pub struct KvPage {
 /// a version, the read returns [`KvOutcome::NotModified`] instead of the value
 /// when the live version matches (a conditional GET), so an up-to-date cache
 /// skips the body transfer.
+///
+/// With `min_position` set, the read is barriered: the answering fold must have
+/// applied at least that [`MutationPosition`] before reading, so a takeover
+/// reader cannot observe a fold that predates its own lease acquisition. The
+/// server waits a short bound and answers [`KvError::Stale`] when the fold does
+/// not catch up, never an absent value. Only a deployment advertising the
+/// `KV_FENCED_LEASES` capability honors the barrier: a pre-fencing plane
+/// ignores the field, so a client must not send it unless the bit is
+/// advertised. Absent keeps today's immediate local read, byte-identical.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvGet {
     pub v: u32,
@@ -103,6 +113,8 @@ pub struct KvGet {
     pub key: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub if_none_match: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_position: Option<MutationPosition>,
 }
 
 /// Request to write `value` at `key` in `namespace`, with an optional expiry.
@@ -146,11 +158,15 @@ pub struct KvCas {
     pub expect: CasExpect,
 }
 
-/// Fenced compare-and-swap: the [`KvCas`] write and precondition, applied only
-/// while the task's fence sequence still equals `fence_token` (the at-most-one
-/// effective-writer gate). A failed fence maps to [`KvError::LeaseLost`], a failed
-/// precondition to [`KvError::VersionConflict`]. Additive over
-/// [`crate::codes::KV_OP_VERSION`] 1.
+/// Fenced compare-and-swap: the [`KvCas`] write and precondition, applied in
+/// one backend transaction that also requires a **live** lease at
+/// (`fence_namespace`, `fence_key`) and a fence sequence still equal to
+/// `fence_token`. A released or expired lease, or a stale token, maps to
+/// [`KvError::LeaseLost`] even before another holder acquires; a failed
+/// precondition to [`KvError::VersionConflict`]. Version
+/// [`crate::codes::KV_LEASE_OP_VERSION`]: the pre-fencing v1 shape (no
+/// coordination namespace, fence-only gate) fails decode and any other `v`
+/// fails [`crate::validate::Validate`], both fail-closed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvCasFenced {
     pub v: u32,
@@ -162,12 +178,15 @@ pub struct KvCasFenced {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_micros: Option<u64>,
     pub expect: CasExpect,
-    /// The task's fence-sequence key, in the reserved fence namespace the plane
-    /// owns.
+    /// The coordination namespace holding the lease and fence rows. Authorized
+    /// separately from the target `namespace` (`kv_fence:read`), so a state
+    /// writer can present a fence without being able to mutate it.
+    pub fence_namespace: String,
+    /// The lease key whose live row and fence sequence gate this write.
     #[serde(with = "crate::encoding::bin_bytes")]
     pub fence_key: Vec<u8>,
     /// The fencing token: the fence-sequence value the holder was granted.
-    /// Strictly monotonic per task, never the lease version.
+    /// Strictly monotonic per key, never the lease-row version.
     pub fence_token: u64,
 }
 
@@ -256,20 +275,69 @@ pub struct KvMove {
     pub to_key: Vec<u8>,
 }
 
-/// Request to acquire an advisory lease (a bounded-TTL distributed lock) on
-/// `key`. On success the holder gets a `lease_token` to present on protected
-/// mutations (the formal `LEASE` primitive). Built on compare-and-swap.
+/// Request to acquire a revocable lease (a bounded-TTL distributed lock) on
+/// `key`. On success the store atomically creates the live lease row and bumps
+/// the never-expiring fence sequence; the holder gets the new `lease_token`
+/// and the granted TTL (the formal `LEASE` primitive). A live lease always
+/// conflicts: renewal is [`KvLeaseRenew`], never re-acquisition. Version
+/// [`crate::codes::KV_LEASE_OP_VERSION`]: the v1 shape (no holder identity)
+/// fails decode fail-closed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvLease {
     pub v: u32,
     pub namespace: String,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
+    /// Requested maximum lifetime, within
+    /// [`MIN_LEASE_TTL_MICROS`](crate::limits::MIN_LEASE_TTL_MICROS)`..=`[`MAX_LEASE_TTL_MICROS`](crate::limits::MAX_LEASE_TTL_MICROS).
+    /// A successful grant is nonzero and never exceeds this duration, so this
+    /// remains a conservative expiry bound when the grant reply is lost. The
+    /// store may grant less; it never grants more, which is why the range is
+    /// validated on the request rather than clamped.
+    pub lease_ttl_micros: u64,
+    /// Stable identity of the acquiring holder (a node or worker id, never a
+    /// connection-scoped value). Renewal and release must present the same
+    /// holder, so a different process cannot extend or drop a lease it does
+    /// not hold.
+    pub holder_id: String,
+    /// The user the lease protects mutations for. `None` leases for the
+    /// authenticated caller. `Some` is a delegated acquisition (an operator
+    /// leasing on behalf of a runtime user) and requires the `kv_lease:admin`
+    /// grant; the fence then validates against the subject's rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<u32>,
+}
+
+/// Request to extend a held lease without changing its token (the formal
+/// `RENEW` primitive). The store requires the same holder (and subject), a
+/// live lease row, and the current fence token, then moves the expiry forward
+/// and returns [`KvOutcome::Renewed`] with the same token: renewal never bumps
+/// the fence. An expired or re-acquired lease answers
+/// [`KvError::LeaseLost`], so a deposed holder learns immediately.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KvLeaseRenew {
+    pub v: u32,
+    pub namespace: String,
+    #[serde(with = "crate::encoding::bin_bytes")]
+    pub key: Vec<u8>,
+    pub holder_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<u32>,
+    pub lease_token: u64,
+    /// Requested maximum extended lifetime, within the same
+    /// [`MIN_LEASE_TTL_MICROS`](crate::limits::MIN_LEASE_TTL_MICROS)`..=`[`MAX_LEASE_TTL_MICROS`](crate::limits::MAX_LEASE_TTL_MICROS)
+    /// range as acquisition. A successful renewal is nonzero and never exceeds
+    /// this duration.
     pub lease_ttl_micros: u64,
 }
 
-/// Request to release an advisory lease early, presenting the `lease_token` the
-/// grant returned (the formal `RELEASE` primitive).
+/// Request to release a held lease early, presenting the same `holder_id` and
+/// the `lease_token` the grant returned (the formal `RELEASE` primitive). The
+/// token is validated against the fence sequence, never the lease-row version
+/// (which resets on re-acquire), and the live row is physically removed in the
+/// same transaction. A missing or expired row under a still-current fence is
+/// the idempotent [`KvOutcome::Released`]`(false)`; a stale fence is
+/// [`KvError::LeaseLost`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvRelease {
     pub v: u32,
@@ -277,6 +345,7 @@ pub struct KvRelease {
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key: Vec<u8>,
     pub lease_token: u64,
+    pub holder_id: String,
 }
 
 /// One key's metadata without its value: version, expiry, and value size. The
@@ -418,11 +487,24 @@ pub enum KvOutcome {
     /// `expire` / `patch`: applied, carrying the entry's version. `expire` leaves
     /// the version unchanged, `patch` bumps it.
     Versioned { version: u64 },
-    /// `lease`: the lease was granted, carrying the fencing token and the granted
-    /// TTL (which the store may shorten from the request).
+    /// `lease`: the lease was granted, carrying the fencing token, the granted
+    /// nonzero TTL (which the store may clamp down from, but never above, the
+    /// request), and the mutation
+    /// position at which the answering fold applied the grant, the barrier a
+    /// takeover read passes back as [`KvGet::min_position`].
     Leased {
         lease_token: u64,
         granted_ttl_micros: u64,
+        position: MutationPosition,
+    },
+    /// `lease_renew`: the lease was extended, carrying the unchanged token,
+    /// the granted TTL, and the renewal's applied mutation position. A caller
+    /// treating an unexpected variant here as success would trust an
+    /// unextended deadline, so decode fail-closed.
+    Renewed {
+        lease_token: u64,
+        granted_ttl_micros: u64,
+        position: MutationPosition,
     },
     /// `release`: `true` when a held lease was released, `false` when none was
     /// held (idempotent release).
@@ -461,10 +543,17 @@ pub enum KvError {
     /// re-read and retry, or learn that an `Absent` precondition lost a race.
     #[error("kv version conflict (current: {current:?})")]
     VersionConflict { current: Option<u64> },
-    /// A held [`KvLease`] expired or was released, so its token no longer
-    /// protects mutations. The caller must re-acquire the lease.
+    /// A held [`KvLease`] expired, was released, or was re-acquired by another
+    /// holder, so its token no longer protects mutations. The caller must stop
+    /// its protected work; a new epoch needs a fresh acquisition.
     #[error("kv lease lost")]
     LeaseLost,
+    /// A barriered [`KvGet`] could not be answered: the local fold did not
+    /// reach `required` within the server's wait bound, or the request's topic
+    /// generation does not match the fold's. Explicitly never mapped to an
+    /// absent value; retry against a caught-up fold.
+    #[error("kv read barrier not reached (required: {required:?})")]
+    Stale { required: MutationPosition },
     /// An in-place op (`expire`, `patch`) targeted a key that is absent or
     /// expired (the formal `NOT_FOUND`).
     #[error("kv key not found")]
@@ -651,22 +740,176 @@ mod tests {
     }
 
     #[test]
-    fn given_a_lease_reply_when_round_tripped_then_should_preserve_token_and_ttl() {
-        let reply = KvReply::Ok(KvOutcome::Leased {
-            lease_token: 77,
-            granted_ttl_micros: 30_000_000,
-        });
+    fn given_a_lease_reply_when_round_tripped_then_should_preserve_token_ttl_and_position() {
+        let position = MutationPosition {
+            topic_generation: 3,
+            partition: 1,
+            offset: 4_200,
+        };
+        for reply in [
+            KvReply::Ok(KvOutcome::Leased {
+                lease_token: 77,
+                granted_ttl_micros: 30_000_000,
+                position,
+            }),
+            KvReply::Ok(KvOutcome::Renewed {
+                lease_token: 77,
+                granted_ttl_micros: 30_000_000,
+                position,
+            }),
+        ] {
+            let bytes = encode_named(&reply).expect("serializes");
+            let back: KvReply = decode_named(&bytes).expect("deserializes");
+            match back {
+                KvReply::Ok(
+                    KvOutcome::Leased {
+                        lease_token,
+                        granted_ttl_micros,
+                        position: got,
+                    }
+                    | KvOutcome::Renewed {
+                        lease_token,
+                        granted_ttl_micros,
+                        position: got,
+                    },
+                ) => {
+                    assert_eq!(lease_token, 77);
+                    assert_eq!(granted_ttl_micros, 30_000_000);
+                    assert_eq!(got, position);
+                }
+                other => panic!("expected Leased or Renewed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_reshaped_lease_request_when_round_tripped_then_should_preserve_holder_and_subject() {
+        let request = KvLease {
+            v: crate::codes::KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_ttl_micros: 30_000_000,
+            holder_id: "warden-node-1".to_owned(),
+            subject_user_id: Some(42),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvLease = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.holder_id, "warden-node-1");
+        assert_eq!(back.subject_user_id, Some(42));
+        // A self-lease omits the subject on the wire.
+        let own = KvLease {
+            subject_user_id: None,
+            ..request
+        };
+        let json = serde_json::to_string(&own).expect("json");
+        assert!(!json.contains("subject_user_id"), "absent subject omitted");
+    }
+
+    #[test]
+    fn given_a_renew_request_when_round_tripped_then_should_preserve_token_and_holder() {
+        let request = KvLeaseRenew {
+            v: crate::codes::KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            holder_id: "warden-node-1".to_owned(),
+            subject_user_id: None,
+            lease_token: 7,
+            lease_ttl_micros: 30_000_000,
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvLeaseRenew = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.lease_token, 7);
+        assert_eq!(back.holder_id, "warden-node-1");
+    }
+
+    #[test]
+    fn given_a_pre_fencing_lease_payload_when_decoded_then_should_fail_closed() {
+        // The v1 shapes, re-declared locally: no holder identity on lease and
+        // release, no coordination namespace on the fenced CAS. The reshape
+        // made those fields required, so an old payload must fail decode
+        // rather than fill in defaults.
+        #[derive(Serialize)]
+        struct LegacyLease<'a> {
+            v: u32,
+            namespace: &'a str,
+            #[serde(with = "crate::encoding::bin_bytes")]
+            key: &'a [u8],
+            lease_ttl_micros: u64,
+        }
+        let legacy = encode_named(&LegacyLease {
+            v: KV_OP_VERSION,
+            namespace: "sessions",
+            key: b"job",
+            lease_ttl_micros: 30_000_000,
+        })
+        .expect("legacy shape serializes");
+        assert!(
+            decode_named::<KvLease>(&legacy).is_err(),
+            "a holder-less lease payload must not decode"
+        );
+
+        #[derive(Serialize)]
+        struct LegacyRelease<'a> {
+            v: u32,
+            namespace: &'a str,
+            #[serde(with = "crate::encoding::bin_bytes")]
+            key: &'a [u8],
+            lease_token: u64,
+        }
+        let legacy = encode_named(&LegacyRelease {
+            v: KV_OP_VERSION,
+            namespace: "sessions",
+            key: b"job",
+            lease_token: 7,
+        })
+        .expect("legacy shape serializes");
+        assert!(
+            decode_named::<KvRelease>(&legacy).is_err(),
+            "a holder-less release payload must not decode"
+        );
+
+        #[derive(Serialize)]
+        struct LegacyCasFenced<'a> {
+            v: u32,
+            namespace: &'a str,
+            #[serde(with = "crate::encoding::bin_bytes")]
+            key: &'a [u8],
+            #[serde(with = "crate::encoding::bin_bytes")]
+            value: &'a [u8],
+            expect: CasExpect,
+            #[serde(with = "crate::encoding::bin_bytes")]
+            fence_key: &'a [u8],
+            fence_token: u64,
+        }
+        let legacy = encode_named(&LegacyCasFenced {
+            v: KV_OP_VERSION,
+            namespace: "sessions",
+            key: b"cursor",
+            value: b"42",
+            expect: CasExpect::Absent,
+            fence_key: b"job",
+            fence_token: 7,
+        })
+        .expect("legacy shape serializes");
+        assert!(
+            decode_named::<KvCasFenced>(&legacy).is_err(),
+            "a fence-only CAS payload must not decode"
+        );
+    }
+
+    #[test]
+    fn given_a_stale_reply_when_round_tripped_then_should_preserve_the_required_position() {
+        let required = MutationPosition {
+            topic_generation: 2,
+            partition: 0,
+            offset: 99,
+        };
+        let reply = KvReply::Err(KvError::Stale { required });
         let bytes = encode_named(&reply).expect("serializes");
         let back: KvReply = decode_named(&bytes).expect("deserializes");
         match back {
-            KvReply::Ok(KvOutcome::Leased {
-                lease_token,
-                granted_ttl_micros,
-            }) => {
-                assert_eq!(lease_token, 77);
-                assert_eq!(granted_ttl_micros, 30_000_000);
-            }
-            other => panic!("expected Leased, got {other:?}"),
+            KvReply::Err(KvError::Stale { required: got }) => assert_eq!(got, required),
+            other => panic!("expected Stale, got {other:?}"),
         }
     }
 
@@ -677,12 +920,13 @@ mod tests {
             namespace: "sessions".to_owned(),
             key: b"user:1".to_vec(),
             if_none_match: Some(5),
+            min_position: None,
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: KvGet = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.if_none_match, Some(5));
-        // A plain get omits the precondition on the wire, so the pre-conditional
-        // contract stays byte-identical.
+        // A plain get omits the precondition and the barrier on the wire, so
+        // the pre-conditional contract stays byte-identical.
         let plain = KvGet {
             if_none_match: None,
             ..request
@@ -691,6 +935,32 @@ mod tests {
         assert!(
             !json.contains("if_none_match"),
             "absent precondition omitted"
+        );
+        assert!(!json.contains("min_position"), "absent barrier omitted");
+    }
+
+    #[test]
+    fn given_a_barriered_get_when_round_tripped_then_should_preserve_the_minimum_position() {
+        let request = KvGet {
+            v: KV_OP_VERSION,
+            namespace: "connectors.state".to_owned(),
+            key: b"source_state/pg".to_vec(),
+            if_none_match: None,
+            min_position: Some(MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 512,
+            }),
+        };
+        let bytes = encode_named(&request).expect("serializes");
+        let back: KvGet = decode_named(&bytes).expect("deserializes");
+        assert_eq!(
+            back.min_position,
+            Some(MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 512,
+            })
         );
     }
 

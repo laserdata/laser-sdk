@@ -19,9 +19,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = "=0.2.0" # typed streaming plus provenance
+laser-sdk = "=0.2.1" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "=0.2.0", features = ["agent", "managed"] }
+laser-sdk = { version = "=0.2.1", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -267,6 +267,10 @@ Live presence is connection-scoped, so one connection may advertise one agent. A
 | `laser.memory(scope)` | agentic memory | remember / recall / improve / forget |
 | `laser.context(conversation)` | one conversation's working record | append, bounded fetch, prompt block, state folds |
 | `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(name)` / `laser.runs()` | the fabric | directed asks, deadline-bound contracts, dependency-ordered workflows, the run registry |
+
+Lease acquisition on a connection-backed `Laser` uses a dedicated coordination connection. A bring-your-own `IggyClient` uses an explicit `FencedLeaseClient` with its own transport instead. A timed-out attempt actively retires that connection, and an ambiguous acquisition waits through its requested TTL before returning an error. A requested lease (or renewal) lifetime must fall in `MIN_LEASE_TTL_MICROS ..= MAX_LEASE_TTL_MICROS` (1s to 5min), rejected locally before the round trip. The store may grant less than the request and never grants more, so a holder needing longer renews. Exclusive workflows race renewal against contract completion, keep the lease through verification and the completion journal append, and release only after that record is durable.
+
+`FencedLeaseClient` is generic over its `ManagedKvTransport`. When the transport is a runtime choice rather than a type-level one (a state-provider seam that cannot grow a type parameter), hold it as `SharedKvTransport` (`Arc<dyn DynManagedKvTransport>`): every `ManagedKvTransport` implements the object-safe trait, and the `Arc` implements `ManagedKvTransport` back, so `FencedLeaseClient::new` accepts it with the same envelope, retry, and decode behavior.
 
 One connection addresses every stream. `connect_with_stream` optionally pins a default stream and `laser.topic(name)` is shorthand against it. Without a default stream, that shortcut returns the typed `NoStream` error. Iggy RBAC is enforced at the stream and topic level, so a permission miss surfaces as a typed error (`is_permission_denied()` / `is_stream_or_topic_not_found()`), never a silent wrong answer.
 

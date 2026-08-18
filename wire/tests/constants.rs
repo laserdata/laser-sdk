@@ -59,6 +59,7 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_KV_CAS_FENCED_CODE, 1_000_312);
     assert_eq!(AGDX_KV_COPY_CODE, 1_000_313);
     assert_eq!(AGDX_KV_MOVE_CODE, 1_000_314);
+    assert_eq!(AGDX_KV_LEASE_RENEW_CODE, 1_000_315);
     assert_eq!(AGDX_FORK_BASE, 1_000_400);
     assert_eq!(AGDX_FORK_CREATE_CODE, 1_000_400);
     assert_eq!(AGDX_FORK_DELETE_CODE, 1_000_401);
@@ -82,6 +83,7 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(QUERY_OP_VERSION, 1);
     assert_eq!(CONTROL_OP_VERSION, 1);
     assert_eq!(KV_OP_VERSION, 1);
+    assert_eq!(KV_LEASE_OP_VERSION, 2);
     assert_eq!(FORK_OP_VERSION, 1);
     assert_eq!(GRAPH_OP_VERSION, 1);
     assert_eq!(AGENT_OP_VERSION, 1);
@@ -108,6 +110,7 @@ fn given_capability_feature_bits_when_compared_then_should_match_the_dictionary(
     assert_eq!(feature::WATCH, 1 << 6);
     assert_eq!(feature::AUTHZ, 1 << 7);
     assert_eq!(feature::DESTINATIONS, 1 << 8);
+    assert_eq!(feature::KV_FENCED_LEASES, 1 << 9);
 }
 
 #[test]

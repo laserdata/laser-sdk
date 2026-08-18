@@ -39,6 +39,13 @@ pub enum LaserError {
     Rejected(String),
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    /// A managed mutation's outcome is unknown: the attempt timed out or the
+    /// transport failed after dispatch, so the server may or may not have
+    /// applied it. This is deliberately not generically retryable. The caller
+    /// must inspect [`is_ambiguous_mutation`](Self::is_ambiguous_mutation) and
+    /// follow the operation-specific recovery contract.
+    #[error("managed mutation outcome unknown: {0}")]
+    AmbiguousMutation(String),
     #[error("the agent has no respond_on topic configured")]
     NoRespondTopic,
     #[error("state store: {0}")]
@@ -334,6 +341,7 @@ impl LaserError {
             | Self::NoCapableAgent { .. }
             | Self::NoInbox { .. }
             | Self::Iggy(_) => true,
+            Self::AmbiguousMutation(_) => false,
         }
     }
 
@@ -408,11 +416,24 @@ impl LaserError {
         matches!(self, Self::Kv(KvError::VersionConflict { .. }))
     }
 
-    /// Whether a read-consistency level could not be met: the projector has not
-    /// yet applied the source log up to the point a `read_your_writes` query
-    /// required. Retryable: the read model is catching up.
+    /// Whether a managed mutation may already have reached the server. A
+    /// generic retry loop must stop: recovery depends on the operation. In
+    /// particular, an ambiguous lease acquisition must wait through its
+    /// requested TTL before a fresh acquisition, because an applied grant can
+    /// otherwise conflict with itself and the reply carries no token to renew
+    /// or release it.
+    pub fn is_ambiguous_mutation(&self) -> bool {
+        matches!(self, Self::AmbiguousMutation(_))
+    }
+
+    /// Whether a read-consistency barrier could not be met: a query projector
+    /// or key-value fold has not yet applied the required source position.
+    /// Retryable: the read model is catching up.
     pub fn is_stale(&self) -> bool {
-        matches!(self, Self::Query(QueryError::Stale { .. }))
+        matches!(
+            self,
+            Self::Query(QueryError::Stale { .. }) | Self::Kv(KvError::Stale { .. })
+        )
     }
 
     /// Whether the connected server refused the operation for missing
@@ -457,7 +478,7 @@ impl LaserError {
         matches!(self, Self::NoCapableAgent { .. })
     }
 
-    /// Whether an advisory lease was lost (expired or re-acquired by another
+    /// Whether a revocable lease was lost (expired, released, or re-acquired by another
     /// holder). For a fenced write, see [`is_fence_violation`](Self::is_fence_violation).
     pub fn is_lease_lost(&self) -> bool {
         matches!(self, Self::Kv(KvError::LeaseLost))
@@ -512,9 +533,9 @@ impl LaserError {
             // A digest mismatch is served-data corruption, a backend fault.
             Self::Integrity { .. } => ResultCode::Backend,
             Self::NoCapableAgent { .. } | Self::NoInbox { .. } => ResultCode::NotFound,
-            // A transport timeout is not read-model staleness (that is
-            // `QueryError::Stale`), so it classifies as a backend/availability
-            // failure, keeping `code()` and `is_stale()` in agreement.
+            // A transport timeout is not read-model staleness (that is a typed
+            // query or KV stale reply), so it classifies as a backend failure,
+            // keeping `code()` and `is_stale()` in agreement.
             _ => ResultCode::Backend,
         }
     }
@@ -593,6 +614,26 @@ mod tests {
             assert!(!error.is_retryable(), "{error} must be permanent");
             assert_eq!(error.code(), ResultCode::Backend);
         }
+    }
+
+    #[test]
+    fn given_an_ambiguous_mutation_when_classified_then_should_require_specific_recovery() {
+        let error = LaserError::AmbiguousMutation("lease reply was lost".to_owned());
+        assert!(error.is_ambiguous_mutation());
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn given_a_stale_kv_read_when_classified_then_should_agree_with_the_result_code() {
+        let error = LaserError::from(KvError::Stale {
+            required: laser_wire::mutation::MutationPosition {
+                topic_generation: 1,
+                partition: 0,
+                offset: 9,
+            },
+        });
+        assert!(error.is_stale());
+        assert_eq!(error.code(), ResultCode::Stale);
     }
 
     // A transient outcome classifies as retryable on every surface, and it keeps

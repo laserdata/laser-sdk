@@ -22,6 +22,11 @@ export interface KvCapabilities {
   readonly available: boolean
   readonly cas: boolean
   readonly casFenced: boolean
+  /** The revocable fenced-lease contract: holder-scoped acquire, renewal,
+   * fence-validated release, fenced compare-and-swap requiring a live lease,
+   * and the barriered read. The lease, renew, release, and fenced-CAS calls
+   * all gate on this bit. */
+  readonly fencedLeases: boolean
 }
 
 export interface Capabilities {
@@ -49,6 +54,7 @@ export type CapabilitySurface =
   | "kv"
   | "kvCas"
   | "kvCasFenced"
+  | "kvFencedLeases"
   | "graph"
   | "forks"
   | "agentWorkflow"
@@ -66,7 +72,7 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
     executionStatus: false
   }),
   destinations: Object.freeze({ available: false, checkpointVersion: 0 }),
-  kv: Object.freeze({ available: false, cas: false, casFenced: false }),
+  kv: Object.freeze({ available: false, cas: false, casFenced: false, fencedLeases: false }),
   graph: false,
   forks: false,
   a2aGateway: false,
@@ -122,7 +128,11 @@ export function managedCapabilitiesFrom(announce: BackendAnnounce): Capabilities
     kv: {
       available: ready && versions.kv > 0,
       cas: ready && opVersionsHasFeature(versions, Feature.KV_CAS),
-      casFenced: ready && opVersionsHasFeature(versions, Feature.KV_CAS_FENCED)
+      casFenced:
+        ready &&
+        (opVersionsHasFeature(versions, Feature.KV_CAS_FENCED) ||
+          opVersionsHasFeature(versions, Feature.KV_FENCED_LEASES)),
+      fencedLeases: ready && opVersionsHasFeature(versions, Feature.KV_FENCED_LEASES)
     },
     graph: ready && versions.graph > 0,
     forks: ready && versions.fork > 0,
@@ -166,7 +176,8 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
     kv: {
       available: configured.kv.available || announced.kv.available,
       cas: configured.kv.cas || announced.kv.cas,
-      casFenced: configured.kv.casFenced || announced.kv.casFenced
+      casFenced: configured.kv.casFenced || announced.kv.casFenced,
+      fencedLeases: configured.kv.fencedLeases || announced.kv.fencedLeases
     },
     graph: configured.graph || announced.graph,
     forks: configured.forks || announced.forks,
@@ -208,15 +219,17 @@ export function requireCapability(capabilities: Capabilities, surface: Capabilit
               ? capabilities.kv.available && capabilities.kv.cas
               : surface === "kvCasFenced"
                 ? capabilities.kv.available && capabilities.kv.casFenced
-                : surface === "graph"
-                  ? capabilities.graph
-                  : surface === "forks"
-                    ? capabilities.forks
-                    : surface === "agentWorkflow"
-                      ? capabilities.agentWorkflow
-                      : surface === "watch"
-                        ? capabilities.watch
-                        : capabilities.authz
+                : surface === "kvFencedLeases"
+                  ? capabilities.kv.available && capabilities.kv.fencedLeases
+                  : surface === "graph"
+                    ? capabilities.graph
+                    : surface === "forks"
+                      ? capabilities.forks
+                      : surface === "agentWorkflow"
+                        ? capabilities.agentWorkflow
+                        : surface === "watch"
+                          ? capabilities.watch
+                          : capabilities.authz
   if (!available) {
     throw new UnsupportedError(`${surface} is not served by this deployment`, {
       cause: { surface }

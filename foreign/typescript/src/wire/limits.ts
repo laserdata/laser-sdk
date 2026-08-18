@@ -9,6 +9,9 @@ export const MAX_SCAN_LIMIT = 1000
 export const DEFAULT_SCAN_LIMIT = 100
 export const DEFAULT_NAMESPACE = "default"
 export const MAX_NAMESPACE_BYTES = 128
+export const MAX_HOLDER_ID_BYTES = 128
+export const MIN_LEASE_TTL_MICROS = 1_000_000
+export const MAX_LEASE_TTL_MICROS = 300_000_000
 
 export const MAX_FORK_ID_BYTES = 128
 

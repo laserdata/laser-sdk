@@ -101,6 +101,12 @@ struct LaserInner {
     // `Arc` so a background reply dispatcher can hold the client without a
     // reference cycle back through `LaserInner` (which would leak the task).
     client: Arc<IggyClient>,
+    #[cfg(feature = "kv")]
+    coordination_connection: Option<String>,
+    #[cfg(feature = "kv")]
+    coordination: OnceCell<Arc<crate::kv::FencedLeaseClient<crate::kv::DedicatedKvTransport>>>,
+    #[cfg(feature = "kv")]
+    coordination_acquire_gate: tokio::sync::Mutex<()>,
     producers: DashMap<ProducerKey, ProducerCell>,
     negotiated: std::sync::RwLock<NegotiatedState>,
     // The agent registry read model's per-stream cache, so a fresh `AgentRegistry`
@@ -243,11 +249,19 @@ impl Laser {
     /// stream. Power-user and test helpers reach for this. Apps use
     /// [`Laser::connect`] or [`Laser::builder`]. Chain
     /// [`with_default_stream`](Self::with_default_stream) to pin a default
-    /// stream.
+    /// stream. The fenced-lease convenience methods need a separately owned
+    /// coordination connection, so a bring-your-own client uses an explicit
+    /// [`FencedLeaseClient`](crate::kv::FencedLeaseClient) for those mutations.
     pub fn from_client(client: IggyClient) -> Self {
         Self {
             inner: Arc::new(LaserInner {
                 client: Arc::new(client),
+                #[cfg(feature = "kv")]
+                coordination_connection: None,
+                #[cfg(feature = "kv")]
+                coordination: OnceCell::new(),
+                #[cfg(feature = "kv")]
+                coordination_acquire_gate: tokio::sync::Mutex::new(()),
                 producers: DashMap::new(),
                 negotiated: std::sync::RwLock::new(NegotiatedState {
                     configured_capabilities: Capabilities::OPEN,
@@ -373,6 +387,55 @@ impl Laser {
     /// The raw `IggyClient` this laser holds. Most callers should not need it.
     pub fn client(&self) -> &IggyClient {
         &self.inner.client
+    }
+
+    #[cfg(feature = "kv")]
+    pub(crate) async fn coordination_client(
+        &self,
+    ) -> Result<Arc<crate::kv::FencedLeaseClient<crate::kv::DedicatedKvTransport>>, LaserError>
+    {
+        let connection = self
+            .inner
+            .coordination_connection
+            .as_ref()
+            .ok_or(LaserError::Config(
+                "fenced lease convenience methods need a connection-backed Laser; use FencedLeaseClient with a dedicated transport for a bring-your-own IggyClient",
+            ))?
+            .clone();
+        Ok(self
+            .inner
+            .coordination
+            .get_or_init(|| async move {
+                Arc::new(crate::kv::FencedLeaseClient::connect_dedicated(connection))
+            })
+            .await
+            .clone())
+    }
+
+    #[cfg(feature = "kv")]
+    pub(crate) async fn acquire_lease(
+        &self,
+        request: laser_wire::kv::KvLease,
+    ) -> Result<crate::kv::Lease, LaserError> {
+        let laser = self.clone();
+        // The owned task keeps the acquisition gate and TTL recovery alive if
+        // its caller cancels while the transport outcome is still unknown.
+        tokio::spawn(async move {
+            let _acquire = laser.inner.coordination_acquire_gate.lock().await;
+            let coordination = laser.coordination_client().await?;
+            let prepared = coordination.prepare_acquire(&request)?;
+            match coordination.acquire(&prepared).await {
+                Err(error @ LaserError::AmbiguousMutation(_)) => {
+                    sleep(Duration::from_micros(request.lease_ttl_micros)).await;
+                    Err(error)
+                }
+                result => result,
+            }
+        })
+        .await
+        .map_err(|error| {
+            LaserError::HandlerConfig(format!("coordination acquisition task failed: {error}"))
+        })?
     }
 
     /// This laser's default data stream, if one was set (via
@@ -689,6 +752,27 @@ impl Laser {
         } else {
             payload
         };
+        let reply = self
+            .inner
+            .client
+            .send_binary_request(code, bytes::Bytes::from(payload))
+            .await?;
+        Ok(reply.to_vec())
+    }
+
+    /// Send an already-framed managed command: the caller built (and holds)
+    /// the `ManagedRequestEnvelope`, so nothing is wrapped here and a retry
+    /// can reuse the exact bytes under the same operation id. The KV
+    /// coordination client is the caller; every other path uses
+    /// [`send_raw_with_response`](Self::send_raw_with_response), which mints a
+    /// fresh operation id per call.
+    #[cfg(feature = "kv")]
+    #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed_preframed"))]
+    pub(crate) async fn send_raw_preframed(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, IggyError> {
         let reply = self
             .inner
             .client
@@ -1099,7 +1183,8 @@ impl LaserBuilder {
             return Err(LaserError::Config(conflict));
         }
         let stream = self.stream.filter(|value| !value.is_empty());
-        let client = match self.connection {
+        #[cfg_attr(not(feature = "kv"), allow(unused_variables))]
+        let (client, coordination_connection) = match self.connection {
             ConnectionConfig::Unset => {
                 return Err(LaserError::Config(
                     "connection_string, address+credentials, or client is required",
@@ -1109,7 +1194,7 @@ impl LaserBuilder {
                 let normalized = normalize_connection_string(&value)?;
                 let client = IggyClientBuilder::from_connection_string(&normalized)?.build()?;
                 client.connect().await?;
-                client
+                (client, Some(normalized))
             }
             ConnectionConfig::Tcp {
                 address,
@@ -1130,9 +1215,9 @@ impl LaserBuilder {
                 let with_tls = resolve_tls(format!("iggy+tcp://{username}:{password}@{address}"))?;
                 let client = IggyClientBuilder::from_connection_string(&with_tls)?.build()?;
                 client.connect().await?;
-                client
+                (client, Some(with_tls))
             }
-            ConnectionConfig::Client(client) => client,
+            ConnectionConfig::Client(client) => (client, None),
         };
         // Probe the server's `AGDX_HELLO` managed command once. A ready managed
         // backend lights up only the surfaces and feature bits it announces.
@@ -1169,6 +1254,12 @@ impl LaserBuilder {
         Ok(Laser {
             inner: Arc::new(LaserInner {
                 client: Arc::new(client),
+                #[cfg(feature = "kv")]
+                coordination_connection,
+                #[cfg(feature = "kv")]
+                coordination: OnceCell::new(),
+                #[cfg(feature = "kv")]
+                coordination_acquire_gate: tokio::sync::Mutex::new(()),
                 producers: DashMap::new(),
                 negotiated: std::sync::RwLock::new(NegotiatedState {
                     configured_capabilities,

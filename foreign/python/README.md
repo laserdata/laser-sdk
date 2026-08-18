@@ -4,7 +4,7 @@ The [LaserData, Inc.](https://laserdata.com) SDK for Python: an open data-platfo
 
 Rust and Python share one contract. Every public primitive, builder option, validation rule, error classification, capability, and transport limitation ships in both SDKs with matched examples and shared BDD coverage where the behavior is language-neutral.
 
-> **Current pre-1.0 release (`0.2.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.2.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` keeps logical identity separate from Iggy replica topology. The group defaults to the agent id spelling, set it explicitly when deployment grouping differs.
 
@@ -252,8 +252,14 @@ print(entry.source)  # origin stream/topic ids, partition, and offset when stamp
 values = await kv.get_many(["user:42", "user:43"])  # one round trip (the mixed-operation batch)
 await kv.copy_to("user:42", "user:42:2026", to_namespace="archive")  # one backend transaction
 await kv.move_to("plan:draft", "plan:current")  # copy plus source delete
+lease = await kv.lease("source-owner", "worker-1", 30)
+state = await kv.get_entry_at_least("source-state", lease.position)
+lease = await kv.renew_lease("source-owner", "worker-1", lease.token, 30)
+await kv.release("source-owner", "worker-1", lease.token)
 await kv.delete("user:42")
 ```
+
+`Lease` exposes `token`, `granted_ttl_secs`, and its `MutationPosition`. Pass that position to `get_entry_at_least` after takeover so the read cannot observe state older than the grant. A requested TTL is a maximum between 1 second and 5 minutes: the store may grant less and never more, so a value outside that range raises before the round trip. A long-running holder renews before the granted TTL expires. A live lease is never extended by reacquisition. Acquisition uses a dedicated coordination connection. If its outcome is ambiguous, that connection is actively retired and `lease` waits through the requested TTL before raising the non-retryable ambiguous-mutation error.
 
 ## Knowledge graph
 

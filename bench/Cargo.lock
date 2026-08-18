@@ -2180,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bon",
  "bson",

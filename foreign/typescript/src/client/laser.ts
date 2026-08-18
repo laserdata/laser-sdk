@@ -675,9 +675,9 @@ export class Laser implements AsyncDisposable {
 
   private managedTransport(): ManagedTransport {
     return {
-      sendManaged: (commandCode, payload) =>
+      sendManaged: (commandCode, payload, options) =>
         this.observe("laser.managed", { operation: "managed", commandCode }, () =>
-          this.transport.sendManaged(commandCode, payload)
+          this.transport.sendManaged(commandCode, payload, options)
         )
     }
   }

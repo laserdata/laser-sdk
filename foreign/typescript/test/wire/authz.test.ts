@@ -26,7 +26,11 @@ import {
   AGDX_AGENT_SUBMIT_CODE,
   AGDX_BATCH_CODE,
   AGDX_HELLO_CODE,
-  AGDX_KV_GET_CODE
+  AGDX_KV_CAS_FENCED_CODE,
+  AGDX_KV_GET_CODE,
+  AGDX_KV_LEASE_CODE,
+  AGDX_KV_LEASE_RENEW_CODE,
+  AGDX_KV_RELEASE_CODE
 } from "../../src/wire/codes.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
@@ -156,12 +160,16 @@ void test("given_delegation_when_checked_then_agent_is_intersected_with_the_user
 
 void test("given_a_command_code_when_classified_then_should_map_to_feature_and_action", () => {
   assert.deepEqual(featureAction(AGDX_KV_GET_CODE), ["kv", "read"])
+  assert.deepEqual(featureAction(AGDX_KV_LEASE_CODE), ["kv_lease", "admin"])
+  assert.deepEqual(featureAction(AGDX_KV_LEASE_RENEW_CODE), ["kv_lease", "admin"])
+  assert.deepEqual(featureAction(AGDX_KV_RELEASE_CODE), ["kv_lease", "admin"])
+  assert.deepEqual(featureAction(AGDX_KV_CAS_FENCED_CODE), ["kv", "write"])
   assert.equal(featureAction(AGDX_HELLO_CODE), undefined)
   assert.equal(featureAction(AGDX_BATCH_CODE), undefined)
   assert.deepEqual(featureAction(AGDX_AGENT_SUBMIT_CODE), ["agent", "write"])
 })
 
-void test("given_feature_action_pairs_when_indexed_then_should_fit_a_u64_mask", () => {
+void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fit_a_u128_mask", () => {
   const seen = new Set<number>()
   const features = [
     "kv",
@@ -172,16 +180,23 @@ void test("given_feature_action_pairs_when_indexed_then_should_fit_a_u64_mask", 
     "query",
     "agent",
     "workflow",
+    "destination",
+    "checkpoint",
     "authz",
+    "kv_lease",
+    "kv_fence",
     "unrecognized"
   ] as const
   const actions = ["read", "write", "delete", "admin", "unrecognized"] as const
   for (const feature of features) {
     for (const action of actions) {
       const index = actionIndex(feature, action)
-      assert.ok(index < 64)
+      assert.ok(index < 128)
       assert.ok(!seen.has(index))
       seen.add(index)
     }
   }
+  assert.equal(actionIndex("authz", "admin"), 53)
+  assert.equal(actionIndex("kv_lease", "admin"), 58)
+  assert.equal(actionIndex("kv_fence", "read"), 60)
 })

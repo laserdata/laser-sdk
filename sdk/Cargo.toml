@@ -50,7 +50,9 @@ graph = ["streaming"]
 integration = []
 # Managed key-value store over the `AGDX_KV` managed commands, backed by
 # laser-plane's point-state backend in Laser Stack or LaserData Cloud.
-kv = ["streaming"]
+# trait-variant backs the injectable coordination transport seam, async-trait
+# its object-safe (`Arc<dyn ..>`) counterpart for a runtime-selected transport.
+kv = ["dep:async-trait", "dep:trait-variant", "streaming"]
 # The managed tier in one word: everything laser-plane serves over the
 # command band. `--features managed` instead of remembering which per-surface
 # features compose it.

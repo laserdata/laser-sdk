@@ -1,15 +1,16 @@
 use crate::batch::BatchRequest;
 use crate::clients::ClientMetadata;
 use crate::codes::AGDX_BATCH_CODE;
+use crate::codes::KV_LEASE_OP_VERSION;
 use crate::error::InvalidError;
 use crate::graph::{GraphEdge, GraphNode, GraphQuery, GraphUpsert, SourceRef};
-use crate::kv::{KvScan, KvSet};
+use crate::kv::{KvCasFenced, KvLease, KvLeaseRenew, KvRelease, KvScan, KvSet};
 use crate::limits::{
     MAX_BATCH_OPS, MAX_CLIENT_METADATA, MAX_FRAME_BYTES, MAX_GRAPH_NODE_LABELS,
-    MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH, MAX_KEY_BYTES, MAX_MEMORY_BODY_BYTES,
-    MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_PAGE_SIZE, MAX_QUERY_NAME_BYTES,
-    MAX_SCAN_LIMIT, MAX_SOURCE_REF_BYTES, MAX_TEXT_QUERY_BYTES, MAX_VALUE_BYTES,
-    MAX_VECTOR_DIMENSIONS,
+    MAX_GRAPH_RESULT_ELEMENTS, MAX_GRAPH_TRAVERSE_DEPTH, MAX_HOLDER_ID_BYTES, MAX_KEY_BYTES,
+    MAX_LEASE_TTL_MICROS, MAX_MEMORY_BODY_BYTES, MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES,
+    MAX_PAGE_SIZE, MAX_QUERY_NAME_BYTES, MAX_SCAN_LIMIT, MAX_SOURCE_REF_BYTES,
+    MAX_TEXT_QUERY_BYTES, MAX_VALUE_BYTES, MAX_VECTOR_DIMENSIONS, MIN_LEASE_TTL_MICROS,
 };
 use crate::memory::MemoryRecord;
 use crate::query::{TextQuery, Value, VectorQuery};
@@ -118,6 +119,118 @@ impl Validate for KvScan {
                 "scan limit {} exceeds cap {MAX_SCAN_LIMIT}",
                 self.limit
             )));
+        }
+        Ok(())
+    }
+}
+
+// The fenced-lease family shares its structural rules, so they live once: the
+// exact op version (any other `v` is a typed rejection, the fail-closed half
+// of the in-place reshape), a bounded key, a bounded non-empty holder.
+fn validate_lease_shape(
+    v: u32,
+    namespace: &str,
+    key: &[u8],
+    holder_id: &str,
+) -> Result<(), InvalidError> {
+    if v != KV_LEASE_OP_VERSION {
+        return Err(InvalidError::new(format!(
+            "unsupported fenced-lease op version (expected {KV_LEASE_OP_VERSION}, got {v})"
+        )));
+    }
+    crate::kv::validate_namespace(namespace)?;
+    validate_kv_key("lease key", key)?;
+    if holder_id.is_empty() {
+        return Err(InvalidError::new("lease holder id must not be empty"));
+    }
+    if holder_id.len() > MAX_HOLDER_ID_BYTES {
+        return Err(InvalidError::new(format!(
+            "lease holder id is {}B, exceeds cap {MAX_HOLDER_ID_BYTES}B",
+            holder_id.len()
+        )));
+    }
+    Ok(())
+}
+
+// A requested lease lifetime is bounded on both sides, and the bound is the
+// contract's, not each backend's: a floor so a grant survives one round trip
+// plus the holder's renewal cadence, a ceiling so a crashed holder's ownership
+// always expires. The store may still grant less than the request
+// (`granted_ttl_micros`), so this rejects only what no deployment would serve,
+// and it rejects it locally instead of after a round trip.
+fn validate_lease_ttl(ttl_micros: u64) -> Result<(), InvalidError> {
+    if !(MIN_LEASE_TTL_MICROS..=MAX_LEASE_TTL_MICROS).contains(&ttl_micros) {
+        return Err(InvalidError::new(format!(
+            "lease ttl is {ttl_micros}\u{b5}s, outside the supported range \
+             {MIN_LEASE_TTL_MICROS}..={MAX_LEASE_TTL_MICROS}\u{b5}s"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_kv_key(label: &str, key: &[u8]) -> Result<(), InvalidError> {
+    if key.is_empty() {
+        return Err(InvalidError::new(format!("{label} is empty")));
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(InvalidError::new(format!(
+            "{label} is {}B, exceeds cap {MAX_KEY_BYTES}B",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+impl Validate for KvLease {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_lease_shape(self.v, &self.namespace, &self.key, &self.holder_id)?;
+        validate_lease_ttl(self.lease_ttl_micros)?;
+        Ok(())
+    }
+}
+
+impl Validate for KvLeaseRenew {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_lease_shape(self.v, &self.namespace, &self.key, &self.holder_id)?;
+        validate_lease_ttl(self.lease_ttl_micros)?;
+        if self.lease_token == 0 {
+            return Err(InvalidError::new("lease token must not be zero"));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for KvRelease {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_lease_shape(self.v, &self.namespace, &self.key, &self.holder_id)?;
+        if self.lease_token == 0 {
+            return Err(InvalidError::new("lease token must not be zero"));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for KvCasFenced {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.v != KV_LEASE_OP_VERSION {
+            return Err(InvalidError::new(format!(
+                "unsupported fenced-lease op version (expected {KV_LEASE_OP_VERSION}, got {})",
+                self.v
+            )));
+        }
+        crate::kv::validate_namespace(&self.namespace)?;
+        crate::kv::validate_namespace(&self.fence_namespace)?;
+        validate_kv_key("key-value key", &self.key)?;
+        validate_kv_key("fence key", &self.fence_key)?;
+        if self.value.len() > MAX_VALUE_BYTES {
+            return Err(InvalidError::new(format!(
+                "value is {}B, exceeds cap {MAX_VALUE_BYTES}B",
+                self.value.len()
+            )));
+        }
+        // Zero is the reserved "unversioned" sentinel, never a granted token.
+        if self.fence_token == 0 {
+            return Err(InvalidError::new("fence token must not be zero"));
         }
         Ok(())
     }
@@ -356,6 +469,172 @@ mod tests {
         assert!(validate_graph_name("").is_err(), "empty");
         assert!(validate_graph_name("bad\tname").is_err(), "control byte");
         assert!(validate_graph_name(&"g".repeat(MAX_GRAPH_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn given_a_lease_request_when_validated_then_should_enforce_version_holder_and_ttl() {
+        use crate::codes::KV_LEASE_OP_VERSION;
+        use crate::kv::KvLease;
+        use crate::limits::MAX_HOLDER_ID_BYTES;
+        let valid = KvLease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_ttl_micros: 30_000_000,
+            holder_id: "warden-node-1".to_owned(),
+            subject_user_id: Some(42),
+        };
+        assert!(valid.validate().is_ok());
+        let wrong_version = KvLease {
+            v: KV_OP_VERSION,
+            ..valid.clone()
+        };
+        assert!(wrong_version.validate().is_err(), "v1 is rejected typed");
+        let empty_holder = KvLease {
+            holder_id: String::new(),
+            ..valid.clone()
+        };
+        assert!(empty_holder.validate().is_err());
+        let long_holder = KvLease {
+            holder_id: "h".repeat(MAX_HOLDER_ID_BYTES + 1),
+            ..valid.clone()
+        };
+        assert!(long_holder.validate().is_err());
+        let zero_ttl = KvLease {
+            lease_ttl_micros: 0,
+            ..valid
+        };
+        assert!(zero_ttl.validate().is_err());
+    }
+
+    // The TTL range is the contract's, so the same rejection happens on the
+    // acquire and the renewal, before any round trip, on every tier.
+    #[test]
+    fn given_out_of_range_lease_ttls_when_validated_then_should_reject_both_ends() {
+        use crate::codes::KV_LEASE_OP_VERSION;
+        use crate::kv::{KvLease, KvLeaseRenew};
+        use crate::limits::{MAX_LEASE_TTL_MICROS, MIN_LEASE_TTL_MICROS};
+        let acquire = KvLease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_ttl_micros: MIN_LEASE_TTL_MICROS,
+            holder_id: "warden-node-1".to_owned(),
+            subject_user_id: None,
+        };
+        assert!(acquire.validate().is_ok(), "the floor itself is grantable");
+        assert!(
+            KvLease {
+                lease_ttl_micros: MAX_LEASE_TTL_MICROS,
+                ..acquire.clone()
+            }
+            .validate()
+            .is_ok(),
+            "the ceiling itself is grantable"
+        );
+        assert!(
+            KvLease {
+                lease_ttl_micros: MIN_LEASE_TTL_MICROS - 1,
+                ..acquire.clone()
+            }
+            .validate()
+            .is_err(),
+            "a lease too short to renew is rejected locally"
+        );
+        assert!(
+            KvLease {
+                lease_ttl_micros: MAX_LEASE_TTL_MICROS + 1,
+                ..acquire
+            }
+            .validate()
+            .is_err(),
+            "an unbounded ownership window is rejected locally"
+        );
+        let renew = KvLeaseRenew {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            holder_id: "warden-node-1".to_owned(),
+            subject_user_id: None,
+            lease_token: 7,
+            lease_ttl_micros: MAX_LEASE_TTL_MICROS + 1,
+        };
+        assert!(renew.validate().is_err(), "renewal shares the same range");
+        assert!(
+            KvLeaseRenew {
+                lease_ttl_micros: MIN_LEASE_TTL_MICROS - 1,
+                ..renew
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn given_renew_and_release_requests_when_validated_then_should_require_a_nonzero_token() {
+        use crate::codes::KV_LEASE_OP_VERSION;
+        use crate::kv::{KvLeaseRenew, KvRelease};
+        let renew = KvLeaseRenew {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            holder_id: "warden-node-1".to_owned(),
+            subject_user_id: None,
+            lease_token: 7,
+            lease_ttl_micros: 30_000_000,
+        };
+        assert!(renew.validate().is_ok());
+        let zero = KvLeaseRenew {
+            lease_token: 0,
+            ..renew
+        };
+        assert!(zero.validate().is_err());
+        let release = KvRelease {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.coordination".to_owned(),
+            key: b"source-owner".to_vec(),
+            lease_token: 7,
+            holder_id: "warden-node-1".to_owned(),
+        };
+        assert!(release.validate().is_ok());
+        let zero = KvRelease {
+            lease_token: 0,
+            ..release
+        };
+        assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_fenced_cas_when_validated_then_should_enforce_both_namespaces_and_the_token() {
+        use crate::codes::KV_LEASE_OP_VERSION;
+        use crate::kv::{CasExpect, KvCasFenced};
+        let valid = KvCasFenced {
+            v: KV_LEASE_OP_VERSION,
+            namespace: "connectors.state".to_owned(),
+            key: b"source_state/pg".to_vec(),
+            value: b"cursor".to_vec(),
+            expires_at_micros: None,
+            expect: CasExpect::Absent,
+            fence_namespace: "connectors.coordination".to_owned(),
+            fence_key: b"source-owner".to_vec(),
+            fence_token: 8,
+        };
+        assert!(valid.validate().is_ok());
+        let wrong_version = KvCasFenced {
+            v: KV_OP_VERSION,
+            ..valid.clone()
+        };
+        assert!(wrong_version.validate().is_err(), "v1 is rejected typed");
+        let bad_fence_namespace = KvCasFenced {
+            fence_namespace: "bad\nns".to_owned(),
+            ..valid.clone()
+        };
+        assert!(bad_fence_namespace.validate().is_err());
+        let zero_token = KvCasFenced {
+            fence_token: 0,
+            ..valid
+        };
+        assert!(zero_token.validate().is_err());
     }
 
     #[test]

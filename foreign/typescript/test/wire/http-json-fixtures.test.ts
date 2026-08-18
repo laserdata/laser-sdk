@@ -81,6 +81,7 @@ void test("given_http_json_views_when_decoded_then_should_preserve_typed_fields"
   assert.equal(capabilities.query.cursorPaging, true)
   assert.equal(capabilities.query.cancellation, true)
   assert.equal(capabilities.query.executionStatus, true)
+  assert.equal(capabilities.kv.fencedLeases, false)
   assert.equal(capabilities.destinations.available, true)
   assert.equal(capabilities.destinations.tableSchema, true)
   assert.equal(capabilities.destinations.strongestConsistency, "linearizable")

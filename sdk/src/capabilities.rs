@@ -111,6 +111,13 @@ pub struct KvCaps {
     /// write on a live fence sequence, and `cas_fenced` then returns
     /// `LaserError::Unsupported`.
     pub cas_fenced: bool,
+    /// Whether the store serves the revocable fenced-lease contract
+    /// (`KV_LEASE_OP_VERSION`): holder-scoped acquire, renewal, fence-validated
+    /// release, fenced compare-and-swap requiring a live lease, and the
+    /// barriered read. The SDK's lease, renew, release, and `cas_fenced` calls
+    /// all gate on this bit, because a server without it would decode their
+    /// reshaped payloads under the old contract instead of rejecting them.
+    pub fenced_leases: bool,
 }
 
 impl Capabilities {
@@ -133,6 +140,7 @@ impl Capabilities {
             available: false,
             cas: false,
             cas_fenced: false,
+            fenced_leases: false,
         },
         graph: false,
         forks: false,
@@ -215,6 +223,13 @@ impl Capabilities {
     #[must_use]
     pub fn with_kv_cas(mut self, value: bool) -> Self {
         self.kv.cas = value;
+        self
+    }
+
+    /// Returns a copy advertising the key-value fenced-lease contract.
+    #[must_use]
+    pub fn with_kv_fenced_leases(mut self, value: bool) -> Self {
+        self.kv.fenced_leases = value;
         self
     }
 
@@ -301,6 +316,8 @@ impl Capabilities {
         use laser_wire::hello::feature;
         self.kv.cas |= versions.has_feature(feature::KV_CAS);
         self.kv.cas_fenced |= versions.has_feature(feature::KV_CAS_FENCED);
+        self.kv.fenced_leases |= versions.has_feature(feature::KV_FENCED_LEASES);
+        self.kv.cas_fenced |= self.kv.fenced_leases;
         self.agent_workflow |= versions.has_feature(feature::AGENT_WORKFLOW);
         self.query.keyword |= versions.has_feature(feature::KEYWORD_SEARCH);
         self.watch |= versions.has_feature(feature::WATCH);
@@ -334,13 +351,21 @@ mod tests {
     #[test]
     fn given_advertised_feature_bits_when_merged_then_should_light_up_the_capabilities() {
         let mut caps = Capabilities::OPEN;
-        let versions = OpVersions::new(1, 1, 1, 1)
-            .with_features(feature::KV_CAS | feature::READ_YOUR_WRITES | feature::KV_CAS_FENCED);
+        let versions = OpVersions::new(1, 1, 1, 1).with_features(
+            feature::KV_CAS
+                | feature::READ_YOUR_WRITES
+                | feature::KV_CAS_FENCED
+                | feature::KV_FENCED_LEASES,
+        );
         caps.merge_features(&versions);
         assert!(caps.kv.cas, "KV_CAS bit should set kv.cas");
         assert!(
             caps.kv.cas_fenced,
             "KV_CAS_FENCED bit should set kv.cas_fenced"
+        );
+        assert!(
+            caps.kv.fenced_leases,
+            "KV_FENCED_LEASES bit should set kv.fenced_leases"
         );
         assert_eq!(
             caps.query.consistency,
@@ -358,6 +383,17 @@ mod tests {
         assert_eq!(caps.query.consistency, Consistency::Strong);
         // Strong subsumes the weaker level, structurally.
         assert!(caps.serves_consistency(Consistency::ReadYourWrites));
+    }
+
+    #[test]
+    fn given_only_fenced_leases_when_merged_then_should_also_advertise_fenced_cas() {
+        let mut caps = Capabilities::OPEN;
+        caps.merge_features(&OpVersions::new(1, 1, 1, 1).with_features(feature::KV_FENCED_LEASES));
+        assert!(caps.kv.fenced_leases);
+        assert!(
+            caps.kv.cas_fenced,
+            "the full fenced-lease contract subsumes fenced CAS"
+        );
     }
 
     #[test]

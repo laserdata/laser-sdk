@@ -60,6 +60,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<query::PyQueryResult>()?;
     module.add_class::<destinations::PyDestinations>()?;
     module.add_class::<kv::PyKv>()?;
+    module.add_class::<kv::PyLease>()?;
+    module.add_class::<kv::PyMutationPosition>()?;
     module.add_class::<kv::PyKvEntry>()?;
     module.add_class::<kv::PyKvPage>()?;
     module.add_class::<stream::PyStream>()?;

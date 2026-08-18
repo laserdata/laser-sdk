@@ -103,7 +103,7 @@ impl PyLaser {
     /// intended for bring-your-own backends and deterministic pre-gate tests.
     /// Omitted fields preserve the current capability set.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
     fn with_capabilities<'py>(
         &self,
         py: Python<'py>,
@@ -116,6 +116,7 @@ impl PyLaser {
         kv: Option<bool>,
         kv_cas: Option<bool>,
         kv_cas_fenced: Option<bool>,
+        kv_fenced_leases: Option<bool>,
         graph: Option<bool>,
         forks: Option<bool>,
         agent_workflow: Option<bool>,
@@ -171,6 +172,9 @@ impl PyLaser {
             }
             if let Some(value) = kv_cas_fenced {
                 capabilities.kv.cas_fenced = value;
+            }
+            if let Some(value) = kv_fenced_leases {
+                capabilities.kv.fenced_leases = value;
             }
             if let Some(value) = graph {
                 capabilities.graph = value;
@@ -328,6 +332,11 @@ pub struct PyCapabilities {
     /// The key-value store serves fenced compare-and-swap (the monotonic fence an
     /// exclusive workflow step needs for an at-most-once effect).
     pub kv_cas_fenced: bool,
+    /// The key-value store serves the revocable fenced-lease contract:
+    /// holder-scoped acquire, renewal, fence-validated release, fenced
+    /// compare-and-swap requiring a live lease, and the barriered read. The
+    /// lease, renew, release, and `cas_fenced` calls all gate on this.
+    pub kv_fenced_leases: bool,
     /// The managed knowledge-graph surface is served.
     pub graph: bool,
     /// Managed copy-on-write forks are served.
@@ -375,6 +384,7 @@ impl From<Capabilities> for PyCapabilities {
             kv: value.kv.available,
             kv_cas: value.kv.cas,
             kv_cas_fenced: value.kv.cas_fenced,
+            kv_fenced_leases: value.kv.fenced_leases,
             graph: value.graph,
             forks: value.forks,
             agent_workflow: value.agent_workflow,

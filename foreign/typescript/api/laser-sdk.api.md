@@ -743,6 +743,13 @@ export type AgUiEvent = {
 export function aguiEvents(laser: Laser, conversation: ConversationId, topic: string): Promise<readonly AgUiEvent[]>;
 
 // @public (undocumented)
+export class AmbiguousMutationError extends LaserError {
+    constructor(message: string, options?: {
+        cause?: unknown;
+    });
+}
+
+// @public (undocumented)
 export const ANY_ROUTE_POLICY: RoutePolicy;
 
 // @public (undocumented)
@@ -1051,7 +1058,7 @@ export interface CapabilitySelector {
 export function capabilitySelector(skill: string, policy: RoutePolicy, principal?: PrincipalId): CapabilitySelector;
 
 // @public (undocumented)
-export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
+export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "kvFencedLeases" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
 
 // @public (undocumented)
 export type CasExpect = {
@@ -2618,7 +2625,7 @@ export class KeyRegistry {
 export class Kv {
     // Warning: (ae-forgotten-export) The symbol "KvBackend" needs to be exported by the entry point index.d.ts
     constructor(backend: KvBackend, getCapabilities: () => Promise<Capabilities>, namespace: string);
-    casFenced(key: Uint8Array, fenceKey: Uint8Array, fenceToken: bigint): KvCasFencedRequest;
+    casFenced(key: Uint8Array, fenceNamespace: string, fenceKey: Uint8Array, fenceToken: bigint): KvCasFencedRequest;
     copyTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
     // (undocumented)
     delete(key: Uint8Array): Promise<boolean>;
@@ -2631,11 +2638,11 @@ export class Kv {
     getAs<T>(key: Uint8Array, codec: Codec<T>): Promise<T | undefined>;
     // (undocumented)
     getEntry(key: Uint8Array): Promise<KvEntry | undefined>;
+    getEntryAtLeast(key: Uint8Array, minPosition: MutationPosition): Promise<KvEntry | undefined>;
     getMany(keys: readonly Uint8Array[]): Promise<readonly (Uint8Array | undefined)[]>;
     // (undocumented)
     getTyped<T>(key: Uint8Array, decodeValue: (value: unknown) => T): Promise<T | undefined>;
-    // (undocumented)
-    lease(key: Uint8Array, leaseTtlMicros: bigint): Promise<Lease>;
+    lease(key: Uint8Array, holderId: string, leaseTtlMicros: bigint): Promise<Lease>;
     // (undocumented)
     moveTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest;
     // (undocumented)
@@ -2643,8 +2650,8 @@ export class Kv {
     // (undocumented)
     static namespaces(backend: KvBackend, getCapabilities: () => Promise<Capabilities>): Promise<readonly KvNamespaceInfo[]>;
     patch(key: Uint8Array, patch: Uint8Array): Promise<bigint>;
-    // (undocumented)
-    release(key: Uint8Array, token: bigint): Promise<boolean>;
+    release(key: Uint8Array, holderId: string, token: bigint): Promise<boolean>;
+    renewLease(key: Uint8Array, holderId: string, token: bigint, leaseTtlMicros: bigint): Promise<Lease>;
     // (undocumented)
     scan(): KvScanRequest;
     set(key: Uint8Array): KvSetRequest;
@@ -2652,7 +2659,7 @@ export class Kv {
 
 // @public
 export class KvCasFencedRequest {
-    constructor(backend: KvBackend, getCapabilities: () => Promise<Capabilities>, namespace: string, key: Uint8Array, fenceKey: Uint8Array, fenceToken: bigint);
+    constructor(backend: KvBackend, getCapabilities: () => Promise<Capabilities>, namespace: string, key: Uint8Array, fenceNamespace: string, fenceKey: Uint8Array, fenceToken: bigint);
     // (undocumented)
     bytes(payload: Uint8Array): this;
     commit(): Promise<bigint>;
@@ -2746,6 +2753,9 @@ export type KvError = {
 } | {
     readonly kind: "notLeader";
 } | {
+    readonly kind: "stale";
+    readonly required: MutationPosition;
+} | {
     readonly kind: "unrecognized";
     readonly tag: string;
     readonly value: unknown;
@@ -2826,6 +2836,12 @@ export type KvOutcome = {
     readonly kind: "leased";
     readonly leaseToken: bigint;
     readonly grantedTtlMicros: bigint;
+    readonly position: MutationPosition;
+} | {
+    readonly kind: "renewed";
+    readonly leaseToken: bigint;
+    readonly grantedTtlMicros: bigint;
+    readonly position: MutationPosition;
 } | {
     readonly kind: "released";
     readonly wasHeld: boolean;
@@ -3119,7 +3135,7 @@ export class LaserError extends Error {
 }
 
 // @public (undocumented)
-export type LaserErrorKind = "config" | "no-stream" | "timeout" | "cancelled" | "unsupported" | "invalid" | "codec" | "typed-decode" | "protocol" | "transport" | "query" | "kv" | "fork" | "graph" | "authz" | "agent-workflow" | "routing" | "presence-conflict" | "signature" | "handler" | "handler-config" | "state-store" | "integrity" | "rejected" | "budget-exceeded" | "policy-blocked" | "step-up-required" | "policy-deferred";
+export type LaserErrorKind = "config" | "no-stream" | "timeout" | "ambiguous-mutation" | "cancelled" | "unsupported" | "invalid" | "codec" | "typed-decode" | "protocol" | "transport" | "query" | "kv" | "fork" | "graph" | "authz" | "agent-workflow" | "routing" | "presence-conflict" | "signature" | "handler" | "handler-config" | "state-store" | "integrity" | "rejected" | "budget-exceeded" | "policy-blocked" | "step-up-required" | "policy-deferred";
 
 // @public (undocumented)
 export interface LaserObserver {
@@ -3142,6 +3158,8 @@ export class LastN implements ContextPolicy {
 export interface Lease {
     // (undocumented)
     readonly grantedTtlMicros: bigint;
+    // (undocumented)
+    readonly position: MutationPosition;
     // (undocumented)
     readonly token: bigint;
 }
@@ -3613,6 +3631,16 @@ export function messagePackCodec<T>(decodeValue: ValueDecoder<T>): Codec<T>;
 
 // @public (undocumented)
 export const METADATA_BRIDGE_HOPS = "bridge_hops";
+
+// @public
+export interface MutationPosition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partition: number;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+}
 
 // @public (undocumented)
 export interface NodeExtract {
@@ -4893,7 +4921,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.2.0";
+export const SDK_VERSION = "0.2.1";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;
@@ -5551,6 +5579,9 @@ export class Workflow {
     // (undocumented)
     step(label: string, target: Router, build: StepFn): StepBuilder;
 }
+
+// @public (undocumented)
+export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence";
 
 // @public (undocumented)
 export interface WorkflowOutcome {

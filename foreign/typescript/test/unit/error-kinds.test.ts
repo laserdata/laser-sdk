@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import {
   AgentWorkflowExecutionError,
+  AmbiguousMutationError,
   AuthzExecutionError,
   BudgetExceededError,
   CancelledError,
@@ -39,6 +40,7 @@ const MESSAGE_ONLY = [
   [ConfigError, "config"],
   [NoStreamError, "no-stream"],
   [TimeoutError, "timeout"],
+  [AmbiguousMutationError, "ambiguous-mutation"],
   [CancelledError, "cancelled"],
   [UnsupportedError, "unsupported"],
   [SignatureError, "signature"],

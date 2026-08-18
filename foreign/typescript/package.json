@@ -1,6 +1,6 @@
 {
   "name": "@laserdata/laser-sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "LaserData SDK over Apache Iggy: typed streaming, operational and lakehouse query, materialization destinations, key-value state, copy-on-write forks, and an optional agent runtime with the Agent Data Exchange Protocol (AGDX).",
   "type": "module",
   "main": "./dist/index.js",

@@ -109,6 +109,7 @@ import {
   AGDX_KV_EXPIRE_CODE,
   AGDX_KV_GET_CODE,
   AGDX_KV_LEASE_CODE,
+  AGDX_KV_LEASE_RENEW_CODE,
   AGDX_KV_MOVE_CODE,
   AGDX_KV_NAMESPACES_CODE,
   AGDX_KV_PATCH_CODE,
@@ -162,6 +163,7 @@ import {
   type KvExpire,
   type KvGet,
   type KvLease,
+  type KvLeaseRenew,
   type KvMove,
   type KvPatch,
   type KvRelease,
@@ -178,6 +180,7 @@ import {
   encodeKvExpire,
   encodeKvGet,
   encodeKvLease,
+  encodeKvLeaseRenew,
   encodeKvMove,
   encodeKvNamespaces,
   encodeKvPatch,
@@ -459,7 +462,7 @@ export const KvCasCommand = framed<KvCas, KvReply>(
 )
 export const KvCasFencedCommand = framed<KvCasFenced, KvReply>(
   AGDX_KV_CAS_FENCED_CODE,
-  "kvCasFenced",
+  "kvFencedLeases",
   encodeKvCasFenced,
   decodeKvReply,
   kvVersion
@@ -487,14 +490,21 @@ export const KvPatchCommand = framed<KvPatch, KvReply>(
 )
 export const KvLeaseCommand = framed<KvLease, KvReply>(
   AGDX_KV_LEASE_CODE,
-  "kv",
+  "kvFencedLeases",
   encodeKvLease,
+  decodeKvReply,
+  kvVersion
+)
+export const KvLeaseRenewCommand = framed<KvLeaseRenew, KvReply>(
+  AGDX_KV_LEASE_RENEW_CODE,
+  "kvFencedLeases",
+  encodeKvLeaseRenew,
   decodeKvReply,
   kvVersion
 )
 export const KvReleaseCommand = framed<KvRelease, KvReply>(
   AGDX_KV_RELEASE_CODE,
-  "kv",
+  "kvFencedLeases",
   encodeKvRelease,
   decodeKvReply,
   kvVersion
@@ -653,6 +663,7 @@ export const EXTRA_MANAGED_COMMANDS = [
   KvExpireCommand,
   KvPatchCommand,
   KvLeaseCommand,
+  KvLeaseRenewCommand,
   KvReleaseCommand,
   KvCopyCommand,
   KvMoveCommand,

@@ -25,6 +25,7 @@ import {
   AGDX_KV_EXPIRE_CODE,
   AGDX_KV_GET_CODE,
   AGDX_KV_LEASE_CODE,
+  AGDX_KV_LEASE_RENEW_CODE,
   AGDX_KV_MOVE_CODE,
   AGDX_KV_NAMESPACES_CODE,
   AGDX_KV_PATCH_CODE,
@@ -57,7 +58,11 @@ export type Feature =
   | "query"
   | "agent"
   | "workflow"
+  | "destination"
+  | "checkpoint"
   | "authz"
+  | "kv_lease"
+  | "kv_fence"
   | "unrecognized"
 
 const KNOWN_FEATURES: ReadonlySet<string> = new Set([
@@ -69,7 +74,11 @@ const KNOWN_FEATURES: ReadonlySet<string> = new Set([
   "query",
   "agent",
   "workflow",
-  "authz"
+  "destination",
+  "checkpoint",
+  "authz",
+  "kv_lease",
+  "kv_fence"
 ])
 
 function parseFeature(word: string): Feature {
@@ -223,6 +232,9 @@ export function featureAction(code: number): readonly [Feature, Action] | undefi
     case AGDX_KV_NAMESPACES_CODE:
     case AGDX_KV_EXISTS_CODE:
       return ["kv", "read"]
+    // A fenced CAS additionally requires `kv_fence:read` on its coordination
+    // namespace. This map carries the primary target-namespace grant and the
+    // enforcer checks the fence grant beside it.
     case AGDX_KV_SET_CODE:
     case AGDX_KV_CAS_CODE:
     case AGDX_KV_CAS_FENCED_CODE:
@@ -230,9 +242,13 @@ export function featureAction(code: number): readonly [Feature, Action] | undefi
     case AGDX_KV_EXPIRE_CODE:
     case AGDX_KV_COPY_CODE:
     case AGDX_KV_MOVE_CODE:
-    case AGDX_KV_LEASE_CODE:
-    case AGDX_KV_RELEASE_CODE:
       return ["kv", "write"]
+    // Lease lifecycle is its own feature: a `kv:write` grant must never imply
+    // acquiring, renewing, or releasing the lease that fences it.
+    case AGDX_KV_LEASE_CODE:
+    case AGDX_KV_LEASE_RENEW_CODE:
+    case AGDX_KV_RELEASE_CODE:
+      return ["kv_lease", "admin"]
     case AGDX_KV_DELETE_CODE:
     case AGDX_KV_DELETE_MANY_CODE:
       return ["kv", "delete"]
@@ -262,26 +278,34 @@ export function featureAction(code: number): readonly [Feature, Action] | undefi
   }
 }
 
-const FEATURES: readonly Feature[] = [
-  "kv",
-  "memory",
-  "projection",
-  "fork",
-  "graph",
-  "query",
-  "agent",
-  "workflow",
-  "authz",
-  "unrecognized"
-]
-const ACTIONS: readonly Action[] = ["read", "write", "delete", "admin", "unrecognized"]
+const FEATURE_ORDINALS = {
+  kv: 0,
+  memory: 1,
+  projection: 2,
+  fork: 3,
+  graph: 4,
+  query: 5,
+  agent: 6,
+  workflow: 7,
+  destination: 8,
+  checkpoint: 9,
+  authz: 10,
+  kv_lease: 11,
+  kv_fence: 12,
+  unrecognized: 13
+} as const satisfies Readonly<Record<Feature, number>>
+const ACTION_ORDINALS = {
+  read: 0,
+  write: 1,
+  delete: 2,
+  admin: 3,
+  unrecognized: 4
+} as const satisfies Readonly<Record<Action, number>>
 
-export const ACTION_COUNT = ACTIONS.length
+export const ACTION_COUNT = 5
 
 export function actionIndex(feature: Feature, action: Action): number {
-  const featureOrdinal = FEATURES.indexOf(feature)
-  const actionOrdinal = ACTIONS.indexOf(action)
-  return featureOrdinal * ACTION_COUNT + actionOrdinal
+  return FEATURE_ORDINALS[feature] * ACTION_COUNT + ACTION_ORDINALS[action]
 }
 
 export function grantsAllow(

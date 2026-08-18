@@ -339,6 +339,7 @@ export function isRetryable(error: LaserError): boolean {
   switch (error.kind) {
     case "config":
     case "no-stream":
+    case "ambiguous-mutation":
     case "unsupported":
     case "invalid":
     case "codec":

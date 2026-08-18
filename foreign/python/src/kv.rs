@@ -2,7 +2,7 @@ use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
 use crate::convert::{duration_seconds, json_to_py, payload_bytes, py_to_json, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
-use laser_sdk::kv::{KvEntry, KvPage};
+use laser_sdk::kv::{KvEntry, KvPage, Lease, MutationPosition};
 use laser_sdk::laser::Laser;
 use laser_sdk::types::ConversationId;
 use pyo3::prelude::*;
@@ -69,6 +69,96 @@ pub struct PyKv {
     namespace: String,
 }
 
+/// The durable managed-mutation position used as a barrier for takeover reads.
+#[gen_stub_pyclass]
+#[pyclass(name = "MutationPosition", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyMutationPosition {
+    #[pyo3(get)]
+    pub topic_generation: u64,
+    #[pyo3(get)]
+    pub partition: u32,
+    #[pyo3(get)]
+    pub offset: u64,
+}
+
+impl From<MutationPosition> for PyMutationPosition {
+    fn from(value: MutationPosition) -> Self {
+        Self {
+            topic_generation: value.topic_generation,
+            partition: value.partition,
+            offset: value.offset,
+        }
+    }
+}
+
+impl From<&PyMutationPosition> for MutationPosition {
+    fn from(value: &PyMutationPosition) -> Self {
+        Self {
+            topic_generation: value.topic_generation,
+            partition: value.partition,
+            offset: value.offset,
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyMutationPosition {
+    #[new]
+    fn new(topic_generation: u64, partition: u32, offset: u64) -> Self {
+        Self {
+            topic_generation,
+            partition,
+            offset,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MutationPosition(topic_generation={}, partition={}, offset={})",
+            self.topic_generation, self.partition, self.offset
+        )
+    }
+}
+
+/// A revocable lease grant and the mutation barrier it established.
+#[gen_stub_pyclass]
+#[pyclass(name = "Lease", frozen)]
+pub struct PyLease {
+    #[pyo3(get)]
+    pub token: u64,
+    #[pyo3(get)]
+    pub granted_ttl_secs: f64,
+    position: PyMutationPosition,
+}
+
+impl From<Lease> for PyLease {
+    fn from(value: Lease) -> Self {
+        Self {
+            token: value.token,
+            granted_ttl_secs: value.granted_ttl.as_secs_f64(),
+            position: value.position.into(),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyLease {
+    #[getter]
+    fn position(&self) -> PyMutationPosition {
+        self.position.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Lease(token={}, granted_ttl_secs={})",
+            self.token, self.granted_ttl_secs
+        )
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyKv {
@@ -94,6 +184,36 @@ impl PyKv {
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
             let entry = laser.kv(namespace).get_entry(key).await.map_err(to_pyerr)?;
+            Python::attach(|py| match entry {
+                Some(entry) => Ok(PyKvEntry::from(entry)
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind()),
+                None => Ok(py.None()),
+            })
+        })
+    }
+
+    /// Barriered read: wait until the answering fold has applied at least
+    /// `min_position`, normally the position returned by `lease` or
+    /// `renew_lease`. A fold that cannot catch up raises a stale `KvError`, never
+    /// returns an absent value. Needs the `kv_fenced_leases` capability.
+    fn get_entry_at_least<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        min_position: PyRef<'_, PyMutationPosition>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        let min_position = MutationPosition::from(&*min_position);
+        future_into_py(py, async move {
+            let entry = laser
+                .kv(namespace)
+                .get_entry_at_least(key, min_position)
+                .await
+                .map_err(to_pyerr)?;
             Python::attach(|py| match entry {
                 Some(entry) => Ok(PyKvEntry::from(entry)
                     .into_pyobject(py)?
@@ -141,20 +261,23 @@ impl PyKv {
         })
     }
 
-    /// Fenced compare-and-swap: write `value` (payload) to `key` only while the
-    /// task's fence sequence still equals `fence_token` (from a prior `lease`),
-    /// and the precondition holds. Give exactly one of `expect_version=` (apply
-    /// only if the key holds that version) or `expect_absent=True` (create only if
-    /// absent). Returns the new version. A stale fence raises `KvError`
-    /// (`is_version_conflict()` is false, a newer holder bumped the sequence). A
-    /// precondition miss raises `KvError` with `is_version_conflict()` true. The
-    /// at-most-one-effective-writer gate for an exclusive external effect.
-    #[pyo3(signature = (key, fence_key, fence_token, value, *, expect_version=None, expect_absent=false, ttl_secs=None))]
+    /// Fenced compare-and-swap: write `value` (payload) to `key` in one backend
+    /// transaction that requires a live lease at (`fence_namespace`,
+    /// `fence_key`) with a fence sequence still equal to `fence_token` (both
+    /// from a prior `lease`), and the precondition. Give exactly one of
+    /// `expect_version=` (apply only if the key holds that version) or
+    /// `expect_absent=True` (create only if absent). Returns the new version. A
+    /// stale fence, or a lease that expired or was released, raises `KvError`
+    /// (`is_version_conflict()` is false). A precondition miss raises `KvError`
+    /// with `is_version_conflict()` true. The at-most-one-effective-writer gate
+    /// for an exclusive external effect.
+    #[pyo3(signature = (key, fence_namespace, fence_key, fence_token, value, *, expect_version=None, expect_absent=false, ttl_secs=None))]
     #[allow(clippy::too_many_arguments)]
     fn cas_fenced<'py>(
         &self,
         py: Python<'py>,
         key: &Bound<'_, PyAny>,
+        fence_namespace: String,
         fence_key: &Bound<'_, PyAny>,
         fence_token: u64,
         value: &Bound<'_, PyAny>,
@@ -173,7 +296,7 @@ impl PyKv {
         future_into_py(py, async move {
             let mut request = laser
                 .kv(namespace)
-                .cas_fenced(key, fence_key, fence_token)
+                .cas_fenced(key, fence_namespace, fence_key, fence_token)
                 .bytes(value);
             if let Some(version) = expect_version {
                 request = request.expect_version(version);
@@ -250,12 +373,21 @@ impl PyKv {
         })
     }
 
-    /// Acquire an advisory lease on `key` for `ttl_secs`. Returns
-    /// `(lease_token, granted_ttl_secs)`.
+    /// Acquire a revocable lease on `key` for `ttl_secs` as `holder` (a stable
+    /// node or worker id). Returns a `Lease` with `token`, `granted_ttl_secs`,
+    /// and the `position` to pass to `get_entry_at_least`. A live
+    /// lease always conflicts: extend with `renew_lease`, never by
+    /// re-acquiring. `ttl_secs` is a requested maximum between 1 second and 5
+    /// minutes; the store may grant less and never more, so a value outside that
+    /// range raises before the round trip and a holder needing longer renews.
+    /// Needs the `kv_fenced_leases` capability. If acquisition is
+    /// ambiguous, the SDK closes the dedicated coordination connection and waits
+    /// `ttl_secs` before raising the non-retryable ambiguous-mutation error.
     fn lease<'py>(
         &self,
         py: Python<'py>,
         key: &Bound<'_, PyAny>,
+        holder: String,
         ttl_secs: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
@@ -264,19 +396,47 @@ impl PyKv {
         future_into_py(py, async move {
             let lease = laser
                 .kv(namespace)
-                .lease(key, duration_seconds(ttl_secs, "ttl_secs")?)
+                .lease(key, holder, duration_seconds(ttl_secs, "ttl_secs")?)
                 .await
                 .map_err(to_pyerr)?;
-            Ok((lease.token, lease.granted_ttl.as_secs_f64()))
+            Ok(PyLease::from(lease))
         })
     }
 
-    /// Release a held lease early, presenting its `token`. Returns `True` when a
-    /// held lease was released.
+    /// Extend a held lease without changing its token, presenting the same
+    /// `holder` and the `token` the grant returned. Returns
+    /// a `Lease` with the unchanged token, fresh TTL, and renewal position.
+    /// `ttl_secs` obeys the same range as `lease`. An expired, released, or
+    /// re-acquired lease raises `KvError`: stop the protected work, a new epoch
+    /// needs a fresh `lease`.
+    fn renew_lease<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        holder: String,
+        token: u64,
+        ttl_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        future_into_py(py, async move {
+            let lease = laser
+                .kv(namespace)
+                .renew_lease(key, holder, token, duration_seconds(ttl_secs, "ttl_secs")?)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(PyLease::from(lease))
+        })
+    }
+
+    /// Release a held lease early, presenting the same `holder` and its
+    /// `token`. Returns `True` when a held lease was released.
     fn release<'py>(
         &self,
         py: Python<'py>,
         key: &Bound<'_, PyAny>,
+        holder: String,
         token: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
@@ -285,7 +445,7 @@ impl PyKv {
         future_into_py(py, async move {
             laser
                 .kv(namespace)
-                .release(key, token)
+                .release(key, holder, token)
                 .await
                 .map_err(to_pyerr)
         })

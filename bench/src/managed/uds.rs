@@ -108,6 +108,7 @@ fn request(arm: UdsArm) -> Result<Vec<u8>, BenchError> {
                 namespace: "laser_bench_uds".to_owned(),
                 key: b"missing".to_vec(),
                 if_none_match: None,
+                min_position: None,
             })
             .map_err(|error| BenchError::Invalid(format!("encode UDS KV request: {error}")))?;
             let forwarded = encode_named(&ForwardedCommand {

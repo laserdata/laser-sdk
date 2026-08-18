@@ -2,7 +2,15 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { Capabilities } from "../../src/client/capabilities.js"
 import { managedCapabilitiesFrom } from "../../src/client/capabilities.js"
-import { InvalidError, UnsupportedError } from "../../src/client/errors.js"
+import {
+  AmbiguousMutationError,
+  InvalidError,
+  TransportError,
+  UnsupportedError
+} from "../../src/client/errors.js"
+import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import { Laser } from "../../src/client/laser.js"
+import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 import { Kv } from "../../src/managed/kv.js"
 import { encodeBatchReply } from "../../src/wire/batch.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
@@ -14,12 +22,21 @@ import {
   KvSetCommand
 } from "../../src/wire/commands.js"
 import { type KvOutcome, type KvReply, encodeKvReply } from "../../src/wire/kv.js"
+import { MIN_LEASE_TTL_MICROS } from "../../src/wire/limits.js"
+
+// The shortest lifetime the contract will accept, and twice it for a request the
+// store can plausibly clamp down from.
+const MIN_TTL_MICROS = BigInt(MIN_LEASE_TTL_MICROS)
+const REQUESTED_TTL_MICROS = 2n * MIN_TTL_MICROS
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
   versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: 0n },
   backends: []
 })
-const CAS_CAPS: Capabilities = { ...CAPS, kv: { ...CAPS.kv, cas: true, casFenced: true } }
+const CAS_CAPS: Capabilities = {
+  ...CAPS,
+  kv: { ...CAPS.kv, cas: true, casFenced: true, fencedLeases: true }
+}
 
 function replyFrame(reply: KvReply): Uint8Array {
   const value = encodeKvReply(reply)
@@ -32,15 +49,27 @@ function okFrame(outcome: KvOutcome): Uint8Array {
 }
 
 function fakeTransport(scriptedReplies: readonly Uint8Array[]): {
-  readonly calls: { readonly code: number; readonly payload: Uint8Array }[]
-  sendManaged(code: number, payload: Uint8Array): Promise<Uint8Array>
+  readonly calls: {
+    readonly code: number
+    readonly payload: Uint8Array
+    readonly options?: { readonly retryAfterReconnect?: boolean }
+  }[]
+  sendManaged(
+    code: number,
+    payload: Uint8Array,
+    options?: { readonly retryAfterReconnect?: boolean }
+  ): Promise<Uint8Array>
 } {
-  const calls: { code: number; payload: Uint8Array }[] = []
+  const calls: {
+    code: number
+    payload: Uint8Array
+    options?: { readonly retryAfterReconnect?: boolean }
+  }[] = []
   let next = 0
   return {
     calls,
-    sendManaged(code, payload) {
-      calls.push({ code, payload })
+    sendManaged(code, payload, options) {
+      calls.push({ code, payload, ...(options === undefined ? {} : { options }) })
       const reply = scriptedReplies[next]
       next += 1
       if (reply === undefined) throw new Error("fake transport ran out of scripted replies")
@@ -144,7 +173,7 @@ void test("given_fenced_cas_not_advertised_when_commit_is_called_then_should_rej
   await assert.rejects(
     () =>
       store
-        .casFenced(Uint8Array.of(1), Uint8Array.of(9), 4n)
+        .casFenced(Uint8Array.of(1), "coordination", Uint8Array.of(9), 4n)
         .bytes(Uint8Array.of(2))
         .expectAbsent()
         .commit(),
@@ -160,7 +189,7 @@ void test("given_fenced_cas_advertised_when_commit_is_called_then_should_send_th
     CAS_CAPS
   )
   const version = await store
-    .casFenced(Uint8Array.of(1), Uint8Array.of(9), 4n)
+    .casFenced(Uint8Array.of(1), "coordination", Uint8Array.of(9), 4n)
     .bytes(Uint8Array.of(2))
     .expectAbsent()
     .commit()
@@ -191,17 +220,101 @@ void test("given_a_versioned_outcome_when_patch_is_called_then_should_return_the
   assert.equal(await store.patch(Uint8Array.of(1), Uint8Array.of(9)), 7n)
 })
 
-void test("given_a_leased_outcome_when_lease_is_called_then_should_return_the_token_and_ttl", async () => {
-  const { kv: store } = kv("sessions", [
-    okFrame({ kind: "leased", leaseToken: 42n, grantedTtlMicros: 1_000n })
-  ])
-  const lease = await store.lease(Uint8Array.of(1), 5_000n)
-  assert.deepEqual(lease, { token: 42n, grantedTtlMicros: 1_000n })
+void test("given_a_leased_outcome_when_lease_is_called_then_should_return_the_token_ttl_and_position", async () => {
+  const position = { topicGeneration: 1n, partition: 0, offset: 512n }
+  const { kv: store, transport } = kv(
+    "sessions",
+    [okFrame({ kind: "leased", leaseToken: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })],
+    CAS_CAPS
+  )
+  const lease = await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS)
+  assert.deepEqual(lease, { token: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })
+  assert.equal(transport.calls[0]?.options?.retryAfterReconnect, false)
+})
+
+void test("given_a_laser_kv_acquire_when_sent_then_should_preserve_the_no_replay_option", async () => {
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  await using laser = await Laser.fromIggyClient(client, { capabilities: CAS_CAPS })
+  let retryAfterReconnect: boolean | undefined
+  laser[INTERNAL_TRANSPORT]().sendManaged = (_code, _payload, options) => {
+    retryAfterReconnect = options?.retryAfterReconnect
+    return Promise.resolve(
+      okFrame({
+        kind: "leased",
+        leaseToken: 42n,
+        grantedTtlMicros: MIN_TTL_MICROS,
+        position: { topicGeneration: 1n, partition: 0, offset: 512n }
+      })
+    )
+  }
+
+  await laser.kv("sessions").lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS)
+
+  assert.equal(retryAfterReconnect, false)
+})
+
+void test("given_an_ambiguous_acquire_when_lease_is_called_then_should_wait_before_returning_a_terminal_error", async () => {
+  let calls = 0
+  const transport = {
+    sendManaged() {
+      calls += 1
+      return Promise.reject(new TransportError("connection lost", true))
+    }
+  }
+  const store = new Kv(transport, () => Promise.resolve(CAS_CAPS), "sessions")
+  const started = performance.now()
+  await assert.rejects(
+    () => store.lease(Uint8Array.of(1), "worker-1", MIN_TTL_MICROS),
+    AmbiguousMutationError
+  )
+  assert.equal(calls, 1)
+  // The recovery wait is the whole requested TTL, not a token gesture.
+  assert.ok(performance.now() - started >= Number(MIN_TTL_MICROS) / 1_000)
+})
+
+void test("given_a_definite_transport_rejection_when_lease_is_called_then_should_preserve_it_without_ttl_recovery", async () => {
+  const denied = new TransportError("server rejected acquisition", false)
+  const store = new Kv(
+    { sendManaged: () => Promise.reject(denied) },
+    () => Promise.resolve(CAS_CAPS),
+    "sessions"
+  )
+
+  await assert.rejects(
+    () => store.lease(Uint8Array.of(1), "worker-1", 60_000_000n),
+    (error) => {
+      assert.equal(error, denied)
+      return true
+    }
+  )
+})
+
+void test("given_a_renewed_outcome_when_renew_lease_is_called_then_should_return_the_same_token", async () => {
+  const position = { topicGeneration: 1n, partition: 0, offset: 513n }
+  const { kv: store } = kv(
+    "sessions",
+    [okFrame({ kind: "renewed", leaseToken: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })],
+    CAS_CAPS
+  )
+  const lease = await store.renewLease(Uint8Array.of(1), "worker-1", 42n, REQUESTED_TTL_MICROS)
+  assert.deepEqual(lease, { token: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })
+})
+
+void test("given_lease_not_advertised_when_lease_is_called_then_should_reject_as_unsupported", async () => {
+  const { kv: store, transport } = kv("sessions", [])
+  await assert.rejects(
+    () => store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS),
+    UnsupportedError
+  )
+  assert.equal(transport.calls.length, 0)
 })
 
 void test("given_a_released_outcome_when_release_is_called_then_should_return_whether_it_was_held", async () => {
-  const { kv: store } = kv("sessions", [okFrame({ kind: "released", wasHeld: false })])
-  assert.equal(await store.release(Uint8Array.of(1), 42n), false)
+  const { kv: store } = kv("sessions", [okFrame({ kind: "released", wasHeld: false })], CAS_CAPS)
+  assert.equal(await store.release(Uint8Array.of(1), "worker-1", 42n), false)
 })
 
 void test("given_copy_to_when_sent_then_should_use_the_copy_command", async () => {

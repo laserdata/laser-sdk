@@ -16,7 +16,7 @@ import type {
 } from "apache-iggy"
 import { readFileSync } from "node:fs"
 import { isIP } from "node:net"
-import { ConfigError, TransportError } from "../client/errors.js"
+import { AmbiguousMutationError, ConfigError, TransportError } from "../client/errors.js"
 import { LASERDATA_ROOT_CA } from "../client/laserdata-ca.js"
 import type { PollingStrategy } from "../stream/polling-strategy.js"
 import type { Routing } from "../stream/routing.js"
@@ -79,7 +79,11 @@ export type ConsumerOffsetTarget =
 export interface LaserTransport {
   readonly kind: "apache-iggy"
   readonly iggyClient: SimpleClient
-  sendManaged(code: number, payload: Uint8Array): Promise<Uint8Array>
+  sendManaged(
+    code: number,
+    payload: Uint8Array,
+    options?: { readonly retryAfterReconnect?: boolean }
+  ): Promise<Uint8Array>
   ensureStream(name: string): Promise<void>
   ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void>
   ensureTopicWithExpiry?(
@@ -598,7 +602,8 @@ export class ApacheIggyTransport implements LaserTransport {
 
   private async execute<Value>(
     operation: (client: SimpleClient) => Promise<Value>,
-    message: string
+    message: string,
+    retryAfterReconnect = true
   ): Promise<Value> {
     const stale = this.client
     if (this.disconnected.has(stale)) {
@@ -609,9 +614,15 @@ export class ApacheIggyTransport implements LaserTransport {
       return await operation(stale)
     } catch (firstCause) {
       if (!this.disconnected.has(stale)) {
+        if (!retryAfterReconnect && serverResponseError(firstCause) === undefined) {
+          throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })
+        }
         throw new TransportError(message, serverResponseError(firstCause) === undefined, {
           cause: firstCause
         })
+      }
+      if (!retryAfterReconnect) {
+        throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })
       }
       try {
         await this.reconnect(stale)
@@ -688,7 +699,11 @@ export class ApacheIggyTransport implements LaserTransport {
     stream.once("close", markDisconnected)
   }
 
-  async sendManaged(code: number, payload: Uint8Array): Promise<Uint8Array> {
+  async sendManaged(
+    code: number,
+    payload: Uint8Array,
+    options?: { readonly retryAfterReconnect?: boolean }
+  ): Promise<Uint8Array> {
     const request = isIdempotentManagedRequest(code)
       ? encodeNamed(
           encodeManagedRequestEnvelope({
@@ -701,7 +716,8 @@ export class ApacheIggyTransport implements LaserTransport {
     const buffer = toNodeBuffer(request)
     const reply = await this.execute(
       (client) => client.sendBinaryRequest(code, buffer),
-      `managed command ${String(code)} failed`
+      `managed command ${String(code)} failed`,
+      options?.retryAfterReconnect ?? true
     )
     return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
   }

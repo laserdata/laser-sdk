@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
+import { CodecError, InvalidError } from "../../src/client/errors.js"
 import {
   decodeKvCas,
   decodeKvCasFenced,
@@ -9,8 +10,11 @@ import {
   decodeKvDeleteMany,
   decodeKvEntry,
   decodeKvGet,
+  decodeKvLease,
+  decodeKvLeaseRenew,
   decodeKvMove,
   decodeKvPatch,
+  decodeKvRelease,
   decodeKvReply,
   decodeKvScan,
   decodeKvSet,
@@ -20,10 +24,13 @@ import {
   encodeKvDeleteMany,
   encodeKvEntry,
   encodeKvGet,
+  encodeKvLease,
+  encodeKvLeaseRenew,
   encodeKvMove,
   encodeKvNamespaces,
   encodeKvOutcome,
   encodeKvPatch,
+  encodeKvRelease,
   encodeKvReply,
   encodeKvScan,
   encodeKvSet,
@@ -31,6 +38,11 @@ import {
   validateNamespace
 } from "../../src/wire/kv.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
+import {
+  MAX_HOLDER_ID_BYTES,
+  MAX_LEASE_TTL_MICROS,
+  MIN_LEASE_TTL_MICROS
+} from "../../src/wire/limits.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
 
@@ -64,8 +76,105 @@ void test("given_the_kv_cas_fenced_fixture_when_decoded_then_should_preserve_the
   const map = expectMap(decodeOne(bytes, "kv_cas_fenced"), "kv_cas_fenced")
   const cas = decodeKvCasFenced(map, "kv_cas_fenced")
   assert.deepEqual(cas.expect, { kind: "absent" })
+  assert.equal(cas.fenceNamespace, "coordination")
   assert.equal(cas.fenceToken, 3n)
   const reencoded = encodeNamed(encodeKvCasFenced(cas))
+  assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_the_kv_lease_fixture_when_decoded_then_should_preserve_holder_and_subject", async () => {
+  const bytes = await readFixture("kv_lease.bin")
+  const map = expectMap(decodeOne(bytes, "kv_lease"), "kv_lease")
+  const lease = decodeKvLease(map, "kv_lease")
+  assert.equal(lease.holderId, "worker-1")
+  assert.equal(lease.subjectUserId, 42)
+  assert.equal(lease.leaseTtlMicros, 30_000_000n)
+  const reencoded = encodeNamed(encodeKvLease(lease))
+  assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_the_kv_lease_renew_fixture_when_decoded_then_should_preserve_token_and_holder", async () => {
+  const bytes = await readFixture("kv_lease_renew.bin")
+  const map = expectMap(decodeOne(bytes, "kv_lease_renew"), "kv_lease_renew")
+  const renew = decodeKvLeaseRenew(map, "kv_lease_renew")
+  assert.equal(renew.holderId, "worker-1")
+  assert.equal(renew.subjectUserId, undefined)
+  assert.equal(renew.leaseToken, 3n)
+  const reencoded = encodeNamed(encodeKvLeaseRenew(renew))
+  assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_the_kv_release_fixture_when_decoded_then_should_preserve_token_and_holder", async () => {
+  const bytes = await readFixture("kv_release.bin")
+  const map = expectMap(decodeOne(bytes, "kv_release"), "kv_release")
+  const release = decodeKvRelease(map, "kv_release")
+  assert.equal(release.leaseToken, 3n)
+  assert.equal(release.holderId, "worker-1")
+  const reencoded = encodeNamed(encodeKvRelease(release))
+  assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_invalid_lease_shapes_when_encoded_then_should_reject_before_transport", () => {
+  const base = {
+    namespace: "coordination",
+    key: new TextEncoder().encode("owner"),
+    leaseTtlMicros: 30_000_000n,
+    holderId: "worker-1"
+  }
+  assert.throws(() => encodeKvLease({ ...base, holderId: "" }), InvalidError)
+  assert.throws(
+    () => encodeKvLease({ ...base, holderId: "h".repeat(MAX_HOLDER_ID_BYTES + 1) }),
+    InvalidError
+  )
+  assert.throws(() => encodeKvLease({ ...base, leaseTtlMicros: 0n }), InvalidError)
+  assert.throws(
+    () =>
+      encodeKvLeaseRenew({
+        ...base,
+        leaseToken: 0n
+      }),
+    InvalidError
+  )
+  assert.throws(() => encodeKvRelease({ ...base, leaseToken: 0n }), InvalidError)
+})
+
+void test("given_out_of_range_lease_ttls_when_encoded_then_should_reject_both_ends", () => {
+  const base = {
+    namespace: "coordination",
+    key: new TextEncoder().encode("owner"),
+    holderId: "worker-1"
+  }
+  const min = BigInt(MIN_LEASE_TTL_MICROS)
+  const max = BigInt(MAX_LEASE_TTL_MICROS)
+  // The bounds themselves are grantable. A step past either end is not.
+  assert.doesNotThrow(() => encodeKvLease({ ...base, leaseTtlMicros: min }))
+  assert.doesNotThrow(() => encodeKvLease({ ...base, leaseTtlMicros: max }))
+  assert.throws(() => encodeKvLease({ ...base, leaseTtlMicros: min - 1n }), InvalidError)
+  assert.throws(() => encodeKvLease({ ...base, leaseTtlMicros: max + 1n }), InvalidError)
+  // Renewal shares the range, so a holder cannot extend past the ceiling.
+  assert.throws(
+    () => encodeKvLeaseRenew({ ...base, leaseToken: 7n, leaseTtlMicros: max + 1n }),
+    InvalidError
+  )
+})
+
+void test("given_a_v1_lease_shape_when_decoded_then_should_fail_closed", () => {
+  const map = encodeKvLease({
+    namespace: "coordination",
+    key: new TextEncoder().encode("owner"),
+    leaseTtlMicros: 30_000_000n,
+    holderId: "worker-1"
+  })
+  map.set("v", 1)
+  assert.throws(() => decodeKvLease(map, "lease"), CodecError)
+})
+
+void test("given_the_kv_get_barriered_fixture_when_decoded_then_should_preserve_the_minimum_position", async () => {
+  const bytes = await readFixture("kv_get_barriered.bin")
+  const map = expectMap(decodeOne(bytes, "kv_get_barriered"), "kv_get_barriered")
+  const get = decodeKvGet(map, "kv_get_barriered")
+  assert.deepEqual(get.minPosition, { topicGeneration: 1n, partition: 0, offset: 512n })
+  const reencoded = encodeNamed(encodeKvGet(get))
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
 })
 
@@ -136,6 +245,40 @@ void test("given_the_kv_reply_page_fixture_when_decoded_then_should_carry_the_en
 void test("given_the_kv_reply_version_conflict_fixture_when_decoded_then_should_carry_the_current_version", async () => {
   const reply = await assertKvReplyRoundTrips("kv_reply_version_conflict.bin")
   assert.deepEqual(reply, { kind: "err", error: { kind: "versionConflict", current: 7n } })
+})
+
+void test("given_the_kv_reply_leased_fixture_when_decoded_then_should_carry_token_ttl_and_position", async () => {
+  const reply = await assertKvReplyRoundTrips("kv_reply_leased.bin")
+  assert.deepEqual(reply, {
+    kind: "ok",
+    outcome: {
+      kind: "leased",
+      leaseToken: 3n,
+      grantedTtlMicros: 30_000_000n,
+      position: { topicGeneration: 1n, partition: 0, offset: 512n }
+    }
+  })
+})
+
+void test("given_the_kv_reply_renewed_fixture_when_decoded_then_should_carry_the_same_token", async () => {
+  const reply = await assertKvReplyRoundTrips("kv_reply_renewed.bin")
+  assert.deepEqual(reply, {
+    kind: "ok",
+    outcome: {
+      kind: "renewed",
+      leaseToken: 3n,
+      grantedTtlMicros: 30_000_000n,
+      position: { topicGeneration: 1n, partition: 0, offset: 513n }
+    }
+  })
+})
+
+void test("given_the_kv_reply_stale_fixture_when_decoded_then_should_carry_the_required_position", async () => {
+  const reply = await assertKvReplyRoundTrips("kv_reply_stale.bin")
+  assert.deepEqual(reply, {
+    kind: "err",
+    error: { kind: "stale", required: { topicGeneration: 1n, partition: 0, offset: 512n } }
+  })
 })
 
 void test("given_namespaces_when_validated_then_should_enforce_bounds", () => {
@@ -223,13 +366,19 @@ void test("given_a_patch_request_when_round_tripped_then_should_preserve_patch_a
   assert.equal(back.ifMatch, 3n)
 })
 
-void test("given_a_lease_reply_when_round_tripped_then_should_preserve_token_and_ttl", () => {
-  const outcome = { kind: "leased" as const, leaseToken: 77n, grantedTtlMicros: 30_000_000n }
+void test("given_a_lease_reply_when_round_tripped_then_should_preserve_token_ttl_and_position", () => {
+  const outcome = {
+    kind: "leased" as const,
+    leaseToken: 77n,
+    grantedTtlMicros: 30_000_000n,
+    position: { topicGeneration: 3n, partition: 1, offset: 4_200n }
+  }
   const bytes = encodeNamed(new Map([["Ok", encodeKvOutcome(outcome)]]))
   const back = decodeKvReply(decodeOne(bytes, "test"), "test")
   if (back.kind !== "ok" || back.outcome.kind !== "leased") throw new Error("wrong shape")
   assert.equal(back.outcome.leaseToken, 77n)
   assert.equal(back.outcome.grantedTtlMicros, 30_000_000n)
+  assert.deepEqual(back.outcome.position, { topicGeneration: 3n, partition: 1, offset: 4_200n })
 })
 
 void test("given_a_conditional_get_when_round_tripped_then_should_preserve_if_none_match_and_omit_when_absent", () => {

@@ -38,6 +38,31 @@ export function decodeManagedRequestEnvelope(
   }
 }
 
+/** Position of one applied mutation on the KV mutation topic: the fold
+ * coordinate a barriered read waits for. Positions compare only within one
+ * `topicGeneration`. A generation mismatch is fail-closed. */
+export interface MutationPosition {
+  readonly topicGeneration: bigint
+  readonly partition: number
+  readonly offset: bigint
+}
+
+export function encodeMutationPosition(position: MutationPosition): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["topic_generation", position.topicGeneration],
+    ["partition", BigInt(position.partition)],
+    ["offset", position.offset]
+  ])
+}
+
+export function decodeMutationPosition(map: CborMap, context: string): MutationPosition {
+  return {
+    topicGeneration: field.requiredU64(map, "topic_generation", context),
+    partition: field.requiredU32(map, "partition", context),
+    offset: field.requiredU64(map, "offset", context)
+  }
+}
+
 export interface MutationCommandEnvelope {
   readonly v: number
   readonly operationId: bigint

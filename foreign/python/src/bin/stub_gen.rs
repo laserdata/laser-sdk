@@ -22,6 +22,7 @@ class LaserError(Exception):
     not_found: builtins.bool
     version_skew: builtins.bool
     version_conflict: builtins.bool
+    ambiguous_mutation: builtins.bool
     stale: builtins.bool
     permission_denied: builtins.bool
     stream_or_topic_not_found: builtins.bool
