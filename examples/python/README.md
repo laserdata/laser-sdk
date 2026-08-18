@@ -76,7 +76,7 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 | [`log.py`](log.py) | Log | write two messages, read them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.cloud/laser-sdk/log) |
 | [`query.py`](query.py) | Views | declare a view over a topic, publish orders, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch.py`](watch.py) | Change feed | react to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
-| [`kv.py`](kv.py) | State | set/get keyed JSON with a TTL, upgrade it under compare-and-swap, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
+| [`kv.py`](kv.py) | State | set/get keyed JSON with a TTL, upgrade it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
 | [`graph.py`](graph.py) | Graph | link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall.py`](recall.py) | Memory | all four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
 | [`context.py`](context.py) | Context | assemble one conversation under a last-N bound and a token budget | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |

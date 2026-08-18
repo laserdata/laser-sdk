@@ -462,6 +462,8 @@ function surfaceAvailable(capabilities: Capabilities, feature: CapabilitySurface
       return capabilities.kv.available && capabilities.kv.cas
     case "kvCasFenced":
       return capabilities.kv.available && capabilities.kv.casFenced
+    case "kvFencedLeases":
+      return capabilities.kv.available && capabilities.kv.fencedLeases
     case "graph":
       return capabilities.graph
     case "forks":

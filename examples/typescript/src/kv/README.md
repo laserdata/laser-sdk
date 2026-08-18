@@ -6,9 +6,10 @@
 
 - Sets a JSON profile under `profiles/user:42` with a 24-hour TTL (`kv.set(key).json(value).ttl(micros).send()`) and reads it back with `kv.get(key)`.
 - Upgrades the same key under compare-and-swap: reads the version with `kv.getEntry(key)`, then `set(key).json(value).expectVersion(version).commit()`, so the write lands only if nobody moved first.
+- Holds a revocable lease as `worker-a` (`kv.lease(leaseKey, holder, ttlMicros)`), reads behind its barrier with `kv.getEntryAtLeast(key, lease.position)` so a fresh holder never plans against its predecessor's state, writes under its fence with `kv.casFenced(key, fenceNamespace, fenceKey, lease.token).expectVersion(version).commit()`, renews at the same fence, releases, and shows the released fence refused as `lease-lost` - the at-most-one-effective-writer gate.
 - Creates a severed fork named `experiment-1`, writes one speculative row with `putRow(..).field(..).send()`, and promotes it back onto the trunk.
 
-Compare-and-swap and forks are separately advertised capabilities, so each act runs only where the deployment serves it.
+Compare-and-swap, the fenced-lease contract, and forks are separately advertised capabilities, so each act runs only where the deployment serves it.
 
 ## Run it
 
