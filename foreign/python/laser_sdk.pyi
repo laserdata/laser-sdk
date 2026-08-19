@@ -1062,7 +1062,7 @@ class Decision:
 
 @typing.final
 class Destinations:
-    def mutate(self, expected_global_state_revision: builtins.int, mutation: typing.Any) -> typing.Any:
+    def mutate(self, expected_global_state_revision: builtins.int, mutation: typing.Any, *, supervisor_assertion: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
         Submit one bounded public checkpoint mutation dict.
         """
@@ -1074,11 +1074,25 @@ class Destinations:
         r"""
         Enable or disable a destination with definition-revision compare-and-set.
         """
-    def get(self, destination_id: builtins.str, *, consistency: builtins.str = 'potentially_stale') -> typing.Any:
+    def bind_table(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_definition_revision: builtins.int, table_uuid: typing.Any) -> typing.Any: ...
+    def add_partition(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, partition_id: builtins.int) -> typing.Any: ...
+    def observe_partition_lifecycle(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, partition_id: builtins.int) -> typing.Any: ...
+    def acquire_lease(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, owner: builtins.str, expected_lease_sequence: builtins.int, lease_duration_micros: builtins.int) -> typing.Any: ...
+    def renew_lease(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, owner: builtins.str, epoch: builtins.int, expected_lease_sequence: builtins.int, lease_duration_micros: builtins.int) -> typing.Any: ...
+    def take_over_lease(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, owner: builtins.str, expected_lease_sequence: builtins.int, lease_duration_micros: builtins.int) -> typing.Any: ...
+    def prepare(self, expected_global_state_revision: builtins.int, expected_checkpoint_revision: builtins.int, attempt: typing.Any) -> typing.Any: ...
+    def complete(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, owner: builtins.str, epoch: builtins.int, expected_checkpoint_revision: builtins.int, completion: typing.Any) -> typing.Any: ...
+    def record_block(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, block: typing.Any) -> typing.Any: ...
+    def clear_block(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, expected_code: typing.Any) -> typing.Any: ...
+    def record_retention_gap(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, gap: typing.Any) -> typing.Any: ...
+    def accept_retention_gap(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, next_offset: builtins.int, supervisor_assertion: typing.Any) -> typing.Any: ...
+    def supersede_generation(self, expected_global_state_revision: builtins.int, expected_definition_revision: builtins.int, replacement: typing.Any, supervisor_assertion: typing.Any) -> typing.Any: ...
+    def record_repair(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, repair: typing.Any, supervisor_assertion: typing.Any) -> typing.Any: ...
+    def get(self, destination_id: builtins.str, *, consistency: builtins.str) -> typing.Any:
         r"""
         Read one destination declaration and checkpoint status.
         """
-    def list(self, *, filter: typing.Optional[typing.Any] = None, after: typing.Optional[builtins.str] = None, limit: builtins.int = 100, consistency: builtins.str = 'potentially_stale') -> typing.Any:
+    def list(self, *, consistency: builtins.str, filter: typing.Optional[typing.Any] = None, after: typing.Optional[builtins.str] = None, limit: builtins.int = 100) -> typing.Any:
         r"""
         List destination declarations and checkpoint status using a bounded page.
         """
@@ -1090,7 +1104,7 @@ class Destinations:
         r"""
         Remove one query route generation with definition-revision compare-and-set.
         """
-    def query_routes(self, *, name_contains: typing.Optional[builtins.str] = None, after: typing.Optional[builtins.str] = None, limit: builtins.int = 100, consistency: builtins.str = 'potentially_stale') -> typing.Any:
+    def query_routes(self, *, consistency: builtins.str, name_contains: typing.Optional[builtins.str] = None, after: typing.Optional[builtins.str] = None, limit: builtins.int = 100) -> typing.Any:
         r"""
         List explicit query routes using a bounded page.
         """
@@ -3282,7 +3296,7 @@ class Topic:
         r"""
         Start a batch publish that flushes 1..N records in a single Iggy send.
         """
-    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.int = 0, retries: typing.Optional[builtins.int] = 3, retry_interval_ms: builtins.int = 1000, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, replication_factor: typing.Optional[builtins.int] = None, message_expiry: builtins.str = 'server_default', max_topic_size: builtins.int = 0) -> Producer:
+    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.int = 0, retries: typing.Optional[builtins.int] = 3, retry_interval_ms: builtins.int = 1000, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, message_expiry: builtins.str = 'server_default', max_topic_size: builtins.int = 0) -> Producer:
         r"""
         Build a Laser direct producer. This is the full streaming hot path
         below the typed publish API: tune batching/linger/retries,

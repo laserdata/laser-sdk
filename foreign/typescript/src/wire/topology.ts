@@ -5,6 +5,7 @@ export const DEFAULT_KV_MUTATIONS_TOPIC = "kv.mutations"
 export const DEFAULT_FORK_MUTATIONS_TOPIC = "fork.mutations"
 export const DEFAULT_RUN_MUTATIONS_TOPIC = "run.mutations"
 export const DEFAULT_GRAPH_MUTATIONS_TOPIC = "graph.mutations"
+export const DEFAULT_CHECKPOINT_MUTATIONS_TOPIC = "checkpoint.mutations"
 
 export interface WireTopology {
   readonly opsStream: string
@@ -15,6 +16,7 @@ export interface WireTopology {
   readonly forkMutationsTopic: string
   readonly runMutationsTopic: string
   readonly graphMutationsTopic: string
+  readonly checkpointMutationsTopic: string
 }
 
 export function defaultWireTopology(): WireTopology {
@@ -26,7 +28,8 @@ export function defaultWireTopology(): WireTopology {
     kvMutationsTopic: DEFAULT_KV_MUTATIONS_TOPIC,
     forkMutationsTopic: DEFAULT_FORK_MUTATIONS_TOPIC,
     runMutationsTopic: DEFAULT_RUN_MUTATIONS_TOPIC,
-    graphMutationsTopic: DEFAULT_GRAPH_MUTATIONS_TOPIC
+    graphMutationsTopic: DEFAULT_GRAPH_MUTATIONS_TOPIC,
+    checkpointMutationsTopic: DEFAULT_CHECKPOINT_MUTATIONS_TOPIC
   }
 }
 
@@ -42,7 +45,8 @@ export function wireTopologyFromPartial(partial: PartialWireTopology): WireTopol
     kvMutationsTopic: partial.kvMutationsTopic ?? defaults.kvMutationsTopic,
     forkMutationsTopic: partial.forkMutationsTopic ?? defaults.forkMutationsTopic,
     runMutationsTopic: partial.runMutationsTopic ?? defaults.runMutationsTopic,
-    graphMutationsTopic: partial.graphMutationsTopic ?? defaults.graphMutationsTopic
+    graphMutationsTopic: partial.graphMutationsTopic ?? defaults.graphMutationsTopic,
+    checkpointMutationsTopic: partial.checkpointMutationsTopic ?? defaults.checkpointMutationsTopic
   }
 }
 
@@ -56,6 +60,7 @@ export function encodeWireTopology(topology: WireTopology): Map<string, unknown>
   map.set("fork_mutations_topic", topology.forkMutationsTopic)
   map.set("run_mutations_topic", topology.runMutationsTopic)
   map.set("graph_mutations_topic", topology.graphMutationsTopic)
+  map.set("checkpoint_mutations_topic", topology.checkpointMutationsTopic)
   return map
 }
 
@@ -68,6 +73,7 @@ export function decodeWireTopology(map: CborMap, context: string): WireTopology 
     kvMutationsTopic: field.optionalString(map, "kv_mutations_topic", context),
     forkMutationsTopic: field.optionalString(map, "fork_mutations_topic", context),
     runMutationsTopic: field.optionalString(map, "run_mutations_topic", context),
-    graphMutationsTopic: field.optionalString(map, "graph_mutations_topic", context)
+    graphMutationsTopic: field.optionalString(map, "graph_mutations_topic", context),
+    checkpointMutationsTopic: field.optionalString(map, "checkpoint_mutations_topic", context)
   })
 }

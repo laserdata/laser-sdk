@@ -46,13 +46,16 @@ import {
 import {
   decodeDestinationBlock,
   decodeDestinationCheckpointStatus,
+  decodeCheckpointMutationResult,
   decodePreparedAttemptSummary,
   decodeRetentionGap,
   encodeDestinationBlock,
+  encodeCheckpointMutationResult,
   encodeDestinationCheckpointStatus,
   encodePreparedAttemptSummary,
   encodeRetentionGap,
   type CheckpointReadConsistency,
+  type CheckpointMutationResult,
   type DestinationBlock,
   type DestinationCheckpointStatus,
   type PreparedAttemptSummary,
@@ -221,6 +224,8 @@ export interface QueryRoutePageView {
   readonly routes: readonly QueryRoute[]
   readonly nextCursor?: string
   readonly definitionRevision: bigint
+  readonly globalStateRevision: bigint
+  readonly consistency: CheckpointReadConsistency
 }
 
 export interface TableView {
@@ -297,6 +302,7 @@ export interface AcceptedOperationView {
   readonly submittedAtMicros: bigint
   readonly completedAtMicros?: bigint
   readonly error?: OperationErrorView
+  readonly result?: CheckpointMutationResult
 }
 
 export interface QueryExecutionView {
@@ -308,8 +314,113 @@ export interface DestinationIssueView {
   readonly retentionGap?: RetentionGap
   readonly preparedAttempt?: PreparedAttemptSummary
   readonly block?: DestinationBlock
+  readonly globalStateRevision: bigint
   readonly checkpointRevision: bigint
   readonly consistency: CheckpointReadConsistency
+}
+
+export type DestinationHttpOperation =
+  | "list_destinations"
+  | "get_destination"
+  | "create_destination"
+  | "enable_destination"
+  | "disable_destination"
+  | "get_operation"
+  | "get_status"
+  | "get_checkpoint"
+  | "get_retention_gap"
+  | "get_prepared_attempt"
+  | "list_query_routes"
+  | "get_table"
+  | "get_table_schema"
+  | "get_current_snapshot"
+  | "list_snapshots"
+  | "get_snapshot"
+  | "list_files"
+  | "get_metrics"
+
+export interface DestinationHttpRequest {
+  readonly v: number
+  readonly operation: DestinationHttpOperation
+  readonly parameters: readonly string[]
+  readonly query: Uint8Array
+  readonly body: Uint8Array
+}
+
+export interface DestinationHttpReply {
+  readonly status: number
+  readonly body: Uint8Array
+}
+
+const DESTINATION_HTTP_OPERATIONS: ReadonlySet<string> = new Set<DestinationHttpOperation>([
+  "list_destinations",
+  "get_destination",
+  "create_destination",
+  "enable_destination",
+  "disable_destination",
+  "get_operation",
+  "get_status",
+  "get_checkpoint",
+  "get_retention_gap",
+  "get_prepared_attempt",
+  "list_query_routes",
+  "get_table",
+  "get_table_schema",
+  "get_current_snapshot",
+  "list_snapshots",
+  "get_snapshot",
+  "list_files",
+  "get_metrics"
+])
+
+export function encodeDestinationHttpRequest(value: DestinationHttpRequest): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["v", value.v],
+    ["operation", value.operation],
+    ["parameters", [...value.parameters]],
+    ["query", value.query.slice()],
+    ["body", value.body.slice()]
+  ])
+}
+
+export function decodeDestinationHttpRequest(
+  map: CborMap,
+  context = "DestinationHttpRequest"
+): DestinationHttpRequest {
+  const operation = field.requiredString(map, "operation", context)
+  if (!DESTINATION_HTTP_OPERATIONS.has(operation)) {
+    throw new CodecError(`${context}.operation is unknown`, context, "operation")
+  }
+  return {
+    v: field.requiredU32(map, "v", context),
+    operation: operation as DestinationHttpOperation,
+    parameters: field.requiredArray(map, "parameters", context, (item, index) =>
+      expectString(item, `${context}.parameters[${String(index)}]`)
+    ),
+    query: field.requiredBytes(map, "query", context).slice(),
+    body: field.requiredBytes(map, "body", context).slice()
+  }
+}
+
+export function encodeDestinationHttpReply(value: DestinationHttpReply): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["status", value.status],
+    ["body", value.body.slice()]
+  ])
+}
+
+export function decodeDestinationHttpReply(
+  map: CborMap,
+  context = "DestinationHttpReply"
+): DestinationHttpReply {
+  const status = field.requiredU32(map, "status", context)
+  if (status > 0xffff) {
+    throw new CodecError(`${context}.status exceeds u16`, context, "status")
+  }
+  return {
+    status,
+    body: field.requiredBytes(map, "body", context).slice()
+  }
 }
 
 const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
@@ -679,7 +790,9 @@ export function decodeQueryRoutePageJson(text: string): QueryRoutePageView {
       )
     ),
     ...(nextCursor === undefined ? {} : { nextCursor }),
-    definitionRevision: field.requiredU64(map, "definition_revision", context)
+    definitionRevision: field.requiredU64(map, "definition_revision", context),
+    globalStateRevision: field.requiredU64(map, "global_state_revision", context),
+    consistency: enumWord(map, "consistency", context, ["linearizable", "potentially_stale"])
   }
 }
 
@@ -687,6 +800,8 @@ export function encodeQueryRoutePageJson(value: QueryRoutePageView): string {
   const map = new Map<string, unknown>([["routes", value.routes.map(encodeQueryRoute)]])
   if (value.nextCursor !== undefined) map.set("next_cursor", value.nextCursor)
   map.set("definition_revision", value.definitionRevision)
+  map.set("global_state_revision", value.globalStateRevision)
+  map.set("consistency", value.consistency)
   return encodeJson(map, "QueryRoutePageView")
 }
 
@@ -906,6 +1021,7 @@ export function decodeAcceptedOperationJson(text: string): AcceptedOperationView
   const map = expectMap(parseJson(text, context), context)
   const completedAtMicros = field.optionalU64(map, "completed_at_micros", context)
   const error = field.optionalMap(map, "error", context)
+  const result = field.optionalMap(map, "result", context)
   return {
     operationId: DestinationOperationId.fromBytes(
       field.requiredBytes(map, "operation_id", context)
@@ -927,7 +1043,10 @@ export function decodeAcceptedOperationJson(text: string): AcceptedOperationView
             code: parseResultCode(field.requiredString(error, "code", context), `${context}.error`),
             message: field.requiredString(error, "message", context)
           }
-        })
+        }),
+    ...(result === undefined
+      ? {}
+      : { result: decodeCheckpointMutationResult(result, `${context}.result`) })
   }
 }
 
@@ -949,6 +1068,7 @@ export function encodeAcceptedOperationJson(value: AcceptedOperationView): strin
       ])
     )
   }
+  if (value.result !== undefined) map.set("result", encodeCheckpointMutationResult(value.result))
   return encodeJson(map, "AcceptedOperationView")
 }
 
@@ -990,6 +1110,7 @@ export function decodeDestinationIssueJson(text: string): DestinationIssueView {
           )
         }),
     ...(block === undefined ? {} : { block: decodeDestinationBlock(block, `${context}.block`) }),
+    globalStateRevision: field.requiredU64(map, "global_state_revision", context),
     checkpointRevision: field.requiredU64(map, "checkpoint_revision", context),
     consistency: enumWord(map, "consistency", context, ["linearizable", "potentially_stale"])
   }
@@ -1004,6 +1125,7 @@ export function encodeDestinationIssueJson(value: DestinationIssueView): string 
     map.set("prepared_attempt", encodePreparedAttemptSummary(value.preparedAttempt))
   }
   if (value.block !== undefined) map.set("block", encodeDestinationBlock(value.block))
+  map.set("global_state_revision", value.globalStateRevision)
   map.set("checkpoint_revision", value.checkpointRevision)
   map.set("consistency", value.consistency)
   return encodeJson(map, "DestinationIssueView")

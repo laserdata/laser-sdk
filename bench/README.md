@@ -24,9 +24,9 @@ The maintained artifact versions are:
 
 | Binary | Version |
 | --- | --- |
-| Iggy server | `0.8.108-ld` |
-| `iggy-bench` | `0.6.0-edge.2` |
-| plane | `0.15.0` |
+| Iggy server | `0.8.109-ld` |
+| `iggy-bench` | `0.6.0-edge.4` |
+| plane | `0.16.0` |
 
 ## Default Campaign
 
@@ -121,9 +121,9 @@ Artifact mode downloads binaries and adjacent Minisign signatures from `https://
 [provisioning]
 mode = "artifact"
 cpu_target = "skylake"
-iggy_server_version = "0.8.108-ld"
-iggy_bench_version = "0.6.0-edge.2"
-plane_version = "0.15.0"
+iggy_server_version = "0.8.109-ld"
+iggy_bench_version = "0.6.0-edge.4"
+plane_version = "0.16.0"
 ```
 
 Path mode runs caller-provided native binaries and records their digests:

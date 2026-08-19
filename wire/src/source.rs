@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 pub const MAX_SOURCE_PARTITIONS: usize = 65_536;
 
 wire_id!(
-    /// Durable identity of one physical Iggy cluster across replica replacement and restore.
+    /// Deployment-provisioned identity of one physical Iggy cluster.
     PhysicalClusterIncarnation
 );
 
@@ -80,17 +80,11 @@ impl Validate for SourcePartitionCut {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceCut {
-    pub metadata_revision: u64,
     pub partitions: Vec<SourcePartitionCut>,
 }
 
 impl Validate for SourceCut {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.metadata_revision == 0 {
-            return Err(InvalidError::new(
-                "source metadata revision must be nonzero",
-            ));
-        }
         if self.partitions.is_empty() || self.partitions.len() > MAX_SOURCE_PARTITIONS {
             return Err(InvalidError::new(format!(
                 "source cut must contain 1..={MAX_SOURCE_PARTITIONS} partitions"
@@ -173,7 +167,6 @@ mod tests {
     fn given_duplicate_partitions_or_inverted_heads_when_a_source_cut_is_validated_then_should_reject()
      {
         let duplicate = SourceCut {
-            metadata_revision: 9,
             partitions: vec![
                 SourcePartitionCut {
                     incarnation: incarnation(1, 7),

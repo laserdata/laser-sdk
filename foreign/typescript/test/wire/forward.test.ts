@@ -24,8 +24,18 @@ void test("given_the_forwarded_query_fixture_when_decoded_then_should_preserve_i
     "forwarded_query"
   )
   assert.deepEqual(
-    { userId: query.userId, clientId: query.clientId, correlation: query.correlation },
-    { userId: 7, clientId: 42n, correlation: "conv-1" }
+    {
+      userId: query.userId,
+      clientId: query.clientId,
+      correlation: query.correlation,
+      grants: query.grants
+    },
+    {
+      userId: 7,
+      clientId: 42n,
+      correlation: "conv-1",
+      grants: []
+    }
   )
   assert.deepEqual(Buffer.from(query.queryEnvelope), Buffer.from([1, 2, 3, 4]))
   assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedQuery(query))), Buffer.from(bytes))
@@ -39,6 +49,7 @@ void test("given_the_forwarded_command_fixture_when_decoded_then_should_preserve
   )
   assert.equal(command.correlation, undefined)
   assert.equal(command.readAll, true)
+  assert.deepEqual(command.grants, [])
   assert.deepEqual(Buffer.from(command.payload), Buffer.from([9, 9, 9]))
   assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
 })

@@ -202,7 +202,6 @@ pub struct ProducerBuilder {
     create_stream: bool,
     create_topic: bool,
     partitions: u32,
-    replication_factor: Option<u8>,
     expiry: IggyExpiry,
     max_topic_size: MaxTopicSize,
     background: Option<BackgroundConfig>,
@@ -220,7 +219,6 @@ impl ProducerBuilder {
             create_stream: true,
             create_topic: true,
             partitions: 1,
-            replication_factor: None,
             expiry: IggyExpiry::ServerDefault,
             max_topic_size: MaxTopicSize::ServerDefault,
             background: None,
@@ -267,12 +265,6 @@ impl ProducerBuilder {
     #[must_use]
     pub fn partitions(mut self, partitions: u32) -> Self {
         self.partitions = partitions;
-        self
-    }
-
-    #[must_use]
-    pub fn replication_factor(mut self, replication_factor: Option<u8>) -> Self {
-        self.replication_factor = replication_factor;
         self
     }
 
@@ -342,12 +334,7 @@ impl ProducerBuilder {
             builder.do_not_create_stream_if_not_exists()
         };
         builder = if self.create_topic {
-            builder.create_topic_if_not_exists(
-                self.partitions,
-                self.replication_factor,
-                self.expiry,
-                self.max_topic_size,
-            )
+            builder.create_topic_if_not_exists(self.partitions, self.expiry, self.max_topic_size)
         } else {
             builder.do_not_create_topic_if_not_exists()
         };

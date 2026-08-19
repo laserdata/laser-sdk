@@ -50,7 +50,7 @@ pub const AGDX_GET_CLIENTS_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 3;
 /// decoded client-side as the typed unsupported, so no capability bit is
 /// needed.
 pub const AGDX_BATCH_CODE: u32 = AGDX_COMMAND_BASE + 20;
-/// Fork-native command code: submit one public checkpoint mutation to Iggy metadata.
+/// Managed command code: submit one public checkpoint mutation to Plane.
 pub const AGDX_CHECKPOINT_CODE: u32 = AGDX_COMMAND_BASE + 21;
 /// Fork-native command code: read one destination and its checkpoint status.
 pub const AGDX_DESTINATION_GET_CODE: u32 = AGDX_COMMAND_BASE + 22;
@@ -58,10 +58,11 @@ pub const AGDX_DESTINATION_GET_CODE: u32 = AGDX_COMMAND_BASE + 22;
 pub const AGDX_DESTINATION_LIST_CODE: u32 = AGDX_COMMAND_BASE + 23;
 /// Fork-native command code: list explicit query-route declarations.
 pub const AGDX_QUERY_ROUTE_LIST_CODE: u32 = AGDX_COMMAND_BASE + 24;
+/// Internal carriage for the closed destination HTTP operation set.
+pub const AGDX_DESTINATION_HTTP_CODE: u32 = AGDX_COMMAND_BASE + 25;
 
 // Authorization and system-management band (1_000_100..=1_000_199). Handled by
-// the streaming server itself, not forwarded to the plane, the same class as
-// `AGDX_SET_CLIENT_METADATA`. Reads +0..+3, writes +4..+6.
+// the streaming server itself. Reads +0..+3, writes +4..+6, history +7.
 /// Base of the authorization and system-management band (first management band).
 pub const AGDX_AUTHZ_BASE: u32 = AGDX_COMMAND_BASE + 100;
 /// Managed command code: read the caller's own effective capabilities (self-read).
@@ -80,6 +81,11 @@ pub const AGDX_AUTHZ_DELETE_ROLE_CODE: u32 = AGDX_AUTHZ_BASE + 5;
 pub const AGDX_AUTHZ_BIND_ROLES_CODE: u32 = AGDX_AUTHZ_BASE + 6;
 /// Managed command code: read the authorization change history (audit).
 pub const AGDX_AUTHZ_HISTORY_CODE: u32 = AGDX_AUTHZ_BASE + 7;
+/// Managed command code: publish one [`crate::control::ControlCommand`] through
+/// Plane. The reply is a [`crate::result::CommandError`] whose `Ok` code means
+/// Plane accepted the control-log append. Applying the command remains
+/// asynchronous.
+pub const AGDX_CONTROL_PUBLISH_CODE: u32 = AGDX_AUTHZ_BASE + 8;
 
 // Query family block (1_000_200..=1_000_299). Direct query ops reserve the
 // +0x decade, projection browse the +1x decade, schema browse the +2x decade.
@@ -262,6 +268,8 @@ pub const CHANGE_OP_VERSION: u32 = 1;
 pub const CLIENT_METADATA_OP_VERSION: u32 = 1;
 /// Wire version of public checkpoint mutation requests and status replies.
 pub const CHECKPOINT_OP_VERSION: u32 = 1;
+/// Iggy-to-Plane destination HTTP carriage version.
+pub const DESTINATION_HTTP_OP_VERSION: u32 = 1;
 /// Wire version of the agent presence body ([`crate::agent::AgentPresence`]) an
 /// agent advertises in its connection metadata. Carried in the body's own `v`
 /// field, not out-of-band, because presence rides the opaque connection-metadata
@@ -272,8 +280,10 @@ pub const PRESENCE_OP_VERSION: u32 = 1;
 /// log record must select its decoder before any body byte is read.
 pub const AGENT_OP_VERSION: u32 = 1;
 
-/// Whether a managed command can change plane-owned state and therefore must
-/// carry a stable operation identity across transport retries.
+/// Whether a Plane-served managed command changes state and therefore must
+/// carry a stable operation identity across transport retries. Iggy's custom
+/// authorization mutations use their established request `mutation_id`
+/// instead of this Plane envelope.
 pub const fn is_idempotent_managed_request(code: u32) -> bool {
     matches!(
         code,

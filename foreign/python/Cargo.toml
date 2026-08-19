@@ -6,7 +6,7 @@ name = "laser-sdk-python"
 # The Python package version tracks the Rust workspace release train (one
 # version across laser-wire, laser-sdk, and the Python SDK), and the dependency
 # pin below binds the exact Rust laser-sdk it wraps.
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
@@ -34,11 +34,11 @@ extension-module = ["pyo3/extension-module"]
 async-trait = "0.1.92"
 bytes = "1.12.1"
 futures = "0.3.34"
-iggy = { version = "=0.11.0-edge.2" }
+iggy = { version = "=0.11.0-edge.4" }
 # Path wins for the in-monorepo wheel build. The version lets a source build (an
 # sdist on a platform with no prebuilt wheel) fetch laser-sdk from crates.io once
 # it is published. Wheels carry it compiled in and pull nothing at install.
-laser-sdk = { path = "../../sdk", version = "=0.2.1", features = ["a2a-bridge", "agent", "agui", "managed", "mcp-bridge", "provenance", "schema-codecs", "sign", "streaming"] }
+laser-sdk = { path = "../../sdk", version = "=0.3.0", features = ["a2a-bridge", "agent", "agui", "managed", "mcp-bridge", "provenance", "schema-codecs", "sign", "streaming"] }
 log = "0.4"
 pyo3 = { version = "0.29.2", features = ["abi3-py310", "experimental-async", "multiple-pymethods"] }
 pyo3-async-runtimes = { version = "0.29.0", features = ["attributes", "tokio-runtime"] }

@@ -308,7 +308,6 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
         AGDX_DESTINATION_GET_CODE | AGDX_DESTINATION_LIST_CODE | AGDX_QUERY_ROUTE_LIST_CODE => {
             (Feature::Destination, Action::Read)
         }
-        AGDX_CHECKPOINT_CODE => (Feature::Checkpoint, Action::Write),
         AGDX_GET_PROJECTION_CODE
         | AGDX_LIST_PROJECTIONS_CODE
         | AGDX_GET_SCHEMA_CODE
@@ -746,10 +745,17 @@ mod tests {
             feature_action(AGDX_GRAPH_UPSERT_CODE),
             Some((Feature::Graph, Action::Write))
         );
+        assert_eq!(
+            feature_action(AGDX_DESTINATION_GET_CODE),
+            Some((Feature::Destination, Action::Read))
+        );
+        assert_eq!(feature_action(AGDX_CHECKPOINT_CODE), None);
+        assert_eq!(feature_action(AGDX_DESTINATION_HTTP_CODE), None);
         // No capability semantics: hello, batch, and the authz band self-gate.
         assert_eq!(feature_action(AGDX_HELLO_CODE), None);
         assert_eq!(feature_action(AGDX_BATCH_CODE), None);
         assert_eq!(feature_action(AGDX_AUTHZ_WHOAMI_CODE), None);
+        assert_eq!(feature_action(AGDX_CONTROL_PUBLISH_CODE), None);
     }
 
     #[test]
@@ -763,6 +769,8 @@ mod tests {
                 assert!(seen.insert(index), "index {index} collided");
             }
         }
+        assert_eq!(action_index(Feature::Destination, Action::Read), 40);
+        assert_eq!(action_index(Feature::Checkpoint, Action::Admin), 48);
     }
 
     #[test]

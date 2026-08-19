@@ -16,9 +16,11 @@ import {
   type DestinationEffectiveState,
   type PartitionLifecycleState,
   type RepairAction,
+  decodeCheckpointReply,
   decodeCheckpointRequestFrame,
   decodeDestinationCheckpointStatus,
   decodePublicCheckpointMutation,
+  encodeCheckpointReplyFrame,
   encodeCheckpointRequest,
   encodeCheckpointRequestFrame,
   encodeDestinationCheckpointStatus,
@@ -433,6 +435,36 @@ void test("public checkpoint requests cannot be confused with replicated mutatio
 
   const replicatedBytes = await fixture("checkpoint_mutation_replicated.bin")
   assert.throws(() => decodeCheckpointRequestFrame(replicatedBytes))
+})
+
+void test("checkpoint mutation result variants match the Rust fixtures", async () => {
+  for (const name of [
+    "checkpoint_reply_destination.bin",
+    "checkpoint_reply_query_route.bin"
+  ] as const) {
+    const bytes = await fixture(name)
+    const reply = decodeCheckpointReply(bytes)
+    assert.equal(reply.kind, "ok")
+    assertSame(encodeCheckpointReplyFrame(reply), bytes)
+  }
+})
+
+void test("checkpoint error replies round trip every Rust enum shape", () => {
+  const errors = [
+    { kind: "invalid" as const, message: "invalid" },
+    { kind: "unavailable" as const, message: "unavailable" },
+    { kind: "not_found" as const },
+    { kind: "lease_lost" as const },
+    { kind: "unauthorized" as const },
+    { kind: "conflict" as const, observedRevision: 9n },
+    { kind: "version" as const, expected: 1, got: 2 }
+  ]
+  for (const error of errors) {
+    assert.deepEqual(decodeCheckpointReply(encodeCheckpointReplyFrame({ kind: "err", error })), {
+      kind: "err",
+      error
+    })
+  }
 })
 
 void test("checkpoint request validation rejects invalid mutations and assertion placement", async () => {

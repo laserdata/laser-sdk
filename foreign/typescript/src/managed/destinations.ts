@@ -7,11 +7,18 @@ import {
   type CheckpointMutationResult,
   type CheckpointReadConsistency,
   type CheckpointRequestEnvelope,
+  type CompletedAttempt,
+  type DestinationBlock,
+  type DestinationBlockCode,
   type DestinationCheckpointPage,
   type DestinationCheckpointView,
   type DestinationListFilter,
+  type PreparedAttempt,
   type PublicCheckpointMutation,
-  type QueryRoutePage
+  type QueryRoutePage,
+  type RepairRecord,
+  type RetentionGap,
+  type SupervisorActorAssertion
 } from "../wire/checkpoint.js"
 import {
   CheckpointCommand,
@@ -24,7 +31,12 @@ import type {
   MaterializationDestination,
   QueryRoute
 } from "../wire/destination.js"
-import { CheckpointRequestId, type DestinationId, type QueryRouteId } from "../wire/ids.js"
+import {
+  type CheckpointOwnerId,
+  CheckpointRequestId,
+  type DestinationId,
+  type QueryRouteId
+} from "../wire/ids.js"
 
 export class Destinations {
   constructor(
@@ -34,13 +46,16 @@ export class Destinations {
 
   async mutate(
     expectedGlobalStateRevision: bigint,
-    mutation: PublicCheckpointMutation
+    mutation: PublicCheckpointMutation,
+    supervisorAssertion?: SupervisorActorAssertion
   ): Promise<CheckpointMutationResult> {
     const request: CheckpointRequestEnvelope = {
       v: CHECKPOINT_OP_VERSION,
-      requestId: CheckpointRequestId.fromU128(mintUlidValue()),
+      requestId:
+        supervisorAssertion?.claims.requestId ?? CheckpointRequestId.fromU128(mintUlidValue()),
       expectedGlobalStateRevision,
-      mutation
+      mutation,
+      ...(supervisorAssertion === undefined ? {} : { supervisorAssertion })
     }
     const reply = await executeManaged(
       this.transport,
@@ -75,6 +90,245 @@ export class Destinations {
     })
   }
 
+  bindTable(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedDefinitionRevision: bigint,
+    tableUuid: Uint8Array
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "bind_table",
+      destinationId,
+      destinationGeneration,
+      expectedDefinitionRevision,
+      tableUuid
+    })
+  }
+
+  addPartition(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    partitionId: number
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "add_partition",
+      destinationId,
+      destinationGeneration,
+      expectedCheckpointRevision,
+      partitionId
+    })
+  }
+
+  observePartitionLifecycle(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    partitionId: number
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "observe_partition_lifecycle",
+      destinationId,
+      destinationGeneration,
+      expectedCheckpointRevision,
+      partitionId
+    })
+  }
+
+  acquireLease(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    owner: CheckpointOwnerId,
+    expectedLeaseSequence: bigint,
+    leaseDurationMicros: bigint
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "acquire_lease",
+      destinationId,
+      destinationGeneration,
+      owner,
+      expectedLeaseSequence,
+      leaseDurationMicros
+    })
+  }
+
+  renewLease(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    owner: CheckpointOwnerId,
+    epoch: bigint,
+    expectedLeaseSequence: bigint,
+    leaseDurationMicros: bigint
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "renew_lease",
+      destinationId,
+      destinationGeneration,
+      owner,
+      epoch,
+      expectedLeaseSequence,
+      leaseDurationMicros
+    })
+  }
+
+  takeOverLease(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    owner: CheckpointOwnerId,
+    expectedLeaseSequence: bigint,
+    leaseDurationMicros: bigint
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "takeover_lease",
+      destinationId,
+      destinationGeneration,
+      owner,
+      expectedLeaseSequence,
+      leaseDurationMicros
+    })
+  }
+
+  prepare(
+    expectedGlobalStateRevision: bigint,
+    expectedCheckpointRevision: bigint,
+    attempt: PreparedAttempt
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "prepare",
+      expectedCheckpointRevision,
+      attempt
+    })
+  }
+
+  complete(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    owner: CheckpointOwnerId,
+    epoch: bigint,
+    expectedCheckpointRevision: bigint,
+    completion: CompletedAttempt
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "complete",
+      destinationId,
+      destinationGeneration,
+      owner,
+      epoch,
+      expectedCheckpointRevision,
+      completion
+    })
+  }
+
+  recordBlock(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    block: DestinationBlock
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "record_block",
+      destinationId,
+      destinationGeneration,
+      expectedCheckpointRevision,
+      block
+    })
+  }
+
+  clearBlock(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    expectedCode: DestinationBlockCode
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "clear_block",
+      destinationId,
+      destinationGeneration,
+      expectedCheckpointRevision,
+      expectedCode
+    })
+  }
+
+  recordRetentionGap(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    gap: RetentionGap
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, {
+      kind: "record_retention_gap",
+      destinationId,
+      destinationGeneration,
+      expectedCheckpointRevision,
+      gap
+    })
+  }
+
+  acceptRetentionGap(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    nextOffset: bigint,
+    supervisorAssertion: SupervisorActorAssertion
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(
+      expectedGlobalStateRevision,
+      {
+        kind: "accept_retention_gap",
+        destinationId,
+        destinationGeneration,
+        expectedCheckpointRevision,
+        nextOffset
+      },
+      supervisorAssertion
+    )
+  }
+
+  supersedeGeneration(
+    expectedGlobalStateRevision: bigint,
+    expectedDefinitionRevision: bigint,
+    replacement: MaterializationDestination,
+    supervisorAssertion: SupervisorActorAssertion
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(
+      expectedGlobalStateRevision,
+      { kind: "supersede_generation", expectedDefinitionRevision, replacement },
+      supervisorAssertion
+    )
+  }
+
+  recordRepair(
+    expectedGlobalStateRevision: bigint,
+    destinationId: DestinationId,
+    destinationGeneration: bigint,
+    expectedCheckpointRevision: bigint,
+    repair: RepairRecord,
+    supervisorAssertion: SupervisorActorAssertion
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(
+      expectedGlobalStateRevision,
+      {
+        kind: "record_repair",
+        destinationId,
+        destinationGeneration,
+        expectedCheckpointRevision,
+        repair
+      },
+      supervisorAssertion
+    )
+  }
+
   registerQueryRoute(
     expectedGlobalStateRevision: bigint,
     route: QueryRoute
@@ -98,7 +352,7 @@ export class Destinations {
 
   async get(
     destinationId: DestinationId,
-    consistency: CheckpointReadConsistency = "potentially_stale"
+    consistency: CheckpointReadConsistency
   ): Promise<DestinationCheckpointView | undefined> {
     const reply = await executeManaged(
       this.transport,
@@ -114,10 +368,10 @@ export class Destinations {
   }
 
   async list(
+    consistency: CheckpointReadConsistency,
     filter: DestinationListFilter = {},
     after?: DestinationId,
-    limit = 100,
-    consistency: CheckpointReadConsistency = "potentially_stale"
+    limit = 100
   ): Promise<DestinationCheckpointPage> {
     const reply = await executeManaged(
       this.transport,
@@ -139,10 +393,10 @@ export class Destinations {
   }
 
   async queryRoutes(
+    consistency: CheckpointReadConsistency,
     nameContains?: string,
     after?: QueryRouteId,
-    limit = 100,
-    consistency: CheckpointReadConsistency = "potentially_stale"
+    limit = 100
   ): Promise<QueryRoutePage> {
     const reply = await executeManaged(
       this.transport,

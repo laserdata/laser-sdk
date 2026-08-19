@@ -724,9 +724,9 @@ impl Laser {
     /// Send a managed command `code` with `payload` over the existing binary
     /// connection and return the raw reply bytes. The query path uses it for
     /// `AGDX_QUERY` on the server, and the connect-time probe uses it for
-    /// `AGDX_HELLO`. Managed authorization mutations use their dedicated
-    /// replicated operations under VSR. Every other AGDX code is explicitly
-    /// non-replicated.
+    /// `AGDX_HELLO`. Every managed command is non-replicated from Iggy's
+    /// perspective. Idempotent writes carry a stable operation identity so
+    /// Plane can append them to its standard Iggy mutation topics.
     #[cfg(any(
         feature = "fork",
         feature = "graph",
@@ -1780,17 +1780,14 @@ pub(crate) async fn ensure_topic_with(
     if client.get_topic(&stream_id, &topic_id).await?.is_some() {
         return Ok(());
     }
-    let result = client
-        .create_topic(
-            &stream_id,
-            topic,
-            partitions,
-            CompressionAlgorithm::default(),
-            None,
-            expiry,
-            MaxTopicSize::ServerDefault,
-        )
-        .await;
+    let options = TopicCreateOptions {
+        partitions_count: Some(partitions),
+        compression_algorithm: Some(CompressionAlgorithm::default()),
+        message_expiry: Some(expiry),
+        max_topic_size: Some(MaxTopicSize::ServerDefault),
+        ..TopicCreateOptions::default()
+    };
+    let result = client.create_topic(&stream_id, topic, &options).await;
     if let Err(error) = result
         && client.get_topic(&stream_id, &topic_id).await?.is_none()
     {

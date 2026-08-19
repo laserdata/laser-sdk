@@ -52,7 +52,7 @@ Every data-stack addition requires regenerated `laser_sdk.pyi`, stub coverage, P
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- The Python package version tracks the Rust workspace release train: one version across laser-wire, laser-sdk, and the Python SDK (`0.2.1`), with the dependency pin binding the exact Rust `laser-sdk` it wraps (`=0.2.1`).
+- The Python package version tracks the Rust workspace release train: one version across laser-wire, laser-sdk, and the Python SDK (`0.3.0`), with the dependency pin binding the exact Rust `laser-sdk` it wraps (`=0.3.0`).
 
 ## Working on it
 

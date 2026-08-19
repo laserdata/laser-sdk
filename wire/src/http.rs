@@ -1,5 +1,6 @@
 use crate::checkpoint::{
-    CheckpointRequestEnvelope, DestinationCheckpointStatus, PreparedAttemptSummary, RetentionGap,
+    CheckpointMutationResult, CheckpointReadConsistency, CheckpointRequestEnvelope,
+    DestinationCheckpointStatus, PreparedAttemptSummary, RetentionGap,
 };
 use crate::destination::{
     DestinationId, DestinationOperationId, MaterializationDestination, QueryRoute,
@@ -120,7 +121,18 @@ pub fn destination_operation_path(id: DestinationOperationId) -> String {
     format!("{DESTINATIONS_PATH}/operations/{id}")
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointReadQuery {
+    pub consistency: CheckpointReadConsistency,
+}
+
+impl CheckpointReadQuery {
+    pub const fn new(consistency: CheckpointReadConsistency) -> Self {
+        Self { consistency }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_stream: Option<String>,
@@ -132,6 +144,7 @@ pub struct DestinationListQuery {
     pub after: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    pub consistency: CheckpointReadConsistency,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +177,8 @@ pub struct AcceptedOperationView {
     pub completed_at_micros: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<OperationErrorView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<CheckpointMutationResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,7 +198,7 @@ pub enum OperationState {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryRouteListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
@@ -191,6 +206,7 @@ pub struct QueryRouteListQuery {
     pub after: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    pub consistency: CheckpointReadConsistency,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +215,8 @@ pub struct QueryRoutePageView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub definition_revision: u64,
+    pub global_state_revision: u64,
+    pub consistency: CheckpointReadConsistency,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,8 +328,55 @@ pub struct DestinationIssueView {
     pub prepared_attempt: Option<PreparedAttemptSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block: Option<crate::checkpoint::DestinationBlock>,
+    pub global_state_revision: u64,
     pub checkpoint_revision: u64,
-    pub consistency: crate::checkpoint::CheckpointReadConsistency,
+    pub consistency: CheckpointReadConsistency,
+}
+
+/// One member of the closed destination HTTP operation set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DestinationHttpOperation {
+    ListDestinations,
+    GetDestination,
+    CreateDestination,
+    EnableDestination,
+    DisableDestination,
+    GetOperation,
+    GetStatus,
+    GetCheckpoint,
+    GetRetentionGap,
+    GetPreparedAttempt,
+    ListQueryRoutes,
+    GetTable,
+    GetTableSchema,
+    GetCurrentSnapshot,
+    ListSnapshots,
+    GetSnapshot,
+    ListFiles,
+    GetMetrics,
+}
+
+/// One closed destination HTTP operation forwarded from Iggy to Plane.
+///
+/// The operation enum prevents arbitrary paths or methods from crossing the
+/// sidecar boundary. Path parameters stay textual, while query and body carry
+/// the JSON encodings of the operation's already-declared HTTP types.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationHttpRequest {
+    pub v: u32,
+    pub operation: DestinationHttpOperation,
+    pub parameters: Vec<String>,
+    pub query: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
+/// Plane's HTTP-shaped response for one [`DestinationHttpRequest`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationHttpReply {
+    pub status: u16,
+    pub body: Vec<u8>,
 }
 
 /// `GET`/`PUT`/`DELETE /agdx/authz/roles/{name}`.

@@ -9,6 +9,7 @@ export const AGDX_CHECKPOINT_CODE = AGDX_COMMAND_BASE + 21
 export const AGDX_DESTINATION_GET_CODE = AGDX_COMMAND_BASE + 22
 export const AGDX_DESTINATION_LIST_CODE = AGDX_COMMAND_BASE + 23
 export const AGDX_QUERY_ROUTE_LIST_CODE = AGDX_COMMAND_BASE + 24
+export const AGDX_DESTINATION_HTTP_CODE = AGDX_COMMAND_BASE + 25
 
 export const AGDX_AUTHZ_BASE = AGDX_COMMAND_BASE + 100
 export const AGDX_AUTHZ_WHOAMI_CODE = AGDX_AUTHZ_BASE
@@ -19,6 +20,7 @@ export const AGDX_AUTHZ_DEFINE_ROLE_CODE = AGDX_AUTHZ_BASE + 4
 export const AGDX_AUTHZ_DELETE_ROLE_CODE = AGDX_AUTHZ_BASE + 5
 export const AGDX_AUTHZ_BIND_ROLES_CODE = AGDX_AUTHZ_BASE + 6
 export const AGDX_AUTHZ_HISTORY_CODE = AGDX_AUTHZ_BASE + 7
+export const AGDX_CONTROL_PUBLISH_CODE = AGDX_AUTHZ_BASE + 8
 
 export const AGDX_QUERY_BASE = AGDX_COMMAND_BASE + 200
 export const AGDX_QUERY_CODE = AGDX_QUERY_BASE
@@ -72,6 +74,7 @@ export const AUTHZ_OP_VERSION = 1
 export const QUERY_OP_VERSION = 1
 export const CONTROL_OP_VERSION = 1
 export const CHECKPOINT_OP_VERSION = 1
+export const DESTINATION_HTTP_OP_VERSION = 1
 export const KV_OP_VERSION = 1
 // The fenced-lease op family (lease, renew, release, fenced CAS): bumped by
 // the holder-identity reshape so a v1 payload can never be mistaken for v2.

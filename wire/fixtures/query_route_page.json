@@ -14,5 +14,7 @@
     }
   ],
   "next_cursor": "route-2",
-  "definition_revision": 8
+  "definition_revision": 8,
+  "global_state_revision": 11,
+  "consistency": "linearizable"
 }

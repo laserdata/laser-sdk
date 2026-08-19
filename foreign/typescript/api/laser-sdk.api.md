@@ -1113,28 +1113,23 @@ export interface CheckedBody {
 export function checkIn(store: BlobStore, thresholdBytes: number, payload: Uint8Array): Promise<CheckedBody>;
 
 // @public (undocumented)
-export interface CheckpointMutationResult {
-    // (undocumented)
-    readonly checkpointRevision: bigint;
-    // (undocumented)
-    readonly definitionRevision: bigint;
-    // (undocumented)
-    readonly destinationGeneration: bigint;
-    // Warning: (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
-    //
-    // (undocumented)
-    readonly destinationId: DestinationId;
-    // (undocumented)
-    readonly globalStateRevision: bigint;
-    // Warning: (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
-    //
-    // (undocumented)
-    readonly lease?: CheckpointOwnerLease;
-    // Warning: (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
-    //
-    // (undocumented)
+export type CheckpointMutationResult = {
+    readonly kind: "destination";
     readonly requestId: CheckpointRequestId;
-}
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly globalStateRevision: bigint;
+    readonly definitionRevision: bigint;
+    readonly checkpointRevision: bigint;
+    readonly lease?: CheckpointOwnerLease;
+} | {
+    readonly kind: "query_route";
+    readonly requestId: CheckpointRequestId;
+    readonly routeId: QueryRouteId;
+    readonly routeGeneration: bigint;
+    readonly globalStateRevision: bigint;
+    readonly definitionRevision: bigint;
+};
 
 // @public (undocumented)
 export type CheckpointReadConsistency = "linearizable" | "potentially_stale";
@@ -1745,27 +1740,61 @@ export class Destinations {
     // Warning: (ae-forgotten-export) The symbol "ManagedTransport" needs to be exported by the entry point index.d.ts
     constructor(transport: ManagedTransport, capabilities: () => Promise<Capabilities>);
     // (undocumented)
-    get(destinationId: DestinationId, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointView | undefined>;
+    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // Warning: (ae-forgotten-export) The symbol "CheckpointOwnerId" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    acquireLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    addPartition(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    bindTable(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, tableUuid: Uint8Array): Promise<CheckpointMutationResult>;
+    // Warning: (ae-forgotten-export) The symbol "DestinationBlockCode" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    clearBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, expectedCode: DestinationBlockCode): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    complete(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, epoch: bigint, expectedCheckpointRevision: bigint, completion: CompletedAttempt): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    get(destinationId: DestinationId, consistency: CheckpointReadConsistency): Promise<DestinationCheckpointView | undefined>;
     // Warning: (ae-forgotten-export) The symbol "DestinationListFilter" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
-    list(filter?: DestinationListFilter, after?: DestinationId, limit?: number, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointPage>;
+    list(consistency: CheckpointReadConsistency, filter?: DestinationListFilter, after?: DestinationId, limit?: number): Promise<DestinationCheckpointPage>;
+    // Warning: (ae-forgotten-export) The symbol "SupervisorActorAssertion" needs to be exported by the entry point index.d.ts
+    //
     // (undocumented)
-    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation): Promise<CheckpointMutationResult>;
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion?: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    observePartitionLifecycle(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
+    // Warning: (ae-forgotten-export) The symbol "PreparedAttempt" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    prepare(expectedGlobalStateRevision: bigint, expectedCheckpointRevision: bigint, attempt: PreparedAttempt): Promise<CheckpointMutationResult>;
     // Warning: (ae-forgotten-export) The symbol "QueryRoutePage" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
-    queryRoutes(nameContains?: string, after?: QueryRouteId, limit?: number, consistency?: CheckpointReadConsistency): Promise<QueryRoutePage>;
+    queryRoutes(consistency: CheckpointReadConsistency, nameContains?: string, after?: QueryRouteId, limit?: number): Promise<QueryRoutePage>;
+    // (undocumented)
+    recordBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, block: DestinationBlock): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    recordRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, gap: RetentionGap): Promise<CheckpointMutationResult>;
     // (undocumented)
     register(expectedGlobalStateRevision: bigint, destination: MaterializationDestination): Promise<CheckpointMutationResult>;
     // (undocumented)
     registerQueryRoute(expectedGlobalStateRevision: bigint, route: QueryRoute): Promise<CheckpointMutationResult>;
-    // Warning: (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
-    //
     // (undocumented)
     removeQueryRoute(expectedGlobalStateRevision: bigint, routeId: QueryRouteId, routeGeneration: bigint, expectedDefinitionRevision: bigint): Promise<CheckpointMutationResult>;
     // (undocumented)
+    renewLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, epoch: bigint, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
+    // (undocumented)
     setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    takeOverLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
 }
 
 // @public (undocumented)
@@ -4921,7 +4950,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.2.1";
+export const SDK_VERSION = "0.3.0";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;
@@ -5611,9 +5640,10 @@ export class ZeroEmbedder implements Embedder {
 // src/agent/reliable-consumer.ts:158:7 - (ae-forgotten-export) The symbol "SignatureContext" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:63:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:63:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
-// src/wire/checkpoint.ts:285:7 - (ae-forgotten-export) The symbol "CheckpointOwnerId" needs to be exported by the entry point index.d.ts
-// src/wire/checkpoint.ts:301:7 - (ae-forgotten-export) The symbol "PreparedAttempt" needs to be exported by the entry point index.d.ts
-// src/wire/checkpoint.ts:324:7 - (ae-forgotten-export) The symbol "DestinationBlockCode" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:363:7 - (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:364:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:369:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
+// src/wire/checkpoint.ts:374:7 - (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
 // src/wire/query.ts:44:7 - (ae-forgotten-export) The symbol "SnapshotSelector" needs to be exported by the entry point index.d.ts
 // src/wire/query.ts:64:30 - (ae-forgotten-export) The symbol "Predicate" needs to be exported by the entry point index.d.ts
 // src/wire/schema.ts:124:33 - (ae-forgotten-export) The symbol "DecimalValue" needs to be exported by the entry point index.d.ts

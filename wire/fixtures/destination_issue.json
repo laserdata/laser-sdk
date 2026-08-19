@@ -10,6 +10,7 @@
     "required_next_offset": 10,
     "retained_start": 20
   },
+  "global_state_revision": 11,
   "checkpoint_revision": 4,
   "consistency": "linearizable"
 }

@@ -33,7 +33,7 @@ pub struct Capabilities {
     /// The managed query surface (`Laser::query`) and the read-consistency it
     /// serves.
     pub query: QueryCaps,
-    /// Materialization destination declarations and VSR checkpoint lifecycle.
+    /// Materialization destination declarations and managed checkpoint lifecycle.
     pub destinations: DestinationCaps,
     /// The managed key-value surface (`Laser::kv`) and its conditional-write
     /// support.
