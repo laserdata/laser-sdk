@@ -4,7 +4,7 @@ The native TypeScript client for [LaserData, Inc.](https://laserdata.com) SDK ov
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Current pre-1.0 release (`0.2.1`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> **Current pre-1.0 release (`0.3.0`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
 
 ## Install
 
@@ -138,8 +138,8 @@ Destination declarations and explicit query routes use `laser.destinations()`. R
 
 ```ts
 const destinations = laser.destinations()
-const page = await destinations.list({}, undefined, 50, "linearizable")
-const routes = await destinations.queryRoutes("orders", undefined, 50)
+const page = await destinations.list("linearizable", {}, undefined, 50)
+const routes = await destinations.queryRoutes("potentially_stale", "orders", undefined, 50)
 const current = await destinations.get(destinationId, "linearizable")
 ```
 

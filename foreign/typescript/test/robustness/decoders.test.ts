@@ -3,6 +3,7 @@ import path from "node:path"
 import { test } from "node:test"
 import { decodeArrowIpcMessageMetadata, decodeArrowIpcPolicy } from "../../src/wire/arrow.js"
 import {
+  decodeCheckpointReply,
   decodeCheckpointRequestFrame,
   decodeDestinationCheckpointStatus
 } from "../../src/wire/checkpoint.js"
@@ -63,6 +64,8 @@ void test("data stack decoders reject malformed fixture mutations without unstru
       mapDecoder("DestinationCheckpointStatus", decodeDestinationCheckpointStatus)
     ],
     ["checkpoint_request_public.bin", decodeCheckpointRequestFrame],
+    ["checkpoint_reply_destination.bin", decodeCheckpointReply],
+    ["checkpoint_reply_query_route.bin", decodeCheckpointReply],
     ["query_page.bin", decodeQueryPageEnvelopeFrame],
     ["query_cancel.bin", decodeQueryCancelEnvelopeFrame],
     ["query_status.bin", decodeQueryStatusEnvelopeFrame],

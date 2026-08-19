@@ -20,7 +20,6 @@ export interface SourcePartitionCut {
   readonly endExclusive: bigint
 }
 export interface SourceCut {
-  readonly metadataRevision: bigint
   readonly partitions: readonly SourcePartitionCut[]
 }
 
@@ -72,14 +71,10 @@ export function decodeSourcePartitionCut(map: CborMap, context: string): SourceP
   }
 }
 export function encodeSourceCut(value: SourceCut): Map<string, unknown> {
-  return new Map<string, unknown>([
-    ["metadata_revision", value.metadataRevision],
-    ["partitions", value.partitions.map(encodeSourcePartitionCut)]
-  ])
+  return new Map<string, unknown>([["partitions", value.partitions.map(encodeSourcePartitionCut)]])
 }
 export function decodeSourceCut(map: CborMap, context: string): SourceCut {
   return {
-    metadataRevision: field.requiredU64(map, "metadata_revision", context),
     partitions: field.requiredArray(map, "partitions", context, (item, index) =>
       decodeSourcePartitionCut(
         expectMap(item, `${context}.partitions[${String(index)}]`),
@@ -98,11 +93,7 @@ export function validateSourceScope(value: SourceScope): void {
   validateSourceName("topic", value.topic)
 }
 export function validateSourceCut(value: SourceCut): void {
-  if (
-    value.metadataRevision === 0n ||
-    value.partitions.length < 1 ||
-    value.partitions.length > MAX_SOURCE_PARTITIONS
-  )
+  if (value.partitions.length < 1 || value.partitions.length > MAX_SOURCE_PARTITIONS)
     throw new InvalidError("source cut revision or partition count is invalid")
   let previous = -1
   let namespace: string | undefined

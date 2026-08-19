@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 
 const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"))
 const allowed = new Set([
+  "0BSD",
   "Apache-2.0",
   "Apache-2.0 AND MIT",
   "BSD-2-Clause",

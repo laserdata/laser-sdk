@@ -3,5 +3,14 @@
   "request_id": "000000000000000000000000CG",
   "state": "succeeded",
   "submitted_at_micros": 1717171717000000,
-  "completed_at_micros": 1717171717001000
+  "completed_at_micros": 1717171717001000,
+  "result": {
+    "kind": "destination",
+    "request_id": "000000000000000000000000CG",
+    "destination_id": "0000000000000000000000009C",
+    "destination_generation": 2,
+    "global_state_revision": 11,
+    "definition_revision": 7,
+    "checkpoint_revision": 3
+  }
 }

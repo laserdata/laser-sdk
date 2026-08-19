@@ -100,6 +100,7 @@ void test("given_the_backend_announce_topology_fixture_when_decoded_then_should_
   assert.equal(announce.topology.forkMutationsTopic, "acme.fork.mutations")
   assert.equal(announce.topology.runMutationsTopic, "acme.run.mutations")
   assert.equal(announce.topology.graphMutationsTopic, "acme.graph.mutations")
+  assert.equal(announce.topology.checkpointMutationsTopic, "acme.checkpoint.mutations")
 
   const reencoded = encodeBackendAnnounce(announce)
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))

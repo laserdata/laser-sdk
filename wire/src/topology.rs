@@ -7,6 +7,7 @@ pub const DEFAULT_KV_MUTATIONS_TOPIC: &str = "kv.mutations";
 pub const DEFAULT_FORK_MUTATIONS_TOPIC: &str = "fork.mutations";
 pub const DEFAULT_RUN_MUTATIONS_TOPIC: &str = "run.mutations";
 pub const DEFAULT_GRAPH_MUTATIONS_TOPIC: &str = "graph.mutations";
+pub const DEFAULT_CHECKPOINT_MUTATIONS_TOPIC: &str = "checkpoint.mutations";
 
 fn default_ops_stream() -> String {
     OPS_STREAM.to_owned()
@@ -40,6 +41,10 @@ fn default_graph_mutations_topic() -> String {
     DEFAULT_GRAPH_MUTATIONS_TOPIC.to_owned()
 }
 
+fn default_checkpoint_mutations_topic() -> String {
+    DEFAULT_CHECKPOINT_MUTATIONS_TOPIC.to_owned()
+}
+
 /// The stream/topic names a deployment's plane and streaming server use,
 /// provisioned or discovered rather than hardcoded. `Default` returns today's
 /// constants from [`crate::topics`], so a deployment that never configures
@@ -70,6 +75,9 @@ pub struct WireTopology {
     /// Log-first graph mutation topic.
     #[serde(default = "default_graph_mutations_topic")]
     pub graph_mutations_topic: String,
+    /// Log-first checkpoint mutation topic.
+    #[serde(default = "default_checkpoint_mutations_topic")]
+    pub checkpoint_mutations_topic: String,
 }
 
 impl Default for WireTopology {
@@ -83,6 +91,7 @@ impl Default for WireTopology {
             fork_mutations_topic: default_fork_mutations_topic(),
             run_mutations_topic: default_run_mutations_topic(),
             graph_mutations_topic: default_graph_mutations_topic(),
+            checkpoint_mutations_topic: default_checkpoint_mutations_topic(),
         }
     }
 }
@@ -105,6 +114,10 @@ mod tests {
             topology.graph_mutations_topic,
             DEFAULT_GRAPH_MUTATIONS_TOPIC
         );
+        assert_eq!(
+            topology.checkpoint_mutations_topic,
+            DEFAULT_CHECKPOINT_MUTATIONS_TOPIC
+        );
     }
 
     #[test]
@@ -121,6 +134,10 @@ mod tests {
         assert_eq!(
             topology.graph_mutations_topic,
             DEFAULT_GRAPH_MUTATIONS_TOPIC
+        );
+        assert_eq!(
+            topology.checkpoint_mutations_topic,
+            DEFAULT_CHECKPOINT_MUTATIONS_TOPIC
         );
     }
 }

@@ -19,6 +19,7 @@ use crate::checkpoint::{
 };
 use crate::codes::*;
 use crate::fork::{ForkCreate, ForkDelete, ForkList, ForkPromote, ForkPut, ForkReply};
+use crate::http::{DestinationHttpReply, DestinationHttpRequest};
 use crate::kv::{KvDelete, KvDeleteMany, KvGet, KvNamespaces, KvReply, KvScan, KvSet};
 use crate::query::{
     QueryCancelEnvelope, QueryCancelReply, QueryEnvelope, QueryPageEnvelope, QueryReply,
@@ -82,6 +83,11 @@ command!(
     AGDX_QUERY_ROUTE_LIST_CODE,
     CheckpointReadReply
 );
+command!(
+    DestinationHttpRequest,
+    AGDX_DESTINATION_HTTP_CODE,
+    DestinationHttpReply
+);
 command!(GetProjection, AGDX_GET_PROJECTION_CODE, BrowseReply);
 command!(ListProjections, AGDX_LIST_PROJECTIONS_CODE, BrowseReply);
 command!(GetSchema, AGDX_GET_SCHEMA_CODE, BrowseReply);
@@ -125,6 +131,7 @@ mod tests {
         assert_eq!(<DestinationGetRequest as Command>::CODE, 1_000_022);
         assert_eq!(<DestinationListRequest as Command>::CODE, 1_000_023);
         assert_eq!(<QueryRouteListRequest as Command>::CODE, 1_000_024);
+        assert_eq!(<DestinationHttpRequest as Command>::CODE, 1_000_025);
         assert_eq!(<GetProjection as Command>::CODE, 1_000_210);
         assert_eq!(<ListProjections as Command>::CODE, 1_000_211);
         assert_eq!(<GetSchema as Command>::CODE, 1_000_220);

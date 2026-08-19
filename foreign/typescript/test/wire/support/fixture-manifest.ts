@@ -58,6 +58,8 @@ export const FIXTURE_MANIFEST: Readonly<Record<string, FixtureStatus>> = {
   "change_record.bin": "covered",
   "checkpoint_mutation_replicated.bin": "covered",
   "checkpoint_public_mutation_discriminants.bin": "covered",
+  "checkpoint_reply_destination.bin": "covered",
+  "checkpoint_reply_query_route.bin": "covered",
   "checkpoint_request_public.bin": "covered",
   "client_metadata_list.bin": "covered",
   "client_metadata_query.bin": "covered",

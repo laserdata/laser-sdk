@@ -87,6 +87,7 @@ import {
   AGDX_AUTHZ_WHOAMI_CODE,
   AGDX_BATCH_CODE,
   AGDX_CHECKPOINT_CODE,
+  AGDX_DESTINATION_HTTP_CODE,
   AGDX_DESTINATION_GET_CODE,
   AGDX_DESTINATION_LIST_CODE,
   AGDX_DECODE_RECORD_CODE,
@@ -130,6 +131,12 @@ import {
   KV_OP_VERSION,
   QUERY_OP_VERSION
 } from "./codes.js"
+import {
+  type DestinationHttpReply,
+  type DestinationHttpRequest,
+  decodeDestinationHttpReply,
+  encodeDestinationHttpRequest
+} from "./http.js"
 import {
   type ForkCreate,
   type ForkDelete,
@@ -367,6 +374,17 @@ export const QueryRouteListCommand: ManagedCommand<QueryRouteListRequest, Checkp
   decode: decodeCheckpointReadReply,
   validate: validateQueryRouteListRequest
 }
+
+export const DestinationHttpCommand: ManagedCommand<DestinationHttpRequest, DestinationHttpReply> =
+  {
+    code: AGDX_DESTINATION_HTTP_CODE,
+    surface: "destinations",
+    encode: (request) => encodeNamed(encodeDestinationHttpRequest(request)),
+    decode: (reply) =>
+      decodeDestinationHttpReply(
+        expectMap(decodeOne(reply, "destination HTTP reply"), "destination HTTP reply")
+      )
+  }
 
 export const GetProjectionCommand = framed<GetProjection, BrowseReply>(
   AGDX_GET_PROJECTION_CODE,
@@ -633,6 +651,7 @@ export const MANAGED_COMMANDS = [
   DestinationGetCommand,
   DestinationListCommand,
   QueryRouteListCommand,
+  DestinationHttpCommand,
   GetProjectionCommand,
   ListProjectionsCommand,
   GetSchemaCommand,

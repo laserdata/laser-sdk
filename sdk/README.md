@@ -19,9 +19,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = "=0.2.1" # typed streaming plus provenance
+laser-sdk = "=0.3.0" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "=0.2.1", features = ["agent", "managed"] }
+laser-sdk = { version = "=0.3.0", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -216,7 +216,7 @@ while let Some(next) = records.next().await {
 
 With the `agent` feature, effects that need asynchronous approval use ordinary typed topics. The SDK validates the intent and ballots, but your application owns the topic layout, replay cursor, and final effect:
 
-```rust
+```rust,ignore
 use laser_sdk::intent::{decide, Intent, IntentPolicy, Vote, VoteChoice};
 use laser_sdk::prelude::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

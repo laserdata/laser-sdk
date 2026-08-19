@@ -25,6 +25,10 @@ import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   AGDX_AGENT_SUBMIT_CODE,
   AGDX_BATCH_CODE,
+  AGDX_CHECKPOINT_CODE,
+  AGDX_CONTROL_PUBLISH_CODE,
+  AGDX_DESTINATION_GET_CODE,
+  AGDX_DESTINATION_HTTP_CODE,
   AGDX_HELLO_CODE,
   AGDX_KV_CAS_FENCED_CODE,
   AGDX_KV_GET_CODE,
@@ -167,6 +171,11 @@ void test("given_a_command_code_when_classified_then_should_map_to_feature_and_a
   assert.equal(featureAction(AGDX_HELLO_CODE), undefined)
   assert.equal(featureAction(AGDX_BATCH_CODE), undefined)
   assert.deepEqual(featureAction(AGDX_AGENT_SUBMIT_CODE), ["agent", "write"])
+  assert.deepEqual(featureAction(AGDX_DESTINATION_GET_CODE), ["destination", "read"])
+  assert.equal(featureAction(AGDX_CHECKPOINT_CODE), undefined)
+  assert.equal(featureAction(AGDX_DESTINATION_HTTP_CODE), undefined)
+  assert.equal(AGDX_CONTROL_PUBLISH_CODE, 1_000_108)
+  assert.equal(featureAction(AGDX_CONTROL_PUBLISH_CODE), undefined)
 })
 
 void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fit_a_u128_mask", () => {
@@ -196,6 +205,8 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
       seen.add(index)
     }
   }
+  assert.equal(actionIndex("destination", "read"), 40)
+  assert.equal(actionIndex("checkpoint", "admin"), 48)
   assert.equal(actionIndex("authz", "admin"), 53)
   assert.equal(actionIndex("kv_lease", "admin"), 58)
   assert.equal(actionIndex("kv_fence", "read"), 60)

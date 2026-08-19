@@ -14,16 +14,17 @@
 use crate::agent_workflow::{AgentRunInfo, AgentSubmit};
 use crate::authz::{Role, WhoamiReply};
 use crate::browse::{ProjectionInfo, SchemaInfo};
+use crate::checkpoint::CheckpointReadConsistency;
 use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector};
 use crate::destination::{DestinationId, DestinationOperationId};
 use crate::fork::ForkInfo;
 use crate::graph::GraphQuery;
 use crate::http::{
-    self, AcceptedOperationView, Capabilities, CasCommittedView, ClientMetadataListView,
-    ClientsQuery, DecodeRecordBody, DeletedManyView, DestinationIssueView, DestinationListQuery,
-    DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody, ForkCreateBody,
-    ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView, KvPutQuery,
-    KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
+    self, AcceptedOperationView, Capabilities, CasCommittedView, CheckpointReadQuery,
+    ClientMetadataListView, ClientsQuery, DecodeRecordBody, DeletedManyView, DestinationIssueView,
+    DestinationListQuery, DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody,
+    ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
+    KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
     QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, RunPageView, RunsQuery,
     SchemaListQuery, SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView,
     TableMetricsView, TableSchemaView, TableSnapshotView, TableView,
@@ -244,8 +245,13 @@ impl<T: Transport> HttpClient<T> {
     pub async fn destination(
         &self,
         id: DestinationId,
+        consistency: CheckpointReadConsistency,
     ) -> ClientResult<Option<DestinationView>, T::Error> {
-        self.get_optional(http::destination_path(id)).await
+        self.get_optional(with_query(
+            &http::destination_path(id),
+            &CheckpointReadQuery::new(consistency),
+        )?)
+        .await
     }
 
     pub async fn create_destination(
@@ -284,29 +290,49 @@ impl<T: Transport> HttpClient<T> {
     pub async fn destination_status(
         &self,
         id: DestinationId,
+        consistency: CheckpointReadConsistency,
     ) -> ClientResult<crate::checkpoint::DestinationCheckpointStatus, T::Error> {
-        self.get(http::destination_status_path(id)).await
+        self.get(with_query(
+            &http::destination_status_path(id),
+            &CheckpointReadQuery::new(consistency),
+        )?)
+        .await
     }
 
     pub async fn destination_checkpoint(
         &self,
         id: DestinationId,
+        consistency: CheckpointReadConsistency,
     ) -> ClientResult<crate::checkpoint::DestinationCheckpointStatus, T::Error> {
-        self.get(http::destination_checkpoint_path(id)).await
+        self.get(with_query(
+            &http::destination_checkpoint_path(id),
+            &CheckpointReadQuery::new(consistency),
+        )?)
+        .await
     }
 
     pub async fn destination_retention_gap(
         &self,
         id: DestinationId,
+        consistency: CheckpointReadConsistency,
     ) -> ClientResult<DestinationIssueView, T::Error> {
-        self.get(http::destination_retention_gap_path(id)).await
+        self.get(with_query(
+            &http::destination_retention_gap_path(id),
+            &CheckpointReadQuery::new(consistency),
+        )?)
+        .await
     }
 
     pub async fn destination_prepared_attempt(
         &self,
         id: DestinationId,
+        consistency: CheckpointReadConsistency,
     ) -> ClientResult<DestinationIssueView, T::Error> {
-        self.get(http::destination_prepared_attempt_path(id)).await
+        self.get(with_query(
+            &http::destination_prepared_attempt_path(id),
+            &CheckpointReadQuery::new(consistency),
+        )?)
+        .await
     }
 
     pub async fn query_routes(
@@ -985,6 +1011,30 @@ mod tests {
     fn given_known_vectors_when_encoded_then_should_match_rfc_url_alphabet() {
         assert_eq!(base64url_encode(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64url_encode(&[0xfb, 0xff]), "-_8");
+    }
+
+    #[test]
+    fn given_checkpoint_reads_when_paths_are_built_then_should_require_the_selected_consistency() {
+        let single = with_query::<(), _>(
+            &http::destination_status_path(DestinationId::from_u128(1)),
+            &CheckpointReadQuery::new(CheckpointReadConsistency::Linearizable),
+        )
+        .expect("single checkpoint read query encodes");
+        assert!(single.ends_with("?consistency=linearizable"));
+
+        let list = with_query::<(), _>(
+            http::DESTINATIONS_PATH,
+            &DestinationListQuery {
+                source_stream: None,
+                source_topic: None,
+                name_contains: None,
+                after: None,
+                limit: None,
+                consistency: CheckpointReadConsistency::PotentiallyStale,
+            },
+        )
+        .expect("checkpoint list query encodes");
+        assert!(list.ends_with("?consistency=potentially_stale"));
     }
 
     #[test]

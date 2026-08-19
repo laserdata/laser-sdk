@@ -32,6 +32,8 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_AUTHZ_DELETE_ROLE_CODE, 1_000_105);
     assert_eq!(AGDX_AUTHZ_BIND_ROLES_CODE, 1_000_106);
     assert_eq!(AGDX_AUTHZ_HISTORY_CODE, 1_000_107);
+    assert_eq!(AGDX_CONTROL_PUBLISH_CODE, 1_000_108);
+    assert_eq!(AGDX_DESTINATION_HTTP_CODE, 1_000_025);
     assert_eq!(AGDX_QUERY_BASE, 1_000_200);
     assert_eq!(AGDX_QUERY_CODE, 1_000_200);
     assert_eq!(AGDX_QUERY_PAGE_CODE, 1_000_201);
@@ -92,6 +94,7 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(CHANGE_OP_VERSION, 1);
     assert_eq!(CLIENT_METADATA_OP_VERSION, 1);
     assert_eq!(CHECKPOINT_OP_VERSION, 1);
+    assert_eq!(DESTINATION_HTTP_OP_VERSION, 1);
     assert_eq!(PRESENCE_OP_VERSION, 1);
 }
 

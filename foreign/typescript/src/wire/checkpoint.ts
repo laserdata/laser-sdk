@@ -357,18 +357,31 @@ export interface CheckpointRequestEnvelope {
   readonly mutation: PublicCheckpointMutation
   readonly supervisorAssertion?: SupervisorActorAssertion
 }
-export interface CheckpointMutationResult {
-  readonly requestId: CheckpointRequestId
-  readonly destinationId: DestinationId
-  readonly destinationGeneration: bigint
-  readonly globalStateRevision: bigint
-  readonly definitionRevision: bigint
-  readonly checkpointRevision: bigint
-  readonly lease?: CheckpointOwnerLease
-}
+export type CheckpointMutationResult =
+  | {
+      readonly kind: "destination"
+      readonly requestId: CheckpointRequestId
+      readonly destinationId: DestinationId
+      readonly destinationGeneration: bigint
+      readonly globalStateRevision: bigint
+      readonly definitionRevision: bigint
+      readonly checkpointRevision: bigint
+      readonly lease?: CheckpointOwnerLease
+    }
+  | {
+      readonly kind: "query_route"
+      readonly requestId: CheckpointRequestId
+      readonly routeId: QueryRouteId
+      readonly routeGeneration: bigint
+      readonly globalStateRevision: bigint
+      readonly definitionRevision: bigint
+    }
 export type CheckpointError =
-  | { readonly kind: "invalid" | "unavailable"; readonly message: string }
-  | { readonly kind: "not_found" | "lease_lost" | "unauthorized" }
+  | { readonly kind: "invalid"; readonly message: string }
+  | { readonly kind: "unavailable"; readonly message: string }
+  | { readonly kind: "not_found" }
+  | { readonly kind: "lease_lost" }
+  | { readonly kind: "unauthorized" }
   | { readonly kind: "conflict"; readonly observedRevision: bigint }
   | { readonly kind: "version"; readonly expected: number; readonly got: number }
 export type CheckpointReply =
@@ -1516,11 +1529,15 @@ function equalIncarnation(left: SourceIncarnation, right: SourceIncarnation): bo
 }
 
 function decodeError(value: unknown, context: string): CheckpointError {
+  if (typeof value === "string") {
+    const kind = value.replaceAll(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+    if (kind === "not_found" || kind === "lease_lost" || kind === "unauthorized") return { kind }
+    throw new CodecError(`unknown checkpoint error \`${value}\``, context, "error")
+  }
   const [tag, body] = singleVariantTag(value, context)
   const kind = tag.replaceAll(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
   if (kind === "invalid" || kind === "unavailable")
     return { kind, message: expectString(body, context) }
-  if (kind === "not_found" || kind === "lease_lost" || kind === "unauthorized") return { kind }
   const map = expectMap(body, context)
   if (kind === "conflict")
     return { kind, observedRevision: field.requiredU64(map, "observed_revision", context) }
@@ -1532,23 +1549,96 @@ function decodeError(value: unknown, context: string): CheckpointError {
     }
   throw new CodecError(`unknown checkpoint error \`${tag}\``, context, "error")
 }
-function decodeMutationResult(map: CborMap, context: string): CheckpointMutationResult {
-  const lease = field.optionalMap(map, "lease", context)
-  return {
-    requestId: CheckpointRequestId.fromBytes(field.requiredBytes(map, "request_id", context)),
-    destinationId: DestinationId.fromBytes(field.requiredBytes(map, "destination_id", context)),
-    destinationGeneration: field.requiredU64(map, "destination_generation", context),
-    globalStateRevision: field.requiredU64(map, "global_state_revision", context),
-    definitionRevision: field.requiredU64(map, "definition_revision", context),
-    checkpointRevision: field.requiredU64(map, "checkpoint_revision", context),
-    ...(lease === undefined ? {} : { lease: decodeLease(lease, context) })
+
+function encodeError(value: CheckpointError): unknown {
+  if (value.kind === "invalid") return new Map([["Invalid", value.message]])
+  if (value.kind === "unavailable") return new Map([["Unavailable", value.message]])
+  if (value.kind === "not_found") return "NotFound"
+  if (value.kind === "lease_lost") return "LeaseLost"
+  if (value.kind === "unauthorized") return "Unauthorized"
+  if (value.kind === "conflict") {
+    return new Map([["Conflict", new Map([["observed_revision", value.observedRevision]])]])
   }
+  return new Map([
+    [
+      "Version",
+      new Map<string, unknown>([
+        ["expected", value.expected],
+        ["got", value.got]
+      ])
+    ]
+  ])
+}
+export function decodeCheckpointMutationResult(
+  map: CborMap,
+  context: string
+): CheckpointMutationResult {
+  const kind = field.requiredString(map, "kind", context)
+  const requestId = CheckpointRequestId.fromBytes(field.requiredBytes(map, "request_id", context))
+  const globalStateRevision = field.requiredU64(map, "global_state_revision", context)
+  const definitionRevision = field.requiredU64(map, "definition_revision", context)
+  if (kind === "destination") {
+    const lease = field.optionalMap(map, "lease", context)
+    return {
+      kind,
+      requestId,
+      destinationId: DestinationId.fromBytes(field.requiredBytes(map, "destination_id", context)),
+      destinationGeneration: field.requiredU64(map, "destination_generation", context),
+      globalStateRevision,
+      definitionRevision,
+      checkpointRevision: field.requiredU64(map, "checkpoint_revision", context),
+      ...(lease === undefined ? {} : { lease: decodeLease(lease, context) })
+    }
+  }
+  if (kind === "query_route") {
+    return {
+      kind,
+      requestId,
+      routeId: QueryRouteId.fromBytes(field.requiredBytes(map, "route_id", context)),
+      routeGeneration: field.requiredU64(map, "route_generation", context),
+      globalStateRevision,
+      definitionRevision
+    }
+  }
+  throw new CodecError(`unknown checkpoint mutation result kind \`${kind}\``, context, "kind")
+}
+
+export function encodeCheckpointMutationResult(
+  value: CheckpointMutationResult
+): Map<string, unknown> {
+  validateCheckpointMutationResult(value)
+  const map = mapOf([
+    ["kind", value.kind],
+    ["request_id", value.requestId.toBytes()]
+  ])
+  if (value.kind === "destination") {
+    map.set("destination_id", value.destinationId.toBytes())
+    map.set("destination_generation", value.destinationGeneration)
+  } else {
+    map.set("route_id", value.routeId.toBytes())
+    map.set("route_generation", value.routeGeneration)
+  }
+  map.set("global_state_revision", value.globalStateRevision)
+  map.set("definition_revision", value.definitionRevision)
+  if (value.kind === "destination") {
+    map.set("checkpoint_revision", value.checkpointRevision)
+    optional(map, "lease", value.lease, encodeLease)
+  }
+  return map
+}
+
+export function encodeCheckpointReplyFrame(reply: CheckpointReply): Uint8Array {
+  const value =
+    reply.kind === "ok"
+      ? new Map([["Ok", encodeCheckpointMutationResult(reply.result)]])
+      : new Map([["Err", encodeError(reply.error)]])
+  return encodeNamed(value)
 }
 export function decodeCheckpointReply(bytes: Uint8Array): CheckpointReply {
   const context = "CheckpointReply"
   const [tag, body] = singleVariantTag(decodeOne(bytes, context), context)
   if (tag === "Ok") {
-    const result = decodeMutationResult(expectMap(body, context), context)
+    const result = decodeCheckpointMutationResult(expectMap(body, context), context)
     validateCheckpointMutationResult(result)
     return { kind: "ok", result }
   }
@@ -1778,15 +1868,25 @@ function decodeView(map: CborMap, context: string): DestinationCheckpointView {
 export function validateCheckpointMutationResult(value: CheckpointMutationResult): void {
   if (
     value.requestId.asU128() === 0n ||
-    value.destinationId.asU128() === 0n ||
-    value.destinationGeneration === 0n ||
     value.globalStateRevision === 0n ||
     value.definitionRevision === 0n
-  )
+  ) {
     throw new InvalidError(
-      "checkpoint mutation result identity, generation, global revision, and definition revision must be nonzero"
+      "checkpoint mutation result request identity, global revision, and definition revision must be nonzero"
     )
-  if (value.lease !== undefined) validateLease(value.lease)
+  }
+  if (value.kind === "destination") {
+    if (value.destinationId.asU128() === 0n || value.destinationGeneration === 0n) {
+      throw new InvalidError(
+        "checkpoint destination result identity and generation must be nonzero"
+      )
+    }
+    if (value.lease !== undefined) validateLease(value.lease)
+    return
+  }
+  if (value.routeId.asU128() === 0n || value.routeGeneration === 0n) {
+    throw new InvalidError("checkpoint query route result identity and generation must be nonzero")
+  }
 }
 
 export function validateDestinationCheckpointStatus(value: DestinationCheckpointStatus): void {

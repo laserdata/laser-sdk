@@ -20,7 +20,7 @@ This repo is one workspace holding two published crates. **laser-wire** is the L
 
 These change the on-the-wire or public contract and break data or downstreams:
 
-- Editing ANYTHING in `wire/src/` that alters encoded payload: command codes, op versions, header keys (`wire/src/headers.rs`), topic names, envelope field names or serde attributes, the content-type / task-state / error-code u8 dictionaries, or the caps. Every message already on the log and every consumer (LaserData Cloud, Iggy server) is pinned to those bytes. The golden corpus under `wire/fixtures/` will fail on drift. During the pre-1.0 package line an intentional breaking change keeps operation versions at 1 and must update fixtures plus every consumer and implementation as one release unit.
+- Editing ANYTHING in `wire/src/` that alters encoded payload: command codes, op versions, header keys (`wire/src/headers.rs`), topic names, envelope field names or serde attributes, the content-type / task-state / error-code u8 dictionaries, or the caps. Every message already on the log and every consumer (LaserData Cloud, Iggy server) is pinned to those bytes. The golden corpus under `wire/fixtures/` will fail on drift. During the pre-1.0 package line an intentional breaking change increments the affected operation version and must update fixtures plus every consumer and implementation as one release unit.
 - Changing `ConversationId::derive` (the FNV-1a algorithm in `sdk/src/types/ids.rs`) without bumping `DERIVE_VERSION` - silently remaps every `SessionPolicy::PerUser` conversation. (`AgentId::wire_id` is no longer a hash: the wire agent id is the name string verbatim.)
 - Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`) - repoints live topics.
 - Changing `Provenance::partition_key` (currently `conversation_id`) - breaks the per-conversation ordering guarantee.
@@ -335,7 +335,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.2.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.3.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 

@@ -23,14 +23,14 @@ use laser_wire::browse::{
 };
 use laser_wire::change::ChangeRecord;
 use laser_wire::checkpoint::{
-    AttemptColumnMetrics, AttemptObject, CheckpointMutationStamp, CheckpointOwnerId,
-    CheckpointReadConsistency, CheckpointRequestEnvelope, CheckpointRequestId, CompletedAttempt,
-    CredentialGeneration, DestinationBlock, DestinationBlockCode, DestinationCheckpointStatus,
-    DestinationEffectiveState, IcebergCommitRequirement, PartitionCheckpoint,
-    PartitionLifecycleChange, PartitionLifecycleState, PreparedAttempt, PreparedAttemptId,
-    PreparedTableRequirements, PublicCheckpointMutation, RepairAction, RepairRecord,
-    ReplicatedCheckpointMutation, ReplicatedCheckpointMutationBody, RetentionGap,
-    SourceOffsetRange,
+    AttemptColumnMetrics, AttemptObject, CheckpointMutationResult, CheckpointMutationStamp,
+    CheckpointOwnerId, CheckpointReadConsistency, CheckpointReply, CheckpointRequestEnvelope,
+    CheckpointRequestId, CompletedAttempt, CredentialGeneration, DestinationBlock,
+    DestinationBlockCode, DestinationCheckpointStatus, DestinationEffectiveState,
+    IcebergCommitRequirement, PartitionCheckpoint, PartitionLifecycleChange,
+    PartitionLifecycleState, PreparedAttempt, PreparedAttemptId, PreparedTableRequirements,
+    PublicCheckpointMutation, RepairAction, RepairRecord, ReplicatedCheckpointMutation,
+    ReplicatedCheckpointMutationBody, RetentionGap, SourceOffsetRange,
 };
 use laser_wire::clients::{ClientMetadata, ClientMetadataList, ClientMetadataQuery};
 use laser_wire::codes::{
@@ -1322,8 +1322,8 @@ fn given_checkpoint_frames_when_encoded_then_should_match_golden_fixtures() {
         request_id: CheckpointRequestId::from_u128(400),
         expected_global_state_revision: 10,
         stamp: CheckpointMutationStamp {
-            primary_timestamp_micros: TIMESTAMP_MICROS,
-            iggy_actor_id: 9,
+            committed_at_micros: TIMESTAMP_MICROS,
+            iggy_actor_id: 0,
             supervisor_actor: None,
         },
         mutation: ReplicatedCheckpointMutationBody::RegisterDestination {
@@ -1331,6 +1331,28 @@ fn given_checkpoint_frames_when_encoded_then_should_match_golden_fixtures() {
         },
     };
     assert_frame("checkpoint_mutation_replicated.bin", &replicated);
+    assert_frame(
+        "checkpoint_reply_destination.bin",
+        &CheckpointReply::Ok(CheckpointMutationResult::Destination {
+            request_id: CheckpointRequestId::from_u128(400),
+            destination_id,
+            destination_generation,
+            global_state_revision: 11,
+            definition_revision: 7,
+            checkpoint_revision: 3,
+            lease: None,
+        }),
+    );
+    assert_frame(
+        "checkpoint_reply_query_route.bin",
+        &CheckpointReply::Ok(CheckpointMutationResult::QueryRoute {
+            request_id: CheckpointRequestId::from_u128(403),
+            route_id: QueryRouteId::from_u128(302),
+            route_generation: 2,
+            global_state_revision: 12,
+            definition_revision: 8,
+        }),
+    );
     assert!(
         decode_named::<ReplicatedCheckpointMutation>(
             &encode_named(&public).expect("public request encodes")
@@ -2203,6 +2225,7 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
             fork_mutations_topic: "acme.fork.mutations".to_owned(),
             run_mutations_topic: "acme.run.mutations".to_owned(),
             graph_mutations_topic: "acme.graph.mutations".to_owned(),
+            checkpoint_mutations_topic: "acme.checkpoint.mutations".to_owned(),
         }),
     );
     // The durable managed-mutation log record: the plane replays these on
@@ -2367,6 +2390,8 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
             routes: vec![canonical_query_route()],
             next_cursor: Some("route-2".to_owned()),
             definition_revision: 8,
+            global_state_revision: 11,
+            consistency: CheckpointReadConsistency::Linearizable,
         },
     );
     assert_json(
@@ -2450,6 +2475,15 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
             submitted_at_micros: TIMESTAMP_MICROS,
             completed_at_micros: Some(TIMESTAMP_MICROS + 1_000),
             error: None,
+            result: Some(CheckpointMutationResult::Destination {
+                request_id: CheckpointRequestId::from_u128(400),
+                destination_id: DestinationId::from_u128(300),
+                destination_generation: 2,
+                global_state_revision: 11,
+                definition_revision: 7,
+                checkpoint_revision: 3,
+                lease: None,
+            }),
         },
     );
     assert_json(
@@ -2478,6 +2512,7 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
             }),
             prepared_attempt: None,
             block: None,
+            global_state_revision: 11,
             checkpoint_revision: 4,
             consistency: CheckpointReadConsistency::Linearizable,
         },

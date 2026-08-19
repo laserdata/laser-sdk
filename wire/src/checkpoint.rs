@@ -1012,7 +1012,7 @@ pub enum RepairAction {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointMutationStamp {
-    pub primary_timestamp_micros: u64,
+    pub committed_at_micros: u64,
     pub iggy_actor_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_actor: Option<VerifiedSupervisorActor>,
@@ -1034,9 +1034,9 @@ pub struct VerifiedSupervisorActor {
 
 impl Validate for CheckpointMutationStamp {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.primary_timestamp_micros == 0 || self.iggy_actor_id == 0 {
+        if self.committed_at_micros == 0 {
             return Err(InvalidError::new(
-                "checkpoint primary timestamp and Iggy actor must be nonzero",
+                "checkpoint committed timestamp must be nonzero",
             ));
         }
         if let Some(actor) = &self.supervisor_actor
@@ -1440,15 +1440,26 @@ impl Validate for ReplicatedCheckpointMutationBody {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointMutationResult {
-    pub request_id: CheckpointRequestId,
-    pub destination_id: DestinationId,
-    pub destination_generation: u64,
-    pub global_state_revision: u64,
-    pub definition_revision: u64,
-    pub checkpoint_revision: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease: Option<CheckpointOwnerLease>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CheckpointMutationResult {
+    Destination {
+        request_id: CheckpointRequestId,
+        destination_id: DestinationId,
+        destination_generation: u64,
+        global_state_revision: u64,
+        definition_revision: u64,
+        checkpoint_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease: Option<CheckpointOwnerLease>,
+    },
+    QueryRoute {
+        request_id: CheckpointRequestId,
+        route_id: QueryRouteId,
+        route_generation: u64,
+        global_state_revision: u64,
+        definition_revision: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -1592,18 +1603,48 @@ impl Validate for QueryRouteListRequest {
 
 impl Validate for CheckpointMutationResult {
     fn validate(&self) -> Result<(), InvalidError> {
-        if self.request_id.as_u128() == 0
-            || self.destination_id.as_u128() == 0
-            || self.destination_generation == 0
-            || self.global_state_revision == 0
-            || self.definition_revision == 0
-        {
-            return Err(InvalidError::new(
-                "checkpoint mutation result identity, generation, global revision, and definition revision must be nonzero",
-            ));
-        }
-        if let Some(lease) = &self.lease {
-            lease.validate()?;
+        match self {
+            Self::Destination {
+                request_id,
+                destination_id,
+                destination_generation,
+                global_state_revision,
+                definition_revision,
+                lease,
+                ..
+            } => {
+                if request_id.as_u128() == 0
+                    || destination_id.as_u128() == 0
+                    || *destination_generation == 0
+                    || *global_state_revision == 0
+                    || *definition_revision == 0
+                {
+                    return Err(InvalidError::new(
+                        "checkpoint destination result identity, generation, global revision, and definition revision must be nonzero",
+                    ));
+                }
+                if let Some(lease) = lease {
+                    lease.validate()?;
+                }
+            }
+            Self::QueryRoute {
+                request_id,
+                route_id,
+                route_generation,
+                global_state_revision,
+                definition_revision,
+            } => {
+                if request_id.as_u128() == 0
+                    || route_id.as_u128() == 0
+                    || *route_generation == 0
+                    || *global_state_revision == 0
+                    || *definition_revision == 0
+                {
+                    return Err(InvalidError::new(
+                        "checkpoint query route result identity, generation, global revision, and definition revision must be nonzero",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -2043,7 +2084,7 @@ mod tests {
             request_id: CheckpointRequestId::from_u128(21),
             expected_global_state_revision: 0,
             stamp: CheckpointMutationStamp {
-                primary_timestamp_micros: 22,
+                committed_at_micros: 22,
                 iggy_actor_id: 23,
                 supervisor_actor: None,
             },
@@ -2072,7 +2113,8 @@ mod tests {
     }
 
     #[test]
-    fn given_a_lease_duration_when_validated_then_should_be_bounded_before_consensus_submission() {
+    fn given_a_lease_duration_when_validated_then_should_be_bounded_before_managed_log_submission()
+    {
         let mutation = PublicCheckpointMutation::AcquireLease {
             destination_id: DestinationId::from_u128(10),
             destination_generation: 1,
@@ -2081,6 +2123,58 @@ mod tests {
             lease_duration_micros: MAX_CHECKPOINT_LEASE_DURATION_MICROS + 1,
         };
         assert!(mutation.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_root_authored_stamp_when_validated_then_should_preserve_actor_zero() {
+        let stamp = CheckpointMutationStamp {
+            committed_at_micros: 1,
+            iggy_actor_id: 0,
+            supervisor_actor: None,
+        };
+
+        stamp
+            .validate()
+            .expect("root actor zero is a valid Iggy identity");
+    }
+
+    #[test]
+    fn given_an_unserved_checkpoint_request_version_when_validated_then_should_reject_it() {
+        let mut request = CheckpointRequestEnvelope::new(
+            CheckpointRequestId::from_u128(1),
+            0,
+            PublicCheckpointMutation::RegisterDestination {
+                destination: destination(),
+            },
+        );
+        request.v = crate::codes::CHECKPOINT_OP_VERSION + 1;
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn given_destination_and_query_route_results_when_validated_then_should_require_variant_specific_identity()
+     {
+        CheckpointMutationResult::Destination {
+            request_id: CheckpointRequestId::from_u128(1),
+            destination_id: DestinationId::from_u128(2),
+            destination_generation: 3,
+            global_state_revision: 4,
+            definition_revision: 5,
+            checkpoint_revision: 0,
+            lease: None,
+        }
+        .validate()
+        .expect("destination result is valid");
+        CheckpointMutationResult::QueryRoute {
+            request_id: CheckpointRequestId::from_u128(6),
+            route_id: QueryRouteId::from_u128(7),
+            route_generation: 8,
+            global_state_revision: 9,
+            definition_revision: 10,
+        }
+        .validate()
+        .expect("query route result is valid");
     }
 
     #[test]

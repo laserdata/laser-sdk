@@ -72,6 +72,8 @@ corpus!(
     "change_record.bin",
     "checkpoint_mutation_replicated.bin",
     "checkpoint_public_mutation_discriminants.bin",
+    "checkpoint_reply_destination.bin",
+    "checkpoint_reply_query_route.bin",
     "checkpoint_request_public.bin",
     "client_metadata_list.bin",
     "client_metadata_query.bin",

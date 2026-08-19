@@ -6,6 +6,8 @@ import {
   AGDX_AGENT_STATUS_CODE,
   AGDX_AGENT_SUBMIT_CODE,
   AGDX_DECODE_RECORD_CODE,
+  AGDX_DESTINATION_GET_CODE,
+  AGDX_DESTINATION_LIST_CODE,
   AGDX_FORK_CREATE_CODE,
   AGDX_FORK_DELETE_CODE,
   AGDX_FORK_LIST_CODE,
@@ -35,6 +37,7 @@ import {
   AGDX_LIST_PROJECTIONS_CODE,
   AGDX_LIST_SCHEMAS_CODE,
   AGDX_QUERY_CODE,
+  AGDX_QUERY_ROUTE_LIST_CODE,
   AGDX_REGISTER_SCHEMA_CODE,
   AUTHZ_OP_VERSION
 } from "./codes.js"
@@ -219,6 +222,10 @@ export function featureAction(code: number): readonly [Feature, Action] | undefi
   switch (code) {
     case AGDX_QUERY_CODE:
       return ["query", "read"]
+    case AGDX_DESTINATION_GET_CODE:
+    case AGDX_DESTINATION_LIST_CODE:
+    case AGDX_QUERY_ROUTE_LIST_CODE:
+      return ["destination", "read"]
     case AGDX_GET_PROJECTION_CODE:
     case AGDX_LIST_PROJECTIONS_CODE:
     case AGDX_GET_SCHEMA_CODE:

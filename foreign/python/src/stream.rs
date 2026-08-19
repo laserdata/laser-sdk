@@ -156,7 +156,7 @@ impl PyTopic {
     /// Build a Laser direct producer. This is the full streaming hot path
     /// below the typed publish API: tune batching/linger/retries,
     /// topology creation, and default key or partition, then `await send(...)`.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=Some(3), retry_interval_ms=1000, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, replication_factor=None, message_expiry="server_default", max_topic_size=0))]
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=Some(3), retry_interval_ms=1000, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
@@ -169,7 +169,6 @@ impl PyTopic {
         create_stream: bool,
         create_topic: bool,
         partitions: u32,
-        replication_factor: Option<u8>,
         message_expiry: &str,
         max_topic_size: u64,
     ) -> PyResult<PyProducer> {
@@ -209,7 +208,6 @@ impl PyTopic {
                 .map_err(InvalidError::new_err)?;
             builder.create_topic_if_not_exists(
                 partitions,
-                replication_factor,
                 expiry,
                 MaxTopicSize::from(max_topic_size),
             )

@@ -100,6 +100,8 @@ interface AcceptedOperationView {
     // (undocumented)
     readonly requestId: CheckpointRequestId;
     // (undocumented)
+    readonly result?: CheckpointMutationResult;
+    // (undocumented)
     readonly state: OperationState;
     // (undocumented)
     readonly submittedAtMicros: bigint;
@@ -264,10 +266,16 @@ const AGDX_CHECKPOINT_CODE: number;
 const AGDX_COMMAND_BASE = 1000000;
 
 // @public (undocumented)
+const AGDX_CONTROL_PUBLISH_CODE: number;
+
+// @public (undocumented)
 const AGDX_DECODE_RECORD_CODE: number;
 
 // @public (undocumented)
 const AGDX_DESTINATION_GET_CODE: number;
+
+// @public (undocumented)
+const AGDX_DESTINATION_HTTP_CODE: number;
 
 // @public (undocumented)
 const AGDX_DESTINATION_LIST_CODE: number;
@@ -2010,10 +2018,17 @@ const CheckpointCommand: ManagedCommand<CheckpointRequestEnvelope, CheckpointRep
 
 // @public (undocumented)
 type CheckpointError = {
-    readonly kind: "invalid" | "unavailable";
+    readonly kind: "invalid";
     readonly message: string;
 } | {
-    readonly kind: "not_found" | "lease_lost" | "unauthorized";
+    readonly kind: "unavailable";
+    readonly message: string;
+} | {
+    readonly kind: "not_found";
+} | {
+    readonly kind: "lease_lost";
+} | {
+    readonly kind: "unauthorized";
 } | {
     readonly kind: "conflict";
     readonly observedRevision: bigint;
@@ -2024,22 +2039,23 @@ type CheckpointError = {
 };
 
 // @public (undocumented)
-export interface CheckpointMutationResult {
-    // (undocumented)
-    readonly checkpointRevision: bigint;
-    // (undocumented)
-    readonly definitionRevision: bigint;
-    // (undocumented)
-    readonly destinationGeneration: bigint;
-    // (undocumented)
-    readonly destinationId: DestinationId;
-    // (undocumented)
-    readonly globalStateRevision: bigint;
-    // (undocumented)
-    readonly lease?: CheckpointOwnerLease;
-    // (undocumented)
+export type CheckpointMutationResult = {
+    readonly kind: "destination";
     readonly requestId: CheckpointRequestId;
-}
+    readonly destinationId: DestinationId;
+    readonly destinationGeneration: bigint;
+    readonly globalStateRevision: bigint;
+    readonly definitionRevision: bigint;
+    readonly checkpointRevision: bigint;
+    readonly lease?: CheckpointOwnerLease;
+} | {
+    readonly kind: "query_route";
+    readonly requestId: CheckpointRequestId;
+    readonly routeId: QueryRouteId;
+    readonly routeGeneration: bigint;
+    readonly globalStateRevision: bigint;
+    readonly definitionRevision: bigint;
+};
 
 // @public (undocumented)
 class CheckpointOwnerId extends WireId<"CheckpointOwnerId"> {
@@ -2896,6 +2912,9 @@ function decodeCasExpect(value: unknown, context: string): CasExpect;
 function decodeChangeRecord(map: CborMap, context: string): ChangeRecord;
 
 // @public (undocumented)
+function decodeCheckpointMutationResult(map: CborMap, context: string): CheckpointMutationResult;
+
+// @public (undocumented)
 function decodeCheckpointReadReply(bytes: Uint8Array): CheckpointReadReply;
 
 // @public (undocumented)
@@ -2951,6 +2970,12 @@ function decodeDestinationBlock(map: CborMap, context: string): DestinationBlock
 
 // @public (undocumented)
 function decodeDestinationCheckpointStatus(map: CborMap, context: string): DestinationCheckpointStatus;
+
+// @public (undocumented)
+function decodeDestinationHttpReply(map: CborMap, context?: string): DestinationHttpReply;
+
+// @public (undocumented)
+function decodeDestinationHttpRequest(map: CborMap, context?: string): DestinationHttpRequest;
 
 // @public (undocumented)
 function decodeDestinationIssueJson(text: string): DestinationIssueView;
@@ -3395,6 +3420,9 @@ export interface Deduplicator {
 const DEFAULT_ARROW_IPC_POLICY: ArrowIpcPolicy;
 
 // @public (undocumented)
+const DEFAULT_CHECKPOINT_MUTATIONS_TOPIC = "checkpoint.mutations";
+
+// @public (undocumented)
 export const DEFAULT_CHUNK_FLUSH_BYTES = 512;
 
 // @public (undocumented)
@@ -3466,6 +3494,9 @@ interface DeleteRoleReq {
     // (undocumented)
     readonly name: string;
 }
+
+// @public (undocumented)
+const DESTINATION_HTTP_OP_VERSION = 1;
 
 // @public (undocumented)
 interface DestinationBlock {
@@ -3606,6 +3637,34 @@ interface DestinationGetRequest {
 }
 
 // @public (undocumented)
+const DestinationHttpCommand: ManagedCommand<DestinationHttpRequest, DestinationHttpReply>;
+
+// @public (undocumented)
+type DestinationHttpOperation = "list_destinations" | "get_destination" | "create_destination" | "enable_destination" | "disable_destination" | "get_operation" | "get_status" | "get_checkpoint" | "get_retention_gap" | "get_prepared_attempt" | "list_query_routes" | "get_table" | "get_table_schema" | "get_current_snapshot" | "list_snapshots" | "get_snapshot" | "list_files" | "get_metrics";
+
+// @public (undocumented)
+interface DestinationHttpReply {
+    // (undocumented)
+    readonly body: Uint8Array;
+    // (undocumented)
+    readonly status: number;
+}
+
+// @public (undocumented)
+interface DestinationHttpRequest {
+    // (undocumented)
+    readonly body: Uint8Array;
+    // (undocumented)
+    readonly operation: DestinationHttpOperation;
+    // (undocumented)
+    readonly parameters: readonly string[];
+    // (undocumented)
+    readonly query: Uint8Array;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
 class DestinationId extends WireId<"DestinationId"> {
     // (undocumented)
     static fromBytes(bytes: Uint8Array): DestinationId;
@@ -3623,6 +3682,8 @@ interface DestinationIssueView {
     readonly checkpointRevision: bigint;
     // (undocumented)
     readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
     // (undocumented)
     readonly preparedAttempt?: PreparedAttemptSummary;
     // (undocumented)
@@ -3698,13 +3759,35 @@ export class Destinations {
     // Warning: (ae-forgotten-export) The symbol "ManagedTransport" needs to be exported by the entry point full.d.ts
     constructor(transport: ManagedTransport, capabilities: () => Promise<Capabilities>);
     // (undocumented)
-    get(destinationId: DestinationId, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointView | undefined>;
+    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
-    list(filter?: DestinationListFilter, after?: DestinationId, limit?: number, consistency?: CheckpointReadConsistency): Promise<DestinationCheckpointPage>;
+    acquireLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
     // (undocumented)
-    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation): Promise<CheckpointMutationResult>;
+    addPartition(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
     // (undocumented)
-    queryRoutes(nameContains?: string, after?: QueryRouteId, limit?: number, consistency?: CheckpointReadConsistency): Promise<QueryRoutePage>;
+    bindTable(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, tableUuid: Uint8Array): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    clearBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, expectedCode: DestinationBlockCode): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    complete(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, epoch: bigint, expectedCheckpointRevision: bigint, completion: CompletedAttempt): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    get(destinationId: DestinationId, consistency: CheckpointReadConsistency): Promise<DestinationCheckpointView | undefined>;
+    // (undocumented)
+    list(consistency: CheckpointReadConsistency, filter?: DestinationListFilter, after?: DestinationId, limit?: number): Promise<DestinationCheckpointPage>;
+    // (undocumented)
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion?: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    observePartitionLifecycle(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    prepare(expectedGlobalStateRevision: bigint, expectedCheckpointRevision: bigint, attempt: PreparedAttempt): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    queryRoutes(consistency: CheckpointReadConsistency, nameContains?: string, after?: QueryRouteId, limit?: number): Promise<QueryRoutePage>;
+    // (undocumented)
+    recordBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, block: DestinationBlock): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    recordRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, gap: RetentionGap): Promise<CheckpointMutationResult>;
     // (undocumented)
     register(expectedGlobalStateRevision: bigint, destination: MaterializationDestination): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -3712,7 +3795,13 @@ export class Destinations {
     // (undocumented)
     removeQueryRoute(expectedGlobalStateRevision: bigint, routeId: QueryRouteId, routeGeneration: bigint, expectedDefinitionRevision: bigint): Promise<CheckpointMutationResult>;
     // (undocumented)
+    renewLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, epoch: bigint, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
+    // (undocumented)
     setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    // (undocumented)
+    takeOverLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
 }
 
 // @public (undocumented)
@@ -3926,6 +4015,12 @@ function encodeCasExpect(expect: CasExpect): unknown;
 function encodeChangeRecord(record: ChangeRecord): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeCheckpointMutationResult(value: CheckpointMutationResult): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeCheckpointReplyFrame(reply: CheckpointReply): Uint8Array;
+
+// @public (undocumented)
 function encodeCheckpointRequest(value: CheckpointRequestEnvelope): Map<string, unknown>;
 
 // @public (undocumented)
@@ -3966,6 +4061,12 @@ function encodeDestinationCheckpointStatus(value: DestinationCheckpointStatus): 
 
 // @public (undocumented)
 function encodeDestinationGetRequest(value: DestinationGetRequest): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeDestinationHttpReply(value: DestinationHttpReply): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeDestinationHttpRequest(value: DestinationHttpRequest): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeDestinationIssueJson(value: DestinationIssueView): string;
@@ -6742,7 +6843,7 @@ interface MaintenanceCapabilities {
 }
 
 // @public (undocumented)
-const MANAGED_COMMANDS: readonly [ManagedCommand<undefined, AuthzReply>, ManagedCommand<ListRolesReq, AuthzReply>, ManagedCommand<GetRoleReq, AuthzReply>, ManagedCommand<GetBindingsReq, AuthzReply>, ManagedCommand<DefineRoleReq, AuthzReply>, ManagedCommand<DeleteRoleReq, AuthzReply>, ManagedCommand<BindRolesReq, AuthzReply>, ManagedCommand<QueryEnvelope, QueryReply>, ManagedCommand<QueryPageEnvelope, QueryReply>, ManagedCommand<QueryCancelEnvelope, QueryStatusReply>, ManagedCommand<QueryStatusEnvelope, QueryStatusReply>, ManagedCommand<CheckpointRequestEnvelope, CheckpointReply>, ManagedCommand<DestinationGetRequest, CheckpointReadReply>, ManagedCommand<DestinationListRequest, CheckpointReadReply>, ManagedCommand<QueryRouteListRequest, CheckpointReadReply>, ManagedCommand<GetProjection, BrowseReply>, ManagedCommand<ListProjections, BrowseReply>, ManagedCommand<GetSchema, BrowseReply>, ManagedCommand<ListSchemas, BrowseReply>, ManagedCommand<RegisterSchema, BrowseReply>, ManagedCommand<DecodeRecord, BrowseReply>, ManagedCommand<KvGet, KvReply>, ManagedCommand<KvSet, KvReply>, ManagedCommand<KvScan, KvReply>, ManagedCommand<KvDelete, KvReply>, ManagedCommand<KvDeleteMany, KvReply>, ManagedCommand<undefined, KvReply>, ManagedCommand<ForkCreate, ForkReply>, ManagedCommand<ForkDelete, ForkReply>, ManagedCommand<ForkPromote, ForkReply>, ManagedCommand<undefined, ForkReply>, ManagedCommand<ForkPut, ForkReply>, ManagedCommand<AgentSubmit, AgentReply>, ManagedCommand<AgentCancel, AgentReply>, ManagedCommand<AgentStatusReq, AgentReply>, ManagedCommand<AgentList, AgentReply>];
+const MANAGED_COMMANDS: readonly [ManagedCommand<undefined, AuthzReply>, ManagedCommand<ListRolesReq, AuthzReply>, ManagedCommand<GetRoleReq, AuthzReply>, ManagedCommand<GetBindingsReq, AuthzReply>, ManagedCommand<DefineRoleReq, AuthzReply>, ManagedCommand<DeleteRoleReq, AuthzReply>, ManagedCommand<BindRolesReq, AuthzReply>, ManagedCommand<QueryEnvelope, QueryReply>, ManagedCommand<QueryPageEnvelope, QueryReply>, ManagedCommand<QueryCancelEnvelope, QueryStatusReply>, ManagedCommand<QueryStatusEnvelope, QueryStatusReply>, ManagedCommand<CheckpointRequestEnvelope, CheckpointReply>, ManagedCommand<DestinationGetRequest, CheckpointReadReply>, ManagedCommand<DestinationListRequest, CheckpointReadReply>, ManagedCommand<QueryRouteListRequest, CheckpointReadReply>, ManagedCommand<DestinationHttpRequest, DestinationHttpReply>, ManagedCommand<GetProjection, BrowseReply>, ManagedCommand<ListProjections, BrowseReply>, ManagedCommand<GetSchema, BrowseReply>, ManagedCommand<ListSchemas, BrowseReply>, ManagedCommand<RegisterSchema, BrowseReply>, ManagedCommand<DecodeRecord, BrowseReply>, ManagedCommand<KvGet, KvReply>, ManagedCommand<KvSet, KvReply>, ManagedCommand<KvScan, KvReply>, ManagedCommand<KvDelete, KvReply>, ManagedCommand<KvDeleteMany, KvReply>, ManagedCommand<undefined, KvReply>, ManagedCommand<ForkCreate, ForkReply>, ManagedCommand<ForkDelete, ForkReply>, ManagedCommand<ForkPromote, ForkReply>, ManagedCommand<undefined, ForkReply>, ManagedCommand<ForkPut, ForkReply>, ManagedCommand<AgentSubmit, AgentReply>, ManagedCommand<AgentCancel, AgentReply>, ManagedCommand<AgentStatusReq, AgentReply>, ManagedCommand<AgentList, AgentReply>];
 
 // @public (undocumented)
 const MANAGED_REQUEST_VERSION = 1;
@@ -8734,7 +8835,11 @@ interface QueryRoutePage {
 // @public (undocumented)
 interface QueryRoutePageView {
     // (undocumented)
+    readonly consistency: CheckpointReadConsistency;
+    // (undocumented)
     readonly definitionRevision: bigint;
+    // (undocumented)
+    readonly globalStateRevision: bigint;
     // (undocumented)
     readonly nextCursor?: string;
     // (undocumented)
@@ -9498,7 +9603,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.2.1";
+export const SDK_VERSION = "0.3.0";
 
 // @public (undocumented)
 interface Select {
@@ -9621,8 +9726,6 @@ interface Sort {
 
 // @public (undocumented)
 interface SourceCut {
-    // (undocumented)
-    readonly metadataRevision: bigint;
     // (undocumented)
     readonly partitions: readonly SourcePartitionCut[];
 }
@@ -10829,6 +10932,9 @@ declare namespace wire {
         validateCheckpointRequest,
         validatePublicCheckpointMutation,
         validateSupervisorAssertion,
+        decodeCheckpointMutationResult,
+        encodeCheckpointMutationResult,
+        encodeCheckpointReplyFrame,
         decodeCheckpointReply,
         decodeRetentionGap,
         decodeDestinationBlock,
@@ -10911,6 +11017,7 @@ declare namespace wire {
         AGDX_DESTINATION_GET_CODE,
         AGDX_DESTINATION_LIST_CODE,
         AGDX_QUERY_ROUTE_LIST_CODE,
+        AGDX_DESTINATION_HTTP_CODE,
         AGDX_AUTHZ_BASE,
         AGDX_AUTHZ_WHOAMI_CODE,
         AGDX_AUTHZ_LIST_ROLES_CODE,
@@ -10920,6 +11027,7 @@ declare namespace wire {
         AGDX_AUTHZ_DELETE_ROLE_CODE,
         AGDX_AUTHZ_BIND_ROLES_CODE,
         AGDX_AUTHZ_HISTORY_CODE,
+        AGDX_CONTROL_PUBLISH_CODE,
         AGDX_QUERY_BASE,
         AGDX_QUERY_CODE,
         AGDX_QUERY_PAGE_CODE,
@@ -10967,6 +11075,7 @@ declare namespace wire {
         QUERY_OP_VERSION,
         CONTROL_OP_VERSION,
         CHECKPOINT_OP_VERSION,
+        DESTINATION_HTTP_OP_VERSION,
         KV_OP_VERSION,
         KV_LEASE_OP_VERSION,
         FORK_OP_VERSION,
@@ -10995,6 +11104,7 @@ declare namespace wire {
         DestinationGetCommand,
         DestinationListCommand,
         QueryRouteListCommand,
+        DestinationHttpCommand,
         GetProjectionCommand,
         ListProjectionsCommand,
         GetSchemaCommand,
@@ -11260,6 +11370,10 @@ declare namespace wire {
         BackendLimits,
         BackendDescriptor,
         BackendAnnounce,
+        encodeDestinationHttpRequest,
+        decodeDestinationHttpRequest,
+        encodeDestinationHttpReply,
+        decodeDestinationHttpReply,
         decodeSchemaDefJson,
         decodeForkInfoJson,
         decodeQueryResultJson,
@@ -11359,6 +11473,9 @@ declare namespace wire {
         AcceptedOperationView,
         QueryExecutionView,
         DestinationIssueView,
+        DestinationHttpOperation,
+        DestinationHttpRequest,
+        DestinationHttpReply,
         decodeProjectionListJson,
         encodeProjectionListJson,
         decodeSchemaListJson,
@@ -11696,6 +11813,7 @@ declare namespace wire {
         DEFAULT_FORK_MUTATIONS_TOPIC,
         DEFAULT_RUN_MUTATIONS_TOPIC,
         DEFAULT_GRAPH_MUTATIONS_TOPIC,
+        DEFAULT_CHECKPOINT_MUTATIONS_TOPIC,
         WireTopology,
         encodeValue,
         decodeValue,
@@ -11734,6 +11852,8 @@ abstract class WireId<Brand extends string> {
 interface WireTopology {
     // (undocumented)
     readonly changesTopic: string;
+    // (undocumented)
+    readonly checkpointMutationsTopic: string;
     // (undocumented)
     readonly controlTopic: string;
     // (undocumented)

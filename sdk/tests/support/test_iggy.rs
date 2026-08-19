@@ -130,17 +130,14 @@ impl TestIggy {
         let stream_id = Identifier::named(&stream)?;
         let topic_id = Identifier::named(topic)?;
         if client.get_topic(&stream_id, &topic_id).await?.is_none() {
-            client
-                .create_topic(
-                    &stream_id,
-                    topic,
-                    1,
-                    CompressionAlgorithm::default(),
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
-                )
-                .await?;
+            let options = TopicCreateOptions {
+                partitions_count: Some(1),
+                compression_algorithm: Some(CompressionAlgorithm::default()),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::ServerDefault),
+                ..TopicCreateOptions::default()
+            };
+            client.create_topic(&stream_id, topic, &options).await?;
         }
         let producer = client.producer(&stream, topic)?.build();
         producer.init().await?;
