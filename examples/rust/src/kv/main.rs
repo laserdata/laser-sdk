@@ -1,4 +1,7 @@
-use laser_examples::{init_tracing, laser, managed_feature_ready, phase, stream_for};
+use laser_examples::{
+    PARTITIONS, ensure_view, index_for, init_tracing, laser, managed_feature_ready, phase,
+    stream_for,
+};
 use laser_sdk::prelude::full::*;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -120,10 +123,17 @@ async fn main() -> Result<(), LaserError> {
 
     if capabilities.forks {
         phase("fork: a branch of the same state, promoted or thrown away");
+        let table = index_for(NAMESPACE);
+        laser.topic(NAMESPACE).ensure(PARTITIONS).await?;
+        ensure_view(&laser, NAMESPACE, &table, ContentType::Json, &["plan"]).await?;
         let fork = laser.fork(FORK);
         fork.squash().await?;
-        fork.create().severed().tables([NAMESPACE]).send().await?;
-        fork.put_row(NAMESPACE, 0, 0)
+        fork.create()
+            .severed()
+            .tables([table.as_str()])
+            .send()
+            .await?;
+        fork.put_row(&table, 0, 0)
             .field("plan", "enterprise-preview")
             .send()
             .await?;

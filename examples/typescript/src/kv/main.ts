@@ -1,5 +1,14 @@
 import { KvExecutionError, type Laser } from "@laserdata/laser-sdk"
-import { decodeUtf8, managedGate, phase, runExample, utf8 } from "../common.js"
+import {
+  PARTITIONS,
+  decodeUtf8,
+  ensureView,
+  indexFor,
+  managedGate,
+  phase,
+  runExample,
+  utf8
+} from "../common.js"
 
 export const EXAMPLE = "kv"
 const NAMESPACE = "profiles"
@@ -85,10 +94,13 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   if (managedGate(capabilities, "forks", EXAMPLE)) {
     phase("fork: a branch of the same state, promoted or thrown away")
+    const table = indexFor(NAMESPACE)
+    await laser.topic(NAMESPACE).ensure(PARTITIONS)
+    await ensureView(laser, NAMESPACE, table, ["plan"])
     const fork = laser.fork(FORK)
     await fork.squash()
-    await fork.create().severed().tables([NAMESPACE]).send()
-    await fork.putRow(NAMESPACE, 0, 0n).field("plan", "enterprise-preview").send()
+    await fork.create().severed().tables([table]).send()
+    await fork.putRow(table, 0, 0n).field("plan", "enterprise-preview").send()
     const applied = await fork.promote()
     console.log(`  fork \`${FORK}\` promoted, ${String(applied)} row(s) applied`)
   }

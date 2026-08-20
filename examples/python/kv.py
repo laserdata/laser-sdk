@@ -100,10 +100,13 @@ async def main() -> None:
 
     if caps.forks:
         _common.phase("fork: a branch of the same state, promoted or thrown away")
+        table = _common.index_for(NAMESPACE)
+        await laser.topic(NAMESPACE).ensure(_common.PARTITIONS)
+        await _common.start_projector(laser, NAMESPACE, ["plan"], index=table)
         fork = laser.fork(FORK_ID)
         await fork.squash()
-        await fork.create(severed=True, tables=[NAMESPACE])
-        await fork.put_row(NAMESPACE, 0, 0).field("plan", "enterprise-preview").send()
+        await fork.create(severed=True, tables=[table])
+        await fork.put_row(table, 0, 0).field("plan", "enterprise-preview").send()
         applied = await fork.promote()
         print(f"  fork '{FORK_ID}' promoted, {applied} row(s) applied")
 

@@ -2,7 +2,7 @@
 
 Four verbs: remember, recall, improve, forget. Every change is a message on
 your log, so memory is versioned and auditable by construction. The durable
-log path recalls by recency; the vector backend adds similarity ranking.
+log path recalls by recency. The vector backend adds similarity ranking.
 
 What it shows:
   - remember one fact under a conversation scope
