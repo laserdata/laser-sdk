@@ -17,7 +17,7 @@ struct Order {
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     // Connect once. `stream_for("log")` only names this run's own isolated
-    // stream (so every example can run side by side); the demo below addresses
+    // stream so every example can run side by side. The demo below addresses
     // `shop/orders` explicitly, which any connection can reach.
     let laser = laser(&stream_for("log"), Capabilities::OPEN).await?;
 

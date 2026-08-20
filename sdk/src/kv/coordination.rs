@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 /// Per-attempt bound before an in-flight coordination request is declared
 /// ambiguous and transport retirement begins. Retirement still waits for any
 /// cancellation-safe Iggy request task to stop before recovery proceeds.
-pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The transport seam under [`FencedLeaseClient`]: send one managed command
 /// frame and return the raw reply bytes, or discard connection state after a
@@ -46,7 +46,7 @@ pub trait LocalManagedKvTransport {
 /// a state-provider seam reached through a `#[non_exhaustive]` enum cannot grow
 /// a type parameter without leaking it through every construction and call
 /// site. [`ManagedKvTransport`]'s methods return an anonymous future per
-/// implementation, so that trait has no vtable; this one boxes the future to
+/// implementation, so that trait has no vtable. This one boxes the future to
 /// get one.
 ///
 /// Do not implement this by hand. Every [`ManagedKvTransport`] already
@@ -62,7 +62,7 @@ pub trait LocalManagedKvTransport {
 /// ```
 ///
 /// The boxing costs one allocation per request, against a network round trip
-/// under a whole-request timeout.
+/// under an in-flight request timeout.
 #[async_trait::async_trait]
 pub trait DynManagedKvTransport: Send + Sync {
     /// See [`ManagedKvTransport::ready`].
@@ -244,7 +244,7 @@ impl PreparedMutation {
 /// run the barriered read, over an injectable [`ManagedKvTransport`].
 ///
 /// The mutation flow is two-phase by design. `prepare_*` validates the request
-/// and mints the operation id once; the matching execute method sends the
+/// and mints the operation id once. The matching execute method sends the
 /// exact frame under a per-attempt timeout. A timeout or transport failure
 /// resets the transport and surfaces as [`LaserError::AmbiguousMutation`]. It
 /// is not generically retryable: [`PreparedMutation::ambiguous_recovery`]
@@ -421,16 +421,11 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
     /// value.
     pub async fn get(&self, request: &KvGet) -> Result<Option<KvEntry>, LaserError> {
         Self::ensure_attempt_timeout(self.attempt_timeout)?;
-        let started = tokio::time::Instant::now();
         self.ready().await?;
-        let remaining = self.attempt_timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(LaserError::Timeout("kv coordination get"));
-        }
         let frame = encode_named(request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
         let send = self.transport.send(AGDX_KV_GET_CODE, frame);
-        let reply = match tokio::time::timeout(remaining, send).await {
+        let reply = match tokio::time::timeout(self.attempt_timeout, send).await {
             Err(_elapsed) => {
                 self.transport.reset().await;
                 return Err(LaserError::Timeout("kv coordination get"));
@@ -455,14 +450,13 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
         attempt_timeout: Duration,
     ) -> Result<KvOutcome, LaserError> {
         Self::ensure_attempt_timeout(attempt_timeout)?;
-        let started = tokio::time::Instant::now();
         if op.client_id != self.client_id {
             return Err(LaserError::Invalid(
                 "prepared mutation belongs to a different fenced-lease client".to_owned(),
             ));
         }
         // A prepared release replayed through `acquire` would coerce outcomes
-        // across operations; the pairing is checked, not assumed.
+        // across operations. The pairing is checked, not assumed.
         if op.code != expected_code {
             return Err(LaserError::Invalid(format!(
                 "prepared mutation carries code {} but was executed as {what}",
@@ -470,16 +464,12 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
             )));
         }
         self.ready_with_timeout(attempt_timeout).await?;
-        let remaining = attempt_timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(LaserError::Timeout("kv coordination mutation readiness"));
-        }
         let send = self.transport.send(op.code, op.frame.clone());
-        let reply = match tokio::time::timeout(remaining, send).await {
+        let reply = match tokio::time::timeout(attempt_timeout, send).await {
             Err(_elapsed) => {
                 self.transport.reset().await;
                 return Err(LaserError::AmbiguousMutation(format!(
-                    "{what} attempt exceeded {:?}; operation-specific recovery is required",
+                    "{what} attempt exceeded {:?} and requires operation-specific recovery",
                     attempt_timeout,
                 )));
             }
@@ -631,6 +621,29 @@ mod tests {
         }
     }
 
+    struct SlowReadyTransport {
+        ready_delay: Duration,
+        send_delay: Duration,
+    }
+
+    impl ManagedKvTransport for &SlowReadyTransport {
+        async fn ready(&self) -> Result<(), LaserError> {
+            tokio::time::sleep(self.ready_delay).await;
+            Ok(())
+        }
+
+        async fn send(&self, _code: u32, _frame: Vec<u8>) -> Result<Vec<u8>, LaserError> {
+            tokio::time::sleep(self.send_delay).await;
+            ok_reply(KvOutcome::Leased {
+                lease_token: 9,
+                granted_ttl_micros: 30_000_000,
+                position: position(),
+            })
+        }
+
+        async fn reset(&self) {}
+    }
+
     fn ok_reply(outcome: KvOutcome) -> Result<Vec<u8>, LaserError> {
         Ok(encode_named(&KvReply::Ok(outcome)).expect("reply encodes"))
     }
@@ -768,6 +781,29 @@ mod tests {
         let outcome = client.acquire(&op).await;
         assert!(matches!(outcome, Err(LaserError::AmbiguousMutation(_))));
         assert_eq!(stub.resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn given_slow_readiness_when_send_fits_the_bound_then_should_not_report_ambiguous() {
+        let transport = SlowReadyTransport {
+            ready_delay: Duration::from_millis(125),
+            send_delay: Duration::from_millis(125),
+        };
+        let client =
+            FencedLeaseClient::new(&transport).with_attempt_timeout(Duration::from_millis(200));
+        let op = client.prepare_acquire(&lease_request()).expect("prepares");
+
+        let lease = client.acquire(&op).await.expect("acquires after readiness");
+
+        assert_eq!(lease.token, 9);
+    }
+
+    #[test]
+    fn given_default_client_when_built_then_should_allow_ten_second_attempts() {
+        let stub = StubTransport::answering(Vec::new());
+        let client = FencedLeaseClient::new(&stub);
+
+        assert_eq!(client.attempt_timeout, Duration::from_secs(10));
     }
 
     #[tokio::test]
