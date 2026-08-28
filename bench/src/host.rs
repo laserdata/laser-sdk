@@ -197,6 +197,7 @@ impl HostAudit {
 /// # Errors
 ///
 /// Returns an error when the set is empty, contains an unsupported CPU index, or Linux rejects the affinity update.
+#[cfg(target_os = "linux")]
 pub fn pin_process(pid: u32, cpus: &[u32]) -> Result<(), BenchError> {
     if cpus.is_empty() {
         return Err(BenchError::Invalid(
@@ -234,6 +235,23 @@ pub fn pin_process(pid: u32, cpus: &[u32]) -> Result<(), BenchError> {
         )));
     }
     Ok(())
+}
+
+/// Report that exact process affinity is unavailable outside Linux.
+///
+/// # Errors
+///
+/// Always returns an error because the authoritative benchmark affinity contract requires Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_process(_pid: u32, cpus: &[u32]) -> Result<(), BenchError> {
+    if cpus.is_empty() {
+        return Err(BenchError::Invalid(
+            "process CPU set cannot be empty".to_owned(),
+        ));
+    }
+    Err(BenchError::Invalid(
+        "process CPU affinity requires Linux".to_owned(),
+    ))
 }
 
 fn validate_core_sets(
