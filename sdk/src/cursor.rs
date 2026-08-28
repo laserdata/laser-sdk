@@ -162,7 +162,7 @@ impl Cursor {
         let mut collected: Vec<(u64, u32, u64, IggyMessage)> = Vec::new();
         for partition in 0..partitions as u32 {
             let batch = crate::poll::drain_partition(
-                self.laser.client(),
+                &self.laser.client(),
                 &self.stream,
                 &self.topic,
                 &self.consumer,

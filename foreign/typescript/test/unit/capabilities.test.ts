@@ -2,9 +2,14 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   OPEN_CAPABILITIES,
+  backend,
+  enabledBackends,
+  isReady,
   managedCapabilitiesFrom,
+  readinessReasons,
   requireCapability,
-  servesConsistency
+  servesConsistency,
+  unreadyBackends
 } from "../../src/client/capabilities.js"
 import { UnsupportedError } from "../../src/client/errors.js"
 import { BackendResourceId } from "../../src/wire/ids.js"
@@ -57,12 +62,36 @@ void test("structured ready backend drives query and destination capabilities", 
 })
 
 void test("unavailable announcement fails closed", () => {
+  const resourceId = BackendResourceId.fromU128(9n)
+  const descriptor = {
+    ...newBackendDescriptor(
+      resourceId,
+      "operational",
+      "Embedded",
+      { kind: "turso", version: "1" },
+      1n,
+      1n
+    ),
+    desiredState: "enabled" as const,
+    observedState: "unavailable" as const,
+    readiness: {
+      ready: false,
+      reasons: [{ code: "probe_failed" as const }],
+      observedAtMicros: 4n
+    }
+  }
   const capabilities = managedCapabilitiesFrom({
     versions: newOpVersions(2, 2, 1, 1),
     ready: false,
-    backends: []
+    backends: [descriptor]
   })
   assert.equal(capabilities.managed, false)
   assert.equal(capabilities.query.available, false)
   assert.equal(capabilities.destinations.available, false)
+  assert.equal(capabilities.backends.length, 1)
+  assert.equal(backend(capabilities, resourceId)?.label, "Embedded")
+  assert.equal(enabledBackends(capabilities).length, 1)
+  assert.equal(unreadyBackends(capabilities).length, 1)
+  assert.equal(readinessReasons(capabilities, resourceId)?.[0]?.code, "probe_failed")
+  assert.equal(isReady(capabilities), false)
 })

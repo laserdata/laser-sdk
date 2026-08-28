@@ -44,7 +44,7 @@ LASER_TOKEN='<token>' \
   cargo run --example event-analytics
 ```
 
-For a LaserData host (`*.laserdata.cloud` or `*.laserdata.com`) TLS and the SDK-embedded CA attach automatically, even when you pass only the connection string. Point `LASER_TLS_CERT=<path>` at any CA file to override, the same knob as the connection string's `tls_ca_file=`. A string that already sets `tls_ca_file=`, a non-LaserData host, or `LASER_NO_TLS=1` is left untouched.
+For a LaserData host (`*.laserdata.cloud` or `*.laserdata.com`) TLS and the SDK-embedded CA attach automatically, even when you pass only the connection string. `LASER_TLS_CERT=<path>` enables TLS with that CA for any host or overrides the embedded CA. A connection string that already sets `tls_ca_file=` remains authoritative, and `LASER_NO_TLS=1` disables automatic TLS setup.
 
 ### Environment variables
 
@@ -54,7 +54,7 @@ For a LaserData host (`*.laserdata.cloud` or `*.laserdata.com`) TLS and the SDK-
 | `LASER_SERVER` | bootstrap host, paired with the auth variables below |
 | `LASER_TOKEN` | personal access token auth |
 | `LASER_USERNAME`, `LASER_PASSWORD` | username and password auth |
-| `LASER_TLS_CERT` | path to a CA cert, overrides auto-attach |
+| `LASER_TLS_CERT` | path to a CA cert, enables TLS for any host or overrides the embedded CA |
 | `LASER_NO_TLS=1` | disable TLS |
 | `LASER_STREAM` | overrides the data stream for every example (default: a per-invocation `laser-<example>-<token>` stream, so repeat and concurrent runs never share state). Set it to your provisioned stream on a managed deployment so the SDK uses it and does not auto-create one, at the cost of repeat runs sharing its state |
 

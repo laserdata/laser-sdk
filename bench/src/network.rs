@@ -1,18 +1,28 @@
 use std::collections::BTreeMap;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::mem::size_of;
 
 use serde::{Deserialize, Serialize};
 use strum::{Display, IntoStaticStr};
 
+#[cfg(target_os = "linux")]
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
+#[cfg(target_os = "linux")]
 const INET_DIAG_INFO: u16 = 2;
+#[cfg(target_os = "linux")]
 const TCP_ESTABLISHED: u8 = 1;
+#[cfg(target_os = "linux")]
 const NLM_F_REQUEST: u16 = 1;
+#[cfg(target_os = "linux")]
 const NLM_F_ROOT: u16 = 0x100;
+#[cfg(target_os = "linux")]
 const NLM_F_MATCH: u16 = 0x200;
+#[cfg(target_os = "linux")]
 const NLMSG_ERROR: u16 = 2;
+#[cfg(target_os = "linux")]
 const NLMSG_DONE: u16 = 3;
+#[cfg(target_os = "linux")]
 const NO_COOKIE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Deserialize, Display, IntoStaticStr, Serialize, PartialEq, Eq)]
@@ -192,6 +202,7 @@ impl NetworkSnapshot {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct InetDiagSockId {
     source_port: u16,
     destination_port: u16,
@@ -202,6 +213,7 @@ struct InetDiagSockId {
 }
 
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct InetDiagRequest {
     family: u8,
     protocol: u8,
@@ -212,6 +224,7 @@ struct InetDiagRequest {
 }
 
 #[repr(C)]
+#[cfg(target_os = "linux")]
 struct NetlinkRequest {
     header: libc::nlmsghdr,
     body: InetDiagRequest,
@@ -219,6 +232,7 @@ struct NetlinkRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct InetDiagMessage {
     family: u8,
     state: u8,
@@ -234,6 +248,7 @@ struct InetDiagMessage {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct RouteAttribute {
     length: u16,
     kind: u16,
@@ -446,6 +461,7 @@ mod linux {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_copy<T: Copy>(bytes: &[u8], offset: usize) -> Result<T, io::Error> {
     if offset.saturating_add(size_of::<T>()) > bytes.len() {
         return Err(invalid_data("truncated kernel network response"));
@@ -454,10 +470,12 @@ fn read_copy<T: Copy>(bytes: &[u8], offset: usize) -> Result<T, io::Error> {
     Ok(unsafe { bytes.as_ptr().add(offset).cast::<T>().read_unaligned() })
 }
 
+#[cfg(target_os = "linux")]
 const fn align4(length: usize) -> usize {
     length.saturating_add(3) & !3
 }
 
+#[cfg(target_os = "linux")]
 fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }

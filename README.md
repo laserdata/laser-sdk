@@ -295,7 +295,7 @@ Laser Stack runs the LaserData Apache Iggy fork with `laser-plane`. Apache Iggy 
 
 ### TLS
 
-Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the public LaserData CA bundled with the SDK. `LASER_TLS_CERT=<path>` overrides that CA, and `LASER_NO_TLS=1` disables automatic TLS setup. Other hosts keep the TLS settings from their connection string.
+Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the public LaserData CA bundled with the SDK. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup. Other hosts keep the TLS settings from their connection string when neither variable is set.
 
 ## Documentation
 

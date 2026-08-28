@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,7 +53,7 @@ struct DeterministicEmbedder {
 }
 
 impl Embedder for DeterministicEmbedder {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, LaserError> {
+    fn embed(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, LaserError>> + Send {
         let mut state = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
             hash.wrapping_mul(0x100_0000_01b3)
                 .wrapping_add(u64::from(byte))
@@ -77,7 +78,7 @@ impl Embedder for DeterministicEmbedder {
                 *component /= norm;
             }
         }
-        Ok(embedding)
+        std::future::ready(Ok(embedding))
     }
 }
 

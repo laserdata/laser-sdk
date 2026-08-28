@@ -5,7 +5,7 @@ use crate::publish::{PyBatchPublish, PyPublish};
 use crate::reader::PyCursor;
 use crate::transport::{
     ConsumerConfig, PyConsumer, PyConsumerGroupTarget, PyProducer, configure_consumer, duration_ms,
-    partitioning,
+    partitioning, positive_duration_ms,
 };
 use crate::typed::{PyTypedRecords, body_to_json};
 use iggy::prelude::{DirectConfig, IggyExpiry, MaxTopicSize};
@@ -196,7 +196,13 @@ impl PyTopic {
                     .build(),
             )
             .partitioning(partitioning(key, partition)?)
-            .send_retries(retries, Some(duration_ms(retry_interval_ms)));
+            .send_retries(
+                retries,
+                Some(positive_duration_ms(
+                    retry_interval_ms,
+                    "retry_interval_ms",
+                )?),
+            );
         builder = if create_stream {
             builder.create_stream_if_not_exists()
         } else {

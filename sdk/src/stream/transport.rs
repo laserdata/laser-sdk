@@ -5,9 +5,8 @@ use bytes::Bytes;
 use futures::Stream;
 use iggy::prelude::{
     AutoCommit, AutoCommitWhen, BackgroundConfig, ConsumerGroupClient, DirectConfig, Identifier,
-    IggyConsumer, IggyConsumerBuilder, IggyDuration, IggyExpiry, IggyMessage, IggyProducer,
-    IggyTimestamp, MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage,
-    SendMessagesResponse,
+    IggyConsumer, IggyConsumerBuilder, IggyExpiry, IggyMessage, IggyProducer, IggyTimestamp,
+    MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage, SendMessagesResponse,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -108,15 +107,6 @@ pub enum CommitPolicy {
 
 impl CommitPolicy {
     fn into_auto_commit(self) -> Result<AutoCommit, LaserError> {
-        let interval = |duration: Duration| {
-            if duration.is_zero() {
-                Err(LaserError::Invalid(
-                    "commit interval must be greater than zero".to_owned(),
-                ))
-            } else {
-                Ok(IggyDuration::from(duration))
-            }
-        };
         let every = |messages: u32| {
             if messages == 0 {
                 Err(LaserError::Invalid(
@@ -128,27 +118,44 @@ impl CommitPolicy {
         };
         Ok(match self {
             Self::Disabled => AutoCommit::Disabled,
-            Self::Interval(duration) => AutoCommit::Interval(interval(duration)?),
+            Self::Interval(duration) => AutoCommit::Interval(positive_duration(
+                duration,
+                "commit interval must be greater than zero",
+            )?),
             Self::Polling => AutoCommit::When(AutoCommitWhen::PollingMessages),
-            Self::IntervalOrPolling(duration) => {
-                AutoCommit::IntervalOrWhen(interval(duration)?, AutoCommitWhen::PollingMessages)
-            }
+            Self::IntervalOrPolling(duration) => AutoCommit::IntervalOrWhen(
+                positive_duration(duration, "commit interval must be greater than zero")?,
+                AutoCommitWhen::PollingMessages,
+            ),
             Self::All => AutoCommit::When(AutoCommitWhen::ConsumingAllMessages),
             Self::IntervalOrAll(duration) => AutoCommit::IntervalOrWhen(
-                interval(duration)?,
+                positive_duration(duration, "commit interval must be greater than zero")?,
                 AutoCommitWhen::ConsumingAllMessages,
             ),
             Self::Each => AutoCommit::When(AutoCommitWhen::ConsumingEachMessage),
             Self::IntervalOrEach(duration) => AutoCommit::IntervalOrWhen(
-                interval(duration)?,
+                positive_duration(duration, "commit interval must be greater than zero")?,
                 AutoCommitWhen::ConsumingEachMessage,
             ),
             Self::Every(messages) => AutoCommit::When(every(messages)?),
-            Self::IntervalOrEvery(duration, messages) => {
-                AutoCommit::IntervalOrWhen(interval(duration)?, every(messages)?)
-            }
+            Self::IntervalOrEvery(duration, messages) => AutoCommit::IntervalOrWhen(
+                positive_duration(duration, "commit interval must be greater than zero")?,
+                every(messages)?,
+            ),
         })
     }
+}
+
+fn positive_duration<T>(duration: Duration, message: &'static str) -> Result<T, LaserError>
+where
+    T: TryFrom<Duration>,
+{
+    if duration.is_zero() {
+        return Err(LaserError::Invalid(message.to_owned()));
+    }
+    duration
+        .try_into()
+        .map_err(|_| LaserError::Invalid(message.to_owned()))
 }
 
 /// A raw streaming record with optional exact-width user headers.
@@ -325,9 +332,18 @@ impl ProducerBuilder {
                     .build(),
             ),
         };
+        let retry_interval = self
+            .retry_interval
+            .map(|duration| {
+                positive_duration(
+                    duration,
+                    "producer retry interval must be greater than zero",
+                )
+            })
+            .transpose()?;
         builder = builder
             .partitioning(self.routing.into_partitioning()?)
-            .send_retries(self.retries, self.retry_interval.map(IggyDuration::from));
+            .send_retries(self.retries, retry_interval);
         builder = if self.create_stream {
             builder.create_stream_if_not_exists()
         } else {
@@ -591,7 +607,10 @@ impl ConsumerBuilder {
             .batch_length(self.batch_length)
             .polling_strategy(self.start.into_polling())
             .auto_commit(self.commit.into_auto_commit()?)
-            .polling_retry_interval(self.polling_retry_interval.into());
+            .polling_retry_interval(positive_duration(
+                self.polling_retry_interval,
+                "consumer polling retry interval must be greater than zero",
+            )?);
         builder = match self.poll_interval {
             Some(interval) => builder.poll_interval(interval.into()),
             None => builder.without_poll_interval(),
@@ -609,7 +628,13 @@ impl ConsumerBuilder {
             };
         }
         if let Some((retries, interval)) = self.init_retries {
-            builder = builder.init_retries(retries, interval.into());
+            builder = builder.init_retries(
+                retries,
+                positive_duration(
+                    interval,
+                    "consumer initialization retry interval must be greater than zero",
+                )?,
+            );
         }
         if self.allow_replay {
             builder = builder.allow_replay();

@@ -121,7 +121,7 @@ jobs:
           enable-cache: true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: 1.98.0
       - name: Build the extension and install test dependencies
         run: uv sync --locked --extra testing
       - name: Verify the stub is current
@@ -275,7 +275,7 @@ jobs:
           python-version: "3.10"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: 1.98.0
       - uses: actions/download-artifact@v4
         with:
           name: sdist

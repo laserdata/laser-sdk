@@ -933,7 +933,7 @@ impl LogMemory {
         let mut drained: Vec<(u32, u64, Vec<IggyMessage>)> = Vec::new();
         for partition in 0..partitions {
             let batch = crate::poll::drain_partition(
-                self.laser.client(),
+                &self.laser.client(),
                 &stream,
                 &topic,
                 &consumer,

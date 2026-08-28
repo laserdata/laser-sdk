@@ -1,6 +1,7 @@
 use laser_wire::checkpoint::CheckpointReadConsistency;
 use laser_wire::query::Consistency;
 
+pub use laser_wire::destination::BackendResourceId;
 pub use laser_wire::hello::{
     BackendDescriptor, BackendDesiredState, BackendImplementation, BackendLimits, BackendMode,
     BackendObservedState, BackendReadiness, BackendReadinessCode, BackendReadinessReason,
@@ -158,6 +159,46 @@ impl Capabilities {
     /// SDK (`OPEN`).
     pub fn is_open_only(&self) -> bool {
         *self == Self::OPEN
+    }
+
+    pub fn backend(&self, resource_id: BackendResourceId) -> Option<&BackendDescriptor> {
+        self.backends
+            .iter()
+            .find(|backend| backend.resource_id == resource_id)
+    }
+
+    pub fn enabled_backends(&self) -> impl Iterator<Item = &BackendDescriptor> {
+        self.backends
+            .iter()
+            .filter(|backend| backend.desired_state == BackendDesiredState::Enabled)
+    }
+
+    pub fn unready_backends(&self) -> impl Iterator<Item = &BackendDescriptor> {
+        self.enabled_backends().filter(|backend| {
+            backend.observed_state != BackendObservedState::Ready || !backend.readiness.ready
+        })
+    }
+
+    pub fn readiness_reasons(
+        &self,
+        resource_id: BackendResourceId,
+    ) -> Option<&[BackendReadinessReason]> {
+        self.backend(resource_id)
+            .map(|backend| backend.readiness.reasons.as_slice())
+    }
+
+    pub fn is_ready(&self) -> bool {
+        if !self.managed {
+            return false;
+        }
+        let mut enabled = self.enabled_backends();
+        let Some(first) = enabled.next() else {
+            return false;
+        };
+        let ready = |backend: &BackendDescriptor| {
+            backend.observed_state == BackendObservedState::Ready && backend.readiness.ready
+        };
+        ready(first) && enabled.all(ready)
     }
 
     // The struct is `#[non_exhaustive]`, so these chainable setters are the
@@ -348,6 +389,26 @@ mod tests {
     use super::*;
     use laser_wire::hello::feature;
 
+    fn backend(
+        id: u128,
+        desired: BackendDesiredState,
+        observed: BackendObservedState,
+        readiness: BackendReadiness,
+    ) -> BackendDescriptor {
+        BackendDescriptor::new(
+            BackendResourceId::from_u128(id),
+            BackendMode::Operational,
+            format!("backend-{id}"),
+            BackendImplementation {
+                kind: "embedded".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            1,
+            1,
+        )
+        .with_state(desired, observed, readiness)
+    }
+
     #[test]
     fn given_advertised_feature_bits_when_merged_then_should_light_up_the_capabilities() {
         let mut caps = Capabilities::OPEN;
@@ -463,5 +524,58 @@ mod tests {
         assert_eq!(caps.backends.len(), 2);
         assert_eq!(caps.backends[1].label, "Warehouse");
         assert!(!caps.is_open_only() && !caps.managed);
+    }
+
+    #[test]
+    fn given_enabled_ready_backends_when_checking_readiness_then_should_be_ready() {
+        let first_id = BackendResourceId::from_u128(1);
+        let caps = Capabilities::OPEN.with_managed(true).with_backends(vec![
+            backend(
+                1,
+                BackendDesiredState::Enabled,
+                BackendObservedState::Ready,
+                BackendReadiness::ready(1),
+            ),
+            backend(
+                2,
+                BackendDesiredState::Disabled,
+                BackendObservedState::Disabled,
+                BackendReadiness::not_ready(BackendReadinessCode::Disabled),
+            ),
+        ]);
+        assert!(caps.is_ready());
+        assert_eq!(
+            caps.backend(first_id).map(|backend| backend.label.as_str()),
+            Some("backend-1")
+        );
+        assert_eq!(caps.enabled_backends().count(), 1);
+        assert_eq!(caps.unready_backends().count(), 0);
+        assert_eq!(caps.readiness_reasons(first_id), Some([].as_slice()));
+    }
+
+    #[test]
+    fn given_starting_backend_when_checking_readiness_then_reason_should_be_exposed() {
+        let id = BackendResourceId::from_u128(3);
+        let caps = Capabilities::OPEN
+            .with_managed(true)
+            .with_backends(vec![backend(
+                3,
+                BackendDesiredState::Enabled,
+                BackendObservedState::Starting,
+                BackendReadiness::not_ready(BackendReadinessCode::ConfigurationPending),
+            )]);
+        assert!(!caps.is_ready());
+        assert_eq!(caps.unready_backends().count(), 1);
+        assert_eq!(
+            caps.readiness_reasons(id)
+                .and_then(|reasons| reasons.first())
+                .map(|reason| reason.code),
+            Some(BackendReadinessCode::ConfigurationPending)
+        );
+    }
+
+    #[test]
+    fn given_managed_without_enabled_backends_when_checking_readiness_then_should_not_be_ready() {
+        assert!(!Capabilities::OPEN.with_managed(true).is_ready());
     }
 }

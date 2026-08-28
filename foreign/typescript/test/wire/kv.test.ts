@@ -158,14 +158,14 @@ void test("given_out_of_range_lease_ttls_when_encoded_then_should_reject_both_en
   )
 })
 
-void test("given_a_v1_lease_shape_when_decoded_then_should_fail_closed", () => {
+void test("given_an_unsupported_lease_version_when_decoded_then_should_fail_closed", () => {
   const map = encodeKvLease({
     namespace: "coordination",
     key: new TextEncoder().encode("owner"),
     leaseTtlMicros: 30_000_000n,
     holderId: "worker-1"
   })
-  map.set("v", 1)
+  map.set("v", 2)
   assert.throws(() => decodeKvLease(map, "lease"), CodecError)
 })
 

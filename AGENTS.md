@@ -20,7 +20,7 @@ This repo is one workspace holding two published crates. **laser-wire** is the L
 
 These change the on-the-wire or public contract and break data or downstreams:
 
-- Editing ANYTHING in `wire/src/` that alters encoded payload: command codes, op versions, header keys (`wire/src/headers.rs`), topic names, envelope field names or serde attributes, the content-type / task-state / error-code u8 dictionaries, or the caps. Every message already on the log and every consumer (LaserData Cloud, Iggy server) is pinned to those bytes. The golden corpus under `wire/fixtures/` will fail on drift. During the pre-1.0 package line an intentional breaking change increments the affected operation version and must update fixtures plus every consumer and implementation as one release unit.
+- Editing ANYTHING in `wire/src/` that alters encoded payload: command codes, op versions, header keys (`wire/src/headers.rs`), topic names, envelope field names or serde attributes, the content-type / task-state / error-code u8 dictionaries, or the caps. Every message already on the log and every consumer (LaserData Cloud, Iggy server) is pinned to those bytes. The golden corpus under `wire/fixtures/` will fail on drift. Before the first published contract, intentional breaking changes keep operation versions at 1 and must update fixtures plus every consumer and implementation as one release unit. Once a contract version ships, a breaking change increments the affected operation version.
 - Changing `ConversationId::derive` (the FNV-1a algorithm in `sdk/src/types/ids.rs`) without bumping `DERIVE_VERSION` - silently remaps every `SessionPolicy::PerUser` conversation. (`AgentId::wire_id` is no longer a hash: the wire agent id is the name string verbatim.)
 - Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`) - repoints live topics.
 - Changing `Provenance::partition_key` (currently `conversation_id`) - breaks the per-conversation ordering guarantee.
@@ -76,7 +76,7 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
     result.rs           unified ResultCode space + HTTP status, From projections off every surface error
     browse.rs           registry browse requests + BrowseReply (incl. DecodeRecord)
     control.rs          Projection / ProjectionBinding / SchemaDef / ControlEnvelope + builders
-    kv.rs               KV requests (incl. KvCas/CasExpect and the fenced-lease family KvLease/KvLeaseRenew/KvRelease/KvCasFenced at KV_LEASE_OP_VERSION 2: holder identity, delegated subject, coordination namespace, barriered KvGet.min_position) + KvReply (incl. Committed/Leased/Renewed) / KvError (incl. VersionConflict/LeaseLost/Stale) + entry version
+    kv.rs               KV requests (incl. KvCas/CasExpect and the fenced-lease family KvLease/KvLeaseRenew/KvRelease/KvCasFenced at KV_LEASE_OP_VERSION 1: holder identity, delegated subject, coordination namespace, barriered KvGet.min_position) + KvReply (incl. Committed/Leased/Renewed) / KvError (incl. VersionConflict/LeaseLost/Stale) + entry version
     fork.rs             fork requests + ForkReply/ForkError
     agent.rs            the Agent Data Exchange Protocol: AgentEnvelope, machine ids (16-byte u128 + Crockford), agent ids (bounded name strings)
                         base32), AgentKind, TaskState/AgentErrorCode/DeadLetterReason u8
@@ -117,9 +117,10 @@ sdk/src/
                       `include_bytes!`) for a `*.laserdata.cloud`/`*.laserdata.com` host with no
                       `tls_ca_file=` query parameter already set. The bundled CA is cached in a
                       per-user, owner-only directory and reused only when its bytes still match
-                      the bundled cert. `LASER_TLS_CERT` overrides the cert, `LASER_NO_TLS=1`
-                      disables the whole check (read by value, so `0`/`false` do not), any other
-                      host passes through untouched
+                      the bundled cert. `LASER_TLS_CERT` enables TLS with an explicit CA for any
+                      host or overrides the bundled cert. `LASER_NO_TLS=1` disables automatic TLS
+                      setup (read by value, so `0`/`false` do not). Any other host passes through
+                      untouched when neither variable is set
   types/              mod.rs re-exports the id types, ids.rs: ConversationId / AgentId /
                       MessageId (FromStr+Display) + the AGDX id bridge (MintUlid, ConversationId
                       <-> wire id, AgentId::wire_id = the name verbatim)
@@ -335,7 +336,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-Audited against the current tree at `0.3.0` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
+Audited against the current tree at `0.3.1` (every symbol below grep-verified to exist with the described shape). This is the one canonical shipped/planned inventory for the workspace, and skill files point here rather than keeping their own copy. Do not document planned API as shipped.
 
 These features exist to exercise the **seams** the paid tiers plug into: their premium forms are managed/durable backends (durable dedup, the knowledge graph, an A2A gateway) activated by capability negotiation, not code changes. Agentic memory has no managed surface of its own, it composes the query and graph surfaces.
 

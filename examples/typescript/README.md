@@ -51,7 +51,7 @@ Set `LASER_STREAM` to the stream provisioned for the deployment. The helper uses
 | `LASER_SERVER` | Host paired with `LASER_TOKEN` or username and password |
 | `LASER_TOKEN` | Personal access token |
 | `LASER_USERNAME`, `LASER_PASSWORD` | Username and password used with `LASER_SERVER` |
-| `LASER_TLS_CERT` | CA file that overrides the embedded LaserData CA |
+| `LASER_TLS_CERT` | CA file that enables TLS for any host or overrides the embedded LaserData CA |
 | `LASER_NO_TLS=1` | Disables automatic TLS |
 | `LASER_STREAM` | Overrides the per-invocation `laser-<example>-<token>` stream |
 | `LASER_MESSAGES` | Record count for examples that publish a configurable workload |

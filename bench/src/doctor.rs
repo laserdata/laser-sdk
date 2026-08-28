@@ -192,6 +192,7 @@ fn uds_probe() -> Result<bool, BenchError> {
     Ok(listener.is_ok())
 }
 
+#[allow(clippy::useless_conversion)] // `statvfs` field widths differ between Linux and macOS.
 fn available_disk_bytes(path: &Path) -> Result<u64, BenchError> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         BenchError::Invalid(format!("disk probe path `{}` contains NUL", path.display()))
@@ -206,7 +207,7 @@ fn available_disk_bytes(path: &Path) -> Result<u64, BenchError> {
     }
     // SAFETY: a successful `statvfs` call initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+    Ok(u64::from(stats.f_bavail).saturating_mul(u64::from(stats.f_frsize)))
 }
 
 fn required_disk_bytes(manifest: &SuiteManifest) -> u64 {

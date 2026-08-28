@@ -239,13 +239,11 @@ pub const CONTROL_OP_VERSION: u32 = 1;
 /// Wire version of the KV op envelopes.
 pub const KV_OP_VERSION: u32 = 1;
 /// Wire version of the fenced-lease op family: `KvLease`, `KvLeaseRenew`,
-/// `KvRelease`, and `KvCasFenced`. Bumped past [`KV_OP_VERSION`] by the
-/// holder-identity reshape so a v1 payload and a v2 payload can never be
-/// mistaken for each other: the reshaped fields are required with no serde
-/// defaults (an old payload fails decode) and [`crate::validate::Validate`]
-/// rejects any other `v` (a typed error, fail-closed). The rest of the KV
-/// surface stays at [`KV_OP_VERSION`].
-pub const KV_LEASE_OP_VERSION: u32 = 2;
+/// `KvRelease`, and `KvCasFenced`. The holder-identity shape was finalized
+/// before publication, so it remains at version 1 with the rest of the KV
+/// surface. Its required fields have no serde defaults and
+/// [`crate::validate::Validate`] rejects any other `v` fail-closed.
+pub const KV_LEASE_OP_VERSION: u32 = 1;
 /// Wire version of the fork op envelopes.
 pub const FORK_OP_VERSION: u32 = 1;
 /// Wire version of the graph op envelopes.

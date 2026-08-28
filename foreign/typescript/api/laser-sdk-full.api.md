@@ -5831,7 +5831,7 @@ export class Kv {
 }
 
 // @public (undocumented)
-const KV_LEASE_OP_VERSION = 2;
+const KV_LEASE_OP_VERSION = 1;
 
 // @public (undocumented)
 const KV_OP_VERSION = 1;
@@ -6550,6 +6550,8 @@ export class Laser implements AsyncDisposable {
     unquarantine(operator: AgentId, agent: AgentId): Promise<void>;
     // (undocumented)
     unquarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void>;
+    // (undocumented)
+    waitUntilReady(timeoutMs: number): Promise<Capabilities>;
     // (undocumented)
     watch(): Watch;
     // (undocumented)
@@ -9603,7 +9605,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.3.0";
+export const SDK_VERSION = "0.3.1";
 
 // @public (undocumented)
 interface Select {

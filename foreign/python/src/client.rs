@@ -1,5 +1,5 @@
 use crate::async_bridge::future_into_py;
-use crate::convert::py_to_de;
+use crate::convert::{duration_seconds, py_to_de};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::PyKeyRegistry;
 use laser_sdk::capabilities::{BackendDescriptor, Capabilities, OpVersions};
@@ -250,6 +250,22 @@ impl PyLaser {
         })
     }
 
+    fn wait_until_ready<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let timeout = duration_seconds(timeout_secs, "timeout_secs")?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .wait_until_ready(timeout)
+                .await
+                .map(PyCapabilities::from)
+                .map_err(to_pyerr)
+        })
+    }
+
     /// Execute independent managed command frames in one round trip. Each
     /// input dict has `code` and raw `payload` fields. Results are raw reply
     /// frames in the same order. This is not a transaction.
@@ -406,6 +422,46 @@ impl From<Capabilities> for PyCapabilities {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCapabilities {
+    fn backend(&self, resource_id: &str) -> Option<PyBackendDescriptor> {
+        self.backends
+            .iter()
+            .find(|backend| backend.resource_id == resource_id)
+            .cloned()
+    }
+
+    fn enabled_backends(&self) -> Vec<PyBackendDescriptor> {
+        self.backends
+            .iter()
+            .filter(|backend| backend.desired_state == "enabled")
+            .cloned()
+            .collect()
+    }
+
+    fn unready_backends(&self) -> Vec<PyBackendDescriptor> {
+        self.enabled_backends()
+            .into_iter()
+            .filter(|backend| backend.observed_state != "ready" || !backend.ready)
+            .collect()
+    }
+
+    fn readiness_reasons(&self, py: Python<'_>, resource_id: &str) -> PyResult<Py<PyAny>> {
+        let reasons = self
+            .backends
+            .iter()
+            .find(|backend| backend.resource_id == resource_id)
+            .map(|backend| backend.inner.readiness.reasons.clone());
+        crate::convert::ser_to_py(py, &reasons)
+    }
+
+    fn is_ready(&self) -> bool {
+        let enabled = self.enabled_backends();
+        self.managed
+            && !enabled.is_empty()
+            && enabled
+                .iter()
+                .all(|backend| backend.observed_state == "ready" && backend.ready)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Capabilities(managed={}, query={}, destinations={}, kv={}, graph={}, forks={}, kv_cas={}, backends={})",

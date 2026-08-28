@@ -486,10 +486,13 @@ mod tests {
         };
         assert!(valid.validate().is_ok());
         let wrong_version = KvLease {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION + 1,
             ..valid.clone()
         };
-        assert!(wrong_version.validate().is_err(), "v1 is rejected typed");
+        assert!(
+            wrong_version.validate().is_err(),
+            "an unsupported version is rejected typed"
+        );
         let empty_holder = KvLease {
             holder_id: String::new(),
             ..valid.clone()
@@ -621,10 +624,13 @@ mod tests {
         };
         assert!(valid.validate().is_ok());
         let wrong_version = KvCasFenced {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION + 1,
             ..valid.clone()
         };
-        assert!(wrong_version.validate().is_err(), "v1 is rejected typed");
+        assert!(
+            wrong_version.validate().is_err(),
+            "an unsupported version is rejected typed"
+        );
         let bad_fence_namespace = KvCasFenced {
             fence_namespace: "bad\nns".to_owned(),
             ..valid.clone()

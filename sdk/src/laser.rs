@@ -61,6 +61,7 @@ pub const OPS_STREAM_DEFAULT: &str = "_agdx";
 type ProducerKey = (String, String);
 type ProducerCell = Arc<OnceCell<Arc<IggyProducer>>>;
 const TRANSIENT_SEND_ATTEMPTS: usize = 10;
+const PUBLISH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Laser client. Cheap to `clone`, since the connection and producer cache
 /// are shared via an internal `Arc`, so one connection is reused across tasks.
@@ -100,7 +101,9 @@ pub struct Laser {
 struct LaserInner {
     // `Arc` so a background reply dispatcher can hold the client without a
     // reference cycle back through `LaserInner` (which would leak the task).
-    client: Arc<IggyClient>,
+    client: std::sync::RwLock<Arc<IggyClient>>,
+    reconnect_connection: Option<String>,
+    reconnect_gate: tokio::sync::Mutex<()>,
     #[cfg(feature = "kv")]
     coordination_connection: Option<String>,
     #[cfg(feature = "kv")]
@@ -161,8 +164,7 @@ impl Laser {
     /// Connect using an Iggy connection string. The connection string is the
     /// only thing required. For a `*.laserdata.cloud` or `*.laserdata.com`
     /// host with no `tls_ca_file=` already set, TLS is auto-attached with
-    /// LaserData's public root CA, bundled in the SDK itself. Point
-    /// Set `LASER_TLS_CERT=<path>` to override the CA, or disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings. Connection strings use the bare `user:password@host:port` form because `Laser::connect` supplies the TCP scheme.
+    /// LaserData's public root CA, bundled in the SDK itself. Set `LASER_TLS_CERT=<path>` to enable TLS with an explicit CA for any host or to override the bundled CA. Disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings when neither variable is set. Connection strings use the bare `user:password@host:port` form because `Laser::connect` supplies the TCP scheme.
     ///
     /// ```no_run
     /// # use laser_sdk::prelude::*;
@@ -255,7 +257,9 @@ impl Laser {
     pub fn from_client(client: IggyClient) -> Self {
         Self {
             inner: Arc::new(LaserInner {
-                client: Arc::new(client),
+                client: std::sync::RwLock::new(Arc::new(client)),
+                reconnect_connection: None,
+                reconnect_gate: tokio::sync::Mutex::new(()),
                 #[cfg(feature = "kv")]
                 coordination_connection: None,
                 #[cfg(feature = "kv")]
@@ -310,7 +314,7 @@ impl Laser {
         let hub = cell
             .get_or_try_init(|| {
                 crate::agent::replies::ReplyHub::create(
-                    self.inner.client.clone(),
+                    self.client(),
                     stream,
                     reply_topic.as_identifier(),
                     #[cfg(feature = "sign")]
@@ -385,8 +389,28 @@ impl Laser {
     }
 
     /// The raw `IggyClient` this laser holds. Most callers should not need it.
-    pub fn client(&self) -> &IggyClient {
-        &self.inner.client
+    pub fn client(&self) -> Arc<IggyClient> {
+        self.inner
+            .client
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn reconnect_from_seed(&self) -> Result<(), LaserError> {
+        let Some(connection) = self.inner.reconnect_connection.as_ref() else {
+            return Ok(());
+        };
+        let _gate = self.inner.reconnect_gate.lock().await;
+        let client = IggyClientBuilder::from_connection_string(connection)?.build()?;
+        client.connect().await?;
+        *self
+            .inner
+            .client
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(client);
+        self.inner.producers.clear();
+        Ok(())
     }
 
     #[cfg(feature = "kv")]
@@ -569,7 +593,7 @@ impl Laser {
             feature = "rbac",
             feature = "runs"
         ))]
-        if let Some(announce) = probe_managed_host(&self.inner.client).await {
+        if let Some(announce) = probe_managed_host(&self.client()).await {
             merge_announcement(&mut capabilities, &announce);
             topology = announce.topology;
         }
@@ -587,6 +611,26 @@ impl Laser {
             .unwrap_or_else(|| negotiated.capabilities.clone())
     }
 
+    pub async fn wait_until_ready(&self, timeout: Duration) -> Result<Capabilities, LaserError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let capabilities = self.refresh_capabilities().await;
+            if capabilities.is_ready() {
+                return Ok(capabilities);
+            }
+            if capabilities.backends.is_empty() {
+                return Err(LaserError::unsupported(
+                    "readiness",
+                    "server has no managed backend descriptors",
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(LaserError::Timeout("managed backend readiness"));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Idempotently creates `topic` on `stream` with `partitions`, creating the
     /// stream first if needed. Used for the `_agdx` ops stream, which is separate
     /// from this laser's data stream.
@@ -596,8 +640,9 @@ impl Laser {
         topic: &str,
         partitions: u32,
     ) -> Result<(), LaserError> {
-        ensure_stream(&self.inner.client, stream).await?;
-        ensure_topic(&self.inner.client, stream, topic, partitions).await
+        let client = self.client();
+        ensure_stream(&client, stream).await?;
+        ensure_topic(&client, stream, topic, partitions).await
     }
 
     /// Like [`ensure_topic_on`](Self::ensure_topic_on) with an explicit
@@ -610,8 +655,9 @@ impl Laser {
         partitions: u32,
         expiry: IggyExpiry,
     ) -> Result<(), LaserError> {
-        ensure_stream(&self.inner.client, stream).await?;
-        ensure_topic_with(&self.inner.client, stream, topic, partitions, expiry).await
+        let client = self.client();
+        ensure_stream(&client, stream).await?;
+        ensure_topic_with(&client, stream, topic, partitions, expiry).await
     }
 
     /// Low-level send: one message with explicit user-headers, on the default
@@ -693,29 +739,45 @@ impl Laser {
         let mut pending = messages;
         let mut confirmations = Vec::new();
         for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
-            let producer = self.producer_on(stream, topic).await?;
-            match producer
-                .send_with_partitioning(pending, Some(partitioning.clone()))
-                .await
-            {
-                Ok(mut response) => {
+            let producer = match self.producer_on(stream, topic).await {
+                Ok(producer) => producer,
+                Err(error) if error.is_retryable() && attempt + 1 < TRANSIENT_SEND_ATTEMPTS => {
+                    self.inner.producers.remove(&key);
+                    self.reconnect_from_seed().await?;
+                    sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let send = producer.send_with_partitioning(pending, Some(partitioning.clone()));
+            let response = tokio::time::timeout(PUBLISH_RESPONSE_TIMEOUT, send).await;
+            match response {
+                Err(_) => {
+                    self.inner.producers.remove(&key);
+                    self.reconnect_from_seed().await?;
+                    return Err(LaserError::Timeout("Iggy publish response"));
+                }
+                Ok(Ok(mut response)) => {
                     confirmations.append(&mut response.confirmations);
                     return Ok(SendMessagesResponse { confirmations });
                 }
-                Err(IggyError::ProducerSendFailed {
+                Ok(Err(IggyError::ProducerSendFailed {
                     cause,
                     failed,
                     committed,
                     ..
-                }) if is_transient_iggy_io_error(&cause)
+                })) if is_transient_iggy_io_error(&cause)
                     && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
                 {
                     confirmations.extend(committed.iter().cloned());
                     pending = reclaim_failed_messages(failed);
                     self.inner.producers.remove(&key);
+                    if attempt == 1 {
+                        self.reconnect_from_seed().await?;
+                    }
                     sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
                 }
-                Err(error) => return Err(error.into()),
+                Ok(Err(error)) => return Err(error.into()),
             }
         }
         unreachable!("retry loop either sends or returns the last publish error")
@@ -753,8 +815,7 @@ impl Laser {
             payload
         };
         let reply = self
-            .inner
-            .client
+            .client()
             .send_binary_request(code, bytes::Bytes::from(payload))
             .await?;
         Ok(reply.to_vec())
@@ -774,8 +835,7 @@ impl Laser {
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, IggyError> {
         let reply = self
-            .inner
-            .client
+            .client()
             .send_binary_request(code, bytes::Bytes::from(payload))
             .await?;
         Ok(reply.to_vec())
@@ -792,7 +852,7 @@ impl Laser {
         stream: &str,
         topic: &str,
     ) -> Result<IggyProducerBuilder, LaserError> {
-        Ok(self.inner.client.producer(stream, topic)?)
+        Ok(self.client().producer(stream, topic)?)
     }
 
     /// A Iggy `IggyConsumerBuilder` for a standalone consumer over one
@@ -834,7 +894,7 @@ impl Laser {
         topic: &str,
         partition: u32,
     ) -> Result<IggyConsumerBuilder, LaserError> {
-        Ok(self.inner.client.consumer(name, stream, topic, partition)?)
+        Ok(self.client().consumer(name, stream, topic, partition)?)
     }
 
     /// A Iggy `IggyConsumerBuilder` for a consumer-group consumer over
@@ -859,7 +919,7 @@ impl Laser {
         stream: &str,
         topic: &str,
     ) -> Result<IggyConsumerBuilder, LaserError> {
-        Ok(self.inner.client.consumer_group(group, stream, topic)?)
+        Ok(self.client().consumer_group(group, stream, topic)?)
     }
 
     pub(crate) async fn producer_on(
@@ -879,7 +939,7 @@ impl Laser {
             .clone();
         let producer = cell
             .get_or_try_init(|| async {
-                let producer = self.inner.client.producer(stream, topic)?.build();
+                let producer = self.client().producer(stream, topic)?.build();
                 for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
                     match producer.init().await {
                         Ok(()) => return Ok::<_, LaserError>(Arc::new(producer)),
@@ -1208,7 +1268,7 @@ impl LaserBuilder {
                     return Err(LaserError::Config("credentials are required"));
                 }
                 // Build through a connection string so the client carries
-                // auto-login credentials: iggy-rs re-authenticates on every
+                // auto-login credentials: the Iggy SDK re-authenticates on every
                 // reconnect, so a dropped connection resumes transparently. A
                 // plain `with_tcp` + manual `login_user` reconnects the socket
                 // but leaves it unauthenticated after a server restart.
@@ -1251,9 +1311,12 @@ impl LaserBuilder {
                 merge_announcement(&mut capabilities, &announce);
             }
         }
+        let reconnect_connection = coordination_connection.clone();
         Ok(Laser {
             inner: Arc::new(LaserInner {
-                client: Arc::new(client),
+                client: std::sync::RwLock::new(Arc::new(client)),
+                reconnect_connection,
+                reconnect_gate: tokio::sync::Mutex::new(()),
                 #[cfg(feature = "kv")]
                 coordination_connection,
                 #[cfg(feature = "kv")]
@@ -1341,6 +1404,7 @@ fn merge_announcement(
 ) {
     let versions = announce.versions;
     capabilities.versions = Some(versions);
+    capabilities.backends.clone_from(&announce.backends);
     capabilities.authz |= versions.has_feature(laser_wire::hello::feature::AUTHZ);
     if announce.ready {
         capabilities.managed = true;
@@ -1349,7 +1413,6 @@ fn merge_announcement(
         capabilities.graph |= versions.graph > 0;
         capabilities.destinations.available |= versions.checkpoint > 0
             && versions.has_feature(laser_wire::hello::feature::DESTINATIONS);
-        capabilities.backends.clone_from(&announce.backends);
         capabilities.merge_features(&versions);
         for backend in announce
             .backends
@@ -1478,7 +1541,7 @@ mod announcement_tests {
         assert!(!capabilities.agent_workflow);
         assert!(!capabilities.watch);
         assert!(capabilities.authz, "server-native authz remains available");
-        assert!(capabilities.backends.is_empty());
+        assert_eq!(capabilities.backends, announce.backends);
         assert_eq!(capabilities.versions, Some(announce.versions));
     }
 
@@ -1522,9 +1585,7 @@ mod announcement_tests {
 /// e.g. a LaserData Cloud bootstrap endpoint works as-is. Then, for a
 /// LaserData Cloud host that does not already name a `tls_ca_file=`, attach
 /// `tls=true` plus LaserData's bundled public CA so a bare connection string
-/// is enough. `LASER_NO_TLS=1` disables this, and `LASER_TLS_CERT=<path>`
-/// overrides the bundled CA with any CA file (the same knob as the connection
-/// string's own `tls_ca_file=`).
+/// is enough. `LASER_TLS_CERT=<path>` enables TLS with that CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup. The connection string's own `tls_ca_file=` remains authoritative.
 fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
     let trimmed = value.trim();
     let scheme_applied = if trimmed.starts_with("iggy://") || trimmed.starts_with("iggy+") {
@@ -1619,13 +1680,29 @@ fn env_flag_enabled(name: &str) -> bool {
 }
 
 fn resolve_tls(connection_string: String) -> Result<String, LaserError> {
-    if env_flag_enabled("LASER_NO_TLS") || has_query_param(&connection_string, "tls_ca_file") {
+    let custom_cert = std::env::var("LASER_TLS_CERT")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    resolve_tls_with(
+        connection_string,
+        env_flag_enabled("LASER_NO_TLS"),
+        custom_cert,
+    )
+}
+
+fn resolve_tls_with(
+    connection_string: String,
+    no_tls: bool,
+    custom_cert: Option<std::path::PathBuf>,
+) -> Result<String, LaserError> {
+    if no_tls || has_query_param(&connection_string, "tls_ca_file") {
         return Ok(connection_string);
     }
-    if !is_laserdata_host(host_of(&connection_string)) {
+    if custom_cert.is_none() && !is_laserdata_host(host_of(&connection_string)) {
         return Ok(connection_string);
     }
-    let cert_path = resolve_cert_path()?;
+    let cert_path = custom_cert.map_or_else(resolve_cert_path, Ok)?;
     let mut with_tls = connection_string;
     if !has_query_param(&with_tls, "tls") {
         let separator = if query_of(&with_tls).is_some() {
@@ -1865,7 +1942,7 @@ mod builder_conflict_tests {
 mod connection_string_tests {
     use super::{
         PROD_CERT, flag_value_enabled, has_query_param, host_of, install_cert, is_laserdata_host,
-        normalize_connection_string, resolve_tls,
+        normalize_connection_string, resolve_tls, resolve_tls_with,
     };
 
     #[test]
@@ -1948,6 +2025,20 @@ mod connection_string_tests {
             resolve_tls("iggy+tcp://u:p@127.0.0.1:8090".to_owned())
                 .expect("tls resolution should succeed"),
             "iggy+tcp://u:p@127.0.0.1:8090",
+        );
+    }
+
+    #[test]
+    fn given_a_custom_ca_when_resolving_a_local_host_then_should_enable_tls() {
+        let resolved = resolve_tls_with(
+            "iggy+tcp://u:p@demo.localhost:8090".to_owned(),
+            false,
+            Some("/tmp/local-ca.crt".into()),
+        )
+        .expect("local TLS resolution should succeed");
+        assert_eq!(
+            resolved,
+            "iggy+tcp://u:p@demo.localhost:8090?tls=true&tls_ca_file=/tmp/local-ca.crt"
         );
     }
 

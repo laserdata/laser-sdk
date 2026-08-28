@@ -80,7 +80,7 @@ impl Stream {
 
     /// Idempotently create this stream.
     pub async fn ensure(&self) -> Result<(), LaserError> {
-        crate::laser::ensure_stream(self.laser.client(), &self.name).await
+        crate::laser::ensure_stream(&self.laser.client(), &self.name).await
     }
 
     /// This stream's name.
