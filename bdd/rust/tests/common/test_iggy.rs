@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 
 #[path = "../../../../sdk/tests/support/test_iggy.rs"]
+#[allow(dead_code)]
 mod server;
 pub use server::TestIggy;
 

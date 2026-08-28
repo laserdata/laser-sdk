@@ -394,16 +394,19 @@ function normalizeTarget(target: string, env: NodeJS.ProcessEnv): string {
 }
 
 function resolveTls(connectionString: string, env: NodeJS.ProcessEnv): string {
-  if (env["LASER_NO_TLS"] !== undefined || connectionString.includes("tls_ca_file=")) {
+  const noTls = ["1", "true", "yes", "on"].includes(
+    (env["LASER_NO_TLS"] ?? "").trim().toLowerCase()
+  )
+  if (noTls || connectionString.includes("tls_ca_file=")) {
     return connectionString
   }
-  if (!isLaserDataHost(hostOf(connectionString))) return connectionString
+  const cert = envValue("LASER_TLS_CERT", env)
+  if (cert.length === 0 && !isLaserDataHost(hostOf(connectionString))) return connectionString
   let withTls = connectionString
   if (!withTls.includes("tls=")) {
     const separator = withTls.includes("?") ? "&" : "?"
     withTls = `${withTls}${separator}tls=true`
   }
-  const cert = envValue("LASER_TLS_CERT", env)
   return cert.length > 0 ? `${withTls}&tls_ca_file=${cert}` : withTls
 }
 

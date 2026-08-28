@@ -40,7 +40,7 @@ For projections, query, KV, forks, graph, and runs, start Laser Stack with `./sc
 
 ## Run against LaserData Cloud
 
-Pass a connection target through the environment. The port defaults to 8090 when omitted. `Laser.connect` uses the Rust SDK connection path, so TLS and the embedded CA attach automatically for `*.laserdata.cloud` and `*.laserdata.com`. Point `LASER_TLS_CERT=<path>` at any CA file to override, the same knob as the connection string's `tls_ca_file=`.
+Pass a connection target through the environment. The port defaults to 8090 when omitted. `Laser.connect` uses the Rust SDK connection path, so TLS and the embedded CA attach automatically for `*.laserdata.cloud` and `*.laserdata.com`. `LASER_TLS_CERT=<path>` enables TLS with that CA for any host or overrides the embedded CA. A connection string that already sets `tls_ca_file=` remains authoritative.
 
 ```sh
 # Form A: bare target with embedded credentials or a token

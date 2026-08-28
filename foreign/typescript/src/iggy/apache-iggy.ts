@@ -422,8 +422,10 @@ export function parseConnectionString(
     (env["LASER_NO_TLS"] ?? "").trim().toLowerCase()
   )
   const autoTls = !noTls && laserDataHost(url.hostname)
-  const tls = url.searchParams.get("tls") === "true" || autoTls
   const caPath = url.searchParams.get("tls_ca_file") ?? env["LASER_TLS_CERT"]
+  const customTls = !noTls && caPath !== undefined && caPath.length > 0
+  const explicitTls = url.searchParams.get("tls")
+  const tls = explicitTls === null ? autoTls || customTls : explicitTls === "true"
   let ca: string | undefined
   if (caPath !== undefined && caPath.length > 0) {
     try {
@@ -613,6 +615,9 @@ export class ApacheIggyTransport implements LaserTransport {
     try {
       return await operation(stale)
     } catch (firstCause) {
+      if (!this.disconnected.has(stale) && serverResponseError(firstCause) === undefined) {
+        this.disconnected.add(stale)
+      }
       if (!this.disconnected.has(stale)) {
         if (!retryAfterReconnect && serverResponseError(firstCause) === undefined) {
           throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })

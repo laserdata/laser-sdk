@@ -19,9 +19,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = "=0.3.0" # typed streaming plus provenance
+laser-sdk = "=0.3.1" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "=0.3.0", features = ["agent", "managed"] }
+laser-sdk = { version = "=0.3.1", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -68,7 +68,7 @@ Direct producers, raw topic sends, and fluent publish terminals return `SendMess
 
 Apache Iggy TCP reconnection is enabled for both the initial handshake and a later dropped socket, with unlimited retries at one-second intervals by default. Tune it through `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` in the connection string. The client reapplies connection-string credentials after reconnecting, so a server restart does not leave the socket unauthenticated.
 
-Pointed at a `*.laserdata.cloud` or `*.laserdata.com` host, `connect`/`connect_with_stream` auto-attach TLS with LaserData's public root CA, bundled in the SDK so a bare connection string is enough. The CA is cached in a per-user, owner-only directory and reused only while its bytes match the bundled cert. `LASER_TLS_CERT=<path>` overrides it, `LASER_NO_TLS=1` disables it (read by value, so `0` and `false` do not), and every other host is left untouched.
+Pointed at a `*.laserdata.cloud` or `*.laserdata.com` host, `connect`/`connect_with_stream` auto-attach TLS with LaserData's public root CA, bundled in the SDK so a bare connection string is enough. The CA is cached in a per-user, owner-only directory and reused only while its bytes match the bundled cert. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup and is read by value, so `0` and `false` do not disable TLS. Every other host is left untouched when neither variable is set.
 
 ## Batch and any payload
 

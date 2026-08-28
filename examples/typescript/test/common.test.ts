@@ -128,6 +128,16 @@ void test("given_a_non_laserdata_host_when_resolved_then_should_not_attach_tls",
   )
 })
 
+void test("given_a_custom_ca_when_a_local_host_is_resolved_then_should_attach_tls", () => {
+  assert.equal(
+    resolveConnectionString({
+      LASER_CONNECTION_STRING: "u:p@demo.localhost",
+      LASER_TLS_CERT: "/tmp/local-ca.crt"
+    }),
+    "iggy+tcp://u:p@demo.localhost:8090?tls=true&tls_ca_file=/tmp/local-ca.crt"
+  )
+})
+
 void test("given_a_string_with_its_own_ca_when_resolved_then_should_not_attach_tls_again", () => {
   assert.equal(
     resolveConnectionString({

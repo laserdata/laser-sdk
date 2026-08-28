@@ -17,7 +17,9 @@ case "$language" in
     ;;
   python|py)
     cd "$repo_root/foreign/python"
-    uv run --extra testing pytest -q ../../bdd/python
+    uv sync --extra testing --locked --no-install-project
+    uv run --no-sync maturin develop
+    uv run --no-sync pytest -q ../../bdd/python
     ;;
   typescript|ts)
     cd "$repo_root/foreign/typescript"

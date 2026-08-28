@@ -91,7 +91,7 @@ The accepted policy requires stream format, self-containment, microsecond timest
 
 ## Compatibility and verification
 
-Wire types use named fields. The hello-negotiated surface slots remain version 1. The fenced-lease KV family separately uses payload version 2 under its feature gate. A breaking contract change replaces its consumers, fixtures, and implementations together rather than preserving an older shape or assigning a migration version.
+Wire types use named fields. The hello-negotiated surface slots and fenced-lease KV family remain version 1. The fenced-lease family separately requires its feature gate. A breaking contract change replaces its consumers, fixtures, and implementations together rather than preserving an older shape or assigning a migration version.
 
 An intentional wire change must update Rust fixtures, the TypeScript fixture manifest and codecs, Python bindings and stubs, HTTP JSON fixtures, API reports, robustness coverage, and `bdd/scenarios/data_stack.feature`. Run focused tests while implementing, then the complete repository gate from `AGENTS.md` before release.
 

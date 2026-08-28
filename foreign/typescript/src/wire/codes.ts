@@ -76,9 +76,8 @@ export const CONTROL_OP_VERSION = 1
 export const CHECKPOINT_OP_VERSION = 1
 export const DESTINATION_HTTP_OP_VERSION = 1
 export const KV_OP_VERSION = 1
-// The fenced-lease op family (lease, renew, release, fenced CAS): bumped by
-// the holder-identity reshape so a v1 payload can never be mistaken for v2.
-export const KV_LEASE_OP_VERSION = 2
+// The fenced-lease holder-identity shape was finalized before publication.
+export const KV_LEASE_OP_VERSION = 1
 export const FORK_OP_VERSION = 1
 export const GRAPH_OP_VERSION = 1
 export const AGENT_WORKFLOW_OP_VERSION = 1

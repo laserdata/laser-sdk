@@ -186,7 +186,7 @@ impl ContextAssembler {
                 // partition longer than the drain ceiling is read from a
                 // tail-anchored window rather than from its head.
                 let start = crate::poll::tail_anchored_offset(
-                    laser.client(),
+                    &laser.client(),
                     &stream,
                     &topic_id,
                     &consumer,
@@ -195,7 +195,7 @@ impl ContextAssembler {
                 )
                 .await?;
                 let batch = crate::poll::drain_partition(
-                    laser.client(),
+                    &laser.client(),
                     &stream,
                     &topic_id,
                     &consumer,

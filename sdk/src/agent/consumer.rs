@@ -609,9 +609,10 @@ where
 {
     let (drain_tx, drain_rx) = oneshot::channel();
     let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+    let client = reliable.laser.client();
     let committer = SerialCommitter {
         worker: &reliable,
-        client: reliable.laser.client(),
+        client: &client,
         group: &group,
         stream: &stream,
         topic: &topic,

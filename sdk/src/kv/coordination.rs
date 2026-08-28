@@ -968,7 +968,7 @@ mod tests {
         let stub = StubTransport::answering(Vec::new());
         let client = FencedLeaseClient::new(&stub);
         let stale_version = KvLease {
-            v: KV_OP_VERSION,
+            v: KV_LEASE_OP_VERSION + 1,
             ..lease_request()
         };
         assert!(client.prepare_acquire(&stale_version).is_err());

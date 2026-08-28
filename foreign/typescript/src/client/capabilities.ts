@@ -1,6 +1,12 @@
 import { UnsupportedError } from "./errors.js"
 import { Feature, opVersionsHasFeature } from "../wire/hello.js"
-import type { BackendAnnounce, BackendDescriptor, OpVersions } from "../wire/hello.js"
+import type {
+  BackendAnnounce,
+  BackendDescriptor,
+  BackendReadinessReason,
+  OpVersions
+} from "../wire/hello.js"
+import type { BackendResourceId } from "../wire/ids.js"
 import type { Consistency } from "../wire/query.js"
 import type { WireTopology } from "../wire/topology.js"
 
@@ -140,7 +146,7 @@ export function managedCapabilitiesFrom(announce: BackendAnnounce): Capabilities
     watch: ready && opVersionsHasFeature(versions, Feature.WATCH),
     authz: opVersionsHasFeature(versions, Feature.AUTHZ),
     versions,
-    backends: ready ? announce.backends : [],
+    backends: announce.backends,
     ...(announce.topology !== undefined ? { topology: announce.topology } : {})
   }
 }
@@ -192,7 +198,7 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
       : configured.versions !== undefined
         ? { versions: configured.versions }
         : {}),
-    backends: announced.managed ? announced.backends : configured.backends,
+    backends: announced.backends.length > 0 ? announced.backends : configured.backends,
     ...(announced.topology !== undefined
       ? { topology: announced.topology }
       : configured.topology !== undefined
@@ -203,6 +209,39 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
 
 export function servesConsistency(capabilities: Capabilities, level: Consistency): boolean {
   return CONSISTENCY_RANK[level] <= CONSISTENCY_RANK[capabilities.query.consistency]
+}
+
+export function backend(
+  capabilities: Capabilities,
+  resourceId: BackendResourceId
+): BackendDescriptor | undefined {
+  return capabilities.backends.find((candidate) => candidate.resourceId.equals(resourceId))
+}
+
+export function enabledBackends(capabilities: Capabilities): readonly BackendDescriptor[] {
+  return capabilities.backends.filter((candidate) => candidate.desiredState === "enabled")
+}
+
+export function unreadyBackends(capabilities: Capabilities): readonly BackendDescriptor[] {
+  return enabledBackends(capabilities).filter(
+    (candidate) => candidate.observedState !== "ready" || !candidate.readiness.ready
+  )
+}
+
+export function readinessReasons(
+  capabilities: Capabilities,
+  resourceId: BackendResourceId
+): readonly BackendReadinessReason[] | undefined {
+  return backend(capabilities, resourceId)?.readiness.reasons
+}
+
+export function isReady(capabilities: Capabilities): boolean {
+  const enabled = enabledBackends(capabilities)
+  return (
+    capabilities.managed &&
+    enabled.length > 0 &&
+    enabled.every((candidate) => candidate.observedState === "ready" && candidate.readiness.ready)
+  )
 }
 
 export function requireCapability(capabilities: Capabilities, surface: CapabilitySurface): void {

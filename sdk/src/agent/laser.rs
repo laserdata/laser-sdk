@@ -43,9 +43,9 @@ impl Laser {
     )]
     pub async fn bootstrap(&self, partitions: u32) -> Result<(), LaserError> {
         let stream = self.stream_required()?;
-        ensure_stream(self.client(), stream).await?;
+        ensure_stream(&self.client(), stream).await?;
         for topic in WELL_KNOWN_TOPICS {
-            ensure_topic(self.client(), stream, &topic.topic_string(), partitions).await?;
+            ensure_topic(&self.client(), stream, &topic.topic_string(), partitions).await?;
         }
         let mut warming = tokio::task::JoinSet::new();
         for topic in WELL_KNOWN_TOPICS {
@@ -272,7 +272,7 @@ impl Laser {
     ) -> Result<AgentReplyReader, LaserError> {
         #[allow(unused_mut)]
         let mut reader = AgentReplyReader::new_at_tail(
-            self.client(),
+            &self.client(),
             self.stream_required()?,
             reply_topic.as_identifier(),
         )
@@ -303,7 +303,7 @@ impl Laser {
             if Instant::now() >= deadline {
                 return Err(LaserError::Timeout("the AGDX reply"));
             }
-            match reader.next_agdx_match(self.client(), correlation).await? {
+            match reader.next_agdx_match(&self.client(), correlation).await? {
                 ReplyScan::Found(envelope) => return Ok(*envelope),
                 ReplyScan::More => continue,
                 ReplyScan::CaughtUp => sleep(Duration::from_millis(50)).await,
@@ -331,7 +331,7 @@ impl Laser {
             reader.verifier = self.registry_verifier();
         }
         for _ in 0..MAX_LOOKUP_PASSES {
-            match reader.next_agdx_match(self.client(), correlation).await? {
+            match reader.next_agdx_match(&self.client(), correlation).await? {
                 ReplyScan::Found(envelope) => return Ok(Some(*envelope)),
                 ReplyScan::More => continue,
                 ReplyScan::CaughtUp => return Ok(None),

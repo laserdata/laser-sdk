@@ -54,9 +54,9 @@ Consistency is fail-not-downgrade. Query reply validation rejects a delivered co
 
 ## Versioning
 
-Named fields allow additive optional growth when readers can safely ignore it. Changed meaning, removed fields, or new executor-dispatched grammar is breaking and requires a coordinated package release across every consumer. The hello-negotiated surface slots remain version 1. The fenced-lease request family is the explicit payload-version exception below.
+Named fields allow additive optional growth when readers can safely ignore it. Changed meaning, removed fields, or new executor-dispatched grammar is breaking and requires a coordinated package release across every consumer. The hello-negotiated surface slots and fenced-lease request family remain version 1.
 
-Query, control, KV, fork, graph, checkpoint, agent, and other surfaces negotiate independently through `OpVersions`. A client checks the version associated with the command it is about to send. Destination and checkpoint commands use `versions.checkpoint`, not the query version. The fenced-lease KV family (`KvLease`, `KvLeaseRenew`, `KvRelease`, `KvCasFenced`) additionally rides its own payload version `KV_LEASE_OP_VERSION = 2` and must only be sent to a server advertising the `KV_FENCED_LEASES` feature bit. A pre-fencing server would decode the reshaped payloads under the old contract instead of rejecting them.
+Query, control, KV, fork, graph, checkpoint, agent, and other surfaces negotiate independently through `OpVersions`. A client checks the version associated with the command it is about to send. Destination and checkpoint commands use `versions.checkpoint`, not the query version. The fenced-lease KV family (`KvLease`, `KvLeaseRenew`, `KvRelease`, `KvCasFenced`) uses payload version `KV_LEASE_OP_VERSION = 1` and must only be sent to a server advertising the `KV_FENCED_LEASES` feature bit. Its holder-identity shape was finalized before publication, so the pre-release breaking reshape does not consume a new operation version.
 
 Permanent u8 dictionaries use unknown-code passthrough where relay compatibility matters. Executor vocabularies such as comparison and aggregate functions remain exhaustive so every backend must handle a new variant explicitly.
 

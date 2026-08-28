@@ -163,10 +163,9 @@ pub struct KvCas {
 /// (`fence_namespace`, `fence_key`) and a fence sequence still equal to
 /// `fence_token`. A released or expired lease, or a stale token, maps to
 /// [`KvError::LeaseLost`] even before another holder acquires; a failed
-/// precondition to [`KvError::VersionConflict`]. Version
-/// [`crate::codes::KV_LEASE_OP_VERSION`]: the pre-fencing v1 shape (no
-/// coordination namespace, fence-only gate) fails decode and any other `v`
-/// fails [`crate::validate::Validate`], both fail-closed.
+/// precondition to [`KvError::VersionConflict`]. The request uses
+/// [`crate::codes::KV_LEASE_OP_VERSION`]. Required fence fields have no decode
+/// defaults and any other `v` fails [`crate::validate::Validate`] fail-closed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvCasFenced {
     pub v: u32,
@@ -279,9 +278,8 @@ pub struct KvMove {
 /// `key`. On success the store atomically creates the live lease row and bumps
 /// the never-expiring fence sequence; the holder gets the new `lease_token`
 /// and the granted TTL (the formal `LEASE` primitive). A live lease always
-/// conflicts: renewal is [`KvLeaseRenew`], never re-acquisition. Version
-/// [`crate::codes::KV_LEASE_OP_VERSION`]: the v1 shape (no holder identity)
-/// fails decode fail-closed.
+/// conflicts: renewal is [`KvLeaseRenew`], never re-acquisition. The request
+/// uses [`crate::codes::KV_LEASE_OP_VERSION`] and requires holder identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KvLease {
     pub v: u32,

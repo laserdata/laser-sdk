@@ -117,6 +117,7 @@ import {
   PresenceConflictError,
   QueryExecutionError,
   InvalidError,
+  TimeoutError,
   UnsupportedError
 } from "./errors.js"
 import { executeManaged, type ManagedTransport } from "./managed.js"
@@ -131,6 +132,7 @@ import {
   OPEN_CAPABILITIES,
   managedCapabilitiesFrom,
   mergeCapabilities,
+  isReady,
   servesConsistency
 } from "./capabilities.js"
 
@@ -706,6 +708,26 @@ export class Laser implements AsyncDisposable {
     if (this.capabilityOverride !== undefined) return this.capabilityOverride
     this.capabilitiesOnce.clear()
     return this.capabilities()
+  }
+
+  async waitUntilReady(timeoutMs: number): Promise<Capabilities> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new InvalidError("timeoutMs must be finite and non-negative")
+    }
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const capabilities = await this.refreshCapabilities()
+      if (isReady(capabilities)) return capabilities
+      if (capabilities.backends.length === 0) {
+        throw new UnsupportedError("server has no managed backend descriptors")
+      }
+      if (Date.now() >= deadline) {
+        throw new TimeoutError("timed out waiting for managed backend readiness", {
+          cause: capabilities.backends.flatMap((candidate) => candidate.readiness.reasons)
+        })
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
   }
 
   private applyAdvertisedTopology(capabilities: Capabilities): void {

@@ -3,7 +3,7 @@ name = "laser-bench"
 version = "0.0.1"
 edition = "2024"
 publish = false
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 description = "Reproducible benchmark harness for LaserData SDK."
 
 [workspace]

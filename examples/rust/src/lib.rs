@@ -84,8 +84,9 @@ const DEFAULT_TCP_PORT: u16 = 8090;
 /// attached automatically (and `tls=true` added if missing), so passing just the
 /// connection string is enough. Non-LaserData hosts are left untouched (manage
 /// their own TLS in the string). Point `LASER_TLS_CERT=<path>` at any CA file
-/// to override (the same knob as the connection string's `tls_ca_file=`),
-/// disable with `LASER_NO_TLS=1`.
+/// to enable TLS with an explicit CA for any host or override the embedded CA
+/// (the same knob as the connection string's `tls_ca_file=`). Disable automatic
+/// TLS setup with `LASER_NO_TLS=1`.
 /// Build a `Laser` on `stream` over the resolved connection. This is the path
 /// every example should use: unlike `Laser::from_client`, the builder runs the
 /// initial `AGDX_HELLO` capability probe. Laser Stack and LaserData Cloud

@@ -5,7 +5,7 @@ use futures::StreamExt;
 use iggy::prelude::{
     AutoCommit, AutoCommitWhen, ConsumerGroupClient, HeaderKey, HeaderKind, HeaderValue,
     Identifier, IggyConsumer, IggyConsumerBuilder, IggyDuration, IggyMessage, IggyProducer,
-    IggyTimestamp, Partitioning, PollingStrategy, ReceivedMessage,
+    IggyTimestamp, NonZeroIggyDuration, Partitioning, PollingStrategy, ReceivedMessage,
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use laser_sdk::error::LaserError;
@@ -26,6 +26,14 @@ pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
 
 pub(crate) fn duration_ms(value: u64) -> IggyDuration {
     IggyDuration::from(Duration::from_millis(value))
+}
+
+pub(crate) fn positive_duration_ms(
+    value: u64,
+    field: &'static str,
+) -> PyResult<NonZeroIggyDuration> {
+    NonZeroIggyDuration::try_from(Duration::from_millis(value))
+        .map_err(|_| InvalidError::new_err(format!("{field} must be greater than zero")))
 }
 
 /// One committed partition range reported by Apache Iggy after a send.
@@ -229,16 +237,23 @@ pub(crate) fn configure_consumer(
                 "auto_commit='interval' requires commit_interval_ms > 0",
             ));
         }
-        (CommitMode::Interval, interval, _) => AutoCommit::Interval(duration_ms(interval)),
+        (CommitMode::Interval, interval, _) => {
+            AutoCommit::Interval(positive_duration_ms(interval, "commit_interval_ms")?)
+        }
         (_, 0, Some(mode)) => AutoCommit::When(mode),
-        (_, interval, Some(mode)) => AutoCommit::IntervalOrWhen(duration_ms(interval), mode),
+        (_, interval, Some(mode)) => {
+            AutoCommit::IntervalOrWhen(positive_duration_ms(interval, "commit_interval_ms")?, mode)
+        }
         _ => unreachable!("commit modes are exhaustively mapped"),
     };
     builder = builder
         .batch_length(config.batch_length)
         .polling_strategy(polling)
         .auto_commit(auto_commit)
-        .polling_retry_interval(duration_ms(config.polling_retry_interval_ms));
+        .polling_retry_interval(positive_duration_ms(
+            config.polling_retry_interval_ms,
+            "polling_retry_interval_ms",
+        )?);
     builder = match config.poll_interval_ms {
         Some(interval) => builder.poll_interval(duration_ms(interval)),
         None => builder.without_poll_interval(),
@@ -256,7 +271,10 @@ pub(crate) fn configure_consumer(
         };
     }
     if let Some(retries) = config.init_retries {
-        builder = builder.init_retries(retries, duration_ms(config.init_retry_interval_ms));
+        builder = builder.init_retries(
+            retries,
+            positive_duration_ms(config.init_retry_interval_ms, "init_retry_interval_ms")?,
+        );
     }
     if config.allow_replay {
         builder = builder.allow_replay();
@@ -739,6 +757,17 @@ impl PyConsumer {
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positive_duration_ms;
+
+    #[test]
+    fn given_retry_intervals_when_converted_then_zero_should_be_rejected() {
+        assert!(positive_duration_ms(1, "retry_interval_ms").is_ok());
+        assert!(positive_duration_ms(0, "retry_interval_ms").is_err());
     }
 }
 

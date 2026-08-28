@@ -142,6 +142,7 @@ apache-avro = { workspace = true }
 async-trait = { workspace = true }
 iggy = { workspace = true }
 laser-wire = { workspace = true, features = ["builders", "cbor", "fixtures"] }
+libc = "0.2"
 prost = { workspace = true }
 protox = { workspace = true }
 serde_json = { workspace = true }

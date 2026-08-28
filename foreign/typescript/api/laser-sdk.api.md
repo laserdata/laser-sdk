@@ -3099,6 +3099,8 @@ export class Laser implements AsyncDisposable {
     // (undocumented)
     unquarantineSigned(operator: AgentId, agent: AgentId, key: SigningKey): Promise<void>;
     // (undocumented)
+    waitUntilReady(timeoutMs: number): Promise<Capabilities>;
+    // (undocumented)
     watch(): Watch;
     // (undocumented)
     whoami(): Promise<WhoamiReply>;
@@ -4950,7 +4952,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.3.0";
+export const SDK_VERSION = "0.3.1";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;

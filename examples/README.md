@@ -14,7 +14,7 @@ examples/
   typescript/ the TypeScript examples (one entry point per scenario) + their README
 ```
 
-Each SDK owns its connection security. The Rust SDK embeds the LaserData public CA, Python uses that same Rust connection path, and TypeScript embeds the same certificate in its package. Examples do not carry certificates or reimplement TLS selection.
+Each SDK owns its connection security. The Rust SDK embeds the LaserData public CA, Python uses that same Rust connection path, and TypeScript embeds the same certificate in its package. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for local or privately signed hosts in every example. Examples do not carry certificates or reimplement TLS selection.
 
 ## Start here
 

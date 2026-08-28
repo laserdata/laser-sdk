@@ -85,7 +85,7 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(QUERY_OP_VERSION, 1);
     assert_eq!(CONTROL_OP_VERSION, 1);
     assert_eq!(KV_OP_VERSION, 1);
-    assert_eq!(KV_LEASE_OP_VERSION, 2);
+    assert_eq!(KV_LEASE_OP_VERSION, 1);
     assert_eq!(FORK_OP_VERSION, 1);
     assert_eq!(GRAPH_OP_VERSION, 1);
     assert_eq!(AGENT_OP_VERSION, 1);

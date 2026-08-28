@@ -479,7 +479,7 @@ async fn watch_terminal(
     let deadline_at = start + deadline;
     let mut consumed = false;
     loop {
-        let pass = reader.poll_contract(laser.client(), correlation).await?;
+        let pass = reader.poll_contract(&laser.client(), correlation).await?;
         match pass.terminal {
             Some(ContractTerminal::Completed(reply)) => return Ok(Contract::Completed(reply)),
             Some(ContractTerminal::Failed(reply)) => return Ok(Contract::Failed(reply)),

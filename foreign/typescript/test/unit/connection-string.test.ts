@@ -76,6 +76,14 @@ void test("given_an_explicit_ca_when_parsed_then_should_override_the_embedded_ca
   assert.equal(parsed.ca, LASERDATA_ROOT_CA)
 })
 
+void test("given_a_custom_ca_when_a_local_host_is_parsed_then_should_enable_tls", () => {
+  const parsed = parseConnectionString("iggy://token@demo.localhost", {
+    LASER_TLS_CERT: "../../sdk/certs/laserdata.crt"
+  })
+  assert.equal(parsed.tls, true)
+  assert.equal(parsed.ca, LASERDATA_ROOT_CA)
+})
+
 void test("given_a_connection_string_without_a_scheme_when_parsed_then_should_prepend_iggy", () => {
   const parsed = parseConnectionString("iggy:iggy@127.0.0.1:8090", {})
   assert.equal(parsed.host, "127.0.0.1")
