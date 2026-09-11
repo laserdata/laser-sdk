@@ -19,9 +19,9 @@ The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, 
 
 ```toml
 [dependencies]
-laser-sdk = "=0.3.1" # typed streaming plus provenance
+laser-sdk = "0.3.2" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "=0.3.1", features = ["agent", "managed"] }
+laser-sdk = { version = "0.3.2", features = ["agent", "managed"] }
 ```
 
 ## Quick example
