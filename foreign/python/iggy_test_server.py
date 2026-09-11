@@ -44,7 +44,7 @@ class IggyTestServer:
         env = os.environ.copy()
         env.update(
             {
-                "IGGY_SYSTEM_PATH": str(data_path),
+                "IGGY_PATH": str(data_path),
                 "IGGY_TCP_ADDRESS": f"127.0.0.1:{self._port}",
                 "IGGY_HTTP_ENABLED": "false",
                 "IGGY_QUIC_ENABLED": "false",
@@ -52,7 +52,9 @@ class IggyTestServer:
                 "IGGY_ROOT_USERNAME": "iggy",
                 "IGGY_ROOT_PASSWORD": "iggy",
                 "IGGY_SHARD_RUNTIME_CAPACITY": "256",
-                "IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
+                "IGGY_SHARDING_CPU_ALLOCATION": "2",
+                "IGGY_SHARDING_PIN_CORES": "false",
+                "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
             }
         )
         self._process = subprocess.Popen(
@@ -170,8 +172,8 @@ class IggyTestCluster:
     def route_endpoint_to(self, replica_id):
         self._proxy_target = self._tcp_ports[replica_id]
 
-    def leader_and_follower(self):
-        base_url = f"http://127.0.0.1:{self._http_ports[0]}"
+    def leader_and_follower(self, via=0):
+        base_url = f"http://127.0.0.1:{self._http_ports[via]}"
         login_body = json.dumps({"username": "iggy", "password": "iggy"}).encode()
         deadline = time.monotonic() + 30
         while True:
@@ -228,7 +230,7 @@ class IggyTestCluster:
         env = os.environ.copy()
         env.update(
             {
-                "IGGY_SYSTEM_PATH": str(data_path),
+                "IGGY_PATH": str(data_path),
                 "IGGY_CLUSTER_ENABLED": "true",
                 "IGGY_CLUSTER_NAME": "laser-sdk-rolling-restart",
                 "IGGY_MESSAGE_BUS_RECONNECT_PERIOD": "100ms",
@@ -239,8 +241,9 @@ class IggyTestCluster:
                 "IGGY_ROOT_USERNAME": "iggy",
                 "IGGY_ROOT_PASSWORD": "iggy",
                 "IGGY_SHARD_RUNTIME_CAPACITY": "256",
-                "IGGY_SYSTEM_SHARDING_CPU_ALLOCATION": "0..1",
-                "IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
+                "IGGY_SHARDING_CPU_ALLOCATION": "1",
+                "IGGY_SHARDING_PIN_CORES": "false",
+                "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
             }
         )
         for node in range(3):

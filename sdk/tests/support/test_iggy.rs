@@ -317,7 +317,7 @@ fn spawn_server(binary: &Path, data_dir: &Path, tcp_port: u16) -> Child {
     let stdout = File::create(&log_path).expect("create Iggy test server log");
     let stderr = stdout.try_clone().expect("clone Iggy test server log");
     Command::new(binary)
-        .env("IGGY_SYSTEM_PATH", data_dir)
+        .env("IGGY_PATH", data_dir)
         .env("IGGY_TCP_ADDRESS", format!("127.0.0.1:{tcp_port}"))
         .env("IGGY_HTTP_ENABLED", "false")
         .env("IGGY_QUIC_ENABLED", "false")
@@ -325,8 +325,9 @@ fn spawn_server(binary: &Path, data_dir: &Path, tcp_port: u16) -> Child {
         .env("IGGY_ROOT_USERNAME", DEFAULT_ROOT_USERNAME)
         .env("IGGY_ROOT_PASSWORD", DEFAULT_ROOT_PASSWORD)
         .env("IGGY_SHARD_RUNTIME_CAPACITY", "256")
-        .env("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION", "all")
-        .env("IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
+        .env("IGGY_SHARDING_CPU_ALLOCATION", "2")
+        .env("IGGY_SHARDING_PIN_CORES", "false")
+        .env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -347,7 +348,7 @@ fn spawn_cluster_node(
     command
         .arg("--replica-id")
         .arg(replica_id.to_string())
-        .env("IGGY_SYSTEM_PATH", data_dir)
+        .env("IGGY_PATH", data_dir)
         .env("IGGY_CLUSTER_ENABLED", "true")
         .env("IGGY_CLUSTER_NAME", "laser-sdk-rolling-restart")
         .env("IGGY_MESSAGE_BUS_RECONNECT_PERIOD", "100ms")
@@ -357,8 +358,9 @@ fn spawn_cluster_node(
         .env("IGGY_ROOT_USERNAME", DEFAULT_ROOT_USERNAME)
         .env("IGGY_ROOT_PASSWORD", DEFAULT_ROOT_PASSWORD)
         .env("IGGY_SHARD_RUNTIME_CAPACITY", "256")
-        .env("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION", "0..1")
-        .env("IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
+        .env("IGGY_SHARDING_CPU_ALLOCATION", "1")
+        .env("IGGY_SHARDING_PIN_CORES", "false")
+        .env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     for node in 0..CLUSTER_SIZE {

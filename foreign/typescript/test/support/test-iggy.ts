@@ -116,7 +116,7 @@ export class TestIggy {
     this.child = spawn(this.binary, [], {
       env: {
         ...process.env,
-        IGGY_SYSTEM_PATH: this.directory,
+        IGGY_PATH: this.directory,
         IGGY_TCP_ADDRESS: `127.0.0.1:${String(this.port)}`,
         IGGY_HTTP_ENABLED: "false",
         IGGY_QUIC_ENABLED: "false",
@@ -124,7 +124,9 @@ export class TestIggy {
         IGGY_ROOT_USERNAME: "iggy",
         IGGY_ROOT_PASSWORD: "iggy",
         IGGY_SHARD_RUNTIME_CAPACITY: "256",
-        IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
+        IGGY_SHARDING_CPU_ALLOCATION: "2",
+        IGGY_SHARDING_PIN_CORES: "false",
+        IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
       },
       stdio: ["ignore", this.log.fd, this.log.fd]
     })
@@ -223,8 +225,8 @@ export class TestIggyCluster {
     this.proxyTarget = required(this.tcpPorts[replicaId], "cluster route target")
   }
 
-  async leaderAndFollower(): Promise<readonly [number, number]> {
-    const baseUrl = `http://127.0.0.1:${String(required(this.httpPorts[0], "HTTP port 0"))}`
+  async leaderAndFollower(via = 0): Promise<readonly [number, number]> {
+    const baseUrl = `http://127.0.0.1:${String(required(this.httpPorts[via], `HTTP port ${String(via)}`))}`
     const deadline = Date.now() + 30_000
     while (Date.now() < deadline) {
       try {
@@ -299,7 +301,7 @@ export class TestIggyCluster {
   private spawn(replicaId: number): void {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
-      IGGY_SYSTEM_PATH: this.directories[replicaId],
+      IGGY_PATH: this.directories[replicaId],
       IGGY_CLUSTER_ENABLED: "true",
       IGGY_CLUSTER_NAME: "laser-sdk-rolling-restart",
       IGGY_MESSAGE_BUS_RECONNECT_PERIOD: "100ms",
@@ -310,8 +312,9 @@ export class TestIggyCluster {
       IGGY_ROOT_USERNAME: "iggy",
       IGGY_ROOT_PASSWORD: "iggy",
       IGGY_SHARD_RUNTIME_CAPACITY: "256",
-      IGGY_SYSTEM_SHARDING_CPU_ALLOCATION: "0..1",
-      IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
+      IGGY_SHARDING_CPU_ALLOCATION: "1",
+      IGGY_SHARDING_PIN_CORES: "false",
+      IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
     }
     for (let node = 0; node < 3; node += 1) {
       const prefix = `IGGY_CLUSTER_NODES_${String(node)}`

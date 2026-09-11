@@ -71,7 +71,7 @@ jobs:
               git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               meaningful_paths="$(
                 git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$' || true
+                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$|^bench/|^fuzz/|^docker-compose\.yml$|^bdd/rust/|^examples/rust/|^foreign/typescript/|^bdd/typescript/|^examples/typescript/' || true
               )"
               pyproject_changes="$(
                 git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- foreign/python/pyproject.toml |
@@ -110,9 +110,7 @@ jobs:
             exit 1
           fi
       - name: Install Iggy runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libhwloc15
+        run: ${{ github.workspace }}/scripts/ci/apt-install.sh libhwloc15
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"

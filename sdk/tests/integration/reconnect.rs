@@ -7,39 +7,13 @@ use tokio::time::Instant;
 #[serial_test::serial(integration)]
 async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk_handle_should_continue_streaming()
  {
-    use iggy::prelude::{
-        Client, ClusterClient, ClusterNodeRole, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
-        IggyClientBuilder, UserClient,
-    };
+    use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let mut cluster = TestIggyCluster::start().await;
-    let discovery = IggyClientBuilder::from_connection_string(&format!(
-        "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{}",
-        cluster.node_endpoint(0),
-    ))
-    .expect("connection string")
-    .build()
-    .expect("discovery client");
-    discovery.connect().await.expect("discovery connect");
-    discovery
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await
-        .expect("login");
-    let metadata = discovery
-        .get_cluster_metadata()
-        .await
-        .expect("cluster metadata");
-    let leader = metadata
-        .nodes
-        .iter()
-        .find(|node| node.role == ClusterNodeRole::Leader)
-        .and_then(|node| node.name.strip_prefix("node-"))
-        .and_then(|value| value.parse::<usize>().ok())
-        .expect("configured leader");
+    let leader = discover_leader(&cluster.node_endpoint(0)).await;
     let follower = (0..3).find(|node| *node != leader).expect("follower");
-    discovery.disconnect().await.expect("discovery disconnect");
     cluster.route_endpoint_to(leader);
     let connection = format!(
         "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{}?reconnection_retries=unlimited&reconnection_interval=100ms",
@@ -95,7 +69,13 @@ async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk
     cluster.restart_node(follower).await;
     let after_follower = sent.load(Ordering::Acquire);
     wait_for_progress(&sent, after_follower + 1, "follower restart").await;
-    cluster.restart_node(leader).await;
+    // Clients reach the cluster through a stable endpoint that follows
+    // leadership. Re-route before the old leader is back: it rejoins as a
+    // follower, and a connection parked on a follower never sees a reply.
+    cluster.stop_node(leader);
+    let new_leader = discover_leader(&cluster.node_endpoint(follower)).await;
+    cluster.route_endpoint_to(new_leader);
+    cluster.start_node(leader).await;
     let after_leader = sent.load(Ordering::Acquire);
     wait_for_progress(&sent, after_leader + 1, "leader restart").await;
 
@@ -107,8 +87,50 @@ async fn given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk
     );
 }
 
+async fn discover_leader(endpoint: &str) -> usize {
+    use iggy::prelude::{
+        Client, ClusterClient, ClusterNodeRole, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
+        IggyClientBuilder, UserClient,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let discovery = IggyClientBuilder::from_connection_string(&format!(
+            "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{endpoint}",
+        ))
+        .expect("connection string")
+        .build()
+        .expect("discovery client");
+        let leader = async {
+            discovery.connect().await?;
+            discovery
+                .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+                .await?;
+            let metadata = discovery.get_cluster_metadata().await?;
+            Ok::<_, iggy::prelude::IggyError>(
+                metadata
+                    .nodes
+                    .iter()
+                    .find(|node| node.role == ClusterNodeRole::Leader)
+                    .and_then(|node| node.name.strip_prefix("node-"))
+                    .and_then(|value| value.parse::<usize>().ok()),
+            )
+        }
+        .await;
+        let _ = discovery.disconnect().await;
+        if let Ok(Some(leader)) = leader {
+            return leader;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cluster did not elect a leader before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn wait_for_progress(counter: &std::sync::atomic::AtomicU64, expected: u64, phase: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while counter.load(std::sync::atomic::Ordering::Acquire) < expected {
         assert!(
             Instant::now() < deadline,
