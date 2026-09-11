@@ -149,7 +149,7 @@ if (external !== undefined) {
     server = spawn(binary, [], {
       env: {
         ...process.env,
-        IGGY_SYSTEM_PATH: directory,
+        IGGY_PATH: directory,
         IGGY_TCP_ADDRESS: `127.0.0.1:${String(port)}`,
         IGGY_HTTP_ENABLED: "false",
         IGGY_QUIC_ENABLED: "false",
@@ -157,7 +157,9 @@ if (external !== undefined) {
         IGGY_ROOT_USERNAME: "iggy",
         IGGY_ROOT_PASSWORD: "iggy",
         IGGY_SHARD_RUNTIME_CAPACITY: "256",
-        IGGY_SYSTEM_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
+        IGGY_SHARDING_CPU_ALLOCATION: "2",
+        IGGY_SHARDING_PIN_CORES: "false",
+        IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
       },
       stdio: ["ignore", log.fd, log.fd],
     })

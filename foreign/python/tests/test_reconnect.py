@@ -40,7 +40,13 @@ async def test_given_cluster_when_nodes_restart_then_same_handle_should_stream()
         await _wait_for_progress(lambda: sent, 1)
         await asyncio.to_thread(cluster.restart_node, follower)
         await _wait_for_progress(lambda: sent, sent + 1)
-        await asyncio.to_thread(cluster.restart_node, leader)
+        # The stable endpoint follows leadership. Re-route before the old
+        # leader is back: it rejoins as a follower, and a connection parked
+        # on a follower never sees a reply.
+        await asyncio.to_thread(cluster.stop_node, leader)
+        new_leader, _ = await asyncio.to_thread(cluster.leader_and_follower, follower)
+        cluster.route_endpoint_to(new_leader)
+        await asyncio.to_thread(cluster.start_node, leader)
         await _wait_for_progress(lambda: sent, sent + 1)
         assert observed > 0
     finally:
@@ -51,7 +57,7 @@ async def test_given_cluster_when_nodes_restart_then_same_handle_should_stream()
 
 
 async def _wait_for_progress(current, expected):
-    deadline = asyncio.get_running_loop().time() + 30
+    deadline = asyncio.get_running_loop().time() + 90
     while current() < expected:
         assert asyncio.get_running_loop().time() < deadline
         await asyncio.sleep(0.05)

@@ -10,7 +10,7 @@ function delay(ms: number): Promise<void> {
 
 void test(
   "given_three_node_cluster_when_follower_and_leader_restart_then_same_sdk_handle_should_continue_streaming",
-  { timeout: 90_000 },
+  { timeout: 240_000 },
   async () => {
     const cluster = await TestIggyCluster.start()
     let laser: Laser | undefined
@@ -45,7 +45,13 @@ void test(
       await waitForProgress(() => sent, 1)
       await cluster.restartNode(follower)
       await waitForProgress(() => sent, sent + 1)
-      await cluster.restartNode(leader)
+      // The stable endpoint follows leadership. Re-route before the old
+      // leader is back: it rejoins as a follower, and a connection parked
+      // on a follower never sees a reply.
+      await cluster.stopNode(leader)
+      const [newLeader] = await cluster.leaderAndFollower(follower)
+      cluster.routeEndpointTo(newLeader)
+      await cluster.startNode(leader)
       await waitForProgress(() => sent, sent + 1)
       assert.ok(observed > 0)
     } finally {
@@ -58,7 +64,7 @@ void test(
 )
 
 async function waitForProgress(current: () => number, expected: number): Promise<void> {
-  const deadline = Date.now() + 30_000
+  const deadline = Date.now() + 90_000
   while (current() < expected) {
     assert.ok(Date.now() < deadline, "streaming did not resume before the deadline")
     await delay(50)

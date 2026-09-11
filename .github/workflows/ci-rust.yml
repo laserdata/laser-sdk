@@ -72,7 +72,7 @@ jobs:
               git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               meaningful_paths="$(
                 git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$' || true
+                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$|^bench/|^docker-compose\.yml$|^foreign/typescript/|^bdd/typescript/|^examples/typescript/|^foreign/python/|^bdd/python/|^examples/python/' || true
               )"
               pyproject_changes="$(
                 git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- foreign/python/pyproject.toml |
@@ -282,9 +282,7 @@ jobs:
       - name: Free up disk space
         uses: ./.github/actions/free-disk-space
       - name: Install Iggy runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libhwloc15
+        run: scripts/ci/apt-install.sh libhwloc15
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.0
@@ -335,9 +333,7 @@ jobs:
       - name: Free up disk space
         uses: ./.github/actions/free-disk-space
       - name: Install Iggy runtime dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libhwloc15
+        run: scripts/ci/apt-install.sh libhwloc15
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.0

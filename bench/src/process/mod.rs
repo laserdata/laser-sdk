@@ -328,7 +328,7 @@ impl NativeIggy {
         command
             .env("IGGY_ROOT_USERNAME", IGGY_USERNAME)
             .env("IGGY_ROOT_PASSWORD", IGGY_PASSWORD)
-            .env("IGGY_SYSTEM_PATH", &system_path)
+            .env("IGGY_PATH", &system_path)
             .env("IGGY_TCP_ENABLED", "true")
             .env("IGGY_TCP_ADDRESS", address.to_string())
             .env("IGGY_HTTP_ENABLED", "false")
