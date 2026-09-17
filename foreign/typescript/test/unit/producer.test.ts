@@ -68,3 +68,18 @@ void test("given_a_committed_send_when_publishing_then_should_return_the_confirm
 
   assert.deepEqual(response.confirmations, [confirmation])
 })
+
+void test("given_transport_managed_retries_when_producer_overrides_them_then_should_not_multiply_attempts", async () => {
+  let sends = 0
+  const transport = {
+    publishRetriesManaged: true,
+    sendMessagesWithHeaders: (...args: Parameters<LaserTransport["sendMessagesWithHeaders"]>) => {
+      sends += 1
+      assert.deepEqual(args[5], { maxRetries: 2, retryBackoffMs: 7 })
+      return Promise.reject(new TransportError("exhausted", true))
+    }
+  } as unknown as LaserTransport
+  const producer = new Producer(transport, "stream", "topic", { retries: 2, retryIntervalMs: 7 })
+  await assert.rejects(producer.send(new Uint8Array([1])), TransportError)
+  assert.equal(sends, 1)
+})

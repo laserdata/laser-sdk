@@ -13,3 +13,7 @@ Area skills are under `.claude/skills/`. Start with [laser-sdk-overview](.claude
 Docs are part of every change: when code or the wire contract changes, update `README.md`, `sdk/README.md`, `wire/README.md`, `AGENTS.md`, this file, the relevant `.claude/skills/*`, `docs/*`, and `the AGDX spec` in the same change. Never report a change done while any doc is stale.
 
 Memory governance applies to both log-backed and in-process vector handles created from a `Laser`. Policies see the proposed item body, not a backend encoding.
+
+## Publish recovery
+
+Rust, Python, and TypeScript publish attempts default to 60 seconds, three retries, and 250 ms exponential backoff capped at 30 seconds. Builder/connect overrides take precedence over `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Preserve message identities and confirmed chunks across retries. Fail permanent errors immediately and return exhausted errors without panicking. Rust reconnects the shared client in place so consumers and reply readers remain attached. Recover only the connection an attempt used, and skip recovery once another publish has replaced it. See [publish recovery](docs/publish-recovery.md).

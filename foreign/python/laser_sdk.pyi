@@ -1921,7 +1921,7 @@ class Laser:
         selection to an estimated token count. Returns the selected messages.
         """
     @staticmethod
-    def connect(connection_string: builtins.str, *, stream: typing.Optional[builtins.str] = None, ops_stream: typing.Optional[builtins.str] = None, control_topic: typing.Optional[builtins.str] = None, dlq_topic: typing.Optional[builtins.str] = None, changes_topic: typing.Optional[builtins.str] = None, verifier: typing.Optional[KeyRegistry] = None) -> typing.Any:
+    def connect(connection_string: builtins.str, *, stream: typing.Optional[builtins.str] = None, ops_stream: typing.Optional[builtins.str] = None, control_topic: typing.Optional[builtins.str] = None, dlq_topic: typing.Optional[builtins.str] = None, changes_topic: typing.Optional[builtins.str] = None, verifier: typing.Optional[KeyRegistry] = None, publish_timeout_ms: typing.Optional[builtins.int] = None, publish_max_retries: typing.Optional[builtins.int] = None, publish_retry_backoff_ms: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts.
         """

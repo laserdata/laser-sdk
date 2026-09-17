@@ -1,3 +1,4 @@
+import { publishOptions, type PublishOptions } from "./publish-options.js"
 import {
   ApacheIggyTransport,
   type ClientOwnership,
@@ -167,6 +168,7 @@ const NO_TOPOLOGY_OVERRIDES: TopologyOverrides = {
 }
 
 interface LaserBuildOptions {
+  readonly publishOptions: PublishOptions
   readonly connectionString?: string
   readonly address?: { readonly host: string; readonly port: number }
   readonly credentials?:
@@ -195,6 +197,7 @@ export interface InjectedClientOptions {
 }
 
 export class LaserBuilder {
+  private publishOptionsValue: Partial<PublishOptions> = {}
   private connectionStringValue: string | undefined
   private addressValue: { readonly host: string; readonly port: number } | undefined
   private credentialsValue: LaserBuildOptions["credentials"]
@@ -209,6 +212,21 @@ export class LaserBuilder {
   private topologyOverridesValue: TopologyOverrides = NO_TOPOLOGY_OVERRIDES
 
   constructor(private readonly create: (options: LaserBuildOptions) => Promise<Laser>) {}
+
+  publishTimeout(milliseconds: number): this {
+    this.publishOptionsValue = { ...this.publishOptionsValue, timeoutMs: milliseconds }
+    return this
+  }
+
+  publishMaxRetries(value: number): this {
+    this.publishOptionsValue = { ...this.publishOptionsValue, maxRetries: value }
+    return this
+  }
+
+  publishRetryBackoff(milliseconds: number): this {
+    this.publishOptionsValue = { ...this.publishOptionsValue, retryBackoffMs: milliseconds }
+    return this
+  }
 
   connectionString(value: string): this {
     this.connectionStringValue = value
@@ -318,6 +336,7 @@ export class LaserBuilder {
       if (value.length === 0) throw new ConfigError(`${name} must not be empty`)
     }
     return this.create({
+      publishOptions: publishOptions(this.publishOptionsValue),
       ...(this.connectionStringValue !== undefined
         ? { connectionString: this.connectionStringValue }
         : {}),
@@ -482,7 +501,11 @@ export class Laser implements AsyncDisposable {
     return new LaserBuilder(async (options) => {
       let transport: ApacheIggyTransport
       if (options.client !== undefined) {
-        transport = await ApacheIggyTransport.fromClient(options.client, options.ownership)
+        transport = await ApacheIggyTransport.fromClient(
+          options.client,
+          options.ownership,
+          options.publishOptions
+        )
       } else if (options.address !== undefined) {
         const credentials = options.credentials ?? {
           kind: "usernamePassword" as const,
@@ -497,11 +520,13 @@ export class Laser implements AsyncDisposable {
           ? `[${options.address.host.replace(/^\[|\]$/g, "")}]`
           : options.address.host
         transport = await ApacheIggyTransport.connect(
-          `iggy://${userInfo}@${authorityHost}:${String(options.address.port)}`
+          `iggy://${userInfo}@${authorityHost}:${String(options.address.port)}`,
+          options.publishOptions
         )
       } else {
         transport = await ApacheIggyTransport.connect(
-          options.connectionString ?? LOCAL_CONNECTION_STRING
+          options.connectionString ?? LOCAL_CONNECTION_STRING,
+          options.publishOptions
         )
       }
       const laser = new Laser(

@@ -258,3 +258,18 @@ def test_crash_context_rejects_a_malformed_dead_letter_capsule():
             },
             last_decision=None,
         )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"publish_timeout_ms": 0},
+        {"publish_retry_backoff_ms": 0},
+        {"publish_timeout_ms": 2147483648},
+    ],
+)
+async def test_given_invalid_publish_settings_when_connecting_then_should_reject_before_io(options):
+    import laser_sdk
+
+    with pytest.raises(laser_sdk.ConfigError):
+        await laser_sdk.Laser.connect("iggy:iggy@127.0.0.1:1", **options)

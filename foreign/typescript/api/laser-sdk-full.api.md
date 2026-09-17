@@ -6603,6 +6603,12 @@ export class LaserBuilder {
     // (undocumented)
     opsStream(value: string): this;
     // (undocumented)
+    publishMaxRetries(value: number): this;
+    // (undocumented)
+    publishRetryBackoff(milliseconds: number): this;
+    // (undocumented)
+    publishTimeout(milliseconds: number): this;
+    // (undocumented)
     token(value: string): this;
     // (undocumented)
     verifier(value: KeyRegistry): this;

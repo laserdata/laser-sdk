@@ -271,7 +271,7 @@ struct PairedOperations {
 }
 
 enum ProducerShutdown {
-    Background(BackgroundShutdown),
+    Background(Box<BackgroundShutdown>),
     Batching(Arc<BatchingProducer>),
 }
 
@@ -1816,10 +1816,10 @@ async fn producer_operations(setup: ProducerSetup<'_>) -> Result<PairedOperation
                     case.batch_size,
                     warmup_records,
                 ),
-                shutdown: Some(ProducerShutdown::Background(BackgroundShutdown {
+                shutdown: Some(ProducerShutdown::Background(Box::new(BackgroundShutdown {
                     raw,
                     laser: laser_producer,
-                })),
+                }))),
                 lane_connections: Vec::new(),
             })
         }
@@ -2196,7 +2196,7 @@ async fn shutdown_producers(
 ) -> Result<(Vec<ProcessMeasurement>, Vec<ProcessMeasurement>), BenchError> {
     match shutdown {
         ProducerShutdown::Background(shutdown) => {
-            shutdown_background(shutdown, monitored_processes).await
+            shutdown_background(*shutdown, monitored_processes).await
         }
         ProducerShutdown::Batching(producer) => {
             let before = capture_processes(monitored_processes)?;

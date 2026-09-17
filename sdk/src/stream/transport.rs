@@ -216,12 +216,13 @@ pub struct ProducerBuilder {
 
 impl ProducerBuilder {
     pub(crate) fn new(topic: Topic) -> Self {
+        let publish = topic.laser.publish_options();
         Self {
             topic,
             batch_length: DEFAULT_BATCH_LENGTH,
             linger: Duration::ZERO,
-            retries: Some(3),
-            retry_interval: Some(DEFAULT_RETRY_INTERVAL),
+            retries: Some(publish.max_retries),
+            retry_interval: Some(publish.retry_backoff),
             routing: Routing::Balanced,
             create_stream: true,
             create_topic: true,
@@ -322,6 +323,13 @@ impl ProducerBuilder {
                 "topic partition count must be greater than zero".to_owned(),
             ));
         }
+        let background = self.background.is_some();
+        let mut publish_options = self.topic.laser.publish_options();
+        publish_options.max_retries = self.retries.unwrap_or(0);
+        if let Some(interval) = self.retry_interval {
+            publish_options.retry_backoff = interval;
+        }
+        publish_options.validate()?;
         let mut builder = self.topic.iggy_producer()?;
         builder = match self.background {
             Some(config) => builder.background(config),
@@ -343,7 +351,10 @@ impl ProducerBuilder {
             .transpose()?;
         builder = builder
             .partitioning(self.routing.into_partitioning()?)
-            .send_retries(self.retries, retry_interval);
+            .send_retries(
+                if background { self.retries } else { Some(0) },
+                retry_interval,
+            );
         builder = if self.create_stream {
             builder.create_stream_if_not_exists()
         } else {
@@ -358,6 +369,14 @@ impl ProducerBuilder {
         producer.init().await?;
         Ok(Producer {
             inner: Arc::new(producer),
+            laser: self.topic.laser.clone(),
+            publish_options,
+            batch_length: if self.batch_length == 0 {
+                DEFAULT_BATCH_LENGTH
+            } else {
+                self.batch_length
+            } as usize,
+            background,
         })
     }
 }
@@ -366,6 +385,10 @@ impl ProducerBuilder {
 /// A cloneable, initialized streaming producer.
 pub struct Producer {
     inner: Arc<IggyProducer>,
+    laser: crate::laser::Laser,
+    publish_options: crate::laser::PublishOptions,
+    batch_length: usize,
+    background: bool,
 }
 
 impl Producer {
@@ -382,7 +405,7 @@ impl Producer {
         &self,
         message: ProducerMessage,
     ) -> Result<SendMessagesResponse, LaserError> {
-        Ok(self.inner.send(vec![message.into_iggy()?]).await?)
+        self.send_iggy(vec![message.into_iggy()?], None).await
     }
 
     /// Send one record with a per-call routing override.
@@ -391,13 +414,11 @@ impl Producer {
         message: ProducerMessage,
         routing: Routing,
     ) -> Result<SendMessagesResponse, LaserError> {
-        Ok(self
-            .inner
-            .send_with_partitioning(
-                vec![message.into_iggy()?],
-                Some(Arc::new(routing.into_partitioning()?)),
-            )
-            .await?)
+        self.send_iggy(
+            vec![message.into_iggy()?],
+            Some(Arc::new(routing.into_partitioning()?)),
+        )
+        .await
     }
 
     /// Send one record with a per-call partition key.
@@ -446,7 +467,54 @@ impl Producer {
             .map(Routing::into_partitioning)
             .transpose()?
             .map(Arc::new);
-        Ok(self.inner.send_with_partitioning(messages, routing).await?)
+        self.send_iggy(messages, routing).await
+    }
+
+    async fn send_iggy(
+        &self,
+        mut messages: Vec<IggyMessage>,
+        routing: Option<Arc<Partitioning>>,
+    ) -> Result<SendMessagesResponse, LaserError> {
+        if self.background {
+            return Ok(self.inner.send_with_partitioning(messages, routing).await?);
+        }
+        crate::laser::prepare_publish_messages(&mut messages);
+        let mut confirmations = Vec::new();
+        let observed = std::sync::atomic::AtomicU64::new(0);
+        for (index, chunk) in messages.chunks(self.batch_length).enumerate() {
+            let response = self
+                .publish_options
+                .run(
+                    || async {
+                        observed.store(
+                            self.laser.publish_generation(),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        Ok(self
+                            .inner
+                            .send_with_partitioning(
+                                chunk.iter().map(crate::laser::clone_iggy_message).collect(),
+                                routing.clone(),
+                            )
+                            .await?)
+                    },
+                    || {
+                        self.laser.reconnect_for_publish(
+                            observed.load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    crate::laser::publish_failure(
+                        error,
+                        &messages[index * self.batch_length + chunk.len()..],
+                        std::mem::take(&mut confirmations),
+                    )
+                })?;
+            confirmations.extend(response.confirmations);
+        }
+        Ok(SendMessagesResponse { confirmations })
     }
 
     /// Flushes buffered `background`-mode messages and stops the worker. A

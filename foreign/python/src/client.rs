@@ -31,7 +31,7 @@ impl PyLaser {
     /// Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts.
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (connection_string, *, stream=None, ops_stream=None, control_topic=None, dlq_topic=None, changes_topic=None, verifier=None))]
+    #[pyo3(signature = (connection_string, *, stream=None, ops_stream=None, control_topic=None, dlq_topic=None, changes_topic=None, verifier=None, publish_timeout_ms=None, publish_max_retries=None, publish_retry_backoff_ms=None))]
     fn connect<'py>(
         py: Python<'py>,
         connection_string: String,
@@ -41,10 +41,22 @@ impl PyLaser {
         dlq_topic: Option<String>,
         changes_topic: Option<String>,
         verifier: Option<&PyKeyRegistry>,
+        publish_timeout_ms: Option<u64>,
+        publish_max_retries: Option<u32>,
+        publish_retry_backoff_ms: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let verifier = verifier.map(PyKeyRegistry::snapshot);
         future_into_py(py, async move {
             let mut builder = Laser::builder().connection_string(connection_string);
+            if let Some(value) = publish_timeout_ms {
+                builder = builder.publish_timeout(std::time::Duration::from_millis(value));
+            }
+            if let Some(value) = publish_max_retries {
+                builder = builder.publish_max_retries(value);
+            }
+            if let Some(value) = publish_retry_backoff_ms {
+                builder = builder.publish_retry_backoff(std::time::Duration::from_millis(value));
+            }
             if let Some(stream) = stream {
                 builder = builder.stream(stream);
             }

@@ -63,3 +63,7 @@ Iggy provides the VSR transport and AGDX command classifier. Agent publish, poll
 - Undecodable messages silently skipped instead of dead-lettered.
 - A permanent / bad-input failure retried `max_attempts` times instead of returning `LaserError::rejected(..)` (immediate DLQ).
 - Assuming a premium capability is present without checking `Laser::capabilities()`.
+
+## Publish recovery
+
+Publish attempts default to 60 seconds with three retries and 250 ms exponential backoff capped at 30 seconds. Rust builder methods `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff` match Python `Laser.connect` keywords `publish_timeout_ms`, `publish_max_retries`, and `publish_retry_backoff_ms`, and TypeScript builder methods `publishTimeout`, `publishMaxRetries`, and `publishRetryBackoff`. Explicit settings override `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Exhaustion returns an error for the application to handle, never a process exit. Preserve message identity and confirmed chunks on retries. See [publish recovery](../../../docs/publish-recovery.md).
