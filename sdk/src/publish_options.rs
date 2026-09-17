@@ -99,7 +99,10 @@ impl PublishOptions {
                 Err(error) => {
                     let retryable = match &error {
                         LaserError::Timeout(_) => true,
-                        LaserError::Iggy(cause) => crate::laser::is_transient_iggy_io_error(cause),
+                        LaserError::Iggy(cause) => {
+                            crate::laser::is_transient_iggy_io_error(cause)
+                                || crate::laser::needs_reauthentication(cause)
+                        }
                         _ => false,
                     };
                     if !retryable || attempt == self.max_retries {
@@ -178,6 +181,41 @@ mod tests {
             .await
             .expect("retry succeeds");
         assert_eq!(result, 42);
+        assert_eq!(sends.get(), 2);
+        assert_eq!(recoveries.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_an_unauthenticated_reply_when_retried_then_should_reconnect_before_the_next_send()
+     {
+        let sends = Cell::new(0);
+        let recoveries = Cell::new(0);
+        let result = options()
+            .run(
+                || {
+                    sends.set(sends.get() + 1);
+                    let attempt = sends.get();
+                    async move {
+                        if attempt == 1 {
+                            return Err(LaserError::Iggy(IggyError::ProducerSendFailed {
+                                cause: Box::new(IggyError::Unauthenticated),
+                                failed: std::sync::Arc::new(Vec::new()),
+                                committed: std::sync::Arc::new(Vec::new()),
+                                stream_name: "s".to_owned(),
+                                topic_name: "t".to_owned(),
+                            }));
+                        }
+                        Ok(7)
+                    }
+                },
+                || {
+                    recoveries.set(recoveries.get() + 1);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .expect("the re-authenticated retry succeeds");
+        assert_eq!(result, 7);
         assert_eq!(sends.get(), 2);
         assert_eq!(recoveries.get(), 1);
     }

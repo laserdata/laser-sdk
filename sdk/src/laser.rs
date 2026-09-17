@@ -1075,6 +1075,19 @@ pub(crate) fn is_transient_iggy_io_error(error: &IggyError) -> bool {
     }
 }
 
+// A publish answered `Unauthenticated` on a connection that already
+// authenticated once means the client's socket was re-dialed underneath it,
+// by its own reconnect or by a leader move, and the new node holds no session
+// for it. Recovery re-dials through the connection string, which carries the
+// auto-login credentials, so the retry runs authenticated.
+pub(crate) fn needs_reauthentication(error: &IggyError) -> bool {
+    match error {
+        IggyError::Unauthenticated => true,
+        IggyError::ProducerSendFailed { cause, .. } => needs_reauthentication(cause),
+        _ => false,
+    }
+}
+
 fn is_idempotent_create_race(error: &IggyError) -> bool {
     matches!(
         error,
