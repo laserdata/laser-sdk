@@ -1,9 +1,10 @@
 use crate::agent::{ConversationState, ReplayBound};
-use crate::context::{ContextAssembler, ContextMessage, ContextPolicy, LastN};
+use crate::context::{Checkpoint, ContextAssembler, ContextMessage, ContextPolicy, LastN};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::memory::{
-    ConsolidationReport, MemoryBackend, MemoryHandle, MemoryScope, RecallBuilder, RememberBuilder,
+    ConsolidationReport, MemoryBackend, MemoryHandle, MemoryItem, MemoryScope, RecallBuilder,
+    RememberBuilder,
 };
 use crate::provenance::{AgentTopic, Provenance};
 use crate::snapshot::SnapshotStore;
@@ -158,6 +159,19 @@ impl ContextScope {
         self.laser.graph(name)
     }
 
+    /// The current tail of `topics`, as a [`Checkpoint`] -- a point in the
+    /// log to fold up to ([`state`](Self::state) with
+    /// [`ReplayBound::At`]) or resume from
+    /// ([`ReplayBound::FromCheckpoint`]) later. Offsets are per topic-
+    /// partition, not per conversation, so this reads exactly what
+    /// [`Session::checkpoint`](crate::agent::Session::checkpoint) does.
+    pub async fn checkpoint(
+        &self,
+        topics: &[AgentTopic<'static>],
+    ) -> Result<Checkpoint, LaserError> {
+        crate::context::checkpoint(&self.laser, topics).await
+    }
+
     /// This context's conversation id.
     pub fn conversation(&self) -> ConversationId {
         self.conversation
@@ -192,6 +206,15 @@ impl ScopedMemory {
     /// items rendered as one prompt-ready block under an optional token budget.
     pub async fn block(&self, token_budget: Option<usize>) -> Result<String, LaserError> {
         self.handle.context(self.conversation, token_budget).await
+    }
+
+    /// Keyword-recall this scope for `query` -- no [`Embedder`](crate::memory::Embedder)
+    /// needed, so it works with the default log-backed memory out of the
+    /// box. For semantic or hybrid recall (needs an embedder configured on
+    /// the backing [`MemoryHandle`]), chain `.recall().semantic(..)`/
+    /// `.hybrid(..)` directly instead.
+    pub async fn search(&self, query: impl Into<String>) -> Result<Vec<MemoryItem>, LaserError> {
+        self.recall().keyword(query).fetch().await
     }
 
     /// One consolidation pass over this conversation, keeping the most relevant

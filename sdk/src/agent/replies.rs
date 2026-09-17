@@ -197,6 +197,7 @@ async fn dispatch_loop(
                 partition,
                 from,
                 REPLY_BATCH,
+                None,
             )
             .await
             {

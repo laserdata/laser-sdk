@@ -169,6 +169,7 @@ impl Cursor {
                 partition,
                 self.offsets[partition as usize],
                 self.batch,
+                None,
             )
             .await?;
             self.offsets[partition as usize] = batch.next_offset;

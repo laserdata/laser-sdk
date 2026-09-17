@@ -22,6 +22,92 @@ pub struct ContextMessage {
     pub envelope: Option<laser_wire::agent::AgentEnvelope>,
 }
 
+/// A point in a conversation's log: the next-offset-to-read on each
+/// partition of each named topic, as of when the checkpoint was captured.
+/// Two symmetric uses on [`ContextAssembler`]: [`to_checkpoint`] folds
+/// history up to and including it, a point-in-time read
+/// (`Session::state_at`); [`from_checkpoint`] resumes forward from it
+/// instead (`Session::replay`). Capture one with
+/// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint).
+///
+/// Keyed by topic name, not by wire format, so this is a client-side
+/// bookmark only, not a record on the log. A topic addressed as
+/// [`AgentTopic::Custom`] has no stable name and is never represented here:
+/// a checkpoint captured over topics that include one simply does not bound
+/// that topic.
+///
+/// [`to_checkpoint`]: ContextAssembler::to_checkpoint
+/// [`from_checkpoint`]: ContextAssembler::from_checkpoint
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Checkpoint {
+    per_topic: BTreeMap<String, BTreeMap<u32, u64>>,
+}
+
+impl Checkpoint {
+    /// This checkpoint's offsets for `topic` (by [`AgentTopic::name`]), or
+    /// `None` when the checkpoint was not taken over that topic.
+    pub fn topic_offsets(&self, topic: &str) -> Option<&BTreeMap<u32, u64>> {
+        self.per_topic.get(topic)
+    }
+
+    /// True when this checkpoint carries no topics at all (an empty
+    /// `topics` list was checkpointed, or none of them had a stable name).
+    pub fn is_empty(&self) -> bool {
+        self.per_topic.is_empty()
+    }
+}
+
+/// The current tail of `topics` on `laser`'s default stream, one entry per
+/// named topic (an [`AgentTopic::Custom`] topic is skipped -- it has no
+/// stable name to key a checkpoint by). Every partition that exists at
+/// capture time gets an entry, including an empty one (offset `0`), so a
+/// later bounded read can tell "nothing yet on this partition" apart from
+/// "this partition postdates the checkpoint."
+pub async fn checkpoint(
+    laser: &Laser,
+    topics: &[AgentTopic<'static>],
+) -> Result<Checkpoint, LaserError> {
+    let stream = Identifier::named(laser.stream_required()?)?;
+    let mut per_topic = BTreeMap::new();
+    for topic in topics {
+        let Some(name) = topic.name() else {
+            continue;
+        };
+        let topic_id = topic.as_identifier();
+        let Some(details) = laser.client().get_topic(&stream, &topic_id).await? else {
+            per_topic.insert(name.to_owned(), BTreeMap::new());
+            continue;
+        };
+        let count = crate::poll::bounded_partitions(details.partitions_count);
+        let consumer = Consumer::new(Identifier::named("laser-checkpoint")?);
+        let mut tails = tokio::task::JoinSet::new();
+        for partition in 0..count {
+            let laser = laser.clone();
+            let stream = stream.clone();
+            let topic_id = topic_id.clone();
+            let consumer = consumer.clone();
+            tails.spawn(async move {
+                let offset = crate::poll::current_tail_offset(
+                    &laser.client(),
+                    &stream,
+                    &topic_id,
+                    &consumer,
+                    partition,
+                )
+                .await?;
+                Ok::<_, LaserError>((partition, offset))
+            });
+        }
+        let mut offsets = BTreeMap::new();
+        while let Some(joined) = tails.join_next().await {
+            let (partition, offset) = joined.map_err(join_failed)??;
+            offsets.insert(partition, offset);
+        }
+        per_topic.insert(name.to_owned(), offsets);
+    }
+    Ok(Checkpoint { per_topic })
+}
+
 /// Selects which assembled messages feed an LLM call.
 pub trait ContextPolicy: Send + Sync {
     fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage>;
@@ -138,9 +224,26 @@ pub struct ContextAssembler {
     /// Per-partition start offsets: partition `p` is read from
     /// `from_offsets[p]` (default `0`). The incremental-resume seam: a fold
     /// seeded from a snapshot passes the snapshot's resume offsets here and
-    /// replays only the tail (the bounded-reads law).
+    /// replays only the tail (the bounded-reads law). Ignored for a topic
+    /// where [`from_checkpoint`](Self::from_checkpoint) also names it --
+    /// set at most one of the two.
     #[builder(default)]
     from_offsets: BTreeMap<u32, u64>,
+    /// Like `from_offsets`, but a [`Checkpoint`] taken with
+    /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint):
+    /// correctly per-topic (`from_offsets` is one map shared across every
+    /// topic in `topics`, so it does not distinguish two topics whose
+    /// offsets have diverged). Read forward from it to the tail, same as an
+    /// unbounded assemble -- the resuming counterpart to `to_checkpoint`,
+    /// which stops instead of continuing. `Option<T>` is implicitly
+    /// optional to the builder (defaults to `None`), so no `#[builder(default)]`
+    /// here.
+    from_checkpoint: Option<Checkpoint>,
+    /// Never read past this [`Checkpoint`], per topic: the point-in-time
+    /// bound behind `Session::state_at` and `ReplayBound::At`. `None` (the
+    /// default) reads to the current tail, unchanged from before this
+    /// field existed.
+    to_checkpoint: Option<Checkpoint>,
 }
 
 impl ContextAssembler {
@@ -179,21 +282,50 @@ impl ContextAssembler {
         for (topic_idx, topic_id, partition) in sources {
             let laser = laser.clone();
             let stream = stream.clone();
-            let start = self.from_offsets.get(&partition).copied().unwrap_or(0);
+            let topic_name = self.topics[topic_idx].name();
+            let from = match &self.from_checkpoint {
+                Some(checkpoint) => topic_name
+                    .and_then(|name| checkpoint.topic_offsets(name))
+                    .and_then(|offsets| offsets.get(&partition).copied())
+                    .unwrap_or(0),
+                None => self.from_offsets.get(&partition).copied().unwrap_or(0),
+            };
+            // The point-in-time ceiling for this (topic, partition), if the
+            // caller set one: `Some(end)` never reads past `end`, `None`
+            // reads to the current tail exactly as before this existed.
+            let cap = self.to_checkpoint.as_ref().map(|checkpoint| {
+                topic_name
+                    .and_then(|name| checkpoint.topic_offsets(name))
+                    .and_then(|offsets| offsets.get(&partition).copied())
+                    .unwrap_or(0)
+            });
             drains.spawn(async move {
                 let consumer = Consumer::new(Identifier::named("laser-context-reader")?);
-                // Context selection keeps the most recent records, so a
-                // partition longer than the drain ceiling is read from a
-                // tail-anchored window rather than from its head.
-                let start = crate::poll::tail_anchored_offset(
-                    &laser.client(),
-                    &stream,
-                    &topic_id,
-                    &consumer,
-                    partition,
-                    start,
-                )
-                .await?;
+                let start = match cap {
+                    // A bounded-above read anchors its window to the
+                    // checkpoint, not the current tail: the checkpoint may
+                    // sit far behind a tail that has since grown, and
+                    // anchoring there (like the tail-anchored path below
+                    // does for an unbounded read) would skip straight past
+                    // the very history being asked for.
+                    Some(end) => {
+                        from.max(end.saturating_sub(crate::poll::MAX_DRAIN_MESSAGES as u64 - 1))
+                    }
+                    // Context selection keeps the most recent records, so a
+                    // partition longer than the drain ceiling is read from a
+                    // tail-anchored window rather than from its head.
+                    None => {
+                        crate::poll::tail_anchored_offset(
+                            &laser.client(),
+                            &stream,
+                            &topic_id,
+                            &consumer,
+                            partition,
+                            from,
+                        )
+                        .await?
+                    }
+                };
                 let batch = crate::poll::drain_partition(
                     &laser.client(),
                     &stream,
@@ -202,6 +334,7 @@ impl ContextAssembler {
                     partition,
                     start,
                     READ_BATCH,
+                    cap,
                 )
                 .await?;
                 Ok::<_, LaserError>((topic_idx, partition, batch.messages))
@@ -266,6 +399,30 @@ fn join_failed(error: tokio::task::JoinError) -> LaserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_checkpoint_when_queried_by_topic_then_should_return_only_its_own_offsets() {
+        let checkpoint = Checkpoint {
+            per_topic: BTreeMap::from([
+                (
+                    "agent.commands".to_owned(),
+                    BTreeMap::from([(0, 5), (1, 2)]),
+                ),
+                ("agent.llm_io".to_owned(), BTreeMap::new()),
+            ]),
+        };
+        assert_eq!(
+            checkpoint.topic_offsets("agent.commands"),
+            Some(&BTreeMap::from([(0, 5), (1, 2)]))
+        );
+        assert_eq!(
+            checkpoint.topic_offsets("agent.llm_io"),
+            Some(&BTreeMap::new())
+        );
+        assert_eq!(checkpoint.topic_offsets("agent.tool_calls"), None);
+        assert!(!checkpoint.is_empty());
+        assert!(Checkpoint::default().is_empty());
+    }
 
     fn message(agent: &str, offset: u64) -> ContextMessage {
         ContextMessage {

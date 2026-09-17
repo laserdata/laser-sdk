@@ -1,4 +1,4 @@
-use crate::context::{ContextAssembler, ContextMessage};
+use crate::context::{Checkpoint, ContextAssembler, ContextMessage};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::provenance::AgentTopic;
@@ -13,12 +13,27 @@ use std::collections::BTreeMap;
 pub enum ReplayBound {
     /// Fold only messages at or after these per-partition offsets, the
     /// incremental form (a persisted cursor, a snapshot's resume offsets).
+    /// One map shared across every topic in `topics`: correct when they are
+    /// all read from the same starting point, ambiguous across topics whose
+    /// offsets have diverged. [`FromCheckpoint`](Self::FromCheckpoint) is the
+    /// per-topic-correct form.
     FromOffsets(BTreeMap<u32, u64>),
     /// Fold only the last `n` messages.
     Last(usize),
     /// Fold the whole partition from offset zero. Correct for a short
     /// conversation and for a first snapshot build, expensive everywhere else.
     Full,
+    /// Fold only messages at or after a [`Checkpoint`], resuming forward to
+    /// the tail: the per-topic-correct sibling of `FromOffsets`, and the
+    /// counterpart to `At` (which stops at the checkpoint instead of
+    /// continuing past it). Pairs with
+    /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint).
+    FromCheckpoint(Checkpoint),
+    /// Fold the conversation's full history up to and including a
+    /// [`Checkpoint`], then stop -- the point-in-time counterpart to
+    /// `FromCheckpoint` (which reads forward from a point instead of up to
+    /// it). The primitive behind `Session::state_at`.
+    At(Checkpoint),
 }
 
 /// Rebuilds in-memory state by folding a conversation's logged events (event sourcing).
@@ -60,6 +75,22 @@ impl ConversationState {
             ReplayBound::Full => {
                 assembler
                     .policy(Box::new(crate::context::LastN(usize::MAX)))
+                    .build()
+                    .assemble(laser)
+                    .await?
+            }
+            ReplayBound::FromCheckpoint(checkpoint) => {
+                assembler
+                    .policy(Box::new(crate::context::LastN(usize::MAX)))
+                    .from_checkpoint(checkpoint)
+                    .build()
+                    .assemble(laser)
+                    .await?
+            }
+            ReplayBound::At(checkpoint) => {
+                assembler
+                    .policy(Box::new(crate::context::LastN(usize::MAX)))
+                    .to_checkpoint(checkpoint)
                     .build()
                     .assemble(laser)
                     .await?

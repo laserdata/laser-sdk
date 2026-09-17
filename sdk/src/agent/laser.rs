@@ -631,6 +631,7 @@ impl AgentReplyReader {
                 partition,
                 from,
                 REPLY_BATCH,
+                None,
             )
             .await?;
             self.offsets[partition as usize] = batch.next_offset;
@@ -710,6 +711,7 @@ impl AgentReplyReader {
                 partition,
                 from,
                 REPLY_BATCH,
+                None,
             )
             .await?;
             self.offsets[partition as usize] = batch.next_offset;

@@ -10,9 +10,12 @@ pub use crate::agent::WORKFLOW_FENCE_NAMESPACE;
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,
-    ReliableConsumer, ReplayBound, RoutePolicy, Router, Workflow,
+    ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionEventKind, Sessions,
+    Workflow,
 };
 pub use crate::capabilities::Capabilities;
+#[cfg(feature = "agent")]
+pub use crate::context::Checkpoint;
 #[cfg(feature = "agent")]
 pub use crate::context_scope::{ContextScope, ScopedMemory};
 #[cfg(feature = "streaming")]
