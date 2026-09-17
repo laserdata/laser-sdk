@@ -20,49 +20,39 @@ pub struct ContextMessage {
     pub payload: Vec<u8>,
     /// The decoded AGDX envelope when the message carries one, else `None`.
     pub envelope: Option<laser_wire::agent::AgentEnvelope>,
+    /// The name of the topic the message was read from.
+    pub topic: String,
 }
 
-/// A point in a conversation's log: the next-offset-to-read on each
-/// partition of each named topic, as of when the checkpoint was captured.
-/// Two symmetric uses on [`ContextAssembler`]: [`to_checkpoint`] folds
-/// history up to and including it, a point-in-time read
-/// (`Session::state_at`); [`from_checkpoint`] resumes forward from it
-/// instead (`Session::replay`). Capture one with
+/// A point in a conversation's log: the next offset each partition of each
+/// named topic will write, as captured by
 /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint).
-///
-/// Keyed by topic name, not by wire format, so this is a client-side
-/// bookmark only, not a record on the log. A topic addressed as
-/// [`AgentTopic::Custom`] has no stable name and is never represented here:
-/// a checkpoint captured over topics that include one simply does not bound
-/// that topic.
-///
-/// [`to_checkpoint`]: ContextAssembler::to_checkpoint
-/// [`from_checkpoint`]: ContextAssembler::from_checkpoint
+/// [`ContextAssembler::to_checkpoint`] folds history up to it and
+/// [`ContextAssembler::from_checkpoint`] resumes after it. It is a client-side
+/// bookmark keyed by topic ([`AgentTopic::topic_string`]), never a record on
+/// the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     per_topic: BTreeMap<String, BTreeMap<u32, u64>>,
 }
 
 impl Checkpoint {
-    /// This checkpoint's offsets for `topic` (by [`AgentTopic::name`]), or
-    /// `None` when the checkpoint was not taken over that topic.
+    /// The per-partition offsets for `topic` (by [`AgentTopic::topic_string`]),
+    /// or `None` when the checkpoint was not taken over that topic.
     pub fn topic_offsets(&self, topic: &str) -> Option<&BTreeMap<u32, u64>> {
         self.per_topic.get(topic)
     }
 
-    /// True when this checkpoint carries no topics at all (an empty
-    /// `topics` list was checkpointed, or none of them had a stable name).
+    /// True when no named topic was checkpointed.
     pub fn is_empty(&self) -> bool {
         self.per_topic.is_empty()
     }
 }
 
 /// The current tail of `topics` on `laser`'s default stream, one entry per
-/// named topic (an [`AgentTopic::Custom`] topic is skipped -- it has no
-/// stable name to key a checkpoint by). Every partition that exists at
-/// capture time gets an entry, including an empty one (offset `0`), so a
-/// later bounded read can tell "nothing yet on this partition" apart from
-/// "this partition postdates the checkpoint."
+/// topic. Every partition that exists at capture time gets an entry,
+/// an empty one at offset `0`, so a later bounded read can tell an empty
+/// partition apart from one created after the checkpoint.
 pub async fn checkpoint(
     laser: &Laser,
     topics: &[AgentTopic<'static>],
@@ -70,12 +60,10 @@ pub async fn checkpoint(
     let stream = Identifier::named(laser.stream_required()?)?;
     let mut per_topic = BTreeMap::new();
     for topic in topics {
-        let Some(name) = topic.name() else {
-            continue;
-        };
+        let name = topic.topic_string();
         let topic_id = topic.as_identifier();
         let Some(details) = laser.client().get_topic(&stream, &topic_id).await? else {
-            per_topic.insert(name.to_owned(), BTreeMap::new());
+            per_topic.insert(name, BTreeMap::new());
             continue;
         };
         let count = crate::poll::bounded_partitions(details.partitions_count);
@@ -103,7 +91,7 @@ pub async fn checkpoint(
             let (partition, offset) = joined.map_err(join_failed)??;
             offsets.insert(partition, offset);
         }
-        per_topic.insert(name.to_owned(), offsets);
+        per_topic.insert(name, offsets);
     }
     Ok(Checkpoint { per_topic })
 }
@@ -224,25 +212,16 @@ pub struct ContextAssembler {
     /// Per-partition start offsets: partition `p` is read from
     /// `from_offsets[p]` (default `0`). The incremental-resume seam: a fold
     /// seeded from a snapshot passes the snapshot's resume offsets here and
-    /// replays only the tail (the bounded-reads law). Ignored for a topic
-    /// where [`from_checkpoint`](Self::from_checkpoint) also names it --
-    /// set at most one of the two.
+    /// replays only the tail (the bounded-reads law). One map for every topic
+    /// in `topics`. A [`from_checkpoint`](Self::from_checkpoint) takes
+    /// precedence for the topics it names.
     #[builder(default)]
     from_offsets: BTreeMap<u32, u64>,
-    /// Like `from_offsets`, but a [`Checkpoint`] taken with
-    /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint):
-    /// correctly per-topic (`from_offsets` is one map shared across every
-    /// topic in `topics`, so it does not distinguish two topics whose
-    /// offsets have diverged). Read forward from it to the tail, same as an
-    /// unbounded assemble -- the resuming counterpart to `to_checkpoint`,
-    /// which stops instead of continuing. `Option<T>` is implicitly
-    /// optional to the builder (defaults to `None`), so no `#[builder(default)]`
-    /// here.
+    /// Resume after a [`Checkpoint`], per topic and partition, and read to the
+    /// tail.
     from_checkpoint: Option<Checkpoint>,
-    /// Never read past this [`Checkpoint`], per topic: the point-in-time
-    /// bound behind `Session::state_at` and `ReplayBound::At`. `None` (the
-    /// default) reads to the current tail, unchanged from before this
-    /// field existed.
+    /// Stop at a [`Checkpoint`], per topic and partition: the point-in-time
+    /// read behind `ReplayBound::At`. `None` reads to the current tail.
     to_checkpoint: Option<Checkpoint>,
 }
 
@@ -282,39 +261,40 @@ impl ContextAssembler {
         for (topic_idx, topic_id, partition) in sources {
             let laser = laser.clone();
             let stream = stream.clone();
-            let topic_name = self.topics[topic_idx].name();
+            let topic_name = self.topics[topic_idx].topic_string();
             let from = match &self.from_checkpoint {
-                Some(checkpoint) => topic_name
-                    .and_then(|name| checkpoint.topic_offsets(name))
+                Some(checkpoint) => checkpoint
+                    .topic_offsets(&topic_name)
                     .and_then(|offsets| offsets.get(&partition).copied())
                     .unwrap_or(0),
                 None => self.from_offsets.get(&partition).copied().unwrap_or(0),
             };
-            // The point-in-time ceiling for this (topic, partition), if the
-            // caller set one: `Some(end)` never reads past `end`, `None`
-            // reads to the current tail exactly as before this existed.
-            let cap = self.to_checkpoint.as_ref().map(|checkpoint| {
-                topic_name
-                    .and_then(|name| checkpoint.topic_offsets(name))
+            // A checkpoint holds the next offset to write, so a bounded read ends
+            // one before it.
+            let until = self.to_checkpoint.as_ref().map(|checkpoint| {
+                checkpoint
+                    .topic_offsets(&topic_name)
                     .and_then(|offsets| offsets.get(&partition).copied())
                     .unwrap_or(0)
             });
             drains.spawn(async move {
                 let consumer = Consumer::new(Identifier::named("laser-context-reader")?);
-                let start = match cap {
-                    // A bounded-above read anchors its window to the
-                    // checkpoint, not the current tail: the checkpoint may
-                    // sit far behind a tail that has since grown, and
-                    // anchoring there (like the tail-anchored path below
-                    // does for an unbounded read) would skip straight past
-                    // the very history being asked for.
-                    Some(end) => {
-                        from.max(end.saturating_sub(crate::poll::MAX_DRAIN_MESSAGES as u64 - 1))
+                let range = match until {
+                    Some(next) => {
+                        let Some(end) = next.checked_sub(1).filter(|end| *end >= from) else {
+                            return Ok::<_, LaserError>((topic_idx, partition, Vec::new()));
+                        };
+                        // Anchor the window at the checkpoint, not at a tail that
+                        // may have moved far past it.
+                        let start = from
+                            .max(end.saturating_sub(crate::poll::MAX_DRAIN_MESSAGES as u64 - 1));
+                        crate::poll::DrainRange::until(partition, start, end)
                     }
                     // Context selection keeps the most recent records, so a
                     // partition longer than the drain ceiling is read from a
                     // tail-anchored window rather than from its head.
-                    None => {
+                    None => crate::poll::DrainRange::open(
+                        partition,
                         crate::poll::tail_anchored_offset(
                             &laser.client(),
                             &stream,
@@ -323,18 +303,16 @@ impl ContextAssembler {
                             partition,
                             from,
                         )
-                        .await?
-                    }
+                        .await?,
+                    ),
                 };
                 let batch = crate::poll::drain_partition(
                     &laser.client(),
                     &stream,
                     &topic_id,
                     &consumer,
-                    partition,
-                    start,
+                    range,
                     READ_BATCH,
-                    cap,
                 )
                 .await?;
                 Ok::<_, LaserError>((topic_idx, partition, batch.messages))
@@ -357,6 +335,7 @@ impl ContextAssembler {
                             provenance,
                             payload: message.payload.to_vec(),
                             envelope,
+                            topic: self.topics[topic_idx].topic_string(),
                         },
                     ));
                 }
@@ -433,6 +412,7 @@ mod tests {
                 .build(),
             payload: Vec::new(),
             envelope: None,
+            topic: "agent.commands".to_owned(),
         }
     }
 

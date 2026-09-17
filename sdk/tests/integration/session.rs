@@ -1,94 +1,93 @@
 use crate::harness;
-use bytes::Bytes;
+use iggy::prelude::Identifier;
 use laser_sdk::prelude::full::*;
+use std::sync::LazyLock;
+
+static SUPPORT_TURNS: LazyLock<Identifier> =
+    LazyLock::new(|| Identifier::named("support.turns").expect("a valid identifier"));
+static SUPPORT_REPLIES: LazyLock<Identifier> =
+    LazyLock::new(|| Identifier::named("support.replies").expect("a valid identifier"));
 
 #[tokio::test]
 #[serial_test::serial(integration)]
 async fn given_per_user_sessions_when_messaging_then_should_isolate_each_user() {
     let laser = harness::laser().await;
-    let policy = SessionPolicy::PerUser;
-    let alice = policy.conversation_for("alice");
-    let bob = policy.conversation_for("bob");
+    let sessions = laser.sessions();
+    let alice = sessions.create("alice");
+    let bob = sessions.create("bob");
 
-    for (conversation, text) in [(alice, "alice message"), (bob, "bob message")] {
-        let provenance = Provenance::builder().conversation_id(conversation).build();
-        laser
-            .send_agent(
-                AgentTopic::Commands,
-                Bytes::copy_from_slice(text.as_bytes()),
-                &provenance,
-            )
+    for (session, text) in [(&alice, "alice message"), (&bob, "bob message")] {
+        session
+            .append(SessionTurnKind::Instruction, text.as_bytes().to_vec())
             .await
-            .expect("the user message should be sent");
+            .expect("the user turn should be appended");
     }
 
-    let alice_context = harness::eventually(|| async {
-        let messages = ContextAssembler::builder()
-            .conversation_id(alice)
-            .topics(vec![AgentTopic::Commands])
-            .build()
-            .assemble(&laser)
+    let turns = harness::eventually(|| async {
+        let turns = alice
+            .context()
             .await
-            .expect("assembling alice's conversation should succeed");
-        (!messages.is_empty()).then_some(messages)
+            .expect("assembling alice's context should succeed");
+        (!turns.is_empty()).then_some(turns)
     })
     .await;
 
-    assert_eq!(alice_context.len(), 1);
-    assert_eq!(alice_context[0].payload.as_slice(), b"alice message");
-    // re-deriving the same user yields the same conversation: stable per user
-    assert_eq!(policy.conversation_for("alice"), alice);
-}
-
-fn collect_payloads(mut acc: Vec<String>, message: &ContextMessage) -> Vec<String> {
-    acc.push(String::from_utf8_lossy(&message.payload).into_owned());
-    acc
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].text(), "alice message");
+    assert_eq!(
+        sessions.create("alice").conversation(),
+        alice.conversation()
+    );
+    assert_ne!(alice.conversation(), bob.conversation());
 }
 
 #[tokio::test]
 #[serial_test::serial(integration)]
-async fn given_a_session_when_appending_typed_turns_then_context_should_read_them_back() {
+async fn given_a_session_when_appending_typed_turns_then_context_should_read_them_back_with_kinds()
+{
     let laser = harness::laser().await;
     let sessions = laser.sessions();
     let session = sessions.create("agent-42");
+    let script = [
+        (SessionTurnKind::Instruction, "summarize the ticket"),
+        (SessionTurnKind::ToolCall, "search(ticket=42)"),
+        (SessionTurnKind::ToolResult, "3 comments found"),
+        (SessionTurnKind::ModelResponse, "it looks like a login bug"),
+        (SessionTurnKind::HumanInput, "approved"),
+        (SessionTurnKind::Response, "it is a login bug"),
+    ];
 
-    session
-        .append(
-            SessionEventKind::Instruction,
-            b"summarize the ticket".to_vec(),
-        )
-        .await
-        .expect("appending the instruction should succeed");
-    session
-        .append(SessionEventKind::ToolCall, b"search(ticket=42)".to_vec())
-        .await
-        .expect("appending the tool call should succeed");
-    session
-        .append(SessionEventKind::ToolResult, b"3 comments found".to_vec())
-        .await
-        .expect("appending the tool result should succeed");
-    session
-        .append(
-            SessionEventKind::ModelResponse,
-            b"it's a login bug".to_vec(),
-        )
-        .await
-        .expect("appending the model response should succeed");
+    for (kind, text) in script {
+        session
+            .append(kind, text.as_bytes().to_vec())
+            .await
+            .expect("appending the turn should succeed");
+    }
 
     let turns = harness::eventually(|| async {
-        let messages = session
+        let turns = session
             .context()
             .await
             .expect("assembling the session's context should succeed");
-        (messages.len() == 4).then_some(messages)
+        (turns.len() == script.len()).then_some(turns)
     })
     .await;
-    assert_eq!(turns.len(), 4);
+    let read_back: Vec<(SessionTurnKind, String)> =
+        turns.iter().map(|turn| (turn.kind, turn.text())).collect();
+    let expected: Vec<(SessionTurnKind, String)> = script
+        .iter()
+        .map(|(kind, text)| (*kind, (*text).to_owned()))
+        .collect();
+    assert_eq!(read_back, expected);
 
-    // `create` derives deterministically: the same id always reaches the same
-    // conversation, so re-"creating" it is really a resume.
-    assert_eq!(sessions.resume("agent-42").id(), session.id());
-    assert_ne!(sessions.start().id(), sessions.start().id());
+    assert_eq!(
+        sessions.open(session.conversation()).conversation(),
+        session.conversation()
+    );
+    assert_ne!(
+        sessions.start().conversation(),
+        sessions.start().conversation()
+    );
 }
 
 #[tokio::test]
@@ -99,17 +98,14 @@ async fn given_a_checkpoint_when_more_turns_are_appended_then_state_at_and_repla
     let session = laser.sessions().start();
 
     session
-        .append(SessionEventKind::Instruction, b"first".to_vec())
+        .append(SessionTurnKind::Instruction, b"first".to_vec())
         .await
         .expect("appending the first turn should succeed");
     session
-        .append(SessionEventKind::ModelResponse, b"second".to_vec())
+        .append(SessionTurnKind::ModelResponse, b"second".to_vec())
         .await
         .expect("appending the second turn should succeed");
 
-    // A checkpoint is a plain tail read, so it is itself subject to the same
-    // ingest-visibility lag as any other read here: retry until it reports
-    // exactly the two turns already appended, not zero, one, or a stale mix.
     let checkpoint = harness::eventually(|| async {
         let checkpoint = session
             .checkpoint()
@@ -124,23 +120,129 @@ async fn given_a_checkpoint_when_more_turns_are_appended_then_state_at_and_repla
     .await;
 
     session
-        .append(SessionEventKind::ToolResult, b"third".to_vec())
+        .append(SessionTurnKind::ToolResult, b"third".to_vec())
         .await
         .expect("appending the third turn should succeed");
-
-    let before = session
-        .state_at(checkpoint.clone(), Vec::new(), collect_payloads)
-        .await
-        .expect("state_at should fold only up to the checkpoint");
-    assert_eq!(before, vec!["first".to_owned(), "second".to_owned()]);
-
     let after = harness::eventually(|| async {
         let turns = session
-            .replay(checkpoint.clone(), Vec::new(), collect_payloads)
+            .turns_since(checkpoint.clone())
             .await
-            .expect("replay should fold forward from the checkpoint");
+            .expect("replay should read forward from the checkpoint");
         (turns.len() == 1).then_some(turns)
     })
     .await;
-    assert_eq!(after, vec!["third".to_owned()]);
+    assert_eq!(after[0].kind, SessionTurnKind::ToolResult);
+    assert_eq!(after[0].text(), "third");
+
+    let before: Vec<String> = session
+        .turns_at(checkpoint.clone())
+        .await
+        .expect("turns up to the checkpoint should read")
+        .iter()
+        .map(SessionTurn::text)
+        .collect();
+    assert_eq!(before, vec!["first".to_owned(), "second".to_owned()]);
+
+    let persisted = serde_json::to_string(&checkpoint).expect("a checkpoint serializes");
+    let restored: Checkpoint = serde_json::from_str(&persisted).expect("a checkpoint deserializes");
+    let replayed = session
+        .replay(restored, Vec::new(), |mut acc: Vec<String>, turn| {
+            acc.push(turn.text());
+            acc
+        })
+        .await
+        .expect("replay from a restored checkpoint should succeed");
+    assert_eq!(replayed, vec!["third".to_owned()]);
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_custom_layout_when_turns_ride_their_own_stream_and_topic_then_should_read_and_checkpoint_there()
+ {
+    let laser = harness::laser().await;
+    let stream = format!(
+        "{}-support",
+        laser.default_stream().expect("a default stream")
+    );
+    laser
+        .stream(&stream)
+        .ensure()
+        .await
+        .expect("the support stream should be created");
+    for topic in ["support.turns", "support.replies"] {
+        laser
+            .stream(&stream)
+            .topic(topic)
+            .ensure(2)
+            .await
+            .expect("the support topic should be created");
+    }
+    let config = SessionConfig::new()
+        .stream(stream.clone())
+        .topic(
+            SessionTurnKind::Instruction,
+            AgentTopic::Custom(&SUPPORT_TURNS),
+        )
+        .topic(
+            SessionTurnKind::Response,
+            AgentTopic::Custom(&SUPPORT_REPLIES),
+        )
+        .memory_namespace("support.sessions")
+        .context_turns(10);
+    let session = laser
+        .sessions_with(config)
+        .expect("a layout with one topic per kind is valid")
+        .create("ticket-7");
+
+    session
+        .append(SessionTurnKind::Instruction, b"where is my order".to_vec())
+        .await
+        .expect("appending on the custom topic should succeed");
+    let turns = harness::eventually(|| async {
+        let turns = session
+            .context()
+            .await
+            .expect("assembling the custom-layout context should succeed");
+        (turns.len() == 1).then_some(turns)
+    })
+    .await;
+    assert_eq!(turns[0].kind, SessionTurnKind::Instruction);
+    assert_eq!(turns[0].message.topic, "support.turns");
+
+    let untouched = laser
+        .sessions()
+        .create("ticket-7")
+        .context()
+        .await
+        .expect("the default layout should still read");
+    assert!(untouched.is_empty());
+
+    let checkpoint = harness::eventually(|| async {
+        let checkpoint = session
+            .checkpoint()
+            .await
+            .expect("a checkpoint over a custom topic should read");
+        (checkpoint.topic_offsets("support.turns").is_some()
+            && session
+                .turns_at(checkpoint.clone())
+                .await
+                .expect("turns up to the checkpoint should read")
+                .len()
+                == 1)
+            .then_some(checkpoint)
+    })
+    .await;
+    session
+        .append(SessionTurnKind::Response, b"shipped yesterday".to_vec())
+        .await
+        .expect("appending the response should succeed");
+    let since = harness::eventually(|| async {
+        let turns = session
+            .turns_since(checkpoint.clone())
+            .await
+            .expect("turns after the checkpoint should read");
+        (turns.len() == 1).then_some(turns)
+    })
+    .await;
+    assert_eq!(since[0].kind, SessionTurnKind::Response);
 }

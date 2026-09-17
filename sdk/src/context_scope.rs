@@ -159,12 +159,10 @@ impl ContextScope {
         self.laser.graph(name)
     }
 
-    /// The current tail of `topics`, as a [`Checkpoint`] -- a point in the
-    /// log to fold up to ([`state`](Self::state) with
-    /// [`ReplayBound::At`]) or resume from
-    /// ([`ReplayBound::FromCheckpoint`]) later. Offsets are per topic-
-    /// partition, not per conversation, so this reads exactly what
-    /// [`Session::checkpoint`](crate::agent::Session::checkpoint) does.
+    /// The current tail of `topics` as a [`Checkpoint`]: fold up to it with
+    /// [`ReplayBound::At`] or resume after it with
+    /// [`ReplayBound::FromCheckpoint`]. Offsets are per topic partition, not
+    /// per conversation.
     pub async fn checkpoint(
         &self,
         topics: &[AgentTopic<'static>],
@@ -175,6 +173,11 @@ impl ContextScope {
     /// This context's conversation id.
     pub fn conversation(&self) -> ConversationId {
         self.conversation
+    }
+
+    /// The `Laser` this scope reads and writes through.
+    pub fn laser(&self) -> &Laser {
+        &self.laser
     }
 }
 
@@ -208,11 +211,10 @@ impl ScopedMemory {
         self.handle.context(self.conversation, token_budget).await
     }
 
-    /// Keyword-recall this scope for `query` -- no [`Embedder`](crate::memory::Embedder)
-    /// needed, so it works with the default log-backed memory out of the
-    /// box. For semantic or hybrid recall (needs an embedder configured on
-    /// the backing [`MemoryHandle`]), chain `.recall().semantic(..)`/
-    /// `.hybrid(..)` directly instead.
+    /// Keyword recall for `query` within this conversation. It needs no
+    /// [`Embedder`](crate::memory::Embedder), so it works on the default
+    /// log-backed memory. Chain [`recall`](Self::recall) for semantic or
+    /// hybrid recall.
     pub async fn search(&self, query: impl Into<String>) -> Result<Vec<MemoryItem>, LaserError> {
         self.recall().keyword(query).fetch().await
     }

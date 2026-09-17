@@ -1112,6 +1112,23 @@ export interface CheckedBody {
 // @public (undocumented)
 export function checkIn(store: BlobStore, thresholdBytes: number, payload: Uint8Array): Promise<CheckedBody>;
 
+// @public
+export class Checkpoint {
+    // (undocumented)
+    static capture(laser: Laser, topics: readonly string[]): Promise<Checkpoint>;
+    // (undocumented)
+    static empty(): Checkpoint;
+    // (undocumented)
+    static fromJSON(value: unknown): Checkpoint;
+    // (undocumented)
+    isEmpty(): boolean;
+    // (undocumented)
+    toJSON(): Record<string, Record<string, string>>;
+    topicOffsets(topic: string): ReadonlyMap<number, bigint> | undefined;
+    // (undocumented)
+    get topics(): readonly string[];
+}
+
 // @public (undocumented)
 export type CheckpointMutationResult = {
     readonly kind: "destination";
@@ -1394,10 +1411,11 @@ export class ContextAssemblerBuilder {
     acrossSubconversations(value?: boolean): this;
     // (undocumented)
     build(): ContextAssembler;
-    // (undocumented)
+    fromCheckpoint(checkpoint: Checkpoint): this;
     fromOffsets(offsets: ReadonlyMap<number, bigint>): this;
     // (undocumented)
     policy(policy: ContextPolicy): this;
+    toCheckpoint(checkpoint: Checkpoint): this;
     // (undocumented)
     topics(topics: readonly string[]): this;
 }
@@ -1423,6 +1441,7 @@ export interface ContextMessage {
     readonly provenance: Provenance;
     // (undocumented)
     readonly timestampMicros: bigint;
+    readonly topic: string;
 }
 
 // @public (undocumented)
@@ -1438,6 +1457,7 @@ export class ContextScope {
     append(topic: string, payload: BytesLike): Promise<void>;
     // (undocumented)
     block(topics: readonly string[], count: number): Promise<string>;
+    checkpoint(topics: readonly string[]): Promise<Checkpoint>;
     // (undocumented)
     readonly conversation: ConversationId;
     // (undocumented)
@@ -1558,6 +1578,7 @@ export class Cursor {
         readonly signal?: AbortSignal;
         readonly pollIntervalMs?: number;
     }): AsyncIterable<ConsumedMessage>;
+    until(ends: ReadonlyMap<number, bigint>): this;
 }
 
 // @public (undocumented)
@@ -1641,6 +1662,18 @@ export const DEFAULT_KEY_NAMESPACE = "agent.keys";
 
 // @public (undocumented)
 export const DEFAULT_RETRY_POLICY: RetryPolicy;
+
+// @public (undocumented)
+export const DEFAULT_SESSION_CONTEXT_TOKENS = 4000;
+
+// @public (undocumented)
+export const DEFAULT_SESSION_CONTEXT_TURNS = 50;
+
+// @public
+export const DEFAULT_SESSION_MEMORY_NAMESPACE = "agent.session";
+
+// @public
+export const DEFAULT_SESSION_TOPICS: readonly string[];
 
 // @public (undocumented)
 export const DEFAULT_SNAPSHOT_NAMESPACE = "agent.snapshots";
@@ -3088,6 +3121,7 @@ export class Laser implements AsyncDisposable {
     sendAgent(topic: string, payload: BytesLike, provenance: Provenance, options?: {
         readonly contentType?: ContentType;
     }): Promise<void>;
+    sessions(options?: SessionOptions): Sessions;
     // (undocumented)
     spawnSubconversation(parent: Provenance): Provenance;
     // (undocumented)
@@ -4631,6 +4665,12 @@ export type ReplayBound = {
     readonly kind: "from-offsets";
     readonly offsets: ReadonlyMap<number, bigint>;
 } | {
+    readonly kind: "from-checkpoint";
+    readonly checkpoint: Checkpoint;
+} | {
+    readonly kind: "at";
+    readonly checkpoint: Checkpoint;
+} | {
     readonly kind: "last";
     readonly count: number;
 } | {
@@ -4955,6 +4995,7 @@ export class ScopedMemory {
     recall(): RecallBuilder;
     // (undocumented)
     remember(payload: Uint8Array): RememberBuilder;
+    search(query: string, limit?: number): Promise<readonly MemoryItem[]>;
 }
 
 // @public (undocumented)
@@ -4970,8 +5011,93 @@ export { SendMessagesResponse }
 // @public (undocumented)
 export const SERIAL_CONCURRENCY: ConcurrencyPolicy;
 
+// @public
+export class Session {
+    constructor(scope: ContextScope, config?: SessionConfig);
+    // (undocumented)
+    append(kind: SessionTurnKind, data: BytesLike): Promise<void>;
+    checkpoint(): Promise<Checkpoint>;
+    // (undocumented)
+    readonly config: SessionConfig;
+    context(): Promise<readonly SessionTurn[]>;
+    // (undocumented)
+    contextWith(policy: ContextPolicy): Promise<readonly SessionTurn[]>;
+    // (undocumented)
+    get conversation(): ConversationId;
+    graph(name: string): GraphHandle;
+    memory(namespace?: string): ScopedMemory;
+    replay<State>(checkpoint: Checkpoint, initial: State, fold: (state: State, turn: SessionTurn) => State): Promise<State>;
+    // (undocumented)
+    readonly scope: ContextScope;
+    stateAt<State>(checkpoint: Checkpoint, initial: State, fold: (state: State, turn: SessionTurn) => State): Promise<State>;
+    turnsAt(checkpoint: Checkpoint): Promise<readonly SessionTurn[]>;
+    turnsSince(checkpoint: Checkpoint): Promise<readonly SessionTurn[]>;
+}
+
+// @public (undocumented)
+export class SessionConfig {
+    constructor(options?: SessionOptions);
+    // (undocumented)
+    readonly contextTokens: number;
+    // (undocumented)
+    readonly contextTurns: number;
+    kindFor(topic: string): SessionTurnKind | undefined;
+    // (undocumented)
+    readonly memoryNamespace: string;
+    // (undocumented)
+    readonly stream: string | undefined;
+    topicFor(kind: SessionTurnKind): string;
+    get topicList(): readonly string[];
+    // (undocumented)
+    readonly topics: Readonly<Record<SessionTurnKind, string>>;
+}
+
+// @public
+export interface SessionOptions {
+    // (undocumented)
+    readonly contextTokens?: number;
+    // (undocumented)
+    readonly contextTurns?: number;
+    // (undocumented)
+    readonly memoryNamespace?: string;
+    // (undocumented)
+    readonly stream?: string;
+    // (undocumented)
+    readonly topics?: Partial<Readonly<Record<SessionTurnKind, string>>>;
+}
+
 // @public (undocumented)
 export type SessionPolicy = "perCall" | "perUser";
+
+// @public
+export class Sessions {
+    constructor(laser: Laser, options?: SessionOptions);
+    // (undocumented)
+    readonly config: SessionConfig;
+    create(id: string): Session;
+    open(conversation: ConversationId): Session;
+    start(): Session;
+}
+
+// @public
+export interface SessionTurn {
+    // (undocumented)
+    readonly kind: SessionTurnKind;
+    // (undocumented)
+    readonly message: ContextMessage;
+}
+
+// @public
+export type SessionTurnKind = "instruction" | "response" | "model.response" | "tool.call" | "tool.result" | "human.input";
+
+// @public
+export function sessionTurnKind(topic: string): SessionTurnKind | undefined;
+
+// @public
+export function sessionTurnText(turn: SessionTurn): string;
+
+// @public
+export function sessionTurnTopic(kind: SessionTurnKind): string;
 
 // @public (undocumented)
 export class SignatureError extends LaserError {
@@ -5260,6 +5386,7 @@ export class Topic {
     json<T>(codec: Codec<T>): TypedTopic<T>;
     // (undocumented)
     readonly name: string;
+    partitionCount(): Promise<number | undefined>;
     // (undocumented)
     producer(options?: ProducerOptions): Producer;
     // (undocumented)
@@ -5283,6 +5410,7 @@ export class Topic {
     }): Promise<SendMessagesResponse>;
     // (undocumented)
     readonly streamName: string;
+    tailOffsets(): Promise<ReadonlyMap<number, bigint>>;
 }
 
 // @public (undocumented)
@@ -5646,8 +5774,8 @@ export class ZeroEmbedder implements Embedder {
 // Warnings were encountered during analysis:
 //
 // src/agent/reliable-consumer.ts:158:7 - (ae-forgotten-export) The symbol "SignatureContext" needs to be exported by the entry point index.d.ts
-// src/conversation-state.ts:63:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
-// src/conversation-state.ts:63:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
+// src/conversation-state.ts:71:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
+// src/conversation-state.ts:71:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:363:7 - (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:364:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:369:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts

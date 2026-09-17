@@ -141,6 +141,7 @@ mod tests {
                 .build(),
             payload: payload.to_vec(),
             envelope: None,
+            topic: "agent.commands".to_owned(),
         }
     }
 

@@ -10,8 +10,8 @@ pub use crate::agent::WORKFLOW_FENCE_NAMESPACE;
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,
-    ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionEventKind, Sessions,
-    Workflow,
+    ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig, SessionTurn,
+    SessionTurnKind, Sessions, Workflow,
 };
 pub use crate::capabilities::Capabilities;
 #[cfg(feature = "agent")]

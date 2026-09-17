@@ -628,10 +628,8 @@ impl AgentReplyReader {
                 &self.stream,
                 &self.topic,
                 &self.consumer,
-                partition,
-                from,
+                crate::poll::DrainRange::open(partition, from),
                 REPLY_BATCH,
-                None,
             )
             .await?;
             self.offsets[partition as usize] = batch.next_offset;
@@ -708,10 +706,8 @@ impl AgentReplyReader {
                 &self.stream,
                 &self.topic,
                 &self.consumer,
-                partition,
-                from,
+                crate::poll::DrainRange::open(partition, from),
                 REPLY_BATCH,
-                None,
             )
             .await?;
             self.offsets[partition as usize] = batch.next_offset;

@@ -41,8 +41,9 @@ pub use router::{
 };
 pub use scope::AgentScope;
 pub use session::{
-    DEFAULT_SESSION_MEMORY_NAMESPACE, DEFAULT_SESSION_TOPICS, Session, SessionEventKind,
-    SessionPolicy, Sessions,
+    DEFAULT_SESSION_CONTEXT_TOKENS, DEFAULT_SESSION_CONTEXT_TURNS,
+    DEFAULT_SESSION_MEMORY_NAMESPACE, DEFAULT_SESSION_TOPICS, Session, SessionConfig,
+    SessionPolicy, SessionTurn, SessionTurnKind, Sessions,
 };
 pub use state::{ConversationState, ReplayBound, resume_offsets};
 #[cfg(feature = "kv")]

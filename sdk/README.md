@@ -266,6 +266,7 @@ Live presence is connection-scoped, so one connection may advertise one agent. A
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |
 | `laser.memory(scope)` | agentic memory | remember / recall / improve / forget |
 | `laser.context(conversation)` | one conversation's working record | append, bounded fetch, prompt block, state folds |
+| `laser.sessions().create(id)` | one agent's session over a conversation | typed turns, model-ready context, scoped memory, checkpoint, `turns_at` / `turns_since`, `state_at` / `replay` folds |
 | `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(name)` / `laser.runs()` | the fabric | directed asks, deadline-bound contracts, dependency-ordered workflows, the run registry |
 
 Lease acquisition on a connection-backed `Laser` uses a dedicated coordination connection. A bring-your-own `IggyClient` uses an explicit `FencedLeaseClient` with its own transport instead. A timed-out attempt actively retires that connection, and an ambiguous acquisition waits through its requested TTL before returning an error. A requested lease (or renewal) lifetime must fall in `MIN_LEASE_TTL_MICROS ..= MAX_LEASE_TTL_MICROS` (1s to 5min), rejected locally before the round trip. The store may grant less than the request and never grants more, so a holder needing longer renews. Exclusive workflows race renewal against contract completion, keep the lease through verification and the completion journal append, and release only after that record is durable.

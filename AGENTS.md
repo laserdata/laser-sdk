@@ -265,7 +265,11 @@ sdk/src/
                       directed-task state machine. Laser::scatter + scatter_report (per-agent ScatterReport)
     workflow.rs       Laser::workflow -> the engine: topo-ordered steps, budgets, verifier panels,
                       saga compensation, journal/replay/resume, all_capable scatter, fenced steps
-    session.rs        SessionPolicy (PerCall / PerUser)
+    session.rs        SessionPolicy (PerCall / PerUser), Laser::sessions / sessions_with(SessionConfig)
+                      -> Sessions (create / start / open) -> Session: typed turns (SessionTurnKind, one
+                      conversation-level AgentTopic each), context, scoped memory, Checkpoint,
+                      turns_at / turns_since, state_at / replay. A facade over ContextScope,
+                      never a second store
     state.rs          ConversationState::load (fold the log)
 sdk/tests/integration/  one shared Apache Iggy, one stream per test, BDD-named cases
   support/test_iggy.rs Native Iggy process harness (test-only, not shipped)

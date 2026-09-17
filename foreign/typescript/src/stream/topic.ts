@@ -268,6 +268,32 @@ export class Topic {
     return new Cursor(this.transport, this.streamName, this.name, partitionIds, options)
   }
 
+  /** The partition count, or `undefined` when the topic does not exist yet. */
+  partitionCount(): Promise<number | undefined> {
+    return this.transport.findTopicPartitionCount(this.streamName, this.name)
+  }
+
+  /** The next offset each partition will write, `0n` for an empty partition.
+   * Empty when the topic does not exist yet. */
+  async tailOffsets(): Promise<ReadonlyMap<number, bigint>> {
+    const partitionCount = (await this.partitionCount()) ?? 0
+    const tails = await Promise.all(
+      Array.from({ length: partitionCount }, async (_, partitionId) => {
+        const polled = await this.transport.pollMessages(
+          this.streamName,
+          this.name,
+          { kind: "single", partitionId, name: "laser-checkpoint" },
+          { kind: "last" },
+          1,
+          false
+        )
+        const last = polled.at(-1)
+        return [partitionId, last === undefined ? 0n : last.offset + 1n] as const
+      })
+    )
+    return new Map(tails)
+  }
+
   publish(): PublishRequest {
     return new PublishRequest(this)
   }

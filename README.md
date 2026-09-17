@@ -111,6 +111,7 @@ Every feature is a **primitive** you reach by one accessor on the connected clie
 | `laser.kv(namespace)` / `laser.fork(id)` | **State** | point reads and writes, CAS, leases, copy-on-write branches |
 | `laser.memory(scope)` | **Memory** | remember, recall (semantic / keyword / hybrid), consolidate |
 | `laser.context(id)` | **Context** | append and assemble one conversation's record, and scope its memory to that conversation |
+| `laser.sessions().create(id)` | **Session** | one agent's conversation as typed turns, a model-ready context, scoped memory, and checkpointed replay |
 | `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(..)` / `laser.runs()` | **Fabric** | directed asks, deadline contracts, ordered workflows, the run registry |
 
 Learn the pattern once and the whole platform reads the same way. In Rust:
@@ -158,6 +159,15 @@ ctx.append(AgentTopic::Audit, b"step done").await?;
 let facts = ctx.memory("support").recall().semantic("refund disputes").fetch().await?;
 let deps = ctx.graph("services").neighbors(node, EdgeDir::Out, None, 2).await?;
 
+// Session: the same conversation as typed turns, context, memory, and replay.
+let session = laser.sessions().create("agent-42");
+session.append(SessionTurnKind::Instruction, b"summarize the ticket").await?;
+session.append(SessionTurnKind::ModelResponse, b"it is a login bug").await?;
+let turns = session.context().await?; // kinds and payloads, last 50 turns within 4000 tokens
+let facts = session.memory().search("login bug").await?;
+let checkpoint = session.checkpoint().await?; // serializable, persist it anywhere
+let later = session.replay(checkpoint, Vec::new(), |mut acc, turn| { acc.push(turn.text()); acc }).await?;
+
 laser.memory("notes").set("current-plan", plan_json).await?; // named point state, an event on the memory topic
 let run = laser.workflow("refund").registered().step(/* .. */).run().await?;
 let page = laser.runs().list().state(AgentRunState::Running).fetch().await?;
@@ -188,6 +198,15 @@ await ctx.append("audit", b"step done")
 facts = await ctx.memory(laser.memory()).recall(semantic="refund disputes")
 turns = await ctx.fetch(last_n=20, token_budget=4_000)
 deps = await ctx.graph("services").neighbors(node, direction="out", depth=2)
+
+# Session: the same conversation as typed turns, context, memory, and replay
+session = laser.sessions().create("agent-42")
+await session.append("instruction", b"summarize the ticket")
+await session.append("model.response", b"it is a login bug")
+turns = await session.context()
+facts = await session.memory().search("login bug")
+checkpoint = await session.checkpoint()
+later = await session.turns_since(checkpoint)
 run = await laser.runs().submit("refund", task)
 ```
 
@@ -223,6 +242,15 @@ const facts = await ctx
   .recall()
   .semantic("refund disputes")
   .fetch()
+
+// Session: the same conversation as typed turns, context, memory, and replay
+const session = laser.sessions().create("agent-42")
+await session.append("instruction", encode("summarize the ticket"))
+await session.append("model.response", encode("it is a login bug"))
+const turns = await session.context()
+const hits = await session.memory().search("login bug")
+const checkpoint = await session.checkpoint()
+const later = await session.turnsSince(checkpoint)
 const run = await laser.runs().submit("refund", task)
 ```
 

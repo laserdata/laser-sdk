@@ -549,7 +549,20 @@ saved = cursor.offsets
 # Replay a conversation's history off the log (agent runtime). `token_budget`
 # trims the selection to an estimated token count, applied after `last_n`.
 history = await laser.assemble_context(conversation_id, last_n=50, token_budget=4_000)
+
+# An agent session: typed turns over the conversation-level topics, a
+# model-ready context, scoped memory, and checkpointed replay.
+session = laser.sessions().create("agent-42")
+await session.append("instruction", b"summarize the ticket")
+await session.append("model.response", b"it is a login bug")
+for turn in await session.context():
+    print(turn.kind, turn.text())
+checkpoint = await session.checkpoint()
+saved = checkpoint.to_json()
+later = await session.turns_since(ls.Checkpoint.from_json(saved))
 ```
+
+`laser.sessions(stream=..., topics={"instruction": "support.turns"}, memory_namespace=..., context_turns=..., context_tokens=...)` lays a fleet's sessions out on its own stream or topics. Every turn kind needs a topic of its own.
 
 ## Memory and state
 

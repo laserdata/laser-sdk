@@ -937,10 +937,8 @@ impl LogMemory {
                 &stream,
                 &topic,
                 &consumer,
-                partition,
-                from[partition as usize],
+                crate::poll::DrainRange::open(partition, from[partition as usize]),
                 READ_BATCH,
-                None,
             )
             .await?;
             if !batch.messages.is_empty() {

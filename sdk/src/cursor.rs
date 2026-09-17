@@ -166,10 +166,8 @@ impl Cursor {
                 &self.stream,
                 &self.topic,
                 &self.consumer,
-                partition,
-                self.offsets[partition as usize],
+                crate::poll::DrainRange::open(partition, self.offsets[partition as usize]),
                 self.batch,
-                None,
             )
             .await?;
             self.offsets[partition as usize] = batch.next_offset;

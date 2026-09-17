@@ -31,6 +31,7 @@ import {
 import { AsyncOnce } from "../runtime/async-once.js"
 import { Stream } from "../stream/stream.js"
 import { ContextScope } from "../context-scope.js"
+import { Sessions, type SessionOptions } from "../session.js"
 import {
   ActionKind,
   GovernorState,
@@ -920,6 +921,13 @@ export class Laser implements AsyncDisposable {
 
   context(conversation: ConversationId): ContextScope {
     return new ContextScope(this, conversation)
+  }
+
+  /** The session accessor: one conversation seen as typed turns, a model-ready
+   * context, scoped memory, and checkpointed replay. Built on `context`, so a
+   * session is never a second store. */
+  sessions(options?: SessionOptions): Sessions {
+    return new Sessions(this, options)
   }
 
   memory(namespace: string): MemoryHandle {

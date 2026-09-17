@@ -13,26 +13,19 @@ use std::collections::BTreeMap;
 pub enum ReplayBound {
     /// Fold only messages at or after these per-partition offsets, the
     /// incremental form (a persisted cursor, a snapshot's resume offsets).
-    /// One map shared across every topic in `topics`: correct when they are
-    /// all read from the same starting point, ambiguous across topics whose
-    /// offsets have diverged. [`FromCheckpoint`](Self::FromCheckpoint) is the
-    /// per-topic-correct form.
+    /// One map shared across every topic in `topics`.
+    /// [`FromCheckpoint`](Self::FromCheckpoint) bounds each topic on its own.
     FromOffsets(BTreeMap<u32, u64>),
     /// Fold only the last `n` messages.
     Last(usize),
     /// Fold the whole partition from offset zero. Correct for a short
     /// conversation and for a first snapshot build, expensive everywhere else.
     Full,
-    /// Fold only messages at or after a [`Checkpoint`], resuming forward to
-    /// the tail: the per-topic-correct sibling of `FromOffsets`, and the
-    /// counterpart to `At` (which stops at the checkpoint instead of
-    /// continuing past it). Pairs with
-    /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint).
+    /// Fold only what was appended after a [`Checkpoint`], per topic and
+    /// partition, up to the tail.
     FromCheckpoint(Checkpoint),
-    /// Fold the conversation's full history up to and including a
-    /// [`Checkpoint`], then stop -- the point-in-time counterpart to
-    /// `FromCheckpoint` (which reads forward from a point instead of up to
-    /// it). The primitive behind `Session::state_at`.
+    /// Fold the history up to a [`Checkpoint`], per topic and partition, and
+    /// stop there.
     At(Checkpoint),
 }
 

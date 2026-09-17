@@ -209,6 +209,7 @@ export {
 export type { AgentContextOptions, Gather, GatherPolicy } from "./agent/context.js"
 export { AgentScope } from "./agent/scope.js"
 export {
+  Checkpoint,
   ContextAssembler,
   ContextAssemblerBuilder,
   ContextChain,
@@ -218,6 +219,19 @@ export {
 } from "./context.js"
 export type { ContextMessage, ContextPolicy } from "./context.js"
 export { ContextScope, ScopedMemory } from "./context-scope.js"
+export {
+  DEFAULT_SESSION_CONTEXT_TOKENS,
+  DEFAULT_SESSION_CONTEXT_TURNS,
+  DEFAULT_SESSION_MEMORY_NAMESPACE,
+  DEFAULT_SESSION_TOPICS,
+  Session,
+  SessionConfig,
+  Sessions,
+  sessionTurnKind,
+  sessionTurnText,
+  sessionTurnTopic
+} from "./session.js"
+export type { SessionOptions, SessionTurn, SessionTurnKind } from "./session.js"
 export { ConversationState, FULL_REPLAY, resumeOffsets } from "./conversation-state.js"
 export type { ReplayBound } from "./conversation-state.js"
 export { FileStore, InMemoryStore } from "./state-store.js"

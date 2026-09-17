@@ -44,6 +44,7 @@ impl PyCrashContext {
                 provenance: message.inner.provenance.clone(),
                 payload: message.inner.payload.clone(),
                 envelope: message.inner.envelope.clone(),
+                topic: message.topic.clone().unwrap_or_default(),
             })
             .collect();
         let dead_letter = dead_letter.map(py_to_de::<AgentDeadLetter>).transpose()?;
