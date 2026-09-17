@@ -111,7 +111,7 @@ jobs:
         run: |
           cargo install cargo-machete --locked --version 0.9.2
           cargo machete
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   # The same static gates for the crates outside the workspace (bdd/rust, bench,
   # and fuzz), which `--workspace` does not reach. Kept a separate job so it runs in
@@ -136,7 +136,7 @@ jobs:
           cargo fmt --all --check
           cargo sort --check
           cargo machete
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --locked --all-targets -- -D warnings
       - name: lint and test bench
         working-directory: bench
         run: |
@@ -166,7 +166,7 @@ jobs:
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-targets --all-features
+      - run: cargo build --locked --workspace --all-targets --all-features
 
   # Every advertised feature combination must lint clean on its own with
   # `-D warnings`: `--all-features` hides a feature-gated module leaking into an
@@ -197,7 +197,7 @@ jobs:
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p laser-wire ${{ matrix.features }} -- -D warnings
+      - run: cargo clippy --locked -p laser-wire ${{ matrix.features }} -- -D warnings
 
   feature-matrix:
     needs: [flags]
@@ -229,7 +229,7 @@ jobs:
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p laser-sdk ${{ matrix.features }} -- -D warnings
+      - run: cargo clippy --locked -p laser-sdk ${{ matrix.features }} -- -D warnings
 
   # The gate that makes the wasm guarantee real: the wire crate's portable
   # surface must compile for wasm32-unknown-unknown. Omits `bson` (native-only).
@@ -245,7 +245,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: >
-          cargo check -p laser-wire --target wasm32-unknown-unknown
+          cargo check --locked -p laser-wire --target wasm32-unknown-unknown
           --no-default-features --features cbor,codecs,fixtures,builders,http-client
 
   # Dependency policy: the wire crate's portable graph bans iggy, tokio, bytes,
@@ -288,18 +288,18 @@ jobs:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@v2
       - if: needs.flags.outputs.server_tests == 'run'
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
       - if: needs.flags.outputs.server_tests == 'run'
-        run: cargo test -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
+        run: cargo test --locked -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
       - name: Server-free tests only (wire release or wire-break change)
         if: needs.flags.outputs.server_tests == 'skip'
         run: |
-          cargo test -p laser-wire --all-features
-          cargo test -p laser-sdk --all-features --lib --test signature_interop
+          cargo test --locked -p laser-wire --all-features
+          cargo test --locked -p laser-sdk --all-features --lib --test signature_interop
       # Doctests are excluded by `clippy --all-targets` and by a default-feature
       # `cargo test`, so a `///` example behind a non-default feature would never
       # compile without this explicit gate.
-      - run: cargo test --workspace --all-features --doc
+      - run: cargo test --locked --workspace --all-features --doc
 
   # Coverage-guided fuzzing of the wire decode surface, bounded per target. The
   # in-tree robustness suite (run by `test`) covers the same entry points every
@@ -340,7 +340,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: BDD scenarios (Rust runner)
         working-directory: bdd/rust
-        run: cargo test
+        run: cargo test --locked
 
   # One aggregate gate so branch protection requires a single check, not every
   # job and matrix leg. Runs after all of them and fails if any did not succeed.

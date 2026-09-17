@@ -361,3 +361,7 @@ At-least-once with idempotent operations, per-conversation (per-partition) order
 ## License
 
 Apache-2.0. Copyright LaserData, Inc. Apache and Apache Iggy are trademarks of the Apache Software Foundation, and use does not imply endorsement.
+
+## Publish recovery
+
+Publish attempts default to 60 seconds with three retries and exponential backoff starting at 250 milliseconds. Configure timeout, retry count, and backoff through the client builder or connect options, or the shared `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS` environment variables. Retry exhaustion returns an error for the application to handle. See [publish recovery and outage handling](docs/publish-recovery.md).

@@ -69,6 +69,8 @@ pub mod prelude;
 #[cfg(feature = "projections")]
 pub mod projections;
 pub mod provenance;
+#[cfg(feature = "streaming")]
+mod publish_options;
 pub mod query;
 #[cfg(feature = "rbac")]
 pub mod rbac;

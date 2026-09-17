@@ -1,5 +1,6 @@
 use crate::capabilities::Capabilities;
 use crate::error::LaserError;
+pub use crate::publish_options::PublishOptions;
 #[cfg(any(
     feature = "fork",
     feature = "destinations",
@@ -61,7 +62,7 @@ pub const OPS_STREAM_DEFAULT: &str = "_agdx";
 type ProducerKey = (String, String);
 type ProducerCell = Arc<OnceCell<Arc<IggyProducer>>>;
 const TRANSIENT_SEND_ATTEMPTS: usize = 10;
-const PUBLISH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLISH_BATCH_LENGTH: usize = 1000;
 
 /// The Laser client. Cheap to `clone`, since the connection and producer cache
 /// are shared via an internal `Arc`, so one connection is reused across tasks.
@@ -102,8 +103,12 @@ struct LaserInner {
     // `Arc` so a background reply dispatcher can hold the client without a
     // reference cycle back through `LaserInner` (which would leak the task).
     client: std::sync::RwLock<Arc<IggyClient>>,
-    reconnect_connection: Option<String>,
     reconnect_gate: tokio::sync::Mutex<()>,
+    // Bumped by every publish reconnect so a publish that failed on an older
+    // connection cannot tear down the one another publish already replaced it
+    // with.
+    publish_generation: std::sync::atomic::AtomicU64,
+    publish_options: PublishOptions,
     #[cfg(feature = "kv")]
     coordination_connection: Option<String>,
     #[cfg(feature = "kv")]
@@ -258,8 +263,9 @@ impl Laser {
         Self {
             inner: Arc::new(LaserInner {
                 client: std::sync::RwLock::new(Arc::new(client)),
-                reconnect_connection: None,
+                publish_options: PublishOptions::default(),
                 reconnect_gate: tokio::sync::Mutex::new(()),
+                publish_generation: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "kv")]
                 coordination_connection: None,
                 #[cfg(feature = "kv")]
@@ -388,6 +394,10 @@ impl Laser {
         scoped
     }
 
+    pub(crate) fn publish_options(&self) -> PublishOptions {
+        self.inner.publish_options
+    }
+
     /// The raw `IggyClient` this laser holds. Most callers should not need it.
     pub fn client(&self) -> Arc<IggyClient> {
         self.inner
@@ -397,19 +407,29 @@ impl Laser {
             .clone()
     }
 
-    async fn reconnect_from_seed(&self) -> Result<(), LaserError> {
-        let Some(connection) = self.inner.reconnect_connection.as_ref() else {
-            return Ok(());
-        };
+    pub(crate) fn publish_generation(&self) -> u64 {
+        self.inner
+            .publish_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reconnect the shared client for a publish that failed on generation
+    /// `observed`. A concurrent publish that already reconnected has moved the
+    /// generation on, and tearing its fresh connection down again would starve
+    /// every publisher during a rolling restart, so that call returns instead.
+    pub(crate) async fn reconnect_for_publish(&self, observed: u64) -> Result<(), LaserError> {
         let _gate = self.inner.reconnect_gate.lock().await;
-        let client = IggyClientBuilder::from_connection_string(connection)?.build()?;
+        if self.publish_generation() != observed {
+            return Ok(());
+        }
+        let client = self.client();
+        // Keep consumers and reply readers on the same client and its diagnostic events.
+        client.disconnect().await?;
         client.connect().await?;
-        *self
-            .inner
-            .client
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(client);
         self.inner.producers.clear();
+        self.inner
+            .publish_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -723,7 +743,7 @@ impl Laser {
         &self,
         stream: &str,
         topic: &str,
-        messages: Vec<IggyMessage>,
+        mut messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
     ) -> Result<SendMessagesResponse, LaserError> {
         if messages.is_empty() {
@@ -731,56 +751,48 @@ impl Laser {
                 confirmations: Vec::new(),
             });
         }
+        prepare_publish_messages(&mut messages);
         let partitioning = Arc::new(match partition_key {
             Some(key) => Partitioning::messages_key_str(key)?,
             None => Partitioning::balanced(),
         });
-        let key = (stream.to_owned(), topic.to_owned());
-        let mut pending = messages;
         let mut confirmations = Vec::new();
-        for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
-            let producer = match self.producer_on(stream, topic).await {
-                Ok(producer) => producer,
-                Err(error) if error.is_retryable() && attempt + 1 < TRANSIENT_SEND_ATTEMPTS => {
-                    self.inner.producers.remove(&key);
-                    self.reconnect_from_seed().await?;
-                    sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let send = producer.send_with_partitioning(pending, Some(partitioning.clone()));
-            let response = tokio::time::timeout(PUBLISH_RESPONSE_TIMEOUT, send).await;
-            match response {
-                Err(_) => {
-                    self.inner.producers.remove(&key);
-                    self.reconnect_from_seed().await?;
-                    return Err(LaserError::Timeout("Iggy publish response"));
-                }
-                Ok(Ok(mut response)) => {
-                    confirmations.append(&mut response.confirmations);
-                    return Ok(SendMessagesResponse { confirmations });
-                }
-                Ok(Err(IggyError::ProducerSendFailed {
-                    cause,
-                    failed,
-                    committed,
-                    ..
-                })) if is_transient_iggy_io_error(&cause)
-                    && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
-                {
-                    confirmations.extend(committed.iter().cloned());
-                    pending = reclaim_failed_messages(failed);
-                    self.inner.producers.remove(&key);
-                    if attempt == 1 {
-                        self.reconnect_from_seed().await?;
-                    }
-                    sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
-                }
-                Ok(Err(error)) => return Err(error.into()),
-            }
+        let observed = std::sync::atomic::AtomicU64::new(0);
+        for (index, chunk) in messages.chunks(PUBLISH_BATCH_LENGTH).enumerate() {
+            let response = self
+                .inner
+                .publish_options
+                .run(
+                    || async {
+                        observed.store(
+                            self.publish_generation(),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        let producer = self.producer_on(stream, topic).await?;
+                        Ok(producer
+                            .send_with_partitioning(
+                                chunk.iter().map(clone_iggy_message).collect(),
+                                Some(partitioning.clone()),
+                            )
+                            .await?)
+                    },
+                    || {
+                        self.reconnect_for_publish(
+                            observed.load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    publish_failure(
+                        error,
+                        &messages[index * PUBLISH_BATCH_LENGTH + chunk.len()..],
+                        std::mem::take(&mut confirmations),
+                    )
+                })?;
+            confirmations.extend(response.confirmations);
         }
-        unreachable!("retry loop either sends or returns the last publish error")
+        Ok(SendMessagesResponse { confirmations })
     }
 
     /// Send a managed command `code` with `payload` over the existing binary
@@ -939,7 +951,16 @@ impl Laser {
             .clone();
         let producer = cell
             .get_or_try_init(|| async {
-                let producer = self.client().producer(stream, topic)?.build();
+                let producer = self
+                    .client()
+                    .producer(stream, topic)?
+                    .direct(
+                        DirectConfig::builder()
+                            .batch_length(PUBLISH_BATCH_LENGTH as u32)
+                            .build(),
+                    )
+                    .send_retries(Some(0), None)
+                    .build();
                 for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
                     match producer.init().await {
                         Ok(()) => return Ok::<_, LaserError>(Arc::new(producer)),
@@ -956,15 +977,6 @@ impl Laser {
             })
             .await?;
         Ok(producer.clone())
-    }
-}
-
-fn reclaim_failed_messages(failed: Arc<Vec<IggyMessage>>) -> Vec<IggyMessage> {
-    match Arc::try_unwrap(failed) {
-        Ok(messages) => messages,
-        // IggyMessage is intentionally not Clone, but its bodies are Bytes. A
-        // transport-held Arc must not collapse a transient retry into failure.
-        Err(shared) => shared.iter().map(clone_iggy_message).collect(),
     }
 }
 
@@ -987,7 +999,46 @@ fn claim_presence_slot(
     }
 }
 
-fn clone_iggy_message(message: &IggyMessage) -> IggyMessage {
+pub(crate) fn publish_failure(
+    error: LaserError,
+    unsent: &[IggyMessage],
+    mut confirmations: Vec<SendMessagesConfirmationResponse>,
+) -> LaserError {
+    match error {
+        LaserError::Iggy(IggyError::ProducerSendFailed {
+            cause,
+            failed,
+            committed,
+            stream_name,
+            topic_name,
+        }) => {
+            confirmations.extend(committed.iter().cloned());
+            let pending = failed
+                .iter()
+                .chain(unsent)
+                .map(clone_iggy_message)
+                .collect();
+            LaserError::Iggy(IggyError::ProducerSendFailed {
+                cause,
+                failed: Arc::new(pending),
+                committed: Arc::new(confirmations),
+                stream_name,
+                topic_name,
+            })
+        }
+        error => error,
+    }
+}
+
+pub(crate) fn prepare_publish_messages(messages: &mut [IggyMessage]) {
+    for message in messages {
+        if message.header.id == 0 {
+            message.header.id = u128::from(ulid::Ulid::generate());
+        }
+    }
+}
+
+pub(crate) fn clone_iggy_message(message: &IggyMessage) -> IggyMessage {
     IggyMessage {
         header: IggyMessageHeader {
             checksum: message.header.checksum,
@@ -1006,7 +1057,17 @@ fn clone_iggy_message(message: &IggyMessage) -> IggyMessage {
 
 pub(crate) fn is_transient_iggy_io_error(error: &IggyError) -> bool {
     match error {
-        IggyError::CannotReadFile
+        IggyError::Disconnected
+        | IggyError::TcpError
+        | IggyError::QuicError
+        | IggyError::StaleClient
+        | IggyError::NotConnected
+        | IggyError::ConnectionClosed
+        | IggyError::CannotEstablishConnection
+        | IggyError::CannotSendMessagesDueToClientDisconnection
+        | IggyError::TransientNotAccepted
+        | IggyError::TransientNotCommitted
+        | IggyError::CannotReadFile
         | IggyError::CannotReadPartitions
         | IggyError::PartitionNotFound(..) => true,
         IggyError::ProducerSendFailed { cause, .. } => is_transient_iggy_io_error(cause),
@@ -1033,6 +1094,9 @@ pub struct LaserBuilder {
     // credentials, or a bring-your-own client) overwrites a different mode already
     // configured, so `build` fails loudly instead of silently dropping the first.
     connection_conflict: Option<&'static str>,
+    publish_timeout: Option<Duration>,
+    publish_max_retries: Option<u32>,
+    publish_retry_backoff: Option<Duration>,
     stream: Option<String>,
     ops_stream: Option<String>,
     control_topic: Option<String>,
@@ -1059,6 +1123,24 @@ enum ConnectionConfig {
 }
 
 impl LaserBuilder {
+    /// Per-attempt publish budget, including producer setup and reconnect. Default: 60 seconds.
+    pub fn publish_timeout(mut self, value: Duration) -> Self {
+        self.publish_timeout = Some(value);
+        self
+    }
+
+    /// Additional at-least-once publish attempts. Default: 3. Zero disables retries.
+    pub fn publish_max_retries(mut self, value: u32) -> Self {
+        self.publish_max_retries = Some(value);
+        self
+    }
+
+    /// Initial exponential retry delay, capped at 30 seconds. Default: 250 milliseconds.
+    pub fn publish_retry_backoff(mut self, value: Duration) -> Self {
+        self.publish_retry_backoff = Some(value);
+        self
+    }
+
     /// Connect using an Iggy connection string
     /// (`iggy+tcp://user:pass@host:port`, `iggy+quic://...`, `iggy+http://...`,
     /// `iggy+ws://...`). The most ergonomic option.
@@ -1242,6 +1324,11 @@ impl LaserBuilder {
         if let Some(conflict) = self.connection_conflict {
             return Err(LaserError::Config(conflict));
         }
+        let publish_options = PublishOptions::from_env(
+            self.publish_timeout,
+            self.publish_max_retries,
+            self.publish_retry_backoff,
+        )?;
         let stream = self.stream.filter(|value| !value.is_empty());
         #[cfg_attr(not(feature = "kv"), allow(unused_variables))]
         let (client, coordination_connection) = match self.connection {
@@ -1311,12 +1398,12 @@ impl LaserBuilder {
                 merge_announcement(&mut capabilities, &announce);
             }
         }
-        let reconnect_connection = coordination_connection.clone();
         Ok(Laser {
             inner: Arc::new(LaserInner {
                 client: std::sync::RwLock::new(Arc::new(client)),
-                reconnect_connection,
+                publish_options,
                 reconnect_gate: tokio::sync::Mutex::new(()),
+                publish_generation: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "kv")]
                 coordination_connection,
                 #[cfg(feature = "kv")]
@@ -1877,11 +1964,10 @@ pub(crate) async fn ensure_topic_with(
 mod builder_conflict_tests {
     #[cfg(feature = "agent")]
     use super::claim_presence_slot;
-    use super::{Laser, reclaim_failed_messages};
+    use super::{Laser, clone_iggy_message, prepare_publish_messages};
     use crate::error::LaserError;
     use bytes::Bytes;
     use iggy::prelude::IggyMessage;
-    use std::sync::Arc;
     #[cfg(feature = "agent")]
     use std::sync::Mutex;
 
@@ -1908,19 +1994,65 @@ mod builder_conflict_tests {
     }
 
     #[test]
-    fn given_a_shared_failed_batch_when_reclaimed_then_should_preserve_it_for_retry() {
+    fn given_a_publish_batch_when_cloned_for_retry_then_should_preserve_message_identity() {
         let message = IggyMessage::builder()
             .payload(Bytes::from_static(b"retry-body"))
             .build()
             .expect("the retry fixture message builds");
-        let failed = Arc::new(vec![message]);
-        let held_by_transport = failed.clone();
+        let mut messages = vec![message];
+        prepare_publish_messages(&mut messages);
+        let retry = clone_iggy_message(&messages[0]);
+        assert_ne!(retry.header.id, 0);
+        assert_eq!(retry.header.id, messages[0].header.id);
+        assert_eq!(retry.payload, Bytes::from_static(b"retry-body"));
+        assert_eq!(retry.user_headers, messages[0].user_headers);
+    }
 
-        let reclaimed = reclaim_failed_messages(failed);
+    #[test]
+    fn given_a_failed_chunk_when_reporting_progress_then_should_keep_confirmations_and_unsent_tail()
+    {
+        use iggy::prelude::{IggyError, SendMessagesConfirmationResponse};
+        use std::sync::Arc;
 
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].payload, Bytes::from_static(b"retry-body"));
-        assert_eq!(held_by_transport.len(), 1);
+        let message = |id| {
+            IggyMessage::builder()
+                .id(id)
+                .payload(Bytes::from_static(b"body"))
+                .build()
+                .expect("message builds")
+        };
+        let confirmed = SendMessagesConfirmationResponse {
+            stream_id: 1,
+            topic_id: 2,
+            partition_id: 0,
+            base_offset: 9,
+        };
+        let error = super::publish_failure(
+            LaserError::Iggy(IggyError::ProducerSendFailed {
+                cause: Box::new(IggyError::Disconnected),
+                failed: Arc::new(vec![message(2)]),
+                committed: Arc::new(vec![]),
+                stream_name: "stream".to_owned(),
+                topic_name: "topic".to_owned(),
+            }),
+            &[message(3)],
+            vec![confirmed],
+        );
+        let LaserError::Iggy(IggyError::ProducerSendFailed {
+            failed, committed, ..
+        }) = error
+        else {
+            panic!("preserve the structured publish error");
+        };
+        assert_eq!(
+            failed
+                .iter()
+                .map(|message| message.header.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].base_offset, 9);
     }
 
     #[tokio::test]

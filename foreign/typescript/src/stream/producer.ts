@@ -63,7 +63,7 @@ export class Producer implements AsyncDisposable {
     private readonly transport: LaserTransport,
     private readonly streamName: string,
     private readonly topicName: string,
-    options: ProducerOptions = {}
+    private readonly options: ProducerOptions = {}
   ) {
     this.routing =
       options.routing?.kind === "key"
@@ -168,6 +168,21 @@ export class Producer implements AsyncDisposable {
     messages: readonly MessageWithHeaders[],
     routing: Routing
   ): Promise<SendMessagesResponse> {
+    if (this.transport.publishRetriesManaged === true) {
+      return this.transport.sendMessagesWithHeaders(
+        this.streamName,
+        this.topicName,
+        messages,
+        routing.kind === "key" ? routing.key : undefined,
+        routing.kind === "partition" ? routing.partition : undefined,
+        {
+          ...(this.options.retries === undefined ? {} : { maxRetries: this.retries }),
+          ...(this.options.retryIntervalMs === undefined
+            ? {}
+            : { retryBackoffMs: this.retryIntervalMs })
+        }
+      )
+    }
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await this.transport.sendMessagesWithHeaders(

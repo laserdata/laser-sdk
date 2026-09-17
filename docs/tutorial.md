@@ -701,3 +701,7 @@ Query, projections, key-value, and forks are the managed surface. They run again
 | `Codec<T>` trait + `Json` + `Msgpack` + `Cbor` + `Bson` | identical wire. Codecs run on the producer side. Schema-first codecs resolve their writer schema from the managed registry |
 | reliable agent runtime | same agent runtime can run inside cloud services |
 | example projector (header path) + test projector (registry path) | the long-running managed projector under Operator |
+
+## Handling cluster outages
+
+Publish retries are bounded and configurable in all three clients. A long-running application must handle exhausted errors and retain work for a later attempt. See [publish recovery](publish-recovery.md) for defaults, language examples, and delivery semantics.

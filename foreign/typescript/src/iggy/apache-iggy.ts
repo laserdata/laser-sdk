@@ -1,5 +1,7 @@
+import { publishOptions, publishWithin, type PublishOptions } from "../client/publish-options.js"
 import {
   Consumer,
+  DeserializeError,
   HeaderKeyFactory,
   HeaderValue as IggyHeaderValueFactory,
   Partitioning,
@@ -16,7 +18,12 @@ import type {
 } from "apache-iggy"
 import { readFileSync } from "node:fs"
 import { isIP } from "node:net"
-import { AmbiguousMutationError, ConfigError, TransportError } from "../client/errors.js"
+import {
+  AmbiguousMutationError,
+  ConfigError,
+  TimeoutError,
+  TransportError
+} from "../client/errors.js"
 import { LASERDATA_ROOT_CA } from "../client/laserdata-ca.js"
 import type { PollingStrategy } from "../stream/polling-strategy.js"
 import type { Routing } from "../stream/routing.js"
@@ -40,6 +47,8 @@ export type { SendMessagesConfirmation, SendMessagesResponse }
 
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
+const TRANSIENT_NOT_COMMITTED = 57
+const TRANSIENT_NOT_ACCEPTED = 58
 
 export function toNodeBuffer(bytes: Uint8Array): Buffer {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
@@ -77,6 +86,7 @@ export type ConsumerOffsetTarget =
   | { readonly kind: "consumer"; readonly name: string }
 
 export interface LaserTransport {
+  readonly publishRetriesManaged?: boolean
   readonly kind: "apache-iggy"
   readonly iggyClient: SimpleClient
   sendManaged(
@@ -122,7 +132,8 @@ export interface LaserTransport {
     topicId: string,
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
-    partitionId?: number
+    partitionId?: number,
+    options?: Partial<PublishOptions>
   ): Promise<SendMessagesResponse>
   pollMessages(
     streamId: string,
@@ -457,15 +468,32 @@ interface ConnectedClient {
   readonly raw: RawClient
 }
 
-interface RawClientConnection {
-  readonly connection: {
-    on(event: "error", listener: (cause?: unknown) => void): void
-    once(event: "error", listener: (cause?: unknown) => void): void
-    off(event: "error", listener: (cause?: unknown) => void): void
-  }
+export interface ClientConnectionEvents {
+  readonly redirecting: boolean
+  on(event: "error", listener: (cause?: unknown) => void): void
+  on(event: "disconnected", listener: (hadError: boolean) => void): void
+  once(event: "error", listener: (cause?: unknown) => void): void
+  off(event: "error", listener: (cause?: unknown) => void): void
 }
 
-async function connectSimpleClient(parsed: ParsedConnectionString): Promise<ConnectedClient> {
+interface RawClientConnection {
+  readonly connection: ClientConnectionEvents
+}
+
+// The client swaps sockets on its own when it follows a leader move or walks
+// the roster. That drop is deliberate and nothing was lost, so retiring the
+// client on it would abort the very send it is relocating.
+export function watchConnectionLoss(connection: ClientConnectionEvents, onLost: () => void): void {
+  connection.on("disconnected", () => {
+    if (connection.redirecting) return
+    onLost()
+  })
+}
+
+async function connectSimpleClient(
+  parsed: ParsedConnectionString,
+  timeoutMs?: number
+): Promise<ConnectedClient> {
   const config: ClientConfig = parsed.tls
     ? {
         heartbeatInterval: VSR_HEARTBEAT_INTERVAL_MS,
@@ -496,7 +524,7 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
   try {
     const connection = (raw as RawClient & RawClientConnection).connection
     const client = new SimpleClient(raw)
-    await new Promise<void>((resolve, reject) => {
+    const ready = new Promise<void>((resolve, reject) => {
       const failed = (cause?: unknown): void => {
         reject(cause instanceof Error ? cause : new Error(String(cause)))
       }
@@ -506,6 +534,7 @@ async function connectSimpleClient(parsed: ParsedConnectionString): Promise<Conn
         resolve()
       }, reject)
     })
+    await (timeoutMs === undefined ? ready : publishWithin(ready, timeoutMs))
     connection.on("error", () => undefined)
     return { client, raw }
   } catch (cause) {
@@ -566,7 +595,9 @@ async function connectWithRetry(parsed: ParsedConnectionString): Promise<Connect
 
 export class ApacheIggyTransport implements LaserTransport {
   readonly kind = "apache-iggy" as const
+  readonly publishRetriesManaged = true
   private readonly reconnectLock = new Mutex()
+  private readonly publishLane = new Mutex()
   private readonly disconnected = new WeakSet<SimpleClient>()
   private readonly consumerGroups = new Map<
     string,
@@ -579,27 +610,34 @@ export class ApacheIggyTransport implements LaserTransport {
   private constructor(
     private client: SimpleClient,
     private readonly connection: ParsedConnectionString | undefined,
-    private readonly ownership: ClientOwnership
+    private readonly ownership: ClientOwnership,
+    private readonly publishConfig: PublishOptions
   ) {}
 
   get iggyClient(): SimpleClient {
     return this.client
   }
 
-  static async connect(connectionString: string): Promise<ApacheIggyTransport> {
+  static async connect(
+    connectionString: string,
+    options?: Partial<PublishOptions>
+  ): Promise<ApacheIggyTransport> {
+    const config = publishOptions(options)
     const parsed = parseConnectionString(connectionString)
     const connected = await connectWithRetry(parsed)
-    const transport = new ApacheIggyTransport(connected.client, parsed, "owned")
+    const transport = new ApacheIggyTransport(connected.client, parsed, "owned", config)
     transport.watch(connected)
     return transport
   }
 
   static async fromClient(
     client: SimpleClient,
-    ownership: ClientOwnership = "borrowed"
+    ownership: ClientOwnership = "borrowed",
+    options?: Partial<PublishOptions>
   ): Promise<ApacheIggyTransport> {
+    const config = publishOptions(options)
     await client.clientProvider()
-    return new ApacheIggyTransport(client, undefined, ownership)
+    return new ApacheIggyTransport(client, undefined, ownership, config)
   }
 
   private async execute<Value>(
@@ -641,8 +679,10 @@ export class ApacheIggyTransport implements LaserTransport {
     }
   }
 
-  private reconnect(stale: SimpleClient): Promise<void> {
+  private reconnect(stale: SimpleClient, deadline?: number): Promise<void> {
     return this.reconnectLock.runExclusive(async () => {
+      if (deadline !== undefined && Date.now() >= deadline)
+        throw new TimeoutError("Iggy publish reconnect")
       if (this.closed) throw new TransportError("transport is closed", false)
       if (this.client !== stale) return
       if (this.connection === undefined) {
@@ -656,10 +696,20 @@ export class ApacheIggyTransport implements LaserTransport {
         retries <= this.connection.reconnection.maxRetries
       ) {
         try {
-          const connected = await connectSimpleClient(this.connection)
+          const remaining = deadline === undefined ? undefined : deadline - Date.now()
+          if (remaining !== undefined && remaining <= 0)
+            throw new TimeoutError("Iggy publish reconnect")
+          const connected = await connectSimpleClient(this.connection, remaining)
           try {
             for (const group of this.consumerGroups.values()) {
-              await connected.client.group.ensureAndJoin(group.streamId, group.topicId, group.name)
+              const join = connected.client.group.ensureAndJoin(
+                group.streamId,
+                group.topicId,
+                group.name
+              )
+              await (deadline === undefined
+                ? join
+                : publishWithin(join, Math.max(1, deadline - Date.now())))
             }
           } catch (cause) {
             await connected.client.destroy().catch(() => undefined)
@@ -670,6 +720,8 @@ export class ApacheIggyTransport implements LaserTransport {
           return
         } catch (error) {
           lastError = error
+          if (deadline !== undefined && Date.now() >= deadline)
+            throw new TimeoutError("Iggy publish reconnect", { cause: error })
           if (serverResponseError(error) !== undefined) {
             break
           }
@@ -681,7 +733,13 @@ export class ApacheIggyTransport implements LaserTransport {
           }
           retries += 1
           await new Promise((resolve) =>
-            setTimeout(resolve, this.connection?.reconnection.intervalMs ?? 0)
+            setTimeout(
+              resolve,
+              Math.min(
+                this.connection?.reconnection.intervalMs ?? 0,
+                deadline === undefined ? Infinity : Math.max(0, deadline - Date.now())
+              )
+            )
           )
         }
       }
@@ -695,13 +753,9 @@ export class ApacheIggyTransport implements LaserTransport {
   }
 
   private watch(connected: ConnectedClient): void {
-    const markDisconnected = (): void => {
+    watchConnectionLoss((connected.raw as RawClient & RawClientConnection).connection, () => {
       this.disconnected.add(connected.client)
-    }
-    const stream = connected.raw.getReadStream()
-    stream.once("error", markDisconnected)
-    stream.once("end", markDisconnected)
-    stream.once("close", markDisconnected)
+    })
   }
 
   async sendManaged(
@@ -820,23 +874,92 @@ export class ApacheIggyTransport implements LaserTransport {
     return topic === null ? undefined : { stream: stream.name, topic: topic.name }
   }
 
+  private async publish(
+    operation: (client: SimpleClient) => Promise<SendMessagesResponse>,
+    options?: Partial<PublishOptions>
+  ): Promise<SendMessagesResponse> {
+    const config = { ...this.publishConfig, ...options }
+    for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+      let used = this.client
+      try {
+        // One attempt holds the connection at a time. The Apache Iggy client
+        // follows a leader move by re-issuing every queued command, and two
+        // queued sends make it authenticate twice per hop, with the second
+        // login settling back on the metadata leader. A lone command walks the
+        // roster cleanly and stays on the partition primary that admits it.
+        return await this.publishLane.runExclusive(async () => {
+          const deadline = Date.now() + config.timeoutMs
+          used = this.client
+          if (this.closed) throw new TransportError("transport is closed", false)
+          if (this.disconnected.has(used)) {
+            // Half the attempt budget goes to recovery so the send that follows
+            // always gets a real window. Spending it all here would leave a
+            // one-millisecond send that times out on a healthy connection and
+            // retires it, and the next attempt would repeat that forever.
+            const recovery = Math.max(1, Math.floor(config.timeoutMs / 2))
+            await publishWithin(this.reconnect(used, Date.now() + recovery), recovery)
+            used = this.client
+          }
+          return await publishWithin(operation(used), Math.max(1, deadline - Date.now()))
+        })
+      } catch (cause) {
+        const response = serverResponseError(cause)
+        const code =
+          response !== undefined && "errorCode" in response ? response.errorCode : undefined
+        const transient = code === TRANSIENT_NOT_COMMITTED || code === TRANSIENT_NOT_ACCEPTED
+        const retryable =
+          transient ||
+          (response === undefined &&
+            !(cause instanceof DeserializeError) &&
+            !(cause instanceof ConfigError) &&
+            !(cause instanceof TransportError && !cause.retryable))
+        // Retire the connection this attempt ran on, and only while it is still
+        // the current one. A concurrent publish may already have replaced it,
+        // and destroying that fresh connection would starve every publisher for
+        // as long as failures keep arriving.
+        if (response === undefined && retryable && this.client === used) {
+          this.disconnected.add(used)
+          // Destroy before retry so a timed-out queued write cannot run on the old socket.
+          await used.destroy().catch(() => undefined)
+        }
+        if (
+          !retryable ||
+          attempt === config.maxRetries ||
+          (this.connection === undefined && !transient)
+        ) {
+          if (cause instanceof TimeoutError) throw cause
+          throw new TransportError("Iggy publish failed", retryable, { cause })
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(config.retryBackoffMs * 2 ** Math.min(attempt, 16), 30_000))
+        )
+      }
+    }
+    throw new TransportError("publish attempts exhausted", true)
+  }
+
   async sendMessages(
     streamId: string,
     topicId: string,
     payloads: readonly Uint8Array[],
     routing: Routing
   ): Promise<SendMessagesResponse> {
-    const partitionId = await this.resolvePartition(streamId, topicId, routing)
-    return this.execute(
-      (client) =>
-        client.message.send({
-          streamId,
-          topicId,
-          messages: payloads.map((payload) => ({ payload: toNodeBuffer(payload) })),
-          partition: Partitioning.PartitionId(partitionId)
-        }),
-      `failed to send to topic \`${topicId}\``
-    )
+    let partitionId: number | undefined
+    const messages = payloads.map((payload) => ({
+      id: mintUlidValue(),
+      payload: toNodeBuffer(payload)
+    }))
+    return this.publish(async (client) => {
+      partitionId ??= await this.resolvePartition(streamId, topicId, routing, client)
+      if (this.disconnected.has(client))
+        throw new TransportError("publish connection was retired", true)
+      return client.message.send({
+        streamId,
+        topicId,
+        messages,
+        partition: Partitioning.PartitionId(partitionId)
+      })
+    })
   }
 
   async sendMessageWithHeaders(
@@ -861,11 +984,11 @@ export class ApacheIggyTransport implements LaserTransport {
     topicId: string,
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
-    partitionId?: number
+    partitionId?: number,
+    options?: Partial<PublishOptions>
   ): Promise<SendMessagesResponse> {
-    const resolvedPartition = await this.resolvePartition(
-      streamId,
-      topicId,
+    let resolvedPartition: number | undefined
+    const routing: Routing =
       partitionId !== undefined
         ? { kind: "partition", partition: partitionId }
         : partitionKey !== undefined
@@ -877,23 +1000,25 @@ export class ApacheIggyTransport implements LaserTransport {
                   : partitionKey
             }
           : { kind: "balanced" }
-    )
-    return this.execute(
-      (client) =>
-        client.message.send({
-          streamId,
-          topicId,
-          messages: messages.map(({ payload, headers }) => ({
-            payload: toNodeBuffer(payload),
-            headers: [...headers].map(([key, value]) => ({
-              key: HeaderKeyFactory.String(key),
-              value: toIggyHeaderValue(value)
-            }))
-          })),
-          partition: Partitioning.PartitionId(resolvedPartition)
-        }),
-      `failed to send to topic \`${topicId}\``
-    )
+    const prepared = messages.map(({ payload, headers }) => ({
+      id: mintUlidValue(),
+      payload: toNodeBuffer(payload),
+      headers: [...headers].map(([key, value]) => ({
+        key: HeaderKeyFactory.String(key),
+        value: toIggyHeaderValue(value)
+      }))
+    }))
+    return this.publish(async (client) => {
+      resolvedPartition ??= await this.resolvePartition(streamId, topicId, routing, client)
+      if (this.disconnected.has(client))
+        throw new TransportError("publish connection was retired", true)
+      return client.message.send({
+        streamId,
+        topicId,
+        messages: prepared,
+        partition: Partitioning.PartitionId(resolvedPartition)
+      })
+    }, options)
   }
 
   async pollMessages(
@@ -1000,12 +1125,18 @@ export class ApacheIggyTransport implements LaserTransport {
   private async resolvePartition(
     streamId: string,
     topicId: string,
-    routing: Routing
+    routing: Routing,
+    client: SimpleClient
   ): Promise<number> {
     if (routing.kind === "partition") return routing.partition
     const key = this.topicKey(streamId, topicId)
-    const partitionCount =
-      this.partitionCounts.get(key) ?? (await this.getTopicPartitionCount(streamId, topicId))
+    let partitionCount = this.partitionCounts.get(key)
+    if (partitionCount === undefined) {
+      const topic = await client.topic.get({ streamId, topicId })
+      if (topic === null) throw new TransportError(`topic ${topicId} does not exist`, false)
+      partitionCount = topic.partitionsCount
+      this.partitionCounts.set(key, partitionCount)
+    }
     if (partitionCount <= 0) {
       throw new TransportError(
         `topic \`${topicId}\` on stream \`${streamId}\` has no partitions`,
