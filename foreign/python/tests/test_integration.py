@@ -428,6 +428,23 @@ async def test_reader_reads_back_published_messages(laser):
     assert cursor.offsets  # advanced past what was read
 
 
+@pytest.mark.parametrize("batch", [6000, 20000])
+async def test_given_large_batches_when_replaying_then_should_bound_reads_and_resume_without_gaps(
+    laser, batch
+):
+    topic = laser.topic("bounded-replay")
+    producer = topic.producer(partition=0, partitions=1, batch_length=1000)
+    await producer.init()
+    await producer.send_batch([str(index).encode() for index in range(10001)], partition=0)
+    cursor = topic.replay(batch=batch)
+    messages = await cursor.poll()
+    assert len(messages) == 10000
+    assert cursor.offsets == [10000]
+    remaining = await cursor.poll()
+    assert [bytes(message.payload) for message in remaining] == [b"10000"]
+    assert cursor.offsets == [10001]
+
+
 async def test_governor_blocks_a_business_publish(laser):
     await laser.topic("business.audit").ensure(partitions=1)
 

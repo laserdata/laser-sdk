@@ -1,6 +1,6 @@
 # governance - permissions at every boundary
 
-> Pure grant decisions run locally, while managed RBAC and budgeted runs use the same policy vocabulary on LaserData Cloud.
+This example applies managed access roles and agent policies. It shows which requests the deployment permits and how the SDK records policy decisions.
 
 ## What it does
 
@@ -31,10 +31,10 @@ LASER_GOVERNANCE_USER_ID=42 \
 
 ## Where to look (LaserData Cloud)
 
-- **Roles**: the `support-reader` role with its allow and explicit deny.
-- **Bindings**: the role assignment for `LASER_GOVERNANCE_USER_ID`.
-- **Identity**: the effective roles returned by `whoami`.
-- **Runs**: the `governed-agent` run and its multidimensional budget.
+- Roles: the `support-reader` role with its allow and explicit deny.
+- Bindings: the role assignment for `LASER_GOVERNANCE_USER_ID`.
+- Identity: the effective roles returned by `whoami`.
+- Runs: the `governed-agent` run and its multidimensional budget.
 
 ## Highlights
 

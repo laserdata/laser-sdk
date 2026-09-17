@@ -1,21 +1,21 @@
 # firehose - millions of messages, many orgs, gigabytes of data
 
-A load generator, not a narrative. Layer: generic. AGDX surfaces: streaming at volume plus materialized views and the query DSL across many indexes. The other examples are small and reproducible. This one publishes millions of big, richly indexed telemetry events across many org indexes so LaserData Cloud can be driven with gigabytes of data: projections, query, table growth, and read-model behaviour under real storage pressure.
+This example generates telemetry records across several organization topics. It tests publication volume, projection, queries, and storage use. Use its message-count and payload-size controls to bound a run.
 
 ## What it does
 
-- Provisions `LASER_FIREHOSE_ORGS` topics (`org_00`, `org_01`, and so on), each registered as its own projection and binding, so each materializes into its own queryable index. The realistic multi-org shape: one index per org, exercising LaserData Cloud maintaining many materialized indexes at once without inventing fake schemas.
-- Publishes `LASER_FIREHOSE_MESSAGES` telemetry events spread across those orgs, with `LASER_FIREHOSE_CONCURRENCY` producers running at once, batching `LASER_FIREHOSE_BATCH` records per send call.
-- Each message carries 16 indexed columns (org, service, region, host, env, severity, `message_type`, http_method, status_code, route, user_id, session_id, trace_id, latency_ms, bytes_out, `ts`) plus a JSON body padded to `LASER_FIREHOSE_PAYLOAD_BYTES`, stored inline so LaserData Cloud keeps the bytes.
+- Create `LASER_FIREHOSE_ORGS` topics, such as `org_00` and `org_01`. Register a projection and binding for each topic.
+- Publish `LASER_FIREHOSE_MESSAGES` across the organizations. Use `LASER_FIREHOSE_CONCURRENCY` producers and `LASER_FIREHOSE_BATCH` records per send.
+- Include 16 indexed columns in each JSON body. The columns are `org`, `service`, `region`, `host`, `env`, `severity`, `message_type`, and `http_method`. They also include `status_code`, `route`, `user_id`, `session_id`, `trace_id`, `latency_ms`, `bytes_out`, and `ts`. Pad the body to `LASER_FIREHOSE_PAYLOAD_BYTES` and request inline storage.
 - Ends with a few best-effort analytics queries: rows per index, count by severity, slowest requests, and the grand total across all orgs.
 
-Reproducible by a per-org xorshift generator (no extra crate), so a run replays identically. Throughput-tuned, so build with `--release`.
+Each organization uses a deterministic xorshift generator. The same input configuration produces the same generated sequence. Use `--release` for load measurements.
 
 ## Run it
 
 Run from `examples/rust`:
 
-Every knob shares the SDK `LASER_` namespace under the `LASER_FIREHOSE_` prefix.
+All load controls use the `LASER_FIREHOSE_` prefix within the SDK `LASER_` namespace.
 
 | variable | default | meaning |
 | --- | --- | --- |
@@ -29,7 +29,7 @@ Every knob shares the SDK `LASER_` namespace under the `LASER_FIREHOSE_` prefix.
 | `LASER_FIREHOSE_QUERY` | `true` | run trailing analytics queries |
 | `LASER_FIREHOSE_PROGRESS_EVERY` | `100000` | progress log cadence in messages |
 
-Approximate log volume is `LASER_FIREHOSE_MESSAGES` times `LASER_FIREHOSE_PAYLOAD_BYTES`. The defaults publish 2M messages at 4 KB, roughly 8 GB across 8 org indexes. LaserData Cloud consumes the projection commands and serves the trailing queries. On Apache Iggy the publish path still runs at full speed and the managed phases are skipped.
+Approximate payload volume is `LASER_FIREHOSE_MESSAGES` multiplied by `LASER_FIREHOSE_PAYLOAD_BYTES`. Defaults produce 2 million messages of 4 KB across 8 organization indexes, about 8 GB of payload. LaserData Cloud handles projection and queries. Apache Iggy runs publication and skips managed phases.
 
 ```sh
 # defaults: about 2M messages across 8 org indexes, 4 KB payloads, about 8 GB
@@ -47,7 +47,7 @@ cargo run --release --example firehose
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: one index per org (`org_00`, `org_01`, ...), each materialized from its own projection, queried for rows per index, count by severity, slowest requests, and the grand total.
+- Query: one index per org (`org_00`, `org_01`, ...), each materialized from its own projection, queried for rows per index, count by severity, slowest requests, and the grand total.
 
 ## Highlights
 

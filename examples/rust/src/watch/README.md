@@ -1,6 +1,6 @@
 # watch - the Change feed primitive
 
-Poll a lightweight advancement feed, then query only when the view has moved. The feed rides the connection you already have and replaces repeated blind queries with a small change record.
+The change feed reports when a projected view advances. This example reads those notifications before querying the view.
 
 Managed by `laser-plane` in Laser Stack or LaserData Cloud, using the same view shape as the `query` example under this run's own `orders_v1_<token>` name. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean.
 

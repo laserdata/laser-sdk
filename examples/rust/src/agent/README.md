@@ -1,14 +1,14 @@
 # agent - the Fabric primitive
 
-A reliable runtime for agents on the log: deduplication, retries, dead-letters, request/reply. Contracts hand out tasks with deadlines. Workflows add budgets and compensation. Discovery lets agents find each other by capability.
+This example runs an agent that handles tasks from the log. It demonstrates capability-based routing, pickup acknowledgments, deadlines, and contract results.
 
-Runs with no Cloud: the agent runtime is open core.
+The agent runtime runs on Apache Iggy without a managed backend.
 
 ## What it shows
 
-- Spawn a handler agent (`Agent::builder().id(..).listen_on(AgentTopic::Commands)...handler(Triage).build().spawn(laser)`) advertising the `resolve-ticket` capability, so it is addressable by what it can do rather than by the name it runs under.
-- Acknowledge on pickup (`.ack_on_pickup(true)`), so a crash mid-handler is a retry rather than a silently dropped task.
-- Hand it a deadline-bounded task by capability, not by name: `laser.contract(Router::to_capable("resolve-ticket", RoutePolicy::Any)).from(..).deadline(Duration::from_secs(60)).send()`.
+- Spawn `Triage` with `Agent::builder().id(..).listen_on(AgentTopic::Commands)...handler(Triage).build().spawn(laser)`. Advertise `resolve-ticket` so callers can select the agent by capability.
+- Enable `.ack_on_pickup(true)` to distinguish task pickup from completion.
+- Send a task with `laser.contract(Router::to_capable("resolve-ticket", RoutePolicy::Any)).from(..).deadline(Duration::from_secs(60)).send()`.
 - Match the outcome (`Contract::Completed` / `Failed` / `NotConsumed` / `TimedOut`) and print the reply.
 
 ## Run it

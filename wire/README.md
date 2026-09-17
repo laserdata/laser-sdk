@@ -2,13 +2,13 @@
 
 [![crates.io](https://img.shields.io/crates/v/laser-wire.svg)](https://crates.io/crates/laser-wire) [![docs.rs](https://docs.rs/laser-wire/badge.svg)](https://docs.rs/laser-wire)
 
-The wire contract by [LaserData, Inc.](https://laserdata.com) for [Apache Iggy](https://iggy.apache.org), as one typed, runtime-free crate: managed command codes, CBOR envelopes, logical schemas and tagged values, operational and lakehouse query IR, destination and checkpoint declarations, Arrow IPC policy, key-value, fork, knowledge-graph, and agent surfaces, HTTP views and routes, dictionaries, caps, and the golden fixture corpus that pins every byte.
+The `laser-wire` crate defines the data contract shared by LaserData clients and services. [LaserData, Inc.](https://laserdata.com) maintains it for the [Apache Iggy](https://iggy.apache.org) binding. It defines command codes, envelopes, schemas, queries, destinations, checkpoints, and state operations. It also defines agent messages, HTTP representations, limits, and reference test data.
 
-The Rust SDK re-exports this crate as `laser_sdk::wire`, Python binds the same types, and the native TypeScript client round-trips every file in this crate's fixture corpus. LaserData Cloud consumes the definitions directly. No IO, async runtime, clock, or randomness is required, so the crate compiles unchanged for native servers and `wasm32-unknown-unknown`.
+Rust exposes these types as `laser_sdk::wire`. Python calls the same Rust code. TypeScript decodes and re-encodes the same reference test data. LaserData Cloud uses the definitions directly. The crate needs no I/O, clock, randomness, or asynchronous runtime. It supports native targets and `wasm32-unknown-unknown`.
 
 ## Features
 
-Modules carve the API surface. Features gate dependencies. No wire-contract type is ever feature-gated.
+Modules group related types and operations. Features select optional dependencies. Wire contract types remain available independently of feature selection.
 
 | Feature | Adds | wasm |
 |---|---|---|
@@ -40,10 +40,10 @@ Modules carve the API surface. Features gate dependencies. No wire-contract type
 | `query` | Queries with explicit operational or lakehouse targets, typed predicates and SQL parameters, cursor paging, status and cancellation, positional typed results, execution evidence, consistency, and errors |
 | `result` | the unified `ResultCode` space + HTTP status mapping with `From` projections off every surface error, and `CommandError` (the surface-agnostic fallback reply) |
 | `browse` | registry browse requests + `BrowseReply`, including `DecodeRecord` |
-| `control` | `Projection` (incl. `ProjectionKind::Graph` + the `EntitySchema` node/edge extraction plan), `ProjectionBinding`, `SchemaDef`, `ControlEnvelope` |
-| `kv` | the key-value requests (incl. `KvCas`/`CasExpect` and the single-transaction `KvCopy`/`KvMove`), `KvReply` (incl. `Committed`), `KvError` (incl. `VersionConflict`), the entry `version` token, and an optional `conversation` on `KvScan`/`KvDeleteMany` that narrows a memory-view scan to one conversation (additive, omitted on the wire when unset) |
+| `control` | `Projection` (including `ProjectionKind::Graph` + the `EntitySchema` node/edge extraction plan), `ProjectionBinding`, `SchemaDef`, `ControlEnvelope` |
+| `kv` | the key-value requests (including `KvCas`/`CasExpect` and the single-transaction `KvCopy`/`KvMove`), `KvReply` (including `Committed`), `KvError` (including `VersionConflict`), the entry `version` token, and an optional `conversation` on `KvScan`/`KvDeleteMany` that narrows a memory-view scan to one conversation (additive, omitted on the wire when unset) |
 | `fork` | the Iggy server requests, `ForkReply`, `ForkError`, and `validate_fork_id` (the shared id charset safelist) |
-| `graph` | the knowledge-graph ops (`GraphQuery`/`GraphNeighbors`/`GraphUpsert`), `GraphResult`, `GraphError`, `NodeId`/`EdgeId`, and the content-addressed constructors `NodeId::content`/`EdgeId::content` + `GraphNode::entity`/`GraphEdge::relate`. A node and an edge carry an optional `source` ([`SourceRef`]: a message position, key-value entry, or memory id) so a graph element links back to its origin, skip-none and excluded from the content-addressed id (`GraphEdge::with_source`). `SourceRef::Message` carries an optional `conversation`, and `GraphQuery`/`GraphNeighbors` an optional `conversation`, so a read narrows a traversal to one conversation (additive, omitted on the wire when unset) |
+| `graph` | the knowledge-graph ops (`GraphQuery`/`GraphNeighbors`/`GraphUpsert`), `GraphResult`, `GraphError`, `NodeId`/`EdgeId`, and the content-addressed constructors `NodeId::content`/`EdgeId::content` + `GraphNode::entity`/`GraphEdge::relate`. A node and an edge carry an optional `source` (`SourceRef`: a message position, key-value entry, or memory id) so a graph element links back to its origin, skip-none and excluded from the content-addressed id (`GraphEdge::with_source`). `SourceRef::Message` carries an optional `conversation`, and `GraphQuery`/`GraphNeighbors` an optional `conversation`, so a read narrows a traversal to one conversation (additive, omitted on the wire when unset) |
 | `hashing` | the one canonical `content_id` (a dependency-free FNV over byte segments) every content-addressed id shares, pinned by a golden vector |
 | `agent` | the Agent Data Exchange Protocol: `AgentEnvelope`, ids, dictionaries, `validate`, `BodyRef`, the pinned operation/metadata vocabularies |
 | `forward` | the forwarded managed-request frames (`ForwardedQuery`/`ForwardedCommand`, the command carrying the optional stable `operation_id` a mutation forwards under) |
@@ -59,17 +59,21 @@ Modules carve the API surface. Features gate dependencies. No wire-contract type
 
 ## Compatibility rules
 
-Query results are schema-first. `QueryResult.fields` defines one ordered logical schema and every `Row.values` array aligns positionally with it. Use the language SDK accessors to read a value by field name. Inline query pages stay bounded at 1000 rows. Publish a self-contained Arrow IPC stream when transferring analytical batches.
+`QueryResult.fields` defines the ordered schema for a result. Each `Row.values` entry matches the field at the same position. Use SDK accessors to read values by field name. A page contains at most 1000 rows. For analytical batches, publish a self-contained Arrow IPC stream.
 
-Operational and lakehouse targets are different variants. An operational result proves its backend resource generation and runtime configuration revision. A lakehouse result additionally proves destination generation, table UUID, snapshot, schema and partition-spec IDs, materialization boundary, checkpoint revision, and global state revision.
+Operational and lakehouse targets use separate variants. Operational results identify the backend resource generation and runtime configuration revision. Lakehouse results also identify the destination generation, table UUID, snapshot, schema, and partition-spec IDs. They include the materialization boundary, checkpoint revision, and global state revision.
 
-Destination declarations are public desired state. Public checkpoint mutations carry bounded client intent and worker evidence, while Plane-promoted transitions add authenticated actors, committed time, authoritative source cuts, absolute lease deadlines, lifecycle evidence, and server-certified repair records. Their types and decoders remain separate so a client body cannot be mistaken for a committed managed-log mutation.
+Destination declarations describe the state that the client requests. Public checkpoint mutations carry client intent and worker evidence. Plane-promoted transitions add authenticated actors, commit time, source boundaries, lease deadlines, lifecycle evidence, and certified repair records. Separate types and decoders prevent a client request from impersonating a committed transition.
 
-Named-field CBOR ignores unknown fields, so additive optional fields are compatible. Enum growth rides the per-surface op versions advertised by the capability handshake. All operation versions remain 1 during the pre-release contract phase, including the fenced-lease ops (`KvLease`, `KvLeaseRenew`, `KvRelease`, `KvCasFenced`). Their holder-identity fields are required with no decode defaults and `Validate` rejects any other `v` fail-closed, gated by the `KV_FENCED_LEASES` capability bit. The reply, outcome, and error enums are `#[non_exhaustive]`, so a consumer keeps compiling when a variant is added. The u8-code dictionaries (task state, agent error code, dead-letter reason) go further: an unknown code decodes to an `Unrecognized(u8)` variant and re-encodes byte-for-byte, so an old build relays a newer peer's code instead of failing. The internally tagged config enums that cross the JSON HTTP surface (`SchemaSource`, `RetentionPolicy`) carry a unit `Unknown` `#[serde(other)]` catch-all in the same spirit (lossy and read-only, so never re-apply an `Unknown`). A few executor-dispatched vocabularies (the query comparison and aggregate operators) are deliberately exhaustive, so adding one is a compile error that forces every backend to implement it rather than silently mis-handling it.
+Named-field CBOR can ignore unknown fields. Optional additions are compatible when their meaning allows old readers to ignore them safely. Operation versions describe support for each command group. During this contract phase, all operation versions remain 1, including `KvLease`, `KvLeaseRenew`, `KvRelease`, and `KvCasFenced`. These requests require their holder-identity fields and the `KV_FENCED_LEASES` capability. `Validate` rejects an unsupported `v`.
 
-Every `Vec<u8>` byte field rides as a CBOR byte string via the shared `encoding::bin_bytes`/`opt_bin_bytes` helpers (compact, unambiguous), never as a bare `Vec<u8>` (which would encode as a CBOR array of integers). The forwarded frames (`ForwardedQuery`/`ForwardedCommand`) and `SchemaSource::Protobuf.descriptor_set` follow this like every other surface.
+The reply, outcome, and error enums use `#[non_exhaustive]`. Code that matches them must handle later variants. The u8 dictionaries preserve unknown values through `Unrecognized(u8)`, so a relay can re-encode them without changing the bytes. `SchemaSource` and `RetentionPolicy` use `Unknown` with `#[serde(other)]` for unknown HTTP variants. This representation loses the original fields and is read-only. Never submit an `Unknown` value as new configuration.
 
-The fixture corpus pins the encoding behavior of the crate itself: regenerate with `AGDX_WIRE_FIXTURES_REGEN=1` only on an intentional wire change. Decoding hostile bytes never panics, and that guarantee is held by a deterministic robustness suite (`wire/tests/robustness.rs`) and a `cargo-fuzz` crate under `fuzz/`.
+Query comparison and aggregate operators are exhaustive. An added operator causes compilation errors until each backend handles it.
+
+Byte fields use the shared `encoding::bin_bytes` and `opt_bin_bytes` helpers. These helpers encode a `Vec<u8>` as a CBOR byte string. Plain `Vec<u8>` serialization produces an integer array. `ForwardedQuery`, `ForwardedCommand`, and `SchemaSource::Protobuf.descriptor_set` follow the same byte-string rule.
+
+Reference files define the expected encoded bytes. If a wire change is intentional, regenerate them with `AGDX_WIRE_FIXTURES_REGEN=1`. The decode tests in `wire/tests/robustness.rs` reject malformed input without a panic. The `cargo-fuzz` project under `fuzz/` also tests malformed input.
 
 ## License
 

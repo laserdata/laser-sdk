@@ -1,14 +1,14 @@
 # order-book - live book + trade-tape analytics
 
-A market-data workload with two readers over one stream, the shape a trading stack actually runs. Layer: generic. AGDX surfaces: streaming (the hot feed) and materialized views with the query DSL (the analytics tape), plus the writer-schema registry on a managed deployment, all on one connection. The query layer sits on top of the raw streaming path, it does not replace it.
+This example sends market fills to a live order-book reader and a trade-history topic. Managed deployments also support analytics and schema-based publication.
 
 ## What it does
 
-- **Live feed.** A deterministic matching engine random-walks prices and streams thousands of fills in bursts over wall-clock time, written raw to the hot feed and, in the same pass, indexed onto a queryable tape.
-- **Hot path.** A tuned Laser producer writes fills as they happen. A consumer-group reader, async-iterated as a `Stream`, folds them into a live order book that prints a rolling snapshot (last price, rolling VWAP, cumulative volume per symbol) as the market moves. Latency-critical, straight off the log, nothing materialized.
-- **Analytics path.** LaserData Cloud materializes the indexed tape into a queryable trade tape, and once the feed drains we compute per-symbol volume and VWAP over every fill. Indexing is body-first: the projection's pointers extract every column out of the JSON fill, typed (integer cents stay integers), and the fills carry the `message_type` and `ts` convention fields so the reserved columns and the query sugar work. No `agdx.idx.*` headers duplicate the payload.
-- **Typed tape audit.** After the aggregates, the same tape replays through one typed handle (`laser.topic(topic).json::<Trade>()`): `records(reader_name)` decodes every fill back into the struct as it drains, and the notionals recomputed off the log must equal the session's own. A record that stopped decoding would surface with its exact log position instead of wedging the reader.
-- **Schema-first tape (managed deployment).** Real feeds are binary, not JSON. On Laser Stack or LaserData Cloud the same fills replay onto a second tape as raw Avro datums. `laser.schemas().register(SchemaSource::Avro { .. }).send()` registers the `Fill` writer schema synchronously: the managed runtime validates that it compiles, allocates a collision-free id, and returns it. The `schema-codecs` feature compiles the schema client-side so `.add_avro(&compiled, id, &fill)` fails before publish if a body stops matching, and the records carry no headers at all because the managed runtime resolves `agdx.sid` and decodes each binary body. The per-symbol notionals come out identical to the JSON tape's. On an open server this coda prints how to point at a deployment and skips.
+- Generate deterministic fills in timed bursts. Publish them to the live feed and queryable tape.
+- Run a Laser producer with a live consumer-group reader. The reader reports last price, rolling volume-weighted average price, and cumulative volume per symbol.
+- Project the tape on a managed deployment, then query volume and volume-weighted average price. Extract typed columns from JSON bodies. Retain `message_type` and `ts` for query helpers without duplicating columns in `agdx.idx.*` headers.
+- Read the tape with `laser.topic(topic).json::<Trade>()` and `records(reader_name)`. Make sure that recomputed notionals match the session totals. Decode errors include the record position.
+- On a managed deployment, register `Fill` through `laser.schemas().register(SchemaSource::Avro { .. }).send()`. Compile it with `schema-codecs`, then publish through `.add_avro(&compiled, id, &fill)`. Records carry `agdx.sid` for schema selection. Make sure that Avro notionals match the JSON tape. An open server skips this phase.
 
 ## Run it
 
@@ -24,8 +24,8 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host cargo run --example o
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: the trade-tape index, queried for per-symbol volume and VWAP.
-- **Writer schemas**: the `Fill` Avro schema the run registered, with its LaserData-Cloud-allocated id.
+- Query: the trade-tape index, queried for per-symbol volume and VWAP.
+- Writer schemas: the `Fill` Avro schema the run registered, with its LaserData-Cloud-allocated id.
 
 ## Highlights
 

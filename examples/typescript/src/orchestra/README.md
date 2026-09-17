@@ -1,6 +1,6 @@
 # orchestra - contracts, panels, workflows, and recovery
 
-> One orchestrator coordinates a pool of long-lived capability agents entirely through the durable log.
+This example coordinates agents through capability discovery, contracts, fan-out, workflows, and operator control. Agents communicate through the log.
 
 ## What it does
 
@@ -39,10 +39,10 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Where to look (LaserData Cloud)
 
-- **Orchestration**: the directed contract, diagnostic panels, quarantine, recovery, and deadline reroute.
-- **Workflows**: the journalled triage, diagnose, and remediate steps with their outputs.
-- **Agent registry**: advertised capabilities, health, quarantine state, and live presence.
-- **Conversations**: every command, response, and correlation that formed the run.
+- Orchestration: the directed contract, diagnostic panels, quarantine, recovery, and deadline reroute.
+- Workflows: the journalled triage, diagnose, and remediate steps with their outputs.
+- Agent registry: advertised capabilities, health, quarantine state, and live presence.
+- Conversations: every command, response, and correlation that formed the run.
 
 ## Highlights
 

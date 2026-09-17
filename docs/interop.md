@@ -1,12 +1,12 @@
 # Edge interoperability: A2A, MCP, AG-UI
 
-The Agent Data Exchange Protocol (AGDX) is the SDK's internal, on-log agent wire format. The edge standards - A2A (agent-to-agent), MCP (agent-to-tool), AG-UI (agent-to-frontend) - bridge _into_ AGDX, so an internal agent only ever speaks to the log while external clients keep their own public contracts. The bridge rule is always the same: **map the core, tunnel the remainder.** The fields AGDX shares with a standard map structurally onto envelope fields. Everything else rides byte-identical in the body (`agdx.ct = json`) and round-trips untouched.
+AGDX is the SDK message format for agents on the log. A2A, MCP, and AG-UI adapters expose external interfaces over these records. Fields shared with AGDX map to envelope fields. Other data stays in the body with `agdx.ct = json` and returns unchanged.
 
-All three are optional, behind feature flags (`a2a-bridge`, `mcp-bridge`, `agui`), and ride the durable log over Iggy's own transports - never SSE. This doc is the bridge usage guide. For what AGDX itself is and why agent messaging on a durable log beats the edge transports these standards ship on, see the [AGDX data exchange model](agdx.md).
+Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. They use log records through the Iggy transport. This guide describes their use. The [AGDX data exchange model](agdx.md) defines the underlying contract.
 
 ## Streams, topics, and RBAC
 
-Nothing in the agent layer is pinned to one stream. A bridge or agent runs on the stream of the `Laser` you hand it, and `laser.with_default_stream(name)` is a cheap view that re-scopes to another stream while sharing the one connection. So a single cluster scales to many streams, each with many topics, by handing each agent or bridge a stream-scoped `Laser`:
+A bridge or agent uses the stream selected by its `Laser` handle. `laser.with_default_stream(name)` selects another default while sharing the connection. Each stream can contain several topics:
 
 ```rust
 let orders = laser.with_default_stream("orders-agents");
@@ -29,18 +29,20 @@ Agent::builder()
     .spawn(billing.clone());
 ```
 
-Topics are equally free: the well-known `AgentTopic` variants name `agent.*` topics, and `AgentTopic::Custom(&id)` takes any Iggy topic name, so a deployment can carry its own stream/topic convention for thousands of agents.
+`AgentTopic` variants name the standard `agent.*` topics. `AgentTopic::Custom(&id)` accepts another Iggy topic name. Deployments can use their own topic layout.
 
-Two authorization layers, both Iggy's, neither in the SDK:
+Credentials and the hosted HTTP endpoint control access:
 
-- **Within one credential** (one `Laser` connection), `with_default_stream` views address every stream that credential may touch.
-- **Across credentials**, open a separate `Laser::connect` per principal. Iggy RBAC enforces which streams and topics each credential may read or write, so per-stream / per-topic permission isolation is a topology and credential question, decided below the protocol. The HTTP edge of a bridge (the JSON-RPC `router`) is unauthenticated by design - wrap it in the embedder's auth middleware (A2A and MCP each define their own edge auth schemes).
+- A `with_default_stream` view can access only streams permitted to its connection credentials.
+- Use separate `Laser::connect` calls for separate principals. Apache Iggy enforces stream and topic permissions. Protect a bridge JSON-RPC `router` with the hosting application authentication middleware.
 
-Streaming is consumed log-natively (offset replay), which is what lets a token stream resume after a disconnect and reassemble later as an auditable transcript. The wire-level mapping is normative in the [AGDX spec](agdx.md). This doc is the usage guide. A runnable end-to-end demo is the `interop` example.
+Clients read streamed records by offset. After a disconnect, they can resume from a saved position and reconstruct the retained transcript. The [AGDX spec](agdx.md) defines the mapping. The `interop` example demonstrates the complete flow.
 
 ## A2A (`a2a-bridge`)
 
-`A2aBridge` exposes an internal agent to A2A JSON-RPC clients and serves the v1.0 Agent Card at `/.well-known/agent-card.json`: the endpoint and protocol version ride `supportedInterfaces` (v1.0 dropped the top-level `protocolVersion`/`url`), and with the `sign` feature `A2aBridge::signed_card` attaches a detached JWS over the JCS-canonicalized card (RFC 8785 + RFC 7515, EdDSA with the same enrolled Ed25519 key the envelope scheme uses. Verify with `sign::verify_card`). v1.0 renamed the JSON-RPC operations to PascalCase. `ListTasks` is not served (the bridge is stateless over the log): an unrecognized method gets the same JSON-RPC error every other unknown method gets.
+`A2aBridge` serves A2A JSON-RPC and the v1.0 card at `/.well-known/agent-card.json`. The card uses `supportedInterfaces` for endpoint and protocol information instead of top-level `protocolVersion` and `url`. With `sign`, `A2aBridge::signed_card` adds a detached JWS over the canonical card. This uses RFC 8785, RFC 7515, and Ed25519. Use `sign::verify_card` to check it.
+
+A2A v1.0 uses PascalCase operation names. The stateless bridge does not serve `ListTasks`. Unknown methods return the standard JSON-RPC error.
 
 | A2A method | Mapping |
 | --- | --- |
@@ -74,7 +76,7 @@ A worker behind the bridge consumes the decoded command envelope (`message.envel
 | `initialize` | Echo the client's protocol version, and advertise only the capabilities served. |
 | `tools/list` | The tools configured via `with_tool` (`name`, optional `title`/`description`, `inputSchema`). |
 | `tools/call` | Publish an AGDX `command` (tool name in `tool`, params tunneled in the body), await the correlated `response`/`error` within a timeout, render the `tools/call` result (`content` + `isError`). |
-| `resources/list` / `resources/read` | Resources configured via `with_resource`, served from config. |
+| `resources/list` / `resources/read` | Resources configured via `with_resource`, served from configuration. |
 | `prompts/list` / `prompts/get` | Prompts configured via `with_prompt`, rendered into MCP prompt messages. |
 
 ```rust
@@ -99,10 +101,10 @@ let app = mcp.router();
 
 ## AG-UI (`agui`)
 
-AG-UI is frontend-facing. Two pieces ship today, both over the log:
+AG-UI provides interfaces for frontends. The SDK supports state synchronization and event rendering through the log:
 
-- **State sync.** `publish_state_snapshot` / `publish_state_delta` emit the shared state and RFC 6902 patches as `state_snapshot` / `state_delta` events. `reconstruct_state` replays a snapshot plus its later deltas into the current state at any historical offset.
-- **Event rendering.** `agui_events` turns a conversation into AG-UI events: chat chunk streams -> `TEXT_MESSAGE_*`, reasoning streams -> `REASONING_MESSAGE_*`, `tool_args` streams -> `TOOL_CALL_START`/`ARGS`/`END`, a tool result -> `TOOL_CALL_RESULT`, `status` task updates -> `RUN_STARTED`/`RUN_FINISHED`, state events -> `STATE_*`, an error terminal -> `RUN_ERROR`.
+- Use `publish_state_snapshot` and `publish_state_delta` for full state and RFC 6902 patches. They produce `state_snapshot` and `state_delta` events. `reconstruct_state` applies a snapshot and subsequent deltas through the selected offset.
+- Use `agui_events` to convert chat, reasoning, tool, task, state, and error records into AG-UI events. The mappings include `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_START`, `ARGS`, `END`, `TOOL_CALL_RESULT`, `RUN_STARTED`, `RUN_FINISHED`, `STATE_*`, and `RUN_ERROR`.
 
 ```rust
 laser
@@ -123,16 +125,16 @@ The niche AG-UI events with no AGDX source (`MESSAGES_SNAPSHOT`, `ACTIVITY_*`, `
 
 ### ATP
 
-The Agent Transfer Protocol (the IETF `draft-li-atp` line) is an internet-scale _federation_ layer: email-like agent identity (`local-part@domain`), DKIM/SPF-style auth published over DNS, and server-mediated store-and-forward delivery.
+The `draft-li-atp` Agent Transfer Protocol describes federation between agent servers. It uses `local-part@domain` identities, DNS-based authentication, and store-and-forward delivery.
 
-It sits at the same layer as A2A and MCP, not at AGDX's substrate layer. The durable log already _is_ the transport, store, ordering, retry (deadline plus retention), dedup, and dead-letter that ATP builds out of relays. So ATP is a **candidate edge bridge**, like A2A and MCP, not a substrate change.
+ATP is a candidate external bridge. AGDX already uses the log for storage, ordering, and replay. An ATP adapter can map external delivery to those operations without changing the substrate.
 
-An ATP message maps onto the envelope cleanly:
+A proposed ATP mapping uses these fields:
 
 - `from` / `to` onto `source` / `target`
 - the nonce onto `idempotency_key`
 - `in_reply_to` onto `correlation` / `cause`
-- a DKIM-style signature onto the dormant AGDX `Signature`, once the key registry lands
+- Map signing through an explicitly defined ATP-to-AGDX signing policy. AGDX already provides `Signature` and SDK key registries.
 
 Two ATP ideas are already in AGDX: the claim-check `BodyRef` (reference, size, digest) and the `bridge_hops` loop guard. AGDX's `AgentId` accepts the email-like `local@domain` form, so federated identity round-trips without a lossy hash.
 
@@ -140,9 +142,9 @@ ATP's trust-score-in-the-envelope admission model is deliberately _not_ adopted:
 
 ### LangChain agent streaming protocol
 
-LangChain's agent streaming protocol (the `agent-protocol` streaming line, defined in CDDL with generated TypeScript and Python bindings) is a thread-centric agent-to-client streaming wire format over Server-Sent Events and WebSocket. It is an edge protocol at the **same layer as AG-UI**, not a substrate.
+The `agent-protocol` streaming proposal describes agent-to-client events through SSE and WebSocket. It defines types in CDDL with TypeScript and Python bindings. AGDX treats it as a candidate external adapter.
 
-It carries a common event envelope across channels (`messages`, `tools`, `lifecycle`, `values` / `updates` / `checkpoints`, `input`, `custom:*`) and reconstructs reconnection with a server-side ring buffer plus per-event sequence numbers (`seq`, `since`, `lastEventId`). The durable log provides that replay natively and without a bounded buffer, which is why it is a **candidate edge bridge**, like AG-UI, not a substrate change.
+Its channels include `messages`, `tools`, `lifecycle`, `values`, `updates`, `checkpoints`, `input`, and `custom:*`. Its reconnect model uses `seq`, `since`, and `lastEventId` with a server buffer. An AGDX adapter can map replay to retained log offsets.
 
 The mapping onto AGDX:
 
@@ -152,7 +154,7 @@ The mapping onto AGDX:
 - its checkpoint-fork onto the AGDX fork
 - its lifecycle `cause` (`toolCall` / `send` / `edge`) onto `cause` / `causal_parent`
 
-One of its ideas shipped here as a result of this comparison: the **human-in-the-loop interrupt/resume** verb. `Agdx::request_input(reply_topic, prompt, timeout)` pauses on a human (it publishes a prompt `command` under a fresh interrupt correlation, then awaits the human's correlated `response` and returns its body), and a responder resolves it with `AgentCtx::respond_input(reply_topic, decision)` or rejects with an AGDX `error` (which surfaces as `LaserError::Rejected`). It composes the existing `command` / `response` verbs, so it adds nothing to the wire. The interop demo shows it on `AgentTopic::HumanInput`.
+`Agdx::request_input(reply_topic, prompt, timeout)` publishes a prompt with a new correlation ID and waits for a response. `AgentCtx::respond_input(reply_topic, decision)` answers it. An AGDX `error` becomes `LaserError::Rejected`. These calls use existing command and response records. The `interop` example demonstrates them on `AgentTopic::HumanInput`.
 
 ```rust
 // Pause for a human decision, resume with their answer.
@@ -165,15 +167,15 @@ let decision = laser
 ctx.respond_input(AgentTopic::Responses, b"approved".to_vec()).await?;
 ```
 
-Two ideas remain on the AGDX **roadmap** (planned, not shipped today): a finer-grained content-block lifecycle inside a single message (typed `text` / `reasoning` / `data` / `tool_call` blocks, each with explicit start / delta / finish), and an applied-through-offset acknowledgement carried on a reply so a client knows the exact log position a command took effect at.
+Two proposals remain unimplemented. One adds typed `text`, `reasoning`, `data`, and `tool_call` blocks with start, delta, and finish events. The other adds a reply position that identifies where a command took effect.
 
 ## Real models
 
-The bridges are model-agnostic - a worker behind them calls whatever LLM it wants. The `interop` example wires the bridges to a worker that uses the examples' `LlmClient` seam: a deterministic mock by default, a real backend with `--features llm-anthropic` / `--features llm-openai`. Nothing in the bridges changes between mock and real.
+The worker behind a bridge selects the model. The `interop` example uses a deterministic `LlmClient` mock by default. `--features llm-anthropic` and `--features llm-openai` select external model clients. The bridge behavior remains the same.
 
 ## Claim-check bodies (any bridge, any topic)
 
-A body too large to ride the log inline externalizes to a [`BlobStore`] at publish and travels as the `BodyRef` capsule (content-type `ref`). The reader resolves and digest-verifies before it ever sees the bytes, so a store that returns the wrong content is a typed integrity error, never a silent wrong body. No default store ships: bring an S3-compatible bucket, the kv surface, or a filesystem in dev.
+A [`BlobStore`] can store a body outside the log. The published `BodyRef` records its location, size, and digest with content-type `ref`. Readers fetch the body and compare its digest before using it. A mismatch returns an integrity error. Supply your own storage implementation, such as object storage, KV, or a development filesystem.
 
 ```rust
 # use laser_sdk::prelude::full::*;

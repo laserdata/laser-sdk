@@ -1,10 +1,10 @@
 # LaserData - Laser SDK
 
-The native TypeScript client for [LaserData, Inc.](https://laserdata.com) SDK over Apache Iggy. It provides typed streaming, declared projections and query, key-value state, copy-on-write forks, a knowledge graph, and an optional agent runtime over one connection.
+This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserData, Inc.](https://laserdata.com) maintains it. One connection supports streaming and managed operations for queries, state, forks, graphs, and agents.
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> **Current pre-1.0 release (`0.3.2`).** The wire contract and public API follow semantic versioning. Minor releases may contain breaking changes until `1.0.0`.
+> The current release is `0.4.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 ## Install
 
@@ -31,9 +31,11 @@ const records = await (await topic.replay()).poll()
 console.log(`read ${records.length} order(s)`)
 ```
 
-Use the bare `user:password@host:port` connection string. The SDK supplies the Apache Iggy TCP scheme internally. One connection addresses every stream on the server. Select a stream explicitly with `laser.stream(name)`, then a topic with `.topic(name)`. `Laser.connectWithStream()` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser.connectEnv()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`. `Laser.local()` targets the default local server. `Laser.builder()` accepts a connection string, an address and credentials, or an injected Apache Iggy client with explicit owned or borrowed lifetime.
+Use a `user:password@host:port` connection string. The SDK supplies the Apache Iggy TCP scheme. Select a stream with `laser.stream(name)` and a topic with `.topic(name)`. `Laser.connectWithStream()` selects a default for the shorter `laser.topic(name)` form. It does not restrict stream access.
 
-Owned connections retry the initial handshake and reconnect after a dropped socket, with unlimited retries at one-second intervals by default. Set `reconnection_retries` to a non-negative integer and `reconnection_interval` to `250ms`, `1s`, or `1m` in the connection string to tune the policy. An injected client remains under its caller's lifecycle and reconnect policy.
+`Laser.connectEnv()` reads `LASER_CONNECTION_STRING` and optional `LASER_STREAM`. `Laser.local()` uses the default local server. `Laser.builder()` accepts a connection string, separate credentials, or an Apache Iggy client. For an injected client, select whether Laser SDK owns or borrows it.
+
+For owned connections, the SDK retries initial connections and reconnects dropped sockets. The default is unlimited retries at one-second intervals. Set `reconnection_retries` to a non-negative integer to limit retries. Set `reconnection_interval` to a duration such as `250ms`, `1s`, or `1m`. The caller controls the lifecycle and reconnect policy of an injected client.
 
 The TypeScript SDK uses Iggy's native VSR transport for owned and injected clients.
 
@@ -47,13 +49,13 @@ The TypeScript SDK uses Iggy's native VSR transport for owned and injected clien
 - standalone and consumer-group readers with first, last, next, offset, or timestamp starts
 - automatic or explicit offset commits, replay, cancellation, and bounded `nextWithin()` waits
 
-Delivery is at least once. Ordering is per selected partition. A handler should make external effects idempotent, or use the fenced managed coordination path when a monotonic holder token is required.
+Delivery is at least once, so records can repeat. Ordering applies within each selected partition. Make external effects idempotent, which means safe to repeat. For operations that require a lease holder token, use fenced managed coordination.
 
-Direct producers and fluent publish terminals return `SendMessagesResponse`. Each confirmation identifies the selected stream, topic, partition, and batch base offset. The list can be empty when a server cannot report offsets. A confirmation is an in-memory commit position, not an fsync guarantee.
+Producers and publish builders return `SendMessagesResponse`. A confirmation identifies a committed batch. It contains the stream, topic, partition, and first offset. The list can be empty when the server does not report offsets. Completion follows the topic durability policy.
 
 ## Runtime-checked records
 
-TypeScript types disappear at runtime. A typed topic therefore takes an explicit codec that validates decoded values instead of pretending a generic parameter can validate bytes.
+TypeScript types do not exist at runtime. A typed topic therefore takes a codec that checks decoded values. A generic type parameter alone cannot check incoming bytes.
 
 ```ts
 import { jsonCodec } from "@laserdata/laser-sdk"
@@ -80,13 +82,13 @@ const record = await reader.nextWithin(1_000)
 console.log(record?.value)
 ```
 
-Registered Avro, Protobuf, and JSON Schema topics compile the writer schema once, validate before transport I/O, stamp its schema ID, and decode through the same schema on reads.
+Registered Avro, Protobuf, and JSON Schema topics compile their writer schema once. They reject invalid values before sending and attach the schema ID. Reads decode through the same schema.
 
 ## Managed data surfaces
 
-LaserData Cloud and Laser Stack announce their capabilities during connection setup and on `laser.refreshCapabilities()`. A not-ready backend keeps every plane-served surface off and is retried without reconnecting. Apache Iggy without a managed backend serves streaming and returns `UnsupportedError` for managed calls. The same client code can feature-detect through `laser.capabilities()`.
+LaserData Cloud and Laser Stack report their capabilities at connection time and through `laser.refreshCapabilities()`. A backend that is not ready leaves its managed operations unavailable. The SDK repeats discovery without reconnecting. Apache Iggy without a managed backend returns `UnsupportedError` for managed calls. Use `laser.capabilities()` to inspect support.
 
-The root client exposes query, projections, bindings, schemas, key-value and CAS, forks, graph traversal, RBAC, runs, watch feeds, and independent managed command batches. Query uses the managed command path, not a request topic. Every command is encoded through the same Rust-owned AGDX fixtures consumed by the other SDKs.
+The root client provides queries, projections, schemas, key-value state, forks, graphs, access roles, runs, change feeds, and managed batches. Query calls use managed commands. They do not use a request topic. Reference data from the Rust implementation defines the expected AGDX encoding for each client.
 
 ```ts
 import { graphNodeEntity, queryResultValue, typedValueDiagnosticText } from "@laserdata/laser-sdk"
@@ -106,9 +108,9 @@ const checkout = graphNodeEntity("Service", "checkout")
 const nearby = await laser.graph("ops").neighbors(checkout.id, "out", undefined, 2)
 ```
 
-Query results are schema-first. `result.fields` defines the ordered logical fields and each `row.values` array is positionally aligned with it. Tagged values preserve integer widths, decimal precision, timestamps, UUIDs, bytes, nested values, and nullability. `queryResultValue()` performs the field-name lookup and `typedValueDiagnosticText()` provides stable display output.
+`result.fields` defines the ordered result schema. Each `row.values` entry matches the field at the same position. Tagged values preserve numeric widths, decimal precision, timestamps, UUIDs, bytes, nested values, and nullability. Use `queryResultValue()` to select a field by name. Use `typedValueDiagnosticText()` for stable display text.
 
-The initial page may use an offset. Every continuation follows the opaque `nextCursor` returned by the server. `hasMore` is true exactly when that cursor is present. `fetchAll()` follows cursors automatically, while each inline page remains capped at 1000 rows.
+The first page can use an offset. Later pages use the `nextCursor` supplied by the server. `hasMore` is true exactly when that cursor is present. `fetchAll()` follows these cursors. Each page contains at most 1000 rows.
 
 A query has a stable execution identity and absolute deadline. `status()` and `cancel()` use dedicated managed commands and fail locally when the deployment does not advertise those capabilities:
 
@@ -119,7 +121,7 @@ const status = await request.status()
 if (status.state === "running") await request.cancel()
 ```
 
-Lakehouse queries name one destination generation and may select a retained snapshot:
+Lakehouse queries name one destination generation and can select a retained snapshot:
 
 ```ts
 const historical = await laser
@@ -132,9 +134,9 @@ const historical = await laser
 console.log(historical.context.resolvedTarget, historical.context.boundary)
 ```
 
-The result context proves the resolved engine and target. Lakehouse pages also prove destination and backend generations, table UUID, snapshot, schema and partition-spec IDs, materialization boundary, checkpoint revision, and global-state revision.
+The result context identifies the engine and target. Lakehouse pages also identify destination and backend generations, the table UUID, snapshot, schema, and partition-spec IDs. They include the materialization boundary, checkpoint revision, and global state revision.
 
-Destination declarations and explicit query routes use `laser.destinations()`. Reads choose potentially stale or linearizable checkpoint state, while writes compare the expected global and definition revisions:
+Use `laser.destinations()` for destination declarations and explicit query routes. Reads select either potentially stale state or state ordered with completed writes. Writes compare the expected global and definition revisions:
 
 ```ts
 const destinations = laser.destinations()
@@ -143,7 +145,7 @@ const routes = await destinations.queryRoutes("potentially_stale", "orders", und
 const current = await destinations.get(destinationId, "linearizable")
 ```
 
-For analytical batches, publish one complete self-contained Arrow IPC stream per message. The SDK validates the metadata and exact byte length before transport I/O:
+For analytical batches, publish one self-contained Arrow IPC stream per message. Before sending, the SDK checks the metadata and exact byte length:
 
 ```ts
 await topic
@@ -160,9 +162,11 @@ await topic
   .send()
 ```
 
-Arrow input must use stream format, be self-contained, use microsecond timestamps, avoid dictionary replacements and deltas, keep decimals within 128 bits, and contain no unions or extension types.
+Arrow input must use a self-contained stream with microsecond timestamps and stable dictionaries. Dictionary replacement and deltas are not allowed. Decimal widths cannot exceed 128 bits. Unions and extension types are not supported.
 
-Accessors are cheap to construct. I/O happens at terminal verbs such as `send()`, `fetch()`, `poll()`, and `nextWithin()`.
+Accessors select operations without performing I/O. Methods such as `send()`, `fetch()`, `poll()`, and `nextWithin()` perform the work.
+
+A replay cursor saves offsets only after all partition reads succeed. A failed or canceled poll leaves them unchanged. Each request reads at most 10,000 messages. Further polls resume from the saved offsets. The TypeScript cursor stream continues waiting for new records until it is stopped.
 
 Durable memory can use the default audit topic through `laser.memory(namespace)`, an existing isolated topic through `laser.memoryOnTopic(topic)`, or a configured topic:
 
@@ -176,11 +180,13 @@ TypeScript duration inputs use milliseconds. `noExpiry()` keeps the raw memory h
 
 ## Agents and coordination
 
-The agent layer adds provenance, typed AGDX commands and responses, chunked streams, registry and presence, routing, reliable commit-after-handle delivery, deduplication, retry and dead-letter handling, contracts, scatter, and workflow execution. Workflow journals support replay and resume, verifier panels, budgets, compensation, and fenced steps. Lease acquisition is never replayed automatically after reconnect. An ambiguous acquire waits through its requested TTL before raising `AmbiguousMutationError`. Exclusive workflows keep the lease through verification and completion journaling, while renewal remains in the race with contract completion and is bounded before lease expiry.
+The agent layer adds record origins, typed AGDX messages, routing, discovery, retries, dead letters, contracts, and workflows. Consumers commit offsets after handling records. Workflow journals support replay, budgets, compensation, and fenced steps. Lease acquisition is not retried automatically after reconnect. If its outcome is unknown, it waits through the requested lifetime before returning `AmbiguousMutationError`. Workflows retain leases through verification and the completion journal write.
 
-Sessions put one agent's conversation behind `laser.sessions().create(id)`: `append(kind, data)` with a kind of `instruction`, `response`, `model.response`, `tool.call`, `tool.result`, or `human.input`, `context()` for the typed turns a model needs, `memory().search(query)`, `checkpoint()` with `turnsAt`, `turnsSince`, `stateAt`, and `replay` around it, and `Checkpoint.fromJSON(JSON.stringify(checkpoint))` to persist one. `laser.sessions({ stream, topics, memoryNamespace, contextTurns, contextTokens })` lays a fleet's sessions out on its own stream or topics.
+Sessions group one agent's conversation through `laser.sessions().create(id)`. `append(kind, data)` records a turn, and `context()` returns typed turns for a model. Turn kinds are `instruction`, `response`, `model.response`, `tool.call`, `tool.result`, and `human.input`. `memory().search(query)` searches memory scoped to the conversation.
 
-Context, snapshots, log and vector memory, action governance, replayable intent decisions, Ed25519 signing, delegation, A2A, MCP, AG-UI, and edge authorization are available from the root package. With a verifier enrolled, every correlated reply wait (contracts, the request/reply hub, `requestInput`) refuses unsigned or unverified responses, verification binds the observed record headers at the broker-stamped record time, and an agent built with a signing key signs its `respond` and `respondInput` answers. The managed `KvKeyRegistry` enrolls, revokes, and snapshots versioned key records through the platform. The SDK transports model provenance but does not invoke a model.
+A checkpoint records the next offset for each topic partition. `checkpoint()`, `turnsAt`, `turnsSince`, `stateAt`, and `replay` support reads and state reconstruction around those saved offsets. `Checkpoint.fromJSON(JSON.stringify(checkpoint))` restores a saved checkpoint. `laser.sessions({ stream, topics, memoryNamespace, contextTurns, contextTokens })` configures the stream, topics, memory namespace, and context limits.
+
+The root package provides context, snapshots, memory, governance, intent records, signing, delegation, A2A, MCP, AG-UI, and edge authorization. A configured verifier rejects unsigned or invalid replies for contracts, shared reply readers, and `requestInput`. It binds signatures to the observed headers and server timestamp. An agent with a signing key signs its `respond` and `respondInput` replies. `KvKeyRegistry` manages versioned keys through the platform. The SDK records model-call metadata but does not call a model.
 
 ```ts
 import { Agent, AgentId, AgentTopic } from "@laserdata/laser-sdk"
@@ -204,9 +210,9 @@ Waiting operations accept `AbortSignal` or an explicit timeout where their contr
 
 ## Errors and ownership
 
-All SDK failures extend `LaserError` and carry a stable `kind`. Configuration, timeout, cancellation, ambiguous mutation, unsupported managed capability, codec, transport, policy, and signature failures have dedicated subclasses. Catch the narrow subclass when recovery differs, otherwise report the base error with its cause.
+SDK failures extend `LaserError` and carry a stable `kind`. Separate subclasses identify configuration, timeout, cancellation, unknown mutation outcomes, unsupported operations, encoding, transport, policy, and signature failures. Catch a specific subclass when it needs different recovery. Otherwise, report the base error and its cause.
 
-`Laser.connect*()` owns its Apache Iggy client. `Laser.builder()` can instead borrow or own an injected client explicitly. `Laser`, `Producer`, `Consumer`, and `AgentHandle` support `await using`. Their explicit `close()` and `shutdown()` methods remain idempotent. Closing a scoped view never closes the root connection.
+`Laser.connect*()` owns its Apache Iggy client. `Laser.builder()` can own or borrow an injected client. `Laser`, `Producer`, `Consumer`, and `AgentHandle` support `await using`. Their `close()` and `shutdown()` methods are safe to repeat. Closing a scoped view leaves the root connection open.
 
 ## Package exports
 
@@ -219,14 +225,14 @@ All SDK failures extend `LaserError` and carry a stable `kind`. Configuration, t
 
 ## Examples and verification
 
-The nine non-benchmark examples live in [`examples/typescript`](../../examples/typescript/README.md). Shared behavior is covered by every feature under [`bdd/scenarios`](../../bdd/scenarios).
+The examples in [`examples/typescript`](../../examples/typescript/README.md) cover eight focused operations and nine larger applications. The shared scenarios under [`bdd/scenarios`](../../bdd/scenarios) describe behavior across clients.
 
 ```sh
 npm ci
 npm run verify
 ```
 
-`verify` runs style, formatting, lint, dependency boundaries, strict types, builds, API reports, unit and wire tests, robustness, coverage, licenses, and packed-consumer checks. Live Apache Iggy integration and shared BDD are separate Docker-backed gates.
+`verify` runs style, formatting, lint, dependency-boundary, type, build, API, unit, wire, coverage, license, and package tests. Integration and shared BDD tests run separately against the versioned native Iggy server.
 
 ## Security and license
 
@@ -234,4 +240,6 @@ Report security issues through the repository security policy. The package is Ap
 
 ## Publish recovery
 
-Publish attempts default to 60 seconds with three retries and exponential backoff starting at 250 milliseconds. Configure timeout, retry count, and backoff through the client builder or connect options, or the shared `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS` environment variables. Retry exhaustion returns an error for the application to handle. See [publish recovery and outage handling](../../docs/publish-recovery.md).
+Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
+
+See [publish recovery and outage handling](../../docs/publish-recovery.md).

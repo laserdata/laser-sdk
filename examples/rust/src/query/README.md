@@ -1,15 +1,15 @@
 # query - the Views primitive
 
-A projection watches your topics and keeps an always-current table you can query. Filter, aggregate, window, paginate, even search by meaning. Like a materialized view, except you never refresh it.
+A projector turns topic records into a queryable view. This example waits for projection, then reads orders that match a filter.
 
 Managed by `laser-plane` in Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean.
 
 ## What it shows
 
-- Ensure the `orders` topic, then declare this run's `orders_v1_<token>` view over it (`laser_examples::ensure_view` with `index_for`), so repeat and concurrent runs never count each other's rows. Naming the index apart from its source topic is what lets a view be versioned without renaming the topic.
+- Create `orders` and this run's `orders_v1_<token>` view through `laser_examples::ensure_view` and `index_for`. Unique view names keep repeated and concurrent runs separate.
 - Publish three orders with a `status` field.
 - Wait for the projector to materialize them (`laser_examples::wait_for_rows`).
-- Query the maintained view: `laser.query(&index)`.where_eq("status", "paid").limit(10).fetch()`. `where_eq` matches an indexed key, the cheap path a projection's key columns answer directly, and `filter_eq` and its siblings cover the rest.
+- Query the view with `laser.query(&index).where_eq("status", "paid").limit(10).fetch()`. `where_eq` uses indexed keys. `filter_eq` and related methods cover other predicates.
 
 ## Run it
 

@@ -1,6 +1,6 @@
 # recall - durable, auditable agent memory
 
-> Four verbs: remember, recall, improve, forget. Every change is a message on your log, so durable memory is versioned and auditable by construction. The log-backed path recalls by recency. Vector and reranker paths add similarity ranking.
+This example records, retrieves, improves, and forgets memory items. Log-based memory reads recent records, while vector memory can rank them by similarity.
 
 ## What it shows
 

@@ -1,6 +1,6 @@
 # log - every message, written once, readable forever
 
-> A topic is an append-only record of every message in your system. Services write to it and read from it like a group chat that never loses a message. New readers start from the beginning or jump straight to now.
+A topic stores records in append order under its retention policy. This example publishes typed orders and reads them by offset.
 
 ## What it shows
 

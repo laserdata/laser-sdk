@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest. This project is pre-1.0, and the wire contract, the AGDX spec, and the public API may change in any release.
+This project is pre-1.0. The SDK API, wire contract, and AGDX specification can change without backward compatibility. Update all affected clients and reference data together.
 
 ## Before you start
 
@@ -14,16 +14,16 @@ The [`justfile`](justfile) defines every gate. The full suite is:
 just ci
 ```
 
-It runs, in order: format check, dependency sort check, unused-dependency check, clippy with warnings denied, the workspace build, the unit and integration tests (integration needs Docker), the doctests, the wasm32 check on the wire crate, the dependency-ban and advisory gates, the decode fuzz targets, and the cross-SDK BDD scenarios. Run the pieces individually with `just lint`, `just test`, `just test-it`, and `just bdd`. A change is not done until `just ci` passes.
+The workflow formats code, sorts dependencies, finds unused dependencies, runs clippy, and builds the workspace. It then runs unit tests, native Iggy integration tests, doctests, WebAssembly checks, dependency checks, fuzzing, and shared behavior scenarios. Use `just lint`, `just test`, `just test-it`, and `just bdd` to run individual groups. The change is complete when the required `just ci` gates pass.
 
 ## Conventions
 
 - Match the surrounding code. Terse comments, one sorted import block, no banner comments.
-- Prose (docs, comments, error and `must_use` strings, commit messages) uses no semicolons and no em-dashes. Use a period, a comma, or a rewrite. The only exception is the literal "TL;DR".
+- Do not use semicolons or em dashes in prose, comments, error text, `must_use` strings, or commit messages.
 - The streaming unit is a message (the spec calls it a record), not an "event". "event" names only a specific AGDX envelope kind or a named domain.
 - Tests are named in given / when / then / should form and use `.expect("message")`, never a bare `unwrap`.
 - Docs are part of every change. When the code or the wire contract changes, update the affected README, the spec, and the relevant guide in the same change.
-- The wire crate stays runtime-free and wasm-portable. No IO, async, clock, or randomness there.
+- Keep the wire crate independent of I/O, clocks, randomness, and asynchronous runtimes. Its optional HTTP client uses a caller-supplied transport.
 
 ## Wire changes
 
@@ -31,7 +31,7 @@ The wire contract is pinned by a golden fixture corpus and a cross-language conf
 
 ## Publishing
 
-The TypeScript and Rust releases use trusted publishing. See [npm trusted publishing](docs/npm-trusted-publishing.md) and [crates.io trusted publishing](docs/crates-trusted-publishing.md) for the one-time registry configuration and release triggers.
+TypeScript and Rust use trusted publishing. The [Rust workflow](.github/workflows/ci-rust.yml) and [TypeScript workflow](.github/workflows/ci-typescript.yml) define release tags, registry authentication, and publication gates.
 
 ## License
 

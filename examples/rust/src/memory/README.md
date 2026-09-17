@@ -1,31 +1,31 @@
 # memory
 
-> Agentic memory, three facets: remember and recall in process, persist durably, and traverse how it connects.
+This example stores incident facts, retrieves related facts, and records feedback. It also demonstrates durable memory and graph relationships on managed deployments.
 
 ## What it does
 
-An agent gets better with use, and this runs three facets over one incident-knowledge domain.
+The example applies memory operations to one set of incident facts.
 
-**Memory** (in-process, needs no server): the four agentic-memory verbs as one loop over `VectorMemory`.
+The local phase uses `VectorMemory` and needs no server:
 
-1. **Remember** the assistant stores what it knows, each item a fact.
-2. **Recall** a question recalls the semantically closest facts, ranked.
-3. **Improve** the operator upvotes the fact that resolved the incident, and the next recall ranks it first. The agent learns.
-4. **Forget** a superseded fact is forgotten and stops surfacing.
+1. Record each known fact.
+2. Retrieve the facts most similar to a question.
+3. Apply positive feedback and make sure that the relevant fact ranks first.
+4. Forget a superseded fact and make sure that recall excludes it.
 
-**Durable memory** (managed): the same four verbs over the memory topic on the log. Every remember publishes to the topic, so the facts persist and replay, and a deployment materializes them into the read view the console's Memory view shows. `memory_topic("incidents")` configures that topic up front: its partition count and a message-expiry window that bounds how long the history lives.
+The durable phase publishes memory records to a topic and reads the managed view. `memory_topic("incidents")` configures the partition count and message expiry. The topic retains the history under that policy.
 
-**One scope** (managed): the incident is one conversation, so `laser.context(conversation)` binds it once. The conversation's messages append and read back through the scope, and `scope.memory("incidents")` recalls the same durable facts without repeating the id. The session (messages plus working memory) is one scope, while durable facts and the graph stay cross-conversation on purpose.
+`laser.context(conversation)` selects the incident conversation. The scope appends and reads messages without repeating the ID. `scope.memory("incidents")` uses that conversation for session memory. Durable facts and graph relationships can span conversations.
 
-**Knowledge graph** (managed): the same ops domain becomes a graph of content-addressed nodes and typed edges, then traversals answer how the entities connect, which recall alone cannot.
+The managed graph phase connects incident entities through typed relationships:
 
-5. **Build** upsert a realistic slice (services, components, teams, incidents) wired by `depends_on`, `mitigated_by`, `replicates`, `owns`, and `affected`.
-6. **Neighbors** what sits one hop from `checkout`.
-7. **Traverse** from every `Service`, follow `depends_on` to the components the whole platform rests on.
-8. **Blast radius** from an incident, follow `affected` to everything it touched, the question an on-call engineer actually asks.
-9. **Provenance** every node and edge links back to the source record it was built from, a click-through in the console.
-10. **Bitemporal** read the graph "as of" a point in valid-time, so a mitigation appears only after it was applied.
-11. **Paths** return whole traced paths, not just the set of reached nodes.
+5. Upsert services, components, teams, and incidents with `depends_on`, `mitigated_by`, `replicates`, `owns`, and `affected` relationships.
+6. Read the neighbors of `checkout`.
+7. Follow `depends_on` from each `Service` to its components.
+8. Follow `affected` from an incident to the entities it affected.
+9. Follow source references from graph elements to their original records.
+10. Read the graph at a selected valid time to exclude mitigations that started later.
+11. Return complete paths through the graph.
 
 ## Run it
 
@@ -50,9 +50,9 @@ The example builds the `ops` graph. Query it through the SDK or open it in the L
 
 ## Highlights
 
-- The agentic-memory verbs `remember` / `recall` / `improve` / `forget` on the `Memory` trait, one backend-agnostic surface, with feedback-weighted recall so the agent gets better with use.
+- Use `remember`, `recall`, `improve`, and `forget` through `Memory`. Feedback changes recall ranking.
 - The model seam: `Embedder` is the one place a real embedding model plugs in, the same boundary as the `LlmClient` seam in the other examples.
-- The graph surface on `Laser::graph(name)`: `upsert` writes nodes and edges, `neighbors` is the one-hop read, and the `start_match` + `out` builder runs a multi-hop traversal, all reusing the query `Filter` grammar.
+- Use `Laser::graph(name)` for `upsert`, `neighbors`, and traversal. `start_match` and `out` select a path through the graph using the shared `Filter` grammar.
 - Content-addressed identity: `MemoryId::content`, `GraphNode::entity`, and `GraphEdge::relate` mint ids from the wire crate's one canonical `content_id`, so the same fact or entity converges across every SDK.
-- One memory model, no backend to choose: `Laser::memory(namespace)` remembers to the log and recalls, and `Laser::memory_topic(topic)` configures the same durable memory (stream, partitions, message-expiry) with no change to the verbs. The knowledge graph carries the relationship layer alongside it.
-- Durable memory is conversation-scoped: each row records the conversation that wrote it, so the LaserData console's Conversations page links a per-conversation lens into the memory, graph, and query surfaces filtered to that conversation.
+- `Laser::memory(namespace)` supplies log-based memory. `Laser::memory_topic(topic)` configures its stream, partitions, and expiry. The graph supplies relationship reads.
+- Memory rows retain their source conversation. The Console can use it to filter memory, graph, and query views.

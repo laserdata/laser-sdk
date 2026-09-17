@@ -2,14 +2,14 @@
 
 ## Supported versions
 
-This project is pre-1.0. Only the latest published `0.0.x` release line receives security fixes. Pin an exact version and upgrade promptly.
+This project is pre-1.0. Security fixes target the latest published release. Pin an exact version and update promptly.
 
 ## Reporting a vulnerability
 
 Please do not open a public issue for a security problem.
 
-Use GitHub's private vulnerability reporting on this repository (the **Security** tab, then **Report a vulnerability**). If that is unavailable, email the maintainers at oss@laserdata.com.
+Use GitHub's private vulnerability reporting on this repository (the Security tab, then Report a vulnerability). If that is unavailable, email the maintainers at oss@laserdata.com.
 
-Include the affected crate and version, a description, and a reproduction if you have one. We aim to acknowledge a report within a few business days and will then coordinate a fix and a disclosure timeline with you.
+Include the crate, version, problem description, and reproduction when available. Maintainers aim to acknowledge reports within a few business days. They then coordinate the fix and disclosure with the reporter.
 
-The wire crate decodes untrusted bytes and is held to a never-panic guarantee backed by a robustness suite and fuzzing, so a decode crash or panic on hostile input is in scope.
+The wire crate decodes untrusted input. Decode crashes and panics are security-reporting concerns. Deterministic tests and fuzzing cover malformed input.

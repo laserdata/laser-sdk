@@ -1,6 +1,6 @@
 # native-streaming - live producer and consumer groups
 
-A focused ordinary message-streaming example over Apache Iggy using only the Laser-facing producer and consumer APIs. Layer: generic. No managed surface is required.
+This example uses the Laser producer and consumer APIs for ordinary Apache Iggy streaming. It demonstrates batching, headers, routing, and automatic or explicit offset commits.
 
 ## What it does
 
@@ -28,6 +28,6 @@ LASER_CONNECTION_STRING='user:pwd@iggy-host:8090' \
 
 - `topic.producer()` exposes direct batching, linger, retries, topology, and per-send key or partition routing.
 - `topic.consumer_group()` returns a `futures::Stream` with configurable start, polling, replay, retries, group creation, and commit policy.
-- `while let Some(message) = consumer.next().await` (Python: `async for message in consumer`) is the ordinary way to drain a live consumer: keep iterating for as long as records keep arriving, no per-call timeout. `Consumer::next_within(timeout)` exists in the SDK for a caller that wants a bounded single-record wait instead, but this example does not need one.
-- `CommitPolicy::Disabled` plus `consumer.commit(&message)` implements commit-after-success delivery. Shutdown does not advance an uncommitted record. This is one `store_offset` network round-trip per message, by design (crash-safe to the exact last handled record, not just the last batch), so it is visibly slower than the batched auto-commit path above on any connection with real latency, most noticeably against a remote or rate-limited deployment.
+- Iterate with `while let Some(message) = consumer.next().await`, or Python `async for message in consumer`. For a bounded single-record wait, use `Consumer::next_within(timeout)`.
+- Use `CommitPolicy::Disabled` with `consumer.commit(&message)` to store an offset after handling. Shutdown does not commit an unhandled record. Each explicit commit requires a `store_offset` round trip, so it can be slower than batched commits.
 - `ConsumerMessage` preserves the raw payload, typed headers, timestamps, partition, and exact log offset.

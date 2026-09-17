@@ -1,6 +1,6 @@
 # LaserData SDK Benchmarks
 
-`bench/` measures Apache Iggy, Laser streaming, AGDX, managed data surfaces, recovery, and MCP interoperability with native release binaries. The harness is a detached Rust workspace, so its dependencies never enter the published SDK crates.
+`bench/` measures Apache Iggy, Laser streaming, AGDX, managed data surfaces, recovery, and MCP interoperability with native release binaries. The test runner is a detached Rust workspace, so its dependencies never enter the published SDK crates.
 
 ## Quick Start
 
@@ -18,7 +18,7 @@ just bench 15 3 8
 
 `LASER_BENCH_PARALLELISM` provides the same parallelism override for scripts and CI. `just bench-smoke` always uses one lane because it validates mechanics rather than capacity.
 
-The harness downloads signed CPU-targeted artifacts for the maintained binary versions. `just bench` compiles only `laser-bench` and runs those service binaries without rebuilding them.
+The test runner downloads signed CPU-targeted artifacts for the maintained binary versions. `just bench` compiles only `laser-bench` and runs those service binaries without rebuilding them.
 
 The maintained artifact versions are:
 
@@ -78,7 +78,7 @@ just bench-histogram target/laser-bench-results/<run>/<scenario>/<repetition>/hi
 | --- | --- | --- |
 | `just bench` | Complete local development campaign | About 3 to 8 minutes plus setup |
 | `just bench 15 3 8` | Longer local campaign with eight lanes | Depends on scenario count and services |
-| `just bench-smoke` | One-second harness and provisioning check | Short |
+| `just bench-smoke` | One-second test runner and provisioning check | Short |
 | `just bench-full` | Exhaustive matrix with 10 repetitions and 30-second arms | Several hours |
 | `just bench-suite <suite> <output>` | Caller-defined immutable campaign | Manifest-defined |
 
@@ -109,7 +109,7 @@ Smoke results validate mechanics only. Default local results support development
 - Output directories are immutable.
 - One campaign may run from a checkout at a time.
 
-The harness binary builds with `lto = true` and `codegen-units = 1`, matching the Iggy fork's release policy, and records that profile in the binary manifest. When a suite declares host CPU controls, the Tokio runtime is sized to the pinned client CPU set and the worker count is recorded in every report.
+The test runner binary builds with `lto = true` and `codegen-units = 1`, matching the Iggy fork's release policy, and records that profile in the binary manifest. When a suite declares host CPU controls, the Tokio runtime is sized to the pinned client CPU set and the worker count is recorded in every report.
 
 Reports include aggregate throughput, the terminal's per-lane average, record and byte rates where applicable, supported latency percentiles, correctness outcomes, one-second workload series, process metrics, cgroup metrics, Iggy statistics, and plane metrics. A total throughput value already includes every configured producer or consumer lane and must not be multiplied again. HDR histograms are stored separately and referenced by SHA-256.
 

@@ -1,6 +1,6 @@
 # watch - stop re-querying blind
 
-> Poll a lightweight advancement feed, then query only when the view has moved. The feed rides the connection you already have.
+The change feed reports when a projected view advances. This example reads those notifications before querying the view.
 
 ## What it shows
 

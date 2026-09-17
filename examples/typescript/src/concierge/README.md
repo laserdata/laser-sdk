@@ -1,6 +1,6 @@
 # concierge - an AI support desk on the log
 
-> The full-stack agent example, combining a queryable ticket world, semantic memory, durable coordination, approvals, speculative planning, and replay.
+This example runs a support desk whose agents coordinate through the log. It combines tickets, queries, memory, credits, approval, and a proposed change in a fork.
 
 ## What it does
 
@@ -46,11 +46,11 @@ Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to replace the deterministic `MockLl
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: the `support_tickets` world model, including payload selection for the original ticket JSON.
-- **KV**: `concierge-credits-<run>` balances and `concierge-dedup-<run>` idempotency keys. The run ID is printed in the namespace.
-- **Forks**: `bulk-resolve-plan`, left open unless `LASER_APPLY_PLAN=1`.
-- **Conversations**: commands, specialist calls, approvals, responses, and the replayed incident audit trail.
-- **Memory**: the diagnosis remembered under the incident conversation.
+- Query: the `support_tickets` world model, including payload selection for the original ticket JSON.
+- KV: `concierge-credits-<run>` balances and `concierge-dedup-<run>` idempotency keys. The run ID is printed in the namespace.
+- Forks: `bulk-resolve-plan`, left open unless `LASER_APPLY_PLAN=1`.
+- Conversations: commands, specialist calls, approvals, responses, and the replayed incident audit trail.
+- Memory: the diagnosis remembered under the incident conversation.
 
 ## Highlights
 

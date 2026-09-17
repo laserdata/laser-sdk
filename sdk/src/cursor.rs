@@ -154,8 +154,9 @@ impl Cursor {
             return Ok(Vec::new());
         };
         let partitions = crate::poll::bounded_partitions(details.partitions_count) as usize;
-        if self.offsets.len() < partitions {
-            self.offsets.resize(partitions, 0);
+        let mut next_offsets = self.offsets.clone();
+        if next_offsets.len() < partitions {
+            next_offsets.resize(partitions, 0);
         }
         // (timestamp, partition, offset, message) so the merge across partitions is
         // ordered by Iggy's single clock, like `ContextAssembler`.
@@ -166,11 +167,11 @@ impl Cursor {
                 &self.stream,
                 &self.topic,
                 &self.consumer,
-                crate::poll::DrainRange::open(partition, self.offsets[partition as usize]),
+                crate::poll::DrainRange::open(partition, next_offsets[partition as usize]),
                 self.batch,
             )
             .await?;
-            self.offsets[partition as usize] = batch.next_offset;
+            next_offsets[partition as usize] = batch.next_offset;
             for message in batch.messages {
                 let offset = message.header.offset;
                 collected.push((message.header.timestamp, partition, offset, message));
@@ -178,6 +179,7 @@ impl Cursor {
         }
         collected
             .sort_by_key(|(timestamp, partition, offset, _)| (*timestamp, *partition, *offset));
+        self.offsets = next_offsets;
         Ok(collected
             .into_iter()
             .map(|(_, partition, _, message)| (partition, message))
@@ -200,4 +202,187 @@ fn headers_to_strings(message: &IggyMessage) -> BTreeMap<String, String> {
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use iggy::http::http_client::HttpClient;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+
+    #[tokio::test]
+    async fn given_later_partition_failure_when_polling_then_should_preserve_all_offsets() {
+        let server = TestServer::start(2, 2).await;
+        server.state.fail.store(true, Ordering::SeqCst);
+        let mut cursor = server.cursor().from_offsets(vec![0, 0]);
+
+        assert!(cursor.poll().await.is_err());
+        assert_eq!(cursor.offsets(), &[0, 0]);
+
+        let messages = cursor.poll().await.expect("retry all partitions");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(cursor.offsets(), &[2, 2]);
+    }
+
+    #[tokio::test]
+    async fn given_later_partition_wait_when_poll_is_cancelled_then_should_preserve_all_offsets() {
+        let server = TestServer::start(2, 2).await;
+        server.state.block.store(true, Ordering::SeqCst);
+        let mut cursor = server.cursor().from_offsets(vec![0, 0]);
+
+        tokio::select! {
+            result = cursor.poll() => panic!("poll must wait for the second partition: {result:?}"),
+            () = server.state.waiting.notified() => {}
+        }
+        assert_eq!(cursor.offsets(), &[0, 0]);
+
+        server.state.block.store(false, Ordering::SeqCst);
+        server.state.release.notify_one();
+        let messages = cursor.poll().await.expect("retry cancelled poll");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(cursor.offsets(), &[2, 2]);
+    }
+
+    #[tokio::test]
+    async fn given_large_batches_when_polling_then_should_bound_reads_and_resume_without_gaps() {
+        let limit = crate::poll::MAX_DRAIN_MESSAGES;
+        let server = TestServer::start(1, limit as u64 + 1).await;
+        for batch in [6000, 20000] {
+            let mut cursor = server.cursor().batch(batch);
+            let messages = cursor.poll().await.expect("bounded read");
+            assert_eq!(messages.len(), limit, "batch size {batch}");
+            assert_eq!(cursor.offsets(), &[limit as u64]);
+
+            let remaining = cursor.poll().await.expect("resume after limit");
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, MessageId::new(0, limit as u64));
+            assert_eq!(cursor.offsets(), &[limit as u64 + 1]);
+        }
+    }
+
+    struct TestServer {
+        url: String,
+        state: Arc<TestState>,
+        task: JoinHandle<()>,
+    }
+
+    struct TestState {
+        partitions: u32,
+        messages: u64,
+        fail: AtomicBool,
+        block: AtomicBool,
+        waiting: Notify,
+        release: Notify,
+    }
+
+    impl TestServer {
+        async fn start(partitions: u32, messages: u64) -> Self {
+            let state = Arc::new(TestState {
+                partitions,
+                messages,
+                fail: AtomicBool::new(false),
+                block: AtomicBool::new(false),
+                waiting: Notify::new(),
+                release: Notify::new(),
+            });
+            let app = Router::new()
+                .route("/streams/test/topics/events", get(topic))
+                .route("/streams/test/topics/events/messages", get(poll))
+                .with_state(state.clone());
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener");
+            let url = format!(
+                "http://{}",
+                listener.local_addr().expect("listener address")
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("test server");
+            });
+            Self { url, state, task }
+        }
+
+        fn cursor(&self) -> Cursor {
+            let client = HttpClient::create(Arc::new(HttpClientConfig {
+                api_url: self.url.clone(),
+                jwt: Some("test-token".to_owned()),
+                retries: 0,
+                ..Default::default()
+            }))
+            .expect("HTTP client");
+            Laser::from_client(IggyClient::new(ClientWrapper::Http(client)))
+                .stream("test")
+                .topic("events")
+                .replay()
+                .expect("cursor")
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn topic(State(state): State<Arc<TestState>>) -> Json<TopicDetails> {
+        Json(TopicDetails {
+            id: 1,
+            created_at: IggyTimestamp::from(0),
+            name: "events".to_owned(),
+            size: IggyByteSize::from(0),
+            message_expiry: IggyExpiry::NeverExpire,
+            compression_algorithm: CompressionAlgorithm::None,
+            max_topic_size: MaxTopicSize::ServerDefault,
+            messages_count: state.messages * u64::from(state.partitions),
+            partitions_count: state.partitions,
+            partitions: Vec::new(),
+            options: Default::default(),
+        })
+    }
+
+    async fn poll(
+        State(state): State<Arc<TestState>>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Response {
+        let partition = query["partition_id"].parse().expect("partition id");
+        if partition == 1 {
+            if state.fail.swap(false, Ordering::SeqCst) {
+                return (StatusCode::BAD_REQUEST, "invalid poll").into_response();
+            }
+            if state.block.load(Ordering::SeqCst) {
+                state.waiting.notify_one();
+                state.release.notified().await;
+            }
+        }
+        let offset: u64 = query["value"].parse().expect("poll offset");
+        let count: u64 = query["count"].parse().expect("poll count");
+        let messages: Vec<_> = (offset..(offset + count).min(state.messages))
+            .map(|offset| {
+                let mut message = IggyMessage::builder()
+                    .payload(vec![1].into())
+                    .build()
+                    .expect("test message");
+                message.header.offset = offset;
+                message.header.timestamp = offset;
+                message
+            })
+            .collect();
+        Json(PolledMessages {
+            partition_id: partition,
+            current_offset: state.messages.saturating_sub(1),
+            count: messages.len() as u32,
+            messages,
+        })
+        .into_response()
+    }
 }

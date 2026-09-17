@@ -113,6 +113,9 @@ pub(crate) async fn drain_partition(
     let mut offset = from;
     let mut messages = Vec::new();
     loop {
+        let count = batch
+            .max(1)
+            .min((MAX_DRAIN_MESSAGES - messages.len()) as u32);
         let mut last_error = None;
         let mut polled = None;
         for attempt in 0..5 {
@@ -123,7 +126,7 @@ pub(crate) async fn drain_partition(
                     Some(partition),
                     consumer,
                     &PollingStrategy::offset(offset),
-                    batch,
+                    count,
                     false,
                 )
                 .await
@@ -145,7 +148,7 @@ pub(crate) async fn drain_partition(
             break;
         };
         offset = last.header.offset.saturating_add(1);
-        let count = polled.messages.len();
+        let received_count = polled.messages.len();
         let mut received = polled.messages;
         if let Some(end) = end
             && let Some(cut) = received
@@ -158,7 +161,7 @@ pub(crate) async fn drain_partition(
             break;
         }
         messages.extend(received);
-        if (count as u32) < batch {
+        if (received_count as u32) < count {
             break;
         }
         if messages.len() >= MAX_DRAIN_MESSAGES {

@@ -1,6 +1,6 @@
 # governance
 
-Capability RBAC and agent governance over the managed surfaces.
+This example applies managed access roles and agent policies. It shows which requests the deployment permits and how the SDK records policy decisions.
 
 ## What it does
 
