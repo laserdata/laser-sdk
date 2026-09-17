@@ -374,3 +374,7 @@ These features exist to exercise the **seams** the paid tiers plug into: their p
 - Niche AG-UI event types with no AGDX source (`MESSAGES_SNAPSHOT`, `ACTIVITY_*`, `RAW`/`CUSTOM`/`META`, `REASONING_ENCRYPTED_VALUE`).
 
 See the AGDX spec for the wire contract.
+
+## Publish recovery
+
+Rust, Python, and TypeScript publish attempts default to 60 seconds, three retries, and 250 ms exponential backoff capped at 30 seconds. Builder/connect overrides take precedence over `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Preserve message identities and confirmed chunks across retries. Fail permanent errors immediately and return exhausted errors without panicking. Rust reconnects the shared client in place so consumers and reply readers remain attached. Recover only the connection an attempt used, and skip recovery once another publish has replaced it. See [publish recovery](docs/publish-recovery.md).

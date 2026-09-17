@@ -27,7 +27,7 @@ pub use crate::fork::ForkHandle;
 #[cfg(feature = "kv")]
 pub use crate::kv::{Kv, KvEntry, KvPage};
 #[cfg(feature = "streaming")]
-pub use crate::laser::{Laser, LaserBuilder};
+pub use crate::laser::{Laser, LaserBuilder, PublishOptions};
 #[cfg(feature = "agent")]
 pub use crate::memory::{Memory, MemoryHandle, MemoryItem};
 #[cfg(feature = "streaming")]

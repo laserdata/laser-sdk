@@ -62,3 +62,7 @@ Every data-stack addition requires regenerated `laser_sdk.pyi`, stub coverage, P
 - Lint and format with ruff (config in the repo-root `ruff.toml`): `ruff check` and `ruff format --check` over `foreign/python`, `bdd/python`, and `examples/python`. The generated `.pyi` is excluded.
 - Tests: `pytest -q` against the versioned Iggy server, plus the BDD suite in `bdd/python`. `LASER_TEST_IGGY_SERVER` selects a local Iggy binary for development.
 - Keep the surface in step with the Rust SDK: when a Rust public method or wire type changes, mirror it here and regenerate stubs, the same docs-currency rule the rest of the repo follows.
+
+## Publish recovery
+
+Publish attempts default to 60 seconds with three retries and 250 ms exponential backoff capped at 30 seconds. Rust builder methods `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff` match Python `Laser.connect` keywords `publish_timeout_ms`, `publish_max_retries`, and `publish_retry_backoff_ms`, and TypeScript builder methods `publishTimeout`, `publishMaxRetries`, and `publishRetryBackoff`. Explicit settings override `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Exhaustion returns an error for the application to handle, never a process exit. Preserve message identity and confirmed chunks on retries. See [publish recovery](../../../docs/publish-recovery.md).

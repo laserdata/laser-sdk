@@ -126,7 +126,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
-          uv run cargo run --bin stub_gen
+          uv run cargo run --locked --bin stub_gen
           git diff --exit-code -- laser_sdk.pyi
       - name: Verify the stub is valid Python a type checker can load
         # A reserved keyword leaking into a parameter name (the `from` bug) makes
