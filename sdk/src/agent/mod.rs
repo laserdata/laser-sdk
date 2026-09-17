@@ -40,7 +40,11 @@ pub use router::{
     CapabilitySelector, InboxRoute, RouteCandidate, RoutePolicy, RouteScorer, Router,
 };
 pub use scope::AgentScope;
-pub use session::SessionPolicy;
+pub use session::{
+    DEFAULT_SESSION_CONTEXT_TOKENS, DEFAULT_SESSION_CONTEXT_TURNS,
+    DEFAULT_SESSION_MEMORY_NAMESPACE, DEFAULT_SESSION_TOPICS, Session, SessionConfig,
+    SessionPolicy, SessionTurn, SessionTurnKind, Sessions,
+};
 pub use state::{ConversationState, ReplayBound, resume_offsets};
 #[cfg(feature = "kv")]
 pub use workflow::WORKFLOW_FENCE_NAMESPACE;

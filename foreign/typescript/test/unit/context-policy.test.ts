@@ -14,7 +14,8 @@ function message(agent: string, offset: bigint, bytes = 4): ContextMessage {
     id: { partitionId: 0, offset },
     provenance: { conversationId: ConversationId.new(), agent: AgentId.new(agent) },
     payload: new Uint8Array(bytes),
-    timestampMicros: offset
+    timestampMicros: offset,
+    topic: "agent.commands"
   }
 }
 

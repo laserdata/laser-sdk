@@ -249,11 +249,26 @@ impl PyProvenance {
 #[pyclass(name = "AgentMessage", frozen)]
 pub struct PyAgentMessage {
     pub(crate) inner: AgentMessage,
+    pub(crate) topic: Option<String>,
 }
 
 impl PyAgentMessage {
     pub(crate) fn from_inner(inner: AgentMessage) -> Self {
-        Self { inner }
+        Self { inner, topic: None }
+    }
+
+    pub(crate) fn from_context(message: laser_sdk::context::ContextMessage) -> Self {
+        Self {
+            inner: AgentMessage {
+                provenance: message.provenance,
+                payload: message.payload,
+                id: message.id,
+                envelope: message.envelope,
+                content_type: None,
+                verified_principal: None,
+            },
+            topic: Some(message.topic),
+        }
     }
 
     // The decoded AGDX envelope, for the chunk reassembler to feed the stream
@@ -269,6 +284,14 @@ impl PyAgentMessage {
     #[getter]
     fn payload(&self) -> Vec<u8> {
         self.inner.payload.clone()
+    }
+
+    /// The topic this message was read from, when it came off a context
+    /// read (`ContextScope.fetch`, `Session.context`). `None` for a consumed
+    /// message, whose consumer knows its topic.
+    #[getter]
+    fn topic(&self) -> Option<String> {
+        self.topic.clone()
     }
 
     /// The enrolled principal that signed this verified contract reply.

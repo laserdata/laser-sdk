@@ -1,9 +1,10 @@
 use crate::agent::{ConversationState, ReplayBound};
-use crate::context::{ContextAssembler, ContextMessage, ContextPolicy, LastN};
+use crate::context::{Checkpoint, ContextAssembler, ContextMessage, ContextPolicy, LastN};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::memory::{
-    ConsolidationReport, MemoryBackend, MemoryHandle, MemoryScope, RecallBuilder, RememberBuilder,
+    ConsolidationReport, MemoryBackend, MemoryHandle, MemoryItem, MemoryScope, RecallBuilder,
+    RememberBuilder,
 };
 use crate::provenance::{AgentTopic, Provenance};
 use crate::snapshot::SnapshotStore;
@@ -158,9 +159,25 @@ impl ContextScope {
         self.laser.graph(name)
     }
 
+    /// The current tail of `topics` as a [`Checkpoint`]: fold up to it with
+    /// [`ReplayBound::At`] or resume after it with
+    /// [`ReplayBound::FromCheckpoint`]. Offsets are per topic partition, not
+    /// per conversation.
+    pub async fn checkpoint(
+        &self,
+        topics: &[AgentTopic<'static>],
+    ) -> Result<Checkpoint, LaserError> {
+        crate::context::checkpoint(&self.laser, topics).await
+    }
+
     /// This context's conversation id.
     pub fn conversation(&self) -> ConversationId {
         self.conversation
+    }
+
+    /// The `Laser` this scope reads and writes through.
+    pub fn laser(&self) -> &Laser {
+        &self.laser
     }
 }
 
@@ -192,6 +209,14 @@ impl ScopedMemory {
     /// items rendered as one prompt-ready block under an optional token budget.
     pub async fn block(&self, token_budget: Option<usize>) -> Result<String, LaserError> {
         self.handle.context(self.conversation, token_budget).await
+    }
+
+    /// Keyword recall for `query` within this conversation. It needs no
+    /// [`Embedder`](crate::memory::Embedder), so it works on the default
+    /// log-backed memory. Chain [`recall`](Self::recall) for semantic or
+    /// hybrid recall.
+    pub async fn search(&self, query: impl Into<String>) -> Result<Vec<MemoryItem>, LaserError> {
+        self.recall().keyword(query).fetch().await
     }
 
     /// One consolidation pass over this conversation, keeping the most relevant

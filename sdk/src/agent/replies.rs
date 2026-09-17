@@ -194,8 +194,7 @@ async fn dispatch_loop(
                 &stream,
                 &topic,
                 &consumer,
-                partition,
-                from,
+                crate::poll::DrainRange::open(partition, from),
                 REPLY_BATCH,
             )
             .await

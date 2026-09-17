@@ -628,8 +628,7 @@ impl AgentReplyReader {
                 &self.stream,
                 &self.topic,
                 &self.consumer,
-                partition,
-                from,
+                crate::poll::DrainRange::open(partition, from),
                 REPLY_BATCH,
             )
             .await?;
@@ -707,8 +706,7 @@ impl AgentReplyReader {
                 &self.stream,
                 &self.topic,
                 &self.consumer,
-                partition,
-                from,
+                crate::poll::DrainRange::open(partition, from),
                 REPLY_BATCH,
             )
             .await?;

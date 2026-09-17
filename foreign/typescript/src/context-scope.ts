@@ -1,12 +1,18 @@
 import type { Laser } from "./client/laser.js"
 import type { GraphHandle } from "./managed/graph.js"
-import { ContextAssembler, LastN, type ContextMessage, type ContextPolicy } from "./context.js"
+import {
+  Checkpoint,
+  ContextAssembler,
+  LastN,
+  type ContextMessage,
+  type ContextPolicy
+} from "./context.js"
 import { ConversationState, type ReplayBound } from "./conversation-state.js"
 import type { SnapshotStore } from "./snapshot.js"
 import type { BytesLike } from "./client/bytes.js"
 import type { ConversationId } from "./types/ids.js"
 import type { MemoryHandle } from "./memory/handle.js"
-import type { Feedback, MemoryId } from "./memory/types.js"
+import type { Feedback, MemoryId, MemoryItem } from "./memory/types.js"
 
 export class ContextScope {
   constructor(
@@ -33,6 +39,12 @@ export class ContextScope {
   async block(topics: readonly string[], count: number): Promise<string> {
     const messages = await this.fetch(topics, count)
     return messages.map((message) => new TextDecoder().decode(message.payload)).join("\n")
+  }
+
+  /** The current tail of `topics` as a `Checkpoint`: fold up to it with the
+   * `at` replay bound or resume after it with `from-checkpoint`. */
+  checkpoint(topics: readonly string[]): Promise<Checkpoint> {
+    return Checkpoint.capture(this.laser, topics)
   }
 
   /** Binds a memory namespace or existing handle to this conversation. */
@@ -94,6 +106,13 @@ export class ScopedMemory {
 
   recall() {
     return this.handle.recall().conversation(this.conversation)
+  }
+
+  /** Keyword recall for `query` within this conversation. Needs no embedder,
+   * so it works on the default log-backed memory. */
+  search(query: string, limit?: number): Promise<readonly MemoryItem[]> {
+    const recall = this.recall().keyword(query)
+    return (limit === undefined ? recall : recall.limit(limit)).fetch()
   }
 
   context(tokenBudget?: number): Promise<string> {

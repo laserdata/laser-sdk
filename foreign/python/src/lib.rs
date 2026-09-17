@@ -23,6 +23,7 @@ mod rbac;
 mod reader;
 mod runs;
 mod schema;
+mod session;
 mod sign;
 mod snapshot;
 mod state_store;
@@ -116,6 +117,10 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<intent::PyDecision>()?;
     module.add_class::<context::PyContextScope>()?;
     module.add_class::<context::PyScopedMemory>()?;
+    module.add_class::<session::PySessions>()?;
+    module.add_class::<session::PySession>()?;
+    module.add_class::<session::PySessionTurn>()?;
+    module.add_class::<session::PyCheckpoint>()?;
     module.add_class::<memory::PyMemory>()?;
     module.add_class::<memory::PyMemoryItem>()?;
     module.add_class::<graph::PyGraph>()?;

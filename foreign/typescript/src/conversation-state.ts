@@ -1,11 +1,13 @@
 import type { Laser } from "./client/laser.js"
-import { ContextAssembler, LastN, type ContextMessage } from "./context.js"
+import { ContextAssembler, LastN, type Checkpoint, type ContextMessage } from "./context.js"
 import type { SnapshotStore } from "./snapshot.js"
 import type { ConversationId } from "./types/ids.js"
 import { foldSnapshotResumeOffset, type FoldSnapshot } from "./wire/snapshot.js"
 
 export type ReplayBound =
   | { readonly kind: "from-offsets"; readonly offsets: ReadonlyMap<number, bigint> }
+  | { readonly kind: "from-checkpoint"; readonly checkpoint: Checkpoint }
+  | { readonly kind: "at"; readonly checkpoint: Checkpoint }
   | { readonly kind: "last"; readonly count: number }
   | { readonly kind: "full" }
 
@@ -33,6 +35,12 @@ async function load<State>(
   if (bound.kind === "full") builder.policy(new LastN(Number.MAX_SAFE_INTEGER))
   if (bound.kind === "from-offsets") {
     builder.policy(new LastN(Number.MAX_SAFE_INTEGER)).fromOffsets(bound.offsets)
+  }
+  if (bound.kind === "from-checkpoint") {
+    builder.policy(new LastN(Number.MAX_SAFE_INTEGER)).fromCheckpoint(bound.checkpoint)
+  }
+  if (bound.kind === "at") {
+    builder.policy(new LastN(Number.MAX_SAFE_INTEGER)).toCheckpoint(bound.checkpoint)
   }
   const history = await builder.build().assemble(laser)
   return history.reduce(fold, initial)

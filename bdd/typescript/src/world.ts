@@ -4,9 +4,11 @@ import {
   Laser,
   MemoryHandle,
   type Capabilities,
+  type Checkpoint,
   type ContextMessage,
   type LaserError,
-  type MemoryId
+  type MemoryId,
+  type Session
 } from "@laserdata/laser-sdk"
 import { randomUUID } from "node:crypto"
 
@@ -20,6 +22,8 @@ export class LaserWorld {
   laser?: Laser
   stream?: string
   conversation?: ConversationId
+  session?: Session
+  checkpoint?: Checkpoint
   assembled: readonly ContextMessage[] = []
   error: LaserError | undefined
   capabilities?: Capabilities
@@ -60,6 +64,16 @@ export class LaserWorld {
   requireConversation(): ConversationId {
     if (this.conversation === undefined) throw new Error("scenario has no conversation")
     return this.conversation
+  }
+
+  requireSession(): Session {
+    if (this.session === undefined) throw new Error("scenario has no session")
+    return this.session
+  }
+
+  requireCheckpoint(): Checkpoint {
+    if (this.checkpoint === undefined) throw new Error("scenario has no checkpoint")
+    return this.checkpoint
   }
 
   async capture(effect: () => Promise<unknown>): Promise<void> {

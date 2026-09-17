@@ -9,4 +9,5 @@ pub mod memory;
 pub mod platform;
 pub mod query;
 pub mod runs;
+pub mod session;
 pub mod streaming;

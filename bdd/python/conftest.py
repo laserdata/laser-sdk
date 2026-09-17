@@ -44,6 +44,8 @@ class World:
         self.loop = asyncio.new_event_loop()
         self.laser = None
         self.conversation = None
+        self.session = None
+        self.checkpoint = None
         self.assembled = []
         self.published = False
         self.count = None

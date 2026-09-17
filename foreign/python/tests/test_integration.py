@@ -1157,3 +1157,47 @@ async def test_request_input_resumes_only_on_a_signed_response(iggy_endpoint):
         await faker.shutdown()
         if approver is not None:
             await approver.shutdown()
+
+
+async def test_given_a_session_when_typed_turns_are_appended_then_context_and_checkpoints_read_back(
+    laser,
+):
+    await laser.bootstrap(partitions=2)
+    sessions = laser.sessions()
+    session = sessions.create("agent-42")
+    assert sessions.create("agent-42").conversation == session.conversation
+    assert sessions.open(session.conversation).conversation == session.conversation
+    assert sessions.start().conversation != sessions.start().conversation
+
+    await session.append("instruction", b"summarize the ticket")
+    await session.append("model.response", "it is a login bug")
+    turns = None
+    for _ in range(100):
+        turns = await session.context()
+        if len(turns) == 2:
+            break
+        await asyncio.sleep(0.05)
+    assert [(turn.kind, turn.text()) for turn in turns] == [
+        ("instruction", "summarize the ticket"),
+        ("model.response", "it is a login bug"),
+    ]
+    assert turns[0].message.topic == ls.Topics.COMMANDS
+
+    checkpoint = await session.checkpoint()
+    restored = ls.Checkpoint.from_json(checkpoint.to_json())
+    assert len(await session.turns_at(restored)) == 2
+    await session.append("tool.result", b"3 comments found")
+    since = None
+    for _ in range(100):
+        since = await session.turns_since(checkpoint)
+        if len(since) == 1:
+            break
+        await asyncio.sleep(0.05)
+    assert [turn.text() for turn in since] == ["3 comments found"]
+    replayed = await session.replay(checkpoint, [], lambda acc, turn: [*acc, turn.kind])
+    assert replayed == ["tool.result"]
+
+    with pytest.raises(ls.InvalidError):
+        laser.sessions(topics={"response": ls.Topics.COMMANDS})
+    with pytest.raises(ls.InvalidError):
+        await session.append("event", b"nope")

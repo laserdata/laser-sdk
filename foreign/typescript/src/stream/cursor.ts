@@ -32,6 +32,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 export class Cursor {
   private batchSize: number
   private readonly partitionOffsets: Map<number, bigint>
+  private readonly partitionEnds = new Map<number, bigint>()
   private readonly readerName: string | undefined
 
   constructor(
@@ -59,6 +60,14 @@ export class Cursor {
     return this
   }
 
+  /** Stops each partition at its exclusive `ends` offset instead of the tail. */
+  until(ends: ReadonlyMap<number, bigint>): this {
+    for (const [partitionId, end] of ends) {
+      if (this.partitionOffsets.has(partitionId)) this.partitionEnds.set(partitionId, end)
+    }
+    return this
+  }
+
   batch(size: number): this {
     this.batchSize = size
     return this
@@ -70,6 +79,8 @@ export class Cursor {
     }
     const results: ConsumedMessage[] = []
     for (const [partitionId, offset] of this.partitionOffsets) {
+      const end = this.partitionEnds.get(partitionId)
+      if (end !== undefined && offset >= end) continue
       const strategy: PollingStrategy = { kind: "offset", value: offset }
       const polled = await this.transport.pollMessages(
         this.streamName,
@@ -84,6 +95,10 @@ export class Cursor {
         false
       )
       for (const message of polled) {
+        if (end !== undefined && message.offset >= end) {
+          this.partitionOffsets.set(partitionId, end)
+          break
+        }
         results.push(message)
         this.partitionOffsets.set(partitionId, message.offset + 1n)
       }

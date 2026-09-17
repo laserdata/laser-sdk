@@ -18,6 +18,7 @@ __all__ = [
     "BatchPublishRequest",
     "Capabilities",
     "ChangeRecord",
+    "Checkpoint",
     "ChunkAssembler",
     "CompiledSchema",
     "Consumer",
@@ -70,6 +71,9 @@ __all__ = [
     "ScopedMemory",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "Session",
+    "SessionTurn",
+    "Sessions",
     "SigningKey",
     "SnapshotStore",
     "Stream",
@@ -372,6 +376,13 @@ class AgentMessage:
     """
     @property
     def payload(self) -> builtins.list[builtins.int]: ...
+    @property
+    def topic(self) -> typing.Optional[builtins.str]:
+        r"""
+        The topic this message was read from, when it came off a context
+        read (`ContextScope.fetch`, `Session.context`). `None` for a consumed
+        message, whose consumer knows its topic.
+        """
     @property
     def verified_principal(self) -> typing.Optional[builtins.str]:
         r"""
@@ -722,6 +733,29 @@ class ChangeRecord:
     def rows(self) -> builtins.int:
         r"""
         Rows the batch wrote.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class Checkpoint:
+    r"""
+    A point in a session's log: the next offset each partition of each topic
+    will write, as of `Session.checkpoint`. A client-side bookmark, never a
+    record on the log. Round-trip it through `to_json`/`from_json` to persist
+    it.
+    """
+    def is_empty(self) -> builtins.bool:
+        r"""
+        True when no topic was checkpointed.
+        """
+    def to_json(self) -> builtins.str:
+        r"""
+        This checkpoint as JSON.
+        """
+    @staticmethod
+    def from_json(json: builtins.str) -> Checkpoint:
+        r"""
+        A checkpoint from `to_json` output.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2215,6 +2249,17 @@ class Laser:
         managed feature: against Apache Iggy every operation raises
         `UnsupportedError`.
         """
+    def sessions(self, *, stream: typing.Optional[builtins.str] = None, topics: typing.Optional[typing.Mapping[builtins.str, builtins.str]] = None, memory_namespace: typing.Optional[builtins.str] = None, context_turns: typing.Optional[builtins.int] = None, context_tokens: typing.Optional[builtins.int] = None) -> Sessions:
+        r"""
+        The session accessor: one conversation seen as typed turns, a
+        model-ready context, scoped memory, and checkpointed replay. Built on
+        `Laser.context`, so a session is never a second store. Free and
+        synchronous, IO at the verbs. The layout is configurable: `stream`
+        puts the sessions on another stream, `topics` maps a turn kind to the
+        topic it rides (`{"instruction": "support.turns"}`), and
+        `memory_namespace`, `context_turns`, `context_tokens` replace the
+        defaults (`agent.session`, 50, 4000).
+        """
     def kv_snapshot_store(self, namespace: typing.Optional[builtins.str] = None) -> SnapshotStore:
         r"""
         A fold-snapshot store in the managed key-value store (one key per
@@ -3131,6 +3176,12 @@ class ScopedMemory:
         Remember `payload` (str, bytes, or bytearray) in this conversation's
         session scope. Returns the new item's id.
         """
+    def search(self, query: builtins.str, *, limit: builtins.int = 50) -> typing.Any:
+        r"""
+        Keyword recall for `query` within this conversation, up to `limit`
+        items. Needs no embedder, so it works on the default log-backed memory.
+        Use `recall(semantic=..)` for semantic or hybrid recall.
+        """
 
 @typing.final
 class SendMessagesConfirmation:
@@ -3153,6 +3204,118 @@ class SendMessagesResponse:
     """
     @property
     def confirmations(self) -> builtins.list[SendMessagesConfirmation]: ...
+
+@typing.final
+class Session:
+    r"""
+    One agent session over a conversation. Turns are agent messages on the
+    conversation-level topics, the context is a bounded assembly of them,
+    memory is the conversation's scoped memory, and a `Checkpoint` bounds
+    point-in-time and incremental replay. Build it with `Laser.sessions`.
+    """
+    @property
+    def conversation(self) -> builtins.str:
+        r"""
+        This session's conversation id.
+        """
+    def scope(self) -> ContextScope:
+        r"""
+        The underlying `ContextScope`, for a topic outside the session's set,
+        an explicit read shape, or the knowledge graph.
+        """
+    def append(self, kind: builtins.str, data: typing.Any) -> typing.Any:
+        r"""
+        Append one turn. `kind` is one of `instruction`, `response`,
+        `model.response`, `tool.call`, `tool.result`, or `human.input`, and
+        `data` is str, bytes, or bytearray.
+        """
+    def context(self, *, last_n: typing.Optional[builtins.int] = None, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        The model-ready context: the last `last_n` turns across the session's
+        topics, trimmed to `token_budget` estimated tokens. Both default to the
+        factory's configured bounds (50 turns, 4000 tokens unless changed).
+        """
+    def memory(self, memory: typing.Optional[Memory] = None) -> ScopedMemory:
+        r"""
+        This session's memory, scoped to the conversation: `memory` defaults to
+        `laser.memory(<configured namespace>)`, or pass any handle from
+        `laser.memory`/`memory_on_topic`/`memory_topic`/`vector_memory`.
+        """
+    def checkpoint(self) -> typing.Any:
+        r"""
+        Where this session's topics end right now. Persist it with
+        `Checkpoint.to_json` and hand it to `turns_at`, `turns_since`,
+        `state_at`, or `replay`.
+        """
+    def turns_at(self, checkpoint: Checkpoint) -> typing.Any:
+        r"""
+        The turns up to `checkpoint`.
+        """
+    def turns_since(self, checkpoint: Checkpoint) -> typing.Any:
+        r"""
+        The turns appended after `checkpoint`.
+        """
+    def state_at(self, checkpoint: Checkpoint, initial: typing.Any, fold: typing.Any) -> typing.Any:
+        r"""
+        Fold the turns up to `checkpoint` with `fold(state, turn) -> state`,
+        starting from `initial`: state as it stood then.
+        """
+    def replay(self, checkpoint: Checkpoint, initial: typing.Any, fold: typing.Any) -> typing.Any:
+        r"""
+        Fold the turns appended after `checkpoint` with `fold(state, turn) ->
+        state`, starting from `initial`: bring state saved at that checkpoint
+        up to date.
+        """
+
+@typing.final
+class SessionTurn:
+    r"""
+    One turn read back from a `Session`: the message plus the kind its topic
+    implies.
+    """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        The turn kind: `instruction`, `response`, `model.response`,
+        `tool.call`, `tool.result`, or `human.input`.
+        """
+    @property
+    def payload(self) -> builtins.list[builtins.int]:
+        r"""
+        The raw payload.
+        """
+    @property
+    def message(self) -> AgentMessage:
+        r"""
+        The message off the log, with its provenance and topic.
+        """
+    def text(self) -> builtins.str:
+        r"""
+        The payload as UTF-8, lossy.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class Sessions:
+    r"""
+    The session factory. Build it with `Laser.sessions`.
+    """
+    def create(self, id: builtins.str) -> Session:
+        r"""
+        The durable session named `id`. The conversation derives from `id`, so
+        the same id always reaches the same history, and nothing is created on
+        the server until a turn is appended.
+        """
+    def start(self) -> Session:
+        r"""
+        A fresh anonymous session. Keep `Session.conversation` to `open` it
+        again later.
+        """
+    def open(self, conversation_id: builtins.str) -> Session:
+        r"""
+        The session over an existing conversation id: one minted by `start`,
+        carried by an inbound message's provenance, or a sub-conversation.
+        """
 
 @typing.final
 class SigningKey:

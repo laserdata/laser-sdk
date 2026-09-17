@@ -20,6 +20,82 @@ export interface ContextMessage {
   readonly payload: Uint8Array
   readonly envelope?: AgentEnvelope
   readonly timestampMicros: bigint
+  /** The name of the topic the message was read from. */
+  readonly topic: string
+}
+
+/** A point in a conversation's log: the next offset each partition of each
+ * topic will write, as captured by `ContextScope.checkpoint`. A client-side
+ * bookmark keyed by topic name, never a record on the log. `toJSON` and
+ * `Checkpoint.fromJSON` persist it. */
+export class Checkpoint {
+  private constructor(
+    private readonly perTopic: ReadonlyMap<string, ReadonlyMap<number, bigint>>
+  ) {}
+
+  static empty(): Checkpoint {
+    return new Checkpoint(new Map())
+  }
+
+  static async capture(laser: Laser, topics: readonly string[]): Promise<Checkpoint> {
+    const entries = await Promise.all(
+      topics.map(async (topic) => [topic, await laser.topic(topic).tailOffsets()] as const)
+    )
+    return new Checkpoint(new Map(entries))
+  }
+
+  /** The per-partition offsets for `topic`, or `undefined` when the checkpoint
+   * was not taken over that topic. */
+  topicOffsets(topic: string): ReadonlyMap<number, bigint> | undefined {
+    return this.perTopic.get(topic)
+  }
+
+  get topics(): readonly string[] {
+    return [...this.perTopic.keys()]
+  }
+
+  isEmpty(): boolean {
+    return this.perTopic.size === 0
+  }
+
+  toJSON(): Record<string, Record<string, string>> {
+    return Object.fromEntries(
+      [...this.perTopic].map(([topic, offsets]) => [
+        topic,
+        Object.fromEntries(
+          [...offsets].map(([partition, offset]) => [String(partition), String(offset)])
+        )
+      ])
+    )
+  }
+
+  static fromJSON(value: unknown): Checkpoint {
+    const parsed: unknown = typeof value === "string" ? JSON.parse(value) : value
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new TypeError("a checkpoint is an object keyed by topic name")
+    }
+    const perTopic = new Map<string, ReadonlyMap<number, bigint>>()
+    for (const [topic, offsets] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof offsets !== "object" || offsets === null || Array.isArray(offsets)) {
+        throw new TypeError(`checkpoint topic ${topic} is not an object keyed by partition`)
+      }
+      perTopic.set(
+        topic,
+        new Map(
+          Object.entries(offsets as Record<string, unknown>).map(([partition, offset]) => {
+            if (
+              !/^\d+$/.test(partition) ||
+              (typeof offset !== "string" && typeof offset !== "number")
+            ) {
+              throw new TypeError(`checkpoint topic ${topic} has an invalid partition entry`)
+            }
+            return [Number(partition), BigInt(offset)]
+          })
+        )
+      )
+    }
+    return new Checkpoint(perTopic)
+  }
 }
 
 export interface ContextPolicy {
@@ -89,6 +165,8 @@ interface ContextAssemblerOptions {
   readonly topics: readonly string[]
   readonly policy: ContextPolicy
   readonly fromOffsets: ReadonlyMap<number, bigint>
+  readonly fromCheckpoint?: Checkpoint
+  readonly toCheckpoint?: Checkpoint
 }
 
 export class ContextAssemblerBuilder {
@@ -96,6 +174,8 @@ export class ContextAssemblerBuilder {
   private selectedTopics: readonly string[] = [AgentTopic.Commands, AgentTopic.Responses]
   private selectedPolicy: ContextPolicy = new LastN(50)
   private offsets: ReadonlyMap<number, bigint> = new Map()
+  private resumeFrom: Checkpoint | undefined
+  private stopAt: Checkpoint | undefined
 
   constructor(private readonly conversation: ConversationId) {}
 
@@ -114,8 +194,22 @@ export class ContextAssemblerBuilder {
     return this
   }
 
+  /** One offset map shared by every topic. `fromCheckpoint` takes precedence
+   * for the topics it names. */
   fromOffsets(offsets: ReadonlyMap<number, bigint>): this {
     this.offsets = new Map(offsets)
+    return this
+  }
+
+  /** Resume after `checkpoint`, per topic and partition, and read to the tail. */
+  fromCheckpoint(checkpoint: Checkpoint): this {
+    this.resumeFrom = checkpoint
+    return this
+  }
+
+  /** Stop at `checkpoint`, per topic and partition: a point-in-time read. */
+  toCheckpoint(checkpoint: Checkpoint): this {
+    this.stopAt = checkpoint
     return this
   }
 
@@ -125,7 +219,9 @@ export class ContextAssemblerBuilder {
       acrossSubconversations: this.acrossChildren,
       topics: this.selectedTopics,
       policy: this.selectedPolicy,
-      fromOffsets: this.offsets
+      fromOffsets: this.offsets,
+      ...(this.resumeFrom === undefined ? {} : { fromCheckpoint: this.resumeFrom }),
+      ...(this.stopAt === undefined ? {} : { toCheckpoint: this.stopAt })
     })
   }
 }
@@ -140,9 +236,23 @@ export class ContextAssembler {
   async assemble(laser: Laser): Promise<readonly ContextMessage[]> {
     const perTopic = await Promise.all(
       this.options.topics.map(async (topic, topicIndex) => {
-        const cursor = await laser.topic(topic).replay({ batchSize: READ_BATCH })
-        cursor.fromOffsets(this.options.fromOffsets)
         const collected: (ContextMessage & { readonly topicIndex: number })[] = []
+        // A topic nobody has written yet has no history, same as in Rust.
+        if ((await laser.topic(topic).partitionCount()) === undefined) return collected
+        const cursor = await laser.topic(topic).replay({ batchSize: READ_BATCH })
+        const resume = this.options.fromCheckpoint?.topicOffsets(topic)
+        cursor.fromOffsets(resume ?? this.options.fromOffsets)
+        const stop = this.options.toCheckpoint
+        if (stop !== undefined) {
+          // A checkpoint holds the next offset to write, so a partition it does
+          // not name existed only after it and reads as empty.
+          const ends = stop.topicOffsets(topic) ?? new Map<number, bigint>()
+          cursor.until(
+            new Map(
+              [...cursor.offsets.keys()].map((partition) => [partition, ends.get(partition) ?? 0n])
+            )
+          )
+        }
         for (;;) {
           const records = await cursor.poll()
           if (records.length === 0) break
@@ -157,6 +267,7 @@ export class ContextAssembler {
                 ? { envelope: decoded.message.envelope }
                 : {}),
               timestampMicros: record.timestampMicros ?? 0n,
+              topic,
               topicIndex
             })
             if (collected.length > MAX_CONTEXT_RECORDS) collected.shift()

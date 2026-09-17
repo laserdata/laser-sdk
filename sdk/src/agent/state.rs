@@ -1,4 +1,4 @@
-use crate::context::{ContextAssembler, ContextMessage};
+use crate::context::{Checkpoint, ContextAssembler, ContextMessage};
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::provenance::AgentTopic;
@@ -13,12 +13,20 @@ use std::collections::BTreeMap;
 pub enum ReplayBound {
     /// Fold only messages at or after these per-partition offsets, the
     /// incremental form (a persisted cursor, a snapshot's resume offsets).
+    /// One map shared across every topic in `topics`.
+    /// [`FromCheckpoint`](Self::FromCheckpoint) bounds each topic on its own.
     FromOffsets(BTreeMap<u32, u64>),
     /// Fold only the last `n` messages.
     Last(usize),
     /// Fold the whole partition from offset zero. Correct for a short
     /// conversation and for a first snapshot build, expensive everywhere else.
     Full,
+    /// Fold only what was appended after a [`Checkpoint`], per topic and
+    /// partition, up to the tail.
+    FromCheckpoint(Checkpoint),
+    /// Fold the history up to a [`Checkpoint`], per topic and partition, and
+    /// stop there.
+    At(Checkpoint),
 }
 
 /// Rebuilds in-memory state by folding a conversation's logged events (event sourcing).
@@ -60,6 +68,22 @@ impl ConversationState {
             ReplayBound::Full => {
                 assembler
                     .policy(Box::new(crate::context::LastN(usize::MAX)))
+                    .build()
+                    .assemble(laser)
+                    .await?
+            }
+            ReplayBound::FromCheckpoint(checkpoint) => {
+                assembler
+                    .policy(Box::new(crate::context::LastN(usize::MAX)))
+                    .from_checkpoint(checkpoint)
+                    .build()
+                    .assemble(laser)
+                    .await?
+            }
+            ReplayBound::At(checkpoint) => {
+                assembler
+                    .policy(Box::new(crate::context::LastN(usize::MAX)))
+                    .to_checkpoint(checkpoint)
                     .build()
                     .assemble(laser)
                     .await?

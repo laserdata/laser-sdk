@@ -5,7 +5,6 @@ use crate::client::PyLaser;
 use crate::convert::payload_bytes;
 use crate::errors::to_pyerr;
 use crate::memory::{Backend, PyMemory, PyMemoryItem, build_scope, map_strategy};
-use laser_sdk::agent::AgentMessage;
 use laser_sdk::context::{Chain, ContextPolicy, LastN, TokenBudget};
 use laser_sdk::laser::Laser;
 use laser_sdk::memory::{MemoryQuery, RecallStrategy};
@@ -37,6 +36,15 @@ impl PyLaser {
 pub struct PyContextScope {
     laser: Laser,
     conversation: ConversationId,
+}
+
+impl PyContextScope {
+    pub(crate) fn new(scope: laser_sdk::context_scope::ContextScope) -> Self {
+        Self {
+            laser: scope.laser().clone(),
+            conversation: scope.conversation(),
+        }
+    }
 }
 
 #[gen_stub_pymethods]
@@ -94,16 +102,7 @@ impl PyContextScope {
                 .map_err(to_pyerr)?;
             Ok(messages
                 .into_iter()
-                .map(|message| {
-                    PyAgentMessage::from_inner(AgentMessage {
-                        provenance: message.provenance,
-                        payload: message.payload,
-                        id: message.id,
-                        envelope: message.envelope,
-                        content_type: None,
-                        verified_principal: None,
-                    })
-                })
+                .map(PyAgentMessage::from_context)
                 .collect::<Vec<_>>())
         })
     }
@@ -173,7 +172,7 @@ impl PyContextScope {
 // The policy behind `last_n` / `token_budget`: cap by turns, then trim the kept
 // turns to the estimated token count when a budget was asked for. Chained in
 // that order so the budget always sees the newest window.
-fn bounded_policy(last_n: usize, token_budget: Option<usize>) -> Box<dyn ContextPolicy> {
+pub(crate) fn bounded_policy(last_n: usize, token_budget: Option<usize>) -> Box<dyn ContextPolicy> {
     match token_budget {
         Some(budget) => Box::new(Chain(vec![
             Box::new(LastN(last_n)),
@@ -190,6 +189,15 @@ fn bounded_policy(last_n: usize, token_budget: Option<usize>) -> Box<dyn Context
 pub struct PyScopedMemory {
     backend: Backend,
     conversation: ConversationId,
+}
+
+impl PyScopedMemory {
+    pub(crate) fn new(backend: Backend, conversation: ConversationId) -> Self {
+        Self {
+            backend,
+            conversation,
+        }
+    }
 }
 
 #[gen_stub_pymethods]
@@ -239,6 +247,32 @@ impl PyScopedMemory {
         future_into_py(py, async move {
             let id = backend.remember(scope, payload).await.map_err(to_pyerr)?;
             Ok(id.to_string())
+        })
+    }
+
+    /// Keyword recall for `query` within this conversation, up to `limit`
+    /// items. Needs no embedder, so it works on the default log-backed memory.
+    /// Use `recall(semantic=..)` for semantic or hybrid recall.
+    #[pyo3(signature = (query, *, limit=50))]
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let backend = self.backend.clone();
+        let scope = build_scope(None, Some(self.conversation.to_string()))?;
+        let query = MemoryQuery::builder()
+            .limit(limit)
+            .semantic(query)
+            .strategy(RecallStrategy::Keyword)
+            .build();
+        future_into_py(py, async move {
+            let items = backend.recall(scope, query).await.map_err(to_pyerr)?;
+            Ok(items
+                .into_iter()
+                .map(PyMemoryItem::from)
+                .collect::<Vec<_>>())
         })
     }
 

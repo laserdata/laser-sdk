@@ -59,20 +59,58 @@ pub(crate) async fn tail_anchored_offset(
     Ok(from_offset.max(window_start))
 }
 
-// Drains a partition from `from_offset` toward its current tail in `batch`-sized
-// polls, returning the messages read (at most `MAX_DRAIN_MESSAGES`) plus the
-// offset to resume from. Callers that poll repeatedly pass back `next_offset` so
-// each pass reads only what is new instead of rescanning from zero.
+// One partition read: from `from` toward the tail, or up to and including
+// `end` for a point-in-time read behind a `Checkpoint`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainRange {
+    pub(crate) partition: u32,
+    pub(crate) from: u64,
+    pub(crate) end: Option<u64>,
+}
+
+impl DrainRange {
+    pub(crate) const fn open(partition: u32, from: u64) -> Self {
+        Self {
+            partition,
+            from,
+            end: None,
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    pub(crate) const fn until(partition: u32, from: u64, end: u64) -> Self {
+        Self {
+            partition,
+            from,
+            end: Some(end),
+        }
+    }
+}
+
+// Drains `range` in `batch`-sized polls, returning the messages read (at most
+// `MAX_DRAIN_MESSAGES`) plus the offset to resume from. Callers that poll
+// repeatedly pass back `next_offset` so each pass reads only what is new. A
+// bounded range drops anything past `end` and resumes at `end + 1`.
 pub(crate) async fn drain_partition(
     client: &IggyClient,
     stream: &Identifier,
     topic: &Identifier,
     consumer: &Consumer,
-    partition: u32,
-    from_offset: u64,
+    range: DrainRange,
     batch: u32,
 ) -> Result<PartitionBatch, LaserError> {
-    let mut offset = from_offset;
+    let DrainRange {
+        partition,
+        from,
+        end,
+    } = range;
+    if end.is_some_and(|end| from > end) {
+        return Ok(PartitionBatch {
+            messages: Vec::new(),
+            next_offset: from,
+        });
+    }
+    let mut offset = from;
     let mut messages = Vec::new();
     loop {
         let mut last_error = None;
@@ -108,11 +146,25 @@ pub(crate) async fn drain_partition(
         };
         offset = last.header.offset.saturating_add(1);
         let count = polled.messages.len();
-        messages.extend(polled.messages);
+        let mut received = polled.messages;
+        if let Some(end) = end
+            && let Some(cut) = received
+                .iter()
+                .position(|message| message.header.offset > end)
+        {
+            received.truncate(cut);
+            messages.extend(received);
+            offset = end.saturating_add(1);
+            break;
+        }
+        messages.extend(received);
         if (count as u32) < batch {
             break;
         }
         if messages.len() >= MAX_DRAIN_MESSAGES {
+            break;
+        }
+        if end.is_some_and(|end| offset > end) {
             break;
         }
     }
@@ -120,4 +172,31 @@ pub(crate) async fn drain_partition(
         messages,
         next_offset: offset,
     })
+}
+
+// The next offset one partition will write: one past its last message, or 0
+// when it is empty. This is what a `Checkpoint` records.
+#[cfg(feature = "agent")]
+pub(crate) async fn current_tail_offset(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    consumer: &Consumer,
+    partition: u32,
+) -> Result<u64, LaserError> {
+    let polled = client
+        .poll_messages(
+            stream,
+            topic,
+            Some(partition),
+            consumer,
+            &PollingStrategy::last(),
+            1,
+            false,
+        )
+        .await?;
+    Ok(polled
+        .messages
+        .last()
+        .map_or(0, |message| message.header.offset.saturating_add(1)))
 }

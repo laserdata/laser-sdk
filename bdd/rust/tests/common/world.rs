@@ -7,7 +7,7 @@ use laser_bdd::memory_engine::MemoryEngine;
 use laser_bdd::query_engine::QueryEngine;
 use laser_sdk::kv::KvError;
 use laser_sdk::memory::MemoryId;
-use laser_sdk::prelude::{ConversationId, Laser, QueryResult};
+use laser_sdk::prelude::{Checkpoint, ConversationId, Laser, QueryResult, Session};
 use laser_sdk::query::ResultCode;
 use std::collections::HashMap;
 use std::fmt;
@@ -21,6 +21,9 @@ pub struct LaserWorld {
     pub laser: Option<Laser>,
     pub platform: Option<Arc<TestIggy>>,
     pub conversation: Option<ConversationId>,
+    /// The session and checkpoint of the session scenarios.
+    pub session: Option<Session>,
+    pub checkpoint: Option<Checkpoint>,
     /// `Ok(())` or the stringified error of the last fallible action.
     pub last_result: Option<Result<(), String>>,
     /// Number of records accepted by the last streaming batch publish.
@@ -99,6 +102,10 @@ impl LaserWorld {
 
     pub fn conversation(&self) -> ConversationId {
         self.conversation.expect("a conversation was started")
+    }
+
+    pub fn session(&self) -> &Session {
+        self.session.as_ref().expect("a session was opened")
     }
 }
 
