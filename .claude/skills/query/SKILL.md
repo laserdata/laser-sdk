@@ -51,7 +51,7 @@ Use the result accessor by logical field name rather than manually searching the
 - Python: `result.value(row, "amount")` and `value_text`.
 - TypeScript: `queryResultValue(result, row, "amount")` and `typedValueDiagnosticText(value)`.
 
-Reply decoding must validate the field graph, reserved provenance pairs, row width, value type and nullability, row count, page cursor agreement, engine identity, delivered consistency, resolved target evidence, and lakehouse checkpoint evidence. A malformed successful reply is a protocol failure, not partially trusted data.
+Reject replies with invalid field structure, reserved-field pairs, row width, value types, nullability, row count, or page cursors. Also require valid engine identity, sufficient consistency, target evidence, and lakehouse checkpoint evidence. Do not use partially decoded success data.
 
 The reserved provenance field IDs and names may appear only as exact top-level result-field pairs. User schemas and nested structs cannot claim them.
 
@@ -61,7 +61,7 @@ The first request may use an offset for initial positioning. Continuation uses o
 
 `AGDX_QUERY_PAGE_CODE`, `AGDX_QUERY_STATUS_CODE`, and `AGDX_QUERY_CANCEL_CODE` all use query version 1 envelopes. Cursor paging, execution status, and cancellation have separate negotiated capability flags and must be rejected locally when unavailable. Terminal execution states require a finish time. Only a failed state carries an error.
 
-Bounded row iteration follows cursors. Aggregate and vector requests remain single-page. Exact totals are opt-in because they may require a full count. Bulk analytical transfer should use Arrow IPC rather than raising the inline query page cap of 1000 rows.
+Bounded row iteration follows server cursors. Aggregate and vector requests use one page. Exact totals are optional because they can require a full count. Use Arrow IPC for bulk analytical data rather than increasing the 1000-row page limit.
 
 ## Result evidence
 
@@ -75,11 +75,11 @@ Consistency is fail-not-downgrade. The delivered level must be at least the requ
 
 ## Destinations and checkpoints
 
-`laser.destinations()` exposes declaration and checkpoint operations. Public callers can register a complete destination, change desired state with revision guards, register or remove explicit query routes, and read destinations or routes with bounded pages and an explicit checkpoint read consistency.
+`laser.destinations()` provides destination and checkpoint operations. Clients can register a destination, change desired state with revision guards, and register or remove query routes. Reads use bounded pages and explicit checkpoint consistency.
 
 `CHECKPOINT_OP_VERSION` is negotiated independently. Every Rust and TypeScript destination command must compare it with `OpVersions.checkpoint` before sending.
 
-Public checkpoint mutations are intentionally narrower than replicated checkpoint mutations. They may request worker lease, progress, completion, and repair operations, but they never carry authenticated actors, primary timestamps, authoritative activation cuts, absolute lease deadlines, or server-certified repair evidence. The server stamps that evidence into a different replicated type, and the fixture corpus pins that separation.
+Public checkpoint requests can describe lease, progress, completion, and repair intent. They cannot supply authenticated actors, commit timestamps, source cuts, absolute lease deadlines, or certified repair evidence. The server adds those fields to a separate committed type. Reference tests keep the representations distinct.
 
 ## Arrow IPC publishing
 
@@ -95,4 +95,4 @@ Wire types use named fields. The hello-negotiated surface slots and fenced-lease
 
 An intentional wire change must update Rust fixtures, the TypeScript fixture manifest and codecs, Python bindings and stubs, HTTP JSON fixtures, API reports, robustness coverage, and `bdd/scenarios/data_stack.feature`. Run focused tests while implementing, then the complete repository gate from `AGENTS.md` before release.
 
-The data-stack BDD scenario checks logical schema behavior, explicit operational and lakehouse targets, positional typed values, destination and checkpoint separation, Arrow metadata, paging, status, and cancellation across Rust, Python, and TypeScript.
+The data-stack BDD scenarios compare Rust, Python, and TypeScript. They cover schemas, targets, typed values, destinations, checkpoints, Arrow metadata, paging, execution status, and cancellation.

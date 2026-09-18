@@ -140,6 +140,7 @@ ulid = { workspace = true }
 [dev-dependencies]
 apache-avro = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 iggy = { workspace = true }
 laser-wire = { workspace = true, features = ["builders", "cbor", "fixtures"] }
 libc = "0.2"

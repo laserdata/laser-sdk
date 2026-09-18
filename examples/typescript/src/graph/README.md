@@ -1,6 +1,6 @@
 # graph - the relationships your messages imply
 
-> Nodes and edges built from what flows through your log - who bought what, which agent said what, what depends on what. Traverse it, search it by meaning, and ask what was true at any point in time.
+A graph connects entities through named relationships. This example writes a relationship and reads the neighboring entities.
 
 ## What it shows
 

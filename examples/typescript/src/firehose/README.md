@@ -1,6 +1,6 @@
 # firehose - bounded multi-tenant ingest
 
-> A configurable load generator for streaming throughput, topic fan-out, materialized indexes, and query pressure.
+This example generates telemetry records across several organization topics. It tests publication volume, projection, queries, and storage use. Use its message-count and payload-size controls to bound a run.
 
 ## What it does
 
@@ -54,9 +54,9 @@ LASER_FIREHOSE_QUERY=false \
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: one index per organization, named `org_00`, `org_01`, and so on, with payload selection enabled per record.
-- **Bindings**: one source-topic binding per organization.
-- **Messages**: deterministic telemetry bodies spread across the configured partitions.
+- Query: one index per organization, named `org_00`, `org_01`, and so on, with payload selection enabled per record.
+- Bindings: one source-topic binding per organization.
+- Messages: deterministic telemetry bodies spread across the configured partitions.
 
 ## Highlights
 

@@ -1,6 +1,6 @@
 # order-book - live book and materialized trade tape
 
-> A deterministic market workload with a low-latency feed, a body-first analytics tape, typed replay, and a schema-first binary tape.
+This example sends market fills to a live order-book reader and a trade-history topic. Managed deployments also support analytics and schema-based publication.
 
 ## What it does
 
@@ -41,10 +41,10 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: the `trades` materialized tape, per-symbol volume and VWAP inputs, and decodable inline payloads.
-- **Writer schemas**: the allocated Avro schema used by `trades_avro`.
-- **Messages**: hot JSON fills on `md_feed`, durable JSON fills on `trades`, and validated Avro datums on `trades_avro`.
-- **Bindings**: the projection binding from the streaming topic to the managed table.
+- Query: the `trades` materialized tape, per-symbol volume and VWAP inputs, and decodable inline payloads.
+- Writer schemas: the allocated Avro schema used by `trades_avro`.
+- Messages: hot JSON fills on `md_feed`, durable JSON fills on `trades`, and validated Avro datums on `trades_avro`.
+- Bindings: the projection binding from the streaming topic to the managed table.
 
 ## Highlights
 

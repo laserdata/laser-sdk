@@ -2,26 +2,26 @@
 
 [![crates.io](https://img.shields.io/crates/v/laser-sdk.svg)](https://crates.io/crates/laser-sdk) [![docs.rs](https://docs.rs/laser-sdk/badge.svg)](https://docs.rs/laser-sdk)
 
-An open SDK by [LaserData, Inc.](https://laserdata.com) over [Apache Iggy](https://iggy.apache.org) for streaming, querying, and coordinating data on a durable log. This is the Rust reference implementation. Python binds this crate and TypeScript implements the same contract natively. All three consume the shared fixture and BDD corpus. Typed publish and consume are the foundation. Declared projections, query, key-value state, forks, and the optional AGDX agent runtime build on that log.
+[LaserData, Inc.](https://laserdata.com) maintains Laser SDK for [Apache Iggy](https://iggy.apache.org). This crate defines the Rust reference implementation. Python calls it, and TypeScript implements the same contract in Node. The clients use shared reference data and behavior tests. Streaming records form the base for projections, queries, key-value state, forks, and the optional AGDX agent runtime.
 
 Laser SDK ships in independently adoptable layers:
 
-- **streaming** (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
-- **managed platform** (`managed` feature), projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack.
-- **agentic** (`agent` feature), reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
-- **edges**, the optional A2A, MCP, and AG-UI adapters.
+- streaming (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
+- managed platform (`managed` feature), projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack.
+- agentic (`agent` feature), reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
+- edges, the optional A2A, MCP, and AG-UI adapters.
 
 The SDK carries `gen_ai.*` provenance describing model calls but never makes them. It moves and coordinates messages only.
 
-The wire contract underneath (CBOR envelopes, the query IR, the agent envelope, header and topic dictionaries, caps, the golden fixture corpus) is its own runtime-free, wasm-portable crate, [`laser-wire`](https://crates.io/crates/laser-wire), re-exported whole as `laser_sdk::wire` and under the historical module paths, so existing imports keep working.
+The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded messages, schemas, command codes, limits, and reference test data. It supports WebAssembly and does not require an asynchronous runtime. Laser SDK exposes it as `laser_sdk::wire` and through the existing module paths.
 
 ## Install
 
 ```toml
 [dependencies]
-laser-sdk = "0.3.2" # typed streaming plus provenance
+laser-sdk = "0.4.0" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.3.2", features = ["agent", "managed"] }
+laser-sdk = { version = "0.4.0", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -64,17 +64,21 @@ while let Some(record) = records.next().await {
 
 This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy.
 
-Direct producers, raw topic sends, and fluent publish terminals return `SendMessagesResponse`. Its confirmations identify the selected stream, topic, partition, and batch base offset. A server that cannot report offsets returns an empty list. The confirmation is an in-memory commit position, not an fsync guarantee, and the base offset is not unique without the other three coordinates.
+Direct producers, topic sends, and publish builders return `SendMessagesResponse`. Each confirmation identifies the stream, topic, partition, and first offset in a batch. A server that does not report offsets returns an empty list. Completion follows the topic durability policy. An offset identifies a position only within its stream, topic, and partition.
 
-Apache Iggy TCP reconnection is enabled for both the initial handshake and a later dropped socket, with unlimited retries at one-second intervals by default. Tune it through `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` in the connection string. The client reapplies connection-string credentials after reconnecting, so a server restart does not leave the socket unauthenticated.
+Apache Iggy retries initial TCP connections and reconnects dropped connections. The default is unlimited retries at one-second intervals. Use `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` to change this behavior. After reconnecting, the client reapplies the credentials from the connection string.
 
-Pointed at a `*.laserdata.cloud` or `*.laserdata.com` host, `connect`/`connect_with_stream` auto-attach TLS with LaserData's public root CA, bundled in the SDK so a bare connection string is enough. The CA is cached in a per-user, owner-only directory and reused only while its bytes match the bundled cert. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup and is read by value, so `0` and `false` do not disable TLS. Every other host is left untouched when neither variable is set.
+For `*.laserdata.cloud` and `*.laserdata.com`, `connect` and `connect_with_stream` enable TLS with the bundled LaserData root CA. A CA is a certificate authority used to establish trust. The SDK stores this certificate in a directory that only the current user can access. It reuses the file only when its bytes match the bundled certificate.
+
+Set `LASER_TLS_CERT=<path>` to use an explicit CA with any host. Set `LASER_NO_TLS=1` to disable automatic TLS. Values `0` and `false` do not disable it. Other hosts retain their connection-string TLS configuration when neither variable is set.
 
 ## Batch and any payload
 
-A single publish is the simplest call, not the common one. `publish_batch` accumulates typed records into one network round-trip. For a continuously running service, `topic.producer()` adds direct batching, linger, retries, and routing. `.background(BackgroundConfig::builder()..)` switches to Apache Iggy's buffered, sharded async sends instead, call `Producer::shutdown()` before dropping it or unflushed messages are lost. `topic.consumer_group()` is a live async stream with server-managed offsets. A replay cursor remains the bounded, caller-checkpointed reader. Batching on both live and bounded paths is what makes the path efficient.
+`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. Before dropping a background producer, call `Producer::shutdown()` to flush its messages. Otherwise, unflushed messages can be lost. `topic.consumer_group()` provides continuous reads with offsets stored on the server.
 
-The body is opaque bytes in any format. `json` / `msgpack` and the batch `add_json` / `add_msgpack` are conveniences over `add_payload`, which takes raw bytes the SDK never inspects. Use `raw_bytes(bytes, ContentType::Avro)` for an already-encoded body, or `add_avro` for schema-first encoding, so Avro, Protobuf, a compressed blob, or your own framing all ride unchanged.
+A replay cursor reads a bounded set of records and keeps its offsets in the client. Save those offsets to resume later. Failed or canceled polls do not advance the saved offsets. Each partition read returns at most 10,000 messages, even when the configured request batch is larger.
+
+The message body contains bytes in the format that the application selects. `json`, `msgpack`, `add_json`, and `add_msgpack` provide encoding helpers. `add_payload` sends raw bytes without inspecting their format. Use `raw_bytes(bytes, ContentType::Avro)` for encoded data or `add_avro` to encode with a schema. Protobuf, compressed data, and application-defined formats can use the same path.
 
 ```rust
 # use laser_sdk::prelude::*;
@@ -91,7 +95,7 @@ println!("commit confirmations: {}", committed.confirmations.len());
 # Ok(()) }
 ```
 
-Schema lives on the projector side, NOT in the producer code above. A `Projection` (which fields are indexed, where to read them from in the payload, whether the body rides alongside the row for retrieval) is declared once through your control workflow:
+A projection describes how a service reads and indexes message fields. Declare a `Projection` through the control API. The declaration selects fields, their positions in the payload, and whether the result retains the body:
 
 ```rust
 use laser_sdk::query::{Projection, ProjectionBinding};
@@ -130,9 +134,9 @@ for row in &result.rows {
 }
 ```
 
-`result.fields` defines the exact order and logical type of every `row.values` entry. Tagged values preserve integer widths, decimal precision, timestamps, UUIDs, bytes, structs, lists, maps, and nullability. Each inline page is capped at 1000 rows. Continuation follows the opaque `next_cursor` returned by the server, and `has_more` is true exactly when that cursor is present.
+`result.fields` gives the ordered schema for `row.values`. Tagged values preserve integer widths, decimal precision, timestamps, UUIDs, bytes, structs, lists, maps, and nullability. Each page contains at most 1000 rows. Use the server-provided `next_cursor` to continue. `has_more` is true exactly when that cursor is present.
 
-Lakehouse queries name one destination generation and may select a retained snapshot:
+Lakehouse queries name one destination generation and can select a retained snapshot:
 
 ```rust,ignore
 let historical = laser
@@ -146,9 +150,9 @@ let historical = laser
 println!("{:?}", historical.context.resolved_target);
 ```
 
-The result context proves the resolved engine and target. Lakehouse pages also prove destination and backend generations, table UUID, snapshot, schema and partition-spec IDs, materialization boundary, checkpoint revision, and global-state revision.
+The result context identifies the selected engine and target. Lakehouse pages also identify destination and backend generations, the table UUID, snapshot, schema, and partition-spec IDs. They include the materialization boundary, checkpoint revision, and global state revision.
 
-Each query builder owns one execution identity. `execution_id()` exposes it for coordination, while `status()` and `cancel()` use the dedicated managed commands and reject locally when the deployment does not advertise those capabilities. `fetch_all()` and bounded row iteration follow server-issued cursors automatically.
+Each query builder keeps one execution identity. Use `execution_id()` to obtain it. The `status()` and `cancel()` commands require the corresponding deployment capabilities. The SDK rejects unsupported calls before sending them. `fetch_all()` and bounded row iteration follow server-issued cursors.
 
 ## Destinations and Arrow IPC
 
@@ -189,11 +193,11 @@ let metadata = ArrowIpcMessageMetadata {
 topic.publish().arrow_ipc(arrow_stream, metadata)?.send().await?;
 ```
 
-The SDK validates metadata and exact payload length before I/O. Managed ingestion enforces stream format, self-containment, microsecond timestamps, stable dictionaries, decimals no wider than 128 bits, and no unions or extension types.
+Before sending, the SDK checks the metadata and exact payload length. Managed ingestion requires a self-contained Arrow stream with microsecond timestamps and stable dictionaries. Decimal widths cannot exceed 128 bits. Unions and extension types are not supported.
 
 ## Typed topics
 
-One handle binds a topic to one body type. The serde forms need no registry, encoding on the way in and decoding with the log position attached on the way out.
+A typed handle binds a topic to one body type. The serde forms encode published values and decode received values. They do not need a schema registry. Decoded records include their log positions.
 
 ```rust
 # use laser_sdk::prelude::*;
@@ -210,7 +214,9 @@ while let Some(next) = records.next().await {
 # Ok(()) }
 ```
 
-`laser.stream("commerce").topic("orders").schema::<Order>(id).await?` is the schema-bound form (feature `schema-codecs`, with the registry served by `laser-plane`): it resolves and compiles the registered writer schema once per handle, validates every body client-side, and stamps `agdx.ct` + `agdx.sid`, so a body that stops matching fails at the producer instead of downstream in the projector. A record that does not decode never wedges a reader: `records` yields `TypedDecodeError { position, source }` naming the exact log position and keeps going, and the reliable path composes instead of duplicating (decode inside an `Agent` handler, undecodable records ride the existing dead-letter policy).
+`laser.stream("commerce").topic("orders").schema::<Order>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by `laser-plane`. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication.
+
+The `records` reader reports `TypedDecodeError { position, source }` for a record that does not decode, then continues. An `Agent` handler can decode through the same API. Its existing dead-letter policy handles invalid records.
 
 ## Durable approval records
 
@@ -251,9 +257,9 @@ if let Some(decision) = decide(&intent, &[vote], now)? {
 
 Every primitive is an accessor on the connected client. The accessor is free and synchronous, IO happens at the terminal verb.
 
-Identity and delivery topology are separate types: `AgentId` is the logical protocol identity used for routing and attribution, `ConsumerGroupName` selects which Apache Iggy replicas share work, and `PrincipalId` is the authenticated server identity used at trust and RBAC boundaries. `Agent::builder` derives the default group spelling from the agent id, and `.consumer_group(..)` overrides deployment topology without changing logical identity.
+`AgentId` identifies an agent for routing and attribution. `ConsumerGroupName` selects the Apache Iggy consumer group that shares work. `PrincipalId` identifies the authenticated user for access decisions. `Agent::builder` derives the default group name from the agent ID. `.consumer_group(..)` changes the group without changing the agent identity.
 
-Live presence is connection-scoped, so one connection may advertise one agent. A second agent receives `LaserError::PresenceConflict` instead of overwriting the first. Claim-based capability routing remains available, while `Router::to_principal(..)` and `CapabilitySelector::principal(..)` require the selected live presence to match a server-authenticated `PrincipalId` and fail with `RoutePrincipalMismatch`. With a verifier enrolled, contract terminals accept only a valid signature from the route identity. `AgentMessage::verified_principal` records who actually answered, including every `ScatterReport` branch.
+One connection can advertise one agent. A second advertisement receives `LaserError::PresenceConflict`. `Router::to_principal(..)` and `CapabilitySelector::principal(..)` require live presence to match the authenticated `PrincipalId`. A mismatch returns `RoutePrincipalMismatch`. With a verifier, contract replies require a valid signature from the selected identity. `AgentMessage::verified_principal` records the responder, including each `ScatterReport` branch.
 
 | Accessor | Scope | Serves |
 | --- | --- | --- |
@@ -266,20 +272,22 @@ Live presence is connection-scoped, so one connection may advertise one agent. A
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |
 | `laser.memory(scope)` | agentic memory | remember / recall / improve / forget |
 | `laser.context(conversation)` | one conversation's working record | append, bounded fetch, prompt block, state folds |
-| `laser.sessions().create(id)` | one agent's session over a conversation | typed turns, model-ready context, scoped memory, checkpoint, `turns_at` / `turns_since`, `state_at` / `replay` folds |
+| `laser.sessions().create(id)` | one agent's conversation | typed turns, context for a model, scoped memory, saved offsets through `checkpoint`, reads through `turns_at` / `turns_since`, state through `state_at` / `replay` |
 | `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(name)` / `laser.runs()` | the fabric | directed asks, deadline-bound contracts, dependency-ordered workflows, the run registry |
 
-Lease acquisition on a connection-backed `Laser` uses a dedicated coordination connection. A bring-your-own `IggyClient` uses an explicit `FencedLeaseClient` with its own transport instead. A timed-out attempt actively retires that connection, and an ambiguous acquisition waits through its requested TTL before returning an error. A requested lease (or renewal) lifetime must fall in `MIN_LEASE_TTL_MICROS ..= MAX_LEASE_TTL_MICROS` (1s to 5min), rejected locally before the round trip. The store may grant less than the request and never grants more, so a holder needing longer renews. Exclusive workflows race renewal against contract completion, keep the lease through verification and the completion journal append, and release only after that record is durable.
+A lease gives one holder temporary permission to coordinate an operation. A connection-backed `Laser` acquires it through a dedicated coordination connection. An application-supplied `IggyClient` uses an explicit `FencedLeaseClient` with its own transport. A timed-out attempt retires that connection. If the outcome is unknown, the call waits through the requested lifetime before returning an error.
 
-`FencedLeaseClient` is generic over its `ManagedKvTransport`. When the transport is a runtime choice rather than a type-level one (a state-provider seam that cannot grow a type parameter), hold it as `SharedKvTransport` (`Arc<dyn DynManagedKvTransport>`): every `ManagedKvTransport` implements the object-safe trait, and the `Arc` implements `ManagedKvTransport` back, so `FencedLeaseClient::new` accepts it with the same envelope, retry, and decode behavior.
+Requested lifetimes must fall within `MIN_LEASE_TTL_MICROS ..= MAX_LEASE_TTL_MICROS`, from 1 second to 5 minutes. The SDK rejects other values before sending. The store can grant less time, but never more. A holder can renew before expiry. Exclusive workflows keep the lease through verification and the completion journal write. They release it after that record is durable.
 
-One connection addresses every stream. `connect_with_stream` optionally pins a default stream and `laser.topic(name)` is shorthand against it. Without a default stream, that shortcut returns the typed `NoStream` error. Iggy RBAC is enforced at the stream and topic level, so a permission miss surfaces as a typed error (`is_permission_denied()` / `is_stream_or_topic_not_found()`), never a silent wrong answer.
+`FencedLeaseClient` accepts a `ManagedKvTransport`. For a transport selected at runtime, use `SharedKvTransport`, which is `Arc<dyn DynManagedKvTransport>`. Each `ManagedKvTransport` implements the object-safe interface. The `Arc` also implements `ManagedKvTransport`. `FencedLeaseClient::new` therefore uses the same envelopes, retries, and decoding with either form.
 
-Every managed read model records the conversation that wrote each row (from the record's `gen_ai.conversation.id` header), so a read can narrow to one conversation server-side: `laser.query(index).conversation(id)`, `laser.graph(name).conversation(id).neighbors(..)`, and `laser.kv(ns).scan().conversation(id)` (and `.delete_many().conversation(id)`) over a memory-view namespace. It is a read-side narrowing over provenance, not a new isolation boundary, so a generic key-value entry that carries no conversation is left out of a conversation-filtered scan.
+One connection can address every stream that its user can access. `connect_with_stream` selects an optional default for `laser.topic(name)`. Without a default, this shortcut returns `NoStream`. Apache Iggy controls access to streams and topics. Use `is_permission_denied()` and `is_stream_or_topic_not_found()` to identify access failures.
+
+Managed read models can retain the originating conversation from `gen_ai.conversation.id`. Use `laser.query(index).conversation(id)` or `laser.graph(name).conversation(id).neighbors(..)` to narrow reads. A memory-view namespace also supports `laser.kv(ns).scan().conversation(id)` and `.delete_many().conversation(id)`. These filters use record metadata and do not create an access boundary. A key-value entry without conversation metadata is excluded from a conversation-filtered scan.
 
 ## The read ladder
 
-Reads are rungs, each buying more machinery for more cost. Take the lowest rung that answers your question.
+Choose the read API that provides the behavior your application needs.
 
 | Rung | Call | You get |
 | --- | --- | --- |
@@ -289,7 +297,7 @@ Reads are rungs, each buying more machinery for more cost. Take the lowest rung 
 | reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering |
 | query | `laser.query(index)` | the materialized read model: filters, aggregates, vector recall, consistency levels |
 
-Writes climb the same way: `topic.send(..)` is the raw zero-overhead append, `publish()` / `publish_batch()` are the typed fluent forms, and `topic.producer()` is the long-lived direct producer with batching, linger, retries, topology, and per-send routing. `topic.batching()` remains the governed size-and-time batcher for typed agent paths, `contract(..)` is a directed task, and `workflow(name)` is the dependency-ordered engine. Nothing on a higher rung hides the rungs below: Apache Iggy builders and client stay reachable for advanced configuration.
+Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` for typed builders. Use `topic.producer()` for a persistent producer with batching, retries, topology discovery, and routing. `topic.batching()` adds governed batches that flush by size or time. `contract(..)` sends a directed task, and `workflow(name)` runs steps in dependency order. Apache Iggy builders and the client remain available for detailed configuration.
 
 ## Features
 
@@ -298,19 +306,21 @@ Writes climb the same way: `topic.send(..)` is the raw zero-overhead append, `pu
 - `provenance`, wire contract + provenance encoding/decoding
 - `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
-- `managed`, the managed tier in one word: everything Laser Stack or LaserData Cloud serves over the command band, composing the granular `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch` features. Each is independently selectable when a program needs one surface without the rest. Open core stays the default: publish and consume use `streaming`, the agent runtime builds on it, and both run on Apache Iggy. Each managed surface lights up by capability negotiation, so the tiering is a deployment fact, not a build fork.
-- `kv`, an independently selectable managed key-value client (get/set/delete/scan, optional expiry, compare-and-swap via `.expect_version`/`.expect_absent().commit()`, single-transaction `copy_to`/`move_to`, and the one-round-trip `get_many` over the mixed-operation batch) over the `AGDX_KV` managed commands, backed by `laser-plane`
+- `managed` enables `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
+- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent().commit()`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
 - capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
 - `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)
 - `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
 - `agui`, AG-UI state sync and event rendering over the log
-- `sign`, ed25519 envelope signing and verification: `Agent::builder().signing_key(..)` signs pickup and terminal replies (including `respond_input`, so a verified `request_input` caller resumes only on that agent's decision), `Agent::builder().verifier(..)` dead-letters unsigned or unverified records before dispatch and binds the signature to the observed record headers at the broker-stamped record time, `LaserBuilder::verifier(..)` applies the same gate to every correlated reply wait (contracts, `request`/reply hub, `request_input`, bridge task lookups) and surfaces the verified principal, signed `quarantine`/`unquarantine` registry facts fold only under an operator key, detached-JWS A2A card signing over the JCS form (`A2aBridge::signed_card` / `sign::verify_card`), and the managed `KvKeyRegistry` (enroll, revoke, and snapshot versioned key records through the platform instead of a side file)
+- `sign` provides Ed25519 signing and verification. `Agent::builder().signing_key(..)` signs pickup and terminal replies, including `respond_input`. `Agent::builder().verifier(..)` rejects unsigned or invalid records before handling. `LaserBuilder::verifier(..)` applies the same requirement to correlated reply waits.
+
+Signatures bind observed headers and are evaluated at the server-recorded timestamp. Signed `quarantine` and `unquarantine` facts require operator keys. `A2aBridge::signed_card` and `sign::verify_card` support detached JWS over the canonical card. `KvKeyRegistry` stores versioned keys in the managed platform.
 
 ## Observability
 
-The SDK instruments its own verbs and runtime loops with `tracing` spans under the target `laser`: hot-path verbs (publish, consume polls, managed calls) at `debug` so a default `info` filter never taxes them, lifecycle (connect, agent spawn, workflow runs, contracts) at `info`. Span fields reuse the wire's provenance vocabulary (`conversation`, `correlation`, `agent`, `topic` / `index`, `operation`, and the command `code` on managed calls), so client spans join log-derived traces in a standard OpenTelemetry pipeline with no custom translation. The exact field-to-header mapping is pinned in the AGDX notes.
+The SDK creates `tracing` spans under the `laser` target. Publication, polls, and managed calls use `debug`. Connections, agent startup, workflows, and contracts use `info`. Fields include `conversation`, `correlation`, `agent`, `topic`, `index`, `operation`, and managed command `code`. The AGDX specification defines their mapping to record headers. An OpenTelemetry subscriber can connect client spans with traces derived from records.
 
-No exporter ships with the SDK: `tracing` is the seam and your subscriber bridges it, e.g. with `tracing-opentelemetry` (the wiring names crates the SDK does not depend on, so it is illustrative, not compiled):
+The SDK supplies spans through `tracing`. Your application supplies the subscriber and exporter. The following example uses `tracing-opentelemetry` to show the connection. It is illustrative and does not compile as part of this crate:
 
 ```rust,ignore
 use tracing_subscriber::layer::SubscriberExt;
@@ -323,11 +333,11 @@ tracing::subscriber::set_global_default(
 
 ## Prelude
 
-`use laser_sdk::prelude::*` imports the slim set: the accessors and the handful of types nearly every program names (~35 items). `use laser_sdk::prelude::full::*` adds the long tail (bridge types, seam traits, projection-control shapes, every memory knob) for an example or test that touches many surfaces. Application code reads best on the slim prelude plus explicit imports.
+`use laser_sdk::prelude::*` imports the common accessors and types, about 35 items. `use laser_sdk::prelude::full::*` also imports bridge types, extension traits, projection types, and memory configuration. Prefer the smaller set and explicit imports for application code.
 
 ## Documentation
 
-The full progressive tutorial (publish, projections, batches, heterogeneous topics, filters / aggregates / vector recall, codecs, user isolation, agentic runtime, open SDK vs managed deployment) lives in the project repository under `docs/tutorial.md`, linked from the [repository README](https://github.com/laserdata/laser-sdk#readme). API reference is on [docs.rs](https://docs.rs/laser-sdk). The AGDX protocol's home is [agdxprotocol.ai](https://agdxprotocol.ai).
+The [repository README](https://github.com/laserdata/laser-sdk#readme) links to `docs/tutorial.md`. The tutorial covers publication, projections, queries, batches, codecs, stream isolation, and agents. The API reference is on [docs.rs](https://docs.rs/laser-sdk). The protocol home is [agdxprotocol.ai](https://agdxprotocol.ai).
 
 ## License
 
@@ -337,4 +347,6 @@ Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of 
 
 ## Publish recovery
 
-Publish attempts default to 60 seconds with three retries and exponential backoff starting at 250 milliseconds. Configure timeout, retry count, and backoff through the client builder or connect options, or the shared `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS` environment variables. Retry exhaustion returns an error for the application to handle. See [publish recovery and outage handling](../docs/publish-recovery.md).
+Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
+
+See [publish recovery and outage handling](../docs/publish-recovery.md).

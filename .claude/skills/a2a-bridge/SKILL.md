@@ -7,7 +7,7 @@ description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`. The adapter (submit / t
 
 The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios.
 
-`a2a.rs` exposes internal agents to A2A-speaking clients over JSON-RPC, mapping the synchronous edge onto durable agent topics so tasks survive a bridge restart and stay replayable. The transport-agnostic adapter (`submit` / `task` / `cancel` / `card`) is behind `a2a-bridge` (serde only). The axum `router()`, the `A2aMethod` dispatch enum, and the JSON-RPC handlers are behind the additive `a2a-http` feature, so a caller can drive the bridge over any transport (or from Python) without compiling axum. Neither is in the default build. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first. Repo rules in [AGENTS.md](../../../AGENTS.md).
+`a2a.rs` maps A2A requests to durable AGDX records. `a2a-bridge` enables the transport-independent `submit`, `task`, `cancel`, and `card` adapter. `a2a-http` adds the axum `router()`, `A2aMethod`, and JSON-RPC handlers. Neither feature is enabled by default. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first and follow [AGENTS.md](../../../AGENTS.md).
 
 ## STOP and ask the user before
 
@@ -17,7 +17,7 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 ## Key symbols
 
 - `TaskState` (re-exported from `laser_wire::agent`, 9 states: submitted, working, input-required, completed, canceled, failed, rejected, auth-required, unknown, plus unknown-code passthrough), `Task`, `TaskStatus`, `Artifact`.
-- `A2aMethod` (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask` - the v1.0 PascalCase spellings. v1.0's `ListTasks` is not served, the bridge is stateless over the log and an unknown method answers the standard method-not-found) - the served methods as an enum with `Display`/`FromStr` (strum). Dispatch parses `request.method` into it, never match on bare method-name string literals. `SendStreamingMessage` maps to the same publish as `SendMessage` (streaming is consumed log-natively via `Laser::reassemble_channel`, not re-emitted as SSE).
+- `A2aMethod` (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask` - the v1.0 PascalCase spellings. V1.0's `ListTasks` is not served, the bridge is stateless over the log and an unknown method answers the standard method-not-found) - the served methods as an enum with `Display`/`FromStr` (strum). Dispatch parses `request.method` into it, never match on bare method-name string literals. `SendStreamingMessage` maps to the same publish as `SendMessage` (streaming is consumed log-natively via `Laser::reassemble_channel`, not re-emitted as SSE).
 - `JsonRpcRequest` / `JsonRpcResponse` / `JsonRpcError` - the 2.0 envelope. `JSONRPC_VERSION` and `APP_ERROR_CODE` are named consts, not literals.
 - `AgentCard` / `AgentCardCapabilities` - the bridge's discovery doc (name = `source`, version, methods, `streaming`).
 - `A2aBridge::new(laser, source, request_topic, reply_topic)` - rides the typed AGDX verbs (`Laser::agdx`), not raw `send_agent`:
@@ -31,8 +31,8 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 ## Rules specific to this area
 
 - The bridge owns no state: truth is the log. `submit`/`task` are pure functions over `Laser`, so the HTTP layer (`router`) is a thin shell and is testable by calling `submit`/`task` directly against Apache Iggy.
-- **Stream is not pinned.** A bridge (and every agent) runs on the stream of the `Laser` handed to it: pass `laser.with_stream(name)` (a cheap view sharing the one connection) to run on a non-default stream. Multi-stream topologies and per-stream Iggy RBAC are a `with_stream` (single credential) or separate-`connect` (per-credential) question, never an SDK limit. The reply wait uses the forward-advancing `AgentReplyReader` (`Laser::await_agdx_reply` for MCP's synchronous loop, `find_agdx_reply` for A2A's stateless `tasks/get`) - never a full re-scan from offset 0.
-- **External-edge authorization** (`sdk/src/edge_auth.rs`, behind `a2a-bridge`/`mcp-bridge`): `authorize_edge` applies the MCP-2025-11 model at the external edge: audience validation, step-up (`EdgeDenial::StepUp` + `WWW-Authenticate`), no token passthrough (the external token never rides the log). On-behalf-of delegation: `sign::verify_delegation` binds the `on_behalf_of` metadata claim to the signed envelope, and `laser_wire::authz::delegated_allow` intersects the agent's grants with the invoker's.
+- A bridge uses the stream selected by its `Laser` handle. Use `laser.with_stream(name)` to share one connection across stream-scoped views. Use separate connections for separate credentials. Reply reads use `AgentReplyReader`, `Laser::await_agdx_reply`, or `find_agdx_reply`. Avoid repeated full scans for an active reply wait.
+- `authorize_edge` in `sdk/src/edge_auth.rs` checks token audience and required scopes. `EdgeDenial::StepUp` reports additional scope through `WWW-Authenticate`. Do not forward external tokens to the log. `sign::verify_delegation` binds `on_behalf_of` to the signed envelope. `laser_wire::authz::delegated_allow` intersects agent and invoking-user grants.
 - Keep model calls and business logic out of the bridge. It only translates the protocol to topic sends and log replays.
 
 ## Testing

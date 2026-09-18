@@ -1,6 +1,6 @@
 # query - queries that already ran
 
-> A projection watches your topics and keeps an always-current table you can query - filter, aggregate, window, paginate, even search by meaning. Like a materialized view, except you never refresh it.
+A projector turns topic records into a queryable view. This example waits for projection, then reads orders that match a filter.
 
 ## What it shows
 

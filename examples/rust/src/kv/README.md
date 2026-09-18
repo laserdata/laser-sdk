@@ -1,15 +1,15 @@
 # kv - the State primitive
 
-A key-value store living next to your log: point reads, compare-and-set, TTLs. Forks give you git-like copies of your data. Branch it, try something, then promote it or throw it away.
+This example reads and writes key-value state. It also demonstrates conditional updates, revocable leases, and copy-on-write forks where the deployment supports them.
 
-Managed by `laser-plane` in Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean. Compare-and-swap, the fenced-lease contract, and forks are separately advertised capabilities, so each act runs only where the deployment serves it.
+This example requires `laser-plane` in Laser Stack or LaserData Cloud. Without it, the example explains the requirement and exits successfully. Conditional writes, fenced leases, and forks require their own reported capabilities.
 
 ## What it shows
 
 - Set a JSON value with a TTL: `laser.kv("profiles").set("user:42").json(&profile)?.ttl(..).send()`.
 - Read it back typed: `kv.get_typed::<Profile>("user:42")`.
-- Upgrade the same key under compare-and-swap: read the version with `kv.get_entry(..)`, then `set(..).expect_version(version).commit()`, so the write lands only if nobody moved first.
-- Hold a revocable lease as `worker-a` (`kv.lease(lease_key, holder, ttl)`), read behind its barrier with `kv.get_entry_at_least(key, lease.position)` so a fresh holder never plans against its predecessor's state, write under its fence with `kv.cas_fenced(key, fence_namespace, fence_key, lease.token).expect_version(version).commit()`, renew at the same fence, release, and see the released fence refused as `lease-lost` - the at-most-one-effective-writer gate.
+- Read its version with `kv.get_entry(..)`, then use `set(..).expect_version(version).commit()`. The write succeeds only if the version still matches.
+- Acquire a lease as `worker-a` through `kv.lease(lease_key, holder, ttl)`. Read with `kv.get_entry_at_least(key, lease.position)`. Write through `kv.cas_fenced(key, fence_namespace, fence_key, lease.token).expect_version(version).commit()`. Renew and release the lease, then make sure that the released token returns `lease-lost`.
 - Open a severed fork, write one speculative row with `put_row(..).field(..).send()`, and promote it, keeping the change.
 
 ## Run it

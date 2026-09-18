@@ -582,7 +582,6 @@ class ReliableWorker {
     detail: string
   ): Promise<void> {
     const { deadlineMicros, ...provenance } = message.provenance
-    void deadlineMicros
     await this.publishDeadLetter(
       {
         ...provenance,

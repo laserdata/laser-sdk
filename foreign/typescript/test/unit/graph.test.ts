@@ -93,7 +93,6 @@ void test("given_a_link_call_when_run_then_should_upsert_both_nodes_and_the_edge
 void test("given_a_stale_edge_when_relink_is_called_then_should_supersede_it_and_link_the_new_target", async () => {
   const alice = graphNodeEntity("customer", "alice")
   const ticket7 = graphNodeEntity("ticket", "7")
-  const ticket9 = graphNodeEntity("ticket", "9")
   const staleEdge: GraphEdge = graphEdgeRelate(alice, "opened", ticket7)
   const alreadyClosedEdge: GraphEdge = {
     ...graphEdgeRelate(alice, "opened", ticket7),
@@ -111,7 +110,6 @@ void test("given_a_stale_edge_when_relink_is_called_then_should_supersede_it_and
   assert.equal(transport.calls[0]?.code, GraphNeighborsCommand.code)
   assert.equal(transport.calls[1]?.code, GraphUpsertCommand.code)
   assert.equal(transport.calls[2]?.code, GraphUpsertCommand.code)
-  void ticket9
 })
 
 void test("given_an_already_matching_edge_when_relink_is_called_then_should_not_supersede_it", async () => {

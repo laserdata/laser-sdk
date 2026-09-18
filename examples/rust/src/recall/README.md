@@ -1,15 +1,15 @@
 # recall - the Memory primitive
 
-Four verbs: remember, recall, improve, forget. Every change is a message on your log, so durable memory is versioned and auditable by construction. The log-backed path recalls by recency. The vector and reranker paths add similarity ranking.
+This example records, retrieves, improves, and forgets memory items. Log-based memory reads recent records, while vector memory can rank them by similarity.
 
-Named `recall` (one of the four verbs), not `memory`, since that name is already the full deep-dive scenario next door. The accessor is still `laser.memory(..)`, connected the same as every other example. Runs with no Cloud deployment: `.folded()` reads the memory topic in process instead of the managed read view, so it works against plain Apache Iggy.
+The `recall` example covers the focused memory API. The larger `memory` example covers additional behavior. `laser.memory(..)` provides the handle. `.folded()` reads the topic locally, so this example works on Apache Iggy without a managed view.
 
 ## What it shows
 
 - `laser.memory("customer:42")` scopes a memory handle to a customer.
 - Remember a fact: `.remember(payload).scope(conversation).send()`, which returns the item's id.
-- Recall the newest facts under a limit: `.recall(conversation).recent().limit(5).folded().fetch()`. The full memory scenario shows true similarity ranking with the vector backend.
-- Reinforce then retire the same item: `improve(&scope, Feedback::new(id, 1.0))` and `forget(&scope, id)`. Both are records on the memory topic, so the store stays an auditable history rather than a mutable cell.
+- Use `.recall(conversation).recent().limit(5).folded().fetch()` to read recent facts. The larger memory example demonstrates vector similarity.
+- Use `improve(&scope, Feedback::new(id, 1.0))` to record feedback. Use `forget(&scope, id)` to record deletion. Both append records to the memory topic.
 
 ## Run it
 

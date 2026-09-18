@@ -1,24 +1,24 @@
 # Agent Data Exchange Protocol (AGDX)
 
-**Home: [agdxprotocol.ai](https://agdxprotocol.ai)**
+Home: [agdxprotocol.ai](https://agdxprotocol.ai)
 
-AGDX is a substrate-neutral specification of how autonomous agents, and the conventional subsystems they exchange data with, move data over a durable log. It is a **data platform for agentic systems on a durable log**. Ultra-low-latency streaming is the foundation, but data is more than messages in flight: it is also materialized views to query and mutable state to coordinate on. AGDX treats all of it, streaming plus materialized views plus working state, as one data-exchange contract over one connection, with a binding per substrate. Agents are the motivating participants and the agent envelope is a first-class part of the model, but the model treats an agent and a service as peers. Nothing in the materialized-view or working-state surfaces is agent-specific.
+AGDX defines how agents and services exchange data over a durable log. A substrate is the system that stores and transports records. The protocol separates the data contract from the substrate binding. A binding maps the contract to a specific system. Streaming records, queryable views, and working state share the contract and connection. Agents and conventional services use the same data operations.
 
-AGDX is the lower-level layer: the efficient on-log message and data contract that agents and services speak natively. The edge agent standards (A2A, MCP, AG-UI) are not competitors at this layer. They sit above it and bridge into AGDX when an external client needs one, so an internal participant only ever speaks to the log while external clients keep their own contracts. The mappings are the [edge interoperability guide](interop.md).
+AGDX defines the records and data operations used by agents and services. A2A, MCP, and AG-UI provide external interfaces through bridges. Internal participants continue to use the log, while external clients use their own protocols. The [edge interoperability guide](interop.md) describes these mappings.
 
-The document is in three parts and an appendix. **Part A** is the core, which names no server. **Part B** is the bindings, where Apache Iggy is the normative binding, Kafka is the portability proof, and HTTP is the management surface. **Part C** records the design rationale and the roadmap. The **appendix** records the SDK API-stability policy.
+Part A defines the core model. Part B defines bindings, including the normative Apache Iggy binding, a Kafka portability example, and HTTP management. Part C records design decisions and planned work. The appendix records the SDK API policy.
 
-The reader's test for the boundary: anything in Part A must be true on every substrate. Anything naming a header key, a command code, a byte order, or a frame layout belongs in Part B.
+Core requirements apply across substrates. Transport-specific header keys, command codes, byte order, and frame layouts belong to a binding.
 
 ## In brief
 
-AGDX is the wire protocol for agents and conventional services to exchange data over a durable log, on one connection. The log is the single source of truth, and everything else is a read model derived from it. Three surfaces share the connection:
+AGDX gives agents and services one connection for data exchange. The log stores the source records. Read models organize retained records for queries and state operations. Three groups of operations share the connection:
 
-- **Streaming** is the foundation: append typed records to topics, read them back by offset.
-- **Materialized views** are projections declared per topic, with a query DSL over them, like a database index.
-- **Working state** is a key-value store and copy-on-write forks, for coordination and speculative branches.
+- Streaming appends typed records to topics and reads them by offset.
+- Materialized views store projections of topic records for queries.
+- Working state provides key-value records and copy-on-write forks for coordination.
 
-Agent messaging (commands, responses, token streams, status, errors) rides the same log as a typed CBOR envelope (A9). The protocol is substrate-neutral: a thin binding maps it onto a concrete log, Apache Iggy today (B1), Kafka and others possible (B2), so the data model outlives any single substrate.
+Agent commands, responses, token streams, status, and errors use a typed CBOR envelope on the same log (A9). A binding maps the model to Apache Iggy (B1), Kafka, or another log (B2). The logical model does not depend on one substrate.
 
 ```
    edges      agents   .   services   .   edge bridges (A2A / MCP / AG-UI)
@@ -40,27 +40,25 @@ Agent messaging (commands, responses, token streams, status, errors) rides the s
                           Apache Iggy today, others possible
 ```
 
-Five layers, from the ground up: **substrate** (the log itself), **wire** (the typed portable contract), **platform** (publish, views, state), **fabric** (the agent envelope, runtime, coordination, and memory), **edges** (the A2A, MCP, and AG-UI bridges). Every layer is independently adoptable: stream on the substrate alone, pin a port to the wire contract, use the platform with no agent concepts, or run the fabric with no edge bridge.
+The substrate stores the log. The wire layer defines portable data types. The platform supplies streaming, views, and state. The fabric adds agent messages, coordination, and memory. Edges expose A2A, MCP, and AG-UI interfaces. An application can use each layer without adopting the layers above it.
 
-Read **Part A** for the substrate-neutral model, **Part B** for how it binds to a substrate, **Part C** for the rationale and roadmap.
+Read Part A for the common model, Part B for bindings, and Part C for design decisions and planned work.
 
 ## 0. Status and conventions
 
-This is a design and specification document, not a frozen release. The repository is pre-1.0 and breaking wire changes are allowed.
+This specification describes the current design. The repository is pre-1.0 and permits breaking changes. A contract change must update its implementations, specifications, and reference test data together.
 
-- The normative body specifies the protocol as it stands. **Roadmap** marks a proposal that is not yet part of the contract: a draft that may evolve or break, recorded so the design space is visible, and pinned into the fixture corpus only once settled.
+- The normative sections define the current protocol. Roadmap sections describe proposals that are not part of the contract. Add reference test data when a proposal becomes part of the contract.
 - Field tables give the logical type. The byte form is named-field CBOR (A2) unless a binding says otherwise.
-- Requirement words (must, must not, should, may) are normative.
+- Requirement words retain their defined force. Required behavior uses must or must not. Recommendations and permitted behavior remain distinct.
 - Component names appear in prose. File paths do not.
-- **Vendor-neutral and pinned for interoperability.** The specification names nothing after any implementor. Its wire contract uses the neutral `agdx` namespace: the header keys (`agdx.*`), pinned dictionaries, and signing domain are fixed so independent implementations interoperate. A binding explicitly identifies which operational names are pinned and which are deployment-configurable. Substrate product names (Apache Iggy, Kafka) appear in binding chapters because a binding targets a named substrate. Keys drawn from OpenTelemetry use the `gen_ai.` namespace verbatim.
-
----
+- The contract uses the `agdx` namespace for interoperable data. Bindings identify fixed names and names that deployments can configure. Apache Iggy and Kafka appear in binding chapters. OpenTelemetry keys retain the `gen_ai.` namespace.
 
 ---
 
 # Part A. The core (substrate-neutral)
 
-Nothing in Part A names a server, a header key, a command code, or a byte order. The core assumes only an abstract substrate: an append-only, partitioned, offset-addressed log with replay and keyed ordering, able to carry a small set of attributes alongside a message body, and offering either a request and reply mechanism or a topic pair to emulate one.
+Part A defines the shared data model. It assumes an append-only log with partitions, offsets, replay, and key-based ordering. Records carry attributes alongside their bodies. The substrate also provides request and reply operations or topic pairs that can implement them.
 
 ## A1. Overview
 
@@ -72,15 +70,15 @@ An implementation provides three things over one authenticated connection.
 2. A general data surface on that log: declared projections with a query DSL, a key-value store, and copy-on-write forks of the materialized read model.
 3. An optional agentic layer: a reliable runtime and a typed agent envelope on the streaming layer.
 
-These are not separate specifications. This document is one spec with one implementation. The agent envelope is the streaming layer's payload, not a protocol layered beside the data model, and there is one version story and one fixture corpus across the whole surface.
+The three groups of operations share one specification and implementation contract. The agent envelope is a streaming payload within that model. Reference test data covers the data types and their versions.
 
-The log is the source of truth. Queries, projections, key-value, and agent coordination are read models on top of it, never a second store kept in sync by hand.
+The log stores the source records. Projections, key-value state, and coordination derive from those records. Deployments manage the resulting read models.
 
-The stack has five named layers, and the names are part of the contract's vocabulary because an architecture users can say out loud is one they adopt piecemeal. **Substrate**: the durable, partitioned, replayable log (Apache Iggy under the normative binding). **Wire**: the typed, runtime-free contract (codes, envelopes, dictionaries, caps, the fixture corpus) that any language can implement. **Platform**: the general data surface, publish and consume, projections and query, key-value and forks. **Fabric**: the agentic layer, the envelope, the reliable runtime, coordination, and memory. **Edges**: the bridges that map external agent protocols (A2A, MCP, AG-UI) onto the fabric. Each layer is adoptable without the ones above it.
+The contract uses five layer names. Substrate means the durable log. Wire means the portable types, codes, envelopes, dictionaries, limits, and reference test data. Platform means streaming, projections, queries, key-value state, and forks. Fabric means agent envelopes, runtime behavior, coordination, and memory. Edges means the A2A, MCP, and AG-UI bridges.
 
 ### A1.2 The thesis: specify the data, bind the transport
 
-A wire that pins a frame layout and a connection handshake ages with the transport. A wire that pins a data model and its semantics survives, because the data is invariant when the substrate changes. So the specification splits into three layers, and only two are owned by the core.
+Transport details can change without changing the logical data model. The specification separates framing, attributes, and payloads. The substrate owns framing. The core defines the logical attributes and payloads.
 
 | Layer | Owner | Content |
 | --- | --- | --- |
@@ -88,11 +86,11 @@ A wire that pins a frame layout and a connection handshake ages with the transpo
 | 2. Out-of-band metadata | the core names which attributes, the binding says how they ride | the attributes a reader or router acts on without decoding the body |
 | 3. Payload | the core | the typed, versioned, named-field CBOR object or envelope, byte-identical everywhere |
 
-> **The assignment rule.** An attribute is carried out of band if and only if a reader or router must act on it without decoding the body. Everything else is payload. Each binding states where the out-of-band attributes physically land.
+> An attribute belongs outside the body only when a reader or router must act on it before decoding the body. Each binding defines where these attributes are stored.
 
 ### A1.3 The surfaces: a data platform on a log
 
-The log is the single source of truth, in the lakehouse sense, and every other surface is a read model derived from it, never a second store kept in sync. Three surfaces share one connection.
+The log stores source records. Views and working state derive from these records. Three groups of operations share one connection.
 
 | Surface | What it is | Nature |
 | --- | --- | --- |
@@ -100,40 +98,40 @@ The log is the single source of truth, in the lakehouse sense, and every other s
 | Materialized views | projections and the query DSL | read models declared per topic, queried like a database index |
 | Working state | key-value and copy-on-write forks | mutable state and speculative branches, addressed by key |
 
-Streaming is the foundation and the others build on it, but the model is deliberately broader than streaming. A system speaks AGDX to query a materialized view, to coordinate on shared state, or to branch it speculatively, not only to push and consume messages.
+Streaming records support the other operations. AGDX also lets a client query a view, coordinate through shared state, or create a branch of that state.
 
 ### A1.4 What the core does not specify
 
-The core carries no transport handshake, no flow-control window, no keepalive, and no multiplexing scheme. A log substrate already provides ordered delivery, retention, offsets, consumer groups, and back-pressure through the pull model, and the core must not duplicate any of it. This is the largest simplification over a transport-shaped protocol: the entire connection-management half lives in the substrate.
+The substrate owns connection negotiation, flow control, keepalive, and connection sharing. It also supplies ordering, retention, offsets, consumer groups, and pull-based backpressure. AGDX must not duplicate these mechanisms.
 
 ### A1.5 The streaming layer is a log, not a queue
 
-This is the most important boundary in the model, and it decides which message-broker ideas apply and which do not. The streaming core is the foundation. The materialized-view and working-state surfaces and the agentic layer are read models and conventions on top of it. A great many primitives from the queue and broker world look relevant and are not, because a log is a different shape from a queue.
+The streaming layer stores records for replay. Views, working state, and agent coordination derive from the log. Their behavior follows log offsets and retention.
 
-The log offers exactly two stream operations, both provided by the substrate: **append** a record (publish), and **read** a topic from an offset under a consumer group (consume). Reading is pull. A consumer polls at its own pace and back-pressure is the pull itself. There is no server push.
+The substrate provides two stream operations: append a record and read records from an offset. Consumers request records at their own pace. This pull model controls the incoming workload. The server does not push records to a consumer.
 
-From that, the delivery semantics follow and are not configurable.
+The protocol uses the following delivery rules:
 
-- Delivery is at-least-once with replay from any offset. Ordering is total within a partition. Agent records use the conversation id as their partition key, generic streaming uses the caller's selected partitioning.
-- **Acknowledgement is an offset commit**, the consumer's own bookkeeping, not a wire message. Commit after processing for at-least-once, and a reader resumes from its last committed offset.
-- **Exactly-once is a consumer-side property** (the business idempotency key plus the reliable consumer's processed-key store), never a mode negotiated with a broker.
-- **Dead-lettering is a runtime convention**: after retry exhaustion the reliable consumer publishes a capsule to a dead-letter topic. It exists because the log lets anyone publish anywhere, not because a broker manages a dead-letter queue.
+- Delivery is at least once, with replay by offset. Ordering is total within a partition. Agent records use the conversation ID as their partition key. Other records use the selected partitioning.
+- An acknowledgment stores the consumer offset. Commit after processing to retain at-least-once behavior. A restarted reader resumes from its stored offset.
+- Consumer deduplication tracks business keys to suppress repeats. The protocol does not guarantee exactly-once external effects.
+- After retry exhaustion, the runtime publishes a record to a dead-letter topic. The record describes the failure and source message.
 
-So the queue and broker primitives below have no place in the model. Each either does not map onto a log or names a need already met by offsets and replay.
+The following queue concepts either do not apply or use existing offset and replay operations:
 
 | Broker or queue primitive | Why it does not apply on a log |
 | --- | --- |
 | server-push delivery (a DELIVER verb) | the log is pull. Consumers poll and replay by offset |
-| ack and nack as settle verbs | acknowledgement is an offset commit, consumer-side. There is no negative-ack or requeue. A consumer simply does not advance its offset, or re-reads |
+| ack and nack as settle verbs | acknowledgement is an offset commit, consumer-side. There is no negative-ack or requeue. A consumer does not advance its offset, or re-reads |
 | delivery-mode negotiation (at-most / at-least / exactly-once) | the log is at-least-once with replay by construction. Exactly-once is consumer dedup, not a selectable mode |
 | redelivery count, visibility timeout, ack deadline | queue bookkeeping. On a log, retry is the reliable consumer's local policy over re-read offsets |
 | broker-managed dead-letter queue | dead-lettering is a runtime convention (a capsule on a DLQ topic), not a managed queue |
 | subscribe versus consume as two modes | one primitive: read a topic from an offset under a consumer group |
 | message priority | a log is ordered by offset within a partition, not reorderable by priority |
 
-Telemetry is likewise not a separate primitive set. Logs, metrics, traces, and events are records published to topics with OTel-aligned provenance headers, materialized by projections (the trace view is one such projection). The observability vocabulary is a convention over publish, not new operations.
+Logs, metrics, traces, and events can use ordinary topic records with OpenTelemetry-aligned metadata. Projections can organize those records into trace views. This convention adds no operation codes.
 
-The client SDK instruments its own verbs and runtime loops with spans (target `laser`, hot-path verbs at debug so a default info filter never taxes them, lifecycle at info), and the span fields are drawn from the same pinned vocabulary the wire carries. The mapping is fixed, so a standard OpenTelemetry pipeline joins client spans with log-derived traces without custom translation: the log is the trace, made operational.
+The SDK creates spans for its methods and runtime loops under the `laser` target. Frequent operations use `debug`, while lifecycle events use `info`. Span fields follow the same names as record metadata. This mapping lets an OpenTelemetry subscriber connect client spans with traces derived from records:
 
 | Span field | Header key | Envelope field |
 | --- | --- | --- |
@@ -144,21 +142,21 @@ The client SDK instruments its own verbs and runtime loops with spans (target `l
 | `operation` | (envelope-only, no header) | `AgentEnvelope.operation` (client verbs outside the envelope use the verb name: `publish`, `poll`, `send`, `ask`, `handle`, `contract`, `workflow`, `managed`) |
 | `code` | (managed calls only) | the command code of the managed operation |
 
-No exporter ships with the SDK. `tracing` is the seam and the deployment's subscriber bridges to OTel.
+The SDK exposes spans through `tracing`. The deployment supplies a subscriber that exports them to OpenTelemetry.
 
-One consequence matters for interoperability. The edge bridges (A2A, MCP, AG-UI, and the candidate ATP and LangChain-streaming bridges) depend only on these log primitives: publish, offset-replay consume, and request-and-reply correlation. An edge protocol's settlement and reconnection concepts map onto offsets (a streaming client resumes from an offset, a task reply is matched by correlation), so interoperability is preserved without importing any queue semantics. The [edge interoperability guide](interop.md) covers the mappings.
+A2A, MCP, and AG-UI bridges use publication, offset replay, and reply correlation. Candidate ATP and LangChain-streaming bridges use the same model. A stream resumes by offset, and a task reply matches its correlation ID. The [edge interoperability guide](interop.md) describes these mappings.
 
-Scoped to those external bridges only, the MCP and A2A edge applies the MCP-2025-11 authorization model: audience validation (a token is accepted only when minted for this server), no token passthrough (an inbound token is never forwarded to the log or an upstream), and step-up (a `403` naming the required scope when the caller is short one). The internal log path is unchanged, it authenticates on the server-stamped identity (B1.4).
+The MCP and A2A edges apply the MCP-2025-11 authorization model. They accept only tokens issued for their audience. They do not forward incoming tokens to the log or upstream services. When a caller lacks a scope, the edge returns `403` and identifies the required scope. Internal log access uses the authenticated identity supplied by the server (B1.4).
 
 ## A2. Encoding rules
 
-- **One encoding.** Every payload is named-field CBOR (RFC 8949), serialized through a single entry point so no surface drifts to a different encoding.
-- **Declaration order, absent optionals skipped.** An unused optional field costs zero bytes. Unknown fields are ignored on decode, so every future field is additive and free.
-- **No silent skip.** A payload is exactly one CBOR item. Trailing bytes are a decode error. Decoding must fail on corrupt or wrong-typed known data, and only fields foreign to the schema may be ignored.
-- **Machine ids** ride as fixed-width 16-byte CBOR byte strings, not bignum-tagged integers, so a port needs only a byte-string reader.
-- **Signing input is canonical by this encoding.** The envelope signature (A9.5) covers the domain separator `agdx.signature.v1`, the encoded `SignatureContext` when the signer binds one, then this same named-field encoding of the envelope with the signature field cleared. Because the encoding is deterministic (declaration order, absent optionals skipped), a decode-then-re-encode is byte-identical, so a verifier reconstructs the exact signing input. This round-trip property is pinned by fixtures.
+- Every payload uses named-field CBOR (RFC 8949). One encoding entry point keeps the format consistent.
+- Encode fields in declaration order. Omit unused optional fields. Decoders can ignore unknown fields when the contract permits it.
+- A payload must contain exactly one CBOR item. Reject trailing bytes and malformed known fields. Ignore only fields that the contract permits readers to ignore.
+- Encode machine IDs as fixed-width 16-byte CBOR byte strings. Do not encode them as tagged large integers.
+- Signing input starts with `agdx.signature.v1`, then an encoded `SignatureContext` when present, then the envelope with its signature cleared (A9.5). Declaration order and omitted optional fields make this encoding deterministic. Reference test data fixes the expected signing bytes.
 
-How a message frame is delimited and how a managed request and reply is carried are binding concerns (B1.4), not core.
+Each binding defines message boundaries and request-reply transport (B1.4).
 
 ## A3. The data object and identity
 
@@ -181,7 +179,7 @@ Id types:
 | agent id | bounded UTF-8 name, non-empty, at most 256 bytes, no ASCII control characters | a named principal (A2A name or URL, MCP server name, OTel agent id) |
 | idempotency key | non-empty UTF-8, at most 64 bytes | a readable business key |
 
-A record id is portable in a way a log position is not. A re-publish into another partition or a disaster-recovery cluster keeps the record id and gets a fresh position.
+A record ID remains stable when a record moves to another partition or recovery cluster. Its log position changes.
 
 ## A4. The out-of-band attribute set
 
@@ -198,7 +196,9 @@ The core defines which attributes must be carriable out of band and what they me
 
 ### A4.1 Trusted versus advisory fields
 
-Out-of-band fields split into two classes, and the split is load-bearing for anyone who wants to bill, meter, or audit on them. A **trusted** field is one a receiver can act on because something verifies it. An **advisory** field is a self-asserted hint any topic writer can stamp: useful for display and correlation, never a basis for billing or an access decision on its own. The table names, per field, its carrier, who can write it, what verifies it, and whether it is safe to bill or audit on. A deployment selects one of the security profiles in B1.1. A verified principal signature can establish authorship on a shared topic. An ACL-bound write-exclusive topic establishes it through topology. Unsigned records on a shared topic remain advisory.
+An out-of-band field is an attribute stored outside the body. A trusted field has evidence that establishes its claim. An advisory field is a claim supplied by a writer. It can help display or correlate records, but cannot establish access rights or billing facts alone.
+
+A deployment selects a security profile from B1.1. A valid principal signature can establish authorship on a shared topic. Exclusive write access can establish authorship through topic permissions. Unsigned records on a shared topic remain advisory. The table identifies the evidence for each field:
 
 | Field | Carrier | Who can write it | What verifies it | Bill or audit on it |
 | --- | --- | --- | --- | --- |
@@ -214,7 +214,7 @@ Out-of-band fields split into two classes, and the split is load-bearing for any
 
 ## A5. The operation registry
 
-Operation **identity and semantics** are core. Operation **encoding** is binding-owned. The core registry names each operation and fixes its meaning. A binding maps the name to its own dispatch. This generalizes the content-type dictionary pattern (a logical variant with a per-wire code) from content types to operations.
+The core registry names operations and defines their meaning. Each binding maps those names to its dispatch mechanism.
 
 | Op id | Surface | Semantics | Status |
 | --- | --- | --- | --- |
@@ -244,15 +244,15 @@ Operation **identity and semantics** are core. Operation **encoding** is binding
 | `agent.submit` / `cancel` / `status` / `list` | coordination | the run registry: submit records intent and mints the run identity (content-addressed, so a retried submit converges), delivery stays the envelope the SDK publishes, transitions are folded from the status records a registered run stamps with the `run` metadata key (A9.6), cancel records an intent flag the engine observes at a step boundary. `submit` MAY carry a multi-dimensional `RunBudget` (events, model calls, tool calls, patches, recursion depth, wall-clock, cost) the run fold accumulates, failing the run when a cap is crossed. It is a governance governor, not a grant. A managed read model over the log, never a second source of truth |  |
 | change feed (no request op) | views | change notification over the read model: a projection binding opts in with `notify`, the projector publishes one change record per committed batch on the changes channel (A11.8, B1.1), and a consumer reads it by offset like any topic. Gated by the `watch` feature bit (A12), it adds no request op, so there is no `watch`/`unwatch` verb to register |  |
 
-The four-verb agentic-memory API (`remember` / `recall` / `improve` / `forget`) is **not** a registry operation: it is an SDK facade that composes `publish`, `query`, and the `graph` ops above (A13), so it adds no wire op of its own.
+The memory API uses `remember`, `recall`, `improve`, and `forget`. These SDK methods combine `publish`, `query`, and `graph` operations (A13). They do not add wire operation codes.
 
-The streaming layer does not use the registry. Its operations are the two substrate stream operations (append and offset-replay consume, A1.5) plus, for the agentic layer, the six agent-envelope kinds (A9), dispatched by the typed envelope rather than by a code. There is no subscribe, consume-mode, ack, nack, or deliver operation, because the log is not a queue (A1.5).
+Streaming uses substrate append and offset-read operations (A1.5). Agent messages also use six envelope kinds (A9). The envelope identifies the message kind. The registry adds no subscribe, consume-mode, ack, nack, or deliver operation.
 
 ## A6. Dictionaries (pinned codes)
 
-All code dictionaries are pinned small integers, permanent, never renumbered. An unknown code decodes to a pass-through unrecognized value rather than failing, so a new entry is additive.
+Code dictionaries use fixed small integers. Existing codes must not be renumbered. An unknown code decodes to a value that preserves the original number for forwarding.
 
-**Content-type**:
+Content-type:
 
 ```
 raw=0  json=1  msgpack=2  cbor=3  bson=4  avro=5  protobuf=6  arrow=7  ref=8  any=255
@@ -260,7 +260,7 @@ raw=0  json=1  msgpack=2  cbor=3  bson=4  avro=5  protobuf=6  arrow=7  ref=8  an
 
 `ref` marks the body as a claim-check capsule (A9.5). `any` is a best-effort sentinel.
 
-**Task state**, the agentic lifecycle, A2A-aligned:
+Task state, the agentic lifecycle, A2A-aligned:
 
 ```
 submitted=1  working=2  input-required=3  completed=4  canceled=5
@@ -269,30 +269,30 @@ failed=6  rejected=7  auth-required=8  unknown=9
 
 Terminal set: completed, canceled, failed, rejected.
 
-**Agentic error code**, the `error` body discriminator:
+Agentic error code, the `error` body discriminator:
 
 ```
 invalid_request=1  unauthorized=2  unsupported=3  deadline_exceeded=4
 cancelled=5  tool_failure=6  internal=7
 ```
 
-**Dead-letter reason**:
+Dead-letter reason:
 
 ```
 retry_exhausted=1  rejected=2  decode_failed=3  deadline_exceeded=4
 ```
 
-**Consistency level.** A query carries one of three shipped levels as the snake-case string the `Consistency` enum serializes to:
+A query selects a `Consistency` level. The enum uses these snake-case strings:
 
 ```
 eventual  read_your_writes  strong
 ```
 
-`eventual` is the default and omitted on the wire. `bounded_staleness` and `linearizable` are reserved for a future revision and not yet defined. Rule: a substrate that cannot satisfy the requested level must fail with a `stale` (or unsupported) result, never serve a weaker guarantee.
+`eventual` is the default and is omitted from the encoded request. `bounded_staleness` and `linearizable` are reserved names without defined behavior. If a substrate cannot satisfy the requested level, it must return `stale` or unsupported. It must not return a weaker guarantee as success.
 
 ## A7. The unified result-code space
 
-One logical result code spans every managed surface (query, key-value, fork, browse). Each surface keeps its own typed error for the detail a caller needs, and every one of those errors also projects onto one `ResultCode`, so a generic client, the HTTP status mapper, and a cross-language port all dispatch on one small dictionary instead of parsing per-surface strings. The codes and the HTTP status each maps to are a pinned cross-repo contract.
+`ResultCode` classifies outcomes across managed operations. Each operation group also defines errors with more specific details. A client can use the shared code without parsing error text. The numeric codes and their HTTP mappings form a shared contract.
 
 | Code | Numeric | HTTP | Meaning |
 | --- | --- | --- | --- |
@@ -316,32 +316,32 @@ One logical result code spans every managed surface (query, key-value, fork, bro
 | stale_generation | 17 | 409 | the requested destination or backend generation is no longer current |
 | target_unavailable | 18 | 503 | the resolved target is not ready to serve the request |
 
-An unknown code from a newer peer rides through as `unrecognized(code)` and re-encodes byte-for-byte, the same forward-compat shape the growable u8 dictionaries use, so an old build relays it rather than failing. Each binding maps the logical code to its own carriage (the HTTP binding to a status, B4).
+An unknown result code decodes as `unrecognized(code)` and retains its original bytes when re-encoded. Each binding defines how to carry the logical result. HTTP uses the status mapping in B4.
 
-A `CommandError` of `{ code, message }` is the surface-agnostic reply for a command code a server does not handle. Each managed surface has its own typed reply, so a server that receives an unhandled or unsupported code (a forwarded compare-and-swap on a build without it, or any future additive code) has no single surface to answer in, and a wrong-surface error fails to decode in a client awaiting a different reply. The server answers such a code with a `CommandError`, and a client that cannot decode the surface's typed reply decodes `CommandError` next, turning the reply into a typed code instead of an opaque transport failure. The two shapes are disjoint, so the fallback decode never misfires on a real reply.
+`CommandError` contains `{ code, message }`. A server uses it when it does not handle a command and cannot select a reply type for that operation. The client first attempts to decode the expected reply. If that fails, it attempts `CommandError` and returns the typed result. These formats are distinct, so the fallback does not reinterpret a valid reply.
 
-The key-value, fork, and agent-workflow error enums carry a dormant `NotLeader` variant: a clustered deployment's node that does not own an operation's mutation ordering declines the conditional write with it, the SDK classifies it as retryable and as `not_leader`, and the caller re-resolves the owner and retries. It is appended at each enum's tail and **no server emits it yet**: an externally tagged serde enum is not forward compatible for readers, so emission waits for a coordinated SDK-first rollout gated by a capability, never a silent server-side switch-on.
+The key-value, fork, and agent-workflow error enums define `NotLeader`. The SDK marks this error as retryable and `not_leader`. A caller can find the current owner and retry. Servers do not yet emit this variant. Its externally tagged encoding needs a coordinated rollout and capability selection before servers start emitting it.
 
 ## A8. Versioning, causality, idempotency, expiry, consistency
 
-- **Versioning** is out of band by necessity for a durable record: a reader selects its decoder before reading the body, so the wire version is an out-of-band attribute (A4), never a body field. The managed surfaces additionally negotiate version at connect (A12) and fail fast before a round trip. Per-message strict handling beyond a whole-version bump rides the agent envelope's must-understand marker (A9.1).
-- **Causality** rides a portable parent record id plus an optional log-position locator (A9.1). A cross-region happens-before token is a roadmap proposal (C3).
-- **Idempotency** is the business key (A3), scoped to the authenticated identity so one peer cannot replay or suppress another's operation.
-- **Expiry** is an absolute epoch-microsecond time. An expired object reads as absent.
-- **Consistency** is a per-query `Consistency` level (`eventual`, `read_your_writes`, `strong`), fail-not-downgrade: a level that cannot be met returns a `stale` result rather than silently serving older data (A11.3, A11.4).
-- **Fencing** is the at-most-one-effective-writer guarantee for an exclusive effect. The producer holds a strictly-monotonic per-task fence (the lease grant returns it, A10.3), and carries it out of band (the fence token, A4). An effect that lands in the key-value store is gated by the fenced compare-and-swap (A10.3), and an effect that lands on the log is gated consumer-side: a record whose fence is below the highest the consumer has accepted for the task is a stale-holder replay and is dropped, ordered before idempotency dedup so it cannot consume the legitimate retry's slot.
+- A durable record carries its wire version outside the body so a reader can choose a decoder first (A4). Managed operations also negotiate versions during connection setup (A12). The agent envelope can require individual features through its must-understand marker (A9.1).
+- A causal link identifies a parent record and can include its log position (A9.1). A token for ordering events across regions remains a proposal (C3).
+- Idempotency makes a repeated operation produce no extra effect. Its business key (A3) is scoped to the authenticated identity.
+- Expiry is an absolute epoch-microsecond time. An expired object reads as absent.
+- A query selects `eventual`, `read_your_writes`, or `strong` through `Consistency`. If the requested level cannot be met, return `stale` rather than a weaker result (A11.3, A11.4).
+- A fence is an increasing token that identifies the current holder. The lease grant supplies a per-task fence (A10.3), carried outside the body (A4). Fenced compare-and-swap protects key-value effects. Consumers reject log records with a fence below the highest accepted token for the task. Apply this rule before duplicate suppression.
 
 Wire compatibility rules for the named-field CBOR encoding:
 
-- **Additive struct fields are compatible.** An unknown named field is ignored on decode, and an absent optional field is the default, so a new optional field is free and needs no version bump. The corollary is a hazard: an additive field whose meaning is "serve differently" (the `consistency` level is the example) is silently ignored by a peer that predates it, which then serves the old behavior and reports success. So a feature carried as an additive field must be capability-gated, and the client must refuse the level a peer does not advertise rather than let the field be silently dropped (A12).
-- **Enum variant additions are not compatible in general.** Externally tagged decode fails on an unknown variant, so adding a variant a peer could receive unsolicited requires bumping that surface's op version. The exception is a variant only ever emitted in reply to a request a peer opts into: an old peer that never makes the request never receives the variant, so it is additive without a bump. The `query.stale`, `kv.committed`, and `kv.version-conflict` outcomes are this case (only a peer that sent a consistency query or a compare-and-swap sees them), which is why those shipped without a query/kv op-version bump.
-- **Pinned u8 dictionaries are exempt from the enum rule** (content-type, task-state, the error and dead-letter codes). A raw u8 always decodes, an unknown code passes through as unrecognized, and codes are permanent and never renumbered, so a new code is additive.
+- Decoders can ignore unknown fields and use defaults for absent optional fields. Optional additions are safe only when ignoring them preserves the requested behavior. If a field changes service behavior, require a reported capability before using it (A12). This rule applies to requested `consistency`.
+- An externally tagged enum rejects unknown variants. If a server can send a new variant without an explicit request, change that operation group version. A reply variant requested only by clients that support it does not reach older clients. `query.stale`, `kv.committed`, and `kv.version-conflict` use this request-specific form.
+- The u8 dictionaries preserve unknown values. Existing content-type, task-state, error, and dead-letter codes must not change. Added codes retain their numeric value when forwarded.
 
 ## A9. The streaming layer: the agent envelope
 
-One CBOR named-field envelope per agent message. It is the streaming layer's typed payload within this one spec, not a separate protocol. The wire version is carried out of band (A4), at version 1.
+Each agent message contains one named-field CBOR envelope. It is a streaming payload in the shared data model. Its version is 1 and is carried outside the body (A4).
 
-**An example.** A `command` asking a tool to run, and the `response` that answers it. The wire form is CBOR, and the opaque ids are 16-byte values shown here in their base32 display form:
+This example pairs a `command` with its `response`. The encoded form is CBOR. The example displays 16-byte IDs in base32:
 
 ```
 command {
@@ -366,7 +366,7 @@ response {
 }
 ```
 
-A streamed answer instead of a single `response` is a run of `chunk` records sharing a `channel`, ordered by `sequence`, ended by `last = true` (A9.4). Absent optional fields cost zero bytes (A2), so a real envelope carries only what it needs.
+A streamed answer contains `chunk` records with the same `channel`. Their `sequence` values define order. `last = true` ends the stream (A9.4). Unused optional fields are omitted (A2).
 
 ### A9.1 Envelope fields
 
@@ -397,7 +397,7 @@ A streamed answer instead of a single `response` is a run of `chunk` records sha
 
 ### A9.2 The per-kind validity matrix
 
-R required, O optional, X invalid. Enforced at three layers: the wire validate function, the SDK constructors, and receivers. Pinned by positive and negative fixtures.
+R means required, O means optional, and X means invalid. Wire validation, SDK constructors, and receivers enforce the matrix. Positive and negative reference cases cover it.
 
 | Field | command | response | event | chunk | status | error |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -418,35 +418,43 @@ R required, O optional, X invalid. Enforced at three layers: the wire validate f
 | `body` | R | R | R | R (empty only with `last`) | O | R |
 | `signature` | O | O | O | O | O | O |
 
-The command and event boundary is the correlation rule: a message expecting a reply or effect is a `command` and requires `correlation`, a message expecting nothing is an `event`. Fire-and-forget commands do not exist.
+A `command` expects a reply or effect and requires `correlation`. An `event` does not expect a reply. Commands cannot omit correlation to request fire-and-forget behavior.
 
 ### A9.3 Closed sub-vocabularies
 
-- `status` discriminator (`operation`): `task` (A2A lifecycle, requires `correlation` and `task_state`), `card` (liveness and capability), `progress` (advisory ticks), `quarantine` (an operator marks an agent out of routing, body is the quarantined agent id, authorized by the registry topic's write access control), `unquarantine` (an operator lifts a prior quarantine, body is the agent id, same authorization, so quarantine is not a one-way door only retention expiry undoes).
+- A `status` uses `operation` to select `task`, `card`, `progress`, `quarantine`, or `unquarantine`. `task` requires `correlation` and `task_state`. `card` reports liveness and capabilities, and `progress` reports advisory progress. `quarantine` excludes the agent named in its body from routing. `unquarantine` restores that agent. Registry-topic write permissions control both operations.
 - Chunk-stream purpose (`operation` on `sequence = 0`, required there, invalid after): `chat`, `reasoning`, `tool_args`.
 - State sync convention (an `event`, never a new kind): `operation = state_snapshot` (body is the full state) or `state_delta` (body is an RFC 6902 JSON Patch).
 
 ### A9.4 Streaming and reassembly
 
-A stream is `chunk` messages sharing a `channel`, ordered by `sequence` within one conversation partition, terminated by `last = true` (with `finish_reason`) or by an `error` carrying the channel. Offsets are the resume primitive. Reassembly is mechanical and every port mirrors it:
+A stream contains `chunk` records with the same `channel`, ordered by `sequence` in one conversation partition. It ends with `last = true` and `finish_reason`, or an `error` that names the channel. Readers resume by offset. Every implementation follows these assembly rules:
 
-- chunks apply in `sequence` order from 0, each exactly once,
-- a duplicate sequence is dropped and counted,
-- a gap ends the stream with a reader-local synthetic terminal (`finish_reason = "gap"`),
-- everything after a terminal is dropped and counted, the first terminal wins,
-- the opening chunk carries the purpose and the abandonment deadline,
-- whole-stream `usage` rides once, on the terminal chunk.
+- Apply chunks in `sequence` order from 0, once per sequence.
+- Drop duplicate sequences and count them.
+- On a sequence gap, end the local stream with `finish_reason = "gap"`.
+- Drop and count records after the first terminal record.
+- Require the opening chunk to carry the purpose and abandonment deadline.
+- Carry whole-stream `usage` once, on the terminal chunk.
 
-The synthetic finish reasons (`abandoned`, `gap`) are reader-local and never appear on the log. Replay always sees the raw truth.
+The reader creates `abandoned` and `gap` locally. They do not appear on the log. Replay returns the original records.
 
 ### A9.5 Capsules (all CBOR, all fixtured)
 
-- **BodyRef** (content-type `ref`): a claim-check naming where the content lives. Fields: `reference` (a URI, object key, or KV key, non-empty, at most 1024 bytes), `size_bytes`, `sha256` (exactly 32 bytes), and a dormant `encryption` scheme code (absent means plaintext). A consumer verifies the fetched bytes against the digest without trusting the store.
-- **Dead-letter capsule**: `source` (the poison message's log position), `reason` (the dead-letter dictionary), `attempts`, optional `detail`, and `payload` (the original encoded envelope verbatim, for trivially correct redrive).
-- **AgentCard** (the `card` status body): optional `name`, optional `version`, a capped `capabilities` list (at most 64) of structured capability descriptors, optional `ttl_micros`. A card older than its TTL means a dead agent. Each capability descriptor names a `skill_id` (capped like every vocabulary string) and carries optional input/output content shape (a `ContentRef` naming either a content-type code or a registered schema id), optional advisory cost and latency classes, an optional max concurrency, an optional health (the pinned `healthy` / `degraded` / `unavailable` dictionary, unknown codes passing through like `TaskState`), and an optional load (per-mille of advertised capacity).
-- **AgentPresence** (the live presence body, carried in the connection-metadata channel of the binding, not in an envelope): `v` (the body version, carried in-band because the metadata channel has no out-of-band version header), `agent` (which agent this connection is, the link from a connection to its card), and an optional `inbox` (the topic this agent currently consumes its work on, within the stream its connection is scoped to). It is the live counterpart to the durable card: it vanishes on disconnect and answers where to send agent work right now. Presence is connection-scoped and singular: a client MUST NOT advertise a second agent on the same connection, and an SDK rejects that attempt rather than overwriting the first claim. A registry retains the connection's server-authenticated principal beside the presence. Claim routes may resolve by agent alone. Principal-bound routes MUST match that retained principal and fail closed on a missing or foreign binding. An absent inbox is liveness-only presence, and a target with no inbox is a routing failure surfaced to the caller, never silently rerouted.
-- **FoldSnapshot**: a periodic snapshot of a client-side fold (the conversation, a workflow journal) so replay resumes from the tail rather than offset zero. Fields: `conversation` (the fold this snapshots), `as_of` (a per-partition map of the last offset folded, inclusive), and `state` (the opaque folded bytes, the producer's codec). Resume seeds the cursor at `offset + 1` per partition, because the cursor takes the next offset to read while the snapshot records the last folded. It rides as a body under the existing content type, so A6 is unchanged. It bounds the conversation and the journal folds, not the registry (an incremental time-to-live-evicting fold over `AgentCard`/`AgentPresence`, above).
-- **Signature** (active, the optional `signature` envelope field A9.1): `scheme` (Ed25519 = 1), `key_id` (8 bytes), `bytes` (64 bytes), and an optional `context` (a `SignatureContext` of `content_type`/`agent_version`). The signing input is domain-separated by the fixed spec constant `agdx.signature.v1`, followed by the encoded `context` when present, then the canonical envelope encoding with the signature field absent. Binding the `context` covers the out-of-band interpretation attributes (`agdx.ct`/`agdx.av`), so an intermediary cannot flip the codec or decoder on a signed record without invalidating it. A context-less signature reproduces the pre-context preimage and stays byte-identical. The constant is one agreed value for the whole spec, so signatures verify across parties. No crypto enters the wire crate, verification is SDK-side against a per-agent key registry. The key is enrolled bound to the authenticated principal (the server-stamped identity), not the self-asserted `source`, so a verified signature proves the enrolled principal signed. When a verifier is enrolled, an unsigned terminal, unknown key, bad signature, or signer other than the bound identity MUST NOT resolve any correlated wait: the contract, the request/reply hub, the interrupt resume (`request_input`), and a bridge's task lookup all apply the same gate, so a peer that can read a reply topic cannot forge a terminal on any of them. Verification binds the observed record headers (`agdx.ct`/`agdx.av`) against the signed context and evaluates the key's validity window at the broker-stamped record time, so replaying history judges each key as of when the record landed. Principal-bound routes use the same server-authenticated principal for discovery and reply verification. Accepted contract and fan-out results expose the verified principal. Absence means no verifier was configured, never that verification failed. A key carries a kind (agent vs operator) and a validity window: a privileged control fact (quarantine/unquarantine) folds only when signed by an operator key valid at fold time, and the fold dedups by record id so a captured fact republished verbatim is dropped.
+- `BodyRef` with content-type `ref` points to external content. `reference` is a non-empty URI, object key, or KV key of at most 1024 bytes. The fields also include `size_bytes`, a 32-byte `sha256`, and optional `encryption`. Absent `encryption` means plaintext. After fetching, the consumer must compare the content with its digest.
+- A dead-letter capsule includes the source log position, `reason`, `attempts`, optional `detail`, and `payload`. The payload preserves the original encoded envelope for redrive.
+- `AgentCard` is the body of a `card` status. It has optional `name`, `version`, and `ttl_micros`, plus at most 64 capability descriptors. A card past its lifetime no longer proves liveness. Each descriptor names a bounded `skill_id` and can include input or output `ContentRef` values. It can also include advisory cost, latency, concurrency, health, and load. Load uses per-mille capacity, and health preserves unknown codes alongside `healthy`, `degraded`, and `unavailable`.
+- `AgentPresence` uses the binding connection-metadata channel. Its fields are `v`, `agent`, and optional `inbox`. The body carries its own version because this channel has no separate version header. The inbox names the current work topic in the relevant stream. Presence disappears on disconnect.
+
+A client must not advertise a second agent on the same connection. The SDK rejects the attempt without replacing the first identity. The registry keeps the authenticated principal with each presence record. Principal-bound routing must match that principal and reject missing or foreign identities. Without an inbox, presence proves only liveness. A target without an inbox produces a routing error.
+- `FoldSnapshot` saves the result of reading records into client-side state. It contains `conversation`, inclusive per-partition `as_of` offsets, and encoded `state`. Resume each partition at its saved offset plus 1. The snapshot uses an existing content type, so A6 is unchanged. It bounds conversation and workflow replay. Registry state instead uses incremental `AgentCard` and `AgentPresence` updates with expiry.
+- `Signature` is the optional envelope signature (A9.1). Its fields are `scheme` (Ed25519 = 1), an 8-byte `key_id`, 64-byte `bytes`, and optional `context`. `SignatureContext` contains `content_type` and `agent_version`. Signing input is `agdx.signature.v1`, the encoded context when present, and the canonical envelope with its signature absent.
+
+A signed context binds `agdx.ct` and `agdx.av` to the envelope. Changing either observed header invalidates that signature. A signature without context uses the context-free input. The wire crate defines the data, while SDK code performs cryptographic checks. Keys bind to an authenticated principal rather than the claimed `source`.
+
+When a verifier is configured, an unsigned reply, unknown key, invalid signature, or wrong signer must not resolve a correlated wait. Contracts, the reply dispatcher, `request_input`, and bridge task reads use this rule. They compare observed headers with the signed context and evaluate key validity at the server-recorded timestamp. Principal-bound routes use the authenticated principal for both discovery and reply checks. Accepted contract and fan-out results report that principal. An absent principal means no verifier was configured, not a failed check.
+
+Keys have an agent or operator kind and a validity window. Quarantine and unquarantine facts require an operator key valid when the registry applies them. The registry ignores repeated record IDs so replay cannot apply the same control fact twice.
 
 ### A9.6 Pinned metadata keys
 
@@ -461,7 +469,7 @@ The synthetic finish reasons (`abandoned`, `gap`) are reader-local and never app
 | `task_context` | string | the task this operation serves. Advisory unless signed |
 | `session_intent` | string | the session's declared intent. Advisory unless signed |
 
-An enveloped message MAY carry the fence token (A4, A8) as a pinned `agdx.fence` metadata key instead of the binding header, exactly one carrier per message (the single-place rule, B1.2).
+An envelope can carry the fence token through `agdx.fence` metadata instead of a binding header. Each message must use exactly one carrier (B1.2).
 
 ### A9.7 Envelope caps
 
@@ -507,7 +515,9 @@ An enveloped message MAY carry the fence token (A4, A8) as a pinned `agdx.fence`
 | `kv.lease_renew` | namespace, key, holder id, optional subject user id, lease token, lease ttl (the same range) | `Renewed { lease_token, granted_ttl_micros, position }` with the unchanged token, or `LeaseLost` when the lease expired, was released, or was re-acquired |
 | `kv.release` | namespace, key, lease token, holder id | `Released(bool)`, or `LeaseLost` on a stale fence token |
 
-Errors: unsupported, invalid key, invalid namespace, too large, backend, version, version-conflict, lease-lost, not-found (an in-place `expire` / `patch` targeting an absent or expired key), stale (a barriered `kv.get` whose fold did not reach the required position, explicitly never mapped to an absent value). Namespaces isolate and scope keys within one shared store: the managed key-value store is a single dataset, not partitioned per user, so any principal permitted by the substrate (B1.4) reads and writes every namespace, the same way it sees every stream it has rights to. The binding stamps the authenticated user id as identity for audit, not as a visibility boundary. Scan caps: page at most 1000, default 100. The `exists` / `expire` / `patch` / `lease` / `lease_renew` / `release` ops and the conditional `if_match` / `if_none_match` carriage realize the data-object operations in C6 on the key-value surface.
+Key-value errors include unsupported, invalid key, invalid namespace, too large, backend, version, version-conflict, lease-lost, not-found, and stale. `expire` and `patch` return not-found for absent or expired keys. A `kv.get` read that cannot reach its required mutation position returns stale, never an absent value.
+
+Namespaces group keys within one shared store. The authenticated user ID records identity for audit and does not itself create a separate dataset. Access depends on the binding permissions (B1.4). Scan pages contain at most 1000 entries and default to 100. `exists`, `expire`, `patch`, `lease`, `lease_renew`, `release`, `if_match`, and `if_none_match` implement the C6 object operations.
 
 For example, writing a session flag with an expiry and reading it back:
 
@@ -521,7 +531,7 @@ kv.get { namespace: "sessions", key: "user:42" }
 
 ### A10.3 Compare-and-swap (optimistic concurrency)
 
-Each entry carries a `version: u64`, assigned by the store and bumped on every successful mutation. A conditional write gives lock-free optimistic concurrency for agents contending on one key.
+The store assigns each entry a `version: u64` and increments it after each successful mutation. A conditional write compares this version before changing the entry.
 
 The operation:
 
@@ -530,11 +540,13 @@ kv.cas { namespace, key, value, expires_at_micros?, expect }
 expect = match(version) | absent
 ```
 
-Success returns `Committed { version }` (the new version, so a caller can chain a further conditional write without a re-read). A precondition miss returns `version-conflict` carrying the current version (`some(v)` when present, `none` when absent), so the caller re-reads and retries, or learns that an `absent` precondition lost a race.
+Success returns `Committed { version }` with the new version. A later conditional write can use it without reading again. A failed precondition returns `version-conflict` and the current version. `some(v)` means the entry exists, and `none` means it is absent. The caller can read again or handle the conflict.
 
-Compare-and-swap is capability-gated by the `kv_cas` flag: a transactional row store (the embedded engine) serves it as a single conditional write, while a backend that cannot do a conditional write leaves the flag clear and returns a clean unsupported error. The version token rides on the entry either way, reading `0` on an unversioned store. The revocable lease (A10.4) builds on this: a lease is a key holding a holder identity, a token, and an expiry, mutated transactionally. The fencing token a holder presents is not the lease row's version (that version is TTL-bounded and resets when the lease expires and is re-acquired, so it is not monotonic), it is a dedicated never-expiring fence sequence (A10.3 fenced compare-and-swap).
+The `kv_cas` capability indicates support for transactional conditional writes. A backend without this support leaves the flag clear and returns unsupported. An unversioned store reports entry version `0`. A lease stores holder identity, token, and expiry in one transaction (A10.4). Its fencing token comes from a separate counter that never expires. The lease row version cannot serve as that counter because it can reset after expiry.
 
-A fenced compare-and-swap (`kv.cas_fenced`, served under the `kv_fenced_leases` feature bit, which subsumes the older fence-only `kv_cas_fenced` flag) is the sibling of `kv.cas`: the identical write and precondition, applied in one backend transaction that also requires a **live** lease at the request's (`fence_namespace`, `fence_key`) and a fence sequence still equal to the presented `fence_token`. The fence sequence is a dedicated, never-expiring per-key counter the lease grant bumps and returns as the token, strictly monotonic across acquire and post-expiry re-acquire alike. A stale fence, an expired lease, or a released lease returns `lease-lost` even before another holder acquires. A failed target precondition returns `version-conflict`. This is the at-most-one-effective-writer gate for an effect that lands in the key-value store. The fenced-lease family (`kv.lease`, `kv.lease_renew`, `kv.release`, `kv.cas_fenced`) uses `KV_LEASE_OP_VERSION = 1`. The holder-identity shape was finalized before publication, its required fields have no decode defaults, and any other `v` is rejected typed and fail-closed.
+`kv.cas_fenced` requires `kv_fenced_leases`, which includes the older `kv_cas_fenced` capability. It applies the target write and precondition in one transaction. The transaction also requires a live lease at (`fence_namespace`, `fence_key`) and a matching `fence_token`. The separate counter increases on every acquisition, including acquisition after expiry.
+
+A stale token, expired lease, or released lease returns `lease-lost`. A failed target precondition returns `version-conflict`. This protects key-value effects from replaced holders. `kv.lease`, `kv.lease_renew`, `kv.release`, and `kv.cas_fenced` use `KV_LEASE_OP_VERSION = 1`. Their holder fields are required without decode defaults. Other `v` values return typed errors.
 
 ### A10.4 Revocable lease
 
@@ -546,11 +558,19 @@ kv.lease_renew { namespace, key, holder_id, subject_user_id?, lease_token, lease
 kv.release { namespace, key, lease_token, holder_id } -> Released(bool)
 ```
 
-A bounded-TTL distributed lock with revocation semantics. Acquisition atomically creates the live lease row and bumps the never-expiring fence sequence. The reply carries the new token, the granted TTL, and the mutation position at which the answering fold applied the grant, the barrier a takeover read passes back as `kv.get`'s `min_position`. The requested TTL is a maximum: a successful grant or renewal has a nonzero TTL no greater than the request, so the request remains a conservative expiry bound if the reply is lost. Because the store only ever grants less, the range is a bound on the *request*, validated locally by every tier before the round trip rather than clamped after it: a requested lifetime outside `MIN_LEASE_TTL_MICROS = 1_000_000` (one round trip plus the holder's own renewal cadence has to fit inside a grant) to `MAX_LEASE_TTL_MICROS = 300_000_000` (a crashed holder's ownership must always expire) is invalid, on acquisition and renewal alike. A holder needing longer renews. `holder_id` is a non-empty stable node or worker identity of at most `MAX_HOLDER_ID_BYTES = 128` UTF-8 bytes. Its charset is otherwise open. Renewal and release must present the same holder, so another process can neither extend nor drop a lease it does not hold. `subject_user_id` is a delegated acquisition (an operator leasing on behalf of a runtime user, gated by the `kv_lease:admin` grant). When absent, the lease protects the authenticated caller's own mutations. A live lease always conflicts, so extension is `kv.lease_renew`, never re-acquisition: renewal requires the same holder and subject, a live row, and the current fence token, then moves the expiry forward and returns the **same** token, never bumping the fence. Release validates the token against the fence sequence, never the lease row's own version (which resets on re-acquire and cannot fence), and physically removes the live row in the same transaction. A missing or expired row under a still-current fence is the idempotent `Released(false)`, while a stale fence is `lease-lost`. A backend that cannot serve leases returns `unsupported`. This realizes the `LEASE` / `RENEW` / `RELEASE` data-object operations in C6.
+A lease grants temporary ownership and supports revocation. Acquisition creates the live lease row and increments the persistent fence counter in one transaction. The reply contains the token, granted lifetime, and mutation position. A takeover read sends this position as `kv.get` `min_position`.
 
-The fenced coordination commands ride the non-replicated managed extension path, so a client must not assume the streaming transport deduplicates `operation_id`. If an acquisition request may have reached the server but its reply is lost, the caller has neither the token nor a holder-bearing conflict reply with which to renew or release. It MUST NOT retry immediately: it waits through the requested TTL from the ambiguous attempt, then prepares a fresh acquisition. A convenience API that does not return the prepared operation must enforce that wait before returning an ambiguous acquisition error, and a transport must not reconnect and replay an acquisition automatically. Renew and release are safe to repeat with the same holder and token. An ambiguous fenced CAS is reconciled through its mandatory target precondition. Generic handler retry loops must treat an ambiguous mutation as terminal rather than rebuilding a request with a new operation identity.
+A grant or renewal has a positive lifetime no greater than requested. Requests must fall between `MIN_LEASE_TTL_MICROS = 1_000_000` and `MAX_LEASE_TTL_MICROS = 300_000_000`. Each client and server boundary rejects values outside the range before executing them. A holder can renew before expiry. `holder_id` is a non-empty UTF-8 identity of at most `MAX_HOLDER_ID_BYTES = 128` bytes. Renewal and release must name the same holder.
 
-Lease lifecycle authorization is split from data access: acquire, renew, and release require `kv_lease:admin` on the coordination namespace, while presenting a fence on `kv.cas_fenced` requires only `kv_fence:read` there beside the target namespace's `kv:write`. A state writer's grant therefore never implies control over the lease that fences it, and the lease holder needs no rights over the fenced data.
+`subject_user_id` allows acquisition on behalf of another user and requires `kv_lease:admin`. Without it, the lease protects the authenticated caller mutations. Acquisition conflicts with a live lease. `kv.lease_renew` requires the same holder and subject, a live row, and the current fence token. It extends expiry and returns the same token. It does not increment the fence.
+
+Release compares the presented token with the persistent fence counter and removes the live row in the same transaction. A missing or expired row with the current token returns `Released(false)`. A stale token returns `lease-lost`. A backend without lease support returns `unsupported`. These operations implement `LEASE`, `RENEW`, and `RELEASE` from C6.
+
+Fenced coordination commands use the non-replicated managed extension. Clients must not assume that the streaming transport deduplicates `operation_id`. If an acquisition can reach the server but its reply is lost, the client lacks the token needed to renew or release. It must wait through the requested lifetime from that attempt before acquiring again. A convenience API must enforce this wait before returning an ambiguous-acquisition error. A transport must not automatically reconnect and replay an acquisition.
+
+Renew and release are safe to repeat with the same holder and token. Reconcile an uncertain fenced CAS through its required target precondition. Generic handler retries must treat an ambiguous mutation as terminal. They must not create a new operation identity and retry it.
+
+Acquire, renew, and release require `kv_lease:admin` on the coordination namespace. `kv.cas_fenced` requires `kv_fence:read` there and `kv:write` on the target namespace. Permission to write data does not grant control over its lease. The lease holder does not need access to the protected data.
 
 ### A10.5 Forks
 
@@ -570,7 +590,7 @@ Copy-on-write branches of the materialized read model.
 | `fork.list` | none | `List([ForkInfo])` |
 | `fork.put` | fork_id, table, partition_id, offset, projection id and version, fields, metadata, optional payload, optional embedding, tombstone flag | `Written` |
 
-A fork id is at most 128 bytes and is restricted to a strict charset safelist: ASCII letters, digits, `-`, `_`, and `.`. The bound is not only a length cap. A backend that overlays a fork inlines the id into a copy-on-write query as a quoted identifier, so the safelist is the one anti-injection rule, owned in the wire contract (`validate_fork_id`) and shared by every fork-serving backend. How many forks a deployment may hold is a managed-side resource policy surfaced as a fork error, not part of the wire contract.
+A fork ID contains at most 128 bytes. Allowed characters are ASCII letters, digits, `-`, `_`, and `.`. `validate_fork_id` enforces the rule before SDK I/O and in the managed plane. A caller cannot use an arbitrary SQL identifier as a fork name.
 
 A query may resolve against a fork's overlay (trunk plus the fork's speculative rows) by naming the fork.
 
@@ -591,19 +611,23 @@ A projection turns a payload into a queryable row. It is global and reusable. Bi
 | `SchemaDef` | id (u32, permanent), source, optional name, optional version |
 | `SchemaSource` | internally tagged on `kind`: `{kind: avro, schema}` \| `{kind: json_schema, schema}` \| `{kind: protobuf, descriptor_set, message_type}`. `descriptor_set` is a byte string. An unknown `kind` from a newer peer decodes to a forward-compatible `unknown` rather than failing the whole reply (the same shape `RetentionPolicy` uses), so an old client still reads a registry holding a source kind it cannot decode against. It must not re-register an `unknown`. |
 
-Storage model: the log keeps the original bytes always, the indexed columns are extracted at materialize time and drive filters and ordering and aggregates, and the inline body is an optional copy alongside the row so typed fetches skip a log round trip. Each row also carries its origin log position (numeric stream id, topic id, partition, offset), stamped per row since one target table can hold rows from several source topics, so a reader can jump a query row back to the record it was projected from. The ids, not names, keep the pointer compact and rename-proof. A record with zero indexed fields is dropped by the projector while the log keeps the bytes. At most 32 indexed fields per record. The inline body copy is capped at 8 MiB (the same ceiling as a key-value value): a larger payload still indexes and stays in the log, it is just not duplicated into the row, so a typed fetch decodes from the log or a claim-check `ref` body. An explicit indexed-field directive wins over schema extraction for the same field.
+The log retains original message bytes under its retention policy. A projector extracts indexed columns for filters, sorting, and aggregation. It can also copy the body into the row to avoid another log read. Each row records its numeric stream ID, topic ID, partition, and offset. These IDs remain valid after a rename.
 
-A materialized view is a read model built by a projector consuming the log, so by default it is eventually consistent: a record is queryable once the projector has materialized it, not at the instant it is appended. The lag is the projector's read-and-apply latency and depends on the backend. A query that needs to see its own prior writes sets the `read_your_writes` consistency level (A11.3), which waits for the projector to reach the source log head and fails with `stale` rather than serving older data if it cannot catch up in time. The log itself stays the synchronous source of truth, readable by offset the moment the append acknowledges.
+A record with no indexed fields produces no row. A record can have at most 32 indexed fields. The inline body limit is 8 MiB. Larger bodies still produce indexed columns, but the row does not copy their payload. Readers can fetch the original record or follow a `ref` body. An explicit field directive takes precedence over schema extraction for that field.
 
-The server obligation for a non-`eventual` level is one rule, owned in the wire contract as a small `ConsistencyGate { applied, required }` helper: serve only when the projector's applied offset for the queried source has reached the required offset (the source head at query time), otherwise return `stale`. `eventual` always passes. `strong` is read-your-writes plus cross-replica agreement, so a `strong` backend layers its own cross-replica check on a gate that has already passed. Every backend uses the one gate so the fail-not-downgrade rule is enforced identically.
+A materialized view contains records already processed by a projector. It is eventually consistent by default, so a new record becomes queryable after projection. The delay depends on the projector and backend. A `read_your_writes` query waits for the projector to reach the source head. If it cannot reach that position in time, the query returns `stale`. The source log remains readable by offset after the append completes.
+
+`ConsistencyGate { applied, required }` compares the applied offset with the required source position. `eventual` always passes this gate. Other levels require the projector to reach the source head captured for the query. A failed gate returns `stale`. `strong` also requires the backend to establish agreement across replicas.
 
 ### A11.2 Control commands (durable on the control topic)
 
-The control envelope carries `{ v, timestamp_micros, command }`. The command is one of `RegisterProjection`, `DropProjection`, `ApplyBinding`, `RemoveBinding`, `RegisterSchema`, `DropSchema`, `RegisterGraph`, `DropGraph`, `RegisterRunSource`, `RemoveRunSource`. A graph projection (`kind = graph` with an entity schema, A11.1) registers through `RegisterGraph` rather than `RegisterProjection`, so a deployment can gate graph registration separately. Schema ids are permanent, collisions are rejected, and a dropped schema still decodes records already stamped with its id. `RegisterRunSource` and `RemoveRunSource` name a `{ stream, topic }` source of run-tagged agent records: the deployment folds a registered source into the run registry (the agent-workflow surface) without a restart, and both commands are idempotent by source. Both variants are additive at the tail of the command enum, so an older reader rejects them as an unknown command rather than misdecoding an existing one.
+The control envelope contains `{ v, timestamp_micros, command }`. Commands are `RegisterProjection`, `DropProjection`, `ApplyBinding`, `RemoveBinding`, `RegisterSchema`, `DropSchema`, `RegisterGraph`, `DropGraph`, `RegisterRunSource`, and `RemoveRunSource`. A graph projection registers through `RegisterGraph` so deployments can control graph registration separately. Schema IDs are permanent and cannot collide. Dropping a schema does not prevent decoding records that already reference it.
+
+`RegisterRunSource` and `RemoveRunSource` name a `{ stream, topic }` source of run-tagged records. They change the run registry source set without restarting the deployment. Repeating either operation for the same source is safe. Older decoders reject an unknown command variant.
 
 ### A11.3 The query IR
 
-A backend-neutral logical IR, compiled per backend on the managed side.
+The query IR is a logical request compiled by the selected backend.
 
 | Field | Meaning |
 | --- | --- |
@@ -640,7 +664,7 @@ A backend-neutral logical IR, compiled per backend on the managed side.
 
 `Page` carries an optional offset, limit, optional exact total, `has_more`, and an optional opaque next cursor. `has_more` and `next_cursor` must agree. A caller retrieves another page through the same execution identity. It does not reconstruct the query or extend the deadline.
 
-Every result carries `QueryContext`. The context records the engine and version, resolved operational or lakehouse target, backend resource and observed generations, runtime-configuration revision, requested and delivered consistency, truncation and resource metrics. A lakehouse result additionally identifies the destination generation, table UUID, snapshot, schema, partition spec, materialization-boundary digest, checkpoint revision, and global state revision.
+Every result includes `QueryContext`. It records the engine, version, target, backend identity, generations, runtime configuration revision, and requested and delivered consistency. It also records truncation and resource metrics. Lakehouse results add destination generation, table UUID, snapshot, schema, partition specification, materialization digest, checkpoint revision, and global state revision.
 
 For example, the ten most recent high-latency calls for one model, newest first:
 
@@ -660,76 +684,100 @@ query {
 
 ### A11.5 Logical schema and canonical values
 
-A logical schema has a nonzero 128-bit ID, nonzero version, 32-byte canonical fingerprint, and ordered fields. Field IDs are positive and unique across the complete nested tree. Names are compared exactly after rejecting control characters. Duplicate sibling names, reserved provenance names, and reserved provenance field IDs are invalid.
+A logical schema has a nonzero 128-bit ID, nonzero version, 32-byte fingerprint, and ordered fields. Field IDs must be positive and unique throughout the nested schema. Names must not contain control characters. Sibling names must be unique. Users cannot declare reserved provenance names or IDs.
 
-Logical types cover boolean, int, long, float, double, decimal, date, time in microseconds since midnight, timestamp in UTC microseconds, timestamp with timezone as a UTC instant, string, UUID, fixed bytes, binary, struct, list, and map. Decimal precision is 1 through 38. Scale cannot exceed precision. UUID uses RFC 4122 network byte order. Floats reject NaN, infinity, and negative zero. Map keys are limited to boolean, int, long, decimal, date, time, timestamp, timestamp with timezone, string, UUID, fixed, and binary. Canonical map ordering uses encoded key bytes.
+Logical types include booleans, integers, floating-point numbers, decimals, dates, times, timestamps, strings, UUIDs, fixed bytes, binary data, structs, lists, and maps. Times use microseconds since midnight. Timestamps use microseconds, with a separate variant for UTC instants with timezone meaning. Decimal precision ranges from 1 to 38, and scale cannot exceed precision. UUIDs use RFC 4122 network byte order. Floating-point values reject NaN, infinity, and negative zero.
+
+Map keys support boolean, integer, decimal, date, time, timestamp, string, UUID, fixed, and binary types. This includes both timestamp variants. Canonical map order follows the encoded key bytes.
 
 The reserved provenance fields use the `__laser_` namespace and fixed IDs from `PROVENANCE_FIELD_ID_START`. They include source and destination identity, original payload and content type, and source position. Users cannot declare those names or IDs.
 
 ### A11.6 Destinations, query routes, and checkpoints
 
-A `MaterializationDestination` declares one immutable generation. It binds a source scope and partition-recreation policy to a projection version, logical schema fingerprint, backend resource generation, physical table identity, Parquet, Iceberg v2, start policy, new-partition policy, blocking error policy, and desired state. It does not carry runtime ownership or observed progress.
+A `MaterializationDestination` defines an immutable generation. It connects a source scope, partition-recreation policy, projection version, schema fingerprint, backend generation, and physical table identity. It also specifies Parquet, Iceberg v2, start behavior, new-partition behavior, blocking errors, and desired state. Runtime ownership and observed progress belong to status records.
 
 A `QueryRoute` independently names an operational index or one lakehouse destination generation. Query routing never follows a projection target role.
 
-Checkpoint mutations use two disjoint envelopes. `CheckpointRequestEnvelope` is the bounded public form. It carries the operation version, request ID, expected global state revision, a public mutation, and optional signed supervisor assertion. Plane promotes it to `ReplicatedCheckpointMutation` after the Iggy AGDX bridge authenticates and forwards the caller. The promoted form adds the committed timestamp, authenticated Iggy actor, and verified supervisor actor evidence before Plane appends it to the standard managed checkpoint mutation topic. The two forms have different fixtures and do not decode as each other.
+`CheckpointRequestEnvelope` is the bounded public request. It contains the operation version, request ID, expected global revision, mutation, and optional signed supervisor assertion. The AGDX bridge authenticates the caller and forwards this request. Plane creates a `ReplicatedCheckpointMutation` with the commit timestamp, authenticated Iggy actor, and verified supervisor evidence. Plane then appends it to the managed checkpoint mutation topic. Separate reference files and decoders prevent the public and committed forms from being confused.
 
-Destination status records the declaration and checkpoint revisions, desired and effective state, backend and schema binding, table UUID, owner lease, ordered partition boundaries, optional prepared attempt, last completion, retention gap, block, repair, and read consistency. Lease ownership is fenced by owner, epoch, sequence, and a bounded deadline. Prepared attempts freeze exact source ranges, resulting boundary, Iceberg commit requirements, manifest and object digests, schema and projection identity, table base state, and credential generations.
+Destination status includes declaration and checkpoint revisions, desired and effective state, backend and schema bindings, table UUID, lease, and ordered partition boundaries. It also records prepared attempts, completion, retention gaps, blocking errors, repairs, and read consistency. Owner, epoch, sequence, and deadline identify the valid lease. Prepared attempts fix source ranges, the resulting boundary, and Iceberg commit requirements. They also fix manifest and object digests, schema and projection identity, table base state, and credential generations.
 
 ### A11.7 Arrow IPC input
 
-Arrow content is one self-contained IPC stream per Iggy message. The message contains its schema, dictionaries, and record batches with no continuation state shared across messages. It carries the logical schema fingerprint in `agdx.sfp` and validates encoded bytes, field count, batch count, row count, and dictionary count against `ArrowIpcPolicy`.
+Each Iggy message contains one self-contained Arrow IPC stream. It includes its schema, dictionaries, and record batches. Messages cannot share continuation state. `agdx.sfp` carries the logical schema fingerprint. `ArrowIpcPolicy` limits encoded bytes, fields, batches, rows, and dictionaries.
 
-Only microsecond time and timestamp units are accepted. Dense and sparse unions, extension types, unsupported dictionary arrangements, decimals wider than 128 bits, missing schema messages, trailing bytes, shared stream state, and policy-limit violations are rejected with a stable `ArrowIpcRejectionCode`. Arrow dependencies remain outside `laser-wire`.
+Time and timestamp units must be microseconds. Reject unions, extension types, unsupported dictionaries, and decimals wider than 128 bits. Also reject missing schema messages, trailing bytes, shared stream state, and policy violations. Return the corresponding `ArrowIpcRejectionCode`. `laser-wire` does not depend on Arrow implementation crates.
 
 ### A11.8 The change feed
 
-"Query after my data landed" should be await-then-query, not sleep-and-retry. The change feed is the log-native answer: a projection binding opts in with `notify` (A11.1), and after each committed projector batch that advanced a notifying binding's table the projector publishes one **change record** per advanced table on the changes channel of the ops stream (B1.1). A consumer reads the channel by offset like any topic, resumes from persisted offsets, and there is no server-push, subscription, or broker watch.
+A projection binding enables change notifications through `notify` (A11.1). After a committed batch advances a notifying table, the projector publishes one change record for that table. It writes the record to the ops stream changes channel (B1.1). Consumers read and resume by offset, as with other topics.
 
 | Type | Fields |
 | --- | --- |
 | `ChangeRecord` | `v` (op version, 1), `index` (the materialized index that advanced), `partition_id`, `from_offset` / `to_offset` (the inclusive source-offset window the batch committed), `rows` (rows written) |
 
-The record is a **wakeup, not truth**: it says the view advanced past an offset window, and the rows themselves are read through `query` (A11.3) or the log. Publishing is best-effort after the batch commits, a lost record costs one missed wakeup and never data, and a consumer that slept past the feed's retention re-reads the view directly. The feed composes with read-your-writes rather than replacing it: read-your-writes answers "has the view caught up to my write", the feed answers "tell me when the view moves". Availability is advertised by the `watch` feature bit (A12), and a client refuses to open the feed locally when the bit is absent, so a consumer never waits on a channel nothing writes to.
+A change record reports that a view advanced through an offset range. Read the rows through `query` (A11.3) or the log. Notifications are best-effort after commit, so losing one does not lose the projected data. If a consumer misses the feed retention window, it reads the view directly.
+
+The feed reports progress. Read-your-writes establishes whether the view includes a required write. The `watch` capability advertises feed support. Without it, the client rejects the request to open a feed before waiting on a channel.
 
 ## A12. Capability negotiation
 
 A single connection negotiates what is available. A managed feature works against a managed implementation or returns `unsupported`.
 
-- At connect the client runs the `hello` operation and may run it again through capability refresh. The reply advertises per-surface op versions for query, control, checkpoint, key-value, fork, agent, and graph plus the managed feature bits. Every hello-negotiated surface slot and the fenced-lease request family currently use version 1. The fenced-lease family additionally requires its feature bit. A zero slot means the surface is not advertised.
-- Each `BackendDescriptor` is structured, versioned, and secret-free. It carries stable backend resource identity, mode, label, implementation kind and version, observed backend and runtime-configuration revisions, desired and observed state, readiness, materialization capabilities, query dialects and typed-value coverage, time travel, consistency, paging and cancellation, schema and maintenance support, and numeric limits. It never carries endpoint URLs, credentials, secret values, or mutable configuration submissions.
-- Backend readiness is an observation with stable reason codes. A configured backend can be unavailable or degraded without losing its identity and capabilities. Clients refresh capabilities after startup races, runtime failover, or backend restart rather than treating the connect-time view as permanent.
-- The SDK capability set is grouped by where a capability lives and what it depends on, not a flat list. A root `managed` flag says a managed plane is connected at all. The managed surfaces served off the log are `query`, `destinations`, `kv`, `graph`, `forks`, and the A2A gateway. The platform-native ones are `sessions` and `durable_dedup`. A surface's sub-features nest under it so a dependent feature cannot be advertised apart from its surface: `query.consistency` is the strongest read-consistency level the query surface serves (the `eventual < read_your_writes < strong` ladder, so a level implies the weaker ones, which makes the impossible "strong-but-not-read-your-writes" state unrepresentable), and `kv.cas` is the key-value conditional-write feature, with `kv.cas_fenced` the fenced sibling that gates a write on a live fence sequence and `kv.fenced_leases` the full revocable-lease contract (holder-scoped acquire, renewal, fence-validated release, live-lease fenced compare-and-swap, and the barriered read) that the SDK's lease, renew, release, and fenced-CAS calls all gate on. Agentic memory composes the query and graph surfaces, so it has no capability of its own. On an open substrate with no managed surface every capability is off and the matching call returns unsupported. The wire `hello` reply still carries the flat `features` bitset (`kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`, `keyword_search`, `watch`, `authz`, `destinations`, `kv_fenced_leases`). The SDK folds those bits into the grouped form (the consistency bits become the served level), and the HTTP capabilities reply mirrors the grouped shape (B4).
-- When the advertised op version is not the SDK's pinned version, the call fails fast with the surface's typed version error before a round trip.
-- A feature carried as an additive request field, rather than its own operation, is refused locally when unadvertised. A compare-and-swap rides its own command code, so an unaware server rejects it cleanly even without a local check, but a read-your-writes (or strong) query rides the additive `consistency` field that an unaware server silently drops, so the client refuses an unadvertised level before sending. The fenced-lease family is stricter because its holder-identity payloads require the additional feature contract: a client MUST NOT send `kv.lease`, `kv.lease_renew`, `kv.release`, `kv.cas_fenced`, or a `kv.get` with `min_position` unless `kv_fenced_leases` is advertised. The same inspection applies inside a raw `batch`. Batching cannot bypass the sub-capability gate. This is what keeps fail-not-downgrade honest (A8).
-- A server MUST keep its two capability carriages in agreement: the binary `hello` `features` bit and the HTTP capabilities boolean for the same feature say the same thing. The contract carries both because the two bindings are separate, and a divergence would let a feature look available on one surface and not the other.
-- Every sub-feature defaults to **not advertised**: the HTTP `Capabilities` constructor leaves `kv.cas` off, `query.consistency` at `eventual`, and `graph` off, and a server opts each up only when it serves it, mirroring the skip-when-zero `features` bitset and the zero `graph` op version. A backend that advertised a feature it cannot honor would turn the clean unsupported error into a silent wrong answer, so the safe default is off and opt-in.
-- When the streaming server and the managed backend are separate processes, the backend is the source of its own capability and readiness truth. The streaming server requests a live `BackendAnnounce` over their private socket whenever it answers a client hello or the HTTP capabilities route. It may retain the last descriptor only to relay it demoted to unavailable when a later probe fails.
-- The announce carries a `ready` flag (skipped on the wire when true, so a ready announce stays byte-identical with the pre-readiness form). Readiness is distinct from configuration: a backend that is configured but has never answered announces the pinned op versions with `ready` false, and a cached announce whose backend has stopped answering is relayed **demoted to not ready** rather than verbatim, keeping its known feature bits and topology as information while withdrawing the claim that they are served right now. A client MUST NOT treat a not-ready announce as available managed surfaces, and MUST be able to re-probe (a capability refresh) so a startup race or a backend restart resolves without reconnecting.
-- The announce optionally carries the deployment's `WireTopology`: the ops stream plus the control, dead-letter, change-feed, and the five managed mutation topic names (`kv`, `fork`, `run`, `graph`, `checkpoint`), so a client adopts the deployment's resolved names instead of hardcoding the defaults. Explicit client configuration always wins over an announced name. The field is skipped when absent, so a pre-topology announce stays byte-identical and an older reader falls back to the pinned default names. Every topology field has its own default, so a partial announce from an older peer still decodes to real names, never empty strings.
-- **Managed mutation identity.** Every Plane-served managed mutation carries one stable operation identity minted once at the logical SDK operation boundary, outside every transport retry loop. The client wraps the mutation request in a `ManagedRequestEnvelope { v, operation_id, payload }` where `operation_id` is a mandatory nonzero u128 (ULID-valued). The streaming server unwraps it, refuses a bare or zero-identity mutation as invalid, and carries the identity on the forwarded frame, and the deployment appends the mutation to its topic as a `MutationCommandEnvelope { v, operation_id, timestamp_micros, command_code, payload }` record. The log is the sole ordering authority (log-first), each mutation topic is single-partition until the protocol defines cross-partition transactions, and only the deployment's own plane may publish to them. The deployment persists each completed mutation outcome atomically with its effect, keyed by the identity, and answers a duplicate identity with the persisted outcome instead of applying again. Retry safety follows from the identity: a read may reconnect and retry freely, a mutation may retry only under its original identity, a deterministic rejection (an over-cap reply, a validation failure) is never retried, and a peer that cannot carry the identity is refused rather than silently retried into an ambiguous outcome. The Iggy fork's three managed authorization mutations are the established exception. They use their request `mutation_id` and dedicated custom replicated operations instead of the Plane envelope.
-- **Managed key records.** The managed signing-key registry is a KV namespace (`agent.keys` by default) holding one versioned key record per key: the KV key is the lowercase hex key id (the first 8 bytes of the SHA-256 of the verifying key) and the value is the named-field CBOR `KeyRecord { v, principal, key_id, verifying_key, kind, valid_from_micros, valid_to_micros?, revoked }` with `v = 1`. Every port reads and writes this one representation, enrollment and revocation are compare-and-swap so concurrent lifecycle operations cannot silently overwrite one another, a snapshot skips an entry that fails validation rather than poisoning the registry, and a record whose stored key id does not match its verifying key is refused.
+- Run `hello` at connection time and again when refreshing capabilities. The reply reports versions for query, control, checkpoint, key-value, fork, agent, and graph, plus feature bits. The current versions are 1. A zero version means the operation group is unavailable. Fenced leases also require their feature bit.
+- `BackendDescriptor` reports versioned backend identity, mode, label, implementation, generations, configuration revisions, state, and readiness. It also reports materialization, query, type, time-travel, consistency, paging, cancellation, schema, maintenance, and limit support. It must not expose URLs, credentials, secrets, or mutable configuration requests.
+- Readiness reports the current backend condition through stable reason codes. Unavailable or degraded backends retain their identity and capability descriptions. Refresh capabilities after startup races, failover, or backend restarts.
+- SDK capabilities group features by their dependencies. `managed` indicates that a managed plane is connected. Managed groups include `query`, `destinations`, `kv`, `graph`, `forks`, and the A2A gateway. Platform-native groups include `sessions` and `durable_dedup`. Memory combines query and graph operations and has no separate capability.
+
+`query.consistency` reports the strongest supported level: `eventual < read_your_writes < strong`. A stronger level includes the weaker levels. `kv.cas` reports conditional writes. `kv.cas_fenced` reports fence-protected writes. `kv.fenced_leases` reports holder-scoped acquisition, renewal, release, fenced CAS, and reads with a required mutation position.
+
+The wire reply retains the flat `features` bitset. Its bits include `kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`, `keyword_search`, `watch`, `authz`, `destinations`, and `kv_fenced_leases`. SDKs convert these bits into grouped capabilities. HTTP reports the grouped form (B4). Without managed support, the corresponding capabilities remain off and calls return unsupported.
+- If the reported operation version differs from the SDK version, reject the call before sending. Return the typed version error for that operation group.
+- If an optional request field changes service behavior, require its capability before sending it. This includes the `consistency` field. A distinct command code can receive an explicit unsupported reply, but an unknown optional field can be ignored.
+
+Do not send `kv.lease`, `kv.lease_renew`, `kv.release`, `kv.cas_fenced`, or `kv.get` with `min_position` unless the peer advertises `kv_fenced_leases`. Apply the same rule inside raw `batch` requests. A batch must not bypass capability requirements.
+- The binary `hello` feature bit and corresponding HTTP capability must agree. A feature cannot be available through only one declaration of the same server capability.
+- Features default to unavailable until the server explicitly reports support. HTTP defaults leave `kv.cas` and `graph` off and `query.consistency` at `eventual`. The binary reply uses zero feature bits and a zero `graph` version. Report a feature only when the backend can provide it.
+- If the server and managed backend run separately, the backend supplies its own capability and readiness report. The server requests live `BackendAnnounce` data through their private socket for client hello and HTTP capability requests. After a failed probe, cached information can be returned only with unavailable status.
+- `BackendAnnounce.ready` distinguishes readiness from configuration. A configured backend that cannot answer reports `ready = false`. If a later probe fails, retain known features and topology only as descriptive information. Mark the backend unavailable. Clients must keep its managed operations unavailable and support refresh without reconnecting. The encoded form omits `ready` when it is true.
+- Optional `WireTopology` reports the ops stream, control, dead-letter, change-feed, and managed mutation topic names. The mutation topics are `kv`, `fork`, `run`, `graph`, and `checkpoint`. Explicit client configuration takes precedence over reported names. Each field has a default, so a partial report does not produce empty names. Omit absent topology from the encoded form.
+- Create one stable identity for each logical Plane-served mutation, outside transport retry loops. Wrap it in `ManagedRequestEnvelope { v, operation_id, payload }`. `operation_id` is a required nonzero u128 with a ULID value. The server rejects bare or zero-identity mutations and preserves the identity when forwarding.
+
+The deployment appends `MutationCommandEnvelope { v, operation_id, timestamp_micros, command_code, payload }` to the managed mutation topic. Each mutation topic has one partition until the contract defines cross-partition transactions. Only the deployment plane can publish there. The backend stores each outcome atomically with its effect, keyed by operation identity. Repeated identities return the saved outcome.
+
+Reads can reconnect and retry. Mutations can retry only with their original identity. Do not retry deterministic rejection, such as invalid input or an oversized reply. Reject peers that cannot carry mutation identity. The three Iggy managed authorization writes use their existing `mutation_id` and dedicated replicated operations instead of the Plane envelope.
+- The managed key registry uses a KV namespace, `agent.keys` by default. Its key is the lowercase hexadecimal form of the first 8 SHA-256 bytes of the verifying key. The value is `KeyRecord { v, principal, key_id, verifying_key, kind, valid_from_micros, valid_to_micros?, revoked }` with `v = 1`.
+
+Every client reads and writes the same named-field CBOR form. Enrollment and revocation use compare-and-swap. A snapshot skips invalid records. Reject a record whose key ID does not match its verifying key.
 
 ## A13. Agentic memory and the knowledge graph
 
-The agentic layer adds two things on top of the data platform: a knowledge graph as a new materialized view, and an agentic-memory API expressed entirely as a facade over the primitives already defined. Memory is not a wire surface of its own. Its four verbs compose `publish` (A1.5), the key-value store (A10), `query` (A11), and the graph ops below, so every SDK gets the same semantics without a parallel command band. There is one model: every write publishes to a memory topic, the source of truth and the full versioned audit of a scope's changes, and recall reads it back. The topic is configurable (stream, name, partition count, and message-expiry, each scope keyed to one partition), and the deployment materializes it into a versioned key-value read view whose retention is independent of the topic's, so a value pruned from the read view is still on the topic until its expiry passes. Recall reads the read view by default, so a large topic never folds to answer one recall. Folding the topic in process is an explicit opt-in for a small, serverless deployment with no read view, never the default. Similarity recall rides an in-process vector index over the same writes, relationship recall the graph. The on-topic record is the wire type `MemoryRecord` (item, forget, feedback), so a deployment folds the topic into the read view without importing the SDK. The fold materializes into a single shared read view, not a per-principal one: access to the managed surfaces (including this view) is gated by the capability layer at the command boundary (B1.4). A memory read is `kv:read` on the materialized namespace, a memory write is a streaming publish on the memory topic, and isolation is name-granular (resource pattern on the unforgeable subject), not a per-record ownership the fold infers. Each record carries its scope as headers, the logical namespace `agdx.mem.ns` the read view materializes under plus the `agdx.mem.user`, `agdx.mem.app`, agent, and conversation layers, so the fold keys each read-view row by that scope rather than by the physical topic. One shared stream and topic can then hold every conversation's memory and still resolve each context. The fold stamps the conversation that wrote each record onto its read-view row (from the record's `gen_ai.conversation.id` header), so a scan can narrow to one conversation's memory (the conversation lens below), a read-side filter over provenance, never the isolation boundary. The fold also stamps the origin log position (numeric stream id, topic id, partition, offset) onto the read-view row as a `SourceRef`, the same message-position provenance the graph carries below, so a reader can navigate a recalled item back to its source record while it is still on the log. The position carries ids, not names, so the pointer stays compact and survives a rename.
+Agent memory combines publication, key-value state, queries, and graph operations. It adds no separate command range. Every memory write appends a `MemoryRecord` to a configurable topic. Its variants describe an item, forgetting an item, or feedback. Each scope maps to one partition.
 
-**The memory verbs (SDK facade, no wire op).**
+The deployment builds a versioned key-value read view from the topic. Topic retention and read-view retention are independent. Default recall reads the managed view. Local topic folding is an explicit alternative for small deployments without that view. A local vector index supports similarity reads, and the graph supports relationship reads.
 
-- `remember` appends an item to the memory topic (the deployment materializes it into the read view). With dedup it content-addresses the item id (below), so storing the same fact twice under the same durable owner stores it once. Entities reach the graph either by an explicit `graph.upsert` or automatically when a graph projection is bound to the source, in which case the projector applies the projection's entity schema to each record and upserts the extracted nodes and edges.
-- `recall` reads back over a multi-signal pipeline: candidate retrieval, score fusion, an optional rerank, then the top results. Its `strategy` routes which signals fire: `auto` (the default) uses the best available, `recent` / `temporal` fold the log or run a time-ranged query over the read view, `semantic` runs a vector query (A11.3), `keyword` runs a lexical relevance match (the `text` IR field, A11.3, where the shipped embedded engine ranks by token coverage then term frequency over its own inverted token index), `graph` runs a traversal, and `hybrid` fuses semantic and keyword by reciprocal rank client-side, each fused item keeping its per-signal attribution (which strategies surfaced it, at what rank and pre-fusion score), so a routed `auto` reports what it picked. The rerank stage is a seam (a cross-encoder, an LLM judge, or a hosted rerank API) the SDK leaves to the application, the same boundary as the embedder and the consolidation summarizer. Routing authority sits where the state is: the managed plane routes when it knows the graph, otherwise the client routes `auto` from the advertised capabilities plus the registered embedder (the graph and a similarity index when present, otherwise recency over the log and its read view).
-- `improve` is feedback and enrichment. Feedback rides the log as a typed record a ranking backend folds into recall order. The richer, asynchronous enrichment (summarizing sessions, reweighting edges, pruning stale items, deriving facts) is **consolidation** (the "memify" / sleep-time pass), a seam a managed backend or an application fills.
-- `forget` tombstones the item on the memory topic (a forget record the fold applies as a delete on the read view). An opt-in cascade also deletes derived graph nodes, edges, and vectors.
+The read view is shared across principals. Managed capability grants control access at the command boundary (B1.4). Reading requires `kv:read` on the materialized namespace, while writing requires publication access to the memory topic. The fold does not infer per-record ownership.
 
-A memory item carries a kind and a lifetime, both SDK labels rather than wire-op fields. The kinds are `fact`, `message`, `summary`, `entity`, `feedback`, and `procedure` (a reusable skill or workflow), and each maps to one of the field's three classes: **episodic** (what happened: `message`), **procedural** (how things are done: `procedure`), and **semantic** (what is known: the rest). The lifetime is `session` (conversation-scoped and prunable) or `durable` (shared across conversations and graph-backed). A memory is scoped along the converging identity layers `user` / `agent` / `session` (the conversation) / `app`, plus the physical stream that is the isolation boundary. Any layer left unset widens recall across it.
+Headers carry the logical namespace `agdx.mem.ns` and scope fields such as `agdx.mem.user`, `agdx.mem.app`, agent, and conversation. The view uses those scopes rather than the physical topic as its logical key. The fold also records the originating conversation from `gen_ai.conversation.id` and a `SourceRef` with numeric stream, topic, partition, and offset. These references survive renames and can locate the source while the log retains it. Conversation filters narrow reads and do not establish ownership.
 
-The session layer is where the context accessor and memory meet. The SDK's context handle, scoped to one conversation, hands out a session-scoped memory view whose recall and remember carry that conversation implicitly, so one scope covers a task's messages and its working memory together. This is an SDK ergonomic over the same scoping fields, not a new wire surface. Durable memory and the graph deliberately stay cross-conversation (a fact learned in one session is worth recalling in the next, and a dependency graph holds no matter which task asked). The context handle can still reach the graph as a convenience so one scope covers a task's messages, memory, and dependency reads, but it returns the graph unnarrowed rather than filtering it to the conversation.
+The memory verbs (SDK facade, no wire op).
 
-**Content-addressed identity.** A deduped memory id and a graph node id are deterministic content hashes, the one canonical `content_id` in the wire crate (a dependency-free, fixtured FNV over byte segments, rendered as the 16-byte id, A3). A memory id hashes the durable owner, kind, and body, so the same fact in two conversations is one durable memory. A node id hashes the entity's label and value, so the same entity extracted from different messages converges on one node, which is what forms a graph rather than disconnected pairs. Every SDK reproduces the id from the same segments, pinned by a golden vector.
+- `remember` appends an item to the memory topic. With duplicate suppression, the ID derives from the durable owner, kind, and body. Repeated content for that owner resolves to the same item. Graph entities come from `graph.upsert` or a bound graph projection that extracts nodes and edges.
+- `recall` retrieves candidates, combines scores, optionally reranks, and returns the highest-ranked items. `auto` selects available signals. `recent` and `temporal` read by time, while `semantic` uses vectors and `keyword` uses lexical matching. `graph` traverses relationships. `hybrid` combines semantic and keyword ranks with reciprocal-rank fusion. Each result retains the contributing strategies, ranks, and original scores.
 
-The content id is a **convergence and dedup key, not a security boundary**. FNV is not second-preimage resistant, so it is deliberately not relied on to prevent a hostile writer from minting a colliding id. The applicable AGDX security profile is the trust boundary, and a principal allowed to write the memory or graph topic can already write any id directly, so a collision buys nothing a direct write does not. The hash's only job is that honest writers converge deterministically. A deployment that needs cross-writer integrity on these ids uses verified principal signatures or ACL-bound write-exclusive topology (A4.1, B1.1). Moving to a keyed cryptographic hash is a future option if a threat model ever requires adversarial collision resistance on the id itself.
+The embedded keyword engine ranks token coverage before term frequency. Reranking is supplied by the application, like embedding and consolidation. A managed plane can route recall using its known graph. Otherwise, the client selects from reported capabilities and its configured embedder, with recency as the fallback.
+- `improve` records feedback that a ranking backend can use. Consolidation supplies further work such as summaries, relationship weighting, pruning, and fact extraction. Applications or managed backends implement this extension.
+- `forget` appends a deletion record that removes the item from the read view. An optional cascade also removes derived graph nodes, edges, and vectors.
 
-**The graph surface (managed wire surface).** A graph is a materialized view named by a `graph` projection (A11.1): the projection's entity schema declares how nodes and edges are extracted from a payload (label and endpoint pointers), and the graph stores them content-addressed so the same entity converges on one node. Nodes and edges are written by the `graph.upsert` op below, idempotent on the content-addressed ids. The graph is gated by the `graph` op version (A12). The ops:
+Memory kinds are SDK labels: `fact`, `message`, `summary`, `entity`, `feedback`, and `procedure`. `message` is episodic memory, `procedure` is procedural memory, and the other kinds are semantic memory. Lifetimes are `session` or `durable`. Scopes include `user`, `agent`, `session`, `app`, and the physical stream. An unset scope field broadens recall across that field.
+
+A context handle selects one conversation. Its session-memory view uses that conversation for reads and writes without repeating it in each call. This uses the existing scope fields and adds no wire operation. Durable memory and graphs can span conversations. The context graph accessor returns the graph without applying a conversation filter.
+
+Content-addressed IDs derive from content. `content_id` applies the shared FNV function to byte segments and returns a 16-byte ID (A3). A memory ID uses durable owner, kind, and body. A graph node ID uses entity label and value. Matching inputs produce the same ID across clients. Reference vectors fix this behavior.
+
+Content IDs support convergence and duplicate suppression. They do not establish trust. FNV does not protect against deliberate collisions. Writers with permission to submit an ID can also submit it directly. Signed principals or exclusive write permissions provide the integrity boundary (A4.1, B1.1). A cryptographic replacement remains an option if the ID itself needs collision resistance.
+
+A `graph` projection names a managed graph view (A11.1). Its entity schema selects labels and source pointers for node and edge extraction. `graph.upsert` writes nodes and edges by their content IDs. Repeating the same upsert does not create duplicate identities. The `graph` operation version controls support (A12):
 
 | Op | Request | Reply |
 | --- | --- | --- |
@@ -737,29 +785,35 @@ The content id is a **convergence and dedup key, not a security boundary**. FNV 
 | `graph.neighbors` | graph name, node id, direction (`out` \| `in` \| `both`), optional edge type, depth, limit, optional valid-time `as_of`, optional `conversation` lens | the reachable nodes and traversed edges |
 | `graph.upsert` | graph name, nodes, edges (the projector path, idempotent on content-addressed ids) | written |
 
-**Bitemporal edges.** An edge MAY carry a valid-time window (`valid_from` / `valid_to`, epoch micros, both optional and open-ended when unset), the time the relationship it records was true in the world. This is orthogonal to system time, which the substrate supplies for free as the log offset of the upsert (when the edge was observed). Carrying valid-time lets a fact be superseded without being destroyed: a changed relationship closes the old edge with a `valid_to` and opens a new edge, both retained, so the history is replayable. The window is metadata, not identity, so re-observing the same relationship updates the same content-addressed edge. The fields are absent on the wire when unset, so a pre-bitemporal edge encodes byte-identically. A traversal reads "as of" a past time with the `as_of` modifier (A13 ops), which keeps only edges whose valid-time window contains that instant. The system-time `as of` over the log offset is the remaining temporal axis.
+An edge can include `valid_from` and `valid_to` in epoch microseconds. Missing bounds are open-ended. This valid-time window describes when the relationship was true. The log position supplies the separate observation time. To replace a relationship, close the old window and record the new relationship while retaining history. The window does not affect the edge ID.
 
-**Provenance.** A node and an edge MAY each carry a `source`: the record an extraction came from, so a reader can navigate from a graph element back to its origin. A source is one of a message position (numeric stream id, topic id, partition, offset, and the `conversation` that asserted it when known), a key-value entry (namespace, key), or a memory item id. On an edge it is the record that most recently asserted the relationship (last-writer, since an edge is rewritten on each observation to keep its valid-time window current). On a node it is the first record the entity was seen in (first-writer): a re-observation keeps that first source, still applies any genuine field change (a later embedding, new attributes), and skips the write entirely when nothing changed, so a hot entity is not rewritten on every sighting. Provenance is metadata, not identity: it is excluded from the content-addressed id, so it never changes which node or edge an upsert targets. The field is absent on the wire when unknown, so a pre-provenance element encodes byte-identically. The complete history is the message log itself, which the deterministic projector can replay. The graph carries only the navigable pointer, bounded by `MAX_SOURCE_REF_BYTES`.
+A traversal with `as_of` follows only edges valid at that instant. Omitted time fields do not change the earlier encoded form. Reads by log offset provide the separate system-time axis.
 
-Caps (`wire/src/limits.rs`): traversal depth at most 8, at most 10000 nodes plus edges per reply, at most 16 labels per node. The depth and element caps are enforced server-side: an over-cap depth and an over-cap upsert are both rejected with a too-large error, so one request cannot drive an unbounded walk or write. A query may resolve against a fork's overlay by naming the fork, the same copy-on-write the row views use (A10.5). A graph traversal reuses the query `Filter` / `Value` / `Consistency` types, so there is one predicate grammar across the row and graph views. The traversal filters prune the walk, they do not post-filter a finished walk: `node_filter` gates frontier admission at every hop (a node that fails it is neither returned nor expanded), `edge_filter` gates which edges are followed (a filtered edge is neither traversed nor returned). Post-hoc filtering is expressible client-side, pruning is not, which is why the server owns it.
+A node or edge can carry `source` to identify its origin. `SourceRef` can name a message position, a key-value entry, or a memory item. A message position includes numeric stream, topic, partition, offset, and optional conversation. The field is omitted when unknown and does not affect the content ID.
 
-The contract defines the full return set and start modes, and the shipped managed engine serves all of them: the `nodes`, `edges`, `paths`, and `triplets` returns and the `ids`, `match`, and vector `nearest` starts. Nodes and edges are stored in dedicated relational tables keyed by `(graph, id)` with an adjacency index on each endpoint, so a hop is an index-driven range read over the whole frontier rather than a per-node scan, and a `nearest` start ranks node embeddings with the backend's native vector distance. A backend that cannot serve a mode still returns a clean unsupported error rather than a partial or silent answer (A12).
+An edge retains the source that most recently asserted it. A node retains the first source that introduced the entity. Later observations can change embeddings or attributes without replacing that first source. If nothing changes, the node is not rewritten. The reference is bounded by `MAX_SOURCE_REF_BYTES`. The log retains the full history for replay.
 
-A traversal or neighbor read may carry a valid-time `as_of` (epoch micros): only edges whose valid-time window contains that instant are followed, so a read sees what was true then rather than only now. This is the read side of the bitemporal edges above. The system-time `as of` over the log offset is the remaining temporal axis.
+`wire/src/limits.rs` limits traversal depth to 8, total returned nodes and edges to 10000, and labels per node to 16. The server rejects excessive depth and oversized upserts with too-large errors. A query can name a fork to read its overlay. Graph reads reuse query `Filter`, `Value`, and `Consistency` types.
 
-A graph is populated two ways: by an explicit `graph.upsert`, and by projector-driven extraction. Binding a `graph` projection to a source topic (the same `ApplyBinding` the row projections use) makes the projector apply the projection's entity schema to each record as it lands and upsert the extracted nodes and edges, idempotent on their content-addressed ids. Extraction is at-least-once over the source: a re-processed record converges on the same nodes and edges rather than duplicating. The SDK's `link(from, relation, to)` / `unlink(..)` sugar is the same machinery one call tall: link upserts both content-addressed entity nodes and the typed edge (re-linking converges), unlink closes the edge bitemporally (`valid_to` at call time) so the fact is superseded, never destroyed.
+`node_filter` controls entry into each traversal step. A rejected node is neither returned nor expanded. `edge_filter` controls which edges are followed and returned. These filters prune the walk before later steps. Client-side filtering of completed results does not provide that behavior.
+
+The managed engine supports `nodes`, `edges`, `paths`, and `triplets` results. Starting modes are `ids`, `match`, and vector `nearest`. Relational tables store nodes and edges by `(graph, id)`. Adjacency indexes support reads over the current frontier. Nearest starts use the backend vector distance. Unsupported modes must return unsupported instead of partial results.
+
+A traversal or neighbor read can use `as_of` in epoch microseconds. It follows only edges whose valid-time window contains that instant. Log offsets provide the separate observation-time axis.
+
+Use `graph.upsert` to write graph elements directly. Alternatively, use `ApplyBinding` to attach a graph projection to a source topic. The projector extracts and upserts each record under its entity schema. Reprocessing converges on the same content IDs. `link(from, relation, to)` upserts two entity nodes and their edge. `unlink(..)` closes the edge with `valid_to` at call time and retains the historical fact.
 
 This realizes the data-object collection primitives that suit a graph (C6) without a separate query language.
 
-**The conversation lens.** Every managed read model that materializes from the log records the conversation that wrote each row, taken from the record's `gen_ai.conversation.id` header, so a read can narrow to one conversation server-side. Three surfaces carry it, each optional and absent on the wire when unset (so a pre-lens contract stays byte-identical). A `graph.query` and a `graph.neighbors` take a `conversation` filter, matched against each element's source conversation, so a traversal returns only what one conversation asserted. A projection materializes the header into an auto-projected `conversation_id` field on every row (a stable reserved field name), so `query` filters by conversation with an ordinary predicate on any projection, no producer-side index directive needed. A key-value scan takes a `conversation` filter, so a scan of the memory read view narrows to one conversation's memory (a generic key-value entry carries no conversation and is left out of a filtered scan). The lens is a read-side narrowing over provenance, not an isolation or authorship boundary. Those guarantees come from the selected security profile in B1.1.
+Conversation filters use the originating `gen_ai.conversation.id` value. Graph queries and neighbors match it against each element source. Projections expose it through the reserved `conversation_id` field for ordinary query predicates. Memory-view scans can filter by conversation, while generic key-value entries without that metadata are excluded.
 
----
+These fields are optional and omitted when unset. They narrow results but do not prove authorship or grant access. The security profile in B1.1 defines those guarantees.
 
 ---
 
 # Part B. Bindings
 
-A binding owns exactly the substrate-specific concerns: the mapping from logical identity to physical address, the carriage of the out-of-band attributes, the operation dispatch encoding, the request and reply mechanism, and the packing of the opaque `cause_at` locator. Everything else is inherited from Part A unchanged. Within a binding, every mapping below is a hard, fixtured contract.
+A binding maps logical identities to addresses and defines attribute encoding, command dispatch, request-reply transport, and the `cause_at` locator. The remaining rules come from Part A. Reference tests define the expected binding-specific representations.
 
 ## B1. The Iggy binding (normative)
 
@@ -773,15 +827,15 @@ A binding owns exactly the substrate-specific concerns: the mapping from logical
 | managed ops | a reserved command range against the connection (B1.4), not a topic |
 | `cause_at` locator packing | the four-level (stream, topic, partition, offset) address as 20 big-endian bytes in the opaque locator slot |
 
-The Iggy binding uses the `_agdx` ops stream with `control.commands`, `dlq`, and `changes` topics for projection control, dead-letter capsules, and the change feed (A11.8). These four names are wire constants a consumer uses from the shared dictionary rather than redeclaring literals. The reference SDK's `Laser` exposes a builder override for each (`ops_stream`, `control_topic`, `dlq_topic`, `changes_topic`). Managed deployments use the shared constants, while the overrides provide per-test isolation against Apache Iggy without a managed backend. Query and the other managed operations are not topics: they ride the reserved command range (B1.4), off the log.
+The Iggy binding uses `_agdx` for its ops stream. `control.commands`, `dlq`, and `changes` carry projection control, dead letters, and change notifications. Use the shared constants for these names. `Laser` also provides `ops_stream`, `control_topic`, `dlq_topic`, and `changes_topic` overrides for deployment or test configuration. Managed queries use the reserved command range rather than a request topic (B1.4).
 
 Connection bootstrap and environment variables are SDK concerns documented in the tutorial, not part of this binding.
 
-The reference SDK always uses Apache Iggy's VSR client framing without changing any AGDX envelope or header bytes. Standard append, poll, consumer-group, and offset commands share the connection with unknown non-replicated managed codes. The fork promotes the dedicated role-definition, role-deletion, and role-binding codes to replicated operations server-side, so the client does not carry a second capability registry.
+The SDK uses standard Apache Iggy transport framing. Append, poll, consumer-group, offset, and managed commands share the connection. The fork handles role-definition, role-deletion, and role-binding commands through the established custom replicated operations. Clients do not implement a second transport or command registry.
 
-The deployed LaserData Apache Iggy fork uses `iggy-server` as its server process. It terminates the VSR connection, authenticates the caller, stamps the trusted user and client identity, classifies authorization at the command edge, and either handles a fork-native command or forwards it to `laser-plane`. The capability probe reports only the surfaces announced by the connected plane. Laser Stack packages this fork and `laser-plane` for local development and deployment. LaserData Cloud uses the same data path and adds Warden, deployment services, and proprietary interfaces around it.
+The Iggy fork runs `iggy-server`. It authenticates the caller and attaches the trusted user and client identities. It enforces command access, then handles an extension command or forwards it to `laser-plane`. Capability discovery includes the connected plane report. Laser Stack packages the fork with `laser-plane`. LaserData Cloud adds Warden, deployment services, and proprietary interfaces.
 
-Partitioning and isolation are separate concerns on Iggy. Agent provenance uses the conversation id as the partition key, which buys total order within a conversation and lets independent conversations run in parallel across a topic's partitions. A single very high-throughput conversation is therefore bounded by one partition and, on a shard-per-core server, one core. Generic streaming does not acquire this rule: it uses balanced, explicit, or caller-keyed partitioning and preserves order within the selected partition. Partitions are a throughput-and-ordering tool, never an access boundary. Iggy RBAC is enforced at the stream and topic level, not the partition level.
+Agent records use the conversation ID as their partition key. This preserves order within a conversation while different conversations can use separate partitions. One conversation is limited by one partition and its owning shard. Generic streaming supports balanced, keyed, or explicit partition selection. Partitions define ordering and workload placement. Apache Iggy enforces access at stream and topic level.
 
 Authorship uses an explicit deployment security profile:
 
@@ -791,13 +845,13 @@ Authorship uses an explicit deployment security profile:
 | Signed principal | a verified envelope binds the enrolled signing key and authenticated principal to the record | shared agent topics with receiver-side verification |
 | Topology isolated | Iggy ACLs bind one authenticated principal to a write-exclusive stream or topic, optionally with signatures for defense in depth | control and effect channels requiring an exclusive writer |
 
-A receiver must know which profile applies and must not use advisory fields for billing or authorization. The reference SDK's shared command and response topics are valid under the advisory profile for trusted local deployments and under the signed-principal profile when verification is enrolled. A deployment that requires topology isolation creates write-exclusive routes and ACLs. Signatures and topology can be combined, but neither changes the streaming server's message body or adds a hot-path authorship header.
+A receiver must know the deployment security profile. It must not use advisory fields for billing or access decisions. Shared topics can use the advisory profile for trusted writers or the signed-principal profile with verification. Topology isolation requires exclusive write routes and access rules. Deployments can combine signatures with those rules. Neither mechanism changes ordinary Iggy message bodies or adds an authorship header.
 
-Iggy accepts a stream or topic reference as either a name or a resolved numeric id, so the binding passes the numeric id on every publish and consume to save addressing bytes. This is a binding optimization, not a core requirement. The core names a topic logically (A3), and a substrate that addresses by name (Kafka, B2) simply does not get this particular saving. It is the same kind of substrate-specific win as the typed headers (B1.5), and it costs no portability because the core never pinned the addressing form.
+Apache Iggy accepts stream and topic names or numeric IDs. The binding can use resolved numeric IDs to reduce addressing bytes. This optimization does not change the logical model. Other bindings can retain their native addressing.
 
 ### B1.2 Out-of-band carriage: the header dictionary
 
-Iggy carries the out-of-band attributes as typed headers, which is where it earns its place. Keys are short and values typed, so the header budget buys the most routing information per byte. The id routing-header duplicates use the typed 128-bit value, little-endian.
+Apache Iggy carries attributes in typed headers. Routing IDs use its typed 128-bit value with little-endian byte order.
 
 The custom keys are standardized under the `agdx.` namespace, fixed so independent implementations interoperate. The full key is the contract. Keys drawn from OpenTelemetry use the `gen_ai.` namespace verbatim, an external standard.
 
@@ -819,15 +873,15 @@ The custom keys are standardized under the `agdx.` namespace, fixed so independe
 | `agdx.mem.ns` | string | the logical memory namespace a record materializes under, so the read view is keyed by scope rather than by the physical topic |
 | `agdx.mem.user` / `agdx.mem.app` | string | the user and app scope layers a memory record belongs to, materialized onto the read-view row so recall narrows by them |
 
-Header caps: 1024-byte soft cap on total header bytes per record, 255-byte ceiling on a single value, 9 bytes of per-header framing counted toward the cap.
+Headers have a 1024-byte soft limit per record. Each value is limited to 255 bytes. Each header also uses 9 framing bytes, counted in the total.
 
-There is no duplication between these headers and the typed envelope when an agent envelope is present. The two carriers serve two cases. A message that carries a typed `AgentEnvelope` (the body) stamps only the minimized routing projection out of band: the content-type, the wire version, the conversation as the partitioning `Uint128`, and the addressee when targeted. The envelope is the single source of truth for everything else (`source`, `cause`, `correlation`, `deadline_micros`, `idempotency_key`), which is never copied to a header. The full provenance dictionary is used only for messages published without an envelope (the generic provenance path), where the headers are the sole carrier and there is nothing to duplicate. So a field is in exactly one place per message: the envelope for typed agent messages, the headers for generic provenance messages.
+A typed `AgentEnvelope` carries its own message fields. Headers contain only content type, wire version, conversation routing ID, and a targeted addressee. `source`, `cause`, `correlation`, `deadline_micros`, and `idempotency_key` remain in the envelope. Generic messages without an envelope use the provenance header dictionary instead. Each field therefore has one authoritative carrier for that message form.
 
 ### B1.3 Versioning carriage
 
-The durable agentic record carries its wire version as the `agdx.av` header, never a body field. The managed request envelopes carry a `v` first field, but the binding also negotiates version at connect through the `hello` reply (A12), which fails fast before a round trip. The in-band `v` is therefore redundant defense, not the primary mechanism.
+Agent records carry their version in `agdx.av`. Managed envelopes carry `v`, and `hello` also reports the supported versions (A12). The client uses discovery to reject unsupported operations before sending. The request version provides another check at the receiver.
 
-Each surface is versioned by the mechanisms named here so an implementer knows where to look. The hello-negotiated slots and fenced-lease request family use version 1. The fenced-lease family also requires its feature gate. When simultaneous hello-slot versions are needed they become a min and max range on the same slot rather than a flag day.
+The table defines the version carrier for each operation group. Hello slots and fenced-lease requests currently use version 1. Fenced leases also require their feature bit. If a later contract supports multiple simultaneous versions, it can use a minimum and maximum on the same slot.
 
 | Surface | Mechanism | Carrier |
 | --- | --- | --- |
@@ -840,7 +894,7 @@ Each surface is versioned by the mechanisms named here so an implementer knows w
 
 ### B1.4 Operation dispatch and the command range
 
-The operation registry (A5) is realized as a `u32` command code. Raw Apache Iggy has no such range and rejects these, which enforces the open-versus-managed boundary.
+The Iggy binding maps each registered operation to a `u32` command code. Original Apache Iggy rejects unsupported managed commands. Standard streaming operations remain available.
 
 | Op id | Code |
 | --- | --- |
@@ -866,15 +920,29 @@ The operation registry (A5) is realized as a `u32` command code. Raw Apache Iggy
 | `graph.query` / `upsert` / `neighbors` | 1_000_600 .. 1_000_602 |
 | `agent.submit` / `cancel` / `status` / `list` | 1_000_700 .. 1_000_703 |
 
-Authorization and system management is the first management band (`+100`), after the internal/handshake block, and the feature bands sit one block down accordingly. The base value is high (a million) only to avoid colliding with Apache Iggy's own low command codes, and the 100-wide blocks are organizational. Both are Iggy-local. They are pinned and fixtured here in the binding, not in the core.
+Authorization and system management use the first management block, `+100`, after internal and discovery commands. Feature blocks follow it. The base value of one million avoids collisions with ordinary Iggy codes. Blocks are 100 codes wide. These fixed numbers belong to this binding and its reference tests.
 
-The server forwards an opaque CBOR request to `laser-plane` over a local Unix socket, stamping the authenticated identity the SDK cannot set. A `ForwardedQuery` carries the trusted user id, the client id, an audit correlation, and the opaque query envelope. Every other plane-served operation uses `ForwardedCommand`, which additionally carries the command code and a retained compatibility field that is no longer used for data selection. The socket frame is `[len: u32 little-endian][named-field CBOR payload]`, with a 64 MiB ceiling. `laser-plane` dispatches these frames to its query, projection and schema browse, KV, fork, graph, run, and mixed-batch handlers. Its projector and fold loops consume the durable Iggy logs and maintain embedded read models, so the forwarded request path is a read or command path over state derived from the log rather than a second source of truth.
+The server forwards CBOR requests to `laser-plane` through a local Unix socket. It attaches authenticated identity that the SDK cannot choose. `ForwardedQuery` carries the trusted user ID, client ID, audit correlation, and query envelope. Other operations use `ForwardedCommand`, with a command code and a retained field that no longer selects data.
 
-The managed surfaces are gated by a **capability layer** orthogonal to the substrate's own permissions, which are never touched. A grant is `effect feature:action [on resource-pattern]`: `effect` allow or deny (deny wins), `feature` maps to the command bands (`kv`, `memory`, `projection`, `graph`, `query`, `fork`, `agent`, `workflow`, plus `authz` for administering the layer, and the coordination split-outs `kv_lease` and `kv_fence`), `action` is `read`/`write`/`delete`/`admin` (a deliberately closed set: every action widens the shared coarse-capability mask by one bit per feature, so new capability semantics split into a feature, never a new action), and the resource pattern is `all`, a `literal` name, or a `prefix`. Lease lifecycle (`kv.lease` / `lease_renew` / `release`) authorizes against `kv_lease:admin` on the coordination namespace, never plain `kv:write`. A fenced compare-and-swap authorizes its target namespace under `kv:write` and additionally requires `kv_fence:read` on its coordination namespace, checked by the enforcer beside the mapped primary grant. `all` is the only pattern that matches a request with no keyed resource selector. `literal` and `prefix` grants require a concrete resource string and never widen into list or whole-surface operations. Grants are assembled through **roles** bound to a subject, and the subject is the server-stamped, unspoofable user id. A role name is at most 64 bytes and restricted to the same strict charset safelist as a fork id: ASCII letters, digits, `-`, `_`, and `.`. The rule is owned in the wire contract (`validate_role_name`) and enforced on define and bind by the SDK, the server edge, and the console alike, never on journal replay, so tightening the rule cannot strand existing state. A user's effective capability is the union of the grants of every bound role, minus any matching deny. With the layer enabled and no bound role, the default is **deny**. The `(feature, action)` a command authorizes against is a pure function of its code (shared by every enforcer so they cannot drift), and the resource is the leading keyed field of the request (kv namespace, fork id, projection/schema id). The server derives both and checks them before forwarding, rejecting with the unauthorized result code, and a `batch` is decomposed and every inner op checked. Query and graph DSL depth (the per-source check) is enforced by the managed side where the envelope is fully parsed. Grants live in the substrate's durable, boot-replayed state journal (the same path as create-user), so the check reads a precomputed, resident capability set with no round trip. Isolation is name-granular (resource pattern on the unforgeable subject), so two principals are separated by distinct namespaces or prefixes plus scoped grants, not by per-record ownership inside a shared name. The physical shared pool (A10, A13) is correct once access is name-gated at the edge. Administering the layer (defining roles, binding them) requires the `authz:admin` capability or the near-root server-management permission (the bootstrap backstop, so an operator is never locked out before any grant exists). `whoami` is answered to the authenticated caller, while role catalog, binding browse, and history reads require `authz:read` or the near-root server-management permission. On-behalf-of delegation carries the invoking user in the signed envelope metadata key `on_behalf_of` (A9.6). The effective grant is then the agent's capabilities intersected with that user's, so the agent can never exceed the user it acts for. Permission intersection, not substitution.
+Socket frames use `[len: u32 little-endian][named-field CBOR payload]` and a 64 MiB limit. `laser-plane` dispatches queries, registry reads, KV, forks, graphs, runs, and batches. Its projectors and state readers maintain models from the durable Iggy logs. Forwarded commands operate on those models.
+
+Managed access uses grants independently of ordinary Apache Iggy permissions. A grant has the form `effect feature:action [on resource-pattern]`. A matching deny takes precedence over allow. Features include `kv`, `memory`, `projection`, `graph`, `query`, `fork`, `agent`, `workflow`, `authz`, `kv_lease`, and `kv_fence`. Actions are the closed set `read`, `write`, `delete`, and `admin`. New capability meanings belong to features rather than new actions.
+
+Resource patterns are `all`, `literal`, or `prefix`. Only `all` matches a request without a keyed resource. Literal and prefix grants require a concrete resource and cannot authorize an entire list implicitly. `kv.lease`, `lease_renew`, and `release` require `kv_lease:admin` on the coordination namespace. Fenced CAS requires `kv:write` on the target and `kv_fence:read` on the coordination namespace.
+
+Roles bind grants to the authenticated user ID supplied by the server. A role name contains at most 64 bytes. Allowed characters are ASCII letters, digits, `-`, `_`, and `.`. `validate_role_name` enforces this rule during define and bind operations in the SDK, server edge, and console. Replay does not reapply the name rule to stored state. Effective access combines role grants, then removes matching denies.
+
+With managed authorization enabled, a user without roles has no managed access. The command code determines its feature and action. The request supplies the keyed resource, such as a namespace, fork ID, or projection ID. The server derives these values and rejects unauthorized requests before forwarding. It checks each operation inside a batch. The managed backend checks query and graph access to individual sources.
+
+The established authorization operations store roles and grants in durable metadata state and restore them on startup. Enforcement reads the resident capability set. Namespace and prefix grants provide name-based separation within shared storage. Per-record ownership is not inferred. `authz:admin` or near-root server management permits role definition and binding. The server-management permission also provides initial administrative access before grants exist.
+
+An authenticated caller can read its own `whoami` result. Role catalogs, binding lists, and history require `authz:read` or near-root server management. Signed `on_behalf_of` metadata names a delegated user (A9.6). Effective permission is the intersection of the agent grants and that user grants. Delegation cannot increase either set.
 
 ### B1.5 Low-latency features exploited
 
-The binding uses Iggy-specific fast paths because the core only requires that the out-of-band attributes be carriable, not how. All three SDKs use VSR exclusively. Typed compact headers, numeric stream and topic identifiers, caller-selected balanced, keyed, or explicit partition routing, the single multiplexed connection for streaming and managed commands, and the low-latency local delivery paths are all used. Client-side batch assembly is exploited the same way: the SDK's opt-in batching producer and buffered chunk writer accumulate records and hand them to one substrate batch append, amortizing the per-message cost without touching what any record carries. Rust retains reference-counted payload bytes on its direct producer and consumer path, TypeScript passes `Uint8Array` into Node `Buffer` views at its Apache Iggy boundary, and Python retains the reference-counted Iggy payload until the one required copy into a Python `bytes` object. Managed reads use VSR's non-replicated extension path. The three authorization mutations use dedicated replicated operations. None of these binding choices changes the core bytes.
+The binding uses standard Iggy framing, typed headers, numeric IDs, partition routing, and shared connections. Batch producers and chunk writers group records without changing their contents. Rust keeps reference-counted payload bytes on direct streaming paths. TypeScript creates Node `Buffer` views over `Uint8Array` at its Iggy boundary. Python retains the Iggy payload until it creates Python `bytes`.
+
+Managed reads use the non-replicated extension path. The three managed authorization writes use dedicated replicated operations. These choices preserve the core payload encoding.
 
 ## B2. The Kafka binding (illustrative, roadmap)
 
@@ -896,15 +964,15 @@ The payload, the envelope, the dictionaries, the validity matrix, and the result
 
 ## B3. Other substrates and the substrate requirement
 
-- **NATS JetStream.** Subjects map to topics, the stream sequence is the offset, durable consumers are consumer groups, JetStream KV maps the state surface natively, headers are untyped. A good fit.
-- **Apache Pulsar.** Topics, partitions, message ids, and subscriptions map closely, with native compaction for the state surface. A good fit.
-- **A single-stream log broker.** Entry ids, consumer groups, and replay exist, but durability and partitioning are weaker and a single stream is the ordering unit. Possible for lighter deployments.
+- NATS JetStream can map subjects to topics and stream sequences to offsets. Durable consumers can represent consumer groups. JetStream KV can supply working state, while its headers remain untyped.
+- Apache Pulsar can map topics, partitions, message IDs, and subscriptions to the model. Compaction can support state materialization.
+- A single-stream broker can supply IDs, consumer groups, and replay. Its durability and partitioning depend on the chosen system. One stream remains one ordering unit.
 
-**The substrate requirement.** A substrate can host the model if it provides an append-only, partitioned, offset-addressed log with replay and keyed ordering, a way to carry the out-of-band attributes alongside a body, and either a request and reply mechanism or a topic pair to emulate one. Typed headers, low-latency local delivery, log compaction, and native transactions are optional accelerators a binding exploits when present. The query surface is always a managed layer above the log.
+A substrate needs an append-only log with partitions, offsets, replay, and key-based ordering. It must carry attributes with message bodies. It also needs request-reply operations or topic pairs that can provide them. Typed headers, local delivery, compaction, and transactions are optional. Queries remain a managed layer above the log.
 
 ## B4. The HTTP binding (management and UI)
 
-A management and UI surface maps the same operation registry onto REST routes for a browser or wasm client. It is a thin translation, not a second source of truth. `laser-wire` provides a runtime-agnostic typed HTTP client over a caller-supplied transport.
+The HTTP binding maps managed operations to REST routes for browser and WebAssembly clients. `laser-wire` provides a typed HTTP client over a transport supplied by the caller. It uses the same operation contract as the binary binding.
 
 | Operation | Route |
 | --- | --- |
@@ -932,11 +1000,13 @@ A management and UI surface maps the same operation registry onto REST routes fo
 | `registry.list_graphs` / `get` / register / drop graph projection | `GET /graphs?topic=&name_contains=&id_prefix=&search=` / `GET /graphs/{id}` / `POST /graphs` / `DELETE /graphs/{id}` (the projection listing narrowed to graph-kind projections, register and drop riding the control envelope) |
 | `authz.whoami` / `list_roles` / `get_role` / define / delete role / `get_bindings` / bind roles | `GET /authz/whoami` / `GET /authz/roles` / `GET /authz/roles/{name}` / `PUT /authz/roles/{name}` / `DELETE /authz/roles/{name}` / `GET /authz/users/{id}/roles` / `PUT /authz/users/{id}/roles` (gated by the `authz` capability, B1.4. `whoami` reads the caller's own bound roles and effective grants, `list_roles` a JSON array of `Role` and `get_role` one `Role` or `404`. A role `PUT`/`DELETE` and a user bind (`PUT` a bare JSON array of role names) journal to the server-side authorization band, the reads forward like any managed read.) |
 
-A graph projection registers and drops through the control commands `RegisterGraph` / `DropGraph` on the control topic (A11.2), the same durable path as a row projection, and lands in the one projection registry alongside row projections. The `/graphs` and `/projections` routes are the two browse views that partition that one registry by kind: `/graphs` keeps only graph-kind projections and `/projections` only row-kind (non-graph) ones, and each id route returns `404` for the other kind. Both list routes forward the same `list_projections` read and filter by kind, so the registry stays a single source of truth and the two views never diverge. On the `/graphs` routes a `POST` registers, a `DELETE` drops, and a `GET` lists or reads, so a graph explorer discovers the available graphs by name without a graph projection ever surfacing in the query/index browse. The node and edge data is written content-addressed by the binary `graph.upsert` op (the `/graph/{name}/query` and `/neighbors` routes read it), not over the registration routes.
+`RegisterGraph` and `DropGraph` update graph projections through the control topic (A11.2). Row and graph projections share one registry. `/graphs` lists graph projections, and `/projections` lists row projections. An ID route returns `404` for the other kind. Both list routes use `list_projections` and filter by kind.
 
-JSON request and reply bodies mirror the CBOR wire types. Key-value keys are arbitrary bytes, so in a path or query parameter they are base64url-encoded, and a value rides the raw request body with the optional expiry carried as the `expires_at_micros` query parameter. The authenticated identity is the same trust boundary the binary binding stamps, so scoping is identical. The route prefix is a deployment-configurable operational name, not a wire constant (the current implementation defaults to `/agdx`, so `GET /capabilities` is served at `/agdx/capabilities`).
+For `/graphs`, `POST` registers, `DELETE` removes, and `GET` reads. `graph.upsert` writes node and edge data. `/graph/{name}/query` and `/neighbors` read that data. Registration routes do not write graph elements.
 
-Each wire error maps to a precise status, the same mapping on every surface, so a client need not parse error strings:
+JSON requests and replies use representations of the CBOR types. Key-value keys use base64url in paths and query parameters because keys can contain arbitrary bytes. Values use the raw request body, with optional `expires_at_micros` in the query. Authentication uses the same identity boundary as the binary binding. Deployments can configure the route prefix. The default `/agdx` places `GET /capabilities` at `/agdx/capabilities`.
+
+Each wire error maps to an HTTP status. Clients can use that mapping without parsing error text:
 
 | Condition | Status |
 | --- | --- |
@@ -950,11 +1020,15 @@ Each wire error maps to a precise status, the same mapping on every surface, so 
 | missing or invalid credential (unauthenticated) | 401 Unauthorized |
 | authenticated but missing the grant (forbidden), or a step-up is required | 403 Forbidden |
 
-The reply contract is uniform: a `2xx` carries the bare `Ok` payload, and every non-`2xx` carries a canonical **error body** `{ code, message, detail? }`. Bare means the inner value, never the binary band's reply wrapper. The browse routes serve a JSON array (`GET /projections`, `GET /schemas`) or a single object (`GET /projections/{id}`, `GET /schemas/{id}`, with `404` for absent), not the `BrowseReply`/`BrowseOutcome` envelope the CBOR socket multiplexes its ops through. A registration replies the bare allocated id. `code` is the unified `ResultCode` (A7) so a client dispatches on the classification rather than parsing the message text. `message` is human-facing, and `detail` is optional structured context (e.g. the conflicting version on a compare-and-swap miss). The status line is derived from `code` via the table above, so the two never disagree. The route constants, the path builders, the typed query-parameter structs (one field per parameter name above), this error body, and a typed client over a caller-injected transport (`gloo-net` on wasm, `reqwest` natively) are all owned in the wire crate's `http` / `http_client` modules, so a browser or native client carries no hand-rolled route, base64url, or query-string glue, and any drift is a compile or doc-test failure rather than a production `404`.
+A successful `2xx` response carries the inner `Ok` value. Other responses carry `{ code, message, detail? }`. `code` is the shared `ResultCode` (A7), `message` is display text, and `detail` is optional structured information. The status derives from the code.
 
-The capabilities reply carries the grouped shape from A12. Query additionally advertises cursor paging, cancellation, and execution status. Destinations advertise lifecycle, checkpoint status, query routes, table schema, snapshots, files, metrics, and strongest checkpoint-read consistency. The sub-features default off and a server advertises one only when it genuinely serves it.
+Browse lists return JSON arrays through `GET /projections` and `GET /schemas`. ID routes return one object through `GET /projections/{id}` and `GET /schemas/{id}`, or `404`. They do not use the binary `BrowseReply` or `BrowseOutcome` wrapper. Registration returns the allocated ID.
 
-Mutation bodies carry a bounded public checkpoint request with a request ID and expected revisions. Asynchronous work returns `AcceptedOperationView` with an operation ID, request ID, state, timestamps, optional typed error, and the tagged destination or query-route mutation result after success. A `2xx` response never implies that asynchronous work completed unless its state says `succeeded`.
+The `http` and `http_client` modules own route constants, path builders, query parameters, error bodies, and the typed client. Callers supply a transport, such as `gloo-net` or `reqwest`. Shared types avoid separate route and encoding implementations.
+
+HTTP capabilities use the grouped representation from A12. Queries can report paging, cancellation, and execution-status support. Destinations can report lifecycle, checkpoints, routes, schema, snapshots, files, metrics, and checkpoint-read consistency. Each feature defaults off. The server reports it only when supported.
+
+Checkpoint mutations carry a bounded public request with an ID and expected revisions. Asynchronous work returns `AcceptedOperationView`. This contains operation and request IDs, state, timestamps, optional errors, and the destination or route result after success. A `2xx` response proves completion only when the operation state is `succeeded`.
 
 ---
 
@@ -964,7 +1038,7 @@ Mutation bodies carry a bounded public checkpoint request with a request ID and 
 
 ### C1.1 Invariants
 
-Every port preserves these, and they are what the fixture corpus pins.
+Reference tests cover these implementation requirements:
 
 - One CBOR encoding with named fields, and decoding fails on trailing bytes.
 - The durable layer versions out of band, never with a body field.
@@ -979,31 +1053,31 @@ Every port preserves these, and they are what the fixture corpus pins.
 
 These decisions are settled. They are recorded here because they are not obvious from the field tables alone.
 
-**The typed envelope is the single source of truth, and the binding stamps only a minimal routing projection out of band.** A message carrying an `AgentEnvelope` puts just the routing subset in headers (content-type, wire version, conversation, and the addressee when targeted). Everything else (`source`, `cause`, `correlation`, `deadline_micros`, `idempotency_key`) lives in the envelope and is never copied to a header. Three forces require this. Several envelope fields are structured or large and do not fit a flat capped header space. Headers are substrate-specific and lossy across hops, so they cannot survive mirroring or republish. And a router wants only a small subset. The generic provenance header dictionary is therefore used only for messages published without an envelope, where the headers are the sole carrier and nothing is duplicated (B1.2).
+An `AgentEnvelope` keeps message data in the payload. Headers carry only content type, version, conversation routing, and an optional addressee. `source`, `cause`, `correlation`, `deadline_micros`, and `idempotency_key` remain in the envelope. Structured fields can exceed header limits, and header formats differ across substrates. Generic messages without an envelope use the provenance headers as their sole carrier (B1.2).
 
-**One result space.** Every surface error projects onto a single `ResultCode` and its HTTP status while keeping its typed detail (A7). A generic client dispatches on the code, and a specialist still reads the typed variant.
+Each error maps to one `ResultCode` and HTTP status while retaining its specific details (A7). Generic clients use the code. Operation-specific clients can inspect the typed error.
 
-**`cause_at` is an opaque, binding-defined byte string, and `cause` is the portable identity.** A foreign consumer that cannot interpret the locator falls back to `cause` (a portable id). This keeps the envelope substrate-neutral while letting each binding pack its native address. The Iggy binding packs its four-level position as 20 big-endian bytes.
+`cause_at` is an opaque, binding-defined byte string, and `cause` is the portable identity. A foreign consumer that cannot interpret the locator falls back to `cause` (a portable id). This keeps the envelope substrate-neutral while letting each binding pack its native address. The Iggy binding packs its four-level position as 20 big-endian bytes.
 
-**Optimistic concurrency is an entry version plus a conditional write.** The key-value store carries a version token, and `kv.cas` commits only against the expected version or absence (A10.3). It is gated by the `kv_cas` capability, so a backend that cannot do a conditional write returns unsupported rather than a wrong answer.
+Optimistic concurrency is an entry version plus a conditional write. The key-value store carries a version token, and `kv.cas` commits only against the expected version or absence (A10.3). It is gated by the `kv_cas` capability, so a backend that cannot do a conditional write returns unsupported rather than a wrong answer.
 
-**Read consistency is a per-query level.** A query names `eventual`, `read_your_writes`, or `strong` (A11.3). A level the backend cannot serve returns `stale` or `unsupported` and is gated by the `read_your_writes` and `strong_consistency` capabilities.
+Read consistency is a per-query level. A query names `eventual`, `read_your_writes`, or `strong` (A11.3). A level the backend cannot serve returns `stale` or `unsupported` and is gated by the `read_your_writes` and `strong_consistency` capabilities.
 
-**`must_understand` lets one message demand strict handling without a version bump.** The marker is a u64 bitset on the envelope (A9.1). A clear bit means ignore-if-unknown, and a set bit a receiver does not implement means reject. No bits are defined yet, so the mechanism is in place for the first feature that needs it.
+`must_understand` lets one message demand strict handling without a version bump. The marker is a u64 bitset on the envelope (A9.1). A clear bit means ignore-if-unknown, and a set bit a receiver does not implement means reject. No bits are defined yet, so the mechanism is in place for the first feature that needs it.
 
 ## C2. What not to adopt
 
-- **Queue and broker primitives.** Server-push delivery, ack and nack settle verbs, delivery-mode negotiation, redelivery counters and visibility timeouts, broker-managed dead-letter queues, and message priority. The streaming layer is a log (A1.5), and these are queue semantics that either do not map or are already provided by offsets, replay, and the reliable consumer. This is the single biggest filter applied to the broker idea-space.
-- **Telemetry as a separate primitive set.** Logs, metrics, traces, and events are records on topics with OTel-aligned provenance headers and a trace projection, not new operations (A1.5).
-- **A transport stack.** No frame layout, flow control, multiplexing, keepalive, or connection handshake of our own. The substrate owns transport. This is the deliberate inversion of a transport-shaped protocol into a data-shaped one.
-- **Cross-substrate distributed transactions.** A transaction, if offered, is scoped to one connection and one responder.
-- **Mutable objects as the primary store.** The state surface is a read model on the log. The log stays the source of truth.
-- **Trust scores or admission control in the envelope.** Every agent-written field is a claim. Enforcement lives at the capability owner. Identity granularity equals credential granularity.
-- **Prompt guardrails as the security boundary.** A model-level filter is advice to a probabilistic component, not enforcement. The enforcement points are the command edge (the capability layer, B1.4) and the effect boundary (the governance hook, C3), and every decision leaves evidence as a record on the log rather than in a second audit store.
+- Queue settlement operations, delivery-mode negotiation, visibility timeouts, and message priority do not define log behavior. Offsets, replay, and the reliable consumer provide the relevant delivery mechanisms (A1.5).
+- Telemetry uses ordinary records with OpenTelemetry-aligned metadata and projections (A1.5). It does not add operation codes.
+- The substrate owns framing, flow control, connection sharing, keepalive, and negotiation. AGDX must not add a parallel transport implementation.
+- Cross-substrate distributed transactions. A transaction, if offered, is scoped to one connection and one responder.
+- Mutable objects as the primary store. The state surface is a read model on the log. The log stays the source of truth.
+- Agent-supplied fields remain claims. The capability owner enforces admission. A credential defines the identity available for access decisions.
+- Model prompts do not enforce the security boundary. The command edge applies access rules (B1.4), and the effect boundary applies governance (C3). Decisions record evidence in the log.
 
 ## C3. Roadmap
 
-These are draft proposals. None is settled, and none is pinned into the fixture corpus. They are recorded so the design space is visible, and they evolve as real use sharpens the scope. Each is expressible in the wire contract independently of the runtime that serves it: the contract defines the shape, a capability flag gates the operation, and an unserved operation returns a clean unsupported error. The dormant claim-check encryption code and the agent version that reads zero until consumed follow the same pattern, as the signature slot already did before the reference SDK activated it (see the roadmap row below).
+The following proposals are not part of the settled contract and have no fixed reference encoding. Each needs data types, capability discovery, and unsupported behavior before adoption. Reserved fields can support later features, as the signature field did before SDK signing support.
 
 | Proposal | Shape (draft) |
 | --- | --- |
@@ -1019,27 +1093,31 @@ These are draft proposals. None is settled, and none is pinned into the fixture 
 
 ## C4. Conformance and fixtures
 
-A conformant port decodes and validates the complete envelope, produces whatever subset of kinds its use case needs, and is pinned by the positive and negative fixture corpus in both directions. It depends only on a CBOR library, the 16-byte id codec, the constants, the validate function, and the verb behaviors. No crypto, no proc-macros, no compression, and no transport beyond its substrate client.
+A conforming client decodes and checks the complete envelope. It can produce only the kinds that its application needs. Positive and negative reference cases cover decoding and encoding. The base implementation needs CBOR, the 16-byte ID codec, constants, validation, and operation behavior. Optional signing adds cryptographic requirements.
 
 A binding adds fixtures for three things only: the identity-to-address mapping, the operation dispatch, and the out-of-band header encoding. The payload fixtures are shared across every binding.
 
-One byte-order rule is easy to get wrong. An application AGDX id (`conversation`, `record`, `correlation`, `channel`, minted SDK-side, distinct from the substrate's own message id or offset) rides the CBOR envelope as a 16-byte **big-endian** byte string (A3). When the same id is also stamped as an Iggy routing header (the conversation, for partitioning), that header copy is Iggy's typed `Uint128`, which is **little-endian** (B1.2). One id, two encodings by carrier. A port that reads the header copy as big-endian will mis-route, so the corpus pins both forms.
+Application IDs such as `conversation`, `record`, `correlation`, and `channel` differ from Iggy message IDs and offsets. CBOR stores them as 16-byte big-endian byte strings (A3). An Iggy routing header stores the conversation through typed `Uint128`, which is little-endian (B1.2). Decode each carrier with its specified byte order. Reference tests cover both forms.
 
 ## C5. Stability and evolution
 
-The contract is pre-1.0 and open to change. The normative surface is Part A as built plus Iggy binding (B1). The roadmap (C3) is a sketch of the design space, and a proposal is pinned into the fixture corpus only once its shape is settled. The dormant slots already in the wire (the signature type, the claim-check encryption code, and the `must_understand` marker) activate additively under that same rule. The Rust SDK surface has its own stability contract in the appendix below, distinct from this wire contract.
+The contract is pre-1.0 and permits breaking changes without backward compatibility. Update every affected client, service, specification, and reference file together. Part A and the Iggy binding define the current contract. Roadmap entries remain proposals until adopted. Reserved fields do not promise implementation. The appendix describes the SDK API separately.
 
 ### C5.1 Right to forget (erasure posture)
 
-Erasure is split by which store owns the bytes. The raw log is append-only and owned by the substrate: a record is not edited in place, so "forget" on the log is retention expiry (the topic's message-expiry drops the segment once its window passes) plus, for a bounded set of subjects, crypto-shredding: a claim-checked body (A9.5) is dropped by deleting its blob-store object, and the log keeps only the now-dangling `BodyRef` capsule whose bytes are unrecoverable. The read models are owned by the managed plane: a tombstone-hide is immediate (the projector applies a delete/supersede and the row stops being returned), and a hard erase-by-subject rebuilds the affected projection from the retained log with the subject's records filtered out. What the platform does _not_ promise is retroactive edit of the immutable log within its retention window. A deployment that must guarantee subject erasure inside that window configures a shorter window or routes those subjects through claim-check so the shred is a single object delete. This is a documented posture, not an operation: no `forget` verb ships, because erasure is a deployment-and-retention decision, not a per-call one.
+Erasure depends on the store that holds the bytes. The substrate log is append-only, so retention controls removal of log records. A referenced body can follow its object store deletion policy while the log retains the `BodyRef`. Deleting an object is not itself proof that every backup copy is erased.
+
+The managed plane can hide a deleted or superseded row after applying its record. A deployment can rebuild a projection while excluding selected records. AGDX does not promise in-place edits to retained log history. Deployments with erasure requirements must define retention and external-object deletion policies. This section describes deployment policy and adds no erasure operation.
 
 ### C5.2 Schema evolution
 
-The schema registry (A11.2) is the evolution seam, but it carries no compatibility-mode contract: `RegisterSchema` allocates a permanent, collision-rejected id (`SchemaDef { id, source, name, version }`), and `name`/`version` are optional caller-tracked metadata the registry stores and returns but never dispatches on, only `id` selects the decoder. Readers decode against a specific id: a record carries its writer schema id (`agdx.sid`), and the versioned-decode path resolves that id, so a topic carrying several live ids decodes each record under the schema it was written with rather than assuming the latest. Migration is therefore additive by construction rather than by a declared mode: a change registers as a new id (ids are never overwritten), producers move to the new id when ready, and readers span as many ids as the topic has ever used. Dropping a schema only retires it from new registrations and browse listings, and a record already stamped with its id keeps decoding. A producer that wants a compatible evolution keeps it compatible by discipline (e.g. only widening what a new id's readers already tolerate), not by a mode the registry checks.
+`RegisterSchema` assigns a permanent ID and rejects collisions (A11.2). `SchemaDef { id, source, name, version }` retains optional name and version metadata. Only the ID selects the decoder. A record carries its writer ID in `agdx.sid`. Readers resolve that ID even when a topic contains records from several schemas.
+
+Register a new ID for a changed schema, then move producers to it. Existing IDs are not overwritten. Dropping a schema removes it from active registration and browsing but retains decoding for existing records. The registry does not enforce a compatibility mode. Applications choose their schema migration policy.
 
 ### C5.3 Cross-surface timeline
 
-"Everything that happened for one context" is a read recipe, not a new verb. A conversation's timeline is the log filtered to one `ConversationId` across the surfaces it touched (commands, responses, tool calls, memory writes, run status), ordered by the substrate's single timestamp clock, exactly what the reader/cursor plus a conversation filter already produce, and what the Conversations lens in the management UI renders. Global stores (kv, memory, graph, query) stay separate views, honestly scoped, rather than being folded into one synthetic timeline. The SDK documents the recipe (a `ContextAssembler` over the context's topics) instead of growing a `timeline()` verb, so there is one context model, not two.
+A conversation timeline reads relevant topics, filters by `ConversationId`, and orders the records by timestamp. It can include commands, responses, tool calls, memory writes, and run status. `ContextAssembler` provides this read pattern over selected topics. KV, memory, graph, and query remain separate views. The SDK does not add a separate `timeline()` operation.
 
 ## C6. Data-object operation map
 
@@ -1061,23 +1139,27 @@ AGDX expresses its data model as named operations rather than defining a second 
 | `BEGIN` / `COMMIT` / `ABORT` (txn) | optional, managed-plane only | roadmap |
 | `EVENT` / `LOG` / `METRIC` / `TRACE` | telemetry is a published record plus the provenance OTel header dictionary (A6), not dedicated ops | convention |
 
-Governance validation is split by ownership. `laser-wire` pins the authz bytes and command codes with fixtures and constants tests, and unit-tests the deny-wins/default-deny/delegation decision helpers. The shared coarse-capability bitmask (`action_index`) is guarded by a compile-time assert that `Feature` count times `ACTION_COUNT` fits the 64-bit mask and that `ACTION_COUNT` equals the true `Action` variant count, so adding a feature or action can never silently alias two capabilities onto one bit or skip a row. The Rust, Python, and TypeScript SDKs test the typed client surface and shared scenarios. The Iggy fork owns full enforcement integration: journal replay, root `admin` seed, per-command resource selection, batch decomposition, and edge rejection before forwarding. The managed plane owns the per-source query/graph depth checks on forwarded grants, and gates the role catalog and role-binding browse reads behind `authz:read` (listing who-can-do-what is itself privileged, so an unprivileged caller cannot enumerate the policy). The `Feature` and `Action` enums are `#[non_exhaustive]` so a newer peer's added capability does not force a breaking match, and an unknown authz `feature`/`action` string an enforcer cannot classify is treated as matching no grant (default-deny), never as a silent allow. The mirrored `governance` examples are live smoke tests against a deployment that advertises `authz`. Raw Apache Iggy correctly skips those phases because it does not serve the server-side authorization band. Above the command edge, the SDK adds the effect-boundary governance hook (C3): a deployment-enrolled `ActionGovernor` decides before an agent's side effect runs and every non-allow decision leaves a digest-chained evidence event on the audit topic, verified by the cross-SDK governance scenarios. The hook cannot widen server-side RBAC, only narrow what an agent does before it reaches the edge.
+`laser-wire` defines authorization types and codes, reference encodings, and grant-decision helpers. A compile-time assertion keeps the `Feature` count multiplied by `ACTION_COUNT` within 64 bits. Another assertion matches `ACTION_COUNT` to the `Action` variants. These prevent capability-bit overlap and omitted action rows.
 
-**Status-code map.** The draft's statuses project onto the unified result-code space (A7): `CREATED`/`OK`/`NO_CONTENT` to `ok`, `VERSION_CONFLICT`/`ALREADY_EXISTS`/`LEASE_LOST`/`TXN_CONFLICT` to `conflict`, `NOT_FOUND` to `not-found`, `NOT_IMPLEMENTED` to `unsupported`, `RESOURCE_EXHAUSTED`/backend faults to `backend`, `INVALID_ARGUMENT` to `invalid-argument`, `PARTIAL` to the paging cursor rather than a status.
+Rust, Python, and TypeScript test their typed APIs and shared scenarios. The Iggy fork tests authorization replay, initial `admin` access, resource selection, batch decomposition, and rejection before forwarding. The managed plane checks access to each query or graph source. Role catalogs and binding lists require `authz:read`.
 
-**Deliberately not adopted (broker semantics the log does not have).** The draft's push messaging (`SUBSCRIBE` / `DELIVER` / `ACK` / `NACK` / per-subscription `ACK_MODE`) is **not** implemented: Apache Iggy is an offset log, not a queue, so delivery guarantees (at-least-once, redelivery, dead-lettering, delivery-count) come from log replay plus idempotent dedup (A1.5, the reliable consumer and the dead-letter capsule A9.5), not from broker settlement ops. `WATCH` / `NOTIFY` change-capture ships as the log-native change feed (A11.8): records on a change topic consumed by offset, not a broker watch.
+`Feature` and `Action` use `#[non_exhaustive]`. An unknown feature or action that enforcement cannot classify matches no grant. It must not create an allow decision. The `governance` examples run managed checks only when the deployment reports `authz`. Original Apache Iggy skips those managed phases.
 
----
+`ActionGovernor` applies policy before an SDK effect. Decisions that are not allow produce linked evidence records. Shared client scenarios test this behavior. The hook can restrict agent actions but cannot grant access denied by server RBAC.
+
+The draft status names map to A7 results. `CREATED`, `OK`, and `NO_CONTENT` map to `ok`. `VERSION_CONFLICT`, `ALREADY_EXISTS`, `LEASE_LOST`, and `TXN_CONFLICT` map to `conflict`. `NOT_FOUND` maps to `not-found`, and `NOT_IMPLEMENTED` maps to `unsupported`. `RESOURCE_EXHAUSTED` and backend faults map to `backend`, while `INVALID_ARGUMENT` maps to `invalid-argument`. `PARTIAL` uses the paging cursor rather than another status.
+
+The draft push operations `SUBSCRIBE`, `DELIVER`, `ACK`, `NACK`, and `ACK_MODE` are not implemented. Delivery uses offsets, replay, duplicate suppression, and dead-letter records (A1.5, A9.5). `WATCH` and `NOTIFY` use the change feed from A11.8. Consumers read its topic by offset.
 
 ---
 
 # Appendix. SDK API stability
 
-This is about the Rust SDK surface, distinct from the wire contract above.
+The Rust SDK API and wire contract are separate. Both can change before 1.0 without preserving backward compatibility. The following conventions describe the current API:
 
-- **Builders are the contract.** Construct wire and data types through their builders and fluent methods. Public fields exist for reading results and for wire mirroring. New fields may appear in any minor release, so exhaustive struct literals are not supported.
-- **Wire mirrors are wire-stability-bound, not API-stability-bound.** Types that mirror the wire keep their public fields because the wire defines them, and they change only when the wire does, per the compatibility rules in A8.
-- **Terminal verb convention.** A fluent builder ends in `.send().await` for a write or `.fetch().await` for a read. Direct async methods are used only where there is nothing to build.
-- **Errors are typed and forward-compatible.** Managed failures nest the wire error intact. Every public error enum and the capability structs (the hello reply, op-version set, and capability map) are `#[non_exhaustive]`, so a new variant or field is not a breaking change. Always keep a wildcard arm. The growable u8 dictionaries (task state, agent error code, dead-letter reason) instead carry an `Unrecognized(u8)` variant that decodes and re-encodes an unknown code byte-for-byte, so an old build relays a newer peer's code rather than failing. The internally tagged configuration enums that cross the JSON HTTP surface (`SchemaSource`, `RetentionPolicy`) carry a unit `Unknown` `#[serde(other)]` catch-all for the same reason: an unknown `kind` decodes rather than failing the whole reply, though it is lossy (the original kind and fields are dropped, so a decoder must not re-apply an `Unknown`). `ContentType` keeps its forward-compat at the byte level instead, through `from_code(u8) -> Option`, because the `agdx.ct` u8 code is its canonical wire form.
-- **Facade growth lands on sub-facade handles**, not as new flat methods on the client. The handles are the only control surface.
-- **The accessor grammar.** Every primitive is reached through an accessor that takes its scope word (`stream(name)` then `topic(name)` mirroring the substrate's stream-then-topic hierarchy, `topic(name)` against the default stream, `query(index)`, `kv(namespace)`, `fork(id)`, `graph(name)`, `memory(name)`, `context(conversation)`, `agent(id)`, `runs()`), and every action is a verb on that object. Accessors are free and synchronous, IO happens at the terminal verb, required arguments are positional, options are always fluent, and binary opt-ins are `.thing()` never `.thing(true)`.
+- Use builders and fluent methods to construct SDK data. Public fields support result inspection and wire implementations. Before 1.0, fields and builders can change together.
+- Wire-mirroring types keep public fields defined by the contract. Change those types together with the encoding and affected clients.
+- End write builders with `.send().await` and read builders with `.fetch().await`. Use direct asynchronous methods when no builder is needed.
+- Managed errors retain their typed wire details. Public error and capability types use `#[non_exhaustive]`, so matches need a wildcard arm. Growable u8 dictionaries use `Unrecognized(u8)` to preserve unknown numbers. `SchemaSource` and `RetentionPolicy` use lossy `Unknown` variants with `#[serde(other)]`. Do not resubmit these unknown variants as configuration. `ContentType` uses `from_code(u8) -> Option` for its encoded `agdx.ct` value.
+- Add related operations to their existing feature handles rather than expanding the root client with unrelated methods.
+- Accessors select scopes through `stream(name)`, `topic(name)`, `query(index)`, `kv(namespace)`, `fork(id)`, `graph(name)`, `memory(name)`, `context(conversation)`, `agent(id)`, and `runs()`. Methods act on those objects. Accessors perform no I/O. Required arguments are positional, and optional configuration uses fluent methods. Boolean opt-ins use `.thing()` rather than `.thing(true)`.

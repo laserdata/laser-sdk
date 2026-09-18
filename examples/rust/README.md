@@ -67,7 +67,7 @@ Data-publishing examples also share four volume knobs, so the same binary runs a
 | `LASER_CONCURRENCY` | parallel publishers (where the example fans out) |
 | `LASER_PAYLOAD_BYTES` | approximate body size (where the example pads bodies) |
 
-Each invocation runs on its own data stream (`laser-<example>-<token>` by default, or `LASER_STREAM` for all). AGDX isolates workloads by stream, never by partition: two examples sharing one stream would also share the well-known agent topics (`agent.commands`, `agent.tool_calls`, ...), so each one's freshly joined consumer group would replay the other's traffic from offset 0 and dead-letter every message it cannot decode. Per-invocation streams let all examples run against one local server at once, and rerun, without colliding. The SDK creates a stream/topic only when it is missing (a local-dev convenience): point `LASER_STREAM` at your existing stream and nothing new is created. The managed deployment owns the `_agdx` ops stream and creates it at boot, not the SDK.
+Each run uses `laser-<example>-<token>` unless `LASER_STREAM` supplies a name. Managed indexes use the same run token. This keeps concurrent examples separate. Reuse an explicit stream only when shared history is intended.
 
 ## Primitives - start here
 
@@ -113,7 +113,7 @@ OPENAI_API_KEY=...    cargo run --example concierge --features llm-openai
 
 ## Managed query phases
 
-Projection registration and query run on Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, event analytics and order book still run their live streaming and replay phases, firehose still publishes its configured load, and each prints one pointer before skipping managed analytics. Concierge is a managed end-to-end scenario and exits green with the same pointer. Query index names use `_` not `.` (for example `clickstream`), because `laser-plane` materializes each index under that exact name and accepts only `[A-Za-z0-9_]`.
+Projection registration and queries require Laser Stack or LaserData Cloud. Without `laser-plane`, examples report the missing capability and skip those phases. Open streaming still runs.
 
 ## Forking the read model (agentic speculation)
 

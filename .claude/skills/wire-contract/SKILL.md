@@ -48,7 +48,7 @@ Provenance result fields are reserved exact ID and name pairs. They are allowed 
 
 Public destination mutations and replicated checkpoint transitions remain different types and decoders. A public request must never be decoded as a worker lease, progress transition, snapshot commit, or repair transition.
 
-Arrow IPC metadata validation in an SDK is the local preflight. Managed ingestion must also parse the stream and enforce stream format, self-containment, schema fingerprint, stable dictionaries, microsecond timestamps, decimal width, unsupported type rejection, and all caps.
+The SDK checks Arrow metadata before publication. Managed ingestion must also parse the stream. Require self-containment, the expected schema fingerprint, stable dictionaries, microsecond timestamps, supported decimal widths and types, and configured limits.
 
 Consistency is fail-not-downgrade. Query reply validation rejects a delivered consistency weaker than requested and rejects missing target evidence.
 
@@ -56,7 +56,7 @@ Consistency is fail-not-downgrade. Query reply validation rejects a delivered co
 
 Named fields allow additive optional growth when readers can safely ignore it. Changed meaning, removed fields, or new executor-dispatched grammar is breaking and requires a coordinated package release across every consumer. The hello-negotiated surface slots and fenced-lease request family remain version 1.
 
-Query, control, KV, fork, graph, checkpoint, agent, and other surfaces negotiate independently through `OpVersions`. A client checks the version associated with the command it is about to send. Destination and checkpoint commands use `versions.checkpoint`, not the query version. The fenced-lease KV family (`KvLease`, `KvLeaseRenew`, `KvRelease`, `KvCasFenced`) uses payload version `KV_LEASE_OP_VERSION = 1` and must only be sent to a server advertising the `KV_FENCED_LEASES` feature bit. Its holder-identity shape was finalized before publication, so the pre-release breaking reshape does not consume a new operation version.
+`OpVersions` negotiates query, control, KV, fork, graph, checkpoint, and agent support independently. Compare the command with its own version slot before sending. Destinations and checkpoints use `versions.checkpoint`. `KvLease`, `KvLeaseRenew`, `KvRelease`, and `KvCasFenced` require `KV_LEASE_OP_VERSION = 1` and `KV_FENCED_LEASES`.
 
 Permanent u8 dictionaries use unknown-code passthrough where relay compatibility matters. Executor vocabularies such as comparison and aggregate functions remain exhaustive so every backend must handle a new variant explicitly.
 
@@ -80,4 +80,4 @@ The fixture manifest is closed. Added or removed files fail TypeScript tests unt
 
 ## Review focus
 
-Reject silent defaulting that broadens a query, accepts malformed success data, downgrades consistency, confuses public and replicated state, trusts caller-declared Arrow metadata without server parsing, or makes TypeScript use lossy `number` for wire u64 or u128 values.
+Reject defaults that broaden a query or weaken consistency. Reject malformed success data, missing target evidence, and confusion between public requests and committed state. Do not trust Arrow metadata without parsing its stream. Keep wire u64 and u128 values exact in TypeScript.

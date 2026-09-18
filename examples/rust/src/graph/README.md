@@ -1,13 +1,13 @@
 # graph - the Graph primitive
 
-Nodes and edges built from what flows through your log - who bought what, which agent said what, what depends on what. Traverse it, search it by meaning, and ask what was true at any point in time.
+A graph connects entities through named relationships. This example writes a relationship and reads the neighboring entities.
 
 Managed by `laser-plane` in Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean.
 
 ## What it shows
 
-- Relate entities in one call: `laser.graph("kg").link("customer:42", "purchased", "product:7")`, which upserts both content-addressed nodes and the typed edge, so re-linking the same triple converges instead of growing.
-- Rebuild the same node id locally (`GraphNode::entity("customer", "42").id`), because a node is addressed by its content and never by a server-assigned key.
+- Use `laser.graph("kg").link("customer:42", "purchased", "product:7")` to write two entity nodes and their relationship. Repeating the same link preserves their content IDs.
+- Use `GraphNode::entity("customer", "42").id` to calculate the same node ID locally.
 - Traverse one relation out of it: `.neighbors(customer, EdgeDir::Out, Some("purchased".to_owned()), 1)`.
 
 ## Run it

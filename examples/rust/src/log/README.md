@@ -1,6 +1,6 @@
 # log - the Log primitive
 
-A topic is an append-only record of every message in your system. Services write to it and read from it like a group chat that never loses a message. New readers start from the beginning or jump straight to now.
+A topic stores records in append order under its retention policy. This example publishes typed orders and reads them by offset.
 
 ## What it shows
 
@@ -8,7 +8,7 @@ A topic is an append-only record of every message in your system. Services write
 - Create a topic (`laser.stream("shop").topic("orders")`) with `ensure(2)`.
 - Publish two JSON messages (`topic.publish().json(&order)?.send()`).
 - Read them back through one typed handle (`topic.json::<Order>().records(..)`), draining from offset 0 until caught up.
-- Run it twice and the second run replays four orders: the log keeps every record, and a fresh reader starts at offset 0. That is the primitive, not a bug.
+- Run it twice against the same retained topic to read four orders on the second run. Each new reader starts at offset 0.
 
 ## Run it
 

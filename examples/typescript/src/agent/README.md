@@ -1,10 +1,10 @@
 # agent - agents that survive crashes and find each other
 
-> A reliable runtime for agents on the log: deduplication, retries, dead-letters, request/reply. Contracts hand out tasks with deadlines. Workflows add budgets and compensation. Discovery lets agents find each other by capability.
+This example runs an agent that handles tasks from the log. It demonstrates capability-based routing, pickup acknowledgments, deadlines, and contract results.
 
 ## What it shows
 
-- Spawns a minimal `triage` handler agent that listens on the commands topic, replies on the responses topic, and advertises the `resolve-ticket` capability (`Agent.builder()...spawn(laser)`), so it is addressable by what it can do rather than by the name it runs under.
+- Run a `triage` handler on the commands topic with replies on the responses topic. Advertise its capability and enable pickup acknowledgments.
 - Acknowledges on pickup (`.ackOnPickup()`), so a crash mid-handler is a retry rather than a silently dropped task.
 - Sends it a deadline-bounded contract by capability, not by name: `laser.contract(routeToCapable("resolve-ticket", ANY_ROUTE_POLICY)).from(...).payload(...).inboxRoute(...).deadline(60_000).send()`.
 - Reads the outcome (`completed` / `failed` / `notConsumed` / `timedOut`) and prints the decoded reply.

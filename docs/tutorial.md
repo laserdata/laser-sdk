@@ -1,6 +1,6 @@
 # LaserData - Laser SDK tutorial
 
-A progressive, hands-on guide to the SDK. Each chapter builds on the last using one running scenario: a real-time agent/LLM observability pipeline capturing every model call your agents make, queryable by latency, outcome, model, and user. By Chapter 8 you can publish a heterogeneous batch in one network round-trip, query it by user/model/outcome, range-aggregate latency and tokens, and recall the nearest past incidents by embedding similarity, all over the same Iggy connection. Chapter 9 layers the agentic runtime on top of the same substrate.
+This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, and similarity reads. Chapter 9 adds agent coordination.
 
 Prerequisites: the install snippet from the [README](../README.md) and Apache Iggy, either from the configured R2 release or a local Iggy binary.
 
@@ -8,19 +8,19 @@ Prerequisites: the install snippet from the [README](../README.md) and Apache Ig
 
 ## Two layers, one connection
 
-Laser SDK is a **streaming** substrate, a **managed** query layer over it, and an **agentic** runtime built on top:
+Laser SDK is a streaming substrate, a managed query layer over it, and an agentic runtime built on top:
 
 | layer | what it is | when you need it |
 | --- | --- | --- |
-| **streaming** (`streaming` feature, default) | typed publish, direct producers, live async consumer groups with server offsets, and the resumable `Cursor`. No agent concepts, no managed backend. | anywhere you stream messages against Apache Iggy. |
-| **managed** (`managed` feature, or the granular `query` / `projections` / `kv` / `fork` / `graph` / `watch` / `runs` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
-| **agentic** (`agent` feature) | reliable consumer + DLQ, conversation/causality, `Router`, `Memory`, `Agent::builder` handlers. Builds on the streaming layer. | When you are orchestrating LLM agents, not just observing traffic. |
+| streaming (`streaming` feature, default) | typed publish, direct producers, live async consumer groups with server offsets, and the resumable `Cursor`. No agent concepts, no managed backend. | anywhere you stream messages against Apache Iggy. |
+| managed (`managed` feature, or the granular `query` / `projections` / `kv` / `fork` / `graph` / `watch` / `runs` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
+| agentic (`agent` feature) | reliable consumer + DLQ, conversation/causality, `Router`, `Memory`, `Agent::builder` handlers. Builds on the streaming layer. | When you are orchestrating LLM agents, not just observing traffic. |
 
-Chapters 1-8 use only the streaming and managed layers. Chapter 9 adds the agentic layer for those who graduate from observation to coordination.
+Chapters 1-8 use streaming and managed data operations. Chapter 9 adds the agent runtime.
 
-Both layers stand on one foundation: **Apache Iggy**, low-latency message streaming. The log is the source of truth. Writes ride it, and the managed features in Laser Stack or LaserData Cloud serve projections, query, KV, and forks over the same connection. The open streaming surface carries no new wire: `Topic::producer()` and `consumer_group()` expose long-lived append and live server-offset reads, `Topic::replay()` gives a resumable caller-offset `Cursor`, and the `StateStore` seam holds point state like cursor checkpoints and dedup keys.
+Apache Iggy provides the log and transport. Laser Stack or LaserData Cloud adds managed projections, queries, KV, and forks on the same connection. `Topic::producer()` and `consumer_group()` provide continuous streaming. `Topic::replay()` provides a cursor with client-owned offsets. `StateStore` can save checkpoints and duplicate-suppression keys.
 
-For ordinary streaming, start with `topic.producer()`, `topic.consumer(..)`, and `topic.consumer_group(..)`. They cover direct batching, linger, retries, key/partition routing, async `Stream` iteration, polling and replay positions, group lifecycle, and automatic or explicit server offset commits. The focused [`native-streaming`](../examples/rust/src/native-streaming/README.md) example shows both automatic and commit-after-success delivery. Laser never hides Apache Iggy: use `topic.iggy_producer()`, `topic.iggy_consumer_group(..)`, or `laser.client()` when an advanced upstream option is not yet surfaced, importing exact-version types through `laser_sdk::iggy`.
+For ordinary streaming, use `topic.producer()`, `topic.consumer(..)`, and `topic.consumer_group(..)`. They provide batching, delays, retries, routing, groups, and automatic or explicit commits. The [`native-streaming`](../examples/rust/src/native-streaming/README.md) example demonstrates both commit modes. For detailed Iggy configuration, use `topic.iggy_producer()`, `topic.iggy_consumer_group(..)`, or `laser.client()`. Import matching Iggy types through `laser_sdk::iggy`.
 
 VSR is the only supported Rust, Python, and TypeScript transport. It requires no Cargo feature or TypeScript connection option. Standard commands, unknown managed codes, and dedicated replicated authorization operations all use the same client connection. The server remains authoritative for custom command classification.
 
@@ -28,7 +28,7 @@ VSR is the only supported Rust, Python, and TypeScript transport. It requires no
 
 ## Chapter 1 - publish your first message
 
-Connect to Apache Iggy, push a single typed message onto a topic. That is it. At this point Iggy has the bytes durably on the log. Nothing is queryable yet because no index exists for that topic. Chapter 2 makes it queryable.
+Connect to Apache Iggy and publish a typed record to a topic. The topic durability policy determines its acknowledgment guarantee. The record becomes queryable after a projection indexes it. Chapter 2 adds that projection.
 
 ```rust
 use laser_sdk::prelude::*; // the slim prelude: accessors + the everyday types. `prelude::full::*` has everything.
@@ -72,19 +72,19 @@ async fn main() -> Result<(), LaserError> {
 }
 ```
 
-The running example is an **agent/LLM observability** stream: every model call your agents make is one `Inference` message. The connection string is the only thing `connect` needs - one Iggy connection that publish, query, and (later) agent traffic share.
+The example records each model call as an `Inference`. Publication, query, and agent operations share the connection created by `connect`.
 
-A **stream** is Iggy namespace one layer above a topic. You can use anywhere from one to thousands of streams on a single connection, grouped by data domain, environment, or any boundary your application owns. The canonical path is `Laser::connect(conn)` followed by `laser.stream(name).topic(name)`. `Laser::connect_with_stream(conn, stream)` and `laser.with_default_stream(stream)` only pin a default stream for the shorter `laser.topic(name)` accessor and agent helpers. They do not limit the connection to that stream. This chapter uses explicit stream addressing.
+A stream groups topics in Apache Iggy. Applications can organize streams by domain, environment, or access boundary. Use `Laser::connect(conn)` and `laser.stream(name).topic(name)` for explicit addressing. `Laser::connect_with_stream(conn, stream)` and `laser.with_default_stream(stream)` select a default for `laser.topic(name)` and agent helpers. They do not restrict the connection to one stream.
 
-`.json(&body)` encodes the value, stamps the compact `agdx.ct` codec code (`json` = `1`), and sends the message on the topic.
+`.json(&body)` encodes the value and selects `agdx.ct` code `1` for JSON. The terminal send publishes it.
 
-The bytes are on Iggy log forever (or until retention rotates them out) and replayable from offset 0. Without `.partition_key(..)`, Iggy's balanced partitioner chooses the partition. Keyed publishing preserves per-key ordering. The records are not indexed until the next chapter declares a projection.
+The log retains records under its retention policy. Readers can replay retained offsets. Without `.partition_key(..)`, balanced routing selects a partition. A stable key selects a consistent partition. Chapter 2 declares the projection used to index these records.
 
 ---
 
 ## Chapter 2 - declare a projection, query the topic
 
-In a database you run `CREATE INDEX ON inferences(latency_ms)` once, then `INSERT` rows and the engine extracts the indexed columns from each row automatically. Same model here. A `Projection` declares which fields are indexed and where to find them in the payload. The producer code from Chapter 1 does not change.
+A `Projection` selects fields and their positions in the payload. It plays a similar role to `CREATE INDEX ON inferences(latency_ms)` in a database. The projector extracts those fields when it processes new records. The Chapter 1 producer stays unchanged.
 
 ```rust
 use laser_sdk::query::{Projection, ProjectionBinding};
@@ -104,17 +104,17 @@ let binding = ProjectionBinding::builder()
     .build();
 ```
 
-This declaration lives once, in your infrastructure repository, and ships to Laser Stack or LaserData Cloud through your control workflow. `laser-plane` picks it up and starts materializing rows. From that point on, every message your producer publishes to `inferences` lands on the queryable index.
+Store the declaration with the deployment configuration and apply it through the control API. `laser-plane` uses it to materialize records from `inferences`.
 
 ### Three storage tiers
 
 A published record lives in up to three places, controlled by the projection:
 
-1. **Iggy log** (always): the original wire bytes, partitioned, replayable from offset 0. The source of truth.
-2. **Indexed columns** (always): the scalar fields you declared via `.fields([...])` / `.field_at(...)`, extracted from the payload at materialize time. These drive `where_eq` / `filter_*` / `order_*` / aggregates.
-3. **Inline body** (default ON): a copy of the full original payload alongside the row, so `fetch_typed::<T>()` decodes back into your struct without going back to Iggy log. Opt out per projection with `.index_only()` when the body is large or already stored elsewhere. The Iggy log keeps the bytes either way.
+1. The Iggy log retains the original encoded records and supports offset replay.
+2. The projector extracts fields from `.fields([...])` or `.field_at(...)`. Queries use them for `where_eq`, `filter_*`, `order_*`, and aggregates.
+3. An inline body copies the original payload into the row for `fetch_typed::<T>()`. Use `.index_only()` to omit that copy. Log retention remains independent.
 
-The body may carry fields that are NOT indexed. Only the declared fields are queryable. Everything else is retrievable through the inline body (when on) or by Iggy replay (when off).
+The body can contain fields that are not indexed. Queries use declared fields. Other fields remain available through the inline body or retained log record.
 
 > _With `.index_only()`, `fetch_typed::<T>()` cannot decode rows because the reserved original-payload field is absent. Callers either use `.fetch()` and read typed positional values through `QueryResult::value`, or replay from Iggy log. Plan the trade-off when you declare the projection, not at query time._
 
@@ -138,12 +138,12 @@ What runs on Apache Iggy is the open SDK's streaming, agent, provenance, dedup, 
 
 Laser Stack and LaserData Cloud serve two more read surfaces, both answering `LaserError::Unsupported` against Apache Iggy without a managed backend:
 
-- **Managed key-value store** (`kv` feature, `Laser::kv`, gated on `Capabilities::kv.available`): `get` / `set` / `delete` / `scan` with optional expiry, arbitrary opaque byte keys/values, namespaced and user-scoped, backed by `laser-plane`'s point-state store. Values take the same codecs as publish - `.bytes` (raw), `.json`, `.msgpack`, `.encode_with::<C>` - and read back with `get` (payload), `get_typed` (JSON), or `get_as::<C, _>` (any codec).
-- **Registry browse** (`laser.projections().get(id)` / `laser.projections().list().fetch()` for projections, `laser.schemas().get(id)` / `laser.schemas().list()` for writer schemas, gated on `Capabilities::managed`): read back which projections and registered writer schemas (Avro/Protobuf/JSON Schema) exist and their full shape. Projection and schema CRUD stay writes on the control topic.
+- The `kv` feature exposes `Laser::kv` when `Capabilities::kv.available` is true. It supports `get`, `set`, `delete`, and `scan` with opaque keys and values. Use `.bytes`, `.json`, `.msgpack`, or `.encode_with::<C>` to write. Use `get`, `get_typed`, or `get_as::<C, _>` to read. Managed grants control namespace access.
+- Read projections through `laser.projections().get(id)` or `laser.projections().list().fetch()`. Read schemas through `laser.schemas().get(id)` or `laser.schemas().list()`. These calls require `Capabilities::managed`. Control-topic writes change projections and schemas.
 
 ### Projection retention, decoupled from topic expiry
 
-A topic's Iggy `message_expiry` controls how long the **log** keeps the raw bytes. By default a projection mirrors that: when Iggy drops a message, the managed runtime prunes the row it produced. But the log and the read-model are different products with different lifetimes - you often want short-lived partitions (cheap storage, fast replay) feeding a **permanent** index. Set the binding's retention to decouple them:
+The topic `message_expiry` controls raw-record retention. A projection normally follows the log and removes rows whose source expires. Set binding retention to select a different lifetime for the read model:
 
 ```rust
 let binding = ProjectionBinding::builder()
@@ -156,9 +156,9 @@ let binding = ProjectionBinding::builder()
 
 `RetentionPolicy` variants:
 
-- `MirrorLog` (default) - follow the log, and also drops the projection when the source **topic is deleted**.
-- `Keep` - rows live forever, regardless of log expiry **or** topic deletion.
-- `KeepUntilSourceDeleted` - ignore message expiry (keep forever), **but** drop the projection when the source topic is deleted. For "permanent index, but it's meaningless once the topic is gone."
+- `MirrorLog` (default) - follow the log, and also drops the projection when the source topic is deleted.
+- `Keep` - rows live forever, regardless of log expiry or topic deletion.
+- `KeepUntilSourceDeleted` - ignore message expiry (keep forever), but drop the projection when the source topic is deleted. For "permanent index, but it is meaningless once the topic is gone."
 - `TimeToLive { ttl_micros }` - keep rows for a fixed age after they were materialized, independent of the log.
 - `MaxRows { rows }` - keep only the newest N rows for the table.
 
@@ -166,13 +166,13 @@ Leave `.retention(...)` unset to inherit the deployment default. The policy is e
 
 ### Why the producer does not stamp `.index(...)` per record
 
-A projection is a **read-model contract**. If producers were stamping `.index("user_id", "alice")` per record they would be:
+A projection defines the indexed fields. Stamping `.index("user_id", "alice")` on each record instead can:
 
-- duplicating field names on every message (wire cost),
-- coupled to projector internals (refactor pain),
-- able to disagree with each other on what the schema is.
+- Repeat field names in every record.
+- Couple producers to projector details.
+- Allow producers to provide inconsistent field definitions.
 
-The projection avoids all three. The producer ships data. The projection is the schema.
+The producer supplies data, and the projection defines extraction.
 
 > _Niche scenario, the producer needs to surface a queryable field on a payload the projector cannot decode (opaque binary, custom framing). For those, the projection can declare a header-source field and the producer stamps it via `.header("trace_id", id)` as ride-along metadata. Same "schema lives on the projector side" principle, header instead of JSON pointer. Not used in the rest of the tutorial._
 
@@ -180,7 +180,7 @@ The projection avoids all three. The producer ships data. The projection is the 
 
 ## Chapter 3 - real-time batches
 
-A busy agent fleet emits thousands of inferences per second. Per-message publishes are not the path. Batches are. **One `publish_batch().send()` is one Iggy `send_messages` network call.** The fluent chain composes records in memory. Nothing leaves the process until `.send().await?`.
+Use batches when applications publish many records. `publish_batch().send()` groups records before sending them through Iggy. The builder keeps records locally until `.send().await?`.
 
 ```rust
 let drained: Vec<Inference> = drain_trace_buffer(Duration::from_secs(1));
@@ -191,15 +191,15 @@ inferences.publish_batch()
     .send().await?;                  // ONE send_messages, N records
 ```
 
-Batch size is bounded by what Iggy will accept on a single `send_messages` call (Apache Iggy's max-message-size budget summed across the records), not by an arbitrary record count cap. Drain larger windows by splitting the producer-side queue into multiple batches.
+Iggy limits the bytes in a `send_messages` request. Split larger producer queues into batches that fit that limit.
 
 Partitioning composes with the batch:
 
-- **No `partition_key`** (default), Iggy's balanced partitioner picks one partition for the whole `send_messages` call. Throughput-friendly.
-- **`.partition_key("alice")`**, the entire batch is hashed to one partition, preserving per-user ordering across records.
-- **One-partition topic**, global order across the whole topic, useful for the heterogeneous-message pattern in Chapter 4.
+- No `partition_key` (default), Iggy's balanced partitioner picks one partition for the whole `send_messages` call. Throughput-friendly.
+- `.partition_key("alice")`, the entire batch is hashed to one partition, preserving per-user ordering across records.
+- One-partition topic, global order across the whole topic, useful for the heterogeneous-message pattern in Chapter 4.
 
-A query for more than `MAX_PAGE_SIZE` (1000 rows) is rejected with `QueryError::TooLarge` rather than silently truncated, and the reply is bounded to 64 MiB as it is built, so a runaway query cannot blow up the wire or be mistaken for the whole answer. Walk larger result sets with the bounded `.max_rows(n).rows()` walk or the explicit `.fetch_all()` covered in Chapter 5.
+A query above `MAX_PAGE_SIZE` (1000 rows) returns `QueryError::TooLarge`. Replies also have a 64 MiB size limit. Use `.max_rows(n).rows()` or `.fetch_all()` to read larger results through bounded pages (Chapter 5).
 
 The projection from Chapter 2 covers every record in this batch. No new declaration needed.
 
@@ -207,7 +207,7 @@ The projection from Chapter 2 covers every record in this batch. No new declarat
 
 ## Chapter 4 - heterogeneous topic, mixed message shapes
 
-Real agents produce more than one shape of message on the same stream. Same topic, same partition (for ordering), three shapes: inferences, tool calls, errors. Declare each shape as its own projection. Bind all three to the same topic. The projector routes per record by `agdx.ref` (the projection-ref header).
+One topic can contain different record types. This chapter uses inferences, tool calls, and errors in one partition. Declare a projection for each shape and bind them to the topic. `agdx.ref` selects the extraction rule for each record.
 
 ```rust
 let tool_call_v1 = Projection::builder("tool.call.v1")
@@ -311,17 +311,19 @@ let all: Vec<Inference> = laser.query("inferences")
     .fetch_all_typed().await?;
 ```
 
-Fluent surface, `where_eq` / `filter_eq` / `filter_ne` / `filter_gt` / `filter_gte` / `filter_lt` / `filter_lte` / `filter_in` / `filter_contains` / `filter_prefix` / `filter(Filter)` (compose `Any`/`Not` trees) / `time_range` / `order_asc` / `order_desc` / `limit` / `offset` / `with_payload` / `select_fields` / `distinct` / `count` / `count_distinct` / `sum` / `avg` / `min` / `max` / `stddev` / `percentile` / `agg_as` / `group_by` / `window` / `having` / `raw_sql` / `raw_sql_with` / `nearest` / `nearest_in`.
+Exact-match and comparison methods are `where_eq`, `filter_eq`, `filter_ne`, `filter_gt`, `filter_gte`, `filter_lt`, `filter_lte`, and `filter_in`. Text predicates use `filter_contains` and `filter_prefix`. `filter(Filter)` composes `Any` and `Not` trees.
+
+Result selection uses `time_range`, `order_asc`, `order_desc`, `limit`, `offset`, `with_payload`, `select_fields`, and `distinct`. Aggregates are `count`, `count_distinct`, `sum`, `avg`, `min`, `max`, `stddev`, and `percentile`. `agg_as`, `group_by`, `window`, and `having` configure aggregate output. `raw_sql` and `raw_sql_with` select SQL. `nearest` and `nearest_in` select vector search.
 
 Terminals, `.fetch()` (paged), `.fetch_typed::<T>()` (`Vec<T>`), `.fetch_one::<T>()` (`Option<T>`), the bounded walks `.max_rows(n).rows()` / `.max_rows(n).rows_typed::<T>()` (explicit ceiling, then row-at-a-time), and the explicit full-result opt-ins `.fetch_all()` / `.fetch_all_typed::<T>()`.
 
-Any query can also narrow to one conversation with `.conversation(conversation_id)`, sugar for a predicate over the `conversation_id` field the deployment auto-projects on every row from the record's `gen_ai.conversation.id` header, so a read returns only what one conversation wrote.
+Use `.conversation(conversation_id)` to restrict results by conversation. The deployment projects `gen_ai.conversation.id` into the reserved `conversation_id` field. The method adds an ordinary predicate on that field.
 
 ---
 
 ## Chapter 6 - vector recall
 
-Same wire, same DSL. A new projection declares which payload field carries the embedding (default `/embedding`). The projector extracts it at materialize time so queries never re-embed.
+A vector projection selects the payload field that contains the embedding, with `/embedding` as the default. The projector stores it during materialization. Queries use the stored embedding.
 
 ```rust
 let incident_v1 = Projection::builder("incident.v1")
@@ -363,13 +365,13 @@ let nearest: Vec<Incident> = laser.query("incidents")
     .fetch_typed().await?;
 ```
 
-The SDK's memory front door (`Laser::memory`) wraps this same path. Reach for it when you want the one remember / recall / improve / forget API. Reach for `query().nearest(..)` when you want full control.
+`Laser::memory` provides the shared memory API: remember, recall, improve, and forget. Use `query().nearest(..)` for direct control of vector queries.
 
 ---
 
 ## Chapter 7 - codecs, JSON, MessagePack, Avro, Protobuf, your own
 
-`ContentType` is the wire tag stamped on `agdx.ct` as a compact `u8` code (`ContentType::code`). `Codec<T>` is the trait that abstracts "encode this `T` + tell me the tag". Four first-party codecs ship: `Json`, `Msgpack`, `Cbor`, and `Bson`. All four are self-describing, so `laser-plane` can index their fields with no schema declared up front. For a schema-first format (Avro, Protobuf), Arrow, or your own framing, implement the trait once or hand bytes via `.raw_bytes(...)`.
+`ContentType::code` selects the `u8` value stored in `agdx.ct`. `Codec<T>` encodes a value and reports its content type. Built-in codecs are `Json`, `Msgpack`, `Cbor`, and `Bson`. Their formats carry field names, so they can be decoded without a writer schema. For other formats, implement the trait or supply `.raw_bytes(...)`.
 
 ```rust
 // First-party shortcuts (JSON and MessagePack have builder sugar):
@@ -389,7 +391,7 @@ laser.stream("agent-telemetry").topic("inferences").publish()
     .send().await?;
 ```
 
-Reading is symmetric. `Codec` encodes. `Decoder` decodes. All four built-in codecs (`Json`, `Msgpack`, `Cbor`, `Bson`) implement both halves. `fetch_typed` defaults to JSON. `fetch_typed_with::<C, _>` and `fetch_one_with` take any codec, so a topic written with MessagePack reads back with MessagePack:
+`Codec` encodes values, and `Decoder` decodes them. `Json`, `Msgpack`, `Cbor`, and `Bson` implement both. `fetch_typed` uses JSON by default. `fetch_typed_with::<C, _>` and `fetch_one_with` select another codec:
 
 ```rust
 let traces: Vec<Inference> = laser.query("inferences").fetch_typed_with::<Msgpack, _>().await?;
@@ -399,7 +401,7 @@ Payload bytes come back out of the public API as `Vec<u8>` for streaming message
 
 ### One typed handle instead of per-call codecs
 
-When a topic carries one body type, bind it once: `laser.stream("agent-telemetry").topic("inferences").json::<Inference>()` (or `.cbor::<Inference>()`) gives a `TypedTopic` whose `publish(&value)` encodes and stamps in one call and whose `records(reader_name)` replays the topic as decoded values, each failure carrying its exact log position. The schema-bound form `.schema::<Inference>(id).await?` (feature `schema-codecs`) resolves the registered writer schema, validates every body client-side, and stamps `agdx.sid` too.
+Use `laser.stream("agent-telemetry").topic("inferences").json::<Inference>()` or `.cbor::<Inference>()` to select one body type. `TypedTopic.publish(&value)` encodes it, and `records(reader_name)` returns typed records. Decode failures include the log position. The `schema-codecs` form `.schema::<Inference>(id).await?` uses a registered schema, rejects invalid values, and adds `agdx.sid`.
 
 ### A custom codec (Avro example)
 
@@ -438,7 +440,9 @@ The `agdx.ct` header code on each record tells the consumer how to decode. The b
 
 The four built-in codecs (`Json`, `Msgpack`, `Cbor`, `Bson`) are self-describing: the bytes carry their own field names, so the managed projector indexes them with nothing declared in advance.
 
-Schema-first formats (Avro, Protobuf) carry no field names in the body, so the projector needs the writer schema to decode them. `laser-plane` keeps registered writer schemas for exactly this. You register a writer schema once, keyed by a `u32` id, then a producer stamps that id on the `agdx.sid` header (`u32` typed value) so the projector resolves the schema and decodes the body. A record whose schema-first codec has no registered schema is indexed only from its `agdx.idx.*` headers (the body is left opaque). A third source kind, `JsonSchema { schema }` (draft 2020-12), covers the self-describing codecs: they decode without a schema, but a record stamping a JSON Schema's id has its decoded payload validated by `laser-plane`. A mismatch never materializes body fields and appears in the plane health counters and in the DLQ when policy requires it.
+Avro and Protobuf need a writer schema to interpret their bodies. Register the schema and attach its `u32` ID through `agdx.sid`. Without a registered schema, projection can use only explicit `agdx.idx.*` headers and leaves the body opaque.
+
+`JsonSchema { schema }` uses draft 2020-12 to check self-describing payloads. A record with that schema ID is decoded and checked by `laser-plane`. A mismatch prevents body-field materialization and appears in health counters. The configured policy determines dead-letter publication.
 
 Registration is synchronous and `laser-plane` allocates the id:
 
@@ -450,11 +454,13 @@ let schema_id = laser
     .await?;
 ```
 
-`laser-plane` validates that the definition compiles, allocates the next free id (concurrent callers never collide), durably appends the control event, and returns the id. Producers then stamp it on `agdx.sid`. `laser.schemas().drop(id)` tombstones it asynchronously. `SchemaSource` is `Avro { schema }` (the canonical Avro JSON text), `Protobuf { descriptor_set, message_type }` (a compiled `FileDescriptorSet` plus the fully-qualified message type to decode), or `JsonSchema { schema }`. The returned id is durable but applies asynchronously, so read back (below) before the first publish against a fresh id. The [`order-book`](../examples/rust/src/order-book/README.md) Avro tape and the [`event-analytics`](../examples/rust/src/event-analytics/README.md) JSON Schema guard walk both paths end to end.
+`laser-plane` compiles the schema, allocates a free ID, appends the control record durably, and returns the ID. Apply that ID through `agdx.sid`. The record applies asynchronously, so read the registry before publishing with a new ID. `laser.schemas().drop(id)` records asynchronous removal.
 
-Ids are permanent. A schema change is always a NEW register (and producers move to stamping the new id), never an in-place replacement: re-keying an id would change how every record already stamped with it decodes. Dropping tombstones the id - records stamped with it keep decoding and the id stays reserved (re-registering the identical definition on the raw control topic revives it. A different definition is rejected and dead-lettered).
+`SchemaSource` supports `Avro { schema }`, `Protobuf { descriptor_set, message_type }`, and `JsonSchema { schema }`. Avro uses schema JSON. Protobuf uses a compiled `FileDescriptorSet` and fully qualified message type. The [`order-book`](../examples/rust/src/order-book/README.md) and [`event-analytics`](../examples/rust/src/event-analytics/README.md) examples demonstrate Avro and JSON Schema.
 
-To read back, `laser.schemas().list()` returns every known writer schema as `Vec<SchemaInfo>` (`SchemaInfo { schema, dropped }` carries the lifecycle flag) and `laser.schemas().get(id)` returns the `Option<SchemaInfo>` occupying an id. Both are read-only browse calls over the same managed bridge as projection browse (`projections().get(id)` / `projections().list()`), and behave the same way off the cloud: they answer an unsupported error against Apache Iggy.
+Schema IDs are permanent. Register a new ID for a changed definition instead of replacing an existing one. Dropped IDs remain reserved, and earlier records retain decoding support. Registering the same definition through the raw control topic can restore it. A different definition under that ID is rejected and dead-lettered.
+
+`laser.schemas().list()` returns `Vec<SchemaInfo>`, where `SchemaInfo { schema, dropped }` includes lifecycle state. `laser.schemas().get(id)` returns `Option<SchemaInfo>`. These reads use the same managed path as `projections().get(id)` and `projections().list()`. Apache Iggy without a managed backend returns unsupported.
 
 The schema registry lives in the managed runtime, and `agdx.sid` selects the registered writer schema used to decode a record. It works against LaserData Cloud or Laser Stack and returns an unsupported error on Apache Iggy without a managed backend.
 
@@ -464,7 +470,7 @@ The schema registry lives in the managed runtime, and `agdx.sid` selects the reg
 
 ## Chapter 8 - many streams on one connection
 
-A stream is Iggy namespace one layer above topics. Scope a connection to any stream and its topics, consumer groups, replay, and projections all stay inside that boundary. You pick the grouping - from one to thousands of streams, all sharing one connection. Group by whatever fits the workload (data domain, environment, or not at all):
+A stream groups topics in Apache Iggy. A connection can address several streams, subject to its permissions. Select groups that fit the workload, such as data domains or environments:
 
 ```rust
 let laser = Laser::connect("iggy:iggy@127.0.0.1:8090").await?;
@@ -472,13 +478,13 @@ laser.stream("checkout").topic("inferences").publish() /* ... */;
 laser.stream("search").topic("inferences").publish() /* ... */;
 ```
 
-The stream accessor is free: the connection and producer cache are shared, so addressing a thousand streams costs nothing until a verb runs. (`with_default_stream` still re-scopes a handle's _default_ stream when you want the one-word `laser.topic(..)` shortcut pointed elsewhere.) If you'd rather attribute inside one stream, stamp it via an indexed projection field (`workspace_id`, `api_key_prefix`, etc.). The query DSL filters on it like any other.
+Stream accessors share the connection and producer cache. They perform no I/O until an operation runs. `with_default_stream` changes the default used by `laser.topic(..)`. For application attribution within a stream, project fields such as `workspace_id` or `api_key_prefix` and filter them in queries.
 
 ---
 
 ## Chapter 9 - the agentic layer
 
-Everything above moves typed messages and queries them. This chapter turns the SDK into a coordination layer for **LLM agents** built on the same one-connection-to-Iggy substrate. The agent runtime is an opt-in feature (`agent`) over the default streaming build. Once you graduate from observing traffic to making decisions about it, the runtime below is what catches the hard parts (correlation, retries, dedup, deadlines, causality, context, memory) so your handler code stays a function from input to output.
+The `agent` feature adds coordination to streaming. It supplies correlation, retries, duplicate suppression, deadlines, causality, context, and memory support. Application handlers implement the business logic.
 
 ### What the agent runtime gives you
 
@@ -488,7 +494,7 @@ Everything above moves typed messages and queries them. This chapter turns the S
 | reply correlation | `Laser::request(...).await`, `AgentCtx::respond(payload)` | request stamps a fresh `correlation_id` (Ulid) on `agdx.corr`, distinct from the business `idempotency_key` on `agdx.idem`. Responder echoes it back via `respond`. Reader filters on `agdx.corr`, so a forged reply that guesses the conversation id cannot hijack. |
 | conversation + causality | `ConversationId`, `MessageId`, `Provenance.causal_parent`, `spawn_subconversation(&parent)` | a conversation is one partition (total order). Sub-conversations carry `agdx.parent_conv` + `agdx.root_conv`. Replies carry `agdx.cause`. Walk one partition for a chat. Walk the causality tree for a multi-agent flow. |
 | routing | `Router::to(agent_id)` / `Router::broadcast()` | stamps / clears `agdx.to`. Defensive filter at the consumer side, see the consumer-group note above. |
-| session facade | `laser.sessions().create(id)` -> `Session`: `append(SessionTurnKind, data)`, `context()`, `memory().search(q)`, `checkpoint()`, `turns_at` / `turns_since`, `state_at` / `replay` | one agent's conversation as typed turns. Each kind rides one conversation-level agent topic, `SessionConfig` moves the layout to its own stream or topics for a fleet, and a `Checkpoint` (serializable) splits history into before and after. |
+| session | `laser.sessions().create(id)` -> `Session`: `append(SessionTurnKind, data)`, `context()`, `memory().search(q)`, `checkpoint()`, `turns_at` / `turns_since`, `state_at` / `replay` | Each turn kind uses one conversation-level agent topic. `SessionConfig` selects the stream and topics. A `Checkpoint` stores offsets for reads before or from that point. |
 | sessions | `SessionPolicy::PerCall` / `SessionPolicy::PerUser` | per-user mode derives a stable `ConversationId` from the user key (versioned FNV-1a) so the SAME user keeps the SAME conversation across processes. |
 | context assembly | `ContextAssembler::builder().conversation_id(c).policy(LastN(20)).assemble()` | read one partition (or walk the causality tree with `across_subconversations`) and apply a `ContextPolicy` (`LastN`, `RoleFilter`, or your own) to feed an LLM call. |
 | log replay -> state | `ConversationState::load(laser, conv, topics, bound, init, fold)` | deterministic fold of the conversation back to current state, under an explicit `ReplayBound` (`FromOffsets` incremental, `Last(n)`, or `Full` written out). `load_with(store, ..)` seeds from a `SnapshotStore` and folds only the tail past the snapshot. Same idea as event sourcing on the conversation partition. |
@@ -559,7 +565,7 @@ Each sub-conversation gets its own partition (= total order within that branch) 
 
 ### Memory, semantic recall
 
-One model, one front door. `Laser::memory(namespace)` remembers by publishing to a memory topic - the durable, replayable audit that is the source of truth - and recalls it back. A deployment materializes that topic into a versioned key-value read view, so recall is fast without giving up the full history.
+`Laser::memory(namespace)` publishes memory changes to a topic. A managed deployment builds a versioned key-value view from those records. Default recall reads that view, while the topic retains history under its own policy.
 
 ```rust
 // One handle per namespace, reused so recall stays incremental across calls.
@@ -572,24 +578,28 @@ mem.remember(b"user prefers concise tone".to_vec())
 let recent = mem.recall(conv).limit(10).fetch().await?;
 ```
 
-Configure the topic when you need to: `laser.memory_topic("assistant").stream("laser-agents").partitions(4).ttl(Duration::from_secs(7 * 86_400)).build()` sets the stream, partition count (each scope keyed to one partition), and how long the audit history lives on the log - separate from the read view's own retention. For in-process similarity recall that needs no server, `memory_with(ns, MemoryBackend::Vector).embedder(..)` embeds on remember and ranks recall by cosine similarity (the `Embedder` trait is the model seam, the way `LlmClient` keeps model calls out of the SDK).
+`laser.memory_topic("assistant").stream("laser-agents").partitions(4).ttl(Duration::from_secs(7 * 86_400)).build()` configures the memory topic. Each scope maps to one partition. Topic expiry is separate from read-view retention.
 
-Every managed read model records the conversation that wrote each row (from the record's `gen_ai.conversation.id` header), so a read narrows to one conversation server-side: `laser.query(index).conversation(id)`, `laser.graph(name).conversation(id).neighbors(..)`, and `laser.kv(ns).scan().conversation(id)` over the materialized memory read view. It is a read-side narrowing over provenance, not a new isolation boundary. Isolation and trusted authorship come from the deployment's selected AGDX security profile, while a generic key-value entry that carries no conversation is left out of a conversation-filtered scan. In the console the Conversations page links each conversation to its memory, graph, and query surfaces filtered to that conversation.
+`memory_with(ns, MemoryBackend::Vector).embedder(..)` provides local similarity memory without a server. It embeds records on write and ranks them by cosine similarity. The application supplies `Embedder`, as it supplies `LlmClient` for model calls.
+
+Managed models can retain the source conversation from `gen_ai.conversation.id`. Filter with `laser.query(index).conversation(id)`, `laser.graph(name).conversation(id).neighbors(..)`, or `laser.kv(ns).scan().conversation(id)`. These filters narrow results without changing access rules. Entries without conversation metadata are excluded from a filtered KV scan. The Console can use these filters to connect conversation, memory, graph, and query views.
 
 ### Open SDK vs the managed runtime
 
-The open streaming surface above - publish, batch, consume, the agentic runtime, provenance, dedup, the `Cursor`, `StateStore`, and log-backed memory - runs against Apache Iggy, and is what you copy out of this repo. The query / projection / KV / fork surface requires a managed backend: it returns `LaserError::Unsupported` on Apache Iggy without one and works against LaserData Cloud or Laser Stack. The same `Laser` handle keeps working either way - the managed capabilities light up when the connected streaming infrastructure advertises a richer set. Capabilities are grouped, not flat: a root `managed` flag, then nested surfaces (`query` with its `available`/`projections`/`schemas`/`consistency`, `kv` with `available`/`cas`, `graph`, `forks`) plus `sessions`, `durable_dedup`, and `a2a_gateway`. They map to the LaserData managed runtime. Agentic memory has no capability of its own: it composes `query` and `graph`. The split:
+Streaming, agents, provenance, duplicate suppression, `Cursor`, `StateStore`, and locally folded memory run on Apache Iggy. Queries, projections, KV, and forks require a managed backend. Without it, calls return `LaserError::Unsupported`.
+
+Capabilities group support under `managed`, `query`, `kv`, `graph`, `forks`, `sessions`, `durable_dedup`, and `a2a_gateway`. Query includes `available`, `projections`, `schemas`, and `consistency`. KV includes `available` and `cas`. Memory combines query and graph capabilities rather than defining another group:
 
 | concern | open SDK (this crate, Apache Iggy) | managed runtime (LaserData Cloud or Laser Stack) |
 | --- | --- | --- |
 | transport | one Iggy connection, publish + batch API | same connection, same wire. Adds capability negotiation at login + the query API |
-| query / projections | not available, returns `LaserError::Unsupported` | picks up `Projection` + `ProjectionBinding` config and materializes read models served off the log |
+| query / projections | not available, returns `LaserError::Unsupported` | picks up `Projection` + `ProjectionBinding` configuration and materializes read models served off the log |
 | reliable consumption | `ReliableConsumer` with in-memory dedup + DLQ | infrastructure-side durable dedup primitives surfaced through `Capabilities::durable_dedup` |
 | memory | `Laser::memory(ns)` runs here: remember publishes to the memory topic, recall folds the log. In-process `VectorMemory<E>` (cosine recall, bring your own `Embedder`) needs no server either | the same `Laser::memory(ns)` - a deployment materializes the topic into a versioned key-value read view for fast recall. Memory itself has no capability flag |
 | sessions / forks | not available, returns `LaserError::Unsupported` | infrastructure-native session start + fork-from primitives, surfaced through `Capabilities::sessions` + `Capabilities::forks` |
 | A2A | `A2aBridge` axum route customers self-host | managed A2A gateway with auth, streaming, persisted task store, agent-card metadata, surfaced through `Capabilities::a2a_gateway` |
 
-The contract: **your app's imports do not change** when you move from Apache Iggy to Laser Stack or LaserData Cloud. Capability negotiation flips the internal seams, and a managed call against Apache Iggy without a managed backend is a typed `Unsupported`. The managed runtime never requires a separate client crate.
+Applications use the same imports for Apache Iggy, Laser Stack, and LaserData Cloud. Capability discovery identifies available operations. Managed calls return typed `Unsupported` errors when the server cannot serve them.
 
 ### Running examples for this chapter
 
@@ -607,7 +617,7 @@ The general-purpose counterpart (`event-analytics`) lives, with per-example READ
 
 ## Chapter 10 - multi-agent orchestration
 
-The fan-out in Chapter 9 is manual: you pick the sub-conversations. The orchestration layer adds discovery and directed coordination so an orchestrator routes by capability, never by hard-coded agent ids, all over the same log with no separate orchestration server.
+Chapter 9 selects sub-conversations directly. The orchestration API adds discovery and capability-based routing through the same log.
 
 ### Agents advertise, the orchestrator resolves
 
@@ -652,7 +662,11 @@ match outcome {
 
 ### A workflow: dependency-ordered steps, panels, and exclusivity
 
-The engine runs steps in dependency order, threads each step's output to the next, and scatters an `all_capable` step to every capable agent (a verifier panel). A budget caps spend and a journal makes a crashed run resumable. `.exclusive()` claims a fenced lease in the public `WORKFLOW_FENCE_NAMESPACE` for the consumer stale-holder gate. For a durable external effect, use `.exclusive_in(namespace)` and commit in the handler through `kv(target_namespace).cas_fenced(key, namespace, run_id, token)` with the stamped token and run id, so the lease and effect validate the same live lease and monotonic fence sequence. The engine starts renewal at half the granted TTL, keeps each renewal in the race with contract completion, and bounds it by lease expiry and the workflow deadline. A successful completion stays leased through verification and the durable journal append, then releases. An exclusive step can declare `.on_timeout(OnTimeout::Reassign)`: after a timeout, the released lease is acquired by a fresh holder, which bumps the fence sequence before re-dispatch and gates the stale holder out, bounded to a few reassignments. The default is `OnTimeout::Fail`.
+The workflow engine runs steps in dependency order and passes results between them. An `all_capable` step sends work to every matching agent. Budgets limit work, and the journal supports recovery. `.exclusive()` acquires a lease in `WORKFLOW_FENCE_NAMESPACE` for stale-holder rejection.
+
+For protected external state, use `.exclusive_in(namespace)`. In the handler, use `kv(target_namespace).cas_fenced(key, namespace, run_id, token)` with the recorded token and run ID. This binds the effect to the same live lease and fence counter. Renewal starts halfway through the granted lifetime and remains bounded by lease expiry and the workflow deadline.
+
+A completed step keeps its lease through verification and the durable journal write, then releases it. `.on_timeout(OnTimeout::Reassign)` acquires a new lease and fence before retrying with another holder. Reassignments are bounded. The default is `OnTimeout::Fail`.
 
 ```rust
 let result = laser
@@ -668,7 +682,7 @@ let result = laser
 
 ### Health and quarantine
 
-An agent advertising itself `Unavailable` is left out of routing. An operator pulls a misbehaving agent with `quarantine`, and the next resolution routes around it. Quarantine is reversible: `unquarantine` lifts it and returns the agent to routing, so the only other way out is retention expiry.
+Routing excludes agents that report `Unavailable`. An operator can exclude an agent with `quarantine` and restore it with `unquarantine`. Retention can also remove the recorded quarantine fact.
 
 ```rust
 laser.quarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
@@ -676,7 +690,7 @@ laser.quarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
 laser.unquarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
 ```
 
-A registry write is authorized by the topic's write access control. With the `sign` feature you can layer signed facts on top: `quarantine_signed` / `unquarantine_signed` carry an ed25519 signature, and a registry built with `LaserBuilder::verifier(keys)` folds a quarantine fact only when its signature verifies. That is defense in depth over Apache Iggy's own access control, which stays the primary gate.
+Registry-topic permissions control publication. With `sign`, use `quarantine_signed` and `unquarantine_signed` for signed facts. A registry configured through `LaserBuilder::verifier(keys)` accepts those facts only with a valid operator signature. This adds a check above native topic permissions.
 
 The `orchestra` example runs all of this end to end (a directed contract, a scatter panel, health exclusion, and quarantine), in both Rust (`cargo run --example orchestra`) and Python (`python orchestra.py`).
 
@@ -684,9 +698,9 @@ The `orchestra` example runs all of this end to end (a directed contract, a scat
 
 ## Running locally
 
-The streaming core (publish, consume, the agent runtime, provenance, the `Cursor`, log-backed memory) runs against Apache Iggy you start with `just up`, and every example and integration test exercises it there with no managed backend.
+Use `just up` to start Apache Iggy for streaming, agents, provenance, cursors, and locally folded memory. The open integration tests use those features without a managed backend.
 
-Query, projections, key-value, and forks are the managed surface. They run against Laser Stack or LaserData Cloud, which materializes projections and serves queries off the log. There is no in-process query worker. Against Apache Iggy without a managed backend these calls return `LaserError::Unsupported`, so to run the query chapters point the example at Laser Stack or LaserData Cloud. The same code runs unchanged in every case. The capability handshake at connect decides what is available.
+Queries, projections, KV, and forks require Laser Stack or LaserData Cloud. A managed backend consumes the log and serves the resulting views. Apache Iggy without that backend returns `LaserError::Unsupported`. Capability discovery identifies available features when the client connects.
 
 ---
 
@@ -705,4 +719,4 @@ Query, projections, key-value, and forks are the managed surface. They run again
 
 ## Handling cluster outages
 
-Publish retries are bounded and configurable in all three clients. A long-running application must handle exhausted errors and retain work for a later attempt. See [publish recovery](publish-recovery.md) for defaults, language examples, and delivery semantics.
+All three clients support configurable limits on publish retries. A long-running application must handle exhausted retries and retain work for a later attempt. See [publish recovery](publish-recovery.md) for defaults, language examples, and delivery behavior.

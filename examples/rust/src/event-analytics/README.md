@@ -1,15 +1,15 @@
 # event-analytics - one clickstream, every read model
 
-The general-purpose example. One topic of clickstream events and every read model the platform offers layered over it, in one run. Scaled by the shared volume knobs (`LASER_MESSAGES`, `LASER_BATCH`), the same binary is a smoke test or a multi-million-event soak. Layer: generic. AGDX surfaces: streaming plus materialized views and the query DSL, with writer-schema validation on a managed deployment.
+This example publishes clickstream events and reads them through a live consumer and a replay cursor. Managed deployments also project the events for analytics and schema checks.
 
 ## What it does
 
-1. **Hot path.** A Laser consumer-group reader tails the raw log live while the producer streams in chunks, folding a rolling ops ticker (events seen, checkouts). `CommitPolicy::Polling` stores offsets on the server before each poll, so the reader resumes safely after a restart. A timeout turns any stall into a diagnostic instead of a hang.
-2. **Analytics.** LaserData Cloud materializes the indexed events into a queryable `clickstream` table and answers what a dashboard asks: the funnel by `message_type`, the slowest routes, per-window counts over the `ts` convention field with `time_range`.
-3. **Resumable export.** An independent reader tails the same log with a `Cursor` and a `StateStore` checkpoint, then restarts and resumes exactly where it stopped instead of re-reading from zero.
-4. **Validated ingest (managed deployment).** A registered JSON Schema (draft 2020-12) guards a second index (the binary schema-first path lives in the order-book example's Avro tape): `laser.schemas().register(source).send()` returns a managed schema id, producers stamp it with `.schema_id(id)`, a well-formed event materializes and a malformed one (a string where an integer must be) never reaches the index. It shows up in the managed runtime's `schema_decode_failures.mismatch` health counter and the DLQ when the policy says so.
+1. Read the log through a consumer group while the producer sends batches. `CommitPolicy::Polling` enables automatic commits during polling. A lost response can require recovery from explicit offsets. A timeout reports a stalled read.
+2. On a managed deployment, query the projected `clickstream` table. The queries use `message_type`, `ts`, and `time_range` for counts and time windows.
+3. Export records through a separate `Cursor` and save offsets in a `StateStore`. Recreate the reader from the saved offsets.
+4. Register a JSON Schema through `laser.schemas().register(source).send()`. Attach its ID with `.schema_id(id)`. A matching record enters the index. A mismatched record increments `schema_decode_failures.mismatch` and follows the configured dead-letter policy.
 
-Indexing is body-first: the projection's pointers extract every column out of the decoded JSON event, typed, so the index and the event body can never disagree and no `agdx.idx.*` headers duplicate the payload. Every record carries the `message_type` + `ts` convention fields so the reserved columns fill and the query sugar works. Point it at LaserData Cloud to register the projection and run analytics. On Apache Iggy, the live consumer and resumable export still run and the managed phase prints one skip pointer.
+Projection pointers extract typed columns from each JSON body. The example does not duplicate those values in `agdx.idx.*` headers. Records include `message_type` and `ts` for the reserved query fields. A managed deployment supplies projection and analytics. Apache Iggy can run the live consumer and resumable export without those phases.
 
 ## Run it
 
@@ -29,9 +29,9 @@ LASER_MESSAGES=2000000 LASER_BATCH=1000 cargo run --release --example event-anal
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: indexes `clickstream` (the main tape) and `clickstream_guarded` (the schema-guarded one, exactly one row).
-- **Writer schemas**: the JSON Schema guard the run registered, with the LaserData-Cloud-allocated id.
-- **Messages**: the raw events with their compact `agdx.*` headers.
+- Query: indexes `clickstream` (the main tape) and `clickstream_guarded` (the schema-guarded one, exactly one row).
+- Writer schemas: the JSON Schema guard the run registered, with the LaserData-Cloud-allocated id.
+- Messages: the raw events with their compact `agdx.*` headers.
 
 ## Highlights
 
@@ -39,5 +39,5 @@ LASER_MESSAGES=2000000 LASER_BATCH=1000 cargo run --release --example event-anal
 - `laser.topic(topic).publish_batch()` chunked indexed publishing (each chunk one `send_messages` call, spread across partitions by the balanced partitioner).
 - `query(..)` aggregates: `count` / `group_by` / `time_range` windows over the `message_type` and `ts` convention fields.
 - `Cursor` + `StateStore` checkpointing for resumable downstream jobs.
-- `laser.watch()` await-then-query: the binding opts into `notify`, and the projection wait re-counts only when the change feed reports the view advanced (falling back to the plain bounded poll where the feed is not published).
+- The binding enables `notify`, and `laser.watch()` reports view progress. The wait helper recounts after a notification. Without a feed, it uses bounded query polling.
 - Writer schemas: synchronous register returning the allocated id, JSON Schema validation guarding an index.

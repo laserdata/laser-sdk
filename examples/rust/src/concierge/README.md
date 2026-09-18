@@ -1,21 +1,21 @@
 # concierge - an AI support desk on the log
 
-The agentic example. One realistic system: an AI support desk operating a live incident end to end, with every agent coordinating only through the log, never a direct call. Each platform feature does the job it exists for inside one story instead of starring in its own demo. Layer: agentic, and the full-AGDX showcase: it exercises every surface in one run, streaming and the agent envelope, materialized views and query, key-value, and forks.
+This example runs a support desk whose agents coordinate through the log. It combines tickets, queries, memory, credits, approval, and a proposed change in a fork.
 
 ## What it does
 
-1. **World model.** A ticket firehose (`LASER_MESSAGES`, batched by `LASER_BATCH`) bulk-ingests into a `support_tickets` topic. Every field rides as an indexed header and the JSON body is inlined, so LaserData Cloud materializes a fully queryable ticket table while the log keeps the raw bytes. Tickets carry the `message_type` and `ts` convention fields, so the reserved columns fill and the `message_type` / `time_range` query sugar works.
-2. **Memory.** Past resolution notes are remembered in a shared in-process `VectorMemory` (a deterministic `Embedder` behind the same seam a real model plugs into) and recalled semantically when the incident arrives. The desk runs in one process, so the specialist reads the index the desk seeded at startup.
-3. **The desk.** Four agents on the agent topics:
-   - **triage** (Commands, responds on Responses) queries the index as a tool for the live blast radius, fans one diagnostic angle per specialist call under a deadline (each on its own correlation conversation), and synthesizes the findings into a diagnosis with the LLM.
-   - **specialist** (ToolCalls to ToolResults) answers each angle from recalled memory plus the LLM.
-   - **resolver** (Commands, KV-deduplicated) applies remediation credits. The effect is a read-modify-write on a KV balance, which is exactly why the `Deduplicator` gate in front of it matters: the credit list is sent twice and the totals come out exact. Credits at or above the threshold hold for a durable approval first.
-   - **approver** (HumanInput to Responses) stands in for the human behind that gate.
-4. **Speculation.** The diagnosis proposes bulk-resolving the open critical checkout backlog. The desk stages the plan in a copy-on-write fork, compares the forked backlog against the trunk, and leaves the fork open with the verdict logged so the LaserData Cloud can show it. `LASER_APPLY_PLAN=1` acts on the verdict instead: promote when the plan clears the criticals, squash when it does not (the trunk never changed).
-5. **Memory loop.** The diagnosis is remembered as a new note, so the next similar incident recalls what this one learned.
-6. **Audit.** The whole incident is one conversation on the log. The run ends by rebuilding it with `ConversationState::load`, the same fold a crashed coordinator runs on restart. No side database, the stream is the state.
+1. Publish tickets to `support_tickets` using `LASER_MESSAGES` and `LASER_BATCH`. Indexed fields and inline JSON support managed queries. `message_type` and `ts` fill the reserved query fields.
+2. Store resolution notes in a shared local `VectorMemory`. The example uses a deterministic `Embedder`. The specialist reads this same index.
+3. The desk. Four agents on the agent topics:
+   - Triage reads Commands, queries affected tickets, requests specialist input under a deadline, and returns its diagnosis on Responses.
+   - The specialist reads ToolCalls and returns memory-assisted model answers on ToolResults.
+   - The resolver reads Commands and updates credit balances. Its KV-backed `Deduplicator` suppresses the repeated credit request in this example. Credits at or above the threshold require recorded approval.
+   - The approver reads HumanInput and answers on Responses.
+4. Stage the proposed backlog change in a fork and compare it with the trunk. The default leaves the fork open. With `LASER_APPLY_PLAN=1`, promote a successful plan or squash it.
+5. Record the diagnosis as a note for later incidents.
+6. Rebuild the incident with `ConversationState::load` from its conversation records.
 
-The queryable world model, KV, approvals, and forks run on Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, the example prints how to point at a managed deployment and exits green before provisioning the desk. The in-process `VectorMemory` remains useful independently in the `memory` example.
+Queries, KV, approvals, and forks require Laser Stack or LaserData Cloud. Without `laser-plane`, the example explains the requirement and exits before creating the desk. The `memory` example also demonstrates local `VectorMemory` independently.
 
 ## Run it
 
@@ -48,17 +48,17 @@ LASER_CONCIERGE_CREDIT_TIMEOUT_SECS=600 \
 
 ## Where to look (LaserData Cloud)
 
-- **Query**: index `support_tickets` (the world model) and `concierge_memory` (the embedded notes).
-- **KV**: namespaces `concierge-credits-<run>` (the applied balances) and `concierge-dedup-<run>` (the idempotency keys that blocked the redelivery). The run logs the exact names.
-- **Forks**: `bulk-resolve-plan` stays open after a default run (with `LASER_APPLY_PLAN=1` it was promoted or squashed by the end).
-- **Messages**: the agent topics carry the whole conversation, provenance headers included.
+- Query: index `support_tickets` (the world model) and `concierge_memory` (the embedded notes).
+- KV: namespaces `concierge-credits-<run>` (the applied balances) and `concierge-dedup-<run>` (the idempotency keys that blocked the redelivery). The run logs the exact names.
+- Forks: `bulk-resolve-plan` stays open after a default run (with `LASER_APPLY_PLAN=1` it was promoted or squashed by the end).
+- Messages: the agent topics carry the whole conversation, provenance headers included.
 
 ## Highlights
 
 - `Agent::builder()` with `.listen_on` / `.respond_on` / `.deduplicator`, `ctx.request(..)` fan-out under a `deadline`, `ctx.respond(..)` replies, `laser.request(..)` awaiting the desk end to end.
 - A shared `VectorMemory` + `Embedder` for remember and recall, closing the loop by remembering the new resolution.
-- A KV-backed `Deduplicator` turning at-least-once delivery into effectively-once effects, proven by a deliberate redelivery.
-- A coordination demo: a credit-ledger compare-and-swap (`set(..).expect_absent()` / `.expect_version(v).commit()`) with a conflict-retry loop for lock-free optimistic concurrency, a `read_your_writes()` query for read-after-write, and `LaserError::code()` classifying every outcome into the unified `ResultCode` (so an unserved level reports cleanly rather than failing the run).
+- A KV-backed `Deduplicator` suppresses the deliberate repeated request in this scenario. It does not establish exactly-once external effects across arbitrary failures.
+- The coordination demo uses `set(..).expect_absent()` and `.expect_version(v).commit()` with conflict retries. It also uses `read_your_writes()` and classifies outcomes through `LaserError::code()` and `ResultCode`.
 - A durable approval gate over `AgentTopic::HumanInput`.
 - `laser.fork(id)` create / `put_row` / overlay query / `promote` / `squash` as a guarded what-if.
 - `ConversationState::load` rebuilding the incident from the log alone.

@@ -1,6 +1,6 @@
 # interop - one agent through A2A, MCP, AG-UI, and human input
 
-> Edge protocols remain thin adapters while workers communicate only through correlated AGDX records on Apache Iggy.
+This example exposes one agent through A2A, MCP, and AG-UI adapters. The agent receives AGDX records through the log and returns correlated replies.
 
 ## What it does
 
@@ -36,9 +36,9 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Where to look (LaserData Cloud)
 
-- **Conversations**: the A2A task, MCP call, chunked chat, and approval request.
-- **Agent registry**: assistant, tool runner, and approver presence while the example runs.
-- **Messages**: commands and responses with stable correlations across each protocol boundary.
+- Conversations: the A2A task, MCP call, chunked chat, and approval request.
+- Agent registry: assistant, tool runner, and approver presence while the example runs.
+- Messages: commands and responses with stable correlations across each protocol boundary.
 
 ## Highlights
 

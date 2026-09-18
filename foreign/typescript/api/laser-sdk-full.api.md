@@ -9652,7 +9652,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.3.2";
+export const SDK_VERSION = "0.4.0";
 
 // @public (undocumented)
 interface Select {

@@ -1,26 +1,26 @@
 # memory - remembered, durable, and connected knowledge
 
-> Agentic memory in three facets: learn in process, persist by conversation, and traverse relationships that recall alone cannot answer.
+This example stores incident facts, retrieves related facts, and records feedback. It also demonstrates durable memory and graph relationships on managed deployments.
 
 ## What it does
 
 The example uses one incident-knowledge domain across three related surfaces.
 
-**Vector memory** runs in process and demonstrates the four memory verbs over a deterministic 64-dimensional embedder.
+Vector memory runs in process and demonstrates the four memory verbs over a deterministic 64-dimensional embedder.
 
-1. **Remember** stores the same eight operational facts as the Rust and Python examples under one new conversation.
-2. **Recall** returns the three closest facts for `checkout is slow during the sale`.
-3. **Improve** upvotes the read-replica fact that resolved the incident and asserts that it ranks first.
-4. **Forget** removes the superseded search-index note and asserts that recall no longer returns it.
+1. Remember stores the same eight operational facts as the Rust and Python examples under one new conversation.
+2. Recall returns the three closest facts for `checkout is slow during the sale`.
+3. Improve upvotes the read-replica fact that resolved the incident and asserts that it ranks first.
+4. Forget removes the superseded search-index note and asserts that recall no longer returns it.
 
-**Durable memory** runs when the deployment advertises graph and KV support.
+Durable memory runs when the deployment advertises graph and KV support.
 
 5. Configures the `incidents` memory topic with four partitions and a one-day message expiry.
 6. Remembers the same eight facts durably under the original conversation and recalls the three most recent.
 7. Prints each recalled fact's source stream, topic, partition, and offset.
 8. Appends an audit message, binds the same durable memory handle to `laser.context(conversation)`, and reads both through one scope.
 
-**Knowledge graph** runs when the deployment advertises graph and KV support.
+Knowledge graph runs when the deployment advertises graph and KV support.
 
 9. Registers the `ops` graph projection.
 10. Writes every entity to the `topology` key-value namespace and attaches that source record to its graph node.
@@ -55,11 +55,11 @@ Connection failures return the original SDK error. A successful connection witho
 
 ## Where to look
 
-- **Memory**: durable facts in the `incidents` topic and namespace, filtered by the run's incident conversation.
-- **Conversations**: the incident audit message and its conversation-scoped memory lens.
-- **Key-value**: the `topology` namespace that gives every graph entity a live source record.
-- **Graph explorer**: the `ops` graph, including eight services, eight components, three teams, and two incidents.
-- **Graph traversal**: `checkout` neighbors, shared service dependencies, the `INC-101` blast radius, valid-time mitigations, and traced paths.
+- Memory: durable facts in the `incidents` topic and namespace, filtered by the run's incident conversation.
+- Conversations: the incident audit message and its conversation-scoped memory lens.
+- Key-value: the `topology` namespace that gives every graph entity a live source record.
+- Graph explorer: the `ops` graph, including eight services, eight components, three teams, and two incidents.
+- Graph traversal: `checkout` neighbors, shared service dependencies, the `INC-101` blast radius, valid-time mitigations, and traced paths.
 
 ## Highlights
 

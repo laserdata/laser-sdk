@@ -1,8 +1,8 @@
 # Wire decode fuzzing
 
-Continuous fuzzing of the laser-wire decode surface, the only place hostile bytes reach the crate. It is detached from the main workspace because it needs a nightly toolchain and the `cargo-fuzz` binary.
+This crate tests `laser-wire` decoders with generated input. It is outside the main workspace because it requires nightly Rust and `cargo-fuzz`.
 
-The same entry points are also covered deterministically by the in-tree `cargo test` robustness suite (`wire/tests/robustness.rs`), which runs on stable with no extra tooling. This crate is for going deeper: long campaigns, coverage guidance, and crash-corpus minimization.
+`wire/tests/robustness.rs` tests the same decoding paths with deterministic inputs on stable Rust. This separate crate supports longer coverage-guided runs and smaller reproductions of crashes.
 
 ## Run
 

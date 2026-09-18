@@ -1,6 +1,6 @@
 # context - one conversation, fully assembled
 
-> Everything one conversation touched - messages, memories, graph entries - scoped by id and assembled on demand under a token budget. Stop hand-rolling context windows.
+This example groups messages by conversation and reads them under a token budget. A context handle keeps the conversation ID with each operation.
 
 ## What it shows
 

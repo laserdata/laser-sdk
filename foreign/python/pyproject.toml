@@ -39,6 +39,19 @@ features = ["pyo3/extension-module"]
 module-name = "laser_sdk"
 include = [{ path = "laser_sdk.pyi", format = "sdist" }]
 
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+    { file = "laser_sdk.pyi" },
+    { file = "../../Cargo.toml" },
+    { file = "../../rust-toolchain.toml" },
+    { file = "../../sdk/**/*" },
+    { file = "../../wire/**/*" },
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
