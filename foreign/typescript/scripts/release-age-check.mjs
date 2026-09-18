@@ -10,16 +10,15 @@ const MINIMUM_RELEASE_AGE_DAYS = Number(process.env.MINIMUM_RELEASE_AGE_DAYS ?? 
 const REGISTRY = "https://registry.npmjs.org"
 const CONCURRENCY = 16
 
-// Packages tracked on a prerelease channel, where the cooldown cannot apply:
-// the SDK pins an exact `edge` build to stay in step with the streaming server
-// it is developed against, and those builds are consumed the day they ship. The
-// exemption is per package and per prerelease version only, so a stable release
-// of the same package still serves its cooldown, and no other dependency is
-// weakened. Keep this list as short as the pins require.
-const PRERELEASE_COOLDOWN_EXEMPT = new Set(["apache-iggy"])
+// Packages released in step with the streaming server the SDK is developed
+// against, where the cooldown cannot apply: the SDK pins the exact client
+// build that matches the server release and consumes it the day it ships, on
+// the stable channel as well as on `edge`. The exemption is per package, so no
+// other dependency is weakened. Keep this list as short as the pins require.
+const SERVER_LOCKSTEP_COOLDOWN_EXEMPT = new Set(["apache-iggy"])
 
-function exemptFromCooldown({ name, version }) {
-  return PRERELEASE_COOLDOWN_EXEMPT.has(name) && version.includes("-")
+function exemptFromCooldown({ name }) {
+  return SERVER_LOCKSTEP_COOLDOWN_EXEMPT.has(name)
 }
 
 function lockedVersions(lockPath) {
@@ -91,7 +90,7 @@ if (tooYoung.length > 0) {
 // The exemptions are named on every run: a skipped check that prints nothing
 // reads as a check that passed.
 for (const { name, version } of exempted) {
-  console.log(`release-age:check exempt, ${name}@${version} is a pinned prerelease`)
+  console.log(`release-age:check exempt, ${name}@${version} is pinned in step with the server`)
 }
 
 console.log(

@@ -34,7 +34,7 @@ extension-module = ["pyo3/extension-module"]
 async-trait = "0.1.92"
 bytes = "1.12.1"
 futures = "0.3.34"
-iggy = { version = "0.11.0-edge.8" }
+iggy = { version = "0.11.0" }
 # Path wins for the in-monorepo wheel build. The version lets a source build (an
 # sdist on a platform with no prebuilt wheel) fetch laser-sdk from crates.io once
 # it is published. Wheels carry it compiled in and pull nothing at install.

@@ -76,7 +76,6 @@ export function applyRoute(router: Router, provenance: Provenance): Provenance {
     case "toCapable":
     case "allCapable": {
       const { targetAgentId, ...rest } = provenance
-      void targetAgentId
       return rest
     }
   }
