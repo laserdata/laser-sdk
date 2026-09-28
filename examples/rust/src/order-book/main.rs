@@ -1,5 +1,6 @@
 use laser_examples::{
-    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, start_projector, stream_for,
+    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, release_after, start_projector,
+    stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::schema_codecs::CompiledSchema;
@@ -225,66 +226,69 @@ async fn main() -> Result<(), LaserError> {
 
     let data_stream = stream_for("order-book");
     let laser = laser(&data_stream, Capabilities::OPEN).await?;
-    laser.topic(FEED_TOPIC).ensure(PARTITIONS).await?;
-    laser.topic(TAPE_TOPIC).ensure(PARTITIONS).await?;
-    let query_available = laser.capabilities().await.query.available;
+    release_after(&laser, &data_stream, async {
+        laser.topic(FEED_TOPIC).ensure(PARTITIONS).await?;
+        laser.topic(TAPE_TOPIC).ensure(PARTITIONS).await?;
+        let query_available = laser.capabilities().await.query.available;
 
-    // Start the projector before the feed opens so no fill is missed, then warm
-    // the hot-path producer and consumer up front so the live phase below times
-    // the market, not the one-off connection and consumer-group handshakes.
-    let projector = if query_available {
-        Some(start_projector(&laser, TAPE_TOPIC, ContentType::Json, COLUMNS).await?)
-    } else {
-        managed_feature_ready(false, "trade-tape analytics", "order-book");
-        None
-    };
-    let producer = build_feed_producer(&laser, &data_stream).await?;
-    let mut consumer = build_book_consumer(&laser, &data_stream).await?;
+        // Start the projector before the feed opens so no fill is missed, then warm
+        // the hot-path producer and consumer up front so the live phase below times
+        // the market, not the one-off connection and consumer-group handshakes.
+        let projector = if query_available {
+            Some(start_projector(&laser, TAPE_TOPIC, ContentType::Json, COLUMNS).await?)
+        } else {
+            managed_feature_ready(false, "trade-tape analytics", "order-book");
+            None
+        };
+        let producer = build_feed_producer(&laser, &data_stream).await?;
+        let mut consumer = build_book_consumer(&laser, &data_stream).await?;
 
-    // Draw the whole session up front so the live feed and the tape index replay
-    // the identical fills.
-    let fills = fills_total();
-    let trades = generate_trades(fills);
+        // Draw the whole session up front so the live feed and the tape index replay
+        // the identical fills.
+        let fills = fills_total();
+        let trades = generate_trades(fills);
 
-    phase("streaming a live market feed");
-    info!("streaming {fills} fills across {} symbols", OPENING.len());
-    let book = stream_live_book(producer, &mut consumer, &trades).await?;
-    consumer.shutdown().await?;
-    book.snapshot(fills);
+        phase("streaming a live market feed");
+        info!("streaming {fills} fills across {} symbols", OPENING.len());
+        let book = stream_live_book(producer, &mut consumer, &trades).await?;
+        consumer.shutdown().await?;
+        book.snapshot(fills);
 
-    phase("publishing the fills to the durable trade tape");
-    // Capture the tape's head per partition before publishing, so the audit
-    // below replays only this session's fills. The tape is durable: a re-run
-    // against the same deployment appends a fresh session, and an audit from
-    // offset zero would compare every session's fills against one session's.
-    let tape_start = tape_head(&laser).await?;
-    index_tape(&laser, &trades).await?;
+        phase("publishing the fills to the durable trade tape");
+        // Capture the tape's head per partition before publishing, so the audit
+        // below replays only this session's fills. The tape is durable: a re-run
+        // against the same deployment appends a fresh session, and an audit from
+        // offset zero would compare every session's fills against one session's.
+        let tape_start = tape_head(&laser).await?;
+        index_tape(&laser, &trades).await?;
 
-    if query_available {
-        phase("trade-tape analytics");
-        wait_for_projection(&laser, fills).await?;
-        report_volume_and_vwap(&laser).await?;
-    }
+        if query_available {
+            phase("trade-tape analytics");
+            wait_for_projection(&laser, fills).await?;
+            report_volume_and_vwap(&laser).await?;
+        }
 
-    phase("typed tape audit: replay the log as `Trade` values");
-    audit_tape(&laser, &trades, tape_start).await?;
+        phase("typed tape audit: replay the log as `Trade` values");
+        audit_tape(&laser, &trades, tape_start).await?;
 
-    // The schema-first coda (managed deployment): the identical fills ride a
-    // second tape as raw Avro datums. No `agdx.idx.*` headers this time, the
-    // LaserData Cloud resolves the registered writer schema via `agdx.sid` and extracts
-    // the indexed columns out of the binary bodies, and the notionals must
-    // come out the same as the JSON tape's.
-    if laser.capabilities().await.managed {
-        phase("schema-first tape: Avro fills decoded by a registered writer schema");
-        avro_tape(&laser, &trades).await?;
-    } else {
-        info!("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape");
-    }
+        // The schema-first coda (managed deployment): the identical fills ride a
+        // second tape as raw Avro datums. No `agdx.idx.*` headers this time, the
+        // LaserData Cloud resolves the registered writer schema via `agdx.sid` and extracts
+        // the indexed columns out of the binary bodies, and the notionals must
+        // come out the same as the JSON tape's.
+        if laser.capabilities().await.managed {
+            phase("schema-first tape: Avro fills decoded by a registered writer schema");
+            avro_tape(&laser, &trades).await?;
+        } else {
+            info!("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape");
+        }
 
-    if let Some(projector) = projector {
-        projector.shutdown().await;
-    }
-    Ok(())
+        if let Some(projector) = projector {
+            projector.shutdown().await;
+        }
+        Ok(())
+    })
+    .await
 }
 
 // Tuned hot-path producer: balanced partitioning spreads the feed across

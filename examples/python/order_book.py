@@ -278,43 +278,46 @@ async def avro_tape(laser: ls.Laser, trades: list[dict]) -> None:
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    caps = await laser.capabilities()
-    count = _common.messages(default=400)
+    try:
+        caps = await laser.capabilities()
+        count = _common.messages(default=400)
 
-    await laser.topic(FEED_TOPIC).ensure(partitions=_common.PARTITIONS)
-    await laser.topic(TAPE_TOPIC).ensure(partitions=_common.PARTITIONS)
+        await laser.topic(FEED_TOPIC).ensure(partitions=_common.PARTITIONS)
+        await laser.topic(TAPE_TOPIC).ensure(partitions=_common.PARTITIONS)
 
-    # Draw the whole session up front so the feed and the tape replay identical fills.
-    trades = generate_trades(count)
+        # Draw the whole session up front so the feed and the tape replay identical fills.
+        trades = generate_trades(count)
 
-    # Register the analytics projector before the tape is written so no fill is
-    # missed by a projector that starts afterwards (managed-only).
-    if caps.query:
-        await _common.start_projector(laser, TAPE_TOPIC, COLUMNS)
+        # Register the analytics projector before the tape is written so no fill is
+        # missed by a projector that starts afterwards (managed-only).
+        if caps.query:
+            await _common.start_projector(laser, TAPE_TOPIC, COLUMNS)
 
-    _common.phase("warming up")
-    print(f"{count} fills across {len(OPENING)} symbols")
-    _common.phase("streaming a live market feed")
-    book = await stream_live_book(laser, trades)
-    book.snapshot(count)
+        _common.phase("warming up")
+        print(f"{count} fills across {len(OPENING)} symbols")
+        _common.phase("streaming a live market feed")
+        book = await stream_live_book(laser, trades)
+        book.snapshot(count)
 
-    _common.phase("publishing the fills to the durable trade tape")
-    await index_tape(laser, trades)
+        _common.phase("publishing the fills to the durable trade tape")
+        await index_tape(laser, trades)
 
-    if _common.managed_gate(caps.query, "query", EXAMPLE):
-        await _common.wait_for_projection(laser, TAPE_TOPIC, count)
-        _common.phase("trade-tape analytics")
-        await report_volume_and_vwap(laser)
+        if _common.managed_gate(caps.query, "query", EXAMPLE):
+            await _common.wait_for_projection(laser, TAPE_TOPIC, count)
+            _common.phase("trade-tape analytics")
+            await report_volume_and_vwap(laser)
 
-    _common.phase("typed tape audit: replaying the log as Fill values")
-    await audit_tape(laser, trades)
+        _common.phase("typed tape audit: replaying the log as Fill values")
+        await audit_tape(laser, trades)
 
-    # The schema-first coda needs writer schemas from a managed deployment.
-    if caps.managed:
-        _common.phase("schema-first tape: Avro fills decoded by a registered writer schema")
-        await avro_tape(laser, trades)
-    elif caps.query:
-        print("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape")
+        # The schema-first coda needs writer schemas from a managed deployment.
+        if caps.managed:
+            _common.phase("schema-first tape: Avro fills decoded by a registered writer schema")
+            await avro_tape(laser, trades)
+        elif caps.query:
+            print("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

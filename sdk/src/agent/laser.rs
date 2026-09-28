@@ -33,6 +33,8 @@ const REPLY_BATCH: u32 = 1000;
 impl Laser {
     /// Create the default data stream and the well-known agent topics (commands, responses, ...), `partitions` each. Idempotent. Requires a default stream (see [`Laser::connect_with_stream`]).
     ///
+    /// The nine topics hold `9 * partitions` partitions on the server, and every partition costs it open files and memory. Keep `partitions` small on small tiers, and remove a stream you no longer need with [`Stream::delete`](crate::stream::Stream::delete).
+    ///
     /// Warms a producer for every well-known topic concurrently, so that cost is
     /// paid once up front instead of lazily on a handler's first reply.
     #[tracing::instrument(

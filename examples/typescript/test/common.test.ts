@@ -1,9 +1,11 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import type { Laser } from "@laserdata/laser-sdk"
 import {
   AsyncResourceGroup,
   Rng,
   ensureDefaultPort,
+  releaseStream,
   resolveConnectionString,
   runToken,
   streamFor
@@ -145,4 +147,21 @@ void test("given_a_string_with_its_own_ca_when_resolved_then_should_not_attach_t
     }),
     "iggy://u:p@h.laserdata.cloud:8090?tls=true&tls_ca_file=/etc/ca.crt"
   )
+})
+
+void test("given_a_run_owned_stream_when_released_then_should_delete_only_that_stream", async () => {
+  const deleted: string[] = []
+  const laser = {
+    stream: (name: string) => ({
+      delete: () => {
+        deleted.push(name)
+        return Promise.resolve(true)
+      }
+    })
+  } as unknown as Laser
+
+  await releaseStream(laser, "agent", {})
+  await releaseStream(laser, "agent", { LASER_STREAM: "provisioned" })
+
+  assert.deepEqual(deleted, [streamFor("agent", {})])
 })

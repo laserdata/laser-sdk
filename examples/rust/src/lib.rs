@@ -3,6 +3,7 @@ use laser_sdk::laser::Laser;
 use laser_sdk::prelude::{Capabilities, LaserError};
 use laser_sdk::query::{Projection, ProjectionBinding};
 use laser_sdk::stream::ContentType;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 pub fn init_tracing() {
@@ -100,6 +101,22 @@ pub async fn laser(stream: &str, capabilities: Capabilities) -> Result<Laser, La
         .capabilities(capabilities)
         .build()
         .await
+}
+
+/// Run `example`, then delete this run's own `stream` whether the example succeeded or not, so repeated runs do not leave their topics and partitions on the server. A provisioned `LASER_STREAM` is kept. The example's own error wins over a cleanup error.
+pub async fn release_after(
+    laser: &Laser,
+    stream: &str,
+    example: impl Future<Output = Result<(), LaserError>>,
+) -> Result<(), LaserError> {
+    let outcome = example.await;
+    let provisioned = std::env::var("LASER_STREAM").is_ok_and(|value| !value.trim().is_empty());
+    let released = if provisioned {
+        Ok(())
+    } else {
+        laser.stream(stream).delete().await.map(|_| ())
+    };
+    outcome.and(released)
 }
 
 /// Check a capability after connecting successfully.

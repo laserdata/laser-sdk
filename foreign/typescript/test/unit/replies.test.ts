@@ -51,6 +51,7 @@ function fakeTransport(script: readonly ScriptedPoll[]): LaserTransport {
     },
     sendManaged: () => Promise.reject(new Error("unused")),
     ensureStream: () => Promise.reject(new Error("unused")),
+    deleteStream: () => Promise.reject(new Error("unused")),
     ensureTopic: () => Promise.reject(new Error("unused")),
     findTopicPartitionCount: () => Promise.resolve(1),
     getTopicPartitionCount: () => Promise.resolve(1),

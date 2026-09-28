@@ -103,6 +103,7 @@ query = ["laser-wire/bson", "streaming"]
 streaming = [
     "dep:dashmap",
     "dep:futures",
+    "dep:iggy_common",
     "dep:serde_json",
     "dep:tokio",
     "dep:tracing",
@@ -123,6 +124,7 @@ dashmap = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 iggy = { workspace = true }
+iggy_common = { workspace = true, optional = true }
 json-patch = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
 laser-wire = { workspace = true, features = ["builders", "cbor"] }
@@ -149,7 +151,7 @@ protox = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
 
 [[test]]
 name = "integration"

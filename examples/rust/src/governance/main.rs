@@ -1,5 +1,6 @@
 use laser_examples::{
-    PARTITIONS, env_u64, init_tracing, laser, managed_feature_ready, phase, stream_for,
+    PARTITIONS, env_u64, init_tracing, laser, managed_feature_ready, phase, release_after,
+    stream_for,
 };
 use laser_sdk::edge_auth::{EdgeClaims, authorize_edge};
 use laser_sdk::iggy::prelude::{Identifier, UserClient, UserStatus};
@@ -30,36 +31,39 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     let stream = stream_for(EXAMPLE);
     let laser = laser(&stream, Capabilities::OPEN).await?;
-    laser.bootstrap(PARTITIONS).await?;
+    release_after(&laser, &stream, async {
+        laser.bootstrap(PARTITIONS).await?;
 
-    phase("Capability RBAC: roles bound to a server-stamped user");
-    let capabilities = laser.capabilities().await;
-    if managed_feature_ready(capabilities.authz, "capability RBAC", EXAMPLE) {
-        let target_user = match std::env::var(TARGET_USER_ENV) {
-            Ok(_) => env_u64(TARGET_USER_ENV, 0) as u32,
-            Err(_) => demo_user_id(&laser).await?,
-        };
-        install_roles(&laser, target_user).await?;
-    }
+        phase("Capability RBAC: roles bound to a server-stamped user");
+        let capabilities = laser.capabilities().await;
+        if managed_feature_ready(capabilities.authz, "capability RBAC", EXAMPLE) {
+            let target_user = match std::env::var(TARGET_USER_ENV) {
+                Ok(_) => env_u64(TARGET_USER_ENV, 0) as u32,
+                Err(_) => demo_user_id(&laser).await?,
+            };
+            install_roles(&laser, target_user).await?;
+        }
 
-    phase("Permission intersection: agent grants cannot exceed the user");
-    demonstrate_intersection();
+        phase("Permission intersection: agent grants cannot exceed the user");
+        demonstrate_intersection();
 
-    phase("External edge: audience validation and step-up");
-    demonstrate_edge_auth();
+        phase("External edge: audience validation and step-up");
+        demonstrate_edge_auth();
 
-    phase("Run governor: submit a budgeted managed run when served");
-    if capabilities.agent_workflow {
-        submit_budgeted_run(&laser).await?;
-    } else {
-        warn!("agent_workflow is not advertised, so the live budgeted-run submit is skipped.");
-    }
+        phase("Run governor: submit a budgeted managed run when served");
+        if capabilities.agent_workflow {
+            submit_budgeted_run(&laser).await?;
+        } else {
+            warn!("agent_workflow is not advertised, so the live budgeted-run submit is skipped.");
+        }
 
-    info!(
-        "governance: role grants, deny-wins matching, on-behalf-of intersection, \
-         external-edge step-up, and budgeted run submission share one governance model."
-    );
-    Ok(())
+        info!(
+            "governance: role grants, deny-wins matching, on-behalf-of intersection, \
+             external-edge step-up, and budgeted run submission share one governance model."
+        );
+        Ok(())
+    })
+    .await
 }
 
 /// The dedicated demo user the roles are bound to, created on first run.

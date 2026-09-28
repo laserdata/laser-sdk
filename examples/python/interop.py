@@ -27,94 +27,101 @@ EXAMPLE = "interop"
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    _common.phase("connecting")
-    await laser.bootstrap(partitions=_common.PARTITIONS)
+    try:
+        _common.phase("connecting")
+        await laser.bootstrap(partitions=_common.PARTITIONS)
 
-    # One worker reachable through A2A (Commands -> Responses) and another through
-    # MCP (ToolCalls -> ToolResults). Same handler shape, same canned model. Each
-    # reads the decoded AGDX command body and answers with a correlated AGDX
-    # response, which is what a bridge's tasks/get and tool result read.
-    async def a2a_worker(ctx, message):
-        prompt = bytes(message.agdx_body or message.payload).decode(errors="replace")
-        await ctx.respond_input(ls.Topics.RESPONSES, complete(prompt).encode())
+        # One worker reachable through A2A (Commands -> Responses) and another through
+        # MCP (ToolCalls -> ToolResults). Same handler shape, same canned model. Each
+        # reads the decoded AGDX command body and answers with a correlated AGDX
+        # response, which is what a bridge's tasks/get and tool result read.
+        async def a2a_worker(ctx, message):
+            prompt = bytes(message.agdx_body or message.payload).decode(errors="replace")
+            await ctx.respond_input(ls.Topics.RESPONSES, complete(prompt).encode())
 
-    async def mcp_worker(ctx, message):
-        prompt = bytes(message.agdx_body or message.payload).decode(errors="replace")
-        await ctx.respond_input(ls.Topics.TOOL_RESULTS, complete(prompt).encode())
+        async def mcp_worker(ctx, message):
+            prompt = bytes(message.agdx_body or message.payload).decode(errors="replace")
+            await ctx.respond_input(ls.Topics.TOOL_RESULTS, complete(prompt).encode())
 
-    # The human behind the interrupt gate: it resolves every request_input it is
-    # handed with a correlated AGDX response. A real deployment routes this to a
-    # UI or a person.
-    async def approver(ctx, message):
-        await ctx.respond_input(ls.Topics.RESPONSES, b"approved")
+        # The human behind the interrupt gate: it resolves every request_input it is
+        # handed with a correlated AGDX response. A real deployment routes this to a
+        # UI or a person.
+        async def approver(ctx, message):
+            await ctx.respond_input(ls.Topics.RESPONSES, b"approved")
 
-    def spawn(agent_id, topic, handler):
-        return laser.spawn_agent(agent_id, topic, handler, poll_interval_ms=10)
+        def spawn(agent_id, topic, handler):
+            return laser.spawn_agent(agent_id, topic, handler, poll_interval_ms=10)
 
-    a2a_agent = spawn("assistant", ls.Topics.COMMANDS, a2a_worker)
-    mcp_agent = spawn("tool-runner", ls.Topics.TOOL_CALLS, mcp_worker)
-    approver_agent = spawn("approver", ls.Topics.HUMAN_INPUT, approver)
+        a2a_agent = spawn("assistant", ls.Topics.COMMANDS, a2a_worker)
+        mcp_agent = spawn("tool-runner", ls.Topics.TOOL_CALLS, mcp_worker)
+        approver_agent = spawn("approver", ls.Topics.HUMAN_INPUT, approver)
 
-    async with a2a_agent, mcp_agent, approver_agent:
-        # A2A: SendMessage publishes the task, the worker answers, GetTask completes.
-        _common.phase("A2A: SendMessage -> GetTask")
-        a2a = laser.a2a_bridge("a2a-gateway", ls.Topics.COMMANDS, ls.Topics.RESPONSES)
-        params = {"message": {"role": "user", "parts": [{"kind": "text", "text": "summarize"}]}}
-        task = await a2a.submit(params)
-        completed = None
-        for _ in range(60):
-            completed = await a2a.task(task["id"])
-            if completed["status"]["state"].lower() not in ("working", "submitted"):
-                break
-            await asyncio.sleep(0.25)
-        artifacts = completed.get("artifacts") or []
-        answer = artifacts[0]["text"] if artifacts and "text" in artifacts[0] else "(no artifact)"
-        print(f"A2A task {completed['id']} -> {completed['status']['state']}: {answer}")
+        async with a2a_agent, mcp_agent, approver_agent:
+            # A2A: SendMessage publishes the task, the worker answers, GetTask completes.
+            _common.phase("A2A: SendMessage -> GetTask")
+            a2a = laser.a2a_bridge("a2a-gateway", ls.Topics.COMMANDS, ls.Topics.RESPONSES)
+            params = {"message": {"role": "user", "parts": [{"kind": "text", "text": "summarize"}]}}
+            task = await a2a.submit(params)
+            completed = None
+            for _ in range(60):
+                completed = await a2a.task(task["id"])
+                if completed["status"]["state"].lower() not in ("working", "submitted"):
+                    break
+                await asyncio.sleep(0.25)
+            artifacts = completed.get("artifacts") or []
+            answer = (
+                artifacts[0]["text"] if artifacts and "text" in artifacts[0] else "(no artifact)"
+            )
+            print(f"A2A task {completed['id']} -> {completed['status']['state']}: {answer}")
 
-        # MCP: tools/call reaches the same worker and renders the answer as a tool result.
-        _common.phase("MCP: initialize / tools/list / tools/call")
-        mcp = laser.mcp_bridge(
-            "mcp-gateway",
-            ls.Topics.TOOL_CALLS,
-            ls.Topics.TOOL_RESULTS,
-            "laser-mcp",
-            tools=[
-                {
-                    "name": "ask",
-                    "description": "ask the assistant a question",
-                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-                }
-            ],
-            timeout_secs=15.0,
-        )
-        print(f"MCP tools/list: {[t['name'] for t in mcp.list_tools()['tools']]}")
-        result = await mcp.call_tool("ask", {"q": "what is the Agent Data Exchange Protocol?"})
-        content = result.get("content") or []
-        text = content[0]["text"] if content and "text" in content[0] else "(empty)"
-        print(f"MCP tools/call -> isError={result.get('isError', False)}, content: {text}")
+            # MCP: tools/call reaches the same worker and renders the answer as a tool result.
+            _common.phase("MCP: initialize / tools/list / tools/call")
+            mcp = laser.mcp_bridge(
+                "mcp-gateway",
+                ls.Topics.TOOL_CALLS,
+                ls.Topics.TOOL_RESULTS,
+                "laser-mcp",
+                tools=[
+                    {
+                        "name": "ask",
+                        "description": "ask the assistant a question",
+                        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+                    }
+                ],
+                timeout_secs=15.0,
+            )
+            print(f"MCP tools/list: {[t['name'] for t in mcp.list_tools()['tools']]}")
+            result = await mcp.call_tool("ask", {"q": "what is the Agent Data Exchange Protocol?"})
+            content = result.get("content") or []
+            text = content[0]["text"] if content and "text" in content[0] else "(empty)"
+            print(f"MCP tools/call -> isError={result.get('isError', False)}, content: {text}")
 
-        # AG-UI: stream a chat answer with the typed AGDX producer, then render the
-        # conversation as AG-UI events straight off the log.
-        _common.phase("AG-UI: render a chat stream as events")
-        conversation = ls.new_conversation_id()
-        correlation = ls.new_correlation_id()
-        stream = laser.agdx(ls.Topics.LLM_IO, "assistant", conversation).stream(correlation, "chat")
-        for token in complete("give a one-line status update").split(" "):
-            await stream.write((token + " ").encode())
-        await stream.finish(finish_reason="stop")
-        events = await laser.agui_events(conversation, ls.Topics.LLM_IO)
-        print(f"AG-UI rendered {len(events)} event(s) from the chat stream")
+            # AG-UI: stream a chat answer with the typed AGDX producer, then render the
+            # conversation as AG-UI events straight off the log.
+            _common.phase("AG-UI: render a chat stream as events")
+            conversation = ls.new_conversation_id()
+            correlation = ls.new_correlation_id()
+            stream = laser.agdx(ls.Topics.LLM_IO, "assistant", conversation).stream(
+                correlation, "chat"
+            )
+            for token in complete("give a one-line status update").split(" "):
+                await stream.write((token + " ").encode())
+            await stream.finish(finish_reason="stop")
+            events = await laser.agui_events(conversation, ls.Topics.LLM_IO)
+            print(f"AG-UI rendered {len(events)} event(s) from the chat stream")
 
-        # HITL: the orchestrator pauses for a human decision with the typed AGDX
-        # producer's request_input, and the approver resolves the interrupt with
-        # a correlated response. Built on AGDX command/response, riding the same log.
-        _common.phase("Human-in-the-loop: request_input -> respond_input")
-        conversation = ls.new_conversation_id()
-        gate = laser.agdx(ls.Topics.HUMAN_INPUT, "orchestrator", conversation)
-        decision = await gate.request_input(
-            ls.Topics.RESPONSES, b"approve a $500 refund?", timeout_secs=15.0
-        )
-        print(f"HITL decision: {bytes(decision).decode(errors='replace')}")
+            # HITL: the orchestrator pauses for a human decision with the typed AGDX
+            # producer's request_input, and the approver resolves the interrupt with
+            # a correlated response. Built on AGDX command/response, riding the same log.
+            _common.phase("Human-in-the-loop: request_input -> respond_input")
+            conversation = ls.new_conversation_id()
+            gate = laser.agdx(ls.Topics.HUMAN_INPUT, "orchestrator", conversation)
+            decision = await gate.request_input(
+                ls.Topics.RESPONSES, b"approve a $500 refund?", timeout_secs=15.0
+            )
+            print(f"HITL decision: {bytes(decision).decode(errors='replace')}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 # The model behind every worker: a deterministic canned reply, the Python

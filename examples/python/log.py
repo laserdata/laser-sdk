@@ -40,19 +40,21 @@ class Order:
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
+    try:
+        _common.phase("write two messages, then read them back")
+        topic = laser.stream(STREAM).topic(TOPIC, cls=Order)
+        await topic.ensure(2)
 
-    _common.phase("write two messages, then read them back")
-    topic = laser.stream(STREAM).topic(TOPIC, cls=Order)
-    await topic.ensure(2)
+        for order in (Order(id=1, total=99), Order(id=2, total=42)):
+            await topic.publish(order).send()
 
-    for order in (Order(id=1, total=99), Order(id=2, total=42)):
-        await topic.publish(order).send()
-
-    # One typed handle pins the contract: `Order` in on publish, `Order` out on
-    # replay. The reader starts at offset 0 and ends once it is caught up.
-    reader = topic.records("log-example")
-    while (record := await reader.next()) is not None:
-        print(f"  order #{record.value.id} total {record.value.total}")
+        # One typed handle pins the contract: `Order` in on publish, `Order` out on
+        # replay. The reader starts at offset 0 and ends once it is caught up.
+        reader = topic.records("log-example")
+        while (record := await reader.next()) is not None:
+            print(f"  order #{record.value.id} total {record.value.total}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

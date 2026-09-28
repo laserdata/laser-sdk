@@ -67,7 +67,7 @@ Data-publishing examples also share four volume knobs, so the same binary runs a
 | `LASER_CONCURRENCY` | parallel publishers (where the example fans out) |
 | `LASER_PAYLOAD_BYTES` | approximate body size (where the example pads bodies) |
 
-Each run uses `laser-<example>-<token>` unless `LASER_STREAM` supplies a name. Managed indexes use the same run token. This keeps concurrent examples separate. Reuse an explicit stream only when shared history is intended.
+Each run uses `laser-<example>-<token>` unless `LASER_STREAM` supplies a name. Managed indexes use the same run token. This keeps concurrent examples separate. Reuse an explicit stream only when shared history is intended. Every example deletes its per-run stream when it finishes, including after an error, so repeated runs do not pile up topics and partitions on the server. A stream supplied through `LASER_STREAM` is kept.
 
 ## Primitives - start here
 

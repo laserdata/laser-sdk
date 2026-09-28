@@ -1,3 +1,4 @@
+import { connectOptions, type ConnectOptions } from "./connect-options.js"
 import { publishOptions, type PublishOptions } from "./publish-options.js"
 import {
   ApacheIggyTransport,
@@ -169,6 +170,7 @@ const NO_TOPOLOGY_OVERRIDES: TopologyOverrides = {
 }
 
 interface LaserBuildOptions {
+  readonly connectOptions: ConnectOptions
   readonly publishOptions: PublishOptions
   readonly connectionString?: string
   readonly address?: { readonly host: string; readonly port: number }
@@ -198,6 +200,7 @@ export interface InjectedClientOptions {
 }
 
 export class LaserBuilder {
+  private connectOptionsValue: Partial<ConnectOptions> = {}
   private publishOptionsValue: Partial<PublishOptions> = {}
   private connectionStringValue: string | undefined
   private addressValue: { readonly host: string; readonly port: number } | undefined
@@ -213,6 +216,14 @@ export class LaserBuilder {
   private topologyOverridesValue: TopologyOverrides = NO_TOPOLOGY_OVERRIDES
 
   constructor(private readonly create: (options: LaserBuildOptions) => Promise<Laser>) {}
+
+  /**
+   * Budget for the initial connect: TCP dial, TLS handshake, login, and the managed capability probe. An expired budget rejects with `TimeoutError` naming the stage that stalled. Default: 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`.
+   */
+  connectTimeout(milliseconds: number): this {
+    this.connectOptionsValue = { timeoutMs: milliseconds }
+    return this
+  }
 
   publishTimeout(milliseconds: number): this {
     this.publishOptionsValue = { ...this.publishOptionsValue, timeoutMs: milliseconds }
@@ -337,6 +348,7 @@ export class LaserBuilder {
       if (value.length === 0) throw new ConfigError(`${name} must not be empty`)
     }
     return this.create({
+      connectOptions: connectOptions(this.connectOptionsValue),
       publishOptions: publishOptions(this.publishOptionsValue),
       ...(this.connectionStringValue !== undefined
         ? { connectionString: this.connectionStringValue }
@@ -370,6 +382,7 @@ interface LaserSharedState {
   lastCapabilities?: Capabilities
   capabilityProbeAtMs?: number
   announcedTopology: LaserTopology
+  closing?: Promise<void>
 }
 
 export type ConsumerRef =
@@ -397,8 +410,7 @@ const WELL_KNOWN_AGENT_TOPICS: readonly string[] = [
   AgentTopic.HumanInput,
   AgentTopic.Audit,
   AgentTopic.WorkflowJournal,
-  AgentTopic.Dlq,
-  AgentTopic.Registry
+  AgentTopic.Dlq
 ]
 
 function actionKind(kind: AgentKind): ActionKind {
@@ -457,8 +469,6 @@ async function probeCapabilities(transport: ManagedTransport): Promise<Capabilit
 
 /** Owns one Apache Iggy connection and addresses every stream available through it. */
 export class Laser implements AsyncDisposable {
-  private closed = false
-
   private constructor(
     private readonly transport: LaserTransport,
     readonly defaultStream: string | undefined,
@@ -500,12 +510,14 @@ export class Laser implements AsyncDisposable {
 
   static builder(): LaserBuilder {
     return new LaserBuilder(async (options) => {
+      const deadline = Date.now() + options.connectOptions.timeoutMs
       let transport: ApacheIggyTransport
       if (options.client !== undefined) {
         transport = await ApacheIggyTransport.fromClient(
           options.client,
           options.ownership,
-          options.publishOptions
+          options.publishOptions,
+          deadline
         )
       } else if (options.address !== undefined) {
         const credentials = options.credentials ?? {
@@ -522,12 +534,14 @@ export class Laser implements AsyncDisposable {
           : options.address.host
         transport = await ApacheIggyTransport.connect(
           `iggy://${userInfo}@${authorityHost}:${String(options.address.port)}`,
-          options.publishOptions
+          options.publishOptions,
+          deadline
         )
       } else {
         transport = await ApacheIggyTransport.connect(
           options.connectionString ?? LOCAL_CONNECTION_STRING,
-          options.publishOptions
+          options.publishOptions,
+          deadline
         )
       }
       const laser = new Laser(
@@ -551,7 +565,7 @@ export class Laser implements AsyncDisposable {
         options.topologyOverrides,
         options.capabilities ?? OPEN_CAPABILITIES
       )
-      if (options.capabilities === undefined) await laser.capabilities()
+      if (options.capabilities === undefined) await laser.probeCapabilitiesBefore(deadline)
       return laser
     })
   }
@@ -565,17 +579,22 @@ export class Laser implements AsyncDisposable {
     return builder.connect()
   }
 
+  /**
+   * Connect using an Iggy connection string. Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` that says whether the server never accepted the connection or never answered the login. Use `Laser.builder().connectTimeout()` for another budget.
+   */
   static async connect(connectionString: string): Promise<Laser> {
-    const transport = await ApacheIggyTransport.connect(connectionString)
+    const deadline = Date.now() + connectOptions().timeoutMs
+    const transport = await ApacheIggyTransport.connect(connectionString, undefined, deadline)
     const laser = new Laser(transport, undefined, new AsyncOnce(), newSharedState())
-    await laser.capabilities()
+    await laser.probeCapabilitiesBefore(deadline)
     return laser
   }
 
   static async connectWithStream(connectionString: string, stream: string): Promise<Laser> {
-    const transport = await ApacheIggyTransport.connect(connectionString)
+    const deadline = Date.now() + connectOptions().timeoutMs
+    const transport = await ApacheIggyTransport.connect(connectionString, undefined, deadline)
     const laser = new Laser(transport, stream, new AsyncOnce(), newSharedState())
-    await laser.capabilities()
+    await laser.probeCapabilitiesBefore(deadline)
     return laser
   }
 
@@ -730,6 +749,29 @@ export class Laser implements AsyncDisposable {
     return capabilities
   }
 
+  private async probeCapabilitiesBefore(deadline: number): Promise<void> {
+    await this.capabilitiesOnce.get(async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const expired = new Promise<Capabilities>((resolve) => {
+        timer = setTimeout(
+          () => {
+            resolve(OPEN_CAPABILITIES)
+          },
+          Math.max(0, deadline - Date.now())
+        )
+      })
+      try {
+        return mergeCapabilities(
+          this.configuredCapabilities,
+          await Promise.race([probeCapabilities(this.managedTransport()), expired])
+        )
+      } finally {
+        clearTimeout(timer)
+      }
+    })
+    await this.capabilities()
+  }
+
   async refreshCapabilities(): Promise<Capabilities> {
     if (this.capabilityOverride !== undefined) return this.capabilityOverride
     this.capabilitiesOnce.clear()
@@ -813,7 +855,20 @@ export class Laser implements AsyncDisposable {
           signed: false
         }),
       async (schemaId) => (await this.schemas().get(schemaId))?.schema,
-      (operation, attributes, effect) => this.observe(operation, attributes, effect)
+      (operation, attributes, effect) => this.observe(operation, attributes, effect),
+      () => {
+        this.shared.registryCaches.delete(name)
+        for (const [key, hub] of this.shared.replyHubs) {
+          if (!key.startsWith(`${name}\u001f`)) continue
+          this.shared.replyHubs.delete(key)
+          void hub.then(
+            (value) => {
+              value.stop()
+            },
+            () => undefined
+          )
+        }
+      }
     )
   }
 
@@ -1213,6 +1268,7 @@ export class Laser implements AsyncDisposable {
 
   async agentRegistry(): Promise<AgentRegistry> {
     const stream = this.requireDefaultStream("agentRegistry()")
+    await this.topic(AgentTopic.Registry).ensure(1)
     let cache = this.shared.registryCaches.get(stream)
     if (cache === undefined) {
       cache = newRegistryCache()
@@ -1225,6 +1281,7 @@ export class Laser implements AsyncDisposable {
   async publishCard(source: AgentId, card: AgentCard): Promise<void> {
     validateAgentCard(card)
     const body = encodeNamed(encodeAgentCard(card))
+    await this.topic(AgentTopic.Registry).ensure(1)
     await this.agdx(AgentTopic.Registry, source, ConversationId.new())
       .status(OPERATION_CARD)
       .body(body)
@@ -1254,6 +1311,7 @@ export class Laser implements AsyncDisposable {
     agent: AgentId,
     key?: SigningKey
   ): Promise<void> {
+    await this.topic(AgentTopic.Registry).ensure(1)
     let fact = this.agdx(AgentTopic.Registry, operator, ConversationId.new())
       .status(operation)
       .body(new TextEncoder().encode(agent.asString()))
@@ -1277,7 +1335,9 @@ export class Laser implements AsyncDisposable {
     if (hub === undefined) {
       hub = ReplyHub.create(this.transport, stream, topic, this.observer, this.verifier)
       this.shared.replyHubs.set(key, hub)
-      void hub.catch(() => this.shared.replyHubs.delete(key))
+      void hub.catch(() => {
+        if (this.shared.replyHubs.get(key) === hub) this.shared.replyHubs.delete(key)
+      })
     }
     return hub
   }
@@ -1479,19 +1539,23 @@ export class Laser implements AsyncDisposable {
 
   /** Closes owned transport resources. Safe to call more than once. */
   async close(): Promise<void> {
-    if (this.closed) return
-    this.closed = true
-    if (!this.ownsClosure) return
-    const hubs = await Promise.allSettled(this.shared.replyHubs.values())
-    for (const hub of hubs) {
-      if (hub.status === "fulfilled") hub.value.stop()
-    }
-    this.shared.replyHubs.clear()
-    await this.observe("laser.close", { operation: "close" }, () => this.transport.close())
+    this.shared.closing ??= (async () => {
+      for (const hub of this.shared.replyHubs.values()) {
+        void hub.then(
+          (value) => {
+            value.stop()
+          },
+          () => undefined
+        )
+      }
+      this.shared.replyHubs.clear()
+      await this.observe("laser.close", { operation: "close" }, () => this.transport.close())
+    })()
+    await this.shared.closing
   }
 
   /** Delegates async disposal to `close()`. */
   [Symbol.asyncDispose](): Promise<void> {
-    return this.close()
+    return this.ownsClosure ? this.close() : Promise.resolve()
   }
 }

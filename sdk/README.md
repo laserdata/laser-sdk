@@ -19,9 +19,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.4.0" # typed streaming plus provenance
+laser-sdk = "0.4.1" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.4.0", features = ["agent", "managed"] }
+laser-sdk = { version = "0.4.1", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -344,6 +344,12 @@ The [repository README](https://github.com/laserdata/laser-sdk#readme) links to 
 Apache-2.0. Copyright LaserData, Inc.
 
 Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of these marks does not imply endorsement by the Apache Software Foundation.
+
+## Connect timeout
+
+Connecting gives up after 30 seconds. Set another budget with the Rust `connect_timeout` builder method, the Python `connect_timeout_ms` connect argument, or the TypeScript `connectTimeout` builder method. The environment variable is `LASER_CONNECT_TIMEOUT_MS`, and explicit configuration overrides it. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe. An expired budget returns a timeout error that says whether the server never accepted the connection or never answered the login. `stream(name).delete()` removes a stream you no longer need, and `close()` ends the shared connection.
+
+See [connect timeout and cleanup](../docs/connect-timeout.md).
 
 ## Publish recovery
 

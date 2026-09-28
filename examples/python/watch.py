@@ -38,29 +38,32 @@ POLL_INTERVAL = 0.2
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    caps = await laser.capabilities()
-    if not _common.managed_gate(caps.query and caps.watch, "the change feed", EXAMPLE):
-        return
+    try:
+        caps = await laser.capabilities()
+        if not _common.managed_gate(caps.query and caps.watch, "the change feed", EXAMPLE):
+            return
 
-    _common.phase("watch a view, then publish something that advances it")
-    await laser.topic(TOPIC).ensure(_common.PARTITIONS)
-    # The same view shape query.py declares, under this run's own name, so this
-    # script runs on its own with no shared state.
-    await _common.start_projector(laser, TOPIC, FIELDS, index=INDEX)
+        _common.phase("watch a view, then publish something that advances it")
+        await laser.topic(TOPIC).ensure(_common.PARTITIONS)
+        # The same view shape query.py declares, under this run's own name, so this
+        # script runs on its own with no shared state.
+        await _common.start_projector(laser, TOPIC, FIELDS, index=INDEX)
 
-    feed = laser.watch(index=INDEX)
+        feed = laser.watch(index=INDEX)
 
-    await laser.topic(TOPIC).publish({"id": 4, "total": 20, "status": "paid"}).send()
+        await laser.topic(TOPIC).publish({"id": 4, "total": 20, "status": "paid"}).send()
 
-    deadline = time.monotonic() + CHANGE_TIMEOUT
-    while not (changes := await feed.poll()):
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"no change on '{INDEX}' arrived within {CHANGE_TIMEOUT:.0f}s")
-        await asyncio.sleep(POLL_INTERVAL)
+        deadline = time.monotonic() + CHANGE_TIMEOUT
+        while not (changes := await feed.poll()):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"no change on '{INDEX}' arrived within {CHANGE_TIMEOUT:.0f}s")
+            await asyncio.sleep(POLL_INTERVAL)
 
-    for change in changes:
-        span = f"{change.from_offset}..{change.to_offset}"
-        print(f"  view advanced: {change.rows} row(s), source offsets {span}")
+        for change in changes:
+            span = f"{change.from_offset}..{change.to_offset}"
+            print(f"  view advanced: {change.rows} row(s), source offsets {span}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

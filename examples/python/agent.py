@@ -38,40 +38,43 @@ async def handle(ctx, message) -> None:
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    # The well-known agent topics (commands, responses, registry, ...) must
-    # exist before an agent's consumer group joins one.
-    await laser.bootstrap(_common.PARTITIONS)
+    try:
+        # The well-known agent topics (commands, responses, registry, ...) must
+        # exist before an agent's consumer group joins one.
+        await laser.bootstrap(_common.PARTITIONS)
 
-    _common.phase("spawn a handler, then hand it a deadline-bounded task")
-    triage = laser.spawn_agent(
-        "triage",
-        COMMANDS,
-        handle,
-        respond_on=RESPONSES,
-        # The advertised capability is what makes this agent addressable by what
-        # it can do rather than by the name it happens to run under.
-        capabilities=[CAPABILITY],
-        # Acknowledge on pickup, so a crash mid-handler is a retry rather than a
-        # silently dropped task.
-        ack_on_pickup=True,
-    )
-    await triage.ready()
+        _common.phase("spawn a handler, then hand it a deadline-bounded task")
+        triage = laser.spawn_agent(
+            "triage",
+            COMMANDS,
+            handle,
+            respond_on=RESPONSES,
+            # The advertised capability is what makes this agent addressable by what
+            # it can do rather than by the name it happens to run under.
+            capabilities=[CAPABILITY],
+            # Acknowledge on pickup, so a crash mid-handler is a retry rather than a
+            # silently dropped task.
+            ack_on_pickup=True,
+        )
+        await triage.ready()
 
-    # A contract is a directed task with a deadline and a real answer. Routed by
-    # capability, not by name.
-    reply = await laser.contract(
-        CAPABILITY,
-        b"ticket #42 is stuck",
-        source="orchestrator",
-        fixed_inbox=COMMANDS,
-        deadline_ms=DEADLINE_MS,
-    )
-    if reply is None:
-        print("  contract ended without a reply")
-    else:
-        print(f"  contract completed: {reply.decode()}")
+        # A contract is a directed task with a deadline and a real answer. Routed by
+        # capability, not by name.
+        reply = await laser.contract(
+            CAPABILITY,
+            b"ticket #42 is stuck",
+            source="orchestrator",
+            fixed_inbox=COMMANDS,
+            deadline_ms=DEADLINE_MS,
+        )
+        if reply is None:
+            print("  contract ended without a reply")
+        else:
+            print(f"  contract completed: {reply.decode()}")
 
-    await triage.shutdown()
+        await triage.shutdown()
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

@@ -132,7 +132,7 @@ impl PublishOptions {
     }
 }
 
-fn env_number(name: &'static str) -> Result<Option<u64>, LaserError> {
+pub(crate) fn env_number(name: &'static str) -> Result<Option<u64>, LaserError> {
     match std::env::var(name) {
         Ok(value) => value
             .parse()

@@ -1955,9 +1955,9 @@ class Laser:
         selection to an estimated token count. Returns the selected messages.
         """
     @staticmethod
-    def connect(connection_string: builtins.str, *, stream: typing.Optional[builtins.str] = None, ops_stream: typing.Optional[builtins.str] = None, control_topic: typing.Optional[builtins.str] = None, dlq_topic: typing.Optional[builtins.str] = None, changes_topic: typing.Optional[builtins.str] = None, verifier: typing.Optional[KeyRegistry] = None, publish_timeout_ms: typing.Optional[builtins.int] = None, publish_max_retries: typing.Optional[builtins.int] = None, publish_retry_backoff_ms: typing.Optional[builtins.int] = None) -> typing.Any:
+    def connect(connection_string: builtins.str, *, stream: typing.Optional[builtins.str] = None, ops_stream: typing.Optional[builtins.str] = None, control_topic: typing.Optional[builtins.str] = None, dlq_topic: typing.Optional[builtins.str] = None, changes_topic: typing.Optional[builtins.str] = None, verifier: typing.Optional[KeyRegistry] = None, connect_timeout_ms: typing.Optional[builtins.int] = None, publish_timeout_ms: typing.Optional[builtins.int] = None, publish_max_retries: typing.Optional[builtins.int] = None, publish_retry_backoff_ms: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
-        Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts.
+        Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts. Connecting gives up after `connect_timeout_ms`, default 30000 or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` naming whether the server never accepted the connection or never answered the login.
         """
     def with_stream(self, stream: builtins.str) -> Laser:
         r"""
@@ -2015,11 +2015,16 @@ class Laser:
         return aliasing clones over the *same* connection: exiting the block does
         not close a clone still in use elsewhere.
         """
+    def close(self) -> typing.Any:
+        r"""
+        Close the shared connection. Every clone from `with_stream` and the other `with_*` methods loses it too. Safe to call more than once.
+        """
     def __aexit__(self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any) -> typing.Any:
         r"""
         Exit `async with`. The connection is reference-counted and closes when the
-        last handle is dropped, so there is no explicit disconnect to call here.
-        Returns `False` so an exception in the body is not suppressed.
+        last handle is dropped, so exiting does not disconnect a clone still in use.
+        Call `close` to end the connection explicitly. Returns `False` so an
+        exception in the body is not suppressed.
         """
     def __repr__(self) -> builtins.str: ...
     def context(self, conversation_id: builtins.str) -> ContextScope:
@@ -3370,6 +3375,10 @@ class Stream:
     def ensure(self) -> typing.Any:
         r"""
         Idempotently create this stream.
+        """
+    def delete(self) -> typing.Any:
+        r"""
+        Delete this stream with every topic and message in it. Returns `False` when the stream did not exist.
         """
     def __repr__(self) -> builtins.str: ...
 

@@ -73,6 +73,10 @@ class RegistryTransport implements LaserTransport {
     return Promise.reject(new Error("unused"))
   }
 
+  deleteStream(): Promise<boolean> {
+    return Promise.reject(new Error("unused"))
+  }
+
   ensureTopic(): Promise<void> {
     return Promise.reject(new Error("unused"))
   }

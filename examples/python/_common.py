@@ -138,6 +138,13 @@ async def connect(example: str) -> ls.Laser:
     return await ls.Laser.connect(_resolve_connection_string(), stream=stream_for(example))
 
 
+async def release_stream(laser: ls.Laser, example: str) -> None:
+    """Delete this run's own stream so repeated runs do not leave their topics
+    and partitions on the server. A provisioned ``LASER_STREAM`` is kept."""
+    if not _env("LASER_STREAM"):
+        await laser.stream(stream_for(example)).delete()
+
+
 def managed_gate(available: bool, feature: str, example: str) -> bool:
     """Check a capability after connecting successfully."""
     if available:

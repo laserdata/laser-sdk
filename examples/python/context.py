@@ -31,26 +31,29 @@ TOKEN_BUDGET = 4_000
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    # Conversation turns ride the well-known agent topics, created once here.
-    await laser.bootstrap(_common.PARTITIONS)
-    conversation = ls.new_conversation_id()
+    try:
+        # Conversation turns ride the well-known agent topics, created once here.
+        await laser.bootstrap(_common.PARTITIONS)
+        conversation = ls.new_conversation_id()
 
-    _common.phase("append a conversation, then assemble it under a budget")
-    ctx = laser.context(conversation)
-    await ctx.append(ls.Topics.COMMANDS, b"book me an aisle seat")
-    await ctx.append(ls.Topics.RESPONSES, b"booked, aisle 12")
+        _common.phase("append a conversation, then assemble it under a budget")
+        ctx = laser.context(conversation)
+        await ctx.append(ls.Topics.COMMANDS, b"book me an aisle seat")
+        await ctx.append(ls.Topics.RESPONSES, b"booked, aisle 12")
 
-    # The shape of a prompt's context is a declared bound, not slicing logic
-    # spread through the application: cap the turns, then fit the budget.
-    turns = await ctx.fetch(
-        topics=[ls.Topics.COMMANDS, ls.Topics.RESPONSES],
-        last_n=LAST_N,
-        token_budget=TOKEN_BUDGET,
-    )
+        # The shape of a prompt's context is a declared bound, not slicing logic
+        # spread through the application: cap the turns, then fit the budget.
+        turns = await ctx.fetch(
+            topics=[ls.Topics.COMMANDS, ls.Topics.RESPONSES],
+            last_n=LAST_N,
+            token_budget=TOKEN_BUDGET,
+        )
 
-    print(f"  {len(turns)} turn(s) within {TOKEN_BUDGET} tokens:")
-    for turn in turns:
-        print(f"    {bytes(turn.payload).decode()}")
+        print(f"  {len(turns)} turn(s) within {TOKEN_BUDGET} tokens:")
+        for turn in turns:
+            print(f"    {bytes(turn.payload).decode()}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

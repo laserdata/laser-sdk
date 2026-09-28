@@ -8,7 +8,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/laserdata/laser-sdk"
 rust-version = "1.98.0"
-version = "0.4.0"
+version = "0.4.1"
 
 [workspace.dependencies]
 apache-avro = { version = "0.22.0" }
@@ -24,10 +24,11 @@ dashmap = { version = "6.2.1" }
 ed25519-dalek = { version = "3.0.0" }
 futures = { version = "0.3.34" }
 iggy = { version = "0.11.0" }
+iggy_common = { version = "0.11.0" }
 json-patch = { version = "4.2.0" }
-jsonschema = { version = "0.56.0", default-features = false }
+jsonschema = { version = "0.58.1", default-features = false }
 laser-sdk = { path = "sdk" }
-laser-wire = { path = "wire", version = "0.4.0" }
+laser-wire = { path = "wire", version = "0.4.1" }
 prost = { version = "0.14.4" }
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 protox = { version = "0.9.1" }
@@ -40,7 +41,7 @@ serial_test = { version = "4.0.1" }
 sha2 = { version = "0.11.0" }
 strum = { version = "0.28.0", features = ["derive"] }
 tempfile = { version = "3.27.0" }
-thiserror = { version = "2.0.20" }
+thiserror = { version = "2.0.21" }
 time = { version = "0.3.55", default-features = false }
 tokio = { version = "1.53.1", features = ["fs", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1.44" }

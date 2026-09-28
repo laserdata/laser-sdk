@@ -147,7 +147,7 @@ pub(crate) async fn execute_scenario(
         &output.join("resolved-stack.json"),
         &serde_json::to_value(&stack)?,
     )?;
-    execute_native_run(DirectExecution {
+    Box::pin(execute_native_run(DirectExecution {
         stack: &stack,
         manifest,
         scenario,
@@ -157,7 +157,7 @@ pub(crate) async fn execute_scenario(
             seed: 1,
         },
         output,
-    })
+    }))
     .await?;
     let host_audit = HostAudit::finish(
         host_before,
@@ -198,7 +198,7 @@ pub(crate) async fn execute_native_run(
         source,
     })?;
     if execution.stack.mode == laser_bench::manifest::ProvisionMode::Compose {
-        return execute_compose_run(execution, &services).await;
+        return Box::pin(execute_compose_run(execution, &services)).await;
     }
     let server_manifest = execution
         .stack

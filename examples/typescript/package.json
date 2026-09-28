@@ -34,8 +34,8 @@
     "@laserdata/laser-sdk": "file:../../foreign/typescript"
   },
   "devDependencies": {
-    "@types/node": "22.20.2",
-    "prettier": "3.9.6",
+    "@types/node": "22.20.4",
+    "prettier": "3.9.8",
     "typescript": "7.0.2"
   }
 }

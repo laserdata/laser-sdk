@@ -38,27 +38,30 @@ ORDERS = [
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    if not _common.managed_gate((await laser.capabilities()).query, "views (query)", EXAMPLE):
-        return
+    try:
+        if not _common.managed_gate((await laser.capabilities()).query, "views (query)", EXAMPLE):
+            return
 
-    _common.phase("keep a queryable view of a topic, then query it")
-    await laser.topic(TOPIC).ensure(_common.PARTITIONS)
-    # Declare this run's `orders_v1_<token>` view over `orders`. From here the
-    # view maintains itself: every record published to the topic lands in the
-    # table, and the per-run name means the counts below are this run's alone.
-    await _common.start_projector(laser, TOPIC, FIELDS, index=INDEX)
+        _common.phase("keep a queryable view of a topic, then query it")
+        await laser.topic(TOPIC).ensure(_common.PARTITIONS)
+        # Declare this run's `orders_v1_<token>` view over `orders`. From here the
+        # view maintains itself: every record published to the topic lands in the
+        # table, and the per-run name means the counts below are this run's alone.
+        await _common.start_projector(laser, TOPIC, FIELDS, index=INDEX)
 
-    for order in ORDERS:
-        await laser.topic(TOPIC).publish(order).send()
-    await _common.wait_for_projection(laser, INDEX, len(ORDERS))
+        for order in ORDERS:
+            await laser.topic(TOPIC).publish(order).send()
+        await _common.wait_for_projection(laser, INDEX, len(ORDERS))
 
-    # `where_eq` matches an indexed key, the cheap path a projection's key
-    # columns answer directly. `filter_eq` and its siblings cover the rest.
-    paid = await laser.query(INDEX).where_eq("status", "paid").limit(10).fetch()
+        # `where_eq` matches an indexed key, the cheap path a projection's key
+        # columns answer directly. `filter_eq` and its siblings cover the rest.
+        paid = await laser.query(INDEX).where_eq("status", "paid").limit(10).fetch()
 
-    print(f"  {len(paid.rows)} of {len(ORDERS)} orders are paid")
-    for row in paid.rows:
-        print(f"    order #{paid.value_text(row, 'id')} total {paid.value_text(row, 'total')}")
+        print(f"  {len(paid.rows)} of {len(ORDERS)} orders are paid")
+        for row in paid.rows:
+            print(f"    order #{paid.value_text(row, 'id')} total {paid.value_text(row, 'total')}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

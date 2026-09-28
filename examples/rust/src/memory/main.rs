@@ -1,4 +1,6 @@
-use laser_examples::{PARTITIONS, init_tracing, laser, managed_feature_ready, phase, stream_for};
+use laser_examples::{
+    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, release_after, stream_for,
+};
 use laser_sdk::prelude::full::*;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -128,347 +130,351 @@ async fn main() -> Result<(), LaserError> {
     let Some(laser) = managed_ready else {
         return Ok(());
     };
-
-    // DURABLE MEMORY (managed). The `VectorMemory` above lives in this process and
-    // is gone when it exits. Durable memory is the single model: every remember
-    // publishes to the memory topic, so the facts persist and replay, browsable in
-    // the console's Memory view (namespace `incidents`). Same four verbs.
-    // `memory_topic` configures that topic up front: a partition count, and a
-    // message-expiry window that bounds how long the history lives on the log.
-    phase("Remember durable facts");
-    let durable = laser
-        .memory_topic("incidents")
-        .partitions(PARTITIONS)
-        .ttl(Duration::from_secs(86_400))
-        .build()
-        .await?;
-    for fact in KNOWLEDGE {
-        durable
-            .remember(fact.as_bytes().to_vec())
-            .scope(conversation)
-            .send()
+    release_after(&laser, &stream_for("memory"), async {
+        // DURABLE MEMORY (managed). The `VectorMemory` above lives in this process and
+        // is gone when it exits. Durable memory is the single model: every remember
+        // publishes to the memory topic, so the facts persist and replay, browsable in
+        // the console's Memory view (namespace `incidents`). Same four verbs.
+        // `memory_topic` configures that topic up front: a partition count, and a
+        // message-expiry window that bounds how long the history lives on the log.
+        phase("Remember durable facts");
+        let durable = laser
+            .memory_topic("incidents")
+            .partitions(PARTITIONS)
+            .ttl(Duration::from_secs(86_400))
+            .build()
             .await?;
-    }
-    let durable_hits = durable.recall(conversation).limit(3).fetch().await?;
-    info!(
-        "stored {} durable facts, recalled {} most-recent",
-        KNOWLEDGE.len(),
-        durable_hits.len()
-    );
-    // Each recalled item points back to its origin log record, so a reader (or
-    // the console) can fold from the read view to the source message.
-    for hit in &durable_hits {
-        if let Some(SourceRef::Message {
-            stream,
-            topic,
-            partition,
-            offset,
-            ..
-        }) = &hit.source
-        {
-            info!("  recalled from source {stream}/{topic} partition {partition} offset {offset}");
+        for fact in KNOWLEDGE {
+            durable
+                .remember(fact.as_bytes().to_vec())
+                .scope(conversation)
+                .send()
+                .await?;
         }
-    }
+        let durable_hits = durable.recall(conversation).limit(3).fetch().await?;
+        info!(
+            "stored {} durable facts, recalled {} most-recent",
+            KNOWLEDGE.len(),
+            durable_hits.len()
+        );
+        // Each recalled item points back to its origin log record, so a reader (or
+        // the console) can fold from the read view to the source message.
+        for hit in &durable_hits {
+            if let Some(SourceRef::Message {
+                stream,
+                topic,
+                partition,
+                offset,
+                ..
+            }) = &hit.source
+            {
+                info!(
+                    "  recalled from source {stream}/{topic} partition {partition} offset {offset}"
+                );
+            }
+        }
 
-    // ONE SCOPE. The incident is one conversation. `laser.context(..)` binds it
-    // once, so the same memory recalls without repeating the id, and the
-    // conversation's own messages read back through the same handle. The session
-    // (messages plus working memory) is one scope, while the knowledge graph
-    // below stays cross-conversation on purpose.
-    phase("Scope the session: messages and memory under one conversation");
-    let session = laser.context(conversation);
-    session
-        .append(
-            AgentTopic::Audit,
-            b"incident opened: checkout slow".to_vec(),
-        )
-        .await?;
-    let scoped_hits = session
-        .memory("incidents")
-        .recall()
-        .limit(3)
-        .fetch()
-        .await?;
-    let trail = session.fetch(vec![AgentTopic::Audit], 8).await?;
-    info!(
-        "one scope recalled {} durable facts and read back {} of the conversation's messages",
-        scoped_hits.len(),
-        trail.len()
-    );
-
-    // BUILD. A realistic slice of a platform's operational knowledge: services own
-    // teams, depend on components, fail over to mitigations, and incidents touch
-    // both. `GraphNode::entity` content-addresses the id, so a component named by
-    // many services is one node, which is what makes this a graph and not a pile
-    // of pairs.
-    phase("Build the knowledge graph");
-    let services = [
-        "checkout",
-        "billing",
-        "search",
-        "cart",
-        "auth",
-        "recommendations",
-        "inventory",
-        "notifications",
-    ];
-    let components = [
-        "orders-db",
-        "db-pool",
-        "read-replica",
-        "search-index",
-        "signing-key",
-        "cache",
-        "payment-gateway",
-        "message-queue",
-    ];
-    let teams = ["payments", "search-platform", "core-platform"];
-    let incidents = ["INC-101", "INC-102"];
-
-    // Every entity as a node, kept by value so the relationships below can wire
-    // the same node objects.
-    let mut by_value: HashMap<&str, GraphNode> = HashMap::new();
-    for value in services {
-        by_value.insert(value, GraphNode::entity("Service", value));
-    }
-    for value in components {
-        by_value.insert(value, GraphNode::entity("Component", value));
-    }
-    for value in teams {
-        by_value.insert(value, GraphNode::entity("Team", value));
-    }
-    for value in incidents {
-        by_value.insert(value, GraphNode::entity("Incident", value));
-    }
-    // Provenance: register each entity as a real record in the `topology`
-    // key-value namespace, then point its graph node at that record. The node's
-    // source is then a live deep link, the console renders it as a click-through
-    // to the actual KV entry. First-writer on the node.
-    let registry = laser.kv("topology");
-    for (value, node) in by_value.iter_mut() {
-        let kind = node.labels.first().map(String::as_str).unwrap_or("Entity");
-        registry
-            .set(*value)
-            .bytes(format!("{{\"kind\":\"{kind}\",\"value\":\"{value}\"}}"))
-            .send()
+        // ONE SCOPE. The incident is one conversation. `laser.context(..)` binds it
+        // once, so the same memory recalls without repeating the id, and the
+        // conversation's own messages read back through the same handle. The session
+        // (messages plus working memory) is one scope, while the knowledge graph
+        // below stays cross-conversation on purpose.
+        phase("Scope the session: messages and memory under one conversation");
+        let session = laser.context(conversation);
+        session
+            .append(
+                AgentTopic::Audit,
+                b"incident opened: checkout slow".to_vec(),
+            )
             .await?;
-        node.source = Some(SourceRef::Kv {
-            namespace: "topology".to_owned(),
-            key: (*value).to_owned(),
-        });
-    }
+        let scoped_hits = session
+            .memory("incidents")
+            .recall()
+            .limit(3)
+            .fetch()
+            .await?;
+        let trail = session.fetch(vec![AgentTopic::Audit], 8).await?;
+        info!(
+            "one scope recalled {} durable facts and read back {} of the conversation's messages",
+            scoped_hits.len(),
+            trail.len()
+        );
 
-    // (from, relationship, to) triples, resolved against the nodes above.
-    let relationships: &[(&str, &str, &str)] = &[
-        ("checkout", "depends_on", "orders-db"),
-        ("checkout", "depends_on", "db-pool"),
-        ("checkout", "depends_on", "payment-gateway"),
-        ("checkout", "mitigated_by", "read-replica"),
-        ("billing", "depends_on", "orders-db"),
-        ("billing", "depends_on", "signing-key"),
-        ("billing", "depends_on", "payment-gateway"),
-        ("search", "depends_on", "search-index"),
-        ("search", "depends_on", "cache"),
-        ("search", "mitigated_by", "cache"),
-        ("cart", "depends_on", "cache"),
-        ("cart", "depends_on", "orders-db"),
-        ("auth", "depends_on", "signing-key"),
-        ("recommendations", "depends_on", "search-index"),
-        ("recommendations", "depends_on", "cache"),
-        ("inventory", "depends_on", "orders-db"),
-        ("inventory", "depends_on", "message-queue"),
-        ("notifications", "depends_on", "message-queue"),
-        ("read-replica", "replicates", "orders-db"),
-        ("payments", "owns", "checkout"),
-        ("payments", "owns", "billing"),
-        ("search-platform", "owns", "search"),
-        ("search-platform", "owns", "recommendations"),
-        ("core-platform", "owns", "auth"),
-        ("core-platform", "owns", "cart"),
-        ("core-platform", "owns", "inventory"),
-        ("core-platform", "owns", "notifications"),
-        ("INC-101", "affected", "checkout"),
-        ("INC-101", "affected", "db-pool"),
-        ("INC-102", "affected", "search"),
-        ("INC-102", "affected", "search-index"),
-    ];
-    // A `mitigated_by` edge is a bitemporal fact: the mitigation became true when
-    // it was applied. Stamp a valid-from so the edge records when, not just that,
-    // it holds. The orthogonal system-time axis (when we observed it) is the log
-    // offset of the upsert, which the substrate records for free, so a later
-    // traversal can ask what was true at a given time. Other edges are open-ended.
-    const MITIGATION_SINCE_US: u64 = 1_900_000_000_000_000;
-    let edges: Vec<GraphEdge> = relationships
-        .iter()
-        .map(|(from, relationship, to)| {
-            // The relationship is anchored on the `from` entity's record, so the
-            // edge carries that source (last-writer on the edge).
-            let edge = GraphEdge::relate(&by_value[from], *relationship, &by_value[to])
-                .with_source(SourceRef::Kv {
-                    namespace: "topology".to_owned(),
-                    key: (*from).to_owned(),
-                });
-            if *relationship == "mitigated_by" {
-                edge.valid(Some(MITIGATION_SINCE_US), None)
-            } else {
-                edge
-            }
-        })
-        .collect();
-    let mitigations = edges.iter().filter(|e| e.valid_from.is_some()).count();
-    let nodes: Vec<GraphNode> = by_value.values().cloned().collect();
-    let checkout = by_value["checkout"].clone();
-    let incident = by_value["INC-101"].clone();
-    info!(
-        "built {} nodes and {} edges ({mitigations} bitemporal, carrying a valid-from)",
-        nodes.len(),
-        edges.len()
-    );
-    // Register the graph projection so the console explorer lists `ops`. The
-    // entity schema is the extraction plan: bind it to a source topic and the
-    // projector applies it per record. Here the demo writes the graph directly
-    // with the `upsert` below, which is the same content-addressed write path.
-    laser
-        .projections()
-        .register_graph(
-            Projection::builder(format!("{GRAPH}.v1"))
-                .name(GRAPH)
-                .content_type(ContentType::Json)
-                .graph(EntitySchema {
-                    nodes: vec![
-                        NodeExtract {
-                            label: "Service".to_owned(),
-                            value_pointer: "/service".to_owned(),
-                            embedding_pointer: None,
-                        },
-                        NodeExtract {
-                            label: "Component".to_owned(),
-                            value_pointer: "/component".to_owned(),
-                            embedding_pointer: None,
-                        },
-                    ],
-                    edges: vec![EdgeExtract {
-                        edge_type: "depends_on".to_owned(),
-                        from_pointer: "/service".to_owned(),
-                        to_pointer: "/component".to_owned(),
-                        valid_from_pointer: None,
-                        valid_to_pointer: None,
-                    }],
-                })
-                .build(),
-        )
-        .await?;
-    laser.graph(GRAPH).upsert(nodes, edges).await?;
-    info!("registered and upserted the '{GRAPH}' graph, browsable in the console explorer");
+        // BUILD. A realistic slice of a platform's operational knowledge: services own
+        // teams, depend on components, fail over to mitigations, and incidents touch
+        // both. `GraphNode::entity` content-addresses the id, so a component named by
+        // many services is one node, which is what makes this a graph and not a pile
+        // of pairs.
+        phase("Build the knowledge graph");
+        let services = [
+            "checkout",
+            "billing",
+            "search",
+            "cart",
+            "auth",
+            "recommendations",
+            "inventory",
+            "notifications",
+        ];
+        let components = [
+            "orders-db",
+            "db-pool",
+            "read-replica",
+            "search-index",
+            "signing-key",
+            "cache",
+            "payment-gateway",
+            "message-queue",
+        ];
+        let teams = ["payments", "search-platform", "core-platform"];
+        let incidents = ["INC-101", "INC-102"];
 
-    // NEIGHBORS. The cheap one-hop read: checkout and everything it points at, its
-    // dependencies and its failover.
-    phase("Read a node's neighbors");
-    let around = laser
-        .graph(GRAPH)
-        .neighbors(checkout.id, EdgeDir::Out, None, 1)
-        .await?;
-    print_nodes("checkout's one-hop neighborhood", &around.nodes);
-
-    // TRAVERSE. From every Service, follow `depends_on` to the components the
-    // whole platform rests on, the structural view recall cannot give.
-    phase("Traverse from a predicate");
-    let dependencies = laser
-        .graph(GRAPH)
-        .start_match(Filter::pred("label", CmpOp::Eq, "Service"))
-        .out("depends_on")
-        .limit(100)
-        .fetch()
-        .await?;
-    print_nodes_of(
-        "components every Service depends on",
-        "Component",
-        &dependencies.nodes,
-    );
-
-    // BLAST RADIUS. From an incident, follow `affected` to everything it touched,
-    // the question an on-call engineer actually asks.
-    phase("Trace an incident's blast radius");
-    let blast = laser
-        .graph(GRAPH)
-        .start_ids(vec![incident.id])
-        .out("affected")
-        .fetch()
-        .await?;
-    let mut touched: Vec<&str> = blast
-        .nodes
-        .iter()
-        .filter(|node| node.id != incident.id)
-        .map(value_of)
-        .collect();
-    touched.sort_unstable();
-    info!("what INC-101 affected: {}", touched.join(", "));
-
-    // PROVENANCE. Every node and edge records the source it was extracted from, so
-    // a traversal is navigable back to its origin. Here each entity points at its
-    // record in the `topology` key-value namespace. The console renders this
-    // `source` as a live click-through to that KV entry (or to the message, for a
-    // projector-built graph). Node source is first-writer, edge source last-writer.
-    phase("Trace a node back to its source");
-    if let Some(node) = around.nodes.iter().find(|node| node.id == checkout.id) {
-        match &node.source {
-            Some(SourceRef::Kv { namespace, key }) => {
-                info!("checkout's source record is {namespace}/{key}")
-            }
-            Some(other) => info!("checkout came from {other:?}"),
-            None => info!("checkout carries no source"),
+        // Every entity as a node, kept by value so the relationships below can wire
+        // the same node objects.
+        let mut by_value: HashMap<&str, GraphNode> = HashMap::new();
+        for value in services {
+            by_value.insert(value, GraphNode::entity("Service", value));
         }
-    }
+        for value in components {
+            by_value.insert(value, GraphNode::entity("Component", value));
+        }
+        for value in teams {
+            by_value.insert(value, GraphNode::entity("Team", value));
+        }
+        for value in incidents {
+            by_value.insert(value, GraphNode::entity("Incident", value));
+        }
+        // Provenance: register each entity as a real record in the `topology`
+        // key-value namespace, then point its graph node at that record. The node's
+        // source is then a live deep link, the console renders it as a click-through
+        // to the actual KV entry. First-writer on the node.
+        let registry = laser.kv("topology");
+        for (value, node) in by_value.iter_mut() {
+            let kind = node.labels.first().map(String::as_str).unwrap_or("Entity");
+            registry
+                .set(*value)
+                .bytes(format!("{{\"kind\":\"{kind}\",\"value\":\"{value}\"}}"))
+                .send()
+                .await?;
+            node.source = Some(SourceRef::Kv {
+                namespace: "topology".to_owned(),
+                key: (*value).to_owned(),
+            });
+        }
 
-    // BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an "as of" read
-    // sees the graph as it was then. Before the mitigation was applied, checkout
-    // has no failover. After, the read-replica mitigation appears. Same query, two
-    // points in valid-time.
-    phase("Read the graph as of a point in time");
-    let before = laser
-        .graph(GRAPH)
-        .start_ids(vec![checkout.id])
-        .out("mitigated_by")
-        .as_of(MITIGATION_SINCE_US - 1)
-        .fetch()
-        .await?;
-    let after = laser
-        .graph(GRAPH)
-        .start_ids(vec![checkout.id])
-        .out("mitigated_by")
-        .as_of(MITIGATION_SINCE_US + 1)
-        .fetch()
-        .await?;
-    let reached = |result: &laser_sdk::wire::graph::GraphResult| {
-        result
+        // (from, relationship, to) triples, resolved against the nodes above.
+        let relationships: &[(&str, &str, &str)] = &[
+            ("checkout", "depends_on", "orders-db"),
+            ("checkout", "depends_on", "db-pool"),
+            ("checkout", "depends_on", "payment-gateway"),
+            ("checkout", "mitigated_by", "read-replica"),
+            ("billing", "depends_on", "orders-db"),
+            ("billing", "depends_on", "signing-key"),
+            ("billing", "depends_on", "payment-gateway"),
+            ("search", "depends_on", "search-index"),
+            ("search", "depends_on", "cache"),
+            ("search", "mitigated_by", "cache"),
+            ("cart", "depends_on", "cache"),
+            ("cart", "depends_on", "orders-db"),
+            ("auth", "depends_on", "signing-key"),
+            ("recommendations", "depends_on", "search-index"),
+            ("recommendations", "depends_on", "cache"),
+            ("inventory", "depends_on", "orders-db"),
+            ("inventory", "depends_on", "message-queue"),
+            ("notifications", "depends_on", "message-queue"),
+            ("read-replica", "replicates", "orders-db"),
+            ("payments", "owns", "checkout"),
+            ("payments", "owns", "billing"),
+            ("search-platform", "owns", "search"),
+            ("search-platform", "owns", "recommendations"),
+            ("core-platform", "owns", "auth"),
+            ("core-platform", "owns", "cart"),
+            ("core-platform", "owns", "inventory"),
+            ("core-platform", "owns", "notifications"),
+            ("INC-101", "affected", "checkout"),
+            ("INC-101", "affected", "db-pool"),
+            ("INC-102", "affected", "search"),
+            ("INC-102", "affected", "search-index"),
+        ];
+        // A `mitigated_by` edge is a bitemporal fact: the mitigation became true when
+        // it was applied. Stamp a valid-from so the edge records when, not just that,
+        // it holds. The orthogonal system-time axis (when we observed it) is the log
+        // offset of the upsert, which the substrate records for free, so a later
+        // traversal can ask what was true at a given time. Other edges are open-ended.
+        const MITIGATION_SINCE_US: u64 = 1_900_000_000_000_000;
+        let edges: Vec<GraphEdge> = relationships
+            .iter()
+            .map(|(from, relationship, to)| {
+                // The relationship is anchored on the `from` entity's record, so the
+                // edge carries that source (last-writer on the edge).
+                let edge = GraphEdge::relate(&by_value[from], *relationship, &by_value[to])
+                    .with_source(SourceRef::Kv {
+                        namespace: "topology".to_owned(),
+                        key: (*from).to_owned(),
+                    });
+                if *relationship == "mitigated_by" {
+                    edge.valid(Some(MITIGATION_SINCE_US), None)
+                } else {
+                    edge
+                }
+            })
+            .collect();
+        let mitigations = edges.iter().filter(|e| e.valid_from.is_some()).count();
+        let nodes: Vec<GraphNode> = by_value.values().cloned().collect();
+        let checkout = by_value["checkout"].clone();
+        let incident = by_value["INC-101"].clone();
+        info!(
+            "built {} nodes and {} edges ({mitigations} bitemporal, carrying a valid-from)",
+            nodes.len(),
+            edges.len()
+        );
+        // Register the graph projection so the console explorer lists `ops`. The
+        // entity schema is the extraction plan: bind it to a source topic and the
+        // projector applies it per record. Here the demo writes the graph directly
+        // with the `upsert` below, which is the same content-addressed write path.
+        laser
+            .projections()
+            .register_graph(
+                Projection::builder(format!("{GRAPH}.v1"))
+                    .name(GRAPH)
+                    .content_type(ContentType::Json)
+                    .graph(EntitySchema {
+                        nodes: vec![
+                            NodeExtract {
+                                label: "Service".to_owned(),
+                                value_pointer: "/service".to_owned(),
+                                embedding_pointer: None,
+                            },
+                            NodeExtract {
+                                label: "Component".to_owned(),
+                                value_pointer: "/component".to_owned(),
+                                embedding_pointer: None,
+                            },
+                        ],
+                        edges: vec![EdgeExtract {
+                            edge_type: "depends_on".to_owned(),
+                            from_pointer: "/service".to_owned(),
+                            to_pointer: "/component".to_owned(),
+                            valid_from_pointer: None,
+                            valid_to_pointer: None,
+                        }],
+                    })
+                    .build(),
+            )
+            .await?;
+        laser.graph(GRAPH).upsert(nodes, edges).await?;
+        info!("registered and upserted the '{GRAPH}' graph, browsable in the console explorer");
+
+        // NEIGHBORS. The cheap one-hop read: checkout and everything it points at, its
+        // dependencies and its failover.
+        phase("Read a node's neighbors");
+        let around = laser
+            .graph(GRAPH)
+            .neighbors(checkout.id, EdgeDir::Out, None, 1)
+            .await?;
+        print_nodes("checkout's one-hop neighborhood", &around.nodes);
+
+        // TRAVERSE. From every Service, follow `depends_on` to the components the
+        // whole platform rests on, the structural view recall cannot give.
+        phase("Traverse from a predicate");
+        let dependencies = laser
+            .graph(GRAPH)
+            .start_match(Filter::pred("label", CmpOp::Eq, "Service"))
+            .out("depends_on")
+            .limit(100)
+            .fetch()
+            .await?;
+        print_nodes_of(
+            "components every Service depends on",
+            "Component",
+            &dependencies.nodes,
+        );
+
+        // BLAST RADIUS. From an incident, follow `affected` to everything it touched,
+        // the question an on-call engineer actually asks.
+        phase("Trace an incident's blast radius");
+        let blast = laser
+            .graph(GRAPH)
+            .start_ids(vec![incident.id])
+            .out("affected")
+            .fetch()
+            .await?;
+        let mut touched: Vec<&str> = blast
             .nodes
             .iter()
-            .filter(|node| node.id != checkout.id)
-            .count()
-    };
-    info!(
-        "checkout mitigations before the rollout: {}, after: {}",
-        reached(&before),
-        reached(&after)
-    );
+            .filter(|node| node.id != incident.id)
+            .map(value_of)
+            .collect();
+        touched.sort_unstable();
+        info!("what INC-101 affected: {}", touched.join(", "));
 
-    // PATHS. The same traversal, asking for whole paths instead of a node set, so
-    // a caller sees how an incident reaches a component, not just that it does.
-    phase("Return whole paths");
-    let paths = laser
-        .graph(GRAPH)
-        .start_ids(vec![incident.id])
-        .out("affected")
-        .return_paths()
-        .fetch()
-        .await?;
-    info!(
-        "INC-101 reaches {} components by a traced path",
-        paths.paths.len()
-    );
+        // PROVENANCE. Every node and edge records the source it was extracted from, so
+        // a traversal is navigable back to its origin. Here each entity points at its
+        // record in the `topology` key-value namespace. The console renders this
+        // `source` as a live click-through to that KV entry (or to the message, for a
+        // projector-built graph). Node source is first-writer, edge source last-writer.
+        phase("Trace a node back to its source");
+        if let Some(node) = around.nodes.iter().find(|node| node.id == checkout.id) {
+            match &node.source {
+                Some(SourceRef::Kv { namespace, key }) => {
+                    info!("checkout's source record is {namespace}/{key}")
+                }
+                Some(other) => info!("checkout came from {other:?}"),
+                None => info!("checkout carries no source"),
+            }
+        }
 
-    info!("done: memory recalls what is relevant, the graph shows how it connects");
-    Ok(())
+        // BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an "as of" read
+        // sees the graph as it was then. Before the mitigation was applied, checkout
+        // has no failover. After, the read-replica mitigation appears. Same query, two
+        // points in valid-time.
+        phase("Read the graph as of a point in time");
+        let before = laser
+            .graph(GRAPH)
+            .start_ids(vec![checkout.id])
+            .out("mitigated_by")
+            .as_of(MITIGATION_SINCE_US - 1)
+            .fetch()
+            .await?;
+        let after = laser
+            .graph(GRAPH)
+            .start_ids(vec![checkout.id])
+            .out("mitigated_by")
+            .as_of(MITIGATION_SINCE_US + 1)
+            .fetch()
+            .await?;
+        let reached = |result: &laser_sdk::wire::graph::GraphResult| {
+            result
+                .nodes
+                .iter()
+                .filter(|node| node.id != checkout.id)
+                .count()
+        };
+        info!(
+            "checkout mitigations before the rollout: {}, after: {}",
+            reached(&before),
+            reached(&after)
+        );
+
+        // PATHS. The same traversal, asking for whole paths instead of a node set, so
+        // a caller sees how an incident reaches a component, not just that it does.
+        phase("Return whole paths");
+        let paths = laser
+            .graph(GRAPH)
+            .start_ids(vec![incident.id])
+            .out("affected")
+            .return_paths()
+            .fetch()
+            .await?;
+        info!(
+            "INC-101 reaches {} components by a traced path",
+            paths.paths.len()
+        );
+
+        info!("done: memory recalls what is relevant, the graph shows how it connects");
+        Ok(())
+    })
+    .await
 }
 
 // The deterministic bag-of-words embedder, the model seam an app fills (here a

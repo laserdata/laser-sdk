@@ -22,7 +22,7 @@ Start Apache Iggy, then run any example. The SDK uses Iggy's native VSR transpor
 npm run example:native-streaming
 ```
 
-With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each invocation gets its own `laser-<example>-<token>` stream so the agent topics, consumer offsets, and managed views never collide, even across repeat runs.
+With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each invocation gets its own `laser-<example>-<token>` stream so the agent topics, consumer offsets, and managed views never collide, even across repeat runs. The run deletes that stream when it finishes, including after an error. A stream supplied through `LASER_STREAM` is kept.
 
 For the complete managed surface, start Laser Stack with `./scripts/up` from its checkout and use the `LASER_CONNECTION_STRING` it prints.
 

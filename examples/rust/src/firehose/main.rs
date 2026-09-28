@@ -1,4 +1,6 @@
-use laser_examples::{env_bool, env_u64, env_usize, init_tracing, laser, phase, stream_for};
+use laser_examples::{
+    env_bool, env_u64, env_usize, init_tracing, laser, phase, release_after, stream_for,
+};
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::{Projection, ProjectionBinding};
 use laser_sdk::stream::{ContentType, Record};
@@ -174,105 +176,108 @@ async fn main() -> Result<(), LaserError> {
     );
 
     let laser = laser(&stream_name, Capabilities::OPEN).await?;
-    let query_available = laser.capabilities().await.query.available;
+    release_after(&laser, &stream_name, async {
+        let query_available = laser.capabilities().await.query.available;
 
-    let topics: Vec<String> = (0..config.orgs)
-        .map(|org| format!("{TOPIC_PREFIX}{org:02}"))
-        .collect();
+        let topics: Vec<String> = (0..config.orgs)
+            .map(|org| format!("{TOPIC_PREFIX}{org:02}"))
+            .collect();
 
-    // Create every topic. LaserData Cloud runs the optional projection and
-    // query phases, while the raw streaming load works against Apache Iggy.
-    phase("provisioning topics and indexes");
-    for topic in &topics {
-        laser.topic(topic).ensure(config.partitions).await?;
-    }
-    if config.register && query_available {
+        // Create every topic. LaserData Cloud runs the optional projection and
+        // query phases, while the raw streaming load works against Apache Iggy.
+        phase("provisioning topics and indexes");
         for topic in &topics {
-            register_index(&laser, &stream_name, topic).await?;
+            laser.topic(topic).ensure(config.partitions).await?;
         }
-        info!(
-            "registered {} projections, waiting for LaserData Cloud to create indexes",
-            topics.len()
-        );
-        // Best effort. Give LaserData Cloud a moment to create the first index. With no
-        // LaserData Cloud attached this short wait simply elapses and we publish anyway.
-        wait_for_index(&laser, &topics[0], Duration::from_secs(15)).await;
-    } else if !config.register {
-        info!("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)");
-    } else {
-        info!(
-            "projection registration needs Laser Stack or LaserData Cloud, publishing to the raw log only"
-        );
-    }
-
-    // Publish.
-    phase("firing the hose");
-    let published = Arc::new(AtomicU64::new(0));
-    let bytes_published = Arc::new(AtomicU64::new(0));
-    let started = Instant::now();
-
-    // Spread the total over the orgs, then run `concurrency` of them at a time
-    // so a large run does not spawn unbounded work.
-    let per_org = config.messages / config.orgs as u64;
-    let remainder = config.messages % config.orgs as u64;
-    let config = Arc::new(config);
-
-    let mut window_start = 0usize;
-    while window_start < topics.len() {
-        let window_end = (window_start + config.concurrency).min(topics.len());
-        let mut handles = Vec::new();
-        for (offset, topic) in topics[window_start..window_end].iter().enumerate() {
-            let shard = (window_start + offset) as u64;
-            // The first orgs take the remainder so the totals add up exactly.
-            let count = per_org + if shard < remainder { 1 } else { 0 };
-            let laser = laser.clone();
-            let topic = topic.clone();
-            let config = config.clone();
-            let published = published.clone();
-            let bytes_published = bytes_published.clone();
-            handles.push(tokio::spawn(async move {
-                produce_shard(
-                    &laser,
-                    &topic,
-                    shard,
-                    count,
-                    &config,
-                    &published,
-                    &bytes_published,
-                )
-                .await
-            }));
+        if config.register && query_available {
+            for topic in &topics {
+                register_index(&laser, &stream_name, topic).await?;
+            }
+            info!(
+                "registered {} projections, waiting for LaserData Cloud to create indexes",
+                topics.len()
+            );
+            // Best effort. Give LaserData Cloud a moment to create the first index. With no
+            // LaserData Cloud attached this short wait simply elapses and we publish anyway.
+            wait_for_index(&laser, &topics[0], Duration::from_secs(15)).await;
+        } else if !config.register {
+            info!("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)");
+        } else {
+            info!(
+                "projection registration needs Laser Stack or LaserData Cloud, publishing to the raw log only"
+            );
         }
-        for handle in handles {
-            handle
-                .await
-                .map_err(|error| LaserError::Invalid(format!("producer task: {error}")))??;
+
+        // Publish.
+        phase("firing the hose");
+        let published = Arc::new(AtomicU64::new(0));
+        let bytes_published = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+
+        // Spread the total over the orgs, then run `concurrency` of them at a time
+        // so a large run does not spawn unbounded work.
+        let per_org = config.messages / config.orgs as u64;
+        let remainder = config.messages % config.orgs as u64;
+        let config = Arc::new(config);
+
+        let mut window_start = 0usize;
+        while window_start < topics.len() {
+            let window_end = (window_start + config.concurrency).min(topics.len());
+            let mut handles = Vec::new();
+            for (offset, topic) in topics[window_start..window_end].iter().enumerate() {
+                let shard = (window_start + offset) as u64;
+                // The first orgs take the remainder so the totals add up exactly.
+                let count = per_org + if shard < remainder { 1 } else { 0 };
+                let laser = laser.clone();
+                let topic = topic.clone();
+                let config = config.clone();
+                let published = published.clone();
+                let bytes_published = bytes_published.clone();
+                handles.push(tokio::spawn(async move {
+                    produce_shard(
+                        &laser,
+                        &topic,
+                        shard,
+                        count,
+                        &config,
+                        &published,
+                        &bytes_published,
+                    )
+                    .await
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .map_err(|error| LaserError::Invalid(format!("producer task: {error}")))??;
+            }
+            window_start = window_end;
         }
-        window_start = window_end;
-    }
 
-    let elapsed = started.elapsed().as_secs_f64().max(1e-6);
-    let total = published.load(Ordering::Relaxed);
-    let total_bytes = bytes_published.load(Ordering::Relaxed);
-    info!(
-        "done: {total} messages, {:.2} GB payload in {:.1}s ({:.0} msg/s, {:.1} MB/s)",
-        total_bytes as f64 / 1e9,
-        elapsed,
-        total as f64 / elapsed,
-        (total_bytes as f64 / 1e6) / elapsed,
-    );
-
-    // Analytics, best effort.
-    if config.query && query_available {
-        phase("sample analytics over the firehose");
-        run_sample_queries(&laser, &topics).await;
-    } else if config.query {
+        let elapsed = started.elapsed().as_secs_f64().max(1e-6);
+        let total = published.load(Ordering::Relaxed);
+        let total_bytes = bytes_published.load(Ordering::Relaxed);
         info!(
-            "sample analytics needs Laser Stack or LaserData Cloud, streaming run completed without it"
+            "done: {total} messages, {:.2} GB payload in {:.1}s ({:.0} msg/s, {:.1} MB/s)",
+            total_bytes as f64 / 1e9,
+            elapsed,
+            total as f64 / elapsed,
+            (total_bytes as f64 / 1e6) / elapsed,
         );
-    }
 
-    Ok(())
+        // Analytics, best effort.
+        if config.query && query_available {
+            phase("sample analytics over the firehose");
+            run_sample_queries(&laser, &topics).await;
+        } else if config.query {
+            info!(
+                "sample analytics needs Laser Stack or LaserData Cloud, streaming run completed without it"
+            );
+        }
+
+        Ok(())
+    })
+    .await
 }
 
 // Run knobs, all read from the environment with sane defaults. The env parsers

@@ -30,6 +30,7 @@ function fakeTransport(pages: readonly (readonly PolledMessage[])[]): LaserTrans
     },
     sendManaged: () => Promise.reject(new Error("unused")),
     ensureStream: () => Promise.reject(new Error("unused")),
+    deleteStream: () => Promise.reject(new Error("unused")),
     ensureTopic: () => Promise.reject(new Error("unused")),
     findTopicPartitionCount: () => Promise.reject(new Error("unused")),
     getTopicPartitionCount: () => Promise.reject(new Error("unused")),

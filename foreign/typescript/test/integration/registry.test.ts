@@ -4,10 +4,35 @@ import { test } from "node:test"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { AgentId } from "../../src/types/ids.js"
 import type { AgentCard } from "../../src/wire/agent.js"
-import { Laser } from "../../src/client/laser.js"
+import { INTERNAL_REPLY_HUB, Laser } from "../../src/client/laser.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
+
+void test("given_a_cached_stream_when_deleted_and_recreated_then_should_discard_registry_and_reply_state", async () => {
+  const streamName = `laser-ts-test-${randomUUID()}`
+  await using laser = await Laser.connectWithStream(CONNECTION_STRING, streamName)
+  const stream = laser.stream(streamName)
+  const agent = AgentId.new("retired-agent")
+  for (const externallyDeleted of [false, true]) {
+    await stream.ensure()
+    await laser.quarantine(AgentId.new("operator"), agent)
+    const registry = await laser.agentRegistry()
+    await registry.refresh(0n)
+    assert.equal(registry.isQuarantined(agent), true)
+    const oldHub = await laser[INTERNAL_REPLY_HUB](AgentTopic.Responses)
+    if (externallyDeleted) await laser.iggyClient.stream.delete({ streamId: streamName })
+    assert.equal(await stream.delete(), !externallyDeleted)
+    await stream.ensure()
+    const fresh = await laser.withDefaultStream(streamName).agentRegistry()
+    assert.equal(fresh.isQuarantined(agent), false)
+    await laser.quarantine(AgentId.new("operator"), agent)
+    await fresh.refresh(0n)
+    assert.equal(fresh.isQuarantined(agent), true)
+    assert.notEqual(await laser[INTERNAL_REPLY_HUB](AgentTopic.Responses), oldHub)
+    await stream.delete()
+  }
+})
 
 void test("given_a_published_card_and_quarantine_when_registry_refreshes_then_should_fold_incrementally", async () => {
   const streamName = `laser-ts-test-${randomUUID()}`

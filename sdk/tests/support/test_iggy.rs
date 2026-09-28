@@ -11,6 +11,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+// A reserved port is released before the server binds it, so another process can take it in
+// between. The server then exits at startup, and a fresh port on the next attempt starts it.
+const STARTUP_ATTEMPTS: usize = 5;
 const IGGY_SERVER_ENV: &str = "LASER_TEST_IGGY_SERVER";
 const CLUSTER_SIZE: usize = 3;
 
@@ -174,25 +177,38 @@ pub struct TestIggy {
 #[allow(dead_code)]
 impl TestIggy {
     pub async fn start() -> Self {
-        Self::start_inner(free_host_port()).await
+        Self::start_inner().await
     }
 
     pub async fn start_pinned() -> Self {
-        Self::start_inner(free_host_port()).await
+        Self::start_inner().await
     }
 
-    async fn start_inner(tcp_port: u16) -> Self {
+    async fn start_inner() -> Self {
         let binary = resolve_server_binary();
-        let data_dir = tempfile::tempdir().expect("create Iggy test data directory");
-        let child = spawn_server(&binary, data_dir.path(), tcp_port);
-        let server = Self {
-            binary,
-            child: Mutex::new(child),
-            data_dir,
-            tcp_port,
-        };
-        server.wait_until_ready().await;
-        server
+        let mut attempt = 1;
+        loop {
+            let data_dir = tempfile::tempdir().expect("create Iggy test data directory");
+            let tcp_port = free_host_port();
+            let child = spawn_server(&binary, data_dir.path(), tcp_port);
+            let server = Self {
+                binary: binary.clone(),
+                child: Mutex::new(child),
+                data_dir,
+                tcp_port,
+            };
+            match server.wait_until_ready().await {
+                Ok(()) => return server,
+                // The server reports a taken port as `CannotBindToSocket` and drops the OS error,
+                // so the log never says "Address already in use".
+                Err(log) if attempt < STARTUP_ATTEMPTS && log.contains("Cannot bind to socket") => {
+                    attempt += 1;
+                }
+                Err(log) => panic!(
+                    "Iggy test server exited during startup on attempt {attempt}, log:\n{log}"
+                ),
+            }
+        }
     }
 
     pub async fn restart(&self) {
@@ -202,7 +218,9 @@ impl TestIggy {
             child.wait().expect("reap Iggy test process");
             *child = spawn_server(&self.binary, self.data_dir.path(), self.tcp_port);
         }
-        self.wait_until_ready().await;
+        if let Err(log) = self.wait_until_ready().await {
+            panic!("Iggy test server exited during restart, log:\n{log}");
+        }
     }
 
     pub async fn client(&self) -> Result<IggyClient, IggyError> {
@@ -231,7 +249,8 @@ impl TestIggy {
         Ok(Laser::from_client(client).with_default_stream(stream))
     }
 
-    async fn wait_until_ready(&self) {
+    // `Err` carries the server log when the process exited before it accepted writes.
+    async fn wait_until_ready(&self) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
             if self
@@ -242,19 +261,15 @@ impl TestIggy {
                 .expect("inspect Iggy test process")
                 .is_some()
             {
-                let log = std::fs::read_to_string(self.log_path())
-                    .unwrap_or_else(|error| format!("failed to read server log: {error}"));
-                panic!(
-                    "Iggy test server exited during startup, log {}:\n{log}",
-                    self.log_path().display(),
-                );
+                return Err(std::fs::read_to_string(self.log_path())
+                    .unwrap_or_else(|error| format!("failed to read server log: {error}")));
             }
             let ready = tokio::time::timeout(Duration::from_secs(2), self.probe_writes())
                 .await
                 .map(|result| result.is_ok())
                 .unwrap_or(false);
             if ready {
-                return;
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 let log = std::fs::read_to_string(self.log_path())

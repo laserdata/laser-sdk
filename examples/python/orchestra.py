@@ -50,106 +50,111 @@ ORCHESTRATOR = "orchestrator"
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    await laser.bootstrap(_common.PARTITIONS)
+    try:
+        await laser.bootstrap(_common.PARTITIONS)
 
-    _common.phase("Discovery: a pool of long-running capability agents connects")
-    # Kept alive for the whole run so the console stays populated. Health is a
-    # property of the card: diag-gamma advertises unavailable to prove routing
-    # reads it, and laggard is deliberately slow to drive the expiry phase.
-    agents = [
-        await spawn("triager", CLASSIFY, "healthy", 0.2),
-        await spawn("diag-alpha", DIAGNOSE, "healthy", 0.4),
-        await spawn("diag-beta", DIAGNOSE, "healthy", 0.4),
-        await spawn("diag-gamma", DIAGNOSE, "unavailable", 0.4),
-        await spawn("executor", REMEDIATE, "healthy", 0.3),
-        await spawn("laggard", SLOW_TASK, "healthy", 6.0),
-    ]
-    print("six agents connected and advertised their capability cards")
-    await pause("DISCOVERY: six agents are live in the registry (one unavailable)")
+        _common.phase("Discovery: a pool of long-running capability agents connects")
+        # Kept alive for the whole run so the console stays populated. Health is a
+        # property of the card: diag-gamma advertises unavailable to prove routing
+        # reads it, and laggard is deliberately slow to drive the expiry phase.
+        agents = [
+            await spawn("triager", CLASSIFY, "healthy", 0.2),
+            await spawn("diag-alpha", DIAGNOSE, "healthy", 0.4),
+            await spawn("diag-beta", DIAGNOSE, "healthy", 0.4),
+            await spawn("diag-gamma", DIAGNOSE, "unavailable", 0.4),
+            await spawn("executor", REMEDIATE, "healthy", 0.3),
+            await spawn("laggard", SLOW_TASK, "healthy", 6.0),
+        ]
+        print("six agents connected and advertised their capability cards")
+        await pause("DISCOVERY: six agents are live in the registry (one unavailable)")
 
-    _common.phase("Contract: a directed task to one capable agent, with a deadline")
-    # The orchestrator names a capability, not an agent. Routing resolves the one
-    # classifier from the registry and waits for the reply or the deadline.
-    reply = await laser.contract(
-        CLASSIFY, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
-    )
-    print("classifier replied:", reply.decode() if reply else "<did not complete>")
-    await pause("CONTRACT: a directed task completed (see it in the Contracts panel)")
-
-    _common.phase("Fan-out: a panel scattered to every capable agent")
-    # Three agents advertise diagnose, but one is unavailable, so the scatter
-    # reaches the two healthy ones without the orchestrator knowing their ids.
-    findings = await diagnose_panel(laser)
-    print(f"panel gathered {findings} findings (the unavailable agent was skipped)")
-    await pause("FAN-OUT: two healthy diagnosers answered, the unavailable one was skipped")
-
-    _common.phase("Workflow: triage, then a diagnose panel, then remediate (journalled)")
-    wf = laser.workflow("incident-response", fixed_inbox=COMMANDS)
-    # Cap the dispatches and wall clock so a runaway fan-out cannot spin.
-    wf.budget(invocations=8, wall_clock_ms=60_000)
-    # Register the run in the managed run registry when the plane serves it (the
-    # Runs panel then shows its lifecycle), and run log-native otherwise.
-    caps = await laser.capabilities()
-    if caps.agent_workflow:
-        wf.registered()
-    wf.step("triage", to_capable=CLASSIFY, build=lambda outputs: INCIDENT)
-    wf.step(
-        "diagnose",
-        all_capable=DIAGNOSE,
-        after=["triage"],
-        # Each step reads the prior steps' outputs from the journal, so the
-        # dependency edge is data, not a shared variable.
-        build=lambda outputs: b"diagnose: " + outputs.get("triage", b""),
-        verify=lambda folded: len(folded) > 0,
-    )
-    wf.step(
-        "remediate",
-        to_capable=REMEDIATE,
-        after=["diagnose"],
-        build=lambda outputs: b"remediate: " + outputs.get("diagnose", b""),
-    )
-    outputs = await wf.run()
-    print(f"workflow completed and journalled: {len(outputs)} steps")
-    await pause("WORKFLOW: the run journalled triage -> diagnose -> remediate (Workflow panel)")
-
-    _common.phase("Quarantine: an operator pulls a misbehaving agent")
-    # Quarantine is a registry fact every fused registry folds, so the next panel
-    # routes around diag-alpha with no change to the orchestrator.
-    await laser.quarantine("operator", "diag-alpha")
-    after = await diagnose_panel(laser)
-    print(f"panel after quarantine: {after} findings (alpha routed around)")
-    await pause("QUARANTINE: diag-alpha is quarantined in the registry, the panel routes around it")
-
-    _common.phase("Recovery: the operator reinstates the agent")
-    await laser.unquarantine("operator", "diag-alpha")
-    reinstated = await diagnose_panel(laser)
-    print(f"panel after un-quarantine: {reinstated} findings (alpha is back)")
-    await pause("RECOVERY: diag-alpha is reinstated, the panel is whole again")
-
-    _common.phase("Expiry + recovery: a tight deadline times out, the orchestrator recovers")
-    # The slow agent acks pickup but cannot finish inside the one-second deadline,
-    # so the contract expires. The orchestrator recovers by re-dispatching to a
-    # healthy fast agent, the pattern any real coordinator uses for a stuck task.
-    slow = await laser.contract(
-        SLOW_TASK, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=1_000
-    )
-    if slow is None:
-        print("the slow agent missed the deadline, recovering on a healthy agent")
-        recovered = await laser.contract(
-            REMEDIATE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
+        _common.phase("Contract: a directed task to one capable agent, with a deadline")
+        # The orchestrator names a capability, not an agent. Routing resolves the one
+        # classifier from the registry and waits for the reply or the deadline.
+        reply = await laser.contract(
+            CLASSIFY, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
         )
-        print("recovered:", recovered.decode() if recovered else "<did not complete>")
-    else:
-        print("unexpectedly fast:", slow.decode())
-    await pause("EXPIRY: the slow agent timed out, the task recovered on a healthy agent")
+        print("classifier replied:", reply.decode() if reply else "<did not complete>")
+        await pause("CONTRACT: a directed task completed (see it in the Contracts panel)")
 
-    print(
-        "\norchestra: discovery, routing, fan-out, a journalled workflow, health,\n"
-        "reversible quarantine, and deadline recovery, all coordinated over the log."
-    )
+        _common.phase("Fan-out: a panel scattered to every capable agent")
+        # Three agents advertise diagnose, but one is unavailable, so the scatter
+        # reaches the two healthy ones without the orchestrator knowing their ids.
+        findings = await diagnose_panel(laser)
+        print(f"panel gathered {findings} findings (the unavailable agent was skipped)")
+        await pause("FAN-OUT: two healthy diagnosers answered, the unavailable one was skipped")
 
-    for agent in agents:
-        await agent.shutdown()
+        _common.phase("Workflow: triage, then a diagnose panel, then remediate (journalled)")
+        wf = laser.workflow("incident-response", fixed_inbox=COMMANDS)
+        # Cap the dispatches and wall clock so a runaway fan-out cannot spin.
+        wf.budget(invocations=8, wall_clock_ms=60_000)
+        # Register the run in the managed run registry when the plane serves it (the
+        # Runs panel then shows its lifecycle), and run log-native otherwise.
+        caps = await laser.capabilities()
+        if caps.agent_workflow:
+            wf.registered()
+        wf.step("triage", to_capable=CLASSIFY, build=lambda outputs: INCIDENT)
+        wf.step(
+            "diagnose",
+            all_capable=DIAGNOSE,
+            after=["triage"],
+            # Each step reads the prior steps' outputs from the journal, so the
+            # dependency edge is data, not a shared variable.
+            build=lambda outputs: b"diagnose: " + outputs.get("triage", b""),
+            verify=lambda folded: len(folded) > 0,
+        )
+        wf.step(
+            "remediate",
+            to_capable=REMEDIATE,
+            after=["diagnose"],
+            build=lambda outputs: b"remediate: " + outputs.get("diagnose", b""),
+        )
+        outputs = await wf.run()
+        print(f"workflow completed and journalled: {len(outputs)} steps")
+        await pause("WORKFLOW: the run journalled triage -> diagnose -> remediate (Workflow panel)")
+
+        _common.phase("Quarantine: an operator pulls a misbehaving agent")
+        # Quarantine is a registry fact every fused registry folds, so the next panel
+        # routes around diag-alpha with no change to the orchestrator.
+        await laser.quarantine("operator", "diag-alpha")
+        after = await diagnose_panel(laser)
+        print(f"panel after quarantine: {after} findings (alpha routed around)")
+        await pause(
+            "QUARANTINE: diag-alpha is quarantined in the registry, the panel routes around it"
+        )
+
+        _common.phase("Recovery: the operator reinstates the agent")
+        await laser.unquarantine("operator", "diag-alpha")
+        reinstated = await diagnose_panel(laser)
+        print(f"panel after un-quarantine: {reinstated} findings (alpha is back)")
+        await pause("RECOVERY: diag-alpha is reinstated, the panel is whole again")
+
+        _common.phase("Expiry + recovery: a tight deadline times out, the orchestrator recovers")
+        # The slow agent acks pickup but cannot finish inside the one-second deadline,
+        # so the contract expires. The orchestrator recovers by re-dispatching to a
+        # healthy fast agent, the pattern any real coordinator uses for a stuck task.
+        slow = await laser.contract(
+            SLOW_TASK, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=1_000
+        )
+        if slow is None:
+            print("the slow agent missed the deadline, recovering on a healthy agent")
+            recovered = await laser.contract(
+                REMEDIATE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
+            )
+            print("recovered:", recovered.decode() if recovered else "<did not complete>")
+        else:
+            print("unexpectedly fast:", slow.decode())
+        await pause("EXPIRY: the slow agent timed out, the task recovered on a healthy agent")
+
+        print(
+            "\norchestra: discovery, routing, fan-out, a journalled workflow, health,\n"
+            "reversible quarantine, and deadline recovery, all coordinated over the log."
+        )
+
+        for agent in agents:
+            await agent.shutdown()
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 def worker(name: str, skill: str, delay: float):

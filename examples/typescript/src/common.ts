@@ -93,13 +93,30 @@ export async function connectExample(
   }
 }
 
+/**
+ * Deletes this run's own stream so repeated runs do not leave their topics and
+ * partitions on the server. A provisioned `LASER_STREAM` is kept.
+ */
+export async function releaseStream(
+  laser: Laser,
+  example: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<void> {
+  if (envValue("LASER_STREAM", env).length === 0)
+    await laser.stream(streamFor(example, env)).delete()
+}
+
 export async function runExample(
   example: string,
   run: (laser: Laser, signal: AbortSignal) => Promise<void>
 ): Promise<void> {
   await using laser = await connectExample(example)
   using shutdown = installShutdownSignals()
-  await run(laser, shutdown.signal)
+  try {
+    await run(laser, shutdown.signal)
+  } finally {
+    await releaseStream(laser, example)
+  }
 }
 
 export function managedGate(

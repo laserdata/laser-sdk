@@ -81,6 +81,15 @@ impl PyStream {
         })
     }
 
+    /// Delete this stream with every topic and message in it. Returns `False` when the stream did not exist.
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let name = self.name.clone();
+        future_into_py(py, async move {
+            laser.stream(&name).delete().await.map_err(to_pyerr)
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!("Stream(name={})", self.name)
     }

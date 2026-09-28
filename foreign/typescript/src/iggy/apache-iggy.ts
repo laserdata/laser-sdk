@@ -1,3 +1,4 @@
+import { connectOptions } from "../client/connect-options.js"
 import { publishOptions, publishWithin, type PublishOptions } from "../client/publish-options.js"
 import {
   Consumer,
@@ -46,6 +47,8 @@ export type ClientOwnership = "owned" | "borrowed"
 export type { SendMessagesConfirmation, SendMessagesResponse }
 
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
+const ACCEPT_STAGE = "Iggy server to accept the connection"
+const LOGIN_STAGE = "Iggy login reply"
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
 const TRANSIENT_NOT_COMMITTED = 57
 const TRANSIENT_NOT_ACCEPTED = 58
@@ -95,6 +98,7 @@ export interface LaserTransport {
     options?: { readonly retryAfterReconnect?: boolean }
   ): Promise<Uint8Array>
   ensureStream(name: string): Promise<void>
+  deleteStream(name: string): Promise<boolean>
   ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void>
   ensureTopicWithExpiry?(
     streamId: string,
@@ -473,7 +477,9 @@ export interface ClientConnectionEvents {
   on(event: "error", listener: (cause?: unknown) => void): void
   on(event: "disconnected", listener: (hadError: boolean) => void): void
   once(event: "error", listener: (cause?: unknown) => void): void
+  once(event: "connect", listener: () => void): void
   off(event: "error", listener: (cause?: unknown) => void): void
+  off(event: "connect", listener: () => void): void
 }
 
 interface RawClientConnection {
@@ -492,7 +498,7 @@ export function watchConnectionLoss(connection: ClientConnectionEvents, onLost: 
 
 async function connectSimpleClient(
   parsed: ParsedConnectionString,
-  timeoutMs?: number
+  deadline?: number
 ): Promise<ConnectedClient> {
   const config: ClientConfig = parsed.tls
     ? {
@@ -524,6 +530,13 @@ async function connectSimpleClient(
   try {
     const connection = (raw as RawClient & RawClientConnection).connection
     const client = new SimpleClient(raw)
+    // The client emits `connect` only once the transport, TLS included, is up, so it
+    // separates a server that never accepts the socket from one that never answers login.
+    let accepted = false
+    const markAccepted = (): void => {
+      accepted = true
+    }
+    connection.once("connect", markAccepted)
     const ready = new Promise<void>((resolve, reject) => {
       const failed = (cause?: unknown): void => {
         reject(cause instanceof Error ? cause : new Error(String(cause)))
@@ -534,11 +547,31 @@ async function connectSimpleClient(
         resolve()
       }, reject)
     })
-    await (timeoutMs === undefined ? ready : publishWithin(ready, timeoutMs))
+    void ready.catch(() => undefined)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await (deadline === undefined
+        ? ready
+        : Promise.race([
+            ready,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => {
+                  reject(new TimeoutError(accepted ? LOGIN_STAGE : ACCEPT_STAGE))
+                },
+                Math.max(0, deadline - Date.now())
+              )
+            })
+          ]))
+    } finally {
+      clearTimeout(timer)
+      connection.off("connect", markAccepted)
+    }
     connection.on("error", () => undefined)
     return { client, raw }
   } catch (cause) {
     raw.destroy()
+    if (cause instanceof TimeoutError) throw cause
     throw new TransportError(`failed to connect to ${parsed.host}:${String(parsed.port)}`, true, {
       cause
     })
@@ -560,7 +593,10 @@ function serverResponseError(error: unknown): Error | undefined {
   return undefined
 }
 
-async function connectWithRetry(parsed: ParsedConnectionString): Promise<ConnectedClient> {
+async function connectWithRetry(
+  parsed: ParsedConnectionString,
+  deadline: number
+): Promise<ConnectedClient> {
   let retries = 0
   let lastError: unknown
   while (
@@ -568,9 +604,9 @@ async function connectWithRetry(parsed: ParsedConnectionString): Promise<Connect
     retries <= parsed.reconnection.maxRetries
   ) {
     try {
-      return await connectSimpleClient(parsed)
+      return await connectSimpleClient(parsed, deadline)
     } catch (error) {
-      if (error instanceof ConfigError) throw error
+      if (error instanceof ConfigError || error instanceof TimeoutError) throw error
       lastError = error
       if (serverResponseError(error) !== undefined) {
         break
@@ -582,7 +618,11 @@ async function connectWithRetry(parsed: ParsedConnectionString): Promise<Connect
         break
       }
       retries += 1
-      await new Promise((resolve) => setTimeout(resolve, parsed.reconnection.intervalMs))
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new TimeoutError(ACCEPT_STAGE, { cause: error })
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(parsed.reconnection.intervalMs, remaining))
+      )
     }
   }
   const responseError = serverResponseError(lastError)
@@ -620,11 +660,12 @@ export class ApacheIggyTransport implements LaserTransport {
 
   static async connect(
     connectionString: string,
-    options?: Partial<PublishOptions>
+    options?: Partial<PublishOptions>,
+    deadline = Date.now() + connectOptions().timeoutMs
   ): Promise<ApacheIggyTransport> {
     const config = publishOptions(options)
     const parsed = parseConnectionString(connectionString)
-    const connected = await connectWithRetry(parsed)
+    const connected = await connectWithRetry(parsed, deadline)
     const transport = new ApacheIggyTransport(connected.client, parsed, "owned", config)
     transport.watch(connected)
     return transport
@@ -633,10 +674,17 @@ export class ApacheIggyTransport implements LaserTransport {
   static async fromClient(
     client: SimpleClient,
     ownership: ClientOwnership = "borrowed",
-    options?: Partial<PublishOptions>
+    options?: Partial<PublishOptions>,
+    deadline = Date.now() + connectOptions().timeoutMs
   ): Promise<ApacheIggyTransport> {
     const config = publishOptions(options)
-    await client.clientProvider()
+    try {
+      await publishWithin(client.clientProvider(), Math.max(0, deadline - Date.now()))
+    } catch (cause) {
+      if (ownership === "owned") void client.destroy().catch(() => undefined)
+      if (cause instanceof TimeoutError) throw new TimeoutError("Iggy client readiness", { cause })
+      throw cause
+    }
     return new ApacheIggyTransport(client, undefined, ownership, config)
   }
 
@@ -645,6 +693,7 @@ export class ApacheIggyTransport implements LaserTransport {
     message: string,
     retryAfterReconnect = true
   ): Promise<Value> {
+    if (this.closed) throw new TransportError("transport is closed", false)
     const stale = this.client
     if (this.disconnected.has(stale)) {
       await this.reconnect(stale)
@@ -699,7 +748,7 @@ export class ApacheIggyTransport implements LaserTransport {
           const remaining = deadline === undefined ? undefined : deadline - Date.now()
           if (remaining !== undefined && remaining <= 0)
             throw new TimeoutError("Iggy publish reconnect")
-          const connected = await connectSimpleClient(this.connection, remaining)
+          const connected = await connectSimpleClient(this.connection, deadline)
           try {
             for (const group of this.consumerGroups.values()) {
               const join = connected.client.group.ensureAndJoin(
@@ -786,6 +835,23 @@ export class ApacheIggyTransport implements LaserTransport {
       (client) => client.stream.ensure(name),
       `failed to ensure stream \`${name}\``
     )
+  }
+
+  async deleteStream(name: string): Promise<boolean> {
+    const deleted = await this.execute(async (client) => {
+      if ((await client.stream.get({ streamId: name })) === null) return false
+      try {
+        await client.stream.delete({ streamId: name })
+      } catch (cause) {
+        if ((await client.stream.get({ streamId: name })) !== null) throw cause
+      }
+      return true
+    }, `failed to delete stream \`${name}\``)
+    const prefix = `${name}\0`
+    for (const cache of [this.partitionCounts, this.balancedCursors, this.consumerGroups]) {
+      for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key)
+    }
+    return deleted
   }
 
   async ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void> {

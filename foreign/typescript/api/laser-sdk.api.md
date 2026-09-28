@@ -3016,7 +3016,6 @@ export class Laser implements AsyncDisposable {
     // (undocumented)
     clientMetadata(): ClientMetadataRequest;
     close(): Promise<void>;
-    // (undocumented)
     static connect(connectionString: string): Promise<Laser>;
     // (undocumented)
     static connectEnv(env?: Readonly<Record<string, string | undefined>>): Promise<Laser>;
@@ -3166,6 +3165,7 @@ export class LaserBuilder {
     connect(): Promise<Laser>;
     // (undocumented)
     connectionString(value: string): this;
+    connectTimeout(milliseconds: number): this;
     // (undocumented)
     controlTopic(value: string): this;
     // (undocumented)
@@ -4999,7 +4999,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.4.0";
+export const SDK_VERSION = "0.4.1";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;
@@ -5229,7 +5229,8 @@ export class Stream {
     // Warning: (ae-forgotten-export) The symbol "GovernPublish" needs to be exported by the entry point index.d.ts
     // Warning: (ae-forgotten-export) The symbol "ResolveSchema" needs to be exported by the entry point index.d.ts
     // Warning: (ae-forgotten-export) The symbol "ObserveEffect" needs to be exported by the entry point index.d.ts
-    constructor(transport: LaserTransport, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined);
+    constructor(transport: LaserTransport, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined, onDelete?: (() => void) | undefined);
+    delete(): Promise<boolean>;
     // (undocumented)
     ensure(): Promise<void>;
     // (undocumented)

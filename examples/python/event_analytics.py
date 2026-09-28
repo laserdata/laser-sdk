@@ -93,32 +93,35 @@ LIVE_SNAPSHOT_EVERY = 50
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    caps = await laser.capabilities()
-    count = _common.messages(default=180)
+    try:
+        caps = await laser.capabilities()
+        count = _common.messages(default=180)
 
-    _common.phase("warming up")
-    await laser.topic(TOPIC).ensure(partitions=_common.PARTITIONS)
-    events = clickstream(count)
+        _common.phase("warming up")
+        await laser.topic(TOPIC).ensure(partitions=_common.PARTITIONS)
+        events = clickstream(count)
 
-    # Register the projector before publishing so no event is missed (managed only).
-    if caps.query:
-        await _common.start_projector(laser, TOPIC, COLUMNS)
+        # Register the projector before publishing so no event is missed (managed only).
+        if caps.query:
+            await _common.start_projector(laser, TOPIC, COLUMNS)
 
-    _common.phase("hot path: a live reader tails the stream while the producer runs")
-    await live_monitor(laser, events)
+        _common.phase("hot path: a live reader tails the stream while the producer runs")
+        await live_monitor(laser, events)
 
-    if _common.managed_gate(caps.query, "query", EXAMPLE):
-        await _common.wait_for_projection(laser, TOPIC, count)
-        _common.phase("read model: ad-hoc analytics over the query layer")
-        await run_analytics(laser)
-        _common.phase("read model: a resumable downstream reader")
-        await run_resumable_export(laser)
+        if _common.managed_gate(caps.query, "query", EXAMPLE):
+            await _common.wait_for_projection(laser, TOPIC, count)
+            _common.phase("read model: ad-hoc analytics over the query layer")
+            await run_analytics(laser)
+            _common.phase("read model: a resumable downstream reader")
+            await run_resumable_export(laser)
 
-    if caps.managed:
-        _common.phase("validated ingest: a JSON Schema guards the index")
-        await run_guarded_ingest(laser)
-    else:
-        print("writer schemas need Laser Stack or LaserData Cloud, skipping validated ingest")
+        if caps.managed:
+            _common.phase("validated ingest: a JSON Schema guards the index")
+            await run_guarded_ingest(laser)
+        else:
+            print("writer schemas need Laser Stack or LaserData Cloud, skipping validated ingest")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 def clickstream(count: int) -> list[dict]:

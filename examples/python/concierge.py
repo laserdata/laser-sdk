@@ -558,142 +558,145 @@ def _env_bool(name: str) -> bool:
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    _common.phase("warming up")
-    await laser.bootstrap(_common.PARTITIONS)
-    await laser.topic(TICKETS_TOPIC).ensure(partitions=_common.PARTITIONS)
-
-    caps = await laser.capabilities()
-    if not _common.managed_gate(caps.query, "the agentic concierge desk", EXAMPLE):
-        return
-    # Register before publishing a single ticket, so no event is missed by a
-    # projector that starts afterwards.
-    _common.phase("registering the index before the ticket firehose")
-    await _common.start_projector(
-        laser,
-        TICKETS_TOPIC,
-        ["ticket_id", "message_type", "customer", "component", "severity", "status", "ts"],
-    )
-
-    total = _common.messages(2_000)
-    chunk = _common.batch(200)
-    _common.phase("ingesting the ticket firehose (the desk's world model)")
-    await ingest_tickets(laser, total, chunk)
-    await _common.wait_for_projection(laser, TICKETS_TOPIC, total)
-    await backlog_snapshot(laser)
-
-    _common.phase("seeding semantic memory with past resolutions")
-    # One shared in-process semantic index for the whole desk: seeded here, read
-    # by every specialist call, and appended to as incidents resolve.
-    semantic = laser.vector_memory(embed)
-    await seed_memory(semantic)
-
-    _common.phase("spawning the desk: triage, specialist, resolver, approver")
-    llm = default_llm()
-    # Run-scoped namespaces so reruns never read each other's state.
-    run = ls.new_conversation_id()
-    dedup_namespace = f"concierge-dedup-{run}"
-    credits_namespace = f"concierge-credits-{run}"
-    triage = laser.spawn_agent(
-        "triage",
-        ls.Topics.COMMANDS,
-        make_triage(llm, TICKETS_TOPIC),
-        respond_on=ls.Topics.RESPONSES,
-        poll_interval_ms=10,
-    )
-    specialist = laser.spawn_agent(
-        "specialist",
-        ls.Topics.TOOL_CALLS,
-        make_specialist(llm, semantic),
-        respond_on=ls.Topics.TOOL_RESULTS,
-        poll_interval_ms=10,
-    )
-    approver_agent = laser.spawn_agent(
-        "approver",
-        ls.Topics.HUMAN_INPUT,
-        approver,
-        respond_on=ls.Topics.RESPONSES,
-        poll_interval_ms=10,
-    )
-    resolver = laser.spawn_agent(
-        "resolver",
-        ls.Topics.COMMANDS,
-        make_resolver(credits_namespace),
-        poll_interval_ms=10,
-        dedup=make_kv_deduplicator(laser, dedup_namespace, DEDUP_TTL),
-    )
-    agents = [triage, specialist, approver_agent, resolver]
-    for agent in agents:
-        await agent.ready()
-
     try:
-        _common.phase("triaging the incident through the desk")
-        incident = ls.new_conversation_id()
-        print(f"  incident on conversation {incident}: {INCIDENT}")
-        reply = await laser.request(
+        _common.phase("warming up")
+        await laser.bootstrap(_common.PARTITIONS)
+        await laser.topic(TICKETS_TOPIC).ensure(partitions=_common.PARTITIONS)
+
+        caps = await laser.capabilities()
+        if not _common.managed_gate(caps.query, "the agentic concierge desk", EXAMPLE):
+            return
+        # Register before publishing a single ticket, so no event is missed by a
+        # projector that starts afterwards.
+        _common.phase("registering the index before the ticket firehose")
+        await _common.start_projector(
+            laser,
+            TICKETS_TOPIC,
+            ["ticket_id", "message_type", "customer", "component", "severity", "status", "ts"],
+        )
+
+        total = _common.messages(2_000)
+        chunk = _common.batch(200)
+        _common.phase("ingesting the ticket firehose (the desk's world model)")
+        await ingest_tickets(laser, total, chunk)
+        await _common.wait_for_projection(laser, TICKETS_TOPIC, total)
+        await backlog_snapshot(laser)
+
+        _common.phase("seeding semantic memory with past resolutions")
+        # One shared in-process semantic index for the whole desk: seeded here, read
+        # by every specialist call, and appended to as incidents resolve.
+        semantic = laser.vector_memory(embed)
+        await seed_memory(semantic)
+
+        _common.phase("spawning the desk: triage, specialist, resolver, approver")
+        llm = default_llm()
+        # Run-scoped namespaces so reruns never read each other's state.
+        run = ls.new_conversation_id()
+        dedup_namespace = f"concierge-dedup-{run}"
+        credits_namespace = f"concierge-credits-{run}"
+        triage = laser.spawn_agent(
+            "triage",
             ls.Topics.COMMANDS,
-            ls.Topics.RESPONSES,
-            INCIDENT.encode(),
-            ls.Provenance(conversation_id=incident),
-            timeout_secs=DESK_TIMEOUT,
+            make_triage(llm, TICKETS_TOPIC),
+            respond_on=ls.Topics.RESPONSES,
+            poll_interval_ms=10,
         )
-        diagnosed = reply.json()
-        print(f"  diagnosis: {diagnosed['diagnosis']}")
-
-        _common.phase("executing remediation credits effectively once")
-        # Send the credit list twice. The KV deduplicator keyed on each credit's
-        # idempotency key makes the redelivery a no-op, so the totals stay exact.
-        await send_credits(laser, incident, CREDITS)
-        await send_credits(laser, incident, CREDITS)
-        credit_timeout = _common.env_int(
-            "LASER_CONCIERGE_CREDIT_TIMEOUT_SECS", CREDIT_DEADLINE_DEFAULT_SECS
+        specialist = laser.spawn_agent(
+            "specialist",
+            ls.Topics.TOOL_CALLS,
+            make_specialist(llm, semantic),
+            respond_on=ls.Topics.TOOL_RESULTS,
+            poll_interval_ms=10,
         )
-        deadline = time.monotonic() + credit_timeout
-        store = laser.kv(credits_namespace)
-        while time.monotonic() < deadline:
-            # A list comprehension, not a generator: each `await` is evaluated
-            # here, where `all` then sees plain bools (an async generator is not
-            # iterable by `all`).
-            applied = [
-                await _read_u64(store, customer) >= total_cents
-                for customer, total_cents in CREDIT_TOTALS.items()
-            ]
-            if all(applied):
-                break
-            await asyncio.sleep(0.25)
-        for customer, expected in CREDIT_TOTALS.items():
-            actual = await _read_u64(store, customer)
-            if actual != expected:
-                raise ls.InvalidError(
-                    f"credits were not effectively once: {customer}={actual}, want {expected}"
-                )
-        print(f"  credits applied exactly once despite the redelivery ({credits_namespace})")
+        approver_agent = laser.spawn_agent(
+            "approver",
+            ls.Topics.HUMAN_INPUT,
+            approver,
+            respond_on=ls.Topics.RESPONSES,
+            poll_interval_ms=10,
+        )
+        resolver = laser.spawn_agent(
+            "resolver",
+            ls.Topics.COMMANDS,
+            make_resolver(credits_namespace),
+            poll_interval_ms=10,
+            dedup=make_kv_deduplicator(laser, dedup_namespace, DEDUP_TTL),
+        )
+        agents = [triage, specialist, approver_agent, resolver]
+        for agent in agents:
+            await agent.ready()
 
-        _common.phase("optimistic concurrency, read-your-writes, and the unified result space")
-        await coordination_demo(laser)
+        try:
+            _common.phase("triaging the incident through the desk")
+            incident = ls.new_conversation_id()
+            print(f"  incident on conversation {incident}: {INCIDENT}")
+            reply = await laser.request(
+                ls.Topics.COMMANDS,
+                ls.Topics.RESPONSES,
+                INCIDENT.encode(),
+                ls.Provenance(conversation_id=incident),
+                timeout_secs=DESK_TIMEOUT,
+            )
+            diagnosed = reply.json()
+            print(f"  diagnosis: {diagnosed['diagnosis']}")
 
-        if caps.forks:
-            _common.phase("speculating a bulk-resolve plan in a fork")
-            await speculative_bulk_resolve(laser)
-        else:
-            print("  read-model forks unavailable here, skipping the speculative plan")
+            _common.phase("executing remediation credits effectively once")
+            # Send the credit list twice. The KV deduplicator keyed on each credit's
+            # idempotency key makes the redelivery a no-op, so the totals stay exact.
+            await send_credits(laser, incident, CREDITS)
+            await send_credits(laser, incident, CREDITS)
+            credit_timeout = _common.env_int(
+                "LASER_CONCIERGE_CREDIT_TIMEOUT_SECS", CREDIT_DEADLINE_DEFAULT_SECS
+            )
+            deadline = time.monotonic() + credit_timeout
+            store = laser.kv(credits_namespace)
+            while time.monotonic() < deadline:
+                # A list comprehension, not a generator: each `await` is evaluated
+                # here, where `all` then sees plain bools (an async generator is not
+                # iterable by `all`).
+                applied = [
+                    await _read_u64(store, customer) >= total_cents
+                    for customer, total_cents in CREDIT_TOTALS.items()
+                ]
+                if all(applied):
+                    break
+                await asyncio.sleep(0.25)
+            for customer, expected in CREDIT_TOTALS.items():
+                actual = await _read_u64(store, customer)
+                if actual != expected:
+                    raise ls.InvalidError(
+                        f"credits were not effectively once: {customer}={actual}, want {expected}"
+                    )
+            print(f"  credits applied exactly once despite the redelivery ({credits_namespace})")
 
-        _common.phase("remembering this resolution for the next incident")
-        await remember_resolution(semantic, diagnosed["diagnosis"])
+            _common.phase("optimistic concurrency, read-your-writes, and the unified result space")
+            await coordination_demo(laser)
 
-        _common.phase("rebuilding the incident from the log alone (the audit trail)")
-        recovered = await recover_incident(laser, incident)
+            if caps.forks:
+                _common.phase("speculating a bulk-resolve plan in a fork")
+                await speculative_bulk_resolve(laser)
+            else:
+                print("  read-model forks unavailable here, skipping the speculative plan")
+
+            _common.phase("remembering this resolution for the next incident")
+            await remember_resolution(semantic, diagnosed["diagnosis"])
+
+            _common.phase("rebuilding the incident from the log alone (the audit trail)")
+            recovered = await recover_incident(laser, incident)
+            print(
+                f"  recovered from the log: {len(recovered['findings'])} findings, "
+                f"diagnosis intact: {bool(recovered['diagnosis'])}"
+            )
+        finally:
+            for agent in agents:
+                await agent.shutdown()
+        _common.phase("done")
         print(
-            f"  recovered from the log: {len(recovered['findings'])} findings, "
-            f"diagnosis intact: {bool(recovered['diagnosis'])}"
+            f"  inspect the run in LaserData Cloud: index '{TICKETS_TOPIC}', "
+            f"KV namespaces '{credits_namespace}' and '{dedup_namespace}'"
         )
     finally:
-        for agent in agents:
-            await agent.shutdown()
-    _common.phase("done")
-    print(
-        f"  inspect the run in LaserData Cloud: index '{TICKETS_TOPIC}', "
-        f"KV namespaces '{credits_namespace}' and '{dedup_namespace}'"
-    )
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

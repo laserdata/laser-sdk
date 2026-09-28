@@ -47,3 +47,33 @@ void test("given_a_default_stream_when_topic_is_called_then_should_use_it", asyn
     await laser.close()
   }
 })
+
+void test("given_an_ensured_stream_when_deleted_then_should_report_absence_on_repeat", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const stream = laser.stream(`laser-ts-test-${randomUUID()}`)
+    await stream.ensure()
+    await stream.topic("events").ensure(1)
+    assert.equal(await stream.delete(), true)
+    assert.equal(await stream.delete(), false)
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_agent_bootstrap_when_called_then_should_create_nine_topics_per_partition_count", async () => {
+  const streamName = `laser-ts-test-${randomUUID()}`
+  await using laser = await Laser.connectWithStream(CONNECTION_STRING, streamName)
+  try {
+    await laser.bootstrap(2)
+    const stream = await laser.iggyClient.stream.get({ streamId: streamName })
+    assert.equal(stream?.topicsCount, 9)
+    const topics = await laser.iggyClient.topic.list({ streamId: streamName })
+    assert.equal(
+      topics.every((topic) => topic.partitionsCount === 2),
+      true
+    )
+  } finally {
+    await laser.stream(streamName).delete()
+  }
+})

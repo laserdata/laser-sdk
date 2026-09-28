@@ -43,20 +43,25 @@ def entity_of(node: dict) -> str:
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    if not _common.managed_gate((await laser.capabilities()).graph, "the knowledge graph", EXAMPLE):
-        return
+    try:
+        if not _common.managed_gate(
+            (await laser.capabilities()).graph, "the knowledge graph", EXAMPLE
+        ):
+            return
 
-    _common.phase("relate entities, then traverse from one of them")
-    graph = laser.graph(GRAPH)
-    for product in PRODUCTS:
-        await graph.link(CUSTOMER, RELATION, product)
+        _common.phase("relate entities, then traverse from one of them")
+        graph = laser.graph(GRAPH)
+        for product in PRODUCTS:
+            await graph.link(CUSTOMER, RELATION, product)
 
-    customer_id = ls.node_id("customer", "42")
-    purchases = await graph.neighbors(customer_id, direction="out", edge_type=RELATION, depth=1)
+        customer_id = ls.node_id("customer", "42")
+        purchases = await graph.neighbors(customer_id, direction="out", edge_type=RELATION, depth=1)
 
-    print(f"  {CUSTOMER} {RELATION}:")
-    for node in purchases["nodes"]:
-        print(f"    {entity_of(node)}")
+        print(f"  {CUSTOMER} {RELATION}:")
+        for node in purchases["nodes"]:
+            print(f"    {entity_of(node)}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

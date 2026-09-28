@@ -37,32 +37,35 @@ FACT = "Prefers aisle seats, travels monthly"
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    # Memory records ride the well-known agent topics, created once here.
-    await laser.bootstrap(_common.PARTITIONS)
-    conversation = ls.new_conversation_id()
+    try:
+        # Memory records ride the well-known agent topics, created once here.
+        await laser.bootstrap(_common.PARTITIONS)
+        conversation = ls.new_conversation_id()
 
-    _common.phase("all four verbs: remember, recall, improve, forget")
-    memory = laser.memory(NAMESPACE)
+        _common.phase("all four verbs: remember, recall, improve, forget")
+        memory = laser.memory(NAMESPACE)
 
-    fact_id = await memory.remember(FACT, conversation=conversation)
+        fact_id = await memory.remember(FACT, conversation=conversation)
 
-    # Durable log memory recalls the newest matching facts. Similarity ranking
-    # is the vector/reranker path shown in the full memory example.
-    hits = await memory.recall(
-        limit=5,
-        conversation=conversation,
-        strategy="recent",
-        folded=True,
-    )
-    print("  newest recalled fact(s):")
-    for hit in hits:
-        print(f"    {hit.text}")
+        # Durable log memory recalls the newest matching facts. Similarity ranking
+        # is the vector/reranker path shown in the full memory example.
+        hits = await memory.recall(
+            limit=5,
+            conversation=conversation,
+            strategy="recent",
+            folded=True,
+        )
+        print("  newest recalled fact(s):")
+        for hit in hits:
+            print(f"    {hit.text}")
 
-    # Reinforce what was useful, then retire it. Both are records on the memory
-    # topic, so the store stays an auditable history, not a mutable cell.
-    await memory.improve(fact_id, 1.0, conversation=conversation)
-    await memory.forget(fact_id, conversation=conversation)
-    print(f"  reinforced then forgot {fact_id}")
+        # Reinforce what was useful, then retire it. Both are records on the memory
+        # topic, so the store stays an auditable history, not a mutable cell.
+        await memory.improve(fact_id, 1.0, conversation=conversation)
+        await memory.forget(fact_id, conversation=conversation)
+        print(f"  reinforced then forgot {fact_id}")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

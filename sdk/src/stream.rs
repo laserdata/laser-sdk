@@ -83,6 +83,11 @@ impl Stream {
         crate::laser::ensure_stream(&self.laser.client(), &self.name).await
     }
 
+    /// Delete this stream with every topic and message in it. Returns `false` when the stream did not exist. Cached producers and agent registry state for the stream are dropped.
+    pub async fn delete(&self) -> Result<bool, LaserError> {
+        crate::laser::delete_stream(&self.laser, &self.name).await
+    }
+
     /// This stream's name.
     pub fn name(&self) -> &str {
         &self.name

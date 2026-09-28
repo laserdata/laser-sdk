@@ -11,6 +11,7 @@ use laser_wire::mutation::{MANAGED_REQUEST_VERSION, ManagedRequestEnvelope};
 use laser_wire::validate::Validate;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -117,12 +118,14 @@ impl ManagedKvTransport for SharedKvTransport {
 /// borrowing a shared producer client would let one slow coordination call
 /// stall unrelated traffic (and the reverse). The first readiness check after
 /// a reset reconnects and re-verifies the `kv_fenced_leases` capability, failing
-/// closed against a pre-fencing deployment.
+/// closed against a pre-fencing deployment. That deployment keeps its one
+/// connection, so each later call answers `Unsupported` without a new login.
 ///
 /// [`reset`]: ManagedKvTransport::reset
 pub struct DedicatedKvTransport {
     connection_string: String,
     slot: Mutex<Option<Laser>>,
+    closed: AtomicBool,
 }
 
 impl DedicatedKvTransport {
@@ -131,23 +134,34 @@ impl DedicatedKvTransport {
         Self {
             connection_string: connection_string.into(),
             slot: Mutex::new(None),
+            closed: AtomicBool::new(false),
         }
     }
 
     async fn client(&self) -> Result<Laser, LaserError> {
         let mut slot = self.slot.lock().await;
-        if let Some(laser) = slot.as_ref() {
-            return Ok(laser.clone());
+        if self.closed.load(Ordering::Acquire) {
+            return Err(crate::iggy::prelude::IggyError::ClientShutdown.into());
         }
-        let laser = Laser::connect(&self.connection_string).await?;
-        if !laser.capabilities().await.kv.fenced_leases {
+        let (laser, reused) = match slot.as_ref() {
+            Some(laser) => (laser.clone(), true),
+            None => {
+                let laser = Laser::connect(&self.connection_string).await?;
+                *slot = Some(laser.clone());
+                (laser, false)
+            }
+        };
+        let mut capabilities = laser.capabilities().await;
+        if reused && !capabilities.kv.fenced_leases {
+            capabilities = laser.refresh_capabilities().await;
+        }
+        if !capabilities.kv.fenced_leases {
             return Err(LaserError::unsupported_feature(
                 "kv",
                 "coordination",
                 "the fenced-lease contract is not advertised by this deployment",
             ));
         }
-        *slot = Some(laser.clone());
         Ok(laser)
     }
 }
@@ -265,6 +279,11 @@ impl FencedLeaseClient<DedicatedKvTransport> {
     /// connected lazily on first use.
     pub fn connect_dedicated(connection_string: impl Into<String>) -> Self {
         Self::new(DedicatedKvTransport::new(connection_string))
+    }
+
+    pub(crate) async fn close(&self) {
+        self.transport.closed.store(true, Ordering::Release);
+        ManagedKvTransport::reset(&self.transport).await;
     }
 }
 
@@ -511,6 +530,9 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
                 self.transport.reset().await;
                 Err(LaserError::Timeout("kv coordination connect"))
             }
+            // A deployment without the capability stays connected, so the next call
+            // answers the same way instead of reconnecting and logging in again.
+            Ok(Err(error @ LaserError::Unsupported { .. })) => Err(error),
             Ok(Err(error)) => {
                 self.transport.reset().await;
                 Err(error)
@@ -588,9 +610,12 @@ mod tests {
         }
     }
 
-    struct UnreadyTransport;
+    #[derive(Default)]
+    struct UnreadyTransport {
+        resets: AtomicUsize,
+    }
 
-    impl ManagedKvTransport for UnreadyTransport {
+    impl ManagedKvTransport for &UnreadyTransport {
         async fn ready(&self) -> Result<(), LaserError> {
             Err(LaserError::unsupported_feature(
                 "kv",
@@ -603,7 +628,9 @@ mod tests {
             panic!("a permanent setup failure must stop before send")
         }
 
-        async fn reset(&self) {}
+        async fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     struct SlowResetTransport {
@@ -824,11 +851,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_closed_coordination_client_when_readied_then_should_not_reconnect() {
+        let client = FencedLeaseClient::connect_dedicated("not a connection string");
+        client.close().await;
+        client.close().await;
+        ManagedKvTransport::reset(&client.transport).await;
+        assert!(matches!(
+            ManagedKvTransport::ready(&client.transport).await,
+            Err(LaserError::Iggy(
+                crate::iggy::prelude::IggyError::ClientShutdown
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn given_a_permanent_setup_failure_when_executing_then_should_preserve_the_error() {
-        let client = FencedLeaseClient::new(UnreadyTransport);
+        let unready = UnreadyTransport::default();
+        let client = FencedLeaseClient::new(&unready);
         let op = client.prepare_acquire(&lease_request()).expect("prepares");
         let outcome = client.acquire(&op).await;
         assert!(matches!(outcome, Err(LaserError::Unsupported { .. })));
+    }
+
+    #[tokio::test]
+    async fn given_an_unsupported_deployment_when_called_repeatedly_then_should_keep_the_connection()
+     {
+        let unready = UnreadyTransport::default();
+        let client = FencedLeaseClient::new(&unready);
+        for _ in 0..3 {
+            let op = client.prepare_acquire(&lease_request()).expect("prepares");
+            assert!(matches!(
+                client.acquire(&op).await,
+                Err(LaserError::Unsupported { .. })
+            ));
+        }
+        assert_eq!(unready.resets.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

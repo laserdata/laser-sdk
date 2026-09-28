@@ -1,5 +1,6 @@
 use laser_examples::{
-    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, start_projector, stream_for,
+    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, release_after, start_projector,
+    stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::WINDOW_START;
@@ -113,54 +114,57 @@ async fn main() -> Result<(), LaserError> {
     phase("warming up");
 
     let laser = laser(&stream_for("event-analytics"), Capabilities::OPEN).await?;
-    laser.topic(TOPIC).ensure(PARTITIONS).await?;
-    let query_available = laser.capabilities().await.query.available;
+    release_after(&laser, &stream_for("event-analytics"), async {
+        laser.topic(TOPIC).ensure(PARTITIONS).await?;
+        let query_available = laser.capabilities().await.query.available;
 
-    let events = clickstream();
+        let events = clickstream();
 
-    // On LaserData Cloud, register before publishing so no event is missed.
-    phase("hot path: a live reader tails the stream while the producer runs");
-    let projector = if query_available {
-        Some(start_projector(&laser, TOPIC, ContentType::Json, COLUMNS).await?)
-    } else {
-        managed_feature_ready(false, "projection-backed analytics", "event-analytics");
-        None
-    };
-    let publisher = {
-        let laser = laser.clone();
-        let events = events.clone();
-        tokio::spawn(async move { publish_clickstream(&laser, &events).await })
-    };
-    live_monitor(&laser, events.len()).await?;
-    publisher
-        .await
-        .map_err(|error| LaserError::Invalid(format!("publisher task: {error}")))??;
-    if query_available {
-        wait_for_projection(&laser, events.len()).await?;
-        phase("read model 1: ad-hoc analytics over the query layer");
-        run_analytics(&laser).await?;
-    }
+        // On LaserData Cloud, register before publishing so no event is missed.
+        phase("hot path: a live reader tails the stream while the producer runs");
+        let projector = if query_available {
+            Some(start_projector(&laser, TOPIC, ContentType::Json, COLUMNS).await?)
+        } else {
+            managed_feature_ready(false, "projection-backed analytics", "event-analytics");
+            None
+        };
+        let publisher = {
+            let laser = laser.clone();
+            let events = events.clone();
+            tokio::spawn(async move { publish_clickstream(&laser, &events).await })
+        };
+        live_monitor(&laser, events.len()).await?;
+        publisher
+            .await
+            .map_err(|error| LaserError::Invalid(format!("publisher task: {error}")))??;
+        if query_available {
+            wait_for_projection(&laser, events.len()).await?;
+            phase("read model 1: ad-hoc analytics over the query layer");
+            run_analytics(&laser).await?;
+        }
 
-    // Read model 2: a resumable downstream reader over the same log.
-    phase("read model 2: a resumable downstream reader");
-    run_resumable_export(&laser, &InMemoryStore::new()).await?;
+        // Read model 2: a resumable downstream reader over the same log.
+        phase("read model 2: a resumable downstream reader");
+        run_resumable_export(&laser, &InMemoryStore::new()).await?;
 
-    // The validated-ingest coda (managed deployment): a registered JSON
-    // Schema turns the loose clickstream contract into an enforced one. A
-    // record stamping the schema's id has its decoded payload validated by
-    // LaserData Cloud's projector. A malformed event is counted, optionally
-    // dead-lettered, and never pollutes the index.
-    if laser.capabilities().await.managed {
-        phase("validated ingest: a JSON Schema guards the index");
-        run_guarded_ingest(&laser).await?;
-    } else {
-        info!("writer schemas need Laser Stack or LaserData Cloud, skipping validated ingest");
-    }
+        // The validated-ingest coda (managed deployment): a registered JSON
+        // Schema turns the loose clickstream contract into an enforced one. A
+        // record stamping the schema's id has its decoded payload validated by
+        // LaserData Cloud's projector. A malformed event is counted, optionally
+        // dead-lettered, and never pollutes the index.
+        if laser.capabilities().await.managed {
+            phase("validated ingest: a JSON Schema guards the index");
+            run_guarded_ingest(&laser).await?;
+        } else {
+            info!("writer schemas need Laser Stack or LaserData Cloud, skipping validated ingest");
+        }
 
-    if let Some(projector) = projector {
-        projector.shutdown().await;
-    }
-    Ok(())
+        if let Some(projector) = projector {
+            projector.shutdown().await;
+        }
+        Ok(())
+    })
+    .await
 }
 
 // A tiny deterministic PRNG (xorshift64*), so the clickstream looks like real

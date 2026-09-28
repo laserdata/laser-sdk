@@ -1,4 +1,5 @@
 use crate::harness;
+use laser_sdk::iggy::prelude::{Identifier, StreamClient};
 use laser_sdk::prelude::{CommitPolicy, ConsumerMessage, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::stream::{HeaderKey, HeaderValue};
 use std::str::FromStr;
@@ -209,4 +210,105 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         .shutdown()
         .await
         .expect("the standalone consumer should shut down");
+}
+
+#[tokio::test]
+async fn given_a_bootstrapped_stream_when_deleted_then_should_remove_it_once() {
+    let laser = harness::laser().await;
+    let stream = laser
+        .default_stream()
+        .expect("the test laser names its stream")
+        .to_owned();
+    assert!(
+        laser
+            .stream(&stream)
+            .delete()
+            .await
+            .expect("the stream should delete")
+    );
+    assert!(
+        !laser
+            .stream(&stream)
+            .delete()
+            .await
+            .expect("a missing stream should report absence")
+    );
+    let identifier = Identifier::named(&stream).expect("the stream name is a valid identifier");
+    assert!(
+        laser
+            .client()
+            .get_stream(&identifier)
+            .await
+            .expect("the stream lookup should succeed")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn given_a_closed_laser_when_used_then_should_refuse_further_requests() {
+    let laser = harness::laser().await;
+    let clone = laser.clone();
+    laser.close().await.expect("the connection should close");
+    laser
+        .close()
+        .await
+        .expect("a second close should be a no-op");
+    assert!(clone.client().get_streams().await.is_err());
+}
+
+#[tokio::test]
+async fn given_a_cached_stream_when_deleted_and_recreated_then_should_discard_its_previous_state() {
+    let laser = harness::laser().await;
+    let stream = laser.default_stream().expect("the test stream is selected");
+    let identifier = Identifier::named(stream).expect("the stream name is valid");
+    let agent = "retired-agent".parse().expect("the agent id is valid");
+    for externally_deleted in [false, true] {
+        laser.bootstrap(1).await.expect("bootstrap the stream");
+        laser
+            .quarantine(
+                "operator".parse().expect("the operator id is valid"),
+                &agent,
+            )
+            .await
+            .expect("publish a registry fact");
+        let mut registry = laser.agent_registry().expect("open the registry");
+        registry.refresh(0).await.expect("read the registry");
+        assert!(registry.is_quarantined(&agent));
+        if externally_deleted {
+            laser
+                .client()
+                .delete_stream(&identifier)
+                .await
+                .expect("delete outside Laser");
+        }
+        assert_eq!(
+            laser
+                .stream(stream)
+                .delete()
+                .await
+                .expect("invalidate the stream"),
+            !externally_deleted
+        );
+        laser.bootstrap(1).await.expect("recreate the stream");
+        let mut registry = laser.agent_registry().expect("open a fresh registry");
+        assert!(!registry.is_quarantined(&agent));
+        laser
+            .quarantine(
+                "operator".parse().expect("the operator id is valid"),
+                &agent,
+            )
+            .await
+            .expect("publish with a fresh producer");
+        registry
+            .refresh(0)
+            .await
+            .expect("read from the new stream's start");
+        assert!(registry.is_quarantined(&agent));
+        laser
+            .stream(stream)
+            .delete()
+            .await
+            .expect("remove the recreated stream");
+    }
+    laser.close().await.expect("close the connection");
 }

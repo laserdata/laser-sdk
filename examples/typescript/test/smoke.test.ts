@@ -17,8 +17,13 @@ async function withLaser(name: string, run: (laser: Laser) => Promise<void>): Pr
     CONNECTION_STRING,
     `laser-ts-example-${name}-${randomUUID()}`
   )
-  await laser.stream(laser.defaultStream ?? "").ensure()
-  await run(laser)
+  const stream = laser.stream(laser.defaultStream ?? "")
+  await stream.ensure()
+  try {
+    await run(laser)
+  } finally {
+    await stream.delete()
+  }
 }
 
 void test(

@@ -42,73 +42,79 @@ LEASE_TTL_SECS = 30
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    caps = await laser.capabilities()
-    if not _common.managed_gate(caps.kv, "state (kv)", EXAMPLE):
-        return
+    try:
+        caps = await laser.capabilities()
+        if not _common.managed_gate(caps.kv, "state (kv)", EXAMPLE):
+            return
 
-    _common.phase("set and get keyed state")
-    store = laser.kv(NAMESPACE)
-    await store.set(KEY).json({"plan": "pro"}).ttl(TTL_SECS).send()
-    profile = await store.get_typed(KEY)
-    print(f"  {KEY} is on {profile['plan']}")
+        _common.phase("set and get keyed state")
+        store = laser.kv(NAMESPACE)
+        await store.set(KEY).json({"plan": "pro"}).ttl(TTL_SECS).send()
+        profile = await store.get_typed(KEY)
+        print(f"  {KEY} is on {profile['plan']}")
 
-    if caps.kv_cas:
-        _common.phase("compare-and-swap: the write lands only if nobody moved first")
-        entry = await store.get_entry(KEY)
-        await store.set(KEY).json({"plan": "enterprise"}).expect_version(entry.version).commit()
-        upgraded = await store.get_typed(KEY)
-        print(f"  version {entry.version} accepted the upgrade, {KEY} is now on {upgraded['plan']}")
+        if caps.kv_cas:
+            _common.phase("compare-and-swap: the write lands only if nobody moved first")
+            entry = await store.get_entry(KEY)
+            await store.set(KEY).json({"plan": "enterprise"}).expect_version(entry.version).commit()
+            upgraded = await store.get_typed(KEY)
+            print(
+                f"  version {entry.version} accepted the upgrade, "
+                f"{KEY} is now on {upgraded['plan']}"
+            )
 
-    if caps.kv_fenced_leases:
-        _common.phase("lease and fenced write: at most one effective writer")
-        lease = await store.lease(LEASE_KEY, HOLDER, LEASE_TTL_SECS)
-        print(f"  {HOLDER} holds {LEASE_KEY} at fence {lease.token}")
-        # Barriered read: the answering fold has applied at least the grant, so a
-        # holder that just took over never plans against its predecessor's state.
-        held = await store.get_entry_at_least(KEY, lease.position)
-        fenced = await store.cas_fenced(
-            KEY,
-            NAMESPACE,
-            LEASE_KEY,
-            lease.token,
-            json.dumps({"plan": "enterprise-plus"}).encode(),
-            expect_version=held.version,
-            ttl_secs=TTL_SECS,
-        )
-        seen = json.loads(held.value)["plan"]
-        print(f"  barriered read saw {seen}, the fenced write landed as version {fenced}")
-        renewed = await store.renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL_SECS)
-        await store.release(LEASE_KEY, HOLDER, renewed.token)
-        print(f"  lease renewed at the same fence {renewed.token}, then released")
-        # The gate holds without waiting for a successor: a released fence is
-        # already dead, so a zombie holder cannot commit through it.
-        try:
-            await store.cas_fenced(
+        if caps.kv_fenced_leases:
+            _common.phase("lease and fenced write: at most one effective writer")
+            lease = await store.lease(LEASE_KEY, HOLDER, LEASE_TTL_SECS)
+            print(f"  {HOLDER} holds {LEASE_KEY} at fence {lease.token}")
+            # Barriered read: the answering fold has applied at least the grant, so a
+            # holder that just took over never plans against its predecessor's state.
+            held = await store.get_entry_at_least(KEY, lease.position)
+            fenced = await store.cas_fenced(
                 KEY,
                 NAMESPACE,
                 LEASE_KEY,
                 lease.token,
-                json.dumps({"plan": "zombie"}).encode(),
-                expect_version=fenced,
+                json.dumps({"plan": "enterprise-plus"}).encode(),
+                expect_version=held.version,
+                ttl_secs=TTL_SECS,
             )
-        except ls.LaserError as error:
-            if not error.lease_lost:
-                raise
-            print("  after release the same fence is refused: lease-lost")
-        else:
-            raise RuntimeError("a released fence was accepted")
+            seen = json.loads(held.value)["plan"]
+            print(f"  barriered read saw {seen}, the fenced write landed as version {fenced}")
+            renewed = await store.renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL_SECS)
+            await store.release(LEASE_KEY, HOLDER, renewed.token)
+            print(f"  lease renewed at the same fence {renewed.token}, then released")
+            # The gate holds without waiting for a successor: a released fence is
+            # already dead, so a zombie holder cannot commit through it.
+            try:
+                await store.cas_fenced(
+                    KEY,
+                    NAMESPACE,
+                    LEASE_KEY,
+                    lease.token,
+                    json.dumps({"plan": "zombie"}).encode(),
+                    expect_version=fenced,
+                )
+            except ls.LaserError as error:
+                if not error.lease_lost:
+                    raise
+                print("  after release the same fence is refused: lease-lost")
+            else:
+                raise RuntimeError("a released fence was accepted")
 
-    if caps.forks:
-        _common.phase("fork: a branch of the same state, promoted or thrown away")
-        table = _common.index_for(NAMESPACE)
-        await laser.topic(NAMESPACE).ensure(_common.PARTITIONS)
-        await _common.start_projector(laser, NAMESPACE, ["plan"], index=table)
-        fork = laser.fork(FORK_ID)
-        await fork.squash()
-        await fork.create(severed=True, tables=[table])
-        await fork.put_row(table, 0, 0).field("plan", "enterprise-preview").send()
-        applied = await fork.promote()
-        print(f"  fork '{FORK_ID}' promoted, {applied} row(s) applied")
+        if caps.forks:
+            _common.phase("fork: a branch of the same state, promoted or thrown away")
+            table = _common.index_for(NAMESPACE)
+            await laser.topic(NAMESPACE).ensure(_common.PARTITIONS)
+            await _common.start_projector(laser, NAMESPACE, ["plan"], index=table)
+            fork = laser.fork(FORK_ID)
+            await fork.squash()
+            await fork.create(severed=True, tables=[table])
+            await fork.put_row(table, 0, 0).field("plan", "enterprise-preview").send()
+            applied = await fork.promote()
+            print(f"  fork '{FORK_ID}' promoted, {applied} row(s) applied")
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

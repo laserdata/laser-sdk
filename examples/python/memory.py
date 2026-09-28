@@ -60,20 +60,22 @@ async def main() -> None:
         return
 
     laser = await _common.connect("memory")
+    try:
+        async with laser:
+            caps = await laser.capabilities()
 
-    async with laser:
-        caps = await laser.capabilities()
+            # PART 2: DURABLE MEMORY, materialized from the memory topic on the log.
+            if _common.managed_gate(caps.kv, "durable memory", "memory"):
+                await run_durable(laser, conversation)
 
-        # PART 2: DURABLE MEMORY, materialized from the memory topic on the log.
-        if _common.managed_gate(caps.kv, "durable memory", "memory"):
-            await run_durable(laser, conversation)
+            # PART 3: KNOWLEDGE GRAPH, a managed read model.
+            if _common.managed_gate(caps.graph, "the knowledge graph", "memory"):
+                await run_graph(laser)
 
-        # PART 3: KNOWLEDGE GRAPH, a managed read model.
-        if _common.managed_gate(caps.graph, "the knowledge graph", "memory"):
-            await run_graph(laser)
-
-    _common.phase("done")
-    print("memory recalls what is relevant, the graph shows how it connects")
+        _common.phase("done")
+        print("memory recalls what is relevant, the graph shows how it connects")
+    finally:
+        await _common.release_stream(laser, "memory")
 
 
 async def run_memory(conversation) -> None:

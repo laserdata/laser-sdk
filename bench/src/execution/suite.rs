@@ -233,7 +233,7 @@ pub(crate) async fn execute_suite_scenarios(
     );
     let mut failed_scenarios = 0usize;
     for (scenario_index, scenario) in scenarios.into_iter().enumerate() {
-        match execute_suite_scenario(
+        match Box::pin(execute_suite_scenario(
             stack,
             manifest,
             &scenario,
@@ -241,7 +241,7 @@ pub(crate) async fn execute_suite_scenarios(
             output,
             scenario_index + 1,
             scenario_count,
-        )
+        ))
         .await
         {
             Ok(result) => {
@@ -337,7 +337,7 @@ pub(crate) async fn execute_suite_scenario(
         )?;
         ui::repetition_started(repetition, scenario.repetitions, &run_directory);
         let started = Instant::now();
-        let pair = execute_native_run(DirectExecution {
+        let pair = Box::pin(execute_native_run(DirectExecution {
             stack,
             manifest,
             scenario,
@@ -347,7 +347,7 @@ pub(crate) async fn execute_suite_scenario(
                 seed,
             },
             output: &run_directory,
-        })
+        }))
         .await?;
         if let Some(pair) = pair {
             ui::pair(&pair, scenario);

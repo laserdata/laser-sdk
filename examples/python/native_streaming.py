@@ -65,45 +65,48 @@ async def publish_messages(producer) -> None:
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    topic = laser.topic(TOPIC)
-    producer = topic.producer(
-        batch_length=BATCH,
-        linger_ms=5,
-        retries=3,
-        retry_interval_ms=1000,
-        partitions=1,
-    )
-    await producer.init()
-
-    _common.phase("producer: exact-width header, keyed routing, and batched messages")
-    await publish_messages(producer)
-
-    _common.phase("consumer: production automatic offset commits")
-    await receive_all(
-        topic.consumer_group(
-            "auto-workers",
+    try:
+        topic = laser.topic(TOPIC)
+        producer = topic.producer(
             batch_length=BATCH,
-            poll_interval_ms=5,
-            polling="first",
-            auto_commit="each",
-            commit_interval_ms=1000,
-            allow_replay=True,
-        ),
-        manual_commit=False,
-    )
+            linger_ms=5,
+            retries=3,
+            retry_interval_ms=1000,
+            partitions=1,
+        )
+        await producer.init()
 
-    _common.phase("consumer: commit after successful handling")
-    await receive_all(
-        topic.consumer_group(
-            "manual-workers",
-            batch_length=BATCH,
-            poll_interval_ms=5,
-            polling="first",
-            auto_commit="disabled",
-            allow_replay=True,
-        ),
-        manual_commit=True,
-    )
+        _common.phase("producer: exact-width header, keyed routing, and batched messages")
+        await publish_messages(producer)
+
+        _common.phase("consumer: production automatic offset commits")
+        await receive_all(
+            topic.consumer_group(
+                "auto-workers",
+                batch_length=BATCH,
+                poll_interval_ms=5,
+                polling="first",
+                auto_commit="each",
+                commit_interval_ms=1000,
+                allow_replay=True,
+            ),
+            manual_commit=False,
+        )
+
+        _common.phase("consumer: commit after successful handling")
+        await receive_all(
+            topic.consumer_group(
+                "manual-workers",
+                batch_length=BATCH,
+                poll_interval_ms=5,
+                polling="first",
+                auto_commit="disabled",
+                allow_replay=True,
+            ),
+            manual_commit=True,
+        )
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 if __name__ == "__main__":

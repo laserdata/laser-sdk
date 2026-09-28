@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolRequestParams, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolRequestParams, ContentBlock, ErrorData, ServerCapabilities, ServerConfig,
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -94,8 +96,8 @@ impl GuaranteedServer {
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GuaranteedServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 

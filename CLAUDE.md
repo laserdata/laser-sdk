@@ -14,6 +14,10 @@ Keep affected documentation consistent with authorized code or contract changes.
 
 Memory governance applies to both log-backed and in-process vector handles created from a `Laser`. Policies see the proposed item body, not a backend encoding.
 
+## Connect timeout
+
+Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples delete their per-run stream on exit. See [connect timeout and cleanup](docs/connect-timeout.md).
+
 ## Publish recovery
 
 Rust, Python, and TypeScript publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds. Explicit builder or connect configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.

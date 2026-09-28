@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use laser_examples::{
     LlmClient, PARTITIONS, batch, default_llm, env_bool, init_tracing, laser,
-    managed_feature_ready, messages, phase, start_projector, stream_for,
+    managed_feature_ready, messages, phase, release_after, start_projector, stream_for,
 };
 use laser_sdk::iggy::prelude::IggyTimestamp;
 use laser_sdk::prelude::full::*;
@@ -152,160 +152,163 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     phase("warming up");
     let laser = laser(&stream_for("concierge"), Capabilities::OPEN).await?;
-    laser.bootstrap(PARTITIONS).await?;
-    laser.topic(TICKETS_TOPIC).ensure(PARTITIONS).await?;
-    let capabilities = laser.capabilities().await;
-    if !managed_feature_ready(capabilities.managed, "the agentic desk", "concierge") {
-        return Ok(());
-    }
-    let _projector = start_projector(
-        &laser,
-        TICKETS_TOPIC,
-        ContentType::Json,
-        &[
-            "ticket_id",
-            "message_type",
-            "customer",
-            "component",
-            "severity",
-            "status",
-            "ts",
-        ],
-    )
-    .await?;
-
-    let total = messages(2_000);
-    let chunk = batch(200);
-    phase("ingesting the ticket firehose (the desk's world model)");
-    ingest_tickets(&laser, total, chunk).await?;
-    wait_for_index(&laser, TICKETS_TOPIC, total as usize).await?;
-    backlog_snapshot(&laser).await?;
-
-    phase("seeding semantic memory with past resolutions");
-    // One shared in-process semantic index for the whole desk: seeded here, read
-    // by every specialist call, and appended to as incidents resolve.
-    let semantic = Arc::new(VectorMemory::new(HashEmbedder));
-    seed_memory(&semantic).await?;
-
-    phase("spawning the desk: triage, specialist, resolver, approver");
-    let llm = default_llm();
-    let mut triage = Agent::builder()
-        .id("triage".parse()?)
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
-        .handler(Triage {
-            llm: llm.clone(),
-            index: TICKETS_TOPIC.to_owned(),
-        })
-        .build()
-        .spawn(laser.clone());
-    let mut specialist = Agent::builder()
-        .id("specialist".parse()?)
-        .listen_on(AgentTopic::ToolCalls)
-        .respond_on(AgentTopic::ToolResults)
-        .handler(Specialist {
-            llm: llm.clone(),
-            semantic: semantic.clone(),
-        })
-        .build()
-        .spawn(laser.clone());
-    let mut approver = Agent::builder()
-        .id("approver".parse()?)
-        .listen_on(AgentTopic::HumanInput)
-        .respond_on(AgentTopic::Responses)
-        .handler(Approver)
-        .build()
-        .spawn(laser.clone());
-    // Run-scoped namespaces so reruns never read each other's state.
-    let run = ConversationId::new();
-    let dedup_namespace = format!("concierge-dedup-{run}");
-    let credits_namespace = format!("concierge-credits-{run}");
-    let mut resolver = Agent::builder()
-        .id("resolver".parse()?)
-        .listen_on(AgentTopic::Commands)
-        .handler(Resolver {
-            credits: credits_namespace.clone(),
-        })
-        .deduplicator(Box::new(KvDeduplicator {
-            laser: laser.clone(),
-            namespace: dedup_namespace.clone(),
-            ttl: DEDUP_TTL,
-        }))
-        .build()
-        .spawn(laser.clone());
-    for agent in [&mut triage, &mut specialist, &mut approver, &mut resolver] {
-        agent.ready().await?;
-    }
-
-    phase("triaging the incident through the desk");
-    let incident = ConversationId::new();
-    let task = Provenance::builder().conversation_id(incident).build();
-    info!("incident on conversation {incident}: {INCIDENT}");
-    let diagnosed: IncidentLog = serde_json::from_slice(
-        &laser
-            .agent("orchestrator".parse()?)
-            .ask(
-                AgentTopic::Commands,
-                AgentTopic::Responses,
-                INCIDENT.as_bytes().to_vec(),
-                &task,
-                DESK_TIMEOUT,
-            )
-            .await?
-            .payload,
-    )
-    .map_err(|error| LaserError::Codec(error.to_string()))?;
-    info!("diagnosis: {}", diagnosed.diagnosis);
-
-    phase("executing remediation credits effectively once");
-    // Send the credit list twice. The KV deduplicator keyed on each credit's
-    // idempotency key makes the redelivery a no-op, so the totals stay exact.
-    send_credits(&laser, incident, CREDITS).await?;
-    send_credits(&laser, incident, CREDITS).await?;
-    wait_for_credits(&laser, &credits_namespace, CREDIT_TOTALS).await?;
-    for &(customer, expected) in CREDIT_TOTALS {
-        let actual = read_u64(&laser.kv(&credits_namespace), customer).await?;
-        if actual != expected {
-            return Err(LaserError::Invalid(format!(
-                "credits were not effectively once: {customer}={actual}, want {expected}"
-            )));
+    release_after(&laser, &stream_for("concierge"), async {
+        laser.bootstrap(PARTITIONS).await?;
+        laser.topic(TICKETS_TOPIC).ensure(PARTITIONS).await?;
+        let capabilities = laser.capabilities().await;
+        if !managed_feature_ready(capabilities.managed, "the agentic desk", "concierge") {
+            return Ok(());
         }
-    }
-    info!(
-        "credits applied exactly once despite the redelivery, inspect them in LaserData Cloud under \
-         KV namespace {credits_namespace}"
-    );
+        let _projector = start_projector(
+            &laser,
+            TICKETS_TOPIC,
+            ContentType::Json,
+            &[
+                "ticket_id",
+                "message_type",
+                "customer",
+                "component",
+                "severity",
+                "status",
+                "ts",
+            ],
+        )
+        .await?;
 
-    phase("optimistic concurrency, read-your-writes, and the unified result space");
-    coordination_demo(&laser).await?;
+        let total = messages(2_000);
+        let chunk = batch(200);
+        phase("ingesting the ticket firehose (the desk's world model)");
+        ingest_tickets(&laser, total, chunk).await?;
+        wait_for_index(&laser, TICKETS_TOPIC, total as usize).await?;
+        backlog_snapshot(&laser).await?;
 
-    if capabilities.forks {
-        phase("speculating a bulk-resolve plan in a fork");
-        speculative_bulk_resolve(&laser).await?;
-    } else {
-        info!("read-model forks unavailable here, skipping the speculative plan");
-    }
+        phase("seeding semantic memory with past resolutions");
+        // One shared in-process semantic index for the whole desk: seeded here, read
+        // by every specialist call, and appended to as incidents resolve.
+        let semantic = Arc::new(VectorMemory::new(HashEmbedder));
+        seed_memory(&semantic).await?;
 
-    phase("remembering this resolution for the next incident");
-    remember_resolution(&semantic, &diagnosed.diagnosis).await?;
+        phase("spawning the desk: triage, specialist, resolver, approver");
+        let llm = default_llm();
+        let mut triage = Agent::builder()
+            .id("triage".parse()?)
+            .listen_on(AgentTopic::Commands)
+            .respond_on(AgentTopic::Responses)
+            .handler(Triage {
+                llm: llm.clone(),
+                index: TICKETS_TOPIC.to_owned(),
+            })
+            .build()
+            .spawn(laser.clone());
+        let mut specialist = Agent::builder()
+            .id("specialist".parse()?)
+            .listen_on(AgentTopic::ToolCalls)
+            .respond_on(AgentTopic::ToolResults)
+            .handler(Specialist {
+                llm: llm.clone(),
+                semantic: semantic.clone(),
+            })
+            .build()
+            .spawn(laser.clone());
+        let mut approver = Agent::builder()
+            .id("approver".parse()?)
+            .listen_on(AgentTopic::HumanInput)
+            .respond_on(AgentTopic::Responses)
+            .handler(Approver)
+            .build()
+            .spawn(laser.clone());
+        // Run-scoped namespaces so reruns never read each other's state.
+        let run = ConversationId::new();
+        let dedup_namespace = format!("concierge-dedup-{run}");
+        let credits_namespace = format!("concierge-credits-{run}");
+        let mut resolver = Agent::builder()
+            .id("resolver".parse()?)
+            .listen_on(AgentTopic::Commands)
+            .handler(Resolver {
+                credits: credits_namespace.clone(),
+            })
+            .deduplicator(Box::new(KvDeduplicator {
+                laser: laser.clone(),
+                namespace: dedup_namespace.clone(),
+                ttl: DEDUP_TTL,
+            }))
+            .build()
+            .spawn(laser.clone());
+        for agent in [&mut triage, &mut specialist, &mut approver, &mut resolver] {
+            agent.ready().await?;
+        }
 
-    phase("rebuilding the incident from the log alone (the audit trail)");
-    let recovered = recover_incident(&laser, incident).await?;
-    info!(
-        "recovered from the log: {} findings, diagnosis intact: {}",
-        recovered.findings.len(),
-        !recovered.diagnosis.is_empty(),
-    );
+        phase("triaging the incident through the desk");
+        let incident = ConversationId::new();
+        let task = Provenance::builder().conversation_id(incident).build();
+        info!("incident on conversation {incident}: {INCIDENT}");
+        let diagnosed: IncidentLog = serde_json::from_slice(
+            &laser
+                .agent("orchestrator".parse()?)
+                .ask(
+                    AgentTopic::Commands,
+                    AgentTopic::Responses,
+                    INCIDENT.as_bytes().to_vec(),
+                    &task,
+                    DESK_TIMEOUT,
+                )
+                .await?
+                .payload,
+        )
+        .map_err(|error| LaserError::Codec(error.to_string()))?;
+        info!("diagnosis: {}", diagnosed.diagnosis);
 
-    for agent in [triage, specialist, approver, resolver] {
-        agent.shutdown().await?;
-    }
-    phase("done");
-    info!(
-        "inspect the run in LaserData Cloud: index `{TICKETS_TOPIC}`, \
-         KV namespaces `{credits_namespace}` and `{dedup_namespace}`"
-    );
-    Ok(())
+        phase("executing remediation credits effectively once");
+        // Send the credit list twice. The KV deduplicator keyed on each credit's
+        // idempotency key makes the redelivery a no-op, so the totals stay exact.
+        send_credits(&laser, incident, CREDITS).await?;
+        send_credits(&laser, incident, CREDITS).await?;
+        wait_for_credits(&laser, &credits_namespace, CREDIT_TOTALS).await?;
+        for &(customer, expected) in CREDIT_TOTALS {
+            let actual = read_u64(&laser.kv(&credits_namespace), customer).await?;
+            if actual != expected {
+                return Err(LaserError::Invalid(format!(
+                    "credits were not effectively once: {customer}={actual}, want {expected}"
+                )));
+            }
+        }
+        info!(
+            "credits applied exactly once despite the redelivery, inspect them in LaserData Cloud under \
+             KV namespace {credits_namespace}"
+        );
+
+        phase("optimistic concurrency, read-your-writes, and the unified result space");
+        coordination_demo(&laser).await?;
+
+        if capabilities.forks {
+            phase("speculating a bulk-resolve plan in a fork");
+            speculative_bulk_resolve(&laser).await?;
+        } else {
+            info!("read-model forks unavailable here, skipping the speculative plan");
+        }
+
+        phase("remembering this resolution for the next incident");
+        remember_resolution(&semantic, &diagnosed.diagnosis).await?;
+
+        phase("rebuilding the incident from the log alone (the audit trail)");
+        let recovered = recover_incident(&laser, incident).await?;
+        info!(
+            "recovered from the log: {} findings, diagnosis intact: {}",
+            recovered.findings.len(),
+            !recovered.diagnosis.is_empty(),
+        );
+
+        for agent in [triage, specialist, approver, resolver] {
+            agent.shutdown().await?;
+        }
+        phase("done");
+        info!(
+            "inspect the run in LaserData Cloud: index `{TICKETS_TOPIC}`, \
+             KV namespaces `{credits_namespace}` and `{dedup_namespace}`"
+        );
+        Ok(())
+    })
+    .await
 }
 
 // A small xorshift64* pseudo random generator seeded by a constant, so the

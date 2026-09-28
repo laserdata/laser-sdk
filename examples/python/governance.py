@@ -16,29 +16,32 @@ EXAMPLE = "governance"
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    await laser.bootstrap(_common.PARTITIONS)
+    try:
+        await laser.bootstrap(_common.PARTITIONS)
 
-    _common.phase("Capability RBAC: roles bound to a server-stamped user")
-    caps = await laser.capabilities()
-    if _common.managed_gate(caps.authz, "capability RBAC", "governance"):
-        await install_roles(laser, _common.env_int("LASER_GOVERNANCE_USER_ID", 1))
+        _common.phase("Capability RBAC: roles bound to a server-stamped user")
+        caps = await laser.capabilities()
+        if _common.managed_gate(caps.authz, "capability RBAC", "governance"):
+            await install_roles(laser, _common.env_int("LASER_GOVERNANCE_USER_ID", 1))
 
-    _common.phase("Permission intersection: agent grants cannot exceed the user")
-    demonstrate_intersection()
+        _common.phase("Permission intersection: agent grants cannot exceed the user")
+        demonstrate_intersection()
 
-    _common.phase("External edge: audience validation and step-up")
-    demonstrate_edge_auth()
+        _common.phase("External edge: audience validation and step-up")
+        demonstrate_edge_auth()
 
-    _common.phase("Run governor: submit a budgeted managed run when served")
-    if caps.agent_workflow:
-        await submit_budgeted_run(laser)
-    else:
-        print("agent_workflow is not advertised, so the live budgeted-run submit is skipped.")
+        _common.phase("Run governor: submit a budgeted managed run when served")
+        if caps.agent_workflow:
+            await submit_budgeted_run(laser)
+        else:
+            print("agent_workflow is not advertised, so the live budgeted-run submit is skipped.")
 
-    print(
-        "\ngovernance: role grants, deny-wins matching, on-behalf-of intersection,\n"
-        "external-edge step-up, and budgeted run submission share one governance model."
-    )
+        print(
+            "\ngovernance: role grants, deny-wins matching, on-behalf-of intersection,\n"
+            "external-edge step-up, and budgeted run submission share one governance model."
+        )
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 async def install_roles(laser, target_user: int) -> None:

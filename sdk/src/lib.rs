@@ -19,6 +19,8 @@ pub mod batching;
 #[cfg(feature = "agent")]
 pub mod blob;
 pub mod capabilities;
+#[cfg(feature = "streaming")]
+mod connect_options;
 #[cfg(feature = "agent")]
 pub mod context;
 #[cfg(feature = "agent")]

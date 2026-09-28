@@ -28,10 +28,10 @@ impl PyLaser {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
-    /// Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts.
+    /// Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts. Connecting gives up after `connect_timeout_ms`, default 30000 or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` naming whether the server never accepted the connection or never answered the login.
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (connection_string, *, stream=None, ops_stream=None, control_topic=None, dlq_topic=None, changes_topic=None, verifier=None, publish_timeout_ms=None, publish_max_retries=None, publish_retry_backoff_ms=None))]
+    #[pyo3(signature = (connection_string, *, stream=None, ops_stream=None, control_topic=None, dlq_topic=None, changes_topic=None, verifier=None, connect_timeout_ms=None, publish_timeout_ms=None, publish_max_retries=None, publish_retry_backoff_ms=None))]
     fn connect<'py>(
         py: Python<'py>,
         connection_string: String,
@@ -41,6 +41,7 @@ impl PyLaser {
         dlq_topic: Option<String>,
         changes_topic: Option<String>,
         verifier: Option<&PyKeyRegistry>,
+        connect_timeout_ms: Option<u64>,
         publish_timeout_ms: Option<u64>,
         publish_max_retries: Option<u32>,
         publish_retry_backoff_ms: Option<u64>,
@@ -48,6 +49,9 @@ impl PyLaser {
         let verifier = verifier.map(PyKeyRegistry::snapshot);
         future_into_py(py, async move {
             let mut builder = Laser::builder().connection_string(connection_string);
+            if let Some(value) = connect_timeout_ms {
+                builder = builder.connect_timeout(std::time::Duration::from_millis(value));
+            }
             if let Some(value) = publish_timeout_ms {
                 builder = builder.publish_timeout(std::time::Duration::from_millis(value));
             }
@@ -310,9 +314,16 @@ impl PyLaser {
         future_into_py(py, async move { Ok(slf) })
     }
 
+    /// Close the shared connection. Every clone from `with_stream` and the other `with_*` methods loses it too. Safe to call more than once.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.inner.clone();
+        future_into_py(py, async move { laser.close().await.map_err(to_pyerr) })
+    }
+
     /// Exit `async with`. The connection is reference-counted and closes when the
-    /// last handle is dropped, so there is no explicit disconnect to call here.
-    /// Returns `False` so an exception in the body is not suppressed.
+    /// last handle is dropped, so exiting does not disconnect a clone still in use.
+    /// Call `close` to end the connection explicitly. Returns `False` so an
+    /// exception in the body is not suppressed.
     #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
     fn __aexit__<'py>(
         &self,

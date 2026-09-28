@@ -60,7 +60,7 @@ LASER_TOKEN='<token>' \
 | `LASER_TOKEN` | personal access token auth |
 | `LASER_USERNAME`, `LASER_PASSWORD` | username and password auth |
 | `LASER_NO_TLS=1` | disable the automatic TLS attach |
-| `LASER_STREAM` | override the data stream for every example (default: a per-invocation `laser-<example>-<token>` stream, so repeat and concurrent runs never share state) |
+| `LASER_STREAM` | override the data stream for every example (default: a per-invocation `laser-<example>-<token>` stream, so repeat and concurrent runs never share state, deleted when the run finishes) |
 | `LASER_MESSAGES`, `LASER_BATCH` | volume knobs for the publishing examples |
 | `LASER_FIREHOSE_*` | the firehose's own knobs (`MESSAGES`, `ORGS`, `CONCURRENCY`, `PAYLOAD_BYTES`, `BATCH`, `PARTITIONS`, `REGISTER`, `QUERY`) |
 | `LASER_APPLY_PLAN=1` | the concierge acts on the speculative fork's verdict (promote or squash) instead of leaving it open |

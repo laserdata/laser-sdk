@@ -1,4 +1,4 @@
-use laser_examples::{init_tracing, laser, phase, stream_for};
+use laser_examples::{init_tracing, laser, phase, release_after, stream_for};
 use laser_sdk::prelude::{
     Capabilities, CommitPolicy, Consumer, ConsumerStart, LaserError, Producer, ProducerMessage,
     Routing,
@@ -16,43 +16,46 @@ const PROGRESS_EVERY: usize = 100;
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("native-streaming"), Capabilities::OPEN).await?;
-    let topic = laser.topic(TOPIC);
-    let producer = topic
-        .producer()
-        .batch_length(BATCH as u32)
-        .linger(Duration::from_millis(5))
-        .retries(Some(3), Some(Duration::from_secs(1)))
-        .routing(Routing::Balanced)
-        .partitions(1)
-        .build()
-        .await?;
+    release_after(&laser, &stream_for("native-streaming"), async {
+        let topic = laser.topic(TOPIC);
+        let producer = topic
+            .producer()
+            .batch_length(BATCH as u32)
+            .linger(Duration::from_millis(5))
+            .retries(Some(3), Some(Duration::from_secs(1)))
+            .routing(Routing::Balanced)
+            .partitions(1)
+            .build()
+            .await?;
 
-    phase("producer: exact-width header, keyed routing, and 1000 batched messages");
-    publish_messages(&producer).await?;
+        phase("producer: exact-width header, keyed routing, and 1000 batched messages");
+        publish_messages(&producer).await?;
 
-    phase("consumer: production interval-or-each auto commit");
-    let auto = topic
-        .consumer_group("auto-workers")
-        .batch_length(BATCH as u32)
-        .poll_interval(Duration::from_millis(5))
-        .start_at(ConsumerStart::First)
-        .allow_replay()
-        .commit_policy(CommitPolicy::IntervalOrEach(Duration::from_secs(1)))
-        .build()
-        .await?;
-    receive(auto, false).await?;
+        phase("consumer: production interval-or-each auto commit");
+        let auto = topic
+            .consumer_group("auto-workers")
+            .batch_length(BATCH as u32)
+            .poll_interval(Duration::from_millis(5))
+            .start_at(ConsumerStart::First)
+            .allow_replay()
+            .commit_policy(CommitPolicy::IntervalOrEach(Duration::from_secs(1)))
+            .build()
+            .await?;
+        receive(auto, false).await?;
 
-    phase("consumer: commit after successful handling (one round-trip per message)");
-    let manual = topic
-        .consumer_group("manual-workers")
-        .batch_length(BATCH as u32)
-        .poll_interval(Duration::from_millis(5))
-        .start_at(ConsumerStart::First)
-        .allow_replay()
-        .commit_policy(CommitPolicy::Disabled)
-        .build()
-        .await?;
-    receive(manual, true).await
+        phase("consumer: commit after successful handling (one round-trip per message)");
+        let manual = topic
+            .consumer_group("manual-workers")
+            .batch_length(BATCH as u32)
+            .poll_interval(Duration::from_millis(5))
+            .start_at(ConsumerStart::First)
+            .allow_replay()
+            .commit_policy(CommitPolicy::Disabled)
+            .build()
+            .await?;
+        receive(manual, true).await
+    })
+    .await
 }
 
 // One keyed send with an exact-width header, then the rest of `MESSAGE_COUNT`

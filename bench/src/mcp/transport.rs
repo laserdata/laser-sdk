@@ -1,5 +1,5 @@
 use axum::serve::ListenerExt;
-use rmcp::model::ClientInfo;
+use rmcp::model::ClientConfig;
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -13,7 +13,7 @@ pub(super) const HTTP_VERSION: &str = "http_1_1";
 pub(super) struct McpTransport {
     pub peer: Peer<RoleClient>,
     server_port: u16,
-    client: RunningService<RoleClient, ClientInfo>,
+    client: RunningService<RoleClient, ClientConfig>,
     cancellation: CancellationToken,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -53,7 +53,7 @@ impl McpTransport {
             http_client,
             StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp")),
         );
-        let client = ClientInfo::default()
+        let client = ClientConfig::default()
             .serve(transport)
             .await
             .map_err(|error| BenchError::Invalid(format!("failed to initialize MCP: {error}")))?;

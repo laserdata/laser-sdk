@@ -1,4 +1,5 @@
 use crate::capabilities::Capabilities;
+use crate::connect_options::{ConnectOptions, connect_before};
 use crate::error::LaserError;
 pub use crate::publish_options::PublishOptions;
 #[cfg(any(
@@ -170,6 +171,8 @@ impl Laser {
     /// only thing required. For a `*.laserdata.cloud` or `*.laserdata.com`
     /// host with no `tls_ca_file=` already set, TLS is auto-attached with
     /// LaserData's public root CA, bundled in the SDK itself. Set `LASER_TLS_CERT=<path>` to enable TLS with an explicit CA for any host or to override the bundled CA. Disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings when neither variable is set. Connection strings use the bare `user:password@host:port` form because `Laser::connect` supplies the TCP scheme.
+    ///
+    /// Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a [`LaserError::Timeout`] that says whether the server never accepted the connection or never answered the login. Set another budget with [`LaserBuilder::connect_timeout`].
     ///
     /// ```no_run
     /// # use laser_sdk::prelude::*;
@@ -405,6 +408,17 @@ impl Laser {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Close the shared connection. Every clone of this `Laser`, and every consumer or reply reader riding it, loses the connection too. A fenced-lease coordination connection this handle opened closes with it. Safe to call more than once.
+    pub async fn close(&self) -> Result<(), LaserError> {
+        #[cfg(feature = "kv")]
+        if self.inner.coordination_connection.is_some() {
+            self.coordination_client().await?.close().await;
+        }
+        #[cfg(feature = "agent")]
+        self.inner.reply_hubs.clear();
+        self.client().shutdown().await.map_err(LaserError::from)
     }
 
     pub(crate) fn publish_generation(&self) -> u64 {
@@ -1107,6 +1121,7 @@ pub struct LaserBuilder {
     // credentials, or a bring-your-own client) overwrites a different mode already
     // configured, so `build` fails loudly instead of silently dropping the first.
     connection_conflict: Option<&'static str>,
+    connect_timeout: Option<Duration>,
     publish_timeout: Option<Duration>,
     publish_max_retries: Option<u32>,
     publish_retry_backoff: Option<Duration>,
@@ -1136,6 +1151,12 @@ enum ConnectionConfig {
 }
 
 impl LaserBuilder {
+    /// Budget for the initial connect: TCP dial, TLS handshake, login, and the managed capability probe. An expired budget returns [`LaserError::Timeout`] naming the stage that stalled. Default: 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`.
+    pub fn connect_timeout(mut self, value: Duration) -> Self {
+        self.connect_timeout = Some(value);
+        self
+    }
+
     /// Per-attempt publish budget, including producer setup and reconnect. Default: 60 seconds.
     pub fn publish_timeout(mut self, value: Duration) -> Self {
         self.publish_timeout = Some(value);
@@ -1342,6 +1363,8 @@ impl LaserBuilder {
             self.publish_max_retries,
             self.publish_retry_backoff,
         )?;
+        let connect_deadline =
+            tokio::time::Instant::now() + ConnectOptions::from_env(self.connect_timeout)?.timeout;
         let stream = self.stream.filter(|value| !value.is_empty());
         #[cfg_attr(not(feature = "kv"), allow(unused_variables))]
         let (client, coordination_connection) = match self.connection {
@@ -1353,7 +1376,7 @@ impl LaserBuilder {
             ConnectionConfig::ConnectionString(value) => {
                 let normalized = normalize_connection_string(&value)?;
                 let client = IggyClientBuilder::from_connection_string(&normalized)?.build()?;
-                client.connect().await?;
+                connect_before(&client, connect_deadline).await?;
                 (client, Some(normalized))
             }
             ConnectionConfig::Tcp {
@@ -1374,7 +1397,7 @@ impl LaserBuilder {
                 // but leaves it unauthenticated after a server restart.
                 let with_tls = resolve_tls(format!("iggy+tcp://{username}:{password}@{address}"))?;
                 let client = IggyClientBuilder::from_connection_string(&with_tls)?.build()?;
-                client.connect().await?;
+                connect_before(&client, connect_deadline).await?;
                 (client, Some(with_tls))
             }
             ConnectionConfig::Client(client) => (client, None),
@@ -1404,7 +1427,10 @@ impl LaserBuilder {
             feature = "runs"
         ))]
         {
-            if let Some(announce) = probe_managed_host(&client).await {
+            // A probe still unanswered at the connect deadline leaves the set open-only, like any other probe failure.
+            if let Ok(Some(announce)) =
+                tokio::time::timeout_at(connect_deadline, probe_managed_host(&client)).await
+            {
                 if let Some(announced) = announce.topology.clone() {
                     topology = announced;
                 }
@@ -1934,6 +1960,31 @@ pub(crate) async fn ensure_stream(client: &IggyClient, stream: &str) -> Result<(
     Ok(())
 }
 
+pub(crate) async fn delete_stream(laser: &Laser, stream: &str) -> Result<bool, LaserError> {
+    let client = laser.client();
+    let identifier = Identifier::named(stream)?;
+    let existed = client.get_stream(&identifier).await?.is_some();
+    if existed
+        && let Err(error) = client.delete_stream(&identifier).await
+        && client.get_stream(&identifier).await?.is_some()
+    {
+        return Err(error.into());
+    }
+    laser
+        .inner
+        .producers
+        .retain(|(producer_stream, _), _| producer_stream != stream);
+    #[cfg(feature = "agent")]
+    {
+        laser.inner.registry_caches.remove(stream);
+        laser
+            .inner
+            .reply_hubs
+            .retain(|(hub_stream, _), _| hub_stream != stream);
+    }
+    Ok(existed)
+}
+
 pub(crate) async fn ensure_topic(
     client: &IggyClient,
     stream: &str,
@@ -1983,6 +2034,9 @@ mod builder_conflict_tests {
     use iggy::prelude::IggyMessage;
     #[cfg(feature = "agent")]
     use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
 
     #[cfg(feature = "agent")]
     #[test]
@@ -2080,6 +2134,64 @@ mod builder_conflict_tests {
             .build()
             .await;
         assert!(matches!(result, Err(LaserError::Config(_))));
+    }
+
+    #[tokio::test]
+    async fn given_a_server_that_never_answers_login_when_building_then_should_time_out_at_the_budget()
+     {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local listener");
+        let address = listener.local_addr().expect("read the bound address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the client");
+            let mut buffer = [0_u8; 1024];
+            while socket.read(&mut buffer).await.is_ok_and(|read| read > 0) {}
+        });
+        let started = tokio::time::Instant::now();
+        let result = Laser::builder()
+            .connection_string(format!("iggy:iggy@{address}"))
+            .connect_timeout(Duration::from_millis(300))
+            .build()
+            .await;
+        assert!(matches!(
+            result,
+            Err(LaserError::Timeout("the Iggy login reply"))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn given_a_zero_connect_timeout_when_building_then_should_reject_the_configuration() {
+        let result = Laser::builder()
+            .connection_string("iggy:iggy@127.0.0.1:8090")
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .await;
+        assert!(matches!(result, Err(LaserError::Config(_))));
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn given_a_closed_laser_when_acquiring_its_first_lease_then_should_not_open_a_connection()
+    {
+        let mut laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        std::sync::Arc::get_mut(&mut laser.inner)
+            .expect("the Laser is not shared yet")
+            .coordination_connection = Some("not a connection string".to_owned());
+        let mut capabilities = crate::capabilities::Capabilities::OPEN;
+        capabilities.kv.fenced_leases = true;
+        let laser = laser.with_capabilities(capabilities);
+        laser.close().await.expect("close the unconnected client");
+        let result = laser
+            .kv("leases")
+            .lease(b"key", "holder", Duration::from_secs(1))
+            .await;
+        assert!(matches!(
+            result,
+            Err(LaserError::Iggy(iggy::prelude::IggyError::ClientShutdown))
+        ));
     }
 }
 

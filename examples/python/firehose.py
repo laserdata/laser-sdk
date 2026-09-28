@@ -97,65 +97,68 @@ FILLER_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789 "
 async def main() -> None:
     config = Config()
     laser = await _common.connect(EXAMPLE)
-    caps = await laser.capabilities()
+    try:
+        caps = await laser.capabilities()
 
-    _common.phase("firehose: warming up")
-    approx_mb = config.messages * config.payload_bytes / 1e6
-    print(
-        f"plan: {config.messages} messages across {config.orgs} org indexes, "
-        f"~{config.payload_bytes} B payloads (~{approx_mb:.0f} MB on the log), "
-        f"batch {config.batch}, {config.concurrency} concurrent producers"
-    )
+        _common.phase("firehose: warming up")
+        approx_mb = config.messages * config.payload_bytes / 1e6
+        print(
+            f"plan: {config.messages} messages across {config.orgs} org indexes, "
+            f"~{config.payload_bytes} B payloads (~{approx_mb:.0f} MB on the log), "
+            f"batch {config.batch}, {config.concurrency} concurrent producers"
+        )
 
-    topics = [f"{TOPIC_PREFIX}{org:02}" for org in range(config.orgs)]
-    for topic in topics:
-        await laser.topic(topic).ensure(partitions=config.partitions)
-
-    register = config.register and caps.query
-    if register:
-        _common.phase("provisioning topics and indexes")
+        topics = [f"{TOPIC_PREFIX}{org:02}" for org in range(config.orgs)]
         for topic in topics:
-            await register_index(laser, topic)
-        print(f"registered {len(topics)} projections, waiting for the plane to create indexes")
-        # Best effort. Give the managed plane a moment to create the first index.
-        # With no managed plane attached this short wait simply elapses and we
-        # publish anyway.
-        await wait_for_index(laser, topics[0], 15.0)
-    elif not config.register:
-        print("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)")
-    else:
-        print("projection registration needs the managed plane, publishing to the raw log only")
+            await laser.topic(topic).ensure(partitions=config.partitions)
 
-    # Spread the total over the orgs, then run `concurrency` shards at a time so a
-    # large run does not spawn unbounded work. The first orgs take the remainder
-    # so the totals add up exactly.
-    per_org = config.messages // config.orgs
-    remainder = config.messages % config.orgs
-    semaphore = asyncio.Semaphore(config.concurrency)
-    counters = {"published": 0, "bytes": 0}
-    started = time.monotonic()
-    _common.phase("firing the hose")
+        register = config.register and caps.query
+        if register:
+            _common.phase("provisioning topics and indexes")
+            for topic in topics:
+                await register_index(laser, topic)
+            print(f"registered {len(topics)} projections, waiting for the plane to create indexes")
+            # Best effort. Give the managed plane a moment to create the first index.
+            # With no managed plane attached this short wait simply elapses and we
+            # publish anyway.
+            await wait_for_index(laser, topics[0], 15.0)
+        elif not config.register:
+            print("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)")
+        else:
+            print("projection registration needs the managed plane, publishing to the raw log only")
 
-    async def shard_task(shard: int, topic: str) -> None:
-        count = per_org + (1 if shard < remainder else 0)
-        async with semaphore:
-            await produce_shard(laser, topic, shard, count, config, counters)
-        print(f"shard {shard:02} done: {count} messages to '{topic}'")
+        # Spread the total over the orgs, then run `concurrency` shards at a time so a
+        # large run does not spawn unbounded work. The first orgs take the remainder
+        # so the totals add up exactly.
+        per_org = config.messages // config.orgs
+        remainder = config.messages % config.orgs
+        semaphore = asyncio.Semaphore(config.concurrency)
+        counters = {"published": 0, "bytes": 0}
+        started = time.monotonic()
+        _common.phase("firing the hose")
 
-    await asyncio.gather(*(shard_task(shard, topic) for shard, topic in enumerate(topics)))
+        async def shard_task(shard: int, topic: str) -> None:
+            count = per_org + (1 if shard < remainder else 0)
+            async with semaphore:
+                await produce_shard(laser, topic, shard, count, config, counters)
+            print(f"shard {shard:02} done: {count} messages to '{topic}'")
 
-    elapsed = max(1e-6, time.monotonic() - started)
-    total = counters["published"]
-    total_bytes = counters["bytes"]
-    print(
-        f"done: {total} messages, {total_bytes / 1e9:.2f} GB payload in {elapsed:.1f}s "
-        f"({total / elapsed:.0f} msg/s, {(total_bytes / 1e6) / elapsed:.1f} MB/s)"
-    )
+        await asyncio.gather(*(shard_task(shard, topic) for shard, topic in enumerate(topics)))
 
-    if config.query and _common.managed_gate(caps.query, "query", EXAMPLE):
-        await _common.wait_for_projection(laser, topics[0], per_org + (1 if remainder else 0))
-        _common.phase("sample analytics over the firehose")
-        await run_sample_queries(laser, topics)
+        elapsed = max(1e-6, time.monotonic() - started)
+        total = counters["published"]
+        total_bytes = counters["bytes"]
+        print(
+            f"done: {total} messages, {total_bytes / 1e9:.2f} GB payload in {elapsed:.1f}s "
+            f"({total / elapsed:.0f} msg/s, {(total_bytes / 1e6) / elapsed:.1f} MB/s)"
+        )
+
+        if config.query and _common.managed_gate(caps.query, "query", EXAMPLE):
+            await _common.wait_for_projection(laser, topics[0], per_org + (1 if remainder else 0))
+            _common.phase("sample analytics over the firehose")
+            await run_sample_queries(laser, topics)
+    finally:
+        await _common.release_stream(laser, EXAMPLE)
 
 
 class Config:

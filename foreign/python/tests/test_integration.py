@@ -1218,3 +1218,41 @@ async def test_given_a_session_when_typed_turns_are_appended_then_context_and_ch
         laser.sessions(topics={"response": ls.Topics.COMMANDS})
     with pytest.raises(ls.InvalidError):
         await session.append("event", b"nope")
+
+
+async def test_given_a_stream_when_deleted_then_should_report_absence_on_repeat(laser):
+    stream = laser.stream(laser.default_stream)
+    await stream.ensure()
+    assert await stream.delete() is True
+    assert await stream.delete() is False
+
+
+async def test_given_a_closed_laser_when_used_then_should_raise(laser):
+    await laser.topic("closing").ensure(partitions=1)
+    clone = laser.with_stream(laser.default_stream)
+    await laser.close()
+    await laser.close()
+    with pytest.raises(ls.LaserError):
+        await clone.stream(laser.default_stream).ensure()
+
+
+async def test_given_a_cached_stream_when_deleted_elsewhere_then_should_publish_after_recreation(
+    laser, iggy_endpoint
+):
+    topic = laser.topic("recreated")
+    await topic.ensure(partitions=1)
+    await topic.publish().json({"generation": 1}).send()
+    other = await ls.Laser.connect(iggy_endpoint)
+    try:
+        assert await other.stream(laser.default_stream).delete() is True
+        assert await laser.stream(laser.default_stream).delete() is False
+        await topic.ensure(partitions=1)
+        result = await topic.publish().json({"generation": 2}).send()
+        assert len(result.confirmations) == 1
+        assert result.confirmations[0].base_offset == 0
+    finally:
+        await other.close()
+        try:
+            await laser.stream(laser.default_stream).delete()
+        finally:
+            await laser.close()
