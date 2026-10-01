@@ -81,6 +81,10 @@ class RegistryTransport implements LaserTransport {
     return Promise.reject(new Error("unused"))
   }
 
+  ensureConsumerGroup(): Promise<void> {
+    return Promise.reject(new Error("unused"))
+  }
+
   findTopicPartitionCount(): Promise<number | undefined> {
     return Promise.resolve(1)
   }

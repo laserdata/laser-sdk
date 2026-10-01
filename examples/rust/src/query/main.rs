@@ -1,6 +1,6 @@
 use laser_examples::{
-    PARTITIONS, ensure_view, index_for, init_tracing, laser, managed_feature_ready, phase,
-    release_after, stream_for, wait_for_rows,
+    PARTITIONS, ensure_view, fresh_run, index_for, init_tracing, laser, managed_feature_ready,
+    phase, stream_for, wait_for_rows,
 };
 use laser_sdk::prelude::full::*;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ struct Order {
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("query"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("query"), async {
+    fresh_run(&laser, &stream_for("query"), async {
         if !laser.capabilities().await.query.available {
             managed_feature_ready(false, "views (query)", "query");
             return Ok(());

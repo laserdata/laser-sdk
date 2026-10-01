@@ -84,6 +84,13 @@ export class Topic {
     })
   }
 
+  /** Idempotently creates the consumer group `name` on this topic without joining it. */
+  async ensureConsumerGroup(name: string): Promise<void> {
+    await this.observed("ensure", { group: name }, async () => {
+      await this.transport.ensureConsumerGroup(this.streamName, this.name, name)
+    })
+  }
+
   async send(payload: BytesLike, options: RawSendOptions = {}): Promise<SendMessagesResponse> {
     if (options.key !== undefined && options.partition !== undefined) {
       throw new InvalidError("send() accepts a routing key or an explicit partition, not both")

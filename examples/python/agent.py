@@ -74,7 +74,7 @@ async def main() -> None:
 
         await triage.shutdown()
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

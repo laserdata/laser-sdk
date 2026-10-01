@@ -15,7 +15,7 @@ Iggy provides the VSR transport and AGDX command classifier. Context assembly, c
 
 - Changing the cross-topic ordering key in `ContextAssembler::assemble` (`(timestamp, topic_index, partition, offset)`) - it defines what an LLM is fed.
 - Changing the `MemoryLogEntry` framing (the typed `Item`/`Forget`/`Feedback` records `LogMemory` writes to the audit topic) - it is the wire format of a memory record on the log.
-- Changing how `recall` scopes results (agent filter, multi-tenancy is at Iggy stream boundary, not a memory scope field).
+- Changing how `recall` scopes results (agent filter, user isolation is at the Iggy stream boundary, not a memory scope field).
 
 ## Key files and symbols
 

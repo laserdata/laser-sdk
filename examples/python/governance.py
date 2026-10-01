@@ -41,7 +41,7 @@ async def main() -> None:
             "external-edge step-up, and budgeted run submission share one governance model."
         )
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 async def install_roles(laser, target_user: int) -> None:

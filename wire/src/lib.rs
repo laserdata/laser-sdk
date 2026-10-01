@@ -16,6 +16,7 @@ pub mod control;
 pub mod destination;
 pub(crate) mod encoding;
 pub mod error;
+pub mod filter;
 pub mod fork;
 pub mod forward;
 pub mod graph;
@@ -88,6 +89,12 @@ pub mod prelude {
         QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
     };
     pub use crate::error::{DecodeError, InvalidError};
+    pub use crate::filter::{
+        Coerce, ConsumerFilter, FaultPolicy, FieldPath, FilterBinding, FilterCodec, FilterConsumer,
+        FilterError, FilterErrorReason, FilterExpr, FilterGroupRef, FilterMutation,
+        FilterMutationOutcome, FilterMutationStatus, FilterRef, FilterSource, FilteredPage,
+        FilteredStart, ReadMode, StopReason, TimestampFormat,
+    };
     pub use crate::fork::{ForkError, ForkInfo, ForkKind, ForkOutcome, ForkReply, ForkStatus};
     pub use crate::graph::{
         EdgeDir, EdgeId, GraphEdge, GraphError, GraphNeighbors, GraphNode, GraphQuery, GraphReply,

@@ -73,3 +73,25 @@ void test("given_a_group_consumer_with_manual_commit_when_rejoined_then_should_r
     await laser.close()
   }
 })
+
+void test("given_manual_group_replay_when_reading_multiple_batches_then_should_not_repeat_offset_zero", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    await topic.send(new TextEncoder().encode("first"))
+    await topic.send(new TextEncoder().encode("second"))
+    const consumer = await topic.consumerGroup(`replay-${randomUUID()}`, {
+      startFrom: { kind: "first" },
+      autoCommit: false,
+      batchLength: 1
+    })
+    try {
+      assert.equal((await consumer.nextWithin(3_000))?.offset, 0n)
+      assert.equal((await consumer.nextWithin(3_000))?.offset, 1n)
+    } finally {
+      await consumer.shutdown()
+    }
+  } finally {
+    await laser.close()
+  }
+})

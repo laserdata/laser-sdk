@@ -1,3 +1,8 @@
+import {
+  type FilterCatalogCommand,
+  decodeFilterCatalogCommand,
+  encodeFilterCatalogCommand
+} from "./filter.js"
 import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, expectMap, expectString, field, singleVariantTag } from "./cbor.js"
 import { ContentType, type ContentType as ContentTypeValue } from "./content.js"
@@ -118,6 +123,7 @@ export type ControlCommand =
   | { readonly kind: "dropGraph"; readonly id: string }
   | { readonly kind: "registerRunSource"; readonly source: SourceSelector }
   | { readonly kind: "removeRunSource"; readonly source: SourceSelector }
+  | { readonly kind: "filterCatalog"; readonly command: FilterCatalogCommand }
 
 export interface ControlEnvelope {
   readonly v: number
@@ -489,6 +495,8 @@ export function encodeControlCommand(command: ControlCommand): Map<string, unkno
       return new Map([["RegisterRunSource", encodeSourceSelector(command.source)]])
     case "removeRunSource":
       return new Map([["RemoveRunSource", encodeSourceSelector(command.source)]])
+    case "filterCatalog":
+      return new Map([["FilterCatalog", encodeFilterCatalogCommand(command.command)]])
   }
 }
 
@@ -540,6 +548,8 @@ export function decodeControlCommand(value: unknown, context: string): ControlCo
         kind: "removeRunSource",
         source: decodeSourceSelector(expectMap(inner, context), context)
       }
+    case "FilterCatalog":
+      return { kind: "filterCatalog", command: decodeFilterCatalogCommand(inner, context) }
     default:
       throw new CodecError(`\`${tag}\` is not a recognized control command`, context, "command")
   }

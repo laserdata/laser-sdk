@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "Reading",
+  "namespace": "fleet",
+  "fields": [
+    {
+      "name": "satellite",
+      "type": "string"
+    },
+    {
+      "name": "mode",
+      "type": "string"
+    },
+    {
+      "name": "battery",
+      "type": "int"
+    }
+  ]
+}

@@ -5,6 +5,8 @@ Runnable examples of the Laser SDK, an open data-platform SDK over Apache Iggy. 
 - generic: low-latency streaming, projections, query, and resumable readers.
 - agentic: conversations, routing, memory, approvals, forks, and governed effects.
 
+**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
 ## Layout
 
 ```
@@ -18,7 +20,7 @@ Each SDK owns its connection security. The Rust SDK embeds the LaserData public 
 
 ## Start here
 
-Start with the focused `log`, `query`, `watch`, `kv`, `graph`, `recall`, `context`, and `agent` examples. Each has Rust, Python, and TypeScript versions with matching steps. They link to [docs.laserdata.cloud/laser-sdk](https://docs.laserdata.cloud/laser-sdk) and to larger scenarios. `recall` is the focused memory example, while `memory` covers the larger scenario.
+Start with the focused `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` examples. Each has Rust, Python, and TypeScript versions with matching steps. They link to [docs.laserdata.cloud/laser-sdk](https://docs.laserdata.cloud/laser-sdk) and to larger scenarios. `recall` is the focused memory example, while `memory` covers the larger scenario.
 
 - Rust: [`rust/README.md`](rust/README.md) - the full catalogue (each tagged agentic vs generic and whether it needs a managed deployment), with a per-example `README.md` under `rust/src/<name>/`.
 - Python: [`python/README.md`](python/README.md) - the Python ports, the same environment conventions, one runnable script per scenario.

@@ -10,6 +10,7 @@
 //   1_000_500..=1_000_599  agentic memory (reserved facade: remember/recall/improve/forget)
 //   1_000_600..=1_000_699  knowledge graph (traverse, neighbors, upsert)
 //   1_000_700..=1_000_799  agent and workflow control (submit/cancel/status/list)
+//   1_000_800..=1_000_899  delivery: consumer filters (filtered reads and their catalog)
 //
 // A query is a non-replicated read, so it is served off the log via these
 // managed commands instead of a topic round-trip. Raw Apache Iggy rejects them
@@ -227,6 +228,50 @@ pub const AGDX_AGENT_STATUS_CODE: u32 = AGDX_AGENT_BASE + 2;
 /// Managed command code: list tasks.
 pub const AGDX_AGENT_LIST_CODE: u32 = AGDX_AGENT_BASE + 3;
 
+// Delivery band (1_000_800..=1_000_899). Consumer filters: a reader asks the
+// streaming server for only the records that match a declarative filter.
+// Reads, acknowledgments, previews, sample tests, and validation are served by
+// the streaming server itself (the +0x decade). The catalog of saved filters and
+// their consumer-group bindings lives in LaserData Cloud and is forwarded (the
+// +1x decade). Whether it is served is advertised by the `CONSUMER_FILTERS`
+// feature bit.
+/// Base of the delivery band.
+pub const AGDX_DELIVERY_BASE: u32 = AGDX_COMMAND_BASE + 800;
+/// Server-native command code: read one bounded page of matching records.
+pub const AGDX_FILTERED_POLL_CODE: u32 = AGDX_DELIVERY_BASE;
+/// Server-native command code: acknowledge a filtered page, fenced to the source
+/// generation the page was read from.
+pub const AGDX_FILTERED_ACK_CODE: u32 = AGDX_DELIVERY_BASE + 1;
+/// Server-native command code: preview a filter over stored records without
+/// joining a consumer group or storing an offset.
+pub const AGDX_FILTER_PREVIEW_CODE: u32 = AGDX_DELIVERY_BASE + 2;
+/// Server-native command code: evaluate a filter against one supplied sample.
+pub const AGDX_FILTER_TEST_CODE: u32 = AGDX_DELIVERY_BASE + 3;
+/// Server-native command code: validate and compile a filter, returning its digest.
+pub const AGDX_FILTER_VALIDATE_CODE: u32 = AGDX_DELIVERY_BASE + 4;
+/// Managed command code: one catalog mutation (register, revise, describe,
+/// set_revision_enabled, archive, drop, bind, unbind), with its authoritative outcome.
+pub const AGDX_FILTER_MUTATE_CODE: u32 = AGDX_DELIVERY_BASE + 10;
+/// Managed command code: read one saved filter.
+pub const AGDX_GET_FILTER_CODE: u32 = AGDX_DELIVERY_BASE + 11;
+/// Managed command code: list saved filters.
+pub const AGDX_LIST_FILTERS_CODE: u32 = AGDX_DELIVERY_BASE + 12;
+/// Managed command code: list one filter's immutable revisions.
+pub const AGDX_LIST_FILTER_REVISIONS_CODE: u32 = AGDX_DELIVERY_BASE + 13;
+/// Managed command code: read the filter binding of one consumer group.
+pub const AGDX_GET_FILTER_BINDING_CODE: u32 = AGDX_DELIVERY_BASE + 14;
+/// Managed command code: list consumer-group filter bindings.
+pub const AGDX_LIST_FILTER_BINDINGS_CODE: u32 = AGDX_DELIVERY_BASE + 15;
+/// Managed command code: read the outcome of a catalog mutation by its operation id.
+pub const AGDX_FILTER_OPERATION_CODE: u32 = AGDX_DELIVERY_BASE + 16;
+/// Internal command code: the streaming server resolves the execution policy of a
+/// filtered read (a saved revision or a group binding). Never sent by a client.
+pub const AGDX_RESOLVE_FILTER_POLICY_CODE: u32 = AGDX_DELIVERY_BASE + 17;
+/// Internal command code: the streaming server waits for the next change of the
+/// filter catalog its plane replayed. A zero wait confirms cached policies
+/// before use. Never sent by a client.
+pub const AGDX_WATCH_FILTER_CATALOG_CODE: u32 = AGDX_DELIVERY_BASE + 18;
+
 // Per-surface op-schema versions, stamped on every request envelope (or, for
 // the agent surface, carried as the `agdx.av` header). A peer rejects a payload
 // it cannot decode rather than mis-reading a skewed schema.
@@ -248,6 +293,9 @@ pub const KV_LEASE_OP_VERSION: u32 = 1;
 pub const FORK_OP_VERSION: u32 = 1;
 /// Wire version of the graph op envelopes.
 pub const GRAPH_OP_VERSION: u32 = 1;
+/// Wire version of the consumer-filter envelopes (reads, acknowledgments,
+/// previews, tests, catalog requests, and their replies).
+pub const FILTER_OP_VERSION: u32 = 1;
 /// Wire version of the agent and workflow control-band envelopes. Distinct from
 /// [`AGENT_OP_VERSION`] (the on-the-log envelope), this versions the request and
 /// reply types of the control band.

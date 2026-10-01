@@ -1,6 +1,5 @@
 use laser_examples::{
-    PARTITIONS, env_u64, init_tracing, laser, managed_feature_ready, phase, release_after,
-    stream_for,
+    PARTITIONS, env_u64, fresh_run, init_tracing, laser, managed_feature_ready, phase, stream_for,
 };
 use laser_sdk::edge_auth::{EdgeClaims, authorize_edge};
 use laser_sdk::iggy::prelude::{Identifier, UserClient, UserStatus};
@@ -31,7 +30,7 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     let stream = stream_for(EXAMPLE);
     let laser = laser(&stream, Capabilities::OPEN).await?;
-    release_after(&laser, &stream, async {
+    fresh_run(&laser, &stream, async {
         laser.bootstrap(PARTITIONS).await?;
 
         phase("Capability RBAC: roles bound to a server-stamped user");

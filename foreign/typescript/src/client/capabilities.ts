@@ -4,6 +4,7 @@ import type {
   BackendAnnounce,
   BackendDescriptor,
   BackendReadinessReason,
+  FilterAnnounce,
   OpVersions
 } from "../wire/hello.js"
 import type { BackendResourceId } from "../wire/ids.js"
@@ -35,6 +36,19 @@ export interface KvCapabilities {
   readonly fencedLeases: boolean
 }
 
+/** Server-side consumer filters. */
+export interface FilterCapabilities {
+  /** Filtered reads, fenced acknowledgments, previews, sample tests, and
+   * validation, served by the streaming server itself. */
+  readonly native: boolean
+  /** Saved filters, revisions, group bindings, and mutation outcomes, served
+   * with a ready managed plane. */
+  readonly catalog: boolean
+  /** The evaluator version and codecs the server announced. Absent from a
+   * server that predates the announcement, which evaluates as this build does. */
+  readonly evaluation?: FilterAnnounce
+}
+
 export interface Capabilities {
   readonly managed: boolean
   readonly query: QueryCapabilities
@@ -46,6 +60,7 @@ export interface Capabilities {
   readonly agentWorkflow: boolean
   readonly watch: boolean
   readonly authz: boolean
+  readonly filters: FilterCapabilities
   readonly sessions: boolean
   readonly durableDedup: boolean
   readonly versions?: OpVersions
@@ -66,6 +81,8 @@ export type CapabilitySurface =
   | "agentWorkflow"
   | "watch"
   | "authz"
+  | "filters"
+  | "filterCatalog"
 
 export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   managed: false,
@@ -85,6 +102,7 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   agentWorkflow: false,
   watch: false,
   authz: false,
+  filters: Object.freeze({ native: false, catalog: false }),
   sessions: false,
   durableDedup: false,
   backends: Object.freeze([])
@@ -145,6 +163,16 @@ export function managedCapabilitiesFrom(announce: BackendAnnounce): Capabilities
     agentWorkflow: ready && opVersionsHasFeature(versions, Feature.AGENT_WORKFLOW),
     watch: ready && opVersionsHasFeature(versions, Feature.WATCH),
     authz: opVersionsHasFeature(versions, Feature.AUTHZ),
+    filters: {
+      native: opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS),
+      catalog:
+        ready &&
+        opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS) &&
+        (versions.filter ?? 0) > 0,
+      ...(opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS) && announce.filters !== undefined
+        ? { evaluation: announce.filters }
+        : {})
+    },
     versions,
     backends: announce.backends,
     ...(announce.topology !== undefined ? { topology: announce.topology } : {})
@@ -191,6 +219,13 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
     agentWorkflow: configured.agentWorkflow || announced.agentWorkflow,
     watch: configured.watch || announced.watch,
     authz: configured.authz || announced.authz,
+    filters: {
+      native: configured.filters.native || announced.filters.native,
+      catalog: configured.filters.catalog || announced.filters.catalog,
+      ...((announced.filters.evaluation ?? configured.filters.evaluation) !== undefined
+        ? { evaluation: announced.filters.evaluation ?? configured.filters.evaluation }
+        : {})
+    },
     sessions: configured.sessions || announced.sessions,
     durableDedup: configured.durableDedup || announced.durableDedup,
     ...(announced.versions !== undefined
@@ -268,7 +303,11 @@ export function requireCapability(capabilities: Capabilities, surface: Capabilit
                         ? capabilities.agentWorkflow
                         : surface === "watch"
                           ? capabilities.watch
-                          : capabilities.authz
+                          : surface === "filters"
+                            ? capabilities.filters.native
+                            : surface === "filterCatalog"
+                              ? capabilities.filters.catalog
+                              : capabilities.authz
   if (!available) {
     throw new UnsupportedError(`${surface} is not served by this deployment`, {
       cause: { surface }

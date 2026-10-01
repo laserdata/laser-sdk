@@ -14,7 +14,7 @@ Python uses PyO3 bindings over the Rust `laser-sdk` crate. Keep data encoding an
 - `src/client.rs` and `src/stream.rs` bind `Laser`, capabilities, the stream/topic accessor grammar, typed topics, publish/batch/replay/ensure, and `producer`/`consumer`/`consumer_group`.
 - `src/transport.rs` binds `Producer`, `Consumer`, and `ConsumerMessage`. Preserve routing, batching, retry, polling, group, header, and commit behavior. It also provides offset inspection and continuous asynchronous reads.
 - Direct and fluent sends return immutable `SendMessagesResponse` and `SendMessagesConfirmation` classes. Keep their stream, topic, partition, and base-offset fields in parity with Rust, regenerate the stub after changes, and never turn an empty confirmation list into a client error.
-- `src/publish.rs`, `reader.rs`, `typed.rs`, `schema.rs`, `query.rs`, `watch.rs`, `kv.rs`, `fork.rs`, and `graph.rs` bind the data-platform write and read surfaces. Complex managed shapes cross through serde instead of hand-maintained mirror classes.
+- `src/publish.rs`, `reader.rs`, `typed.rs`, `schema.rs`, `query.rs`, `watch.rs`, `kv.rs`, `fork.rs`, `graph.rs`, and `filters.rs` bind the data-platform write and read surfaces. `filters.rs` binds `ConsumerFilter`, `FilterExpr`, the filtered reader, and the catalog client, and must stay in parity with `sdk/src/filters/`. Complex managed shapes cross through serde instead of hand-maintained mirror classes.
 - `src/agent.rs`, `agdx.rs`, `agent_runtime.rs`, `workflow.rs`, `runs.rs`, `rbac.rs`, `context.rs`, `memory.rs`, `state_store.rs`, and `sign.rs` expose agent behavior. Keep these bindings consistent with Rust. `laser.agdx(..., signing_key=)` signs producer envelopes, and `spawn_agent(signing_key=)` signs replies through `PyAgentCtx`. `verifier=` selects receive-side keys. The `agent_ctx` test helper also accepts `signing_key=`.
 
 `laser.sessions(*, stream=None, topics=None, memory_namespace=None, context_turns=None, context_tokens=None)` returns `Sessions`. Its `create(id)`, `start()`, and `open(conversation_id)` methods return a `Session`. `append(kind, data)` records a turn. `context(*, last_n, token_budget)` returns `list[SessionTurn]`, with `kind`, `payload`, `text()`, and `message` fields. The message includes its source `topic`.
@@ -72,7 +72,7 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- Python follows the shared workspace version, currently `0.4.1`. Its dependency must select the matching Rust `laser-sdk` crate.
+- Python follows the shared workspace version, currently `0.5.0`. Its dependency must select the matching Rust `laser-sdk` crate.
 
 ## Working on it
 

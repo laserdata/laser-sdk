@@ -51,6 +51,14 @@ use laser_wire::destination::{
     NewPartitionPolicy, PartitionStart, PhysicalTable, ProjectionRef, QueryRoute, QueryRouteId,
     QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
 };
+use laser_wire::filter::{
+    AckReceipt, AppliedPolicy, ConsumerFilter, FilterBinding, FilterCatalogCommand,
+    FilterCatalogOutcome, FilterCatalogReply, FilterConsumer, FilterError, FilterErrorReason,
+    FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterMutation, FilterMutationOutcome,
+    FilterMutationRequest, FilterMutationResult, FilterMutationStatus, FilterOutcome, FilterRef,
+    FilterReply, FilterRevisionRef, FilterSource, FilterValidation, FilteredAck, FilteredPage,
+    FilteredPollRequest, FilteredStart, ReadMode, SourceGeneration, StopReason,
+};
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
 };
@@ -2888,4 +2896,299 @@ mod agent_fixtures {
     fn channel() -> ChannelId {
         ChannelId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0006)
     }
+}
+
+fn canonical_safe_mode_filter() -> ConsumerFilter {
+    let satellites = FilterExpr::pred("table", CmpOp::Eq, "satellites");
+    ConsumerFilter::json(FilterExpr::any([
+        FilterExpr::all([
+            satellites.clone(),
+            FilterExpr::pred("op", CmpOp::Eq, "u"),
+            FilterExpr::pred("changed", CmpOp::Contains, "mode"),
+            FilterExpr::pred("after.mode", CmpOp::Eq, "safe"),
+        ]),
+        FilterExpr::all([satellites, FilterExpr::pred("op", CmpOp::Eq, "d")]),
+        FilterExpr::all([
+            FilterExpr::pred("event", CmpOp::Eq, "satellite.telemetry_changed"),
+            FilterExpr::present("fields.mode"),
+        ]),
+    ]))
+}
+
+fn canonical_generation() -> SourceGeneration {
+    SourceGeneration {
+        stream_id: 1,
+        stream_created_at_micros: TIMESTAMP_MICROS,
+        topic_id: 2,
+        topic_created_at_micros: TIMESTAMP_MICROS + 1,
+        partition_id: 0,
+        partition_created_revision: 17,
+        purge_generation: 0,
+    }
+}
+
+fn canonical_group() -> FilterGroupRef {
+    FilterGroupRef {
+        stream: "orbit".to_owned(),
+        topic: "fleet_changes".to_owned(),
+        group: "anomaly-desk".to_owned(),
+    }
+}
+
+fn canonical_identity() -> FilterGroupIdentity {
+    FilterGroupIdentity {
+        stream_id: 1,
+        stream_created_at_micros: TIMESTAMP_MICROS,
+        topic_id: 2,
+        topic_created_at_micros: TIMESTAMP_MICROS + 1,
+        group_id: 3,
+    }
+}
+
+#[test]
+fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures() {
+    let filter = canonical_safe_mode_filter();
+    assert_json("filter_consumer_filter.json", &filter);
+    assert_frame("filter_consumer_filter.bin", &filter);
+    assert_json(
+        "filter_validation.json",
+        &FilterValidation {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            digest: filter.digest(),
+            reads_payload: true,
+            reads_headers: false,
+        },
+    );
+    assert_frame(
+        "filter_poll_request.bin",
+        &FilteredPollRequest {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            partition_id: 0,
+            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+            filter: FilterRef::Revision {
+                filter_id: 1,
+                revision: 1,
+            },
+            start: FilteredStart::Next,
+            count: 200,
+            max_reply_bytes: 1024 * 1024,
+            read_mode: ReadMode::Primary,
+        },
+    );
+    assert_frame(
+        "filter_poll_request_group_id.bin",
+        &FilteredPollRequest {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            partition_id: 0,
+            consumer: FilterConsumer::GroupId(3),
+            filter: FilterRef::Bound,
+            start: FilteredStart::Next,
+            count: 200,
+            max_reply_bytes: 1024 * 1024,
+            read_mode: ReadMode::Primary,
+        },
+    );
+    assert_frame(
+        "filter_reply_revision_disabled.bin",
+        &FilterReply::Err(FilterError::new(
+            FilterErrorReason::RevisionDisabled,
+            "filter 1 revision 2 is disabled",
+        )),
+    );
+    assert_frame(
+        "filter_reply_page.bin",
+        &FilterReply::Ok(FilterOutcome::Page(FilteredPage {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            partition_id: 0,
+            policy: AppliedPolicy {
+                group_id: Some(canonical_identity().group_id),
+                digest: filter.digest(),
+                filter_id: Some(1),
+                revision: Some(1),
+            },
+            generation: canonical_generation(),
+            read_mode: ReadMode::Primary,
+            next_scan_offset: Some(1397),
+            safe_ack_offset: Some(1396),
+            frontier: 2000,
+            examined: 397,
+            matched: 0,
+            stop: StopReason::Budget,
+            fault: None,
+            unevaluated: Vec::new(),
+            evaluation_limits: None,
+            records: {
+                let mut body = vec![0; 16];
+                body[4..12].copy_from_slice(&2000_u64.to_le_bytes());
+                body
+            },
+        })),
+    );
+    assert_frame(
+        "filter_ack.bin",
+        &FilteredAck {
+            group_id: Some(canonical_identity().group_id),
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            partition_id: 0,
+            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+            generation: canonical_generation(),
+            digest: filter.digest(),
+            offset: 1396,
+        },
+    );
+    assert_frame(
+        "filter_reply_acknowledged.bin",
+        &FilterReply::Ok(FilterOutcome::Acknowledged(AckReceipt {
+            partition_id: 0,
+            offset: 1396,
+            generation: canonical_generation(),
+        })),
+    );
+    assert_frame(
+        "filter_reply_error.bin",
+        &FilterReply::Err(FilterError::new(
+            FilterErrorReason::SourceChanged,
+            "partition 0 was purged",
+        )),
+    );
+}
+
+#[test]
+fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() {
+    let filter = canonical_safe_mode_filter();
+    let register = FilterMutationRequest {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        operation_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+        mutation: FilterMutation::Register {
+            name: "sats-safe-mode".to_owned(),
+            description: "Satellites entering safe mode".to_owned(),
+            filter: filter.clone(),
+        },
+    };
+    assert_frame("filter_mutation_register.bin", &register);
+    assert_json("filter_mutation_register.json", &register);
+    let unbind = FilterMutationRequest {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        operation_id: 10,
+        mutation: FilterMutation::Unbind {
+            group: canonical_group(),
+            expected_digest: filter.digest(),
+            expected_identity: Some(canonical_identity()),
+        },
+    };
+    assert_frame("filter_mutation_unbind_exact.bin", &unbind);
+    assert_json("filter_mutation_unbind_exact.json", &unbind);
+    let binding = FilterBinding {
+        group: canonical_group(),
+        identity: canonical_identity(),
+        filter_id: 1,
+        revision: 1,
+        digest: filter.digest(),
+        bound_at_micros: TIMESTAMP_MICROS,
+    };
+    assert_frame(
+        "filter_catalog_reply_bound.bin",
+        &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Mutation(
+            FilterMutationOutcome {
+                v: laser_wire::codes::FILTER_OP_VERSION,
+                operation_id: 7,
+                status: FilterMutationStatus::Applied(FilterMutationResult::Bound(binding)),
+            },
+        ))),
+    );
+    assert_frame(
+        "filter_catalog_reply_registered.bin",
+        &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Mutation(
+            FilterMutationOutcome {
+                v: laser_wire::codes::FILTER_OP_VERSION,
+                operation_id: 8,
+                status: FilterMutationStatus::Applied(FilterMutationResult::Registered(
+                    FilterRevisionRef {
+                        filter_id: 1,
+                        revision: 1,
+                        digest: filter.digest(),
+                    },
+                )),
+            },
+        ))),
+    );
+    let revision_state = FilterMutationRequest {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        operation_id: 9,
+        mutation: FilterMutation::SetRevisionEnabled {
+            filter_id: 1,
+            revision: 2,
+            enabled: false,
+        },
+    };
+    assert_frame("filter_mutation_revision_state.bin", &revision_state);
+    assert_json("filter_mutation_revision_state.json", &revision_state);
+    assert_frame(
+        "filter_catalog_reply_revision_state.bin",
+        &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Mutation(
+            FilterMutationOutcome {
+                v: laser_wire::codes::FILTER_OP_VERSION,
+                operation_id: 9,
+                status: FilterMutationStatus::Applied(FilterMutationResult::RevisionState {
+                    filter_id: 1,
+                    revision: 2,
+                    enabled: false,
+                }),
+            },
+        ))),
+    );
+    assert_frame(
+        "filter_catalog_reply_revisions.bin",
+        &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Revisions(
+            laser_wire::filter::FilterRevisionPage {
+                filter_id: 1,
+                total: 2,
+                page: 0,
+                page_size: 50,
+                items: [true, false]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, enabled)| laser_wire::filter::FilterRevisionInfo {
+                        enabled,
+                        revision: index as u32 + 1,
+                        digest: canonical_safe_mode_filter().digest(),
+                        filter: canonical_safe_mode_filter(),
+                        created_at_micros: TIMESTAMP_MICROS,
+                    })
+                    .collect(),
+            },
+        ))),
+    );
+    assert_frame(
+        "control_filter_catalog.bin",
+        &ControlEnvelope {
+            v: CONTROL_OP_VERSION,
+            timestamp_micros: TIMESTAMP_MICROS,
+            command: ControlCommand::FilterCatalog(FilterCatalogCommand {
+                limits: Some(laser_wire::filter::FilterCatalogLimits::default()),
+                operation_id: 9,
+                actor_user_id: 1,
+                mutation: FilterMutation::Bind {
+                    group: canonical_group(),
+                    filter_id: 1,
+                    revision: 1,
+                },
+                identity: Some(canonical_identity()),
+                filter_id: None,
+                grants: Vec::new(),
+            }),
+        },
+    );
 }

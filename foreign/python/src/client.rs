@@ -119,7 +119,7 @@ impl PyLaser {
     /// intended for bring-your-own backends and deterministic pre-gate tests.
     /// Omitted fields preserve the current capability set.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, filters=None, filters_catalog=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
     fn with_capabilities<'py>(
         &self,
         py: Python<'py>,
@@ -138,6 +138,8 @@ impl PyLaser {
         agent_workflow: Option<bool>,
         watch: Option<bool>,
         authz: Option<bool>,
+        filters: Option<bool>,
+        filters_catalog: Option<bool>,
         a2a_gateway: Option<bool>,
         sessions: Option<bool>,
         durable_dedup: Option<bool>,
@@ -206,6 +208,12 @@ impl PyLaser {
             }
             if let Some(value) = authz {
                 capabilities.authz = value;
+            }
+            if let Some(value) = filters {
+                capabilities.filters.native = value;
+            }
+            if let Some(value) = filters_catalog {
+                capabilities.filters.catalog = value;
             }
             if let Some(value) = a2a_gateway {
                 capabilities.a2a_gateway = value;
@@ -344,6 +352,28 @@ impl PyLaser {
     }
 }
 
+/// Consumer-filter evaluator version and codecs advertised by the server.
+#[gen_stub_pyclass]
+#[pyclass(name = "FilterAnnounce", frozen, get_all, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyFilterAnnounce {
+    pub evaluator_version: u32,
+    pub codecs: Vec<String>,
+}
+
+impl From<laser_sdk::wire::hello::FilterAnnounce> for PyFilterAnnounce {
+    fn from(value: laser_sdk::wire::hello::FilterAnnounce) -> Self {
+        Self {
+            evaluator_version: value.evaluator_version,
+            codecs: value
+                .codecs
+                .into_iter()
+                .map(|codec| codec.to_string())
+                .collect(),
+        }
+    }
+}
+
 /// A read-only snapshot of the premium capability set the connected
 /// infrastructure advertised. All flags are false against Apache Iggy.
 #[gen_stub_pyclass]
@@ -388,6 +418,11 @@ pub struct PyCapabilities {
     /// The authorization control surface is served (`Laser.whoami()` and the
     /// role/binding verbs).
     pub authz: bool,
+    /// Consumer filters are served by the streaming server (`Laser.filters()`
+    /// readers, previews, sample tests, validation).
+    pub filters: bool,
+    /// The saved-filter catalog and group bindings are served.
+    pub filters_catalog: bool,
     /// A managed A2A gateway is available.
     pub a2a_gateway: bool,
     /// Platform-native session lifecycle.
@@ -400,6 +435,7 @@ pub struct PyCapabilities {
     /// The materialization backends the connected server exposes (identity
     /// only). Empty against Apache Iggy and servers that advertise none.
     pub backends: Vec<PyBackendDescriptor>,
+    pub evaluation: Option<PyFilterAnnounce>,
 }
 
 impl From<Capabilities> for PyCapabilities {
@@ -429,6 +465,9 @@ impl From<Capabilities> for PyCapabilities {
             agent_workflow: value.agent_workflow,
             watch: value.watch,
             authz: value.authz,
+            filters: value.filters.native,
+            filters_catalog: value.filters.catalog,
+            evaluation: value.filters.evaluation.map(PyFilterAnnounce::from),
             a2a_gateway: value.a2a_gateway,
             sessions: value.sessions,
             durable_dedup: value.durable_dedup,
@@ -512,6 +551,7 @@ pub struct PyOpVersions {
     pub agent: u32,
     pub graph: u32,
     pub checkpoint: u32,
+    pub filter: u32,
     pub features: u64,
 }
 
@@ -525,6 +565,7 @@ impl From<OpVersions> for PyOpVersions {
             agent: value.agent,
             graph: value.graph,
             checkpoint: value.checkpoint,
+            filter: value.filter,
             features: value.features,
         }
     }
@@ -535,7 +576,7 @@ impl From<OpVersions> for PyOpVersions {
 impl PyOpVersions {
     fn __repr__(&self) -> String {
         format!(
-            "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, checkpoint={}, features={})",
+            "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, checkpoint={}, filter={}, features={})",
             self.query,
             self.control,
             self.kv,
@@ -543,6 +584,7 @@ impl PyOpVersions {
             self.agent,
             self.graph,
             self.checkpoint,
+            self.filter,
             self.features
         )
     }

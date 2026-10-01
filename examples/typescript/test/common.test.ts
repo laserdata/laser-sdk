@@ -5,9 +5,8 @@ import {
   AsyncResourceGroup,
   Rng,
   ensureDefaultPort,
-  releaseStream,
+  resetStream,
   resolveConnectionString,
-  runToken,
   streamFor
 } from "../src/common.js"
 
@@ -46,8 +45,8 @@ void test("given_connection_environment_when_resolved_then_should_preserve_share
     }),
     "iggy+tcp://secret@cloud.example:8090"
   )
-  assert.equal(streamFor("interop", {}), `laser-interop-${runToken()}`)
-  assert.equal(streamFor("interop", { LASER_STREAM: "tenant-stream" }), "tenant-stream")
+  assert.equal(streamFor("interop", {}), "laser-interop-typescript")
+  assert.equal(streamFor("interop", { LASER_STREAM: "org-stream" }), "org-stream")
 })
 
 void test("given_a_host_without_a_port_when_normalized_then_should_add_the_default", () => {
@@ -149,7 +148,7 @@ void test("given_a_string_with_its_own_ca_when_resolved_then_should_not_attach_t
   )
 })
 
-void test("given_a_run_owned_stream_when_released_then_should_delete_only_that_stream", async () => {
+void test("given_a_run_owned_stream_when_reset_then_should_delete_only_that_stream", async () => {
   const deleted: string[] = []
   const laser = {
     stream: (name: string) => ({
@@ -160,8 +159,8 @@ void test("given_a_run_owned_stream_when_released_then_should_delete_only_that_s
     })
   } as unknown as Laser
 
-  await releaseStream(laser, "agent", {})
-  await releaseStream(laser, "agent", { LASER_STREAM: "provisioned" })
+  await resetStream(laser, "agent", {})
+  await resetStream(laser, "agent", { LASER_STREAM: "provisioned" })
 
   assert.deepEqual(deleted, [streamFor("agent", {})])
 })

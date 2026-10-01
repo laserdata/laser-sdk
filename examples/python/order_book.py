@@ -317,7 +317,7 @@ async def main() -> None:
         elif caps.query:
             print("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

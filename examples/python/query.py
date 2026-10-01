@@ -61,7 +61,7 @@ async def main() -> None:
         for row in paid.rows:
             print(f"    order #{paid.value_text(row, 'id')} total {paid.value_text(row, 'total')}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

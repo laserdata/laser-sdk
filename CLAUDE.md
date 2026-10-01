@@ -6,7 +6,7 @@ This workspace holds the `wire/` and `sdk/` Rust crates, Python bindings under `
 
 The streaming layer provides Laser producers and continuous consumers with server-stored offsets. Apache Iggy builders, client, and types remain available for detailed configuration. All clients use the Iggy transport. Managed reads use the non-replicated extension, and the server classifies the three authorization writes as dedicated replicated operations.
 
-Area skills are under `.claude/skills/`. Start with [laser-sdk-overview](.claude/skills/laser-sdk-overview/SKILL.md). TypeScript work also loads [typescript-sdk](.claude/skills/typescript-sdk/SKILL.md).
+Area skills are under `.claude/skills/`. Start with [laser-sdk-overview](.claude/skills/laser-sdk-overview/SKILL.md). TypeScript work also loads [typescript-sdk](.claude/skills/typescript-sdk/SKILL.md). Consumer filters (`sdk/src/filters/`, `wire/src/filter/`, and their TypeScript and Python peers) load [consumer-filters](.claude/skills/consumer-filters/SKILL.md).
 
 The [AGDX specification](docs/agdx.md) defines streams, topics, headers, envelopes, queries, and limits. `laser-wire` implements these types, and `wire/fixtures/` defines their expected encoding.
 
@@ -16,7 +16,7 @@ Memory governance applies to both log-backed and in-process vector handles creat
 
 ## Connect timeout
 
-Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples delete their per-run stream on exit. See [connect timeout and cleanup](docs/connect-timeout.md).
+Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples reset their own stream at the start of a run and keep it afterwards. See [connect timeout and cleanup](docs/connect-timeout.md).
 
 ## Publish recovery
 

@@ -1,0 +1,105 @@
+{
+  "v": 1,
+  "operation_id": "1339673755198158349044581307228491536",
+  "mutation": {
+    "register": {
+      "name": "sats-safe-mode",
+      "description": "Satellites entering safe mode",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      }
+    }
+  }
+}

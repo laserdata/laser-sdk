@@ -13,8 +13,21 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "foreign" / "python"))
 from iggy_test_server import IggyTestServer  # noqa: E402
 
 
+# `LASER_BDD_PLANE=1` marks a stack with a managed plane, which skips the
+# `@no_plane` scenarios.
 def pytest_configure(config):
     config.addinivalue_line("markers", "bridges: edge bridge interoperability scenarios")
+    config.addinivalue_line("markers", "plane: requires a managed plane")
+    config.addinivalue_line("markers", "no_plane: requires a server without a managed plane")
+
+
+def pytest_collection_modifyitems(config, items):
+    plane = bool(os.environ.get("LASER_BDD_PLANE"))
+    for item in items:
+        if (plane and "no_plane" in item.keywords) or (not plane and "plane" in item.keywords):
+            item.add_marker(
+                pytest.mark.skip(reason="scenario requires another deployment capability")
+            )
 
 
 @pytest.fixture(scope="session")
@@ -51,6 +64,7 @@ class World:
         self.count = None
         self.caps = None
         self.error = None
+        self.filtered = []
 
     def run(self, factory):
         # `factory` is a zero-arg callable returning a coroutine. The binding's
@@ -121,6 +135,8 @@ class Bench:
         self.memory_ids = {}
         self.graph_engine = None
         self.data_stack = None
+        self.filter = None
+        self.verdict = None
 
 
 @pytest.fixture

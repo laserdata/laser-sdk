@@ -32,6 +32,14 @@
   "agent_workflow": false,
   "watch": false,
   "authz": false,
+  "filters": {
+    "native": false,
+    "preview": false,
+    "primary_routing": false,
+    "catalog": false,
+    "managed_groups": false,
+    "evaluator_version": 0
+  },
   "versions": {
     "query": 1,
     "control": 1,

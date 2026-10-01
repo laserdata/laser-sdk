@@ -14,8 +14,10 @@ llm-openai = ["dep:reqwest"]
 
 [dependencies]
 async-trait = { workspace = true }
+ciborium = { workspace = true }
 futures = { workspace = true }
 laser-sdk = { workspace = true, features = ["a2a-bridge", "agui", "managed", "mcp-bridge", "schema-codecs", "streaming"] }
+prost = { workspace = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,6 +41,10 @@ path = "src/watch/main.rs"
 [[example]]
 name = "kv"
 path = "src/kv/main.rs"
+
+[[example]]
+name = "cdc"
+path = "src/cdc/main.rs"
 
 [[example]]
 name = "graph"

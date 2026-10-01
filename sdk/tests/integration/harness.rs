@@ -38,6 +38,25 @@ pub async fn laser() -> Laser {
     laser
 }
 
+/// A `Laser` connected through a connection string, on a data stream unique to
+/// this test. The connect-time probe runs, and dedicated data connections can
+/// open with the same credentials.
+pub async fn connected_laser() -> Laser {
+    connected_laser_on(iggy().await).await
+}
+
+pub async fn connected_laser_on(server: &TestIggy) -> Laser {
+    let _bootstrap = BOOTSTRAP.lock().await;
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let stream = format!("it_{}_{id}", std::process::id());
+    let laser = Laser::connect(&server.connection_string())
+        .await
+        .expect("connect")
+        .with_default_stream(stream);
+    laser.bootstrap(1).await.expect("bootstrap");
+    laser
+}
+
 pub async fn reconnect(existing: &Laser) -> Laser {
     let stream = existing
         .default_stream()

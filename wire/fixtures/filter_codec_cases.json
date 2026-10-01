@@ -1,0 +1,2091 @@
+{
+  "schemas": [
+    {
+      "id": 1,
+      "source": {
+        "kind": "avro",
+        "schema": "{\"type\":\"record\",\"name\":\"Change\",\"fields\":[{\"name\":\"counter\",\"type\":\"long\"},{\"name\":\"mode\",\"type\":\"string\"},{\"name\":\"values\",\"type\":{\"type\":\"array\",\"items\":\"int\"}}]}"
+      }
+    },
+    {
+      "id": 2,
+      "source": {
+        "kind": "protobuf",
+        "descriptor_set": [
+          10,
+          155,
+          1,
+          10,
+          11,
+          102,
+          108,
+          101,
+          101,
+          116,
+          46,
+          112,
+          114,
+          111,
+          116,
+          111,
+          18,
+          5,
+          102,
+          108,
+          101,
+          101,
+          116,
+          34,
+          125,
+          10,
+          6,
+          67,
+          104,
+          97,
+          110,
+          103,
+          101,
+          18,
+          24,
+          10,
+          7,
+          99,
+          111,
+          117,
+          110,
+          116,
+          101,
+          114,
+          24,
+          1,
+          32,
+          1,
+          40,
+          3,
+          66,
+          2,
+          16,
+          0,
+          72,
+          0,
+          136,
+          1,
+          1,
+          18,
+          21,
+          10,
+          4,
+          109,
+          111,
+          100,
+          101,
+          24,
+          2,
+          32,
+          1,
+          40,
+          9,
+          66,
+          2,
+          16,
+          0,
+          72,
+          1,
+          136,
+          1,
+          1,
+          18,
+          18,
+          10,
+          6,
+          118,
+          97,
+          108,
+          117,
+          101,
+          115,
+          24,
+          3,
+          32,
+          3,
+          40,
+          5,
+          66,
+          2,
+          16,
+          0,
+          18,
+          25,
+          10,
+          5,
+          99,
+          104,
+          105,
+          108,
+          100,
+          24,
+          4,
+          32,
+          1,
+          40,
+          11,
+          50,
+          6,
+          67,
+          104,
+          97,
+          110,
+          103,
+          101,
+          66,
+          2,
+          16,
+          0,
+          66,
+          10,
+          10,
+          8,
+          95,
+          99,
+          111,
+          117,
+          110,
+          116,
+          101,
+          114,
+          66,
+          7,
+          10,
+          5,
+          95,
+          109,
+          111,
+          100,
+          101,
+          98,
+          6,
+          112,
+          114,
+          111,
+          116,
+          111,
+          51
+        ],
+        "message_type": "fleet.Change"
+      }
+    },
+    {
+      "id": 3,
+      "source": {
+        "kind": "avro",
+        "schema": "{\"type\":\"record\",\"name\":\"ByteFields\",\"fields\":[{\"name\":\"data\",\"type\":\"bytes\"},{\"name\":\"tag\",\"type\":{\"type\":\"fixed\",\"name\":\"Tag\",\"size\":2}},{\"name\":\"spare\",\"type\":\"string\"}]}"
+      }
+    },
+    {
+      "id": 4,
+      "source": {
+        "kind": "avro",
+        "schema": "{\"type\":\"record\",\"name\":\"LogicalBytes\",\"fields\":[{\"name\":\"dec\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":8,\"scale\":2}},{\"name\":\"span\",\"type\":{\"type\":\"fixed\",\"name\":\"Span\",\"size\":12,\"logicalType\":\"duration\"}},{\"name\":\"id\",\"type\":{\"type\":\"fixed\",\"name\":\"Identity\",\"size\":16,\"logicalType\":\"uuid\"}}]}"
+      }
+    },
+    {
+      "id": 5,
+      "source": {
+        "kind": "avro",
+        "schema": "{\"type\":\"record\",\"name\":\"Unions\",\"fields\":[{\"name\":\"body\",\"type\":[{\"type\":\"record\",\"name\":\"Alpha\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]},{\"type\":\"record\",\"name\":\"Beta\",\"fields\":[{\"name\":\"x\",\"type\":\"long\"}]}]}]}"
+      }
+    },
+    {
+      "id": 6,
+      "source": {
+        "kind": "avro",
+        "schema": "{\"type\":\"record\",\"name\":\"TextUnion\",\"fields\":[{\"name\":\"status\",\"type\":[\"string\",{\"type\":\"enum\",\"name\":\"State\",\"symbols\":[\"ready\",\"warm\"]}]}]}"
+      }
+    },
+    {
+      "id": 7,
+      "source": {
+        "kind": "protobuf",
+        "descriptor_set": [
+          10,
+          198,
+          1,
+          10,
+          12,
+          112,
+          97,
+          114,
+          105,
+          116,
+          121,
+          46,
+          112,
+          114,
+          111,
+          116,
+          111,
+          18,
+          6,
+          112,
+          97,
+          114,
+          105,
+          116,
+          121,
+          34,
+          165,
+          1,
+          10,
+          7,
+          77,
+          101,
+          116,
+          114,
+          105,
+          99,
+          115,
+          18,
+          19,
+          10,
+          7,
+          99,
+          111,
+          117,
+          110,
+          116,
+          101,
+          114,
+          24,
+          1,
+          32,
+          1,
+          40,
+          3,
+          66,
+          2,
+          16,
+          0,
+          18,
+          17,
+          10,
+          5,
+          114,
+          97,
+          116,
+          105,
+          111,
+          24,
+          2,
+          32,
+          1,
+          40,
+          1,
+          66,
+          2,
+          16,
+          0,
+          18,
+          26,
+          10,
+          6,
+          99,
+          111,
+          117,
+          110,
+          116,
+          115,
+          24,
+          3,
+          32,
+          3,
+          40,
+          11,
+          50,
+          6,
+          67,
+          111,
+          117,
+          110,
+          116,
+          115,
+          66,
+          2,
+          16,
+          0,
+          18,
+          16,
+          10,
+          4,
+          116,
+          101,
+          120,
+          116,
+          24,
+          4,
+          32,
+          1,
+          40,
+          9,
+          66,
+          2,
+          16,
+          0,
+          18,
+          26,
+          10,
+          5,
+          99,
+          104,
+          105,
+          108,
+          100,
+          24,
+          5,
+          32,
+          1,
+          40,
+          11,
+          50,
+          7,
+          77,
+          101,
+          116,
+          114,
+          105,
+          99,
+          115,
+          66,
+          2,
+          16,
+          0,
+          26,
+          40,
+          10,
+          6,
+          67,
+          111,
+          117,
+          110,
+          116,
+          115,
+          18,
+          11,
+          10,
+          3,
+          107,
+          101,
+          121,
+          24,
+          1,
+          32,
+          1,
+          40,
+          3,
+          18,
+          13,
+          10,
+          5,
+          118,
+          97,
+          108,
+          117,
+          101,
+          24,
+          2,
+          32,
+          1,
+          40,
+          3,
+          58,
+          2,
+          56,
+          1,
+          98,
+          6,
+          112,
+          114,
+          111,
+          116,
+          111,
+          51
+        ],
+        "message_type": "parity.Metrics"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "avro exact 42",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "54087361666504020400",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf exact 42",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "082a1204736166651a020102",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "cbor exact 42",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "a167636f756e7465721b000000000000002a",
+      "headers": [],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro exact 9007199254740993",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 9007199254740993
+            }
+          }
+        }
+      },
+      "payload_hex": "8280808080808020087361666504020400",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf exact 9007199254740993",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 9007199254740993
+            }
+          }
+        }
+      },
+      "payload_hex": "0881808080808080101204736166651a020102",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "cbor exact 9007199254740993",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 9007199254740993
+            }
+          }
+        }
+      },
+      "payload_hex": "a167636f756e7465721b0020000000000001",
+      "headers": [],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro exact -9007199254740993",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": -9007199254740993
+            }
+          }
+        }
+      },
+      "payload_hex": "8180808080808020087361666504020400",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf exact -9007199254740993",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": -9007199254740993
+            }
+          }
+        }
+      },
+      "payload_hex": "08ffffffffffffffefff011204736166651a020102",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "cbor exact -9007199254740993",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": -9007199254740993
+            }
+          }
+        }
+      },
+      "payload_hex": "a167636f756e7465723b0020000000000000",
+      "headers": [],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro missing schema passed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        },
+        "foreign_policy": "pass"
+      },
+      "payload_hex": "54087361666500",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "missing_schema"
+    },
+    {
+      "name": "avro foreign schema passed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        },
+        "foreign_policy": "pass"
+      },
+      "payload_hex": "54087361666500",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 99
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "schema_not_allowed"
+    },
+    {
+      "name": "avro truncated",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "ff",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "avro size limit",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "54087361666500",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1,
+      "fault": "too_large"
+    },
+    {
+      "name": "avro header short circuit",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "any": [
+            {
+              "header": {
+                "key": "route",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "yes"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "counter",
+                "op": "eq",
+                "value": {
+                  "kind": "long",
+                  "value": 42
+                }
+              }
+            }
+          ]
+        }
+      },
+      "payload_hex": "ff",
+      "headers": [
+        {
+          "key": "route",
+          "value": {
+            "kind": "string",
+            "value": "yes"
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf missing schema passed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        },
+        "foreign_policy": "pass"
+      },
+      "payload_hex": "082a",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "missing_schema"
+    },
+    {
+      "name": "protobuf foreign schema passed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        },
+        "foreign_policy": "pass"
+      },
+      "payload_hex": "082a",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 99
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "schema_not_allowed"
+    },
+    {
+      "name": "protobuf truncated",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "ff",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "protobuf size limit",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "082a",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1,
+      "fault": "too_large"
+    },
+    {
+      "name": "protobuf header short circuit",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "any": [
+            {
+              "header": {
+                "key": "route",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "yes"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "counter",
+                "op": "eq",
+                "value": {
+                  "kind": "long",
+                  "value": 42
+                }
+              }
+            }
+          ]
+        }
+      },
+      "payload_hex": "ff",
+      "headers": [
+        {
+          "key": "route",
+          "value": {
+            "kind": "string",
+            "value": "yes"
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro negative block",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "5408736166650304020400",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro huge null array budget",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "540873616665808080808040",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "too_large"
+    },
+    {
+      "name": "avro trailing bytes",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "5408736166650000",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor tags",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "c001",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor indefinite",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "9f01ff",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor nontext map key",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "a10101",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor duplicate keys",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "a2616101616102",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor infinity",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "f97c00",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor trailing",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "0102",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor depth",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "81818100",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 1,
+      "max_payload_bytes": 1048576,
+      "fault": "too_deep"
+    },
+    {
+      "name": "protobuf depth",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "22022200",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 1,
+      "max_payload_bytes": 1048576,
+      "fault": "too_deep"
+    },
+    {
+      "name": "avro missing schema rejected by default",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "54087361666500",
+      "headers": [],
+      "expected": "rejected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "missing_schema"
+    },
+    {
+      "name": "avro foreign schema rejected by default",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          1
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "54087361666500",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 99
+          }
+        }
+      ],
+      "expected": "rejected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "schema_not_allowed"
+    },
+    {
+      "name": "protobuf missing schema rejected by default",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "082a",
+      "headers": [],
+      "expected": "rejected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "missing_schema"
+    },
+    {
+      "name": "protobuf foreign schema rejected by default",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          2
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "082a",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 99
+          }
+        }
+      ],
+      "expected": "rejected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "schema_not_allowed"
+    },
+    {
+      "name": "avro bytes compare as integer arrays",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          3
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "data[1]",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 127
+            }
+          }
+        }
+      },
+      "payload_hex": "06007fffaabb06616263",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 3
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro fixed compare as integer arrays",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          3
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "tag[0]",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 170
+            }
+          }
+        }
+      },
+      "payload_hex": "06007fffaabb06616263",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 3
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro unused invalid text still faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          3
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "data[1]",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 127
+            }
+          }
+        }
+      },
+      "payload_hex": "06007fffaabb02ff",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 3
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "avro decimal uses physical bytes",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          4
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "dec[1]",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 244
+            }
+          }
+        }
+      },
+      "payload_hex": "0401f4000000000000000000000000000102030405060708090a0b0c0d0e0f",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 4
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro duration uses physical fixed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          4
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "span[11]",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "0401f4000000000000000000000000000102030405060708090a0b0c0d0e0f",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 4
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro fixed uuid uses physical bytes",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          4
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "id[15]",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 15
+            }
+          }
+        }
+      },
+      "payload_hex": "0401f4000000000000000000000000000102030405060708090a0b0c0d0e0f",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 4
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf omitted proto3 integer default",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          7
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 7
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf absent message preserves presence",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          7
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "absent": "child"
+        }
+      },
+      "payload_hex": "",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 7
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf int64 map key is decimal text",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          7
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counts.42",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 9
+            }
+          }
+        }
+      },
+      "payload_hex": "1a04082a1009",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 7
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "protobuf unread invalid UTF8 faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          7
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "2202c328",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 7
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "avro ambiguous record union",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          5
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "body.x",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 42
+            }
+          }
+        }
+      },
+      "payload_hex": "0054",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 5
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "avro string and enum union",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "avro",
+        "schema_refs": [
+          6
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "status",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "ready"
+            }
+          }
+        }
+      },
+      "payload_hex": "0200",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 6
+          }
+        }
+      ],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "cbor undefined preserves presence",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "present": "counter"
+        }
+      },
+      "payload_hex": "a167636f756e746572f7",
+      "headers": [],
+      "expected": "selected",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576
+    },
+    {
+      "name": "cbor invalid UTF8 faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "a167636f756e74657262c328",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor negative integer below i64 minimum faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred": {
+            "field": "counter",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "a167636f756e7465723bffffffffffffffff",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "malformed"
+    },
+    {
+      "name": "cbor integral float is not epoch integer",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "cbor",
+        "schema_refs": [],
+        "fault_policy": "stop",
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "counter",
+              "op": "eq",
+              "value": {
+                "kind": "long",
+                "value": 42
+              }
+            },
+            "coerce": {
+              "kind": "timestamp",
+              "format": "epoch_seconds"
+            }
+          }
+        },
+        "mismatch_policy": "pass"
+      },
+      "payload_hex": "a167636f756e746572fb4045000000000000",
+      "headers": [],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "protobuf integral float is not epoch integer",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "codec": "protobuf",
+        "schema_refs": [
+          7
+        ],
+        "fault_policy": "stop",
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "ratio",
+              "op": "eq",
+              "value": {
+                "kind": "long",
+                "value": 42
+              }
+            },
+            "coerce": {
+              "kind": "timestamp",
+              "format": "epoch_seconds"
+            }
+          }
+        },
+        "mismatch_policy": "pass"
+      },
+      "payload_hex": "110000000000004540",
+      "headers": [
+        {
+          "key": "agdx.sid",
+          "value": {
+            "kind": "uint",
+            "value": 7
+          }
+        }
+      ],
+      "expected": "fault",
+      "max_depth": 64,
+      "max_payload_bytes": 1048576,
+      "fault": "type_mismatch"
+    }
+  ]
+}

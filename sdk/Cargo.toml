@@ -38,6 +38,15 @@ agent = [
     "provenance",
     "streaming",
 ]
+# Server-side consumer filters: filtered reads with fenced acknowledgments,
+# the saved-filter catalog, group bindings, previews, and the shared evaluator
+# for local checks, over the `AGDX_FILTER*` delivery commands.
+filters = [
+    "dep:iggy_binary_protocol",
+    "dep:secrecy",
+    "laser-wire/filter-eval",
+    "streaming",
+]
 # Copy-on-write forks of the materialized read model: the `ForkHandle` and its
 # fluent builders over the `AGDX_FORK` managed commands.
 fork = ["streaming"]
@@ -58,6 +67,7 @@ kv = ["dep:async-trait", "dep:trait-variant", "streaming"]
 # features compose it.
 managed = [
     "destinations",
+    "filters",
     "fork",
     "graph",
     "kv",
@@ -124,11 +134,13 @@ dashmap = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 iggy = { workspace = true }
+iggy_binary_protocol = { workspace = true, optional = true }
 iggy_common = { workspace = true, optional = true }
 json-patch = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
 laser-wire = { workspace = true, features = ["builders", "cbor"] }
 prost-reflect = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

@@ -73,15 +73,21 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
     codes.rs            managed command codes + per-surface op versions (incl. AGENT_OP_VERSION)
     headers.rs          agdx.* / gen_ai.* header dictionaries + header caps (incl. agdx.av)
     topics.rs           _agdx ops stream + topic names
-    limits.rs           page / KV / frame / agent-envelope caps
+    limits.rs           page / KV / frame / agent-envelope / consumer-filter caps (MAX_FILTER_*, MAX_FILTERED_PAGE_*)
     content.rs          ContentType + the agdx.ct u8 dictionary
-    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
+    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES,CONSUMER_FILTERS}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
     query.rs            query IR (incl. Consistency level) + QueryEnvelope/QueryReply/Row/QueryError (incl. Stale)
     result.rs           unified ResultCode space + HTTP status, From projections off every surface error
     browse.rs           registry browse requests + BrowseReply (incl. DecodeRecord)
     control.rs          Projection / ProjectionBinding / SchemaDef / ControlEnvelope + builders
     kv.rs               KV requests (incl. KvCas/CasExpect and the fenced-lease family KvLease/KvLeaseRenew/KvRelease/KvCasFenced at KV_LEASE_OP_VERSION 1: holder identity, delegated subject, coordination namespace, barriered KvGet.min_position) + KvReply (incl. Committed/Leased/Renewed) / KvError (incl. VersionConflict/LeaseLost/Stale) + entry version
     fork.rs             fork requests + ForkReply/ForkError
+    filter/             consumer filters: expr (ConsumerFilter + FilterExpr builders, record
+                        policies), path, text (six match kinds), coerce, read (filtered poll,
+                        ack, preview, test, the reason codes), catalog (saved filters,
+                        revisions, group bindings, mutations and outcomes), headers (the
+                        typed header dictionary), codecs (JSON/CBOR/Avro/Protobuf decode),
+                        eval (the compiled evaluator, feature filter-eval)
     agent.rs            the Agent Data Exchange Protocol: AgentEnvelope, machine ids (16-byte u128 + Crockford), agent ids (bounded name strings)
                         base32), AgentKind, TaskState/AgentErrorCode/DeadLetterReason u8
                         dictionaries, TokenUsage, AgentDeadLetter, dormant Signature,
@@ -107,10 +113,19 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
     robustness.rs       deterministic decode-never-panics suite: random + byte-flipped
                         + truncated inputs through the framer and every envelope
     constants.rs        every code / key / topic / cap pinned as a LITERAL
+    filter_eval_corpus.rs  the cross-language evaluator corpus over
+                        fixtures/filter_eval_cases.json + filter_codec_cases.json, the
+                        verdicts Rust, TypeScript, and Python must all reproduce
 fuzz/                   cargo-fuzz crate (nightly, outside the workspace): the
                         frame_decode and decode_envelope targets, run via just fuzz
 sdk/src/
   lib.rs              module wiring + LaserError re-export + `pub use laser_wire as wire`
+  filters/            (feature filters) Laser::filters: client.rs (validate/test/preview, the
+                      catalog verbs, apply/apply_as/wait_for_outcome), reader.rs (the filtered
+                      reader + builder, MatchedPage/MatchedRecord, ack/ack_through/ack_page,
+                      the outstanding-page bound), group.rs (group membership + rejoin
+                      refusal on a recreated source), guard.rs (the local re-check),
+                      progress.rs, route.rs
   error.rs            LaserError (the one crate error, maps wire DecodeError/InvalidError)
   prelude.rs          the single glob downstreams import
   laser.rs            Laser + LaserBuilder: connect/connect_env/connect_with_stream/local,
@@ -302,8 +317,8 @@ scripts/run-bdd-tests.sh  driver for the per-language BDD runners
 examples/rust/          [[example]] bins under src/<scenario>/main.rs, LlmClient seam in lib.rs
 examples/python/        one runnable script per scenario + a shared _common.py connect helper
 examples/typescript/    nine non-benchmark mirrors, one entry point + README per scenario
-                        all three also carry the eight per-primitive examples (log,
-                        query, watch, kv, graph, recall, context, agent), held
+                        all three also carry the nine per-primitive examples (log,
+                        query, watch, kv, cdc, graph, recall, context, agent), held
                         step-for-step identical across the languages
 docs/                   tutorial.md (progressive guide), building-agents.md (scenario
                         -> SDK recipe guide), agdx.md (the AGDX spec),
@@ -344,13 +359,15 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.4.1` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.5.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as durable duplicate suppression, graphs, and an A2A gateway. Memory combines query and graph operations and has no separate managed command group.
 
 The open SDK supports provenance, causality, context, memory, routing, sessions, and state. Reliable consumption supports graceful drain, `ConcurrencyPolicy::SerialPerPartition`, `AgentMiddleware`, `DeadLetterSink`, and `Agent::builder` retry, verifier, and duplicate-suppression controls. `laser_sdk::testing`, `respond_on`, and `AgentCtx` support handlers.
 
 Streaming provides producers and continuous partition or consumer-group readers with exact headers, routing, retries, commits, and server offsets. Apache Iggy controls stream and topic access. Its builders remain available for detailed configuration. Python exposes the same underlying streaming implementation.
+
+Consumer filters (`filters` feature, `sdk/src/filters/`) select records on the LaserData Iggy fork before they cross the network. `Laser::filters().reader(stream, topic)` reads one consumer or a consumer group through the partition primary, delivers `MatchedRecord`s with their original offsets, stores progress only through fenced acknowledgments (`ack`, `ack_through`, `ack_page`), and bounds outstanding pages per partition (`max_unacked_pages`, default 1024). Filters are `ConsumerFilter` over JSON, CBOR, Avro, Protobuf, or headers only, with fault, foreign, and mismatch policies. `validate`, `test`, and `preview` run without progress. With `laser-plane`, the catalog verbs `register`, `revise`, `describe`, `bind`, `create_consumer_group`, `unbind`, `unbind_binding`, `set_revision_enabled`, `archive`, and `delete` manage saved revisions and group bindings, and `apply_as` resumes a mutation under a recorded operation id. TypeScript (`foreign/typescript/src/managed/filters.ts`) and Python (`foreign/python/src/filters.rs`) carry the same surface, and `wire/tests/filter_eval_corpus.rs` pins identical verdicts across the three.
 
 `sdk/src/govern.rs` defines `ActionGovernor` under `agent`. `Laser::with_governor` applies it before publication, AGDX operations, and memory writes. `Verdict` values are `Allow`, `Observe`, `Block`, `StepUp`, `Modify`, and `Defer`. `GovernorMode::Observe` records decisions without enforcing them and warns on evidence failure. `Enforce` applies the decision and rejects effects if required evidence cannot be stored.
 
@@ -399,7 +416,7 @@ See the AGDX spec for the wire contract.
 
 ## Connect timeout
 
-Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples delete their per-run stream on exit. See [connect timeout and cleanup](docs/connect-timeout.md).
+Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples reset their own stream at the start of a run and keep it afterwards. See [connect timeout and cleanup](docs/connect-timeout.md).
 
 ## Publish recovery
 

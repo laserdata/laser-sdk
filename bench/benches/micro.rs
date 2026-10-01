@@ -11,9 +11,13 @@ use laser_sdk::stream::ProducerMessage;
 use laser_sdk::types::{ConversationId, MessageId};
 use laser_wire::agent::{AgentEnvelope, ChannelId};
 use laser_wire::batch::{BatchReply, BatchRequest};
+use laser_wire::filter::eval::{
+    CompiledFilter, DecodeLimits, FilterRecord, HeaderRef, HeaderValueRef,
+};
+use laser_wire::filter::{ConsumerFilter, FilterExpr, TextMatch};
 use laser_wire::framing::{decode_named, encode_named};
 use laser_wire::kv::KvSet;
-use laser_wire::query::QueryEnvelope;
+use laser_wire::query::{CmpOp, QueryEnvelope};
 use laser_wire::result::ResultCode;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
@@ -299,8 +303,79 @@ fn message_construction(criterion: &mut Criterion) {
     group.finish();
 }
 
+// A CDC change record the size of a Frostline fleet event, about 600 bytes.
+const CHANGE_RECORD: &str = r#"{"run_id":"9b80689e","event_id":4210771,"window_id":84,"sequence":1052692,"logical_time":4210771000,"kind":"change","truck_id":"FR-0442","region":"north","cargo":"pharma","type":"fleet.truck.v1.updated","change":{"op":"update","changed":["temperature_band","temperature_deci_c"],"before":{"temperature_band":"safe","temperature_deci_c":52,"battery_pct":81,"unit_state":"running","trip_status":"en_route","region":"north","cargo":"pharma","declared_weight_tonnes":"12.50"},"after":{"temperature_band":"unsafe","temperature_deci_c":122,"battery_pct":80,"unit_state":"fault","trip_status":"en_route","region":"north","cargo":"pharma","declared_weight_tonnes":"12.50"}},"telemetry":null,"checkpoint":null}"#;
+
+// Cost of one evaluation per predicate kind, the numbers docs quote for choosing a filter.
+fn filter_evaluation(criterion: &mut Criterion) {
+    let headers = [
+        HeaderRef {
+            key: "frostline.unit",
+            value: HeaderValueRef::String("reefer"),
+        },
+        HeaderRef {
+            key: "agdx.ct",
+            value: HeaderValueRef::Uint(1),
+        },
+    ];
+    let record = FilterRecord {
+        payload: CHANGE_RECORD.as_bytes(),
+        headers: &headers,
+    };
+    let limits = DecodeLimits::default();
+    let cases = [
+        (
+            "header only",
+            ConsumerFilter::headers_only(FilterExpr::header("frostline.unit", CmpOp::Eq, "reefer")),
+        ),
+        (
+            "payload equality",
+            ConsumerFilter::json(FilterExpr::all([
+                FilterExpr::pred("kind", CmpOp::Eq, "change"),
+                FilterExpr::pred("change.after.temperature_band", CmpOp::Eq, "unsafe"),
+            ])),
+        ),
+        (
+            "text contains",
+            ConsumerFilter::json(FilterExpr::text("type", TextMatch::Contains, ".v1.")),
+        ),
+        (
+            "text glob",
+            ConsumerFilter::json(FilterExpr::text(
+                "type",
+                TextMatch::Glob,
+                "fleet.*.v?.updated",
+            )),
+        ),
+        (
+            "text regex",
+            ConsumerFilter::json(FilterExpr::text(
+                "type",
+                TextMatch::Regex,
+                r"^fleet\.[a-z]+\.v[0-9]+\.",
+            )),
+        ),
+        (
+            "text contains ignoring case",
+            ConsumerFilter::json(
+                FilterExpr::text("type", TextMatch::Contains, ".V1.").case_insensitive(),
+            ),
+        ),
+    ];
+    let mut group = criterion.benchmark_group("filter_evaluation");
+    group.throughput(Throughput::Bytes(CHANGE_RECORD.len() as u64));
+    for (name, filter) in cases {
+        let compiled = CompiledFilter::compile(&filter).expect("the benchmark filter compiles");
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| compiled.evaluate(black_box(&record), &limits));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    filter_evaluation,
     wire_framing,
     provenance_headers,
     chunk_assembly,

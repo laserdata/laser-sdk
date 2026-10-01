@@ -75,7 +75,7 @@ async def main() -> None:
         _common.phase("done")
         print("memory recalls what is relevant, the graph shows how it connects")
     finally:
-        await _common.release_stream(laser, "memory")
+        await laser.close()
 
 
 async def run_memory(conversation) -> None:

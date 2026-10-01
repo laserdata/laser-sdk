@@ -70,6 +70,10 @@ pub enum Feature {
     /// right to validate against a coordination namespace's lease and fence
     /// rows without any right to mutate them.
     KvFence,
+    /// The saved consumer-filter catalog: browse (`read`), register, revise, and
+    /// describe (`write`), archive and drop (`delete`), and group bindings or
+    /// revision pause/resume (`admin`). Filtered reads themselves need only native source permission.
+    Filter,
     /// A feature name a newer peer used that this build does not know. An unknown
     /// `feature` string decodes here instead of failing the whole grant set, and
     /// it matches no request (requests only ever carry a known feature), so an
@@ -346,6 +350,12 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
         AGDX_AGENT_STATUS_CODE | AGDX_AGENT_LIST_CODE => (Feature::Agent, Action::Read),
         AGDX_AGENT_SUBMIT_CODE => (Feature::Agent, Action::Write),
         AGDX_AGENT_CANCEL_CODE => (Feature::Agent, Action::Delete),
+        AGDX_GET_FILTER_CODE
+        | AGDX_LIST_FILTERS_CODE
+        | AGDX_LIST_FILTER_REVISIONS_CODE
+        | AGDX_GET_FILTER_BINDING_CODE
+        | AGDX_LIST_FILTER_BINDINGS_CODE
+        | AGDX_FILTER_OPERATION_CODE => (Feature::Filter, Action::Read),
         _ => return None,
     };
     Some(pair)

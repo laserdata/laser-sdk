@@ -106,7 +106,7 @@ async def main() -> None:
             manual_commit=True,
         )
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

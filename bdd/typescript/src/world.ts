@@ -1,6 +1,8 @@
 import { setWorldConstructor, type IWorldOptions } from "@cucumber/cucumber"
 import {
+  type ConsumerFilter,
   ConversationId,
+  type FilterVerdict,
   Laser,
   MemoryHandle,
   type Capabilities,
@@ -44,6 +46,9 @@ export class LaserWorld {
   bridgeTaskState?: string
   reconstructedState: unknown
   aguiEventTypes: readonly string[] = []
+  filter?: ConsumerFilter
+  verdict?: FilterVerdict
+  filtered: readonly Uint8Array[] = []
 
   constructor(_options: IWorldOptions) {}
 

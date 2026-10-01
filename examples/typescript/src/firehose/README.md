@@ -1,4 +1,4 @@
-# firehose - bounded multi-tenant ingest
+# firehose - bounded multi-organization ingest
 
 This example generates telemetry records across several organization topics. It tests publication volume, projection, queries, and storage use. Use its message-count and payload-size controls to bound a run.
 

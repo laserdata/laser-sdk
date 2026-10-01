@@ -1,0 +1,56 @@
+{
+  "records": {
+    "mode update": {
+      "text": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"battery_pct\":61}}"
+    },
+    "mode update without changed": {
+      "text": "{\"op\":\"u\",\"table\":\"satellites\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"battery_pct\":61}}"
+    },
+    "battery update": {
+      "text": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"battery_pct\"],\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"battery_pct\":61}}"
+    },
+    "decommission": {
+      "text": "{\"op\":\"d\",\"table\":\"satellites\",\"before\":{\"id\":\"sat-042\"}}"
+    },
+    "telemetry": {
+      "text": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":\"safe\"}}"
+    },
+    "telemetry with null mode": {
+      "text": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":null}}"
+    },
+    "battery telemetry": {
+      "text": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"battery_pct\":58}}"
+    },
+    "ground station update": {
+      "text": "{\"op\":\"u\",\"table\":\"ground_stations\",\"changed\":[\"status\"],\"after\":{\"id\":\"svalbard\",\"status\":\"online\"}}"
+    },
+    "catalogued satellite": {
+      "text": "{\"after\":{\"norad_id\":9007199254740993}}"
+    },
+    "neighbor satellite": {
+      "text": "{\"after\":{\"norad_id\":9007199254740992}}"
+    },
+    "afternoon contact": {
+      "text": "{\"contact_at\":\"2026-09-21T14:30:00+02:00\"}"
+    },
+    "morning contact": {
+      "text": "{\"contact_at\":\"2026-09-21T13:30:00+02:00\"}"
+    },
+    "contact without zone": {
+      "text": "{\"contact_at\":\"2026-09-21T14:30:00\"}"
+    },
+    "malformed": {
+      "text": "{\"op\":"
+    },
+    "opaque": {
+      "hex": "0a077361742d303432"
+    }
+  },
+  "feed": [
+    "mode update",
+    "mode update without changed",
+    "telemetry",
+    "ground station update",
+    "decommission"
+  ]
+}

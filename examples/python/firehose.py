@@ -158,7 +158,7 @@ async def main() -> None:
             _common.phase("sample analytics over the firehose")
             await run_sample_queries(laser, topics)
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 class Config:

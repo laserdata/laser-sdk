@@ -1,4 +1,4 @@
-use laser_examples::{PARTITIONS, init_tracing, laser, phase, release_after, stream_for};
+use laser_examples::{PARTITIONS, fresh_run, init_tracing, laser, phase, stream_for};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentCard, CapabilityDescriptor, Health};
 use std::time::Duration;
@@ -51,7 +51,7 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     let stream = stream_for(EXAMPLE);
     let laser = laser(&stream, Capabilities::OPEN).await?;
-    release_after(&laser, &stream, async {
+    fresh_run(&laser, &stream, async {
         laser.bootstrap(PARTITIONS).await?;
 
         phase("Discovery: a pool of long-running capability agents connects");

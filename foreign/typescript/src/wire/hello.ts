@@ -3,6 +3,7 @@ import { type CborMap, decodeOne, encodeNamed, expectMap, expectString, field } 
 import { BackendResourceId } from "./ids.js"
 import type { Consistency, SqlDialect } from "./query.js"
 import type { LogicalTypeKind } from "./schema.js"
+import { type FilterCodec, decodeFilterCodec } from "./filter.js"
 import { type WireTopology, decodeWireTopology, encodeWireTopology } from "./topology.js"
 
 export const Feature = {
@@ -15,7 +16,8 @@ export const Feature = {
   WATCH: 1n << 6n,
   AUTHZ: 1n << 7n,
   DESTINATIONS: 1n << 8n,
-  KV_FENCED_LEASES: 1n << 9n
+  KV_FENCED_LEASES: 1n << 9n,
+  CONSUMER_FILTERS: 1n << 10n
 } as const
 
 export interface OpVersions {
@@ -26,6 +28,7 @@ export interface OpVersions {
   readonly agent: number
   readonly graph: number
   readonly checkpoint?: number
+  readonly filter?: number
   readonly features: bigint
 }
 export function newOpVersions(
@@ -34,7 +37,7 @@ export function newOpVersions(
   kv: number,
   fork: number
 ): OpVersions {
-  return { query, control, kv, fork, agent: 0, graph: 0, checkpoint: 0, features: 0n }
+  return { query, control, kv, fork, agent: 0, graph: 0, checkpoint: 0, filter: 0, features: 0n }
 }
 export function opVersionsHasFeature(versions: OpVersions, bit: bigint): boolean {
   return (versions.features & bit) === bit
@@ -49,6 +52,7 @@ export function encodeOpVersions(value: OpVersions): Map<string, unknown> {
   if (value.agent !== 0) map.set("agent", value.agent)
   if (value.graph !== 0) map.set("graph", value.graph)
   if ((value.checkpoint ?? 0) !== 0) map.set("checkpoint", value.checkpoint)
+  if ((value.filter ?? 0) !== 0) map.set("filter", value.filter)
   if (value.features !== 0n) map.set("features", value.features)
   return map
 }
@@ -61,6 +65,7 @@ export function decodeOpVersions(map: CborMap, context: string): OpVersions {
     agent: field.optionalU32(map, "agent", context) ?? 0,
     graph: field.optionalU32(map, "graph", context) ?? 0,
     checkpoint: field.optionalU32(map, "checkpoint", context) ?? 0,
+    filter: field.optionalU32(map, "filter", context) ?? 0,
     features: field.optionalU64(map, "features", context) ?? 0n
   }
 }
@@ -154,6 +159,29 @@ export interface BackendAnnounce {
   readonly ready?: boolean
   readonly backends: readonly BackendDescriptor[]
   readonly topology?: WireTopology
+  /**
+   * The consumer-filter evaluation the streaming server serves, set with the
+   * `CONSUMER_FILTERS` bit. Absent from an older server.
+   */
+  readonly filters?: FilterAnnounce
+}
+
+/**
+ * The evaluator version and codecs a server serves. A client refuses a filter
+ * the server would evaluate differently, before the first page.
+ */
+export interface FilterAnnounce {
+  readonly evaluatorVersion: number
+  readonly codecs: readonly FilterCodec[]
+}
+
+/** Whether a filter of `evaluatorVersion` and `codec` evaluates on the announcing server as it does here. */
+export function filterAnnounceEvaluates(
+  announce: FilterAnnounce,
+  evaluatorVersion: number,
+  codec: FilterCodec
+): boolean {
+  return announce.evaluatorVersion === evaluatorVersion && announce.codecs.includes(codec)
 }
 
 export function newBackendDescriptor(
@@ -488,12 +516,20 @@ export function encodeBackendAnnounce(value: BackendAnnounce): Uint8Array {
   if (value.ready === false) map.set("ready", false)
   if (value.backends.length > 0) map.set("backends", value.backends.map(encodeBackendDescriptor))
   optional(map, "topology", value.topology, encodeWireTopology)
+  if (value.filters !== undefined) {
+    const filters = new Map<string, unknown>([
+      ["evaluator_version", value.filters.evaluatorVersion]
+    ])
+    if (value.filters.codecs.length > 0) filters.set("codecs", [...value.filters.codecs])
+    map.set("filters", filters)
+  }
   return encodeNamed(map)
 }
 export function decodeBackendAnnounce(bytes: Uint8Array): BackendAnnounce {
   const context = "BackendAnnounce"
   const map = expectMap(decodeOne(bytes, context), context)
   const topology = field.optionalMap(map, "topology", context)
+  const filters = field.optionalMap(map, "filters", context)
   return {
     versions: decodeOpVersions(field.requiredMap(map, "versions", context), `${context}.versions`),
     ready: field.optionalBoolean(map, "ready", context) ?? true,
@@ -502,6 +538,16 @@ export function decodeBackendAnnounce(bytes: Uint8Array): BackendAnnounce {
     ),
     ...(topology === undefined
       ? {}
-      : { topology: decodeWireTopology(topology, `${context}.topology`) })
+      : { topology: decodeWireTopology(topology, `${context}.topology`) }),
+    ...(filters === undefined
+      ? {}
+      : {
+          filters: {
+            evaluatorVersion: field.requiredU32(filters, "evaluator_version", `${context}.filters`),
+            codecs: field.optionalArray(filters, "codecs", `${context}.filters`, (item, index) =>
+              decodeFilterCodec(item, `${context}.filters.codecs[${String(index)}]`)
+            )
+          }
+        })
   }
 }

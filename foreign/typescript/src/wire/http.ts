@@ -8,6 +8,7 @@ import {
   type SchemaInfo
 } from "./browse.js"
 import { type CborMap, expectMap, expectString, field } from "./cbor.js"
+import { type FilterCodec, decodeFilterCodec } from "./filter.js"
 import { decodeSchemaDef, encodeSchemaDef, type SchemaDef } from "./control.js"
 import { decodeForkInfo, encodeForkInfo, type ForkInfo } from "./fork.js"
 import {
@@ -31,7 +32,7 @@ import {
   type QueryResult
 } from "./query.js"
 import { decodeSourceRef, encodeSourceRef, type SourceRef } from "./graph.js"
-import { type ResultCode } from "./result.js"
+import { type ResultCode, resultCodeFromWord, resultCodeWord } from "./result.js"
 import { decodeWireTopology, encodeWireTopology, type WireTopology } from "./topology.js"
 import {
   bigIntToBytes16,
@@ -92,6 +93,28 @@ export const CLIENTS_PATH = "/agdx/clients"
 export const RUNS_PATH = "/agdx/runs"
 export const AUTHZ_WHOAMI_PATH = "/agdx/authz/whoami"
 export const AUTHZ_ROLES_PATH = "/agdx/authz/roles"
+export const FILTERS_PATH = "/agdx/filters"
+export const FILTER_MUTATIONS_PATH = "/agdx/filters/mutations"
+export const FILTER_VALIDATE_PATH = "/agdx/filters/validate"
+export const FILTER_TEST_PATH = "/agdx/filters/test"
+export const FILTER_PREVIEW_PATH = "/agdx/filters/preview"
+export const FILTER_BINDINGS_PATH = "/agdx/filter-bindings"
+
+export function filterPath(id: number): string {
+  return `${FILTERS_PATH}/${String(id)}`
+}
+
+export function filterRevisionsPath(id: number): string {
+  return `${FILTERS_PATH}/${String(id)}/revisions`
+}
+
+export function filterOperationPath(operationId: bigint): string {
+  return `${FILTERS_PATH}/operations/${operationId.toString()}`
+}
+
+export function filterBindingPath(stream: string, topic: string, group: string): string {
+  return `${FILTER_BINDINGS_PATH}/${encodeURIComponent(stream)}/${encodeURIComponent(topic)}/${encodeURIComponent(group)}`
+}
 
 export const authzRolePath = (name: string): string => `${AUTHZ_ROLES_PATH}/${name}`
 export const authzUserRolesPath = (userId: number): string =>
@@ -174,6 +197,16 @@ export interface KvCapsView {
   readonly fencedLeases: boolean
 }
 
+export interface FilterCapsView {
+  readonly native: boolean
+  readonly preview: boolean
+  readonly primaryRouting: boolean
+  readonly catalog: boolean
+  readonly managedGroups: boolean
+  readonly evaluatorVersion: number
+  readonly codecs: readonly FilterCodec[]
+}
+
 export interface HttpCapabilities {
   readonly managed: boolean
   readonly query: QueryCapsView
@@ -184,6 +217,7 @@ export interface HttpCapabilities {
   readonly agentWorkflow: boolean
   readonly watch: boolean
   readonly authz: boolean
+  readonly filters: FilterCapsView
   readonly versions: OpVersions
   readonly backends: readonly BackendDescriptor[]
   readonly topology?: WireTopology
@@ -423,50 +457,6 @@ export function decodeDestinationHttpReply(
   }
 }
 
-const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
-  ["ok", { kind: "known", name: "Ok" }],
-  ["unsupported", { kind: "known", name: "Unsupported" }],
-  ["not_found", { kind: "known", name: "NotFound" }],
-  ["invalid_argument", { kind: "known", name: "InvalidArgument" }],
-  ["too_large", { kind: "known", name: "TooLarge" }],
-  ["conflict", { kind: "known", name: "Conflict" }],
-  ["stale", { kind: "known", name: "Stale" }],
-  ["version_skew", { kind: "known", name: "VersionSkew" }],
-  ["unauthenticated", { kind: "known", name: "Unauthenticated" }],
-  ["backend", { kind: "known", name: "Backend" }],
-  ["forbidden", { kind: "known", name: "Forbidden" }],
-  ["step_up_required", { kind: "known", name: "StepUpRequired" }],
-  ["unavailable", { kind: "known", name: "Unavailable" }],
-  ["resource_limit", { kind: "known", name: "ResourceLimit" }],
-  ["cancelled", { kind: "known", name: "Cancelled" }],
-  ["deadline_exceeded", { kind: "known", name: "DeadlineExceeded" }],
-  ["expired_snapshot", { kind: "known", name: "ExpiredSnapshot" }],
-  ["stale_generation", { kind: "known", name: "StaleGeneration" }],
-  ["target_unavailable", { kind: "known", name: "TargetUnavailable" }]
-])
-
-const RESULT_WORDS: Readonly<Record<string, string>> = {
-  Ok: "ok",
-  Unsupported: "unsupported",
-  NotFound: "not_found",
-  InvalidArgument: "invalid_argument",
-  TooLarge: "too_large",
-  Conflict: "conflict",
-  Stale: "stale",
-  VersionSkew: "version_skew",
-  Unauthenticated: "unauthenticated",
-  Backend: "backend",
-  Forbidden: "forbidden",
-  StepUpRequired: "step_up_required",
-  Unavailable: "unavailable",
-  ResourceLimit: "resource_limit",
-  Cancelled: "cancelled",
-  DeadlineExceeded: "deadline_exceeded",
-  ExpiredSnapshot: "expired_snapshot",
-  StaleGeneration: "stale_generation",
-  TargetUnavailable: "target_unavailable"
-}
-
 function parseJson(text: string, context: string): unknown {
   try {
     return fromJsonValue(JSON.parse(text) as unknown, context)
@@ -643,7 +633,7 @@ function enumWord<T extends string>(
 }
 
 function parseResultCode(value: string, context: string): ResultCode {
-  const code = RESULT_NAMES.get(value)
+  const code = resultCodeFromWord(value)
   if (code === undefined) throw new CodecError(`unknown result code \`${value}\``, context, "code")
   return code
 }
@@ -652,7 +642,7 @@ function encodeResultCode(value: ResultCode, context: string): string {
   if (value.kind === "unrecognized") {
     throw new CodecError("unrecognized numeric result codes have no JSON spelling", context, "code")
   }
-  const word = RESULT_WORDS[value.name]
+  const word = resultCodeWord(value)
   if (word === undefined) throw new CodecError("result code has no JSON spelling", context, "code")
   return word
 }
@@ -1235,6 +1225,7 @@ export function decodeCapabilitiesJson(text: string): HttpCapabilities {
     agentWorkflow: field.optionalBoolean(map, "agent_workflow", context) ?? false,
     watch: field.optionalBoolean(map, "watch", context) ?? false,
     authz: field.optionalBoolean(map, "authz", context) ?? false,
+    filters: decodeFilterCaps(field.optionalMap(map, "filters", context), `${context}.filters`),
     versions: decodeOpVersions(field.requiredMap(map, "versions", context), `${context}.versions`),
     backends: field.optionalArray(map, "backends", context, (item, index) =>
       decodeBackendDescriptor(item, `${context}.backends[${String(index)}]`)
@@ -1264,11 +1255,45 @@ export function encodeCapabilitiesJson(value: HttpCapabilities): string {
     ["agent_workflow", value.agentWorkflow],
     ["watch", value.watch],
     ["authz", value.authz],
+    ["filters", encodeFilterCaps(value.filters)],
     ["versions", encodeOpVersions(value.versions)]
   ])
   if (value.backends.length > 0) map.set("backends", value.backends.map(encodeBackendDescriptor))
   if (value.topology !== undefined) map.set("topology", encodeWireTopology(value.topology))
   return encodeJson(map, "Capabilities")
+}
+
+function decodeFilterCaps(map: CborMap | undefined, context: string): FilterCapsView {
+  const flag = (key: string): boolean =>
+    map === undefined ? false : (field.optionalBoolean(map, key, context) ?? false)
+  return {
+    native: flag("native"),
+    preview: flag("preview"),
+    primaryRouting: flag("primary_routing"),
+    catalog: flag("catalog"),
+    managedGroups: flag("managed_groups"),
+    evaluatorVersion:
+      map === undefined ? 0 : (field.optionalU32(map, "evaluator_version", context) ?? 0),
+    codecs:
+      map === undefined
+        ? []
+        : field.optionalArray(map, "codecs", context, (item, index) =>
+            decodeFilterCodec(item, `${context}.codecs[${String(index)}]`)
+          )
+  }
+}
+
+function encodeFilterCaps(value: FilterCapsView): Map<string, unknown> {
+  const map = new Map<string, unknown>([
+    ["native", value.native],
+    ["preview", value.preview],
+    ["primary_routing", value.primaryRouting],
+    ["catalog", value.catalog],
+    ["managed_groups", value.managedGroups],
+    ["evaluator_version", value.evaluatorVersion]
+  ])
+  if (value.codecs.length > 0) map.set("codecs", [...value.codecs])
+  return map
 }
 
 function decodeKvEntry(map: CborMap, context: string): KvEntryView {
@@ -1324,7 +1349,7 @@ export function decodeErrorBodyJson(text: string): ErrorBody {
   const context = "ErrorBody"
   const map = expectMap(parseJson(text, context), context)
   const word = field.requiredString(map, "code", context)
-  const code = RESULT_NAMES.get(word)
+  const code = resultCodeFromWord(word)
   if (code === undefined) throw new CodecError(`unknown result code \`${word}\``, context, "code")
   return {
     code,
@@ -1342,9 +1367,11 @@ export function encodeErrorBodyJson(value: ErrorBody): string {
     )
   }
   const map = new Map<string, unknown>([
-    ["code", RESULT_WORDS[value.code.name]],
+    ["code", resultCodeWord(value.code)],
     ["message", value.message]
   ])
   if (value.detail !== undefined) map.set("detail", value.detail)
   return encodeJson(map, "ErrorBody")
 }
+
+export const FILTER_METRICS_PATH = "/agdx/filters/metrics"

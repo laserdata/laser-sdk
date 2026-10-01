@@ -1,3 +1,5 @@
+import type { FaultReason, FilterError, FilterErrorReason } from "../wire/filter.js"
+
 export type LaserErrorKind =
   | "config"
   | "no-stream"
@@ -15,6 +17,7 @@ export type LaserErrorKind =
   | "fork"
   | "graph"
   | "authz"
+  | "filter"
   | "agent-workflow"
   | "routing"
   | "presence-conflict"
@@ -189,6 +192,46 @@ export class AuthzExecutionError extends LaserError {
     options?: { cause?: unknown }
   ) {
     super(message, "authz", options)
+  }
+}
+
+/** The streaming server or the filter catalog refused a consumer-filter operation. */
+export class FilterExecutionError extends LaserError {
+  constructor(
+    message: string,
+    readonly detail: FilterError,
+    options?: { cause?: unknown }
+  ) {
+    super(message, "filter", options)
+  }
+
+  get reason(): FilterErrorReason {
+    return this.detail.reason
+  }
+}
+
+/**
+ * A partition stopped at a record it cannot deliver. `reason` names the stop
+ * as the Python and Rust SDKs do (`fault` or `oversized_record`), and
+ * `faultReason` the decode fault.
+ */
+export class FilterStopError extends LaserError {
+  constructor(
+    readonly stop: "fault" | "oversized_record",
+    readonly partitionId: number,
+    readonly offset: bigint,
+    readonly faultReason?: FaultReason
+  ) {
+    super(
+      stop === "fault"
+        ? `filter fault on partition ${String(partitionId)} at offset ${offset.toString()}: ${faultReason ?? "malformed"}`
+        : `the record at offset ${offset.toString()} on partition ${String(partitionId)} exceeds the filtered reply cap`,
+      "filter"
+    )
+  }
+
+  get reason(): "fault" | "oversized_record" {
+    return this.stop
   }
 }
 

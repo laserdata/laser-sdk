@@ -46,6 +46,7 @@ Every client uses standard Iggy transport. Managed reads use the non-replicated 
 - `Laser` facade, reliable consumer, `Agent` builder, router, sessions, request/reply, shutdown -> [agent-runtime](../agent-runtime/SKILL.md)
 - Reading the log back: `ContextAssembler`/policies, `ConversationState`, `Memory`/`LogMemory` -> [context-and-memory](../context-and-memory/SKILL.md)
 - Example crate, the `LlmClient` seam, `TestIggy`, integration-test conventions -> [examples-and-testing](../examples-and-testing/SKILL.md)
+- Consumer filters: `Laser::filters()` readers and acknowledgments, previews and tests, the saved-filter catalog and group bindings (`sdk/src/filters/`, feature `filters`), the `wire/src/filter/` contract and evaluator corpus, and the TypeScript and Python peers -> [consumer-filters](../consumer-filters/SKILL.md)
 - Typed records and publish live under the `streaming` feature and `laser_sdk::stream`. Queryable indexing directives stay on those records because they are written at append time.
 - Preserve all `SendMessagesResponse` confirmations across retries. Each identifies a stream, topic, partition, and base offset. The server can return none when it does not report offsets. Completion follows the topic durability policy.
 - Query DSL and `query()` (managed deployment only: the `AGDX_QUERY` managed command off the log via `send_raw_with_response`, Apache Iggy without a managed backend returns `Unsupported`. No topic request/reply query path) -> [query](../query/SKILL.md)

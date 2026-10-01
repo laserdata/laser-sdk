@@ -65,7 +65,7 @@ async def main() -> None:
         await memory.forget(fact_id, conversation=conversation)
         print(f"  reinforced then forgot {fact_id}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

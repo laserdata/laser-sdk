@@ -92,3 +92,57 @@ export function resultCodeIsRetryable(value: ResultCode): boolean {
     (value.name === "Unavailable" || value.name === "Stale" || value.name === "TargetUnavailable")
   )
 }
+
+const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
+  ["ok", { kind: "known", name: "Ok" }],
+  ["unsupported", { kind: "known", name: "Unsupported" }],
+  ["not_found", { kind: "known", name: "NotFound" }],
+  ["invalid_argument", { kind: "known", name: "InvalidArgument" }],
+  ["too_large", { kind: "known", name: "TooLarge" }],
+  ["conflict", { kind: "known", name: "Conflict" }],
+  ["stale", { kind: "known", name: "Stale" }],
+  ["version_skew", { kind: "known", name: "VersionSkew" }],
+  ["unauthenticated", { kind: "known", name: "Unauthenticated" }],
+  ["backend", { kind: "known", name: "Backend" }],
+  ["forbidden", { kind: "known", name: "Forbidden" }],
+  ["step_up_required", { kind: "known", name: "StepUpRequired" }],
+  ["unavailable", { kind: "known", name: "Unavailable" }],
+  ["resource_limit", { kind: "known", name: "ResourceLimit" }],
+  ["cancelled", { kind: "known", name: "Cancelled" }],
+  ["deadline_exceeded", { kind: "known", name: "DeadlineExceeded" }],
+  ["expired_snapshot", { kind: "known", name: "ExpiredSnapshot" }],
+  ["stale_generation", { kind: "known", name: "StaleGeneration" }],
+  ["target_unavailable", { kind: "known", name: "TargetUnavailable" }]
+])
+
+const RESULT_WORDS: Readonly<Record<string, string>> = {
+  Ok: "ok",
+  Unsupported: "unsupported",
+  NotFound: "not_found",
+  InvalidArgument: "invalid_argument",
+  TooLarge: "too_large",
+  Conflict: "conflict",
+  Stale: "stale",
+  VersionSkew: "version_skew",
+  Unauthenticated: "unauthenticated",
+  Backend: "backend",
+  Forbidden: "forbidden",
+  StepUpRequired: "step_up_required",
+  Unavailable: "unavailable",
+  ResourceLimit: "resource_limit",
+  Cancelled: "cancelled",
+  DeadlineExceeded: "deadline_exceeded",
+  ExpiredSnapshot: "expired_snapshot",
+  StaleGeneration: "stale_generation",
+  TargetUnavailable: "target_unavailable"
+}
+
+/** The code a snake_case wire word names, `undefined` for an unknown word. */
+export function resultCodeFromWord(word: string): ResultCode | undefined {
+  return RESULT_NAMES.get(word)
+}
+
+/** The snake_case wire word of a known code, `undefined` for an unrecognized one. */
+export function resultCodeWord(value: ResultCode): string | undefined {
+  return value.kind === "known" ? RESULT_WORDS[value.name] : undefined
+}

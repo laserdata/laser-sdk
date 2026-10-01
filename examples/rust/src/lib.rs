@@ -34,9 +34,9 @@ pub fn phase(title: &str) {
 pub const DEFAULT_STREAM: &str = "laser";
 pub const PARTITIONS: u32 = 4;
 
-/// The token every name this invocation creates is suffixed with, so two runs
-/// (sequential or concurrent, any language) never share example state and each
-/// run sees exactly the rows it wrote. Stable within one process.
+/// The token every managed index name this invocation creates is suffixed
+/// with, so two runs (sequential or concurrent, any language) never count each
+/// other's rows. Stable within one process.
 pub fn run_token() -> &'static str {
     static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOKEN.get_or_init(|| {
@@ -50,13 +50,14 @@ pub fn run_token() -> &'static str {
 
 /// The data stream an example uses: `LASER_STREAM` if set (managed: your
 /// provisioned stream, so the SDK auto-creates nothing and repeat runs share
-/// its state), else a per-invocation stream `laser-<example>-<token>`. The
-/// `_agdx` ops stream is owned by the managed deployment, not by the SDK.
+/// its state), else `laser-<example>-rust`. The name is stable so the result
+/// stays on the server after a run and a rerun starts clean. The `_agdx`
+/// ops stream is owned by the managed deployment, not by the SDK.
 pub fn stream_for(example: &str) -> String {
     std::env::var("LASER_STREAM")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("{DEFAULT_STREAM}-{example}-{}", run_token()))
+        .unwrap_or_else(|| format!("{DEFAULT_STREAM}-{example}-rust"))
 }
 
 /// A managed index name owned by this invocation (`orders_v1` becomes
@@ -103,20 +104,19 @@ pub async fn laser(stream: &str, capabilities: Capabilities) -> Result<Laser, La
         .await
 }
 
-/// Run `example`, then delete this run's own `stream` whether the example succeeded or not, so repeated runs do not leave their topics and partitions on the server. A provisioned `LASER_STREAM` is kept. The example's own error wins over a cleanup error.
-pub async fn release_after(
+/// Delete the previous run's `stream`, then run `example` and keep the stream
+/// it creates, so the result stays on the server for inspection and the
+/// next run starts clean. A provisioned `LASER_STREAM` is never deleted.
+pub async fn fresh_run(
     laser: &Laser,
     stream: &str,
     example: impl Future<Output = Result<(), LaserError>>,
 ) -> Result<(), LaserError> {
-    let outcome = example.await;
     let provisioned = std::env::var("LASER_STREAM").is_ok_and(|value| !value.trim().is_empty());
-    let released = if provisioned {
-        Ok(())
-    } else {
-        laser.stream(stream).delete().await.map(|_| ())
-    };
-    outcome.and(released)
+    if !provisioned {
+        laser.stream(stream).delete().await?;
+    }
+    example.await
 }
 
 /// Check a capability after connecting successfully.

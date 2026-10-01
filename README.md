@@ -1,8 +1,8 @@
 # LaserData - Laser SDK
 
-Laser SDK provides streaming, queries, key-value state, forks, graphs, and agent coordination over one [Apache Iggy](https://iggy.apache.org) connection. [LaserData, Inc.](https://laserdata.com) maintains the SDK. A log stores records in append order. Managed services build query results and state from those records.
+Laser SDK provides streaming, queries, key-value state, forks, graphs, and agent coordination through one client over [Apache Iggy](https://iggy.apache.org). [LaserData, Inc.](https://laserdata.com) maintains the SDK. A log stores records in append order. Managed services build query results and state from those records.
 
-The log is the source of truth. A read model is data organized for a specific query. Services can rebuild these models from retained log records. A support task can record messages, keep working memory, and track dependencies through the same SDK.
+**The log is the source of truth.** A read model is data organized for a specific query. Services can rebuild these models from retained log records. A support task can record messages, keep working memory, and track dependencies through the same SDK.
 
 Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines the reference SDK behavior. Python ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) calls the Rust implementation. TypeScript ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) provides a native Node client. Shared test data and behavior scenarios compare the clients. The [`laser-wire` crate](https://crates.io/crates/laser-wire) ([source](wire/README.md)) defines the data exchanged between them.
 
@@ -10,7 +10,9 @@ Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines th
 
 Read the three-language guides at [docs.laserdata.cloud/laser-sdk](https://docs.laserdata.cloud/laser-sdk). Start with the [quickstart](https://docs.laserdata.cloud/laser-sdk/quickstart) or the focused [`examples/`](examples/README.md).
 
-After the focused examples, [Photon Market](https://github.com/laserdata/laser-example-photon-market) shows a more realistic Rust system built with Laser SDK across multiple modules and microservices.
+After the focused examples, two public example repositories go further. [Photon Market](https://github.com/laserdata/laser-example-photon-market) shows a more realistic Rust system built with Laser SDK across multiple modules and microservices. [Frostline](https://github.com/laserdata/laser-example-frostline) is the consumer-filter showcase: one change feed, three teams reading their own slice, and a benchmark that measures how much payload never left the server.
+
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 ## Quick start
 
@@ -108,6 +110,7 @@ An accessor selects a feature on the connected client. A method performs an acti
 | `laser.destinations()` | Destinations | declare materialization targets, change desired state, inspect checkpoints and query routes |
 | `laser.graph(name)` | Graph | link entities, traverse, find neighbors and nearest vectors |
 | `laser.watch()` | Change feed | consume advancement records instead of re-querying blind |
+| `laser.filters()` | [Consumer filters](https://docs.laserdata.cloud/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
 | `laser.kv(namespace)` / `laser.fork(id)` | State | point reads and writes, CAS, leases, copy-on-write branches |
 | `laser.memory(scope)` | Memory | remember, recall (semantic / keyword / hybrid), consolidate |
 | `laser.context(id)` | Context | append and assemble one conversation's record, and scope its memory to that conversation |
@@ -269,8 +272,9 @@ Data platform (the core, stands on its own):
 | Primitive | What you get |
 | --- | --- |
 | Publish / consume | Typed serde values or raw records onto topics, direct producer batching/linger/routing, and live async partition or consumer-group readers with server offsets and configurable commit policies. |
+| Consumer filters | **Receive only matching records across the network.** Payload predicates, exact-width typed headers, text matching (equals, prefix, suffix, contains, glob, regex, optionally case-insensitive), saved group policies, previews, and safe acknowledgments over the original log. One log can carry many kinds of events in different codecs: records in another format are skipped, and records with unexpected field types can be delivered marked unevaluated so the consumer decides. The CDC example saves **98.5% of payload transfer**, and the [Frostline example](https://github.com/laserdata/laser-example-frostline) reports **96.9% of payload and 96.5% of total TCP application traffic avoided** over ten million records in its own measurements. |
 | Projections + query DSL | Filters, aggregates, time ranges, pagination, and vector recall over indexes you declare once per topic, with opt-in read-your-writes consistency, and a `conversation(id)` filter that narrows any query to the records one conversation wrote. |
-| Key-value + forks | Working state with compare-and-swap, conditional ops, expiry, JSON merge-patch, and revocable holder-scoped leases, plus copy-on-write branches of the read model for speculative work. |
+| Key-value + forks | Working state with compare-and-swap, conditional ops, expiry, JSON merge-patch, and revocable holder-scoped leases, plus **copy-on-write branches of the read model** for speculative work. |
 | Knowledge graph | Content-addressed nodes and edges, traversal / neighbor / nearest-vector / path reads, bitemporal valid-time edges, source back-links, and a `conversation(id)` filter that narrows a traversal to one conversation. |
 | Governance (RBAC) | Capability grants over the managed surfaces: `effect feature:action [on resource]` assembled through roles bound to the unforgeable server-stamped user, deny-wins, default-deny. New users receive no managed capabilities unless roles are explicitly bound. `laser.whoami()` + the role/binding/history verbs, including revision-guarded role binding. Orthogonal to Iggy's own permissions, enforced server-side at the edge. |
 
@@ -278,14 +282,14 @@ Agent fabric (opt in with the `agent` feature):
 
 | Primitive | What you get |
 | --- | --- |
-| Reliable runtime | A consumer with dedup, retry, and dead-letter, request/reply correlation, conversation and causality tracking, routing, sessions, and context assembly. |
+| Reliable runtime | A consumer with **dedup, retry, and dead-letter**, request/reply correlation, conversation and causality tracking, routing, sessions, and context assembly. |
 | Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` publish to a memory topic (the versioned audit) that materializes to a versioned key-value read view and recalls by recency. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add semantic / keyword / hybrid ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
 | Discovery | Agents advertise a capability card and a live inbox, fused into one cached registry with health-aware resolution and reversible operator `quarantine` / `unquarantine`. One connection may advertise one agent. Sensitive routes can require the presence's server-authenticated principal. |
 | Coordination | `contract` (a directed task with a deadline and a real consumed / completed / timed-out answer), `fan_out` / `scatter` (ask every capable agent, gather under a policy), and `approval_gate` (pause for a human). With signing enabled, terminals fail closed on unsigned or wrongly signed replies and expose the verified principal. |
-| Workflow engine | `laser.workflow(..).step(..)`: dependency-ordered steps, budgets, verifier panels, saga compensation, crash-recovery replay from a journal, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
+| Workflow engine | `laser.workflow(..).step(..)`: dependency-ordered steps, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
 | Run registry | `laser.runs()`: submit a run, read its state, list runs (filtered, paged), record a cancel intent. A managed read model folded from the status records a `.registered()` workflow or contract stamps, so "what happened to that task" is one call, and the log stays the truth. |
 | AGDX envelope | A typed, versioned, fixture-pinned agent message format on the log, with producer verbs, resumable token streams, and deterministic reassembly. ([notes](docs/agdx.md)) |
-| Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, typed or raw topic publish, AGDX verb, and memory write before it runs. Enforce or shadow mode records every non-allow decision as digest-chained evidence. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
+| Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, typed or raw topic publish, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
 | Durable intent | SDK-level typed records for asynchronous effect approval, not an AGDX wire extension. Fallible `Intent::builder().build()` validates the frozen voter set, threshold, deadline, and body digest. Fallible `Vote::cast` binds an eligible voter to that digest and policy version. `decide` ignores invalid, early, late, and future ballots, then returns a canonical commit or abort. Mandatory voters must allow, conflicting repeats abort, and `Decision::authorizes` verifies the exact intent before an effect runs. Voter identity is trusted only under a signed-principal or topology-isolated deployment profile. |
 | Swarm activity | A supervisor's replay-safe read model over governance evidence: `SwarmActivity::observe` deduplicates by decision id, `.agent(name)` reads one agent's counts and deterministic latest decision, and `.agents()` lists every folded agent busiest first. |
 | Crash context | A recovery tool's one-call bundle over an already-read journal tail, dead-letter capsule, and latest governance decision. `.summarize()` emits a bounded deterministic digest with control characters escaped, so untrusted payloads cannot forge diagnostic lines. It performs no I/O and never invokes a model. |
@@ -295,19 +299,19 @@ Agent routing, contracts, fan-out, and workflows run as client-side state machin
 
 ## Why it is good to build on
 
-- Streaming and managed operations use the same connection and record metadata.
-- Read models can rebuild from retained records. A new projection, index, or agent can read earlier records by offset.
+- **Streaming and managed operations share one client, Iggy transport, and record metadata.**
+- **Read models can rebuild from retained records.** A new projection, index, or agent can read earlier records by offset.
 - `laser.stream("commerce").topic("orders").json::<Order>()` publishes and replays `Order` values. A schema-bound handle checks each value against its registered schema before sending. Decode failures include the record position. Producers and consumers support batches.
 - Streaming, the agent runtime, log-based memory, and open coordination run on Apache Iggy. Managed operations use capabilities reported by LaserData Cloud or Laser Stack.
-- A fence is an increasing token that identifies a lease holder. An `.exclusive_in(namespace)` step and `kv(namespace).cas_fenced(..)` use the same fence sequence. The protected state rejects writes from a replaced holder.
-- Rust defines the reference behavior. Python calls that implementation. TypeScript uses the same encoded test data and shared behavior scenarios.
+- A fence is an increasing token that identifies a lease holder. An `.exclusive_in(namespace)` step and `kv(namespace).cas_fenced(..)` use the same fence sequence. **The protected state rejects writes from a replaced holder.**
+- Rust defines the reference behavior. Python calls that implementation. TypeScript uses the same encoded test data and **shared behavior scenarios**.
 
 ## Open core, managed surface
 
 | Deployment | Available surfaces |
 | --- | --- |
 | Apache Iggy | Streaming, provenance, AGDX, the agent runtime, log-backed memory, contracts, and workflows |
-| Laser Stack | Everything above, plus query, projections, KV, forks, graph, durable memory, the run registry, durable dedup, and fenced leases |
+| Laser Stack | Everything above, plus consumer filters, query, projections, KV, forks, graph, durable memory, the run registry, durable dedup, and fenced leases |
 | LaserData Cloud | The complete SDK surface with managed deployment and UI services |
 
 Capability negotiation runs during connection setup. A managed call against Apache Iggy without a managed backend returns `LaserError::Unsupported`. The underlying client remains available through `topic.iggy_producer()`, `topic.iggy_consumer(..)`, and `laser.client()`.
@@ -342,7 +346,7 @@ Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the p
 | [`laser-sdk`](sdk/README.md) (`sdk/`) | the client and agent runtime, re-exporting the wire crate as `laser_sdk::wire`. |
 | [`foreign/python`](foreign/python/README.md) | the Python SDK, PyO3 bindings over the Rust crate. |
 | [`foreign/typescript`](foreign/typescript/README.md) | the native TypeScript SDK over Apache Iggy. |
-| [`examples`](examples/README.md) | Eight focused examples cover `log`, `query`, `watch`, `kv`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, an order book, load generation, support agents, memory, interoperability, `orchestra`, and governance. |
+| [`examples`](examples/README.md) | Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, an order book, load generation, support agents, memory, interoperability, `orchestra`, and governance. |
 
 ## Benchmarks
 
@@ -401,3 +405,9 @@ See [connect timeout and cleanup](docs/connect-timeout.md).
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
 
 See [publish recovery and outage handling](docs/publish-recovery.md).
+
+## Consumer filter groups and offsets
+
+**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages` in Rust and Python and `maxUnackedPages` in TypeScript, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+**Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.

@@ -1,5 +1,7 @@
 use crate::harness;
-use laser_sdk::iggy::prelude::{Identifier, StreamClient};
+use laser_sdk::iggy::prelude::{
+    Consumer, Identifier, MessageClient, PollingStrategy, StreamClient, TopicClient,
+};
 use laser_sdk::prelude::{CommitPolicy, ConsumerMessage, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::stream::{HeaderKey, HeaderValue};
 use std::str::FromStr;
@@ -311,4 +313,331 @@ async fn given_a_cached_stream_when_deleted_and_recreated_then_should_discard_it
             .expect("remove the recreated stream");
     }
     laser.close().await.expect("close the connection");
+}
+
+#[tokio::test]
+async fn given_a_fresh_consumer_when_reading_next_then_should_start_at_zero_and_resume_after_a_real_commit()
+ {
+    let laser = harness::laser().await;
+    let topic = laser.topic("default-next");
+    let producer = topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("producer");
+    producer
+        .send_batch_with_routing(
+            [
+                ProducerMessage::new(b"zero".as_slice()),
+                ProducerMessage::new(b"one".as_slice()),
+            ],
+            Some(Routing::Partition(0)),
+        )
+        .await
+        .expect("publish");
+    let build = || {
+        topic
+            .consumer("fresh", 0)
+            .batch_length(1)
+            .commit_policy(CommitPolicy::Disabled)
+            .build()
+    };
+    let mut first = build().await.expect("first consumer");
+    let record = first
+        .next_within(RECEIVE_TIMEOUT)
+        .await
+        .expect("first record");
+    assert_eq!(record.position.offset, 0);
+    first.shutdown().await.expect("uncommitted shutdown");
+    let mut retried = build().await.expect("retry consumer");
+    let record = retried
+        .next_within(RECEIVE_TIMEOUT)
+        .await
+        .expect("uncommitted record repeats");
+    assert_eq!(record.position.offset, 0);
+    retried.commit(&record).await.expect("commit zero");
+    retried.shutdown().await.expect("shutdown");
+    let mut resumed = build().await.expect("resume consumer");
+    assert_eq!(
+        resumed
+            .next_within(RECEIVE_TIMEOUT)
+            .await
+            .expect("next after committed zero")
+            .position
+            .offset,
+        1
+    );
+    resumed.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn given_default_polling_when_shutdown_after_offset_zero_then_should_resume_at_one() {
+    let laser = harness::connected_laser().await;
+    let topic = laser.topic("default-shutdown-zero");
+    let producer = topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("producer");
+    producer
+        .send_batch_with_routing(
+            [
+                ProducerMessage::new(b"zero".as_slice()),
+                ProducerMessage::new(b"one".as_slice()),
+                ProducerMessage::new(b"two".as_slice()),
+                ProducerMessage::new(b"three".as_slice()),
+            ],
+            Some(Routing::Partition(0)),
+        )
+        .await
+        .expect("publish");
+    let mut first = topic
+        .consumer("partial", 0)
+        .batch_length(4)
+        .build()
+        .await
+        .expect("consumer");
+    assert_eq!(
+        first
+            .next_within(RECEIVE_TIMEOUT)
+            .await
+            .expect("first record")
+            .position
+            .offset,
+        0
+    );
+    first
+        .shutdown()
+        .await
+        .expect("shutdown with a partial batch");
+    let mut resumed = topic
+        .consumer("partial", 0)
+        .batch_length(4)
+        .build()
+        .await
+        .expect("resume");
+    assert_eq!(
+        resumed
+            .next_within(RECEIVE_TIMEOUT)
+            .await
+            .expect("remaining record")
+            .position
+            .offset,
+        1
+    );
+    resumed.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn given_each_commit_policy_when_shutdown_after_zero_then_should_preserve_its_resume_contract()
+ {
+    let laser = harness::laser().await;
+    let interval = Duration::from_secs(60);
+    let policies = [
+        CommitPolicy::Disabled,
+        CommitPolicy::Interval(interval),
+        CommitPolicy::Polling,
+        CommitPolicy::IntervalOrPolling(interval),
+        CommitPolicy::All,
+        CommitPolicy::IntervalOrAll(interval),
+        CommitPolicy::Each,
+        CommitPolicy::IntervalOrEach(interval),
+        CommitPolicy::Every(10),
+        CommitPolicy::IntervalOrEvery(interval, 10),
+    ];
+    for (index, policy) in policies.into_iter().enumerate() {
+        for group in [false, true] {
+            let topic = laser.topic(format!("policy-zero-{index}-{group}"));
+            let producer = topic
+                .producer()
+                .partitions(1)
+                .build()
+                .await
+                .expect("producer");
+            producer
+                .send_batch_with_routing(
+                    [
+                        ProducerMessage::new(b"zero".as_slice()),
+                        ProducerMessage::new(b"one".as_slice()),
+                    ],
+                    Some(Routing::Partition(0)),
+                )
+                .await
+                .expect("publish");
+            let builder = if group {
+                topic.consumer_group("worker")
+            } else {
+                topic.consumer("worker", 0)
+            };
+            let mut first = builder
+                .batch_length(2)
+                .commit_policy(policy)
+                .build()
+                .await
+                .expect("consumer");
+            assert_eq!(
+                first
+                    .next_within(RECEIVE_TIMEOUT)
+                    .await
+                    .expect("zero")
+                    .position
+                    .offset,
+                0
+            );
+            first.shutdown().await.expect("shutdown");
+            let builder = if group {
+                topic.consumer_group("worker")
+            } else {
+                topic.consumer("worker", 0)
+            };
+            let mut resumed = builder
+                .commit_policy(CommitPolicy::Disabled)
+                .build()
+                .await
+                .expect("resume");
+            let found = resumed
+                .next_within(RECEIVE_TIMEOUT)
+                .await
+                .expect("resumed message")
+                .position
+                .offset;
+            let expected = u64::from(policy != CommitPolicy::Disabled);
+            assert_eq!(found, expected, "policy {policy:?}, group {group}");
+            resumed.shutdown().await.expect("close");
+        }
+    }
+}
+
+// A purge restarts the partition at offset zero and clears every stored
+// offset. A consumer rebuilt after the purge must read the replacement
+// history from its first record under every commit policy.
+#[tokio::test]
+async fn given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_the_new_offset_zero()
+ {
+    let laser = harness::laser().await;
+    let stream = laser
+        .default_stream()
+        .expect("the test laser names its stream")
+        .to_owned();
+    let interval = Duration::from_secs(60);
+    let policies = [
+        CommitPolicy::Disabled,
+        CommitPolicy::Interval(interval),
+        CommitPolicy::Polling,
+        CommitPolicy::IntervalOrPolling(interval),
+        CommitPolicy::All,
+        CommitPolicy::IntervalOrAll(interval),
+        CommitPolicy::Each,
+        CommitPolicy::IntervalOrEach(interval),
+        CommitPolicy::Every(10),
+        CommitPolicy::IntervalOrEvery(interval, 10),
+    ];
+    for (index, policy) in policies.into_iter().enumerate() {
+        for group in [false, true] {
+            let topic_name = format!("policy-purge-{index}-{group}");
+            let topic = laser.topic(&topic_name);
+            let producer = topic
+                .producer()
+                .partitions(1)
+                .build()
+                .await
+                .expect("producer");
+            producer
+                .send_batch_with_routing(
+                    [
+                        ProducerMessage::new(b"telemetry-0".as_slice()),
+                        ProducerMessage::new(b"telemetry-1".as_slice()),
+                        ProducerMessage::new(b"telemetry-2".as_slice()),
+                    ],
+                    Some(Routing::Partition(0)),
+                )
+                .await
+                .expect("publish before purge");
+            let builder = if group {
+                topic.consumer_group("ground-station")
+            } else {
+                topic.consumer("ground-station", 0)
+            };
+            let mut before = builder
+                .batch_length(3)
+                .commit_policy(policy)
+                .build()
+                .await
+                .expect("consumer before purge");
+            for expected in 0..3 {
+                let record = before
+                    .next_within(RECEIVE_TIMEOUT)
+                    .await
+                    .expect("record before purge");
+                assert_eq!(record.position.offset, expected);
+                if policy == CommitPolicy::Disabled {
+                    before.commit(&record).await.expect("manual commit");
+                }
+            }
+            before.shutdown().await.expect("shutdown before purge");
+
+            laser
+                .client()
+                .purge_topic(
+                    &Identifier::named(&stream).expect("stream identifier"),
+                    &Identifier::named(&topic_name).expect("topic identifier"),
+                )
+                .await
+                .expect("purge");
+            let stream_id = Identifier::named(&stream).expect("stream id");
+            let topic_id = Identifier::named(&topic_name).expect("topic id");
+            // Metadata acknowledges before the partition owner applies the purge.
+            harness::eventually(|| async {
+                let visible = laser
+                    .client()
+                    .poll_messages(
+                        &stream_id,
+                        &topic_id,
+                        Some(0),
+                        &Consumer::default(),
+                        &PollingStrategy::first(),
+                        3,
+                        false,
+                    )
+                    .await
+                    .expect("purge visibility poll");
+                visible.messages.is_empty().then_some(())
+            })
+            .await;
+            producer
+                .send_batch_with_routing(
+                    [
+                        ProducerMessage::new(b"safe-mode-0".as_slice()),
+                        ProducerMessage::new(b"safe-mode-1".as_slice()),
+                    ],
+                    Some(Routing::Partition(0)),
+                )
+                .await
+                .expect("publish after purge");
+
+            let builder = if group {
+                topic.consumer_group("ground-station")
+            } else {
+                topic.consumer("ground-station", 0)
+            };
+            let mut after = builder
+                .commit_policy(policy)
+                .build()
+                .await
+                .expect("consumer after purge");
+            let record = after
+                .next_within(RECEIVE_TIMEOUT)
+                .await
+                .expect("first record after purge");
+            assert_eq!(
+                (record.position.offset, record.payload.as_ref()),
+                (0, b"safe-mode-0".as_slice()),
+                "policy {policy:?}, group {group}"
+            );
+            after.shutdown().await.expect("shutdown after purge");
+            producer.shutdown().await.expect("producer shutdown");
+        }
+    }
 }

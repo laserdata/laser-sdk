@@ -1,4 +1,6 @@
 use laser_wire::checkpoint::CheckpointReadConsistency;
+use laser_wire::filter::FilterCodec;
+use laser_wire::hello::FilterAnnounce;
 use laser_wire::query::Consistency;
 
 pub use laser_wire::destination::BackendResourceId;
@@ -56,6 +58,9 @@ pub struct Capabilities {
     /// The authorization control surface (`Laser::whoami` and the role/binding
     /// verbs). Fork-native, advertised by the `AUTHZ` feature bit.
     pub authz: bool,
+    /// Server-side consumer filters (`Laser::filters`): native filtered reads
+    /// and, with a managed plane, the saved-filter catalog.
+    pub filters: FilterCaps,
     /// Platform-native session lifecycle (the infrastructure tracks a session).
     pub sessions: bool,
     /// Platform-side durable deduplication (survives a cold start without replay).
@@ -96,6 +101,33 @@ pub struct QueryCaps {
 pub struct DestinationCaps {
     pub available: bool,
     pub consistency: CheckpointReadConsistency,
+}
+
+/// Server-side consumer filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterCaps {
+    /// Filtered reads, fenced acknowledgments, previews, sample tests, and
+    /// validation. Served by the streaming server itself, advertised by the
+    /// `CONSUMER_FILTERS` feature bit, so it needs no managed plane.
+    pub native: bool,
+    /// Saved filters, revisions, group bindings, and mutation outcomes. Needs a
+    /// ready managed plane that advertises the `filter` op version.
+    pub catalog: bool,
+    /// The evaluator version and codecs the server announced. `None` from a
+    /// server that predates the announcement, which then evaluates as this
+    /// build does.
+    pub evaluation: Option<FilterAnnounce>,
+}
+
+impl FilterCaps {
+    /// Whether the server evaluates a filter built for `evaluator_version`
+    /// with `codec` exactly as this build does.
+    #[must_use]
+    pub fn evaluates(&self, evaluator_version: u32, codec: FilterCodec) -> bool {
+        self.evaluation
+            .as_ref()
+            .is_none_or(|evaluation| evaluation.evaluates(evaluator_version, codec))
+    }
 }
 
 /// The managed key-value surface and its conditional-write support.
@@ -149,6 +181,11 @@ impl Capabilities {
         agent_workflow: false,
         watch: false,
         authz: false,
+        filters: FilterCaps {
+            native: false,
+            catalog: false,
+            evaluation: None,
+        },
         sessions: false,
         durable_dedup: false,
         versions: None,
@@ -309,6 +346,18 @@ impl Capabilities {
         self
     }
 
+    /// Returns a copy advertising native consumer filters and, separately, the
+    /// saved-filter catalog.
+    #[must_use]
+    pub fn with_filters(mut self, native: bool, catalog: bool) -> Self {
+        self.filters = FilterCaps {
+            native,
+            catalog,
+            evaluation: None,
+        };
+        self
+    }
+
     /// Returns a copy with platform-native sessions.
     #[must_use]
     pub fn with_sessions(mut self, value: bool) -> Self {
@@ -343,6 +392,7 @@ impl Capabilities {
     /// already set by a BYO builder survives, and one the server does not
     /// advertise stays off.
     #[cfg(any(
+        feature = "filters",
         feature = "fork",
         feature = "destinations",
         feature = "graph",
@@ -363,6 +413,7 @@ impl Capabilities {
         self.query.keyword |= versions.has_feature(feature::KEYWORD_SEARCH);
         self.watch |= versions.has_feature(feature::WATCH);
         self.authz |= versions.has_feature(feature::AUTHZ);
+        self.filters.native |= versions.has_feature(feature::CONSUMER_FILTERS);
         self.destinations.available |=
             versions.checkpoint > 0 && versions.has_feature(feature::DESTINATIONS);
         if self.destinations.available {
@@ -432,6 +483,17 @@ mod tests {
             caps.query.consistency,
             Consistency::ReadYourWrites,
             "the read-your-writes bit should raise the level"
+        );
+    }
+
+    #[test]
+    fn given_the_consumer_filters_bit_when_merged_then_should_light_up_native_filters_only() {
+        let mut caps = Capabilities::OPEN;
+        caps.merge_features(&OpVersions::new(1, 1, 1, 1).with_features(feature::CONSUMER_FILTERS));
+        assert!(caps.filters.native);
+        assert!(
+            !caps.filters.catalog,
+            "the catalog needs a ready plane with the filter op version"
         );
     }
 

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
+import { setTimeout as delay } from "node:timers/promises"
+import { Consumer, PollingStrategy } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
 import { CancelledError } from "../../src/client/errors.js"
 
@@ -62,13 +64,20 @@ void test("given_manual_commit_when_the_consumer_is_recreated_then_should_resume
     await topic.send(utf8("one"))
     await topic.send(utf8("two"))
 
-    const first = topic.consumer(0, { startFrom: { kind: "first" }, autoCommit: false })
+    const first = topic.consumer("resume-reader", 0, {
+      startFrom: { kind: "first" },
+      autoCommit: false
+    })
     const one = await first.nextWithin(2_000)
     assert.ok(one !== null)
     assert.equal(decodeUtf8(one.payload), "one")
     await first.commit(one)
+    await first.shutdown()
 
-    const resumed = topic.consumer(0, { startFrom: { kind: "next" }, autoCommit: false })
+    const resumed = topic.consumer("resume-reader", 0, {
+      startFrom: { kind: "next" },
+      autoCommit: false
+    })
     const two = await resumed.nextWithin(2_000)
     assert.ok(two !== null)
     assert.equal(decodeUtf8(two.payload), "two")
@@ -145,6 +154,114 @@ void test("given_invalid_consumer_controls_when_created_then_should_reject_befor
     )
     const consumer = topic.consumer(0)
     await assert.rejects(consumer.nextWithin(Number.NaN), /timeout/)
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_a_fresh_consumer_when_reading_next_then_should_start_at_zero", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    await topic.send(utf8("zero"))
+    await topic.send(utf8("one"))
+    const options = { autoCommit: false, batchLength: 1 }
+    const first = topic.consumer("fresh", 0, options)
+    assert.equal((await first.nextWithin(2_000))?.offset, 0n)
+    await first.shutdown()
+    const retried = topic.consumer("fresh", 0, options)
+    const zero = await retried.nextWithin(2_000)
+    assert.ok(zero !== null)
+    assert.equal(zero.offset, 0n)
+    await retried.commit(zero)
+    await retried.shutdown()
+    const resumed = topic.consumer("fresh", 0, options)
+    assert.equal((await resumed.nextWithin(2_000))?.offset, 1n)
+    await resumed.shutdown()
+  } finally {
+    await laser.close()
+  }
+})
+
+void test("given_default_polling_when_shutdown_after_offset_zero_then_should_resume_at_one", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const topic = await freshTopic(laser)
+    for (const value of ["zero", "one", "two", "three"]) await topic.send(utf8(value))
+    const first = topic.consumer("partial", 0, { batchLength: 4 })
+    assert.equal((await first.nextWithin(2_000))?.offset, 0n)
+    assert.equal(first.lastConsumedOffset(0), 0n)
+    await first.shutdown()
+    const resumed = topic.consumer("partial", 0, { batchLength: 4 })
+    assert.equal((await resumed.nextWithin(2_000))?.offset, 1n)
+    await resumed.shutdown()
+  } finally {
+    await laser.close()
+  }
+})
+
+// A purge restarts the partition at offset zero and clears every stored
+// offset. A consumer rebuilt after the purge reads the replacement history
+// from its first record, whatever its commit mode or start position.
+void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_the_new_offset_zero", async () => {
+  const laser = await Laser.connect(CONNECTION_STRING)
+  try {
+    const variants = [
+      { group: false, options: {} },
+      { group: false, options: { autoCommit: false } },
+      { group: false, options: { startFrom: { kind: "first" as const } } },
+      { group: true, options: {} },
+      { group: true, options: { autoCommit: false } }
+    ]
+    for (const { group, options } of variants) {
+      const streamName = `laser-ts-test-${randomUUID()}`
+      const topic = laser.stream(streamName).topic("telemetry")
+      await laser.stream(streamName).ensure()
+      await topic.ensure(1)
+      for (const value of ["telemetry-0", "telemetry-1", "telemetry-2"])
+        await topic.send(utf8(value))
+      const open = () =>
+        group
+          ? topic.consumerGroup("ground-station", { ...options, batchLength: 3 })
+          : Promise.resolve(topic.consumer("ground-station", 0, { ...options, batchLength: 3 }))
+      const before = await open()
+      for (let expected = 0n; expected < 3n; expected++) {
+        const record = await before.nextWithin(2_000)
+        assert.ok(record !== null)
+        assert.equal(record.offset, expected)
+        if (options.autoCommit === false) await before.commit(record)
+      }
+      await before.shutdown()
+
+      await laser.iggyClient.topic.purge({ streamId: streamName, topicId: "telemetry" })
+      // Metadata commits before the owner applies the purge. Wait for the empty source before publishing its replacement.
+      const deadline = performance.now() + 5_000
+      for (;;) {
+        const polled = await laser.iggyClient.message.poll({
+          streamId: streamName,
+          topicId: "telemetry",
+          partitionId: 0,
+          consumer: Consumer.Single,
+          pollingStrategy: PollingStrategy.First,
+          count: 3,
+          autocommit: false
+        })
+        if (polled.count === 0) break
+        assert(performance.now() < deadline, "the owner did not apply the purge")
+        await delay(10)
+      }
+      for (const value of ["safe-mode-0", "safe-mode-1"]) await topic.send(utf8(value))
+
+      const after = await open()
+      try {
+        const record = await after.nextWithin(2_000)
+        assert.ok(record !== null, `group ${String(group)}, options ${JSON.stringify(options)}`)
+        assert.equal(record.offset, 0n)
+        assert.equal(decodeUtf8(record.payload), "safe-mode-0")
+      } finally {
+        await after.shutdown()
+      }
+    }
   } finally {
     await laser.close()
   }

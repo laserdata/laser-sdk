@@ -54,7 +54,7 @@ async def main() -> None:
         while (record := await reader.next()) is not None:
             print(f"  order #{record.value.id} total {record.value.total}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

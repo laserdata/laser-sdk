@@ -1,4 +1,4 @@
-use laser_examples::{PARTITIONS, init_tracing, laser, phase, release_after, stream_for};
+use laser_examples::{PARTITIONS, fresh_run, init_tracing, laser, phase, stream_for};
 use laser_sdk::prelude::full::*;
 
 // The Context primitive: one conversation's full record, assembled on
@@ -11,7 +11,7 @@ const TOKEN_BUDGET: usize = 4_000;
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("context"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("context"), async {
+    fresh_run(&laser, &stream_for("context"), async {
         // Conversation turns ride the well-known agent topics, created once here.
         laser.bootstrap(PARTITIONS).await?;
         let conversation = ConversationId::new();

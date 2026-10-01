@@ -5,7 +5,7 @@
 // `--features llm-anthropic` (ANTHROPIC_API_KEY) or `--features llm-openai`
 // (OPENAI_API_KEY). Nothing in the bridges changes between mock and real.
 use laser_examples::{
-    LlmClient, PARTITIONS, default_llm, init_tracing, laser, phase, release_after, stream_for,
+    LlmClient, PARTITIONS, default_llm, fresh_run, init_tracing, laser, phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{
@@ -20,7 +20,7 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     phase("connecting");
     let laser = laser(&stream_for("interop"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("interop"), async {
+    fresh_run(&laser, &stream_for("interop"), async {
         laser.bootstrap(PARTITIONS).await?;
         let llm = default_llm();
 

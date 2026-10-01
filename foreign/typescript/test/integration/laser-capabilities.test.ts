@@ -16,13 +16,14 @@ function probeObserver(onProbe: () => void): LaserObserver {
   }
 }
 
-void test("given_apache_iggy_when_probing_capabilities_then_should_report_open_not_managed", async () => {
+void test("given_no_managed_plane_when_probing_capabilities_then_should_report_native_filters_not_managed", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const capabilities = await laser.capabilities()
     assert.equal(capabilities.managed, false)
     assert.deepEqual(capabilities.backends, [])
-    assert.equal(capabilities.versions, undefined)
+    assert.equal(capabilities.filters.native, true)
+    assert.equal(capabilities.filters.catalog, false)
   } finally {
     await laser.close()
   }

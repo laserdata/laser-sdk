@@ -22,6 +22,7 @@ __all__ = [
     "ChunkAssembler",
     "CompiledSchema",
     "Consumer",
+    "ConsumerFilter",
     "ConsumerMessage",
     "ContextScope",
     "CrashContext",
@@ -29,6 +30,10 @@ __all__ = [
     "Decision",
     "Destinations",
     "FileStore",
+    "FilterAnnounce",
+    "FilterExpr",
+    "FilteredReader",
+    "Filters",
     "ForkHandle",
     "ForkPutRequest",
     "GovernedAction",
@@ -48,6 +53,8 @@ __all__ = [
     "KvSetRequest",
     "Laser",
     "Lease",
+    "MatchedPage",
+    "MatchedRecord",
     "McpBridge",
     "Memory",
     "MemoryItem",
@@ -671,6 +678,17 @@ class Capabilities:
         role/binding verbs).
         """
     @property
+    def filters(self) -> builtins.bool:
+        r"""
+        Consumer filters are served by the streaming server (`Laser.filters()`
+        readers, previews, sample tests, validation).
+        """
+    @property
+    def filters_catalog(self) -> builtins.bool:
+        r"""
+        The saved-filter catalog and group bindings are served.
+        """
+    @property
     def a2a_gateway(self) -> builtins.bool:
         r"""
         A managed A2A gateway is available.
@@ -697,6 +715,8 @@ class Capabilities:
         The materialization backends the connected server exposes (identity
         only). Empty against Apache Iggy and servers that advertise none.
         """
+    @property
+    def evaluation(self) -> typing.Optional[FilterAnnounce]: ...
     def backend(self, resource_id: builtins.str) -> typing.Optional[BackendDescriptor]: ...
     def enabled_backends(self) -> builtins.list[BackendDescriptor]: ...
     def unready_backends(self) -> builtins.list[BackendDescriptor]: ...
@@ -854,7 +874,10 @@ class CompiledSchema:
 class Consumer:
     r"""
     A Laser partition or consumer-group reader. It is an async iterator and
-    exposes manual offset storage for commit-after-handle delivery.
+    exposes manual offset storage for commit-after-handle delivery. A purge
+    restarts the partition at offset 0 without telling an open reader, which
+    can keep its old position and skip the replacement records, so rebuild it
+    after a purge.
     """
     @property
     def name(self) -> builtins.str:
@@ -890,16 +913,99 @@ class Consumer:
         """
     def last_stored_offset(self, partition: builtins.int) -> typing.Any:
         r"""
-        Last offset this consumer stored on the server for `partition`.
+        Local Iggy SDK offset bookkeeping. An initial zero does not prove a
+        durable checkpoint exists. Use `next` polling for server-side resume.
         """
     def shutdown(self) -> typing.Any:
         r"""
-        Stop polling and leave the group. Automatic policies flush final offset
-        state. Disabled auto-commit preserves the last explicit commit.
+        Stop polling and leave the group. Automatic policies delegate final
+        offset handling to the Iggy SDK. Polling commits before delivery, so
+        shutdown is not a processing checkpoint. Disabled auto-commit preserves
+        the last explicit commit.
         """
     def __aiter__(self) -> Consumer: ...
     def __anext__(self) -> typing.Any: ...
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ConsumerFilter:
+    r"""
+    One consumer filter: an expression, the payload codec, and the fault
+    policy. Its `digest` identifies exactly these semantics.
+    """
+    @property
+    def digest(self) -> bytes:
+        r"""
+        The SHA-256 digest of the filter's semantics.
+        """
+    @property
+    def codec(self) -> builtins.str: ...
+    @property
+    def fault_policy(self) -> builtins.str: ...
+    @property
+    def expr(self) -> FilterExpr: ...
+    @staticmethod
+    def json(expr: FilterExpr, fault_policy: builtins.str = 'stop') -> ConsumerFilter:
+        r"""
+        Decode the payload as JSON. `fault_policy` is `stop` (the default),
+        `pass`, or `drop`.
+        """
+    @staticmethod
+    def cbor(expr: FilterExpr, fault_policy: builtins.str = 'stop') -> ConsumerFilter:
+        r"""
+        Decode a CBOR payload with bounded depth and size.
+        """
+    @staticmethod
+    def avro(expr: FilterExpr, schema_refs: typing.Sequence[builtins.int], fault_policy: builtins.str = 'stop') -> ConsumerFilter:
+        r"""
+        Decode a raw Avro datum selected by its agdx.sid header.
+        """
+    @staticmethod
+    def protobuf(expr: FilterExpr, schema_refs: typing.Sequence[builtins.int], fault_policy: builtins.str = 'stop') -> ConsumerFilter:
+        r"""
+        Decode a Protobuf message selected by its agdx.sid header.
+        """
+    @staticmethod
+    def headers_only(expr: FilterExpr, fault_policy: builtins.str = 'stop') -> ConsumerFilter:
+        r"""
+        Never decode the payload. Only header predicates are allowed.
+        """
+    def with_fault_policy(self, policy: builtins.str) -> ConsumerFilter:
+        r"""
+        A copy with the malformed-payload policy: stop, pass, or drop.
+        """
+    def with_foreign_policy(self, policy: builtins.str) -> ConsumerFilter:
+        r"""
+        A copy whose records in another format (another `agdx.ct` codec, or a
+        writer schema the filter does not list) are skipped (`reject`, the
+        default) or delivered unevaluated (`pass`).
+        """
+    def with_mismatch_policy(self, policy: builtins.str) -> ConsumerFilter:
+        r"""
+        A copy whose records with a value of a type a predicate cannot compare
+        are skipped (`reject`, the default) or delivered unevaluated (`pass`).
+        """
+    @staticmethod
+    def from_dict(value: typing.Any) -> ConsumerFilter:
+        r"""
+        Rebuild a filter from its wire dict.
+        """
+    def to_dict(self) -> typing.Any:
+        r"""
+        The filter as its wire dict.
+        """
+    def evaluate(self, payload: typing.Any, headers: typing.Optional[dict] = None, *, schemas: typing.Optional[typing.Any] = None, max_payload_bytes: typing.Optional[builtins.int] = None, max_depth: typing.Optional[builtins.int] = None) -> builtins.str:
+        r"""
+        Evaluate the filter locally with the evaluator the server runs:
+        `selected`, `rejected`, or `fault`. `headers` carries typed user headers.
+        """
+    def explain(self, payload: typing.Any, headers: typing.Optional[dict] = None, *, schemas: typing.Optional[typing.Any] = None, max_payload_bytes: typing.Optional[builtins.int] = None, max_depth: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Evaluate the filter locally and explain the verdict as the server
+        would: a dict with `verdict`, an optional `fault`, and the `root`
+        explanation tree with one node per predicate.
+        """
+    def __eq__(self, other: ConsumerFilter) -> builtins.bool: ...
 
 @typing.final
 class ConsumerMessage:
@@ -919,6 +1025,13 @@ class ConsumerMessage:
     def timestamp_micros(self) -> builtins.int: ...
     @property
     def origin_timestamp_micros(self) -> builtins.int: ...
+    @property
+    def headers_malformed(self) -> builtins.bool:
+        r"""
+        True when a header entry or the block structure is malformed.
+        Valid entries remain readable. Unknown value kinds are raw bytes.
+        A structurally truncated block has no decoded headers.
+        """
     @property
     def payload(self) -> bytes:
         r"""
@@ -1168,6 +1281,297 @@ class FileStore:
     def delete(self, key: builtins.str) -> typing.Any:
         r"""
         Remove `key`. A no-op if it was already absent.
+        """
+
+@typing.final
+class FilterAnnounce:
+    r"""
+    Consumer-filter evaluator version and codecs advertised by the server.
+    """
+    @property
+    def evaluator_version(self) -> builtins.int: ...
+    @property
+    def codecs(self) -> builtins.list[builtins.str]: ...
+
+@typing.final
+class FilterExpr:
+    r"""
+    One predicate or a composition of predicates over a record. Build it with
+    the static constructors: `FilterExpr.pred("after.mode", "eq", "safe")`.
+    """
+    @staticmethod
+    def all(children: typing.Sequence[FilterExpr]) -> FilterExpr:
+        r"""
+        Every child matches.
+        """
+    @staticmethod
+    def any(children: typing.Sequence[FilterExpr]) -> FilterExpr:
+        r"""
+        At least one child matches.
+        """
+    @staticmethod
+    def negate(child: FilterExpr) -> FilterExpr:
+        r"""
+        The child does not match. Unknown stays unknown.
+        """
+    @staticmethod
+    def pred(field: builtins.str, op: builtins.str, value: typing.Any) -> FilterExpr:
+        r"""
+        Compare a payload field (`a.b[0]`) with `op` (`eq`, `ne`, `lt`, `lte`,
+        `gt`, `gte`, `in`, `contains`, `prefix`) against `value`.
+        """
+    @staticmethod
+    def pred_as(field: builtins.str, op: builtins.str, value: typing.Any, coerce: builtins.str) -> FilterExpr:
+        r"""
+        Compare after an explicit coercion: `number`, `rfc3339`,
+        `epoch_seconds`, `epoch_millis`, or `epoch_micros`.
+        """
+    @staticmethod
+    def present(path: builtins.str) -> FilterExpr:
+        r"""
+        The payload path exists. An explicit `null` counts as present.
+        """
+    @staticmethod
+    def absent(path: builtins.str) -> FilterExpr:
+        r"""
+        The payload path does not exist.
+        """
+    @staticmethod
+    def header(key: builtins.str, op: builtins.str, value: typing.Any) -> FilterExpr:
+        r"""
+        Compare one typed user header, keyed exactly.
+        """
+    @staticmethod
+    def text(field: builtins.str, kind: builtins.str, pattern: builtins.str, case_insensitive: builtins.bool = False) -> FilterExpr:
+        r"""
+        Match a text payload field: `kind` is `equals`, `prefix`, `suffix`,
+        `contains`, `glob`, or `regex`. A value of another type is a type
+        mismatch, which follows the filter's mismatch policy.
+        """
+    @staticmethod
+    def header_text(key: builtins.str, kind: builtins.str, pattern: builtins.str, case_insensitive: builtins.bool = False) -> FilterExpr:
+        r"""
+        Match one text user header, keyed exactly, the way `text` matches a field.
+        """
+    @staticmethod
+    def from_dict(value: typing.Any) -> FilterExpr:
+        r"""
+        Rebuild an expression from its wire dict.
+        """
+    def to_dict(self) -> typing.Any:
+        r"""
+        The expression as its wire dict.
+        """
+    def __eq__(self, other: FilterExpr) -> builtins.bool: ...
+
+@typing.final
+class FilteredReader:
+    r"""
+    Reads only the records a consumer filter selects and stores progress
+    through fenced acknowledgments. Build it with `Filters.reader`. Drive one
+    reader from one task. `async for record in reader` yields matching records
+    until the task is cancelled. A record whose `next_record` call is cancelled
+    after it was read is yielded again by the next call, so a cancellation never
+    strands a record the partition's progress waits for.
+    """
+    def next_page(self) -> typing.Any:
+        r"""
+        The next page with at least one match. Waits while nothing is new,
+        without holding the reader, so `ack` and `close` run meanwhile.
+        """
+    def try_next_page(self) -> typing.Any:
+        r"""
+        Read until a page matches or nothing is new. `None` when nothing is new.
+        """
+    def read_round(self) -> typing.Any:
+        r"""
+        One bounded round without an idle wait. Returns (page, more).
+        Read examined_in_round() for the count of source records examined.
+        """
+    def examined_in_round(self) -> builtins.int:
+        r"""
+        Source records examined in the last bounded round, including empty pages.
+        """
+    def next_record(self) -> typing.Any:
+        r"""
+        The next matching record.
+        """
+    def ack(self, record: MatchedRecord) -> typing.Any:
+        r"""
+        Mark one record handled and store the progress this completes.
+        """
+    def ack_through(self, record: MatchedRecord) -> typing.Any:
+        r"""
+        Mark all preceding records on this partition through `record` handled.
+        Process the prefix first. Later records in the same page stay pending.
+        """
+    def ack_page(self, page: MatchedPage) -> typing.Any:
+        r"""
+        Mark every record of `page` handled and store the progress this
+        completes.
+        """
+    def partitions(self) -> typing.Any:
+        r"""
+        The partitions this reader reads now.
+        """
+    def idle_interval(self) -> typing.Any:
+        r"""
+        How long this reader waits, in seconds, when nothing is new.
+        """
+    def owns(self, record: MatchedRecord) -> typing.Any:
+        r"""
+        Whether `record` was read by this reader in its current membership, so
+        it can still be acknowledged. A rejoin retires every earlier page.
+        """
+    def data_connections_opened(self) -> typing.Any:
+        r"""
+        Data connections this reader opened to partition primaries, including
+        routes later retired. A healthy reader opens one per node and keeps it.
+        """
+    def close(self) -> typing.Any:
+        r"""
+        Store completed progress, leave the group, and close the data
+        connections. Closing twice is a no-op.
+        """
+    def __aiter__(self) -> FilteredReader: ...
+    def __anext__(self) -> typing.Any: ...
+
+@typing.final
+class Filters:
+    r"""
+    Consumer filters on one connection. Build it with `Laser.filters()`.
+    Catalog replies are dicts in the wire shape.
+    """
+    def reader(self, stream: builtins.str, topic: builtins.str, *, consumer: typing.Optional[builtins.str] = None, group: typing.Optional[builtins.str] = None, group_id: typing.Optional[builtins.int] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, start: builtins.str = 'next', start_offset: typing.Optional[builtins.int] = None, start_timestamp_micros: typing.Optional[builtins.int] = None, count: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, read_mode: builtins.str = 'primary', local_guard: builtins.bool = False, idle_interval: typing.Optional[builtins.float] = None) -> typing.Any:
+        r"""
+        A filtered reader over `stream` / `topic`. Name an independent
+        `consumer` (every partition unless `partitions` is given) or a
+        consumer `group` or numeric `group_id` (its assigned partitions). Pass
+        an inline `filter`, a
+        saved `filter_id` and `revision`, or nothing for a group's binding.
+        `start` is `next` (the default), `first`, or `last`, or use
+        `start_offset` / `start_timestamp_micros`.
+        `read_mode` is primary or local. Local reads cannot acknowledge.
+        `local_guard` checks delivered records against the filter locally.
+        `idle_interval` is seconds, finite and non-negative.
+        `count` bounds records per page, default 100.
+        `max_reply_bytes` bounds record bytes per page.
+        `max_unacked_pages` bounds outstanding pages per partition, default 1024.
+        A numeric `group_id` identifies an existing group in this source incarnation.
+        """
+    def validate(self, filter: ConsumerFilter) -> typing.Any:
+        r"""
+        Validate and compile `filter` on the server without running it.
+        """
+    def test(self, payload: typing.Any, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, headers: typing.Optional[dict] = None) -> typing.Any:
+        r"""
+        Evaluate a filter against one supplied `payload` and optional typed
+        `headers`, and explain the verdict. Nothing is read or stored.
+        """
+    def preview(self, stream: builtins.str, topic: builtins.str, partition_id: builtins.int, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, from_offset: builtins.int = 0, max_examined: typing.Optional[builtins.int] = None, max_records: typing.Optional[builtins.int] = None, explain: builtins.bool = False) -> typing.Any:
+        r"""
+        Preview a filter over stored records of one partition. A preview joins
+        no group and stores no offset.
+        """
+    def get(self, filter_id: builtins.int) -> typing.Any:
+        r"""
+        One saved filter with its latest revision and bindings.
+        """
+    def list(self, *, name_contains: typing.Optional[builtins.str] = None, state: typing.Optional[builtins.str] = None, before_id: typing.Optional[builtins.int] = None, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
+        r"""
+        One page of saved filters, newest first. Pass the last `id` of a page
+        as `before_id` to read the next one stably while the catalog changes.
+        """
+    def revisions(self, filter_id: builtins.int, *, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
+        r"""
+        One page of a filter's revisions, newest first.
+        """
+    def binding(self, stream: builtins.str, topic: builtins.str, group: builtins.str) -> typing.Any:
+        r"""
+        The binding of one consumer group. Raises `FilterError` with reason
+        `not_found` when the group is unbound.
+        """
+    def bindings(self, *, filter_id: typing.Optional[builtins.int] = None, stream: typing.Optional[builtins.str] = None, topic: typing.Optional[builtins.str] = None, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
+        r"""
+        One page of bindings, optionally narrowed to one filter, one
+        `stream`, or one `stream` and `topic`.
+        """
+    def apply(self, mutation: typing.Any) -> typing.Any:
+        r"""
+        Apply one catalog `mutation` (a wire dict such as
+        `{"archive": {"filter_id": 7}}`) under a fresh operation id, wait for
+        its outcome, and return the applied result dict. A rejection raises
+        `FilterError`, and an outcome still pending after the wait raises an
+        error that names the operation id.
+        """
+    def apply_as(self, operation_id: builtins.int, mutation: typing.Any) -> typing.Any:
+        r"""
+        apply under a caller-chosen `operation_id`, so a
+        caller that records the id first can resume the same mutation after a
+        crash.
+        """
+    def mutate(self, operation_id: builtins.int, mutation: typing.Any) -> typing.Any:
+        r"""
+        Send one catalog `mutation` (a wire dict such as
+        `{"archive": {"filter_id": 7}}`) under a caller-chosen `operation_id`
+        and return its outcome dict, which may be `pending`. Retrying with the
+        same id never applies it twice.
+        """
+    def wait_for_outcome(self, operation_id: builtins.int, *, timeout: builtins.float = 30.0) -> typing.Any:
+        r"""
+        Wait up to `timeout` seconds for the outcome of `operation_id`, for
+        example the id an ambiguous mutation error names. Returns the applied
+        result dict, raises `FilterError` for a rejection, and
+        raises an error while it stays pending.
+        """
+    def operation(self, operation_id: builtins.int) -> typing.Any:
+        r"""
+        The recorded outcome of the mutation `operation_id`.
+        """
+    def register(self, name: builtins.str, filter: ConsumerFilter, *, description: builtins.str = '') -> typing.Any:
+        r"""
+        Save a new filter as revision 1 and wait for the applied outcome.
+        Returns the revision dict (`filter_id`, `revision`, `digest`).
+        """
+    def revise(self, filter_id: builtins.int, expected_revision: builtins.int, filter: ConsumerFilter) -> typing.Any:
+        r"""
+        Add a revision. `expected_revision` must still be the latest one.
+        """
+    def describe(self, filter_id: builtins.int, description: builtins.str) -> typing.Any:
+        r"""
+        Replace a filter's description.
+        """
+    def archive(self, filter_id: builtins.int) -> typing.Any:
+        r"""
+        Hide a filter from new bindings. Existing bindings keep executing.
+        """
+    def delete(self, filter_id: builtins.int) -> typing.Any:
+        r"""
+        Delete a filter. Raises `FilterError` with reason `conflict` while a
+        consumer group is bound to it.
+        """
+    def bind(self, stream: builtins.str, topic: builtins.str, group: builtins.str, filter_id: builtins.int, revision: builtins.int) -> typing.Any:
+        r"""
+        Pin an existing consumer group to one revision. Returns the binding dict.
+        """
+    def create_consumer_group(self, stream: builtins.str, topic: builtins.str, group: builtins.str, filter_id: builtins.int, revision: builtins.int) -> typing.Any:
+        r"""
+        Create the consumer group if absent and bind it to a saved revision.
+        A failed bind can leave an unbound group. Returns the binding dict.
+        """
+    def set_revision_enabled(self, filter_id: builtins.int, revision: builtins.int, enabled: builtins.bool) -> typing.Any:
+        r"""
+        Pause or resume a revision while preserving its content and digest.
+        """
+    def unbind_binding(self, binding: typing.Any) -> typing.Any:
+        r"""
+        Release exactly the group incarnation a binding dict (from `binding` or
+        `bindings`) names, by its stored identity and digest. A group deleted
+        and recreated under the same name keeps its own binding.
+        """
+    def unbind(self, stream: builtins.str, topic: builtins.str, group: builtins.str, expected_digest: typing.Sequence[builtins.int]) -> typing.Any:
+        r"""
+        Release the currently named group, conditional on its digest.
         """
 
 @typing.final
@@ -1985,7 +2389,7 @@ class Laser:
         A clone whose change-feed records publish to `changes_topic` on the ops
         stream instead of the default `changes`.
         """
-    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
+    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, filters: typing.Optional[builtins.bool] = None, filters_catalog: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Return a clone with selected negotiated capabilities overridden. This is
         intended for bring-your-own backends and deterministic pre-gate tests.
@@ -2037,6 +2441,13 @@ class Laser:
     def destinations(self) -> Destinations:
         r"""
         Open the managed materialization destination and query-route surface.
+        """
+    def filters(self) -> Filters:
+        r"""
+        Server-side consumer filters: filtered readers, previews, sample tests,
+        and the saved-filter catalog. Native reads need a server that serves
+        consumer filters. The catalog also needs a managed plane. Either missing
+        raises `UnsupportedError`.
         """
     def fork(self, fork_id: builtins.str) -> ForkHandle:
         r"""
@@ -2319,6 +2730,73 @@ class Lease:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class MatchedPage:
+    r"""
+    One page of matching records from one partition.
+    """
+    @property
+    def partition_id(self) -> builtins.int: ...
+    @property
+    def records(self) -> builtins.list[MatchedRecord]: ...
+    @property
+    def stop(self) -> builtins.str:
+        r"""
+        Why the page stopped: `filled`, `budget`, `end_of_visible`, `fault`,
+        or `oversized_record`.
+        """
+    @property
+    def examined(self) -> builtins.int: ...
+    @property
+    def frontier(self) -> builtins.int: ...
+    @property
+    def safe_ack_offset(self) -> typing.Optional[builtins.int]: ...
+    @property
+    def policy(self) -> typing.Any:
+        r"""
+        The executed filter as a dict: `digest`, and `filter_id` / `revision`
+        for a saved one.
+        """
+    @property
+    def generation(self) -> typing.Any:
+        r"""
+        The source history the page was read from, as a dict.
+        """
+
+@typing.final
+class MatchedRecord:
+    r"""
+    One matching record, unchanged from the stream.
+    """
+    @property
+    def partition_id(self) -> builtins.int: ...
+    @property
+    def offset(self) -> builtins.int: ...
+    @property
+    def frontier(self) -> builtins.int:
+        r"""
+        The partition frontier observed with this record.
+        """
+    @property
+    def evaluated(self) -> builtins.bool:
+        r"""
+        False when a pass fault, foreign-codec, or type-mismatch policy
+        delivered the record without evaluation.
+        """
+    @property
+    def headers_malformed(self) -> builtins.bool:
+        r"""
+        True when a header entry or block structure is malformed. Valid
+        headers and payload remain readable. Unknown value kinds remain raw.
+        A truncated block has empty `message.headers`.
+        """
+    @property
+    def message(self) -> ConsumerMessage:
+        r"""
+        The record as a `ConsumerMessage`: payload, typed headers, id, and
+        timestamps. Decoded once, then shared.
+        """
+
+@typing.final
 class McpBridge:
     r"""
     An MCP bridge: serve tools / resources / prompts over the log and route
@@ -2515,6 +2993,8 @@ class OpVersions:
     def graph(self) -> builtins.int: ...
     @property
     def checkpoint(self) -> builtins.int: ...
+    @property
+    def filter(self) -> builtins.int: ...
     @property
     def features(self) -> builtins.int: ...
     def __repr__(self) -> builtins.str: ...
@@ -3504,6 +3984,11 @@ class Topic:
         Idempotently create this topic with `partitions`, creating the stream
         first when needed.
         """
+    def ensure_consumer_group(self, name: builtins.str) -> typing.Any:
+        r"""
+        Idempotently create the consumer group `name` on this topic without
+        joining it.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -3818,6 +4303,11 @@ class KvError(LaserError): ...
 class ForkError(LaserError): ...
 class GraphError(LaserError): ...
 class AuthzError(LaserError): ...
+class FilterError(LaserError):
+    reason: builtins.str
+    fault_reason: builtins.str | None
+    partition_id: builtins.int | None
+    offset: builtins.int | None
 class SignatureError(LaserError): ...
 class UnsupportedError(LaserError): ...
 class InvalidError(LaserError, builtins.ValueError): ...

@@ -78,6 +78,7 @@ corpus!(
     "client_metadata_list.bin",
     "client_metadata_query.bin",
     "control_apply_binding.bin",
+    "control_filter_catalog.bin",
     "control_drop_schema.bin",
     "control_register_projection.bin",
     "control_register_schema_avro.bin",
@@ -93,6 +94,28 @@ corpus!(
     "destination_page.json",
     "error_body.json",
     "fold_snapshot.bin",
+    "filter_ack.bin",
+    "filter_catalog_reply_bound.bin",
+    "filter_catalog_reply_registered.bin",
+    "filter_consumer_filter.bin",
+    "filter_consumer_filter.json",
+    "filter_eval_cases.json",
+    "filter_codec_cases.json",
+    "filter_mutation_register.bin",
+    "filter_mutation_register.json",
+    "filter_mutation_unbind_exact.bin",
+    "filter_mutation_unbind_exact.json",
+    "filter_poll_request.bin",
+    "filter_poll_request_group_id.bin",
+    "filter_reply_revision_disabled.bin",
+    "filter_mutation_revision_state.bin",
+    "filter_mutation_revision_state.json",
+    "filter_catalog_reply_revision_state.bin",
+    "filter_catalog_reply_revisions.bin",
+    "filter_reply_acknowledged.bin",
+    "filter_reply_error.bin",
+    "filter_reply_page.bin",
+    "filter_validation.json",
     "fork_create.bin",
     "fork_info.json",
     "fork_put.bin",
@@ -184,6 +207,9 @@ pub fn assert_matches(name: &str, encoded: &[u8]) {
         "fixture `{name}` drifted from the canonical frame"
     );
 }
+
+/// Shared payload-codec semantics, consumed by native and TypeScript tests.
+pub const FILTER_CODEC_CASES: &str = include_str!("../fixtures/filter_codec_cases.json");
 
 #[cfg(test)]
 mod tests {

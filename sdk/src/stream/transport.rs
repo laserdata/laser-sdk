@@ -9,7 +9,7 @@ use iggy::prelude::{
     MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage, SendMessagesResponse,
 };
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -86,10 +86,11 @@ pub enum CommitPolicy {
     Disabled,
     /// Store offsets on a fixed interval.
     Interval(Duration),
-    /// Store the previous batch offset before polling again.
+    /// Commit the current polled batch on the server before delivery. A crash
+    /// can skip records the application has not processed.
     #[default]
     Polling,
-    /// Store on an interval or before polling, whichever happens first.
+    /// Store on an interval or commit the current batch during polling.
     IntervalOrPolling(Duration),
     /// Store after consuming all records returned by a poll.
     All,
@@ -710,6 +711,7 @@ impl ConsumerBuilder {
         let mut consumer = builder.build();
         consumer.init().await?;
         Ok(Consumer {
+            yielded_zero: BTreeSet::new(),
             inner: Some(consumer),
             manual_commit,
             shutdown_target,
@@ -758,8 +760,12 @@ impl TryFrom<ReceivedMessage> for ConsumerMessage {
     }
 }
 
-/// An initialized live reader with server-managed offsets.
+/// An initialized live reader with server-managed offsets. A purge restarts
+/// the partition at offset 0 without telling an open reader, which can keep
+/// its old position and skip the replacement records, so rebuild it after a
+/// purge.
 pub struct Consumer {
+    yielded_zero: BTreeSet<u32>,
     inner: Option<IggyConsumer>,
     manual_commit: bool,
     shutdown_target: Option<ConsumerGroupTarget>,
@@ -827,15 +833,18 @@ impl Consumer {
             .and_then(|consumer| consumer.get_last_consumed_offset(partition))
     }
 
-    /// Return the last offset this reader stored for a partition.
+    /// Return local Iggy SDK offset bookkeeping. Its initial zero does not
+    /// prove a durable checkpoint exists. Use `Next` for server-side resume.
     pub fn last_stored_offset(&self, partition: u32) -> Option<u64> {
         self.inner
             .as_ref()
             .and_then(|consumer| consumer.get_last_stored_offset(partition))
     }
 
-    /// Stop polling and leave the group. Automatic policies flush final offset
-    /// state. [`CommitPolicy::Disabled`] preserves the last explicit commit.
+    /// Stop polling and leave the group. Automatic policies delegate final
+    /// offset handling to the Iggy SDK. Polling commits before delivery, so
+    /// shutdown is not a processing checkpoint. [`CommitPolicy::Disabled`]
+    /// preserves the last explicit commit.
     pub async fn shutdown(&mut self) -> Result<(), LaserError> {
         if self.manual_commit {
             drop(self.inner.take());
@@ -852,12 +861,26 @@ impl Consumer {
             }
             return Ok(());
         }
-        if let Some(consumer) = self.inner.as_mut() {
-            consumer.shutdown().await?;
-        }
+        let outcome = if let Some(consumer) = self.inner.as_mut() {
+            let mut stored = Ok(());
+            for partition in &self.yielded_zero {
+                if consumer
+                    .get_last_stored_offset(*partition)
+                    .is_none_or(|offset| offset == 0)
+                {
+                    // The native shutdown treats an unset stored offset as zero.
+                    // Explicitly store a delivered zero for automatic policies.
+                    stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
+                }
+            }
+            let stopped = consumer.shutdown().await;
+            stored.and(stopped)
+        } else {
+            Ok(())
+        };
         self.inner.take();
         self.shutdown_target.take();
-        Ok(())
+        outcome.map_err(Into::into)
     }
 
     fn inner(&self) -> Result<&IggyConsumer, LaserError> {
@@ -875,7 +898,17 @@ impl Stream for Consumer {
             return Poll::Ready(None);
         };
         match Pin::new(inner).poll_next(context) {
-            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(message.try_into())),
+            Poll::Ready(Some(Ok(message))) => {
+                let converted: Result<ConsumerMessage, LaserError> = message.try_into();
+                if let Ok(message) = &converted {
+                    if message.position.offset == 0 {
+                        self.yielded_zero.insert(message.partition_id);
+                    } else {
+                        self.yielded_zero.remove(&message.partition_id);
+                    }
+                }
+                Poll::Ready(Some(converted))
+            }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,

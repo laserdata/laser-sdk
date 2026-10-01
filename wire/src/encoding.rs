@@ -154,6 +154,49 @@ pub(crate) mod opt_bin_bytes {
     }
 }
 
+/// A `u128` that JSON carries as decimal text, because JSON numbers lose
+/// precision above 2^53 in most clients. Binary formats keep the integer.
+pub mod u128_text {
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.collect_str(value)
+        } else {
+            serializer.serialize_u128(*value)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        struct Text;
+        impl Visitor<'_> for Text {
+            type Value = u128;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a u128 as decimal text or as an integer")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
+                v.parse().map_err(|_| E::custom("not a decimal u128"))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
+                Ok(u128::from(v))
+            }
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {
+                Ok(v)
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<u128, E> {
+                u128::try_from(v).map_err(|_| E::custom("a negative operation id"))
+            }
+        }
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(Text)
+        } else {
+            deserializer.deserialize_u128(Text)
+        }
+    }
+}
+
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use crate::framing::{decode_named, encode_named};

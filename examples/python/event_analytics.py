@@ -121,7 +121,7 @@ async def main() -> None:
         else:
             print("writer schemas need Laser Stack or LaserData Cloud, skipping validated ingest")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 def clickstream(count: int) -> list[dict]:

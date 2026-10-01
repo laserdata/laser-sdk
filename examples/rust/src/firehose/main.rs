@@ -1,5 +1,5 @@
 use laser_examples::{
-    env_bool, env_u64, env_usize, init_tracing, laser, phase, release_after, stream_for,
+    env_bool, env_u64, env_usize, fresh_run, init_tracing, laser, phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::{Projection, ProjectionBinding};
@@ -176,7 +176,7 @@ async fn main() -> Result<(), LaserError> {
     );
 
     let laser = laser(&stream_name, Capabilities::OPEN).await?;
-    release_after(&laser, &stream_name, async {
+    fresh_run(&laser, &stream_name, async {
         let query_available = laser.capabilities().await.query.available;
 
         let topics: Vec<String> = (0..config.orgs)

@@ -42,9 +42,9 @@ export function phase(title: string): void {
   console.log(`\n\x1b[1;36m▸ ${title}\x1b[0m\n\x1b[36m${rule}\x1b[0m`)
 }
 
-// The token every name this invocation creates is suffixed with, so two runs
-// (sequential or concurrent, any language) never share example state and each
-// run sees exactly the rows it wrote.
+// The token every managed index name this invocation creates is suffixed with,
+// so two runs (sequential or concurrent, any language) never count each
+// other's rows.
 const RUN_TOKEN = `${(process.pid & 0xffff).toString(16).padStart(4, "0")}${(Date.now() & 0xffff)
   .toString(16)
   .padStart(4, "0")}`
@@ -54,8 +54,13 @@ export function runToken(): string {
   return RUN_TOKEN
 }
 
+/**
+ * The data stream an example uses: `LASER_STREAM` if set (managed: your
+ * provisioned stream), else `laser-<example>-typescript`. The name is stable
+ * so the result stays on the server after a run and a rerun starts clean.
+ */
 export function streamFor(example: string, env: NodeJS.ProcessEnv = process.env): string {
-  return envValue("LASER_STREAM", env) || `${DEFAULT_STREAM}-${example}-${RUN_TOKEN}`
+  return envValue("LASER_STREAM", env) || `${DEFAULT_STREAM}-${example}-typescript`
 }
 
 /**
@@ -85,6 +90,7 @@ export async function connectExample(
     .defaultStream(stream)
     .connect()
   try {
+    await resetStream(laser, example, env)
     await laser.stream(stream).ensure()
     return laser
   } catch (error) {
@@ -94,10 +100,11 @@ export async function connectExample(
 }
 
 /**
- * Deletes this run's own stream so repeated runs do not leave their topics and
- * partitions on the server. A provisioned `LASER_STREAM` is kept.
+ * Deletes the previous run's stream of this example before a new run, so the
+ * run starts clean and its result stays on the server afterwards for
+ * inspection. A provisioned `LASER_STREAM` is kept.
  */
-export async function releaseStream(
+export async function resetStream(
   laser: Laser,
   example: string,
   env: NodeJS.ProcessEnv = process.env
@@ -112,23 +119,20 @@ export async function runExample(
 ): Promise<void> {
   await using laser = await connectExample(example)
   using shutdown = installShutdownSignals()
-  try {
-    await run(laser, shutdown.signal)
-  } finally {
-    await releaseStream(laser, example)
-  }
+  await run(laser, shutdown.signal)
 }
 
 export function managedGate(
   capabilities: Capabilities,
   feature: CapabilitySurface,
-  example: string
+  example: string,
+  label: string = feature
 ): boolean {
   if (surfaceAvailable(capabilities, feature)) return true
   console.log(
     [
       "",
-      `  ${feature} is unavailable on this deployment.`,
+      `  ${label} is unavailable on this deployment.`,
       "  Use Laser Stack or LaserData Cloud:",
       "",
       `    LASER_CONNECTION_STRING=user:password@host npm run example:${example}`,
@@ -494,5 +498,9 @@ function surfaceAvailable(capabilities: Capabilities, feature: CapabilitySurface
       return capabilities.watch
     case "authz":
       return capabilities.authz
+    case "filters":
+      return capabilities.filters.native
+    case "filterCatalog":
+      return capabilities.filters.catalog
   }
 }

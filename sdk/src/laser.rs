@@ -3,6 +3,7 @@ use crate::connect_options::{ConnectOptions, connect_before};
 use crate::error::LaserError;
 pub use crate::publish_options::PublishOptions;
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",
@@ -17,6 +18,7 @@ use dashmap::DashMap;
 #[cfg(feature = "streaming")]
 use iggy::prelude::*;
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",
@@ -28,6 +30,7 @@ use iggy::prelude::*;
 ))]
 use laser_wire::framing::decode_named;
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",
@@ -110,8 +113,11 @@ struct LaserInner {
     // with.
     publish_generation: std::sync::atomic::AtomicU64,
     publish_options: PublishOptions,
-    #[cfg(feature = "kv")]
-    coordination_connection: Option<String>,
+    // The normalized connection string, when this handle built its own client.
+    // Dedicated connections (fenced-lease coordination, partition-primary data
+    // connections for filtered reads) reuse its credentials and TLS settings.
+    #[cfg(any(feature = "filters", feature = "kv"))]
+    connection_string: Option<String>,
     #[cfg(feature = "kv")]
     coordination: OnceCell<Arc<crate::kv::FencedLeaseClient<crate::kv::DedicatedKvTransport>>>,
     #[cfg(feature = "kv")]
@@ -269,8 +275,8 @@ impl Laser {
                 publish_options: PublishOptions::default(),
                 reconnect_gate: tokio::sync::Mutex::new(()),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(feature = "kv")]
-                coordination_connection: None,
+                #[cfg(any(feature = "filters", feature = "kv"))]
+                connection_string: None,
                 #[cfg(feature = "kv")]
                 coordination: OnceCell::new(),
                 #[cfg(feature = "kv")]
@@ -413,7 +419,7 @@ impl Laser {
     /// Close the shared connection. Every clone of this `Laser`, and every consumer or reply reader riding it, loses the connection too. A fenced-lease coordination connection this handle opened closes with it. Safe to call more than once.
     pub async fn close(&self) -> Result<(), LaserError> {
         #[cfg(feature = "kv")]
-        if self.inner.coordination_connection.is_some() {
+        if self.inner.connection_string.is_some() {
             self.coordination_client().await?.close().await;
         }
         #[cfg(feature = "agent")]
@@ -447,6 +453,13 @@ impl Laser {
         Ok(())
     }
 
+    /// The connection string this handle connected with, or `None` for a
+    /// bring-your-own client.
+    #[cfg(feature = "filters")]
+    pub(crate) fn connection_string(&self) -> Option<&str> {
+        self.inner.connection_string.as_deref()
+    }
+
     #[cfg(feature = "kv")]
     pub(crate) async fn coordination_client(
         &self,
@@ -454,7 +467,7 @@ impl Laser {
     {
         let connection = self
             .inner
-            .coordination_connection
+            .connection_string
             .as_ref()
             .ok_or(LaserError::Config(
                 "fenced lease convenience methods need a connection-backed Laser; use FencedLeaseClient with a dedicated transport for a bring-your-own IggyClient",
@@ -619,6 +632,7 @@ impl Laser {
         #[allow(unused_mut)]
         let mut topology = None;
         #[cfg(any(
+            feature = "filters",
             feature = "fork",
             feature = "graph",
             feature = "kv",
@@ -816,6 +830,7 @@ impl Laser {
     /// perspective. Idempotent writes carry a stable operation identity so
     /// Plane can append them to its standard Iggy mutation topics.
     #[cfg(any(
+        feature = "filters",
         feature = "fork",
         feature = "graph",
         feature = "kv",
@@ -1366,8 +1381,8 @@ impl LaserBuilder {
         let connect_deadline =
             tokio::time::Instant::now() + ConnectOptions::from_env(self.connect_timeout)?.timeout;
         let stream = self.stream.filter(|value| !value.is_empty());
-        #[cfg_attr(not(feature = "kv"), allow(unused_variables))]
-        let (client, coordination_connection) = match self.connection {
+        #[cfg_attr(not(any(feature = "filters", feature = "kv")), allow(unused_variables))]
+        let (client, connection_string) = match self.connection {
             ConnectionConfig::Unset => {
                 return Err(LaserError::Config(
                     "connection_string, address+credentials, or client is required",
@@ -1418,6 +1433,7 @@ impl LaserBuilder {
         let mut capabilities = configured_capabilities.clone();
         let mut topology = laser_wire::topology::WireTopology::default();
         #[cfg(any(
+            feature = "filters",
             feature = "fork",
             feature = "graph",
             feature = "kv",
@@ -1443,8 +1459,8 @@ impl LaserBuilder {
                 publish_options,
                 reconnect_gate: tokio::sync::Mutex::new(()),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(feature = "kv")]
-                coordination_connection,
+                #[cfg(any(feature = "filters", feature = "kv"))]
+                connection_string,
                 #[cfg(feature = "kv")]
                 coordination: OnceCell::new(),
                 #[cfg(feature = "kv")]
@@ -1491,6 +1507,7 @@ impl LaserBuilder {
 // unadvertised (`None`), the backends empty, and the SDK skips fail-fast version
 // checks.
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",
@@ -1515,6 +1532,7 @@ async fn probe_managed_host(client: &IggyClient) -> Option<laser_wire::hello::Ba
 }
 
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",
@@ -1532,8 +1550,17 @@ fn merge_announcement(
     capabilities.versions = Some(versions);
     capabilities.backends.clone_from(&announce.backends);
     capabilities.authz |= versions.has_feature(laser_wire::hello::feature::AUTHZ);
+    capabilities.filters.native |=
+        versions.has_feature(laser_wire::hello::feature::CONSUMER_FILTERS);
+    if capabilities.filters.native {
+        capabilities
+            .filters
+            .evaluation
+            .clone_from(&announce.filters);
+    }
     if announce.ready {
         capabilities.managed = true;
+        capabilities.filters.catalog |= capabilities.filters.native && versions.filter > 0;
         capabilities.kv.available |= versions.kv > 0;
         capabilities.forks |= versions.fork > 0;
         capabilities.graph |= versions.graph > 0;
@@ -1574,6 +1601,7 @@ fn merge_announcement(
 #[cfg(all(
     test,
     any(
+        feature = "filters",
         feature = "fork",
         feature = "graph",
         feature = "kv",
@@ -1635,6 +1663,37 @@ mod announcement_tests {
     }
 
     #[test]
+    fn given_consumer_filters_without_a_plane_when_merged_then_should_serve_native_filters_only() {
+        let announce = BackendAnnounce::new(
+            OpVersions::new(0, 0, 0, 0).with_features(feature::CONSUMER_FILTERS | feature::AUTHZ),
+        )
+        .unavailable();
+        let mut capabilities = Capabilities::OPEN;
+
+        merge_announcement(&mut capabilities, &announce);
+
+        assert!(capabilities.filters.native);
+        assert!(!capabilities.filters.catalog);
+        assert!(!capabilities.managed);
+    }
+
+    #[test]
+    fn given_consumer_filters_and_a_ready_catalog_when_merged_then_should_serve_both() {
+        let announce = BackendAnnounce::new(
+            OpVersions::new(1, 1, 1, 1)
+                .with_filter(laser_wire::codes::FILTER_OP_VERSION)
+                .with_features(feature::CONSUMER_FILTERS),
+        )
+        .with_backends(vec![backend(1, true)]);
+        let mut capabilities = Capabilities::OPEN;
+
+        merge_announcement(&mut capabilities, &announce);
+
+        assert!(capabilities.filters.native);
+        assert!(capabilities.filters.catalog);
+    }
+
+    #[test]
     fn given_an_unavailable_backend_when_merged_then_should_not_enable_plane_surfaces() {
         let announce = BackendAnnounce::new(
             OpVersions::new(1, 1, 1, 1)
@@ -1675,6 +1734,7 @@ mod announcement_tests {
     // surface features enabled the function does not exist, so neither can its
     // tests.
     #[cfg(any(
+        feature = "filters",
         feature = "fork",
         feature = "graph",
         feature = "kv",
@@ -1755,7 +1815,7 @@ fn authority_start(after_scheme: &str) -> usize {
 }
 
 // Strip scheme, userinfo, and port from a connection string's authority.
-fn host_of(connection_string: &str) -> &str {
+pub(crate) fn host_of(connection_string: &str) -> &str {
     let after_scheme = after_scheme(connection_string);
     let host_and_port = &after_scheme[authority_start(after_scheme)..];
     let authority = host_and_port
@@ -1790,6 +1850,32 @@ fn has_query_param(connection_string: &str, key: &str) -> bool {
             name.eq_ignore_ascii_case(key)
         })
     })
+}
+
+// The same connection string aimed at another node of the deployment. Only the
+// host and port change. A TLS connection keeps verifying the original host
+// name, which the node certificates carry, instead of the node's address.
+#[cfg(feature = "filters")]
+pub(crate) fn with_endpoint(connection_string: &str, endpoint: &str) -> String {
+    let rest = after_scheme(connection_string);
+    let start = connection_string.len() - rest.len() + authority_start(rest);
+    let end = connection_string[start..]
+        .find(['/', '?', '#'])
+        .map_or(connection_string.len(), |length| start + length);
+    let rewritten = format!(
+        "{}{endpoint}{}",
+        &connection_string[..start],
+        &connection_string[end..]
+    );
+    let tls = query_of(connection_string).is_some_and(|query| {
+        query
+            .split('&')
+            .any(|pair| pair.eq_ignore_ascii_case("tls=true"))
+    });
+    if !tls || has_query_param(connection_string, "tls_domain") {
+        return rewritten;
+    }
+    format!("{rewritten}&tls_domain={}", host_of(connection_string))
 }
 
 // An opt-out flag is read by value. Bare presence is not enough:
@@ -2179,7 +2265,7 @@ mod builder_conflict_tests {
         let mut laser = Laser::from_client(iggy::prelude::IggyClient::default());
         std::sync::Arc::get_mut(&mut laser.inner)
             .expect("the Laser is not shared yet")
-            .coordination_connection = Some("not a connection string".to_owned());
+            .connection_string = Some("not a connection string".to_owned());
         let mut capabilities = crate::capabilities::Capabilities::OPEN;
         capabilities.kv.fenced_leases = true;
         let laser = laser.with_capabilities(capabilities);
@@ -2201,6 +2287,30 @@ mod connection_string_tests {
         PROD_CERT, flag_value_enabled, has_query_param, host_of, install_cert, is_laserdata_host,
         normalize_connection_string, resolve_tls, resolve_tls_with,
     };
+
+    #[cfg(feature = "filters")]
+    #[test]
+    fn given_another_node_when_aimed_at_then_should_keep_credentials_and_options() {
+        assert_eq!(
+            super::with_endpoint(
+                "iggy+tcp://user:p/ss@host:8090?heartbeat_interval=5s",
+                "10.0.0.7:8091"
+            ),
+            "iggy+tcp://user:p/ss@10.0.0.7:8091?heartbeat_interval=5s",
+        );
+    }
+
+    #[cfg(feature = "filters")]
+    #[test]
+    fn given_a_tls_connection_when_aimed_at_another_node_then_should_verify_the_original_host() {
+        assert_eq!(
+            super::with_endpoint(
+                "iggy+tcp://user:pass@edge.laserdata.cloud:8090?tls=true",
+                "10.0.0.7:8090"
+            ),
+            "iggy+tcp://user:pass@10.0.0.7:8090?tls=true&tls_domain=edge.laserdata.cloud",
+        );
+    }
 
     #[test]
     fn given_a_full_tcp_connection_string_when_normalized_then_should_be_unchanged() {

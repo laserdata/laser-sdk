@@ -32,7 +32,7 @@ Streaming and managed calls share one authenticated connection. Managed deployme
 
 There are two authorization layers, and they guard different things.
 
-Native Iggy permissions decide whether a credential can see streams, create topics, send records, and poll records. Use them to isolate tenants and agent inboxes at the stream/topic boundary. A stream the principal cannot read must be treated like a missing stream.
+Native Iggy permissions decide whether a credential can see streams, create topics, send records, and poll records. Use them to isolate users, teams, and agent inboxes at the stream/topic boundary. A stream the principal cannot read must be treated like a missing stream.
 
 LaserData governance roles decide whether the same server-stamped user can call managed surfaces: query, projections, KV, graph, forks, the run registry, workflow control, and the `authz` administration band. A role is a set of grants:
 

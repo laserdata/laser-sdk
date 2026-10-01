@@ -89,6 +89,10 @@ class FakeTransport implements LaserTransport {
     return Promise.reject(new Error("unused"))
   }
 
+  ensureConsumerGroup(): Promise<void> {
+    return Promise.reject(new Error("unused"))
+  }
+
   getTopicPartitionCount(): Promise<number> {
     return Promise.resolve(1)
   }

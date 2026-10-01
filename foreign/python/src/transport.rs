@@ -306,7 +306,7 @@ pub(crate) fn partitioning(
     }
 }
 
-fn header_value(value: &Bound<'_, PyAny>) -> PyResult<HeaderValue> {
+pub(crate) fn header_value(value: &Bound<'_, PyAny>) -> PyResult<HeaderValue> {
     if let Ok(pair) = value.cast::<PyTuple>() {
         if pair.len() != 2 {
             return Err(InvalidError::new_err(
@@ -574,28 +574,93 @@ impl TryFrom<HeaderValue> for PyHeader {
 
     fn try_from(value: HeaderValue) -> Result<Self, Self::Error> {
         let kind = value.kind();
-        let converted = match kind {
-            HeaderKind::Raw => PyHeaderValue::Raw(value.as_raw()?.to_vec()),
-            HeaderKind::String => PyHeaderValue::String(value.as_str()?.to_owned()),
-            HeaderKind::Bool => PyHeaderValue::Bool(value.as_bool()?),
-            HeaderKind::Int8 => PyHeaderValue::Int(value.as_int8()?.into()),
-            HeaderKind::Int16 => PyHeaderValue::Int(value.as_int16()?.into()),
-            HeaderKind::Int32 => PyHeaderValue::Int(value.as_int32()?.into()),
-            HeaderKind::Int64 => PyHeaderValue::Int(value.as_int64()?.into()),
-            HeaderKind::Int128 => PyHeaderValue::Int(value.as_int128()?),
-            HeaderKind::Uint8 => PyHeaderValue::Uint(value.as_uint8()?.into()),
-            HeaderKind::Uint16 => PyHeaderValue::Uint(value.as_uint16()?.into()),
-            HeaderKind::Uint32 => PyHeaderValue::Uint(value.as_uint32()?.into()),
-            HeaderKind::Uint64 => PyHeaderValue::Uint(value.as_uint64()?.into()),
-            HeaderKind::Uint128 => PyHeaderValue::Uint(value.as_uint128()?),
-            HeaderKind::Float32 => PyHeaderValue::Float(value.as_float32()?.into()),
-            HeaderKind::Float64 => PyHeaderValue::Float(value.as_float64()?),
+        let converted = (|| -> Result<PyHeaderValue, Self::Error> {
+            Ok(match kind {
+                HeaderKind::Raw => PyHeaderValue::Raw(value.as_raw()?.to_vec()),
+                HeaderKind::String => PyHeaderValue::String(value.as_str()?.to_owned()),
+                HeaderKind::Bool => PyHeaderValue::Bool(value.as_bool()?),
+                HeaderKind::Int8 => PyHeaderValue::Int(value.as_int8()?.into()),
+                HeaderKind::Int16 => PyHeaderValue::Int(value.as_int16()?.into()),
+                HeaderKind::Int32 => PyHeaderValue::Int(value.as_int32()?.into()),
+                HeaderKind::Int64 => PyHeaderValue::Int(value.as_int64()?.into()),
+                HeaderKind::Int128 => PyHeaderValue::Int(value.as_int128()?),
+                HeaderKind::Uint8 => PyHeaderValue::Uint(value.as_uint8()?.into()),
+                HeaderKind::Uint16 => PyHeaderValue::Uint(value.as_uint16()?.into()),
+                HeaderKind::Uint32 => PyHeaderValue::Uint(value.as_uint32()?.into()),
+                HeaderKind::Uint64 => PyHeaderValue::Uint(value.as_uint64()?.into()),
+                HeaderKind::Uint128 => PyHeaderValue::Uint(value.as_uint128()?),
+                HeaderKind::Float32 => PyHeaderValue::Float(value.as_float32()?.into()),
+                HeaderKind::Float64 => PyHeaderValue::Float(value.as_float64()?),
+            })
+        })();
+        let (kind, converted) = match converted {
+            Ok(converted) => (kind.to_string(), converted),
+            Err(_) => (
+                "raw".to_owned(),
+                PyHeaderValue::Raw(value.as_bytes().to_vec()),
+            ),
         };
         Ok(Self {
-            kind: kind.to_string(),
+            kind,
             value: converted,
         })
     }
+}
+
+fn received_headers(mut bytes: &[u8]) -> Option<(BTreeMap<String, PyHeader>, bool)> {
+    let mut headers = BTreeMap::new();
+    let mut malformed = false;
+    while !bytes.is_empty() {
+        let (key_kind, key_bytes) = header_field(&mut bytes)?;
+        let (value_kind, value_bytes) = header_field(&mut bytes)?;
+        let Ok(key_kind) = HeaderKind::from_code(key_kind) else {
+            continue;
+        };
+        let key = HeaderKey::from_raw(key_kind, key_bytes).ok()?;
+        if key_kind == HeaderKind::String && std::str::from_utf8(key_bytes).is_err() {
+            malformed = true;
+            continue;
+        }
+        let raw = || PyHeader {
+            kind: "raw".to_owned(),
+            value: PyHeaderValue::Raw(value_bytes.to_vec()),
+        };
+        let value = match HeaderKind::from_code(value_kind) {
+            Ok(kind) => {
+                let converted = if kind == HeaderKind::Bool && !matches!(value_bytes, [0] | [1]) {
+                    None
+                } else {
+                    HeaderValue::from_raw(kind, value_bytes)
+                        .ok()
+                        .and_then(|value| PyHeader::try_from(value).ok())
+                };
+                match converted {
+                    Some(value) => {
+                        malformed |= value.kind == "raw" && kind != HeaderKind::Raw;
+                        value
+                    }
+                    None => {
+                        malformed = true;
+                        raw()
+                    }
+                }
+            }
+            Err(_) => raw(),
+        };
+        headers.insert(key.to_string_value(), value);
+    }
+    Some((headers, malformed))
+}
+
+fn header_field<'a>(bytes: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
+    let kind = *bytes.first()?;
+    let length = u32::from_le_bytes(bytes.get(1..5)?.try_into().ok()?) as usize;
+    if kind == 0 || !(1..=255).contains(&length) {
+        return None;
+    }
+    let value = bytes.get(5..5 + length)?;
+    *bytes = &bytes[5 + length..];
+    Some((kind, value))
 }
 
 /// One message yielded by a Laser consumer, including its exact log
@@ -618,29 +683,47 @@ pub struct PyConsumerMessage {
     pub timestamp_micros: u64,
     #[pyo3(get)]
     pub origin_timestamp_micros: u64,
+    /// True when a header entry or the block structure is malformed.
+    /// Valid entries remain readable. Unknown value kinds are raw bytes.
+    /// A structurally truncated block has no decoded headers.
+    #[pyo3(get)]
+    pub headers_malformed: bool,
 }
 
 impl TryFrom<ReceivedMessage> for PyConsumerMessage {
     type Error = laser_sdk::iggy::prelude::IggyError;
 
     fn try_from(received: ReceivedMessage) -> Result<Self, Self::Error> {
-        let headers = received
-            .message
-            .user_headers_map()?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(key, value)| Ok((key.to_string_value(), value.try_into()?)))
-            .collect::<Result<_, Self::Error>>()?;
+        Self::of(
+            &received.message,
+            received.partition_id,
+            received.current_offset,
+        )
+    }
+}
+
+impl PyConsumerMessage {
+    /// A view of one stored record, read through any path that keeps the
+    /// record's bytes intact.
+    pub(crate) fn of(
+        message: &laser_sdk::iggy::prelude::IggyMessage,
+        partition_id: u32,
+        current_offset: u64,
+    ) -> Result<Self, laser_sdk::iggy::prelude::IggyError> {
+        let (headers, headers_malformed) =
+            received_headers(message.user_headers.as_deref().unwrap_or_default())
+                .unwrap_or_else(|| (BTreeMap::new(), true));
         Ok(Self {
-            payload: received.message.payload,
-            message_id: received.message.header.id.to_string(),
+            payload: message.payload.clone(),
+            message_id: message.header.id.to_string(),
             headers,
-            checksum: received.message.header.checksum,
-            offset: received.message.header.offset,
-            current_offset: received.current_offset,
-            partition_id: received.partition_id,
-            timestamp_micros: received.message.header.timestamp,
-            origin_timestamp_micros: received.message.header.origin_timestamp,
+            headers_malformed,
+            checksum: message.header.checksum,
+            offset: message.header.offset,
+            current_offset,
+            partition_id,
+            timestamp_micros: message.header.timestamp,
+            origin_timestamp_micros: message.header.origin_timestamp,
         })
     }
 }
@@ -706,7 +789,10 @@ impl PyConsumerMessage {
 }
 
 /// A Laser partition or consumer-group reader. It is an async iterator and
-/// exposes manual offset storage for commit-after-handle delivery.
+/// exposes manual offset storage for commit-after-handle delivery. A purge
+/// restarts the partition at offset 0 without telling an open reader, which
+/// can keep its old position and skip the replacement records, so rebuild it
+/// after a purge.
 #[gen_stub_pyclass]
 #[pyclass(name = "Consumer")]
 pub struct PyConsumer {
@@ -714,6 +800,7 @@ pub struct PyConsumer {
     inner: Arc<Mutex<Option<IggyConsumer>>>,
     shutdown: watch::Sender<bool>,
     manual_commit: bool,
+    yielded_zero: Arc<Mutex<std::collections::BTreeSet<u32>>>,
     shutdown_target: Option<PyConsumerGroupTarget>,
 }
 
@@ -729,6 +816,7 @@ impl PyConsumer {
             inner: Arc::new(Mutex::new(Some(inner))),
             shutdown,
             manual_commit,
+            yielded_zero: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             shutdown_target,
         }
     }
@@ -736,6 +824,7 @@ impl PyConsumer {
     async fn receive(
         inner: Arc<Mutex<Option<IggyConsumer>>>,
         shutdown: watch::Sender<bool>,
+        yielded_zero: Arc<Mutex<std::collections::BTreeSet<u32>>>,
     ) -> PyResult<Option<PyConsumerMessage>> {
         if *shutdown.borrow() {
             return Ok(None);
@@ -748,7 +837,14 @@ impl PyConsumer {
         let mut shutdown_rx = shutdown.subscribe();
         tokio::select! {
             received = consumer.next() => match received {
-                Some(Ok(received)) => Ok(Some(received.try_into().map_err(transport_error)?)),
+                Some(Ok(received)) => {
+                    let partition = received.partition_id;
+                    let offset = received.message.header.offset;
+                    let message = received.try_into().map_err(transport_error)?;
+                    let mut zeros = yielded_zero.lock().await;
+                    if offset == 0 { zeros.insert(partition); } else { zeros.remove(&partition); }
+                    Ok(Some(message))
+                },
                 Some(Err(error)) => Err(transport_error(error)),
                 None => Ok(None),
             },
@@ -762,7 +858,61 @@ impl PyConsumer {
 
 #[cfg(test)]
 mod tests {
-    use super::positive_duration_ms;
+    use super::{PyConsumerMessage, PyHeaderValue, positive_duration_ms};
+    use iggy::prelude::IggyMessage;
+
+    #[test]
+    fn given_unknown_header_values_when_a_record_is_exposed_then_should_preserve_raw_and_known_entries()
+     {
+        let mut bytes = entry("future", 99, b"opaque");
+        bytes.extend(entry("priority", 10, &7_u16.to_le_bytes()));
+        let mut message = IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"payload"))
+            .build()
+            .expect("message");
+        message.user_headers = Some(bytes.into());
+        let decoded = PyConsumerMessage::of(&message, 0, 0).expect("readable message");
+        assert!(!decoded.headers_malformed);
+        assert!(
+            matches!(&decoded.headers["future"].value, PyHeaderValue::Raw(value) if value == b"opaque")
+        );
+        assert!(matches!(
+            decoded.headers["priority"].value,
+            PyHeaderValue::Uint(7)
+        ));
+    }
+
+    #[test]
+    fn given_an_invalid_header_width_when_a_record_is_exposed_then_should_keep_payload_and_other_headers()
+     {
+        let mut bytes = entry("broken", 10, &[7]);
+        bytes.extend(entry("agdx.ct", 9, &[1]));
+        let mut message = IggyMessage::builder()
+            .payload(bytes::Bytes::from_static(b"payload"))
+            .build()
+            .expect("message");
+        message.user_headers = Some(bytes.into());
+        let decoded = PyConsumerMessage::of(&message, 0, 0).expect("readable message");
+        assert!(decoded.headers_malformed);
+        assert_eq!(decoded.payload.as_ref(), b"payload");
+        assert!(
+            matches!(&decoded.headers["broken"].value, PyHeaderValue::Raw(value) if value == &[7])
+        );
+        assert!(matches!(
+            decoded.headers["agdx.ct"].value,
+            PyHeaderValue::Uint(1)
+        ));
+    }
+
+    fn entry(key: &str, kind: u8, value: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![2];
+        bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(kind);
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(value);
+        bytes
+    }
 
     #[test]
     fn given_retry_intervals_when_converted_then_zero_should_be_rejected() {
@@ -805,7 +955,10 @@ impl PyConsumer {
     fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let shutdown = self.shutdown.clone();
-        future_into_py(py, async move { Self::receive(inner, shutdown).await })
+        let yielded_zero = self.yielded_zero.clone();
+        future_into_py(py, async move {
+            Self::receive(inner, shutdown, yielded_zero).await
+        })
     }
 
     /// Store `offset` on the server for the message partition. With no
@@ -885,7 +1038,8 @@ impl PyConsumer {
         })
     }
 
-    /// Last offset this consumer stored on the server for `partition`.
+    /// Local Iggy SDK offset bookkeeping. An initial zero does not prove a
+    /// durable checkpoint exists. Use `next` polling for server-side resume.
     fn last_stored_offset<'py>(
         &self,
         py: Python<'py>,
@@ -901,12 +1055,15 @@ impl PyConsumer {
         })
     }
 
-    /// Stop polling and leave the group. Automatic policies flush final offset
-    /// state. Disabled auto-commit preserves the last explicit commit.
+    /// Stop polling and leave the group. Automatic policies delegate final
+    /// offset handling to the Iggy SDK. Polling commits before delivery, so
+    /// shutdown is not a processing checkpoint. Disabled auto-commit preserves
+    /// the last explicit commit.
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let already_shutdown = self.shutdown.send_replace(true);
         let inner = self.inner.clone();
         let manual_commit = self.manual_commit;
+        let yielded_zero = self.yielded_zero.clone();
         let shutdown_target = self.shutdown_target.clone();
         future_into_py(py, async move {
             if already_shutdown {
@@ -929,11 +1086,23 @@ impl PyConsumer {
                 return Ok(());
             }
             let mut inner = inner.lock().await;
-            if let Some(consumer) = inner.as_mut() {
-                consumer.shutdown().await.map_err(transport_error)?;
-            }
+            let outcome = if let Some(consumer) = inner.as_mut() {
+                let mut stored = Ok(());
+                for partition in yielded_zero.lock().await.iter() {
+                    if consumer
+                        .get_last_stored_offset(*partition)
+                        .is_none_or(|offset| offset == 0)
+                    {
+                        stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
+                    }
+                }
+                let stopped = consumer.shutdown().await;
+                stored.and(stopped)
+            } else {
+                Ok(())
+            };
             inner.take();
-            Ok(())
+            outcome.map_err(transport_error)
         })
     }
 
@@ -944,8 +1113,9 @@ impl PyConsumer {
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let shutdown = self.shutdown.clone();
+        let yielded_zero = self.yielded_zero.clone();
         future_into_py(py, async move {
-            match Self::receive(inner, shutdown).await? {
+            match Self::receive(inner, shutdown, yielded_zero).await? {
                 Some(message) => Ok(message),
                 None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
             }

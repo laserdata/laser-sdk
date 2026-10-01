@@ -22,6 +22,8 @@ pub use crate::context_scope::{ContextScope, ScopedMemory};
 pub use crate::cursor::Cursor;
 #[cfg(feature = "destinations")]
 pub use crate::destinations::Destinations;
+#[cfg(feature = "filters")]
+pub use crate::filters::{FilteredReader, Filters};
 #[cfg(feature = "fork")]
 pub use crate::fork::ForkHandle;
 #[cfg(feature = "kv")]
@@ -87,6 +89,11 @@ pub mod full {
     #[cfg(feature = "agent")]
     pub use crate::context::{
         Chain, ContextAssembler, ContextMessage, ContextPolicy, LastN, RoleFilter, TokenBudget,
+    };
+    #[cfg(feature = "filters")]
+    pub use crate::filters::{
+        ConsumerFilter, FaultPolicy, FilterBinding, FilterExpr, FilterGroupRef, FilterRef,
+        FilteredReaderBuilder, FilteredStart, MatchedPage, MatchedRecord, ReadMode,
     };
     #[cfg(feature = "fork")]
     pub use crate::fork::{ForkInfo, ForkKind, ForkStatus};

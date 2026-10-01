@@ -1,5 +1,5 @@
 use laser_examples::{
-    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, release_after, stream_for,
+    PARTITIONS, fresh_run, init_tracing, laser, managed_feature_ready, phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use std::collections::HashMap;
@@ -130,7 +130,7 @@ async fn main() -> Result<(), LaserError> {
     let Some(laser) = managed_ready else {
         return Ok(());
     };
-    release_after(&laser, &stream_for("memory"), async {
+    fresh_run(&laser, &stream_for("memory"), async {
         // DURABLE MEMORY (managed). The `VectorMemory` above lives in this process and
         // is gone when it exits. Durable memory is the single model: every remember
         // publishes to the memory topic, so the facts persist and replay, browsable in

@@ -8,11 +8,14 @@ import {
   AGDX_DECODE_RECORD_CODE,
   AGDX_DESTINATION_GET_CODE,
   AGDX_DESTINATION_LIST_CODE,
+  AGDX_FILTER_OPERATION_CODE,
   AGDX_FORK_CREATE_CODE,
   AGDX_FORK_DELETE_CODE,
   AGDX_FORK_LIST_CODE,
   AGDX_FORK_PROMOTE_CODE,
   AGDX_FORK_PUT_CODE,
+  AGDX_GET_FILTER_BINDING_CODE,
+  AGDX_GET_FILTER_CODE,
   AGDX_GET_PROJECTION_CODE,
   AGDX_GET_SCHEMA_CODE,
   AGDX_GRAPH_NEIGHBORS_CODE,
@@ -34,6 +37,9 @@ import {
   AGDX_KV_RELEASE_CODE,
   AGDX_KV_SCAN_CODE,
   AGDX_KV_SET_CODE,
+  AGDX_LIST_FILTER_BINDINGS_CODE,
+  AGDX_LIST_FILTER_REVISIONS_CODE,
+  AGDX_LIST_FILTERS_CODE,
   AGDX_LIST_PROJECTIONS_CODE,
   AGDX_LIST_SCHEMAS_CODE,
   AGDX_QUERY_CODE,
@@ -66,6 +72,7 @@ export type Feature =
   | "authz"
   | "kv_lease"
   | "kv_fence"
+  | "filter"
   | "unrecognized"
 
 const KNOWN_FEATURES: ReadonlySet<string> = new Set([
@@ -81,7 +88,8 @@ const KNOWN_FEATURES: ReadonlySet<string> = new Set([
   "checkpoint",
   "authz",
   "kv_lease",
-  "kv_fence"
+  "kv_fence",
+  "filter"
 ])
 
 function parseFeature(word: string): Feature {
@@ -280,6 +288,13 @@ export function featureAction(code: number): readonly [Feature, Action] | undefi
       return ["agent", "write"]
     case AGDX_AGENT_CANCEL_CODE:
       return ["agent", "delete"]
+    case AGDX_GET_FILTER_CODE:
+    case AGDX_LIST_FILTERS_CODE:
+    case AGDX_LIST_FILTER_REVISIONS_CODE:
+    case AGDX_GET_FILTER_BINDING_CODE:
+    case AGDX_LIST_FILTER_BINDINGS_CODE:
+    case AGDX_FILTER_OPERATION_CODE:
+      return ["filter", "read"]
     default:
       return undefined
   }
@@ -299,7 +314,8 @@ const FEATURE_ORDINALS = {
   authz: 10,
   kv_lease: 11,
   kv_fence: 12,
-  unrecognized: 13
+  filter: 13,
+  unrecognized: 14
 } as const satisfies Readonly<Record<Feature, number>>
 const ACTION_ORDINALS = {
   read: 0,

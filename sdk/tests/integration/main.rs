@@ -13,6 +13,10 @@ mod contract;
 mod deadletter;
 mod decomposition;
 mod fanout;
+#[cfg(feature = "filters")]
+mod filters;
+#[cfg(feature = "filters")]
+mod filters_group;
 mod governance;
 mod handoff;
 mod human_input;

@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "operation_id": "9",
+  "mutation": {
+    "set_revision_enabled": {
+      "filter_id": 1,
+      "revision": 2,
+      "enabled": false
+    }
+  }
+}

@@ -56,6 +56,15 @@ create_exception!(
 );
 create_exception!(
     laser_sdk,
+    FilterError,
+    LaserError,
+    "A consumer-filter operation returned a typed failure. `reason` names the cause \
+     (`conflict`, `source_changed`, `not_found`, ...). A read stopped at a record it \
+     cannot pass has `reason` `fault` or `oversized_record` and carries `partition_id` \
+     and `offset`."
+);
+create_exception!(
+    laser_sdk,
     SignatureError,
     LaserError,
     "Envelope signing or verification failed, or a signer was not enrolled."
@@ -220,6 +229,9 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         SdkError::Fork(_) => ForkError::new_err(message),
         SdkError::Graph(_) => GraphError::new_err(message),
         SdkError::Authz(_) => AuthzError::new_err(message),
+        SdkError::Filter(_)
+        | SdkError::FilterFault { .. }
+        | SdkError::FilterOversizedRecord { .. } => FilterError::new_err(message),
         SdkError::Signature(_) => SignatureError::new_err(message),
         SdkError::Timeout(_) => {
             Python::attach(|py| PyErr::from_type(timeout_error(py).clone(), message))
@@ -264,6 +276,34 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         let _ = value.setattr("budget_exceeded", budget_exceeded);
         let _ = value.setattr("quarantined", quarantined);
         let _ = value.setattr("not_leader", not_leader);
+        match &err {
+            SdkError::Filter(error) => {
+                let _ = value.setattr("reason", error.reason.to_string());
+                let _ = value.setattr("fault_reason", py.None());
+                let _ = value.setattr("partition_id", py.None());
+                let _ = value.setattr("offset", py.None());
+            }
+            SdkError::FilterFault {
+                partition_id,
+                offset,
+                reason,
+            } => {
+                let _ = value.setattr("reason", "fault");
+                let _ = value.setattr("fault_reason", reason.to_string());
+                let _ = value.setattr("partition_id", partition_id);
+                let _ = value.setattr("offset", offset);
+            }
+            SdkError::FilterOversizedRecord {
+                partition_id,
+                offset,
+            } => {
+                let _ = value.setattr("reason", "oversized_record");
+                let _ = value.setattr("fault_reason", py.None());
+                let _ = value.setattr("partition_id", partition_id);
+                let _ = value.setattr("offset", offset);
+            }
+            _ => {}
+        }
     });
     pyerr
 }
@@ -279,6 +319,7 @@ pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult
     module.add("ForkError", py.get_type::<ForkError>())?;
     module.add("GraphError", py.get_type::<GraphError>())?;
     module.add("AuthzError", py.get_type::<AuthzError>())?;
+    module.add("FilterError", py.get_type::<FilterError>())?;
     module.add("SignatureError", py.get_type::<SignatureError>())?;
     module.add("UnsupportedError", py.get_type::<UnsupportedError>())?;
     // Graft `ValueError` in as a second base (the macro takes one base only):

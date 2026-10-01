@@ -1,6 +1,6 @@
 use laser_examples::{
-    PARTITIONS, ensure_view, index_for, init_tracing, laser, managed_feature_ready, phase,
-    release_after, stream_for,
+    PARTITIONS, ensure_view, fresh_run, index_for, init_tracing, laser, managed_feature_ready,
+    phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ struct Profile {
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("kv"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("kv"), async {
+    fresh_run(&laser, &stream_for("kv"), async {
         let capabilities = laser.capabilities().await;
         if !capabilities.kv.available {
             managed_feature_ready(false, "state (kv)", "kv");

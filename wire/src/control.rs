@@ -825,6 +825,9 @@ pub enum ControlCommand {
     RegisterRunSource(SourceSelector),
     /// Stop folding run-status records from this topic. Idempotent.
     RemoveRunSource(SourceSelector),
+    /// One consumer-filter catalog mutation, stamped by the streaming server.
+    /// Its outcome (applied or rejected) is recorded under the operation id.
+    FilterCatalog(crate::filter::FilterCatalogCommand),
 }
 
 /// Versioned wrapper around a [`ControlCommand`], CBOR-named on the wire.

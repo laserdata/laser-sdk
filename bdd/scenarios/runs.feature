@@ -9,24 +9,29 @@ Feature: The managed run registry and the unsupported boundary
     Given a running data platform
     And a fresh stream bootstrapped with 1 partitions
 
+  @no_plane
   Scenario: The run registry is not advertised on open Apache Iggy
     Then the run registry is unavailable
 
+  @no_plane
   Scenario: Submitting a run returns Unsupported on open Apache Iggy
     When I submit a run to agent "diagnoser"
     Then the call fails as unsupported
     And the unified result code is unsupported
 
+  @no_plane
   Scenario: Reading a run's status returns Unsupported on open Apache Iggy
     When I read the status of run "run-7"
     Then the call fails as unsupported
     And the unified result code is unsupported
 
+  @no_plane
   Scenario: Cancelling a run returns Unsupported on open Apache Iggy
     When I cancel run "run-7"
     Then the call fails as unsupported
     And the unified result code is unsupported
 
+  @no_plane
   Scenario: Listing runs returns Unsupported on open Apache Iggy
     When I list runs
     Then the call fails as unsupported

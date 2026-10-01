@@ -30,6 +30,31 @@ pub async fn fresh_laser() -> FreshLaser {
     FreshLaser { laser, iggy }
 }
 
+/// A `Laser` connected through a connection string on a fresh stream, so the
+/// capability probe runs and partition-primary data connections can open.
+pub async fn fresh_connected_laser() -> FreshLaser {
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let stream = format!("bdd_{}_{id}", std::process::id());
+    let (connection_string, iggy) = match std::env::var(ADDR_ENV) {
+        Ok(address) => (
+            format!("iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@{address}"),
+            None,
+        ),
+        Err(_) => {
+            let iggy = Arc::clone(
+                IGGY.get_or_init(|| async { Arc::new(TestIggy::start().await) })
+                    .await,
+            );
+            (iggy.connection_string(), Some(iggy))
+        }
+    };
+    let laser = Laser::connect(&connection_string)
+        .await
+        .expect("connect to Iggy")
+        .with_default_stream(stream);
+    FreshLaser { laser, iggy }
+}
+
 async fn connect_client() -> (IggyClient, Option<Arc<TestIggy>>) {
     let Ok(address) = std::env::var(ADDR_ENV) else {
         let iggy = Arc::clone(

@@ -696,7 +696,7 @@ async def main() -> None:
             f"KV namespaces '{credits_namespace}' and '{dedup_namespace}'"
         )
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

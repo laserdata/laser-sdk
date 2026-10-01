@@ -375,6 +375,25 @@ impl PyTopic {
         })
     }
 
+    /// Idempotently create the consumer group `name` on this topic without
+    /// joining it.
+    fn ensure_consumer_group<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let stream = self.stream.clone();
+        let topic = self.name.clone();
+        future_into_py(py, async move {
+            let handle = match &stream {
+                Some(stream) => laser.stream(stream.clone()).topic(&*topic),
+                None => laser.topic(&*topic),
+            };
+            handle.ensure_consumer_group(&name).await.map_err(to_pyerr)
+        })
+    }
+
     fn __repr__(&self) -> String {
         match &self.stream {
             Some(stream) => format!("Topic(stream={stream}, name={})", self.name),

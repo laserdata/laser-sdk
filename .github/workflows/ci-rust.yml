@@ -264,9 +264,7 @@ jobs:
       - name: cargo deny
         run: |
           cargo install cargo-deny --locked --version 0.19.8
-          cargo deny --manifest-path wire/Cargo.toml --target wasm32-unknown-unknown \
-            --no-default-features --features cbor,codecs,fixtures,builders,http-client \
-            check --config deny-wire.toml bans
+          python3 scripts/check-wire-dependencies.py
       - run: cargo deny check advisories
 
   # All cargo tests: unit plus wire fixtures/robustness with every additive

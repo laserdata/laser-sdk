@@ -31,6 +31,18 @@ cbor = ["dep:ciborium"]
 # Codec/Decoder traits + Json, Cbor, Msgpack body-codec impls and Row/KvEntry
 # decode helpers. wasm-safe.
 codecs = ["cbor", "dep:rmp-serde"]
+# The consumer-filter evaluator: compile a `ConsumerFilter` once and judge JSON
+# payloads and typed headers against it. The streaming server, the SDKs, and
+# the BDD reference engine share this implementation, including CBOR and
+# registered Avro/Protobuf payload decoders. This optional evaluator is outside
+# the dependency-minimal portable contract feature set.
+filter-eval = [
+    "dep:apache-avro",
+    "dep:ciborium",
+    "dep:prost-reflect",
+    "dep:ouroboros",
+    "serde_json/float_roundtrip",
+]
 # The golden corpus embedded via include_bytes! plus assertion helpers.
 fixtures = ["codecs"]
 # The fluent `Query::builder()` (bon-derived). Non-default so a type-only
@@ -50,8 +62,13 @@ bson = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 
 [dependencies]
+apache-avro = { workspace = true, optional = true }
 bon = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
+memchr = { workspace = true }
+ouroboros = { workspace = true, optional = true }
+prost-reflect = { workspace = true, optional = true }
+regex = { workspace = true }
 rmp-serde = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -64,6 +81,11 @@ thiserror = { workspace = true }
 name = "robustness"
 path = "tests/robustness.rs"
 required-features = ["fixtures"]
+
+[[test]]
+name = "filter_eval_corpus"
+path = "tests/filter_eval_corpus.rs"
+required-features = ["filter-eval"]
 
 [[test]]
 name = "wire_fixtures"

@@ -6,6 +6,7 @@ use crate::query::QueryError;
 use crate::types::IdError;
 use iggy::prelude::IggyError;
 use laser_wire::error::{DecodeError, InvalidError};
+use laser_wire::filter::FilterErrorReason;
 use laser_wire::result::{CommandError, ResultCode};
 
 /// The one error type every fallible SDK call returns.
@@ -74,6 +75,25 @@ pub enum LaserError {
     /// The streaming server answered an authorization op with a typed failure.
     #[error("authz: {0}")]
     Authz(#[from] laser_wire::authz::AuthzError),
+    /// The streaming server or the filter catalog answered a consumer-filter
+    /// operation with a typed failure.
+    #[error("filter: {0}")]
+    Filter(#[from] laser_wire::filter::FilterError),
+    /// A filtered read stopped in front of a record the filter could not
+    /// evaluate under the `stop` fault policy. The record and everything after
+    /// it stay unacknowledged.
+    #[error("filter fault on partition {partition_id} at offset {offset}: {reason}")]
+    FilterFault {
+        partition_id: u32,
+        offset: u64,
+        reason: laser_wire::filter::FaultReason,
+    },
+    /// A matching record alone exceeds the filtered reply cap, so no page can
+    /// carry it. The record and everything after it stay unacknowledged.
+    #[error(
+        "the record at offset {offset} on partition {partition_id} exceeds the filtered reply cap"
+    )]
+    FilterOversizedRecord { partition_id: u32, offset: u64 },
     /// Iggy answered a destination or checkpoint operation with a typed failure.
     #[error("checkpoint: {0}")]
     Checkpoint(Box<laser_wire::checkpoint::CheckpointError>),
@@ -248,6 +268,7 @@ impl From<CommandError> for LaserError {
 /// are disjoint (an enum-tagged reply versus a `{code, message}` map), so the
 /// fallback never misfires on a genuine reply.
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",
@@ -326,6 +347,8 @@ impl LaserError {
             | Self::Cancelled { .. }
             | Self::Quarantined { .. }
             | Self::Authz(_)
+            | Self::FilterFault { .. }
+            | Self::FilterOversizedRecord { .. }
             | Self::Id(_) => false,
             #[cfg(feature = "provenance")]
             Self::Provenance(_) => false,
@@ -335,6 +358,7 @@ impl LaserError {
             Self::Agent(error) => ResultCode::from(error).is_retryable(),
             Self::Graph(error) => ResultCode::from(error).is_retryable(),
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()).is_retryable(),
+            Self::Filter(error) => error.code.is_retryable(),
             Self::Handler(_)
             | Self::Timeout(_)
             | Self::PolicyDeferred(_)
@@ -376,7 +400,7 @@ impl LaserError {
                 | Self::Kv(KvError::Unsupported(_))
                 | Self::Fork(ForkError::Unsupported(_))
                 | Self::Graph(laser_wire::graph::GraphError::Unsupported(_))
-        )
+        ) || self.filter_reason() == Some(FilterErrorReason::Unsupported)
     }
 
     /// Whether the failure names a missing resource (index, fork). Distinct
@@ -386,11 +410,12 @@ impl LaserError {
             self,
             Self::Query(QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_))
                 | Self::Fork(ForkError::NotFound(_))
-        ) || matches!(
-            self,
-            Self::Checkpoint(error)
-                if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::NotFound)
-        )
+        ) || self.filter_reason() == Some(FilterErrorReason::NotFound)
+            || matches!(
+                self,
+                Self::Checkpoint(error)
+                    if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::NotFound)
+            )
     }
 
     /// Whether the failure is wire-version skew between this SDK and the
@@ -402,11 +427,12 @@ impl LaserError {
             Self::Query(QueryError::Version { .. })
                 | Self::Kv(KvError::Version { .. })
                 | Self::Fork(ForkError::Version { .. })
-        ) || matches!(
-            self,
-            Self::Checkpoint(error)
-                if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Version { .. })
-        )
+        ) || self.filter_reason() == Some(FilterErrorReason::VersionSkew)
+            || matches!(
+                self,
+                Self::Checkpoint(error)
+                    if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Version { .. })
+            )
     }
 
     /// Whether a compare-and-swap lost its precondition (the key changed under
@@ -447,6 +473,9 @@ impl LaserError {
             self,
             Self::Iggy(IggyError::Unauthorized | IggyError::Unauthenticated)
                 | Self::RoutePrincipalMismatch { .. }
+        ) || matches!(
+            self.filter_reason(),
+            Some(FilterErrorReason::Forbidden | FilterErrorReason::Unauthenticated)
         ) || matches!(
             self,
             Self::Checkpoint(error)
@@ -500,6 +529,14 @@ impl LaserError {
         matches!(self, Self::Quarantined { .. })
     }
 
+    /// The typed consumer-filter cause, when the failure is one.
+    pub fn filter_reason(&self) -> Option<FilterErrorReason> {
+        match self {
+            Self::Filter(error) => Some(error.reason),
+            _ => None,
+        }
+    }
+
     /// This failure's place in the unified [`ResultCode`] space. A managed
     /// surface error projects onto its surface code, and a client-side failure maps
     /// to the closest code. Lets a caller branch on one dictionary instead of
@@ -507,6 +544,9 @@ impl LaserError {
     /// on the management surface.
     pub fn code(&self) -> ResultCode {
         match self {
+            Self::Filter(error) => error.code,
+            Self::FilterFault { .. } => ResultCode::InvalidArgument,
+            Self::FilterOversizedRecord { .. } => ResultCode::TooLarge,
             Self::Query(error) => ResultCode::from(error),
             Self::Kv(error) => ResultCode::from(error),
             Self::Fork(error) => ResultCode::from(error),

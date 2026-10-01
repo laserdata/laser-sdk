@@ -18,6 +18,7 @@ Modules group related types and operations. Features select optional dependencie
 | `fixtures` | the golden corpus embedded via `include_bytes!` + assert helpers | yes |
 | `builders` | the fluent `Query::builder()` (bon-derived), non-default so a type-only consumer that struct-literals `Query` does not pull `bon` | yes |
 | `http-client` | a typed `/agdx/*` client (`http_client`) over a caller-injected `Transport` (gloo-net on wasm, reqwest natively), the crate's one async surface, runtime-agnostic | yes |
+| `filter-eval` | the consumer-filter evaluator: compile a `ConsumerFilter` once and judge JSON, CBOR, Avro, and Protobuf records with the same verdicts the server gives | yes |
 
 ## Module map
 
@@ -26,7 +27,8 @@ Modules group related types and operations. Features select optional dependencie
 | `codes` | managed command codes + per-surface op versions |
 | `headers` | the `agdx.*` / `gen_ai.*` header dictionaries + header caps + `CONVERSATION_FIELD` (the auto-projected `conversation_id` field name the conversation lens filters on) |
 | `topics` | the `_agdx` ops stream + topic names |
-| `limits` | page, query, KV, frame, and agent-envelope caps |
+| `limits` | page, query, KV, frame, agent-envelope, and consumer-filter caps (`MAX_FILTER_BYTES`, `MAX_FILTERED_PAGE_RECORDS`, `MAX_FILTERED_PAGE_BYTES`, the catalog and preview bounds) |
+| `filter` | consumer filters: `ConsumerFilter` and `FilterExpr` builders (`expr`), field paths, text matching, coercions, the filtered poll, acknowledgment, preview, and test request and reply types (`read`), the saved-filter catalog and group bindings (`catalog`), the typed header dictionary (`headers`), the codec decoders (`codecs`), and the evaluator (`eval`, feature `filter-eval`), with `fixtures/filter_eval_cases.json` and `fixtures/filter_codec_cases.json` as the cross-language corpus |
 | `content` | `ContentType` + the `agdx.ct` u8 code dictionary |
 | `hello` | `HelloReply`, independently negotiated `OpVersions`, structured backend descriptors and capabilities, and the backend announcement consumed during capability negotiation |
 | `authz` | the capability layer: `Effect`/`Feature`/`Action`/`ResourcePattern`/`Grant`/`Role`/`RoleBinding`, the `feature_action(code)` classifier + `action_index` coarse-bitmask layout, the whoami/role/binding/history request+reply types, revision-guarded binding writes, and `AuthzReply`/`AuthzError`. Orthogonal to the substrate's own permissions, the fork-native authorization band (`AGDX_AUTHZ_*`) |

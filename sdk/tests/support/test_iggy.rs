@@ -1,6 +1,10 @@
+#[path = "owned_server.rs"]
+mod owned_server;
+
 use bytes::Bytes;
 use iggy::prelude::*;
 use laser_sdk::prelude::Laser;
+use owned_server::OwnedServer;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,7 +22,7 @@ const IGGY_SERVER_ENV: &str = "LASER_TEST_IGGY_SERVER";
 const CLUSTER_SIZE: usize = 3;
 
 struct ClusterNodeProcess {
-    child: Child,
+    child: OwnedServer,
     data_dir: TempDir,
     log_path: PathBuf,
 }
@@ -169,33 +173,41 @@ async fn spawn_stable_proxy(
 #[allow(dead_code)]
 pub struct TestIggy {
     binary: PathBuf,
-    child: Mutex<Child>,
+    child: Mutex<OwnedServer>,
     data_dir: TempDir,
     tcp_port: u16,
+    env: Vec<(String, String)>,
 }
 
 #[allow(dead_code)]
 impl TestIggy {
     pub async fn start() -> Self {
-        Self::start_inner().await
+        Self::start_inner(Vec::new()).await
     }
 
     pub async fn start_pinned() -> Self {
-        Self::start_inner().await
+        Self::start_inner(Vec::new()).await
     }
 
-    async fn start_inner() -> Self {
+    /// A dedicated server with extra `IGGY_*` configuration, for a suite whose
+    /// server settings must not leak into the shared instance.
+    pub async fn start_with(env: Vec<(String, String)>) -> Self {
+        Self::start_inner(env).await
+    }
+
+    async fn start_inner(env: Vec<(String, String)>) -> Self {
         let binary = resolve_server_binary();
         let mut attempt = 1;
         loop {
             let data_dir = tempfile::tempdir().expect("create Iggy test data directory");
             let tcp_port = free_host_port();
-            let child = spawn_server(&binary, data_dir.path(), tcp_port);
+            let child = spawn_server(&binary, data_dir.path(), tcp_port, &env);
             let server = Self {
                 binary: binary.clone(),
                 child: Mutex::new(child),
                 data_dir,
                 tcp_port,
+                env: env.clone(),
             };
             match server.wait_until_ready().await {
                 Ok(()) => return server,
@@ -216,7 +228,7 @@ impl TestIggy {
             let mut child = self.child.lock().expect("lock Iggy test process");
             child.kill().expect("kill Iggy test process");
             child.wait().expect("reap Iggy test process");
-            *child = spawn_server(&self.binary, self.data_dir.path(), self.tcp_port);
+            *child = spawn_server(&self.binary, self.data_dir.path(), self.tcp_port, &self.env);
         }
         if let Err(log) = self.wait_until_ready().await {
             panic!("Iggy test server exited during restart, log:\n{log}");
@@ -237,6 +249,15 @@ impl TestIggy {
 
     pub async fn laser(&self, stream: impl Into<String>) -> Result<Laser, IggyError> {
         Ok(Laser::from_client(self.client().await?).with_default_stream(stream))
+    }
+
+    /// The root connection string, for a `Laser::connect` that runs the
+    /// capability probe and can open dedicated connections.
+    pub fn connection_string(&self) -> String {
+        format!(
+            "iggy+tcp://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@127.0.0.1:{}",
+            self.tcp_port
+        )
     }
 
     pub async fn laser_reconnecting(&self, stream: impl Into<String>) -> Result<Laser, IggyError> {
@@ -327,11 +348,16 @@ impl Drop for TestIggy {
     }
 }
 
-fn spawn_server(binary: &Path, data_dir: &Path, tcp_port: u16) -> Child {
+fn spawn_server(
+    binary: &Path,
+    data_dir: &Path,
+    tcp_port: u16,
+    env: &[(String, String)],
+) -> OwnedServer {
     let log_path = data_dir.join("test-server.log");
     let stdout = File::create(&log_path).expect("create Iggy test server log");
     let stderr = stdout.try_clone().expect("clone Iggy test server log");
-    Command::new(binary)
+    let child = Command::new(binary)
         .env("IGGY_PATH", data_dir)
         .env("IGGY_TCP_ADDRESS", format!("127.0.0.1:{tcp_port}"))
         .env("IGGY_HTTP_ENABLED", "false")
@@ -343,10 +369,12 @@ fn spawn_server(binary: &Path, data_dir: &Path, tcp_port: u16) -> Child {
         .env("IGGY_SHARDING_CPU_ALLOCATION", "2")
         .env("IGGY_SHARDING_PIN_CORES", "false")
         .env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .expect("spawn the VSR Iggy test server")
+        .expect("spawn the VSR Iggy test server");
+    OwnedServer::new(child)
 }
 
 fn spawn_cluster_node(
@@ -356,7 +384,7 @@ fn spawn_cluster_node(
     replica_id: usize,
     tcp_ports: &[u16; CLUSTER_SIZE],
     replica_ports: &[u16; CLUSTER_SIZE],
-) -> Child {
+) -> OwnedServer {
     let stdout = File::create(log_path).expect("create cluster node log");
     let stderr = stdout.try_clone().expect("clone cluster node log");
     let mut command = Command::new(binary);
@@ -398,7 +426,7 @@ fn spawn_cluster_node(
                 replica_ports[node].to_string(),
             );
     }
-    command.spawn().expect("spawn Iggy cluster node")
+    OwnedServer::new(command.spawn().expect("spawn Iggy cluster node"))
 }
 
 fn log_contains(path: &Path, marker: &str) -> bool {

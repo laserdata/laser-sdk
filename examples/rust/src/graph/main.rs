@@ -1,6 +1,4 @@
-use laser_examples::{
-    init_tracing, laser, managed_feature_ready, phase, release_after, stream_for,
-};
+use laser_examples::{fresh_run, init_tracing, laser, managed_feature_ready, phase, stream_for};
 use laser_sdk::prelude::full::*;
 
 // The Graph primitive: nodes and edges built from what your messages mention,
@@ -13,7 +11,7 @@ const RELATION: &str = "purchased";
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("graph"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("graph"), async {
+    fresh_run(&laser, &stream_for("graph"), async {
         if !laser.capabilities().await.graph {
             managed_feature_ready(false, "the knowledge graph", "graph");
             return Ok(());

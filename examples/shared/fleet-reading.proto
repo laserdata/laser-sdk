@@ -1,0 +1,8 @@
+syntax = "proto3";
+package fleet;
+
+message Reading {
+  string satellite = 1;
+  string mode = 2;
+  int32 battery = 3;
+}

@@ -47,10 +47,10 @@ def run_token() -> str:
 
 def stream_for(example: str) -> str:
     """The data stream an example uses: ``LASER_STREAM`` if set (managed: your
-    provisioned stream, so repeat runs share its state), otherwise a
-    per-invocation ``laser-<example>-<token>`` stream so runs never collide on
-    the well-known agent topics or on each other's rows."""
-    return _env("LASER_STREAM") or f"{DEFAULT_STREAM}-{example}-{_RUN_TOKEN}"
+    provisioned stream, so repeat runs share its state), otherwise
+    ``laser-<example>-python``. The name is stable so the result stays on the
+    server after a run and a rerun starts clean."""
+    return _env("LASER_STREAM") or f"{DEFAULT_STREAM}-{example}-python"
 
 
 def index_for(base: str) -> str:
@@ -134,15 +134,18 @@ def _resolve_connection_string() -> str:
 
 
 async def connect(example: str) -> ls.Laser:
-    """Connect over the resolved target, pinned to the example's stream."""
-    return await ls.Laser.connect(_resolve_connection_string(), stream=stream_for(example))
-
-
-async def release_stream(laser: ls.Laser, example: str) -> None:
-    """Delete this run's own stream so repeated runs do not leave their topics
-    and partitions on the server. A provisioned ``LASER_STREAM`` is kept."""
+    """Connect over the resolved target, pinned to the example's stream. The
+    previous run's stream is deleted so the run starts clean, and the stream
+    the run creates is kept afterwards for inspection. A provisioned
+    ``LASER_STREAM`` is never deleted."""
+    laser = await ls.Laser.connect(_resolve_connection_string(), stream=stream_for(example))
     if not _env("LASER_STREAM"):
-        await laser.stream(stream_for(example)).delete()
+        try:
+            await laser.stream(stream_for(example)).delete()
+        except BaseException:
+            await laser.close()
+            raise
+    return laser
 
 
 def managed_gate(available: bool, feature: str, example: str) -> bool:

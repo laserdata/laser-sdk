@@ -33,7 +33,7 @@ def test_signing_key_rejects_a_seed_with_the_wrong_length():
 
 async def test_connect_reports_open_capabilities(laser):
     caps = await laser.capabilities()
-    # Raw Apache Iggy advertises no managed features.
+    # Without a managed plane nothing managed is advertised.
     assert caps.query is False
     assert caps.kv is False
     assert caps.forks is False
@@ -44,7 +44,9 @@ async def test_connect_reports_open_capabilities(laser):
     assert refreshed.kv is False
     assert refreshed.forks is False
     assert refreshed.backends == []
-    assert refreshed.versions is None
+    # The server answers the probe for its own consumer filters.
+    assert refreshed.filters is True
+    assert refreshed.filters_catalog is False
 
 
 async def test_capability_override_survives_refresh(laser):
@@ -1256,3 +1258,82 @@ async def test_given_a_cached_stream_when_deleted_elsewhere_then_should_publish_
             await laser.stream(laser.default_stream).delete()
         finally:
             await laser.close()
+
+
+async def test_given_a_fresh_consumer_when_reading_next_then_should_start_at_zero(laser):
+    topic = laser.topic("default-next")
+    producer = topic.producer(partition=0, partitions=1)
+    await producer.send_batch([b"zero", b"one"])
+    first = topic.consumer("fresh", partition=0, batch_length=1, auto_commit="disabled")
+    assert (await asyncio.wait_for(first.next(), 10)).offset == 0
+    await first.shutdown()
+    retried = topic.consumer("fresh", partition=0, batch_length=1, auto_commit="disabled")
+    zero = await asyncio.wait_for(retried.next(), 10)
+    assert zero.offset == 0
+    await retried.commit(zero)
+    await retried.shutdown()
+    resumed = topic.consumer("fresh", partition=0, batch_length=1, auto_commit="disabled")
+    assert (await asyncio.wait_for(resumed.next(), 10)).offset == 1
+    await resumed.shutdown()
+
+
+async def test_given_default_polling_when_shutdown_after_offset_zero_then_should_resume_at_one(
+    laser,
+):
+    topic = laser.topic("default-shutdown-zero")
+    producer = topic.producer(partition=0, partitions=1)
+    await producer.send_batch([b"zero", b"one", b"two", b"three"])
+    first = topic.consumer("partial", partition=0, batch_length=4)
+    assert (await asyncio.wait_for(first.next(), 10)).offset == 0
+    await first.shutdown()
+    resumed = topic.consumer("partial", partition=0, batch_length=4)
+    assert (await asyncio.wait_for(resumed.next(), 10)).offset == 1
+    await resumed.shutdown()
+
+
+@pytest.mark.parametrize("group", [False, True])
+@pytest.mark.parametrize(
+    "mode,interval",
+    [
+        ("disabled", None),
+        ("interval", 60_000),
+        ("polling", None),
+        ("polling", 60_000),
+        ("all", None),
+        ("all", 60_000),
+        ("each", None),
+        ("each", 60_000),
+        ("every", None),
+        ("every", 60_000),
+    ],
+)
+async def test_given_each_commit_policy_when_shutdown_after_zero_then_should_resume_correctly(
+    laser, group, mode, interval
+):
+    topic = laser.topic("policy-zero")
+    producer = topic.producer(partition=0, partitions=1)
+    await producer.send(b"zero")
+    await producer.send(b"one")
+    options = {"auto_commit": mode, "batch_length": 2}
+    if interval is not None:
+        options["commit_interval_ms"] = interval
+    if mode == "every":
+        options["commit_every"] = 10
+    first = (
+        topic.consumer_group("worker", **options)
+        if group
+        else topic.consumer("worker", partition=0, **options)
+    )
+    assert (await asyncio.wait_for(first.next(), 10)).offset == 0
+    await first.shutdown()
+    resumed = (
+        topic.consumer_group("worker", auto_commit="disabled")
+        if group
+        else topic.consumer("worker", partition=0, auto_commit="disabled")
+    )
+    try:
+        assert (await asyncio.wait_for(resumed.next(), 10)).offset == (
+            0 if mode == "disabled" else 1
+        )
+    finally:
+        await resumed.shutdown()

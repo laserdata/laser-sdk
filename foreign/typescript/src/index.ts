@@ -16,6 +16,8 @@ export {
   KvExecutionError,
   ForkExecutionError,
   AuthzExecutionError,
+  FilterExecutionError,
+  FilterStopError,
   AgentWorkflowExecutionError,
   GraphExecutionError,
   RejectedError,
@@ -77,7 +79,7 @@ export type {
   SendMessagesConfirmation,
   SendMessagesResponse
 } from "./iggy/apache-iggy.js"
-export type { Capabilities, CapabilitySurface } from "./client/capabilities.js"
+export type { Capabilities, CapabilitySurface, FilterCapabilities } from "./client/capabilities.js"
 export { QueryRequest } from "./managed/query.js"
 export { Destinations } from "./managed/destinations.js"
 export type { QueryResult, Row, Filter, Consistency, QueryTarget } from "./wire/query.js"
@@ -123,6 +125,86 @@ export type {
   KvError,
   CasExpect
 } from "./wire/kv.js"
+export {
+  DEFAULT_OUTCOME_WAIT_MS,
+  FilteredReader,
+  FilteredReaderBuilder,
+  Filters,
+  READER_TAG
+} from "./managed/filters.js"
+export type {
+  CatalogPageOptions,
+  FilterListOptions,
+  FilterPreviewOptions,
+  FilterTransport,
+  MatchedPage,
+  MatchedRecord,
+  ReaderTag
+} from "./managed/filters.js"
+export {
+  ConsumerFilter,
+  ExactDecimal,
+  FILTER_EVALUATOR_VERSION,
+  FieldPath,
+  FilterExpr,
+  consumerFilterDigest,
+  consumerFilterJson,
+  decodeConsumerFilterJson
+} from "./wire/filter.js"
+export type {
+  AckReceipt,
+  AppliedPolicy,
+  Coerce,
+  CoercedPredicate,
+  Continuation,
+  ExplainNode,
+  FaultPolicy,
+  FaultReason,
+  FilterBinding,
+  FilterBindingPage,
+  FilterCodec,
+  FilterConsumer,
+  FilterDetail,
+  FilterError,
+  FilterErrorReason,
+  FilterExplanation,
+  FilterGroupIdentity,
+  FilterGroupRef,
+  FilterHeader,
+  FilterLiteral,
+  FilterMutation,
+  FilterMutationOutcome,
+  FilterMutationResult,
+  FilterMutationStatus,
+  FilterPage,
+  FilterPreview,
+  FilterRef,
+  FilterRevisionInfo,
+  FilterRevisionPage,
+  FilterRevisionRef,
+  FilterSource,
+  FilterState,
+  FilterSummary,
+  FilterTestResult,
+  FilterValidation,
+  FilteredStart,
+  HeaderPredicate,
+  HeaderScalar,
+  PathSegment,
+  PreviewRecord,
+  ReadMode,
+  RecordFault,
+  RecordPolicy,
+  SourceGeneration,
+  StopReason,
+  TextMatch,
+  TextPredicate,
+  TimestampFormat,
+  Truth,
+  Verdict as FilterVerdict
+} from "./wire/filter.js"
+export { CompiledFilter, DEFAULT_DECODE_LIMITS } from "./wire/filter-eval.js"
+export type { DecodeLimits, FilterRecord, JsonValue } from "./wire/filter-eval.js"
 export { Fork, ForkCreateRequest, ForkPutRequest } from "./managed/forks.js"
 export type { ForkInfo, ForkKind, ForkStatus, ForkOutcome, ForkError } from "./wire/fork.js"
 export {

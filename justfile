@@ -61,9 +61,7 @@ wasm:
 # dependency policy for the wire crate's portable surface (bans iggy, tokio,
 # bytes, ulid, dashmap, tracing, getrandom)
 deny-wire:
-  cargo deny --manifest-path wire/Cargo.toml --target wasm32-unknown-unknown \
-    --no-default-features --features cbor,codecs,fixtures,builders,http-client \
-    check --config deny-wire.toml bans
+  python3 scripts/check-wire-dependencies.py
 
 # workspace vulnerability / unmaintained-crate advisories (needs cargo-deny)
 advisories:

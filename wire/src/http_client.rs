@@ -17,12 +17,18 @@ use crate::browse::{ProjectionInfo, SchemaInfo};
 use crate::checkpoint::CheckpointReadConsistency;
 use crate::control::{Projection, ProjectionBinding, SchemaSource, SourceSelector};
 use crate::destination::{DestinationId, DestinationOperationId};
+use crate::filter::{
+    ConsumerFilter, FilterBinding, FilterBindingPage, FilterDetail, FilterMutationOutcome,
+    FilterMutationRequest, FilterPage, FilterPreview, FilterPreviewRequest, FilterRevisionPage,
+    FilterTestResult, FilterValidation,
+};
 use crate::fork::ForkInfo;
 use crate::graph::GraphQuery;
 use crate::http::{
     self, AcceptedOperationView, Capabilities, CasCommittedView, CheckpointReadQuery,
     ClientMetadataListView, ClientsQuery, DecodeRecordBody, DeletedManyView, DestinationIssueView,
     DestinationListQuery, DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody,
+    FilterBindingListQuery, FilterListQuery, FilterRevisionListQuery, FilterTestBody,
     ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
     KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
     QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, RunPageView, RunsQuery,
@@ -636,6 +642,121 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// `GET /agdx/filters`: list saved consumer filters, newest first.
+    pub async fn list_filters(
+        &self,
+        query: &FilterListQuery,
+    ) -> ClientResult<FilterPage, T::Error> {
+        self.get(with_query(http::FILTERS_PATH, query)?).await
+    }
+
+    /// `GET /agdx/filters/{id}`: one saved filter, or `None` on a 404.
+    pub async fn get_filter(&self, id: u32) -> ClientResult<Option<FilterDetail>, T::Error> {
+        self.get_optional(http::filter_path(id)).await
+    }
+
+    /// `GET /agdx/filters/{id}/revisions`: the filter's revisions, newest first.
+    pub async fn list_filter_revisions(
+        &self,
+        id: u32,
+        query: &FilterRevisionListQuery,
+    ) -> ClientResult<FilterRevisionPage, T::Error> {
+        self.get(with_query(&http::filter_revisions_path(id), query)?)
+            .await
+    }
+
+    /// `POST /agdx/filters/mutations`: apply one catalog mutation. The reply is
+    /// the authoritative outcome: applied, rejected (with the typed reason), or
+    /// pending (read it later with [`filter_operation`](Self::filter_operation)).
+    /// A retry with the same operation id returns the first outcome.
+    pub async fn mutate_filter(
+        &self,
+        request: &FilterMutationRequest,
+    ) -> ClientResult<FilterMutationOutcome, T::Error> {
+        let payload = serde_json::to_vec(request)
+            .map_err(|error| ClientError::Decode(format!("request body: {error}")))?;
+        let response = self
+            .dispatch(
+                Method::Post,
+                http::FILTER_MUTATIONS_PATH.to_owned(),
+                Some(payload),
+            )
+            .await?;
+        if let Ok(outcome) = serde_json::from_slice::<FilterMutationOutcome>(&response.body) {
+            return Ok(outcome);
+        }
+        decode_ok(&response)
+    }
+
+    /// `GET /agdx/filters/operations/{id}`: a mutation's outcome, or `None` when
+    /// the catalog has no record of it.
+    pub async fn filter_operation(
+        &self,
+        operation_id: u128,
+    ) -> ClientResult<Option<FilterMutationOutcome>, T::Error> {
+        self.get_optional(http::filter_operation_path(operation_id))
+            .await
+    }
+
+    /// `POST /agdx/filters/validate`: validate and compile a filter.
+    pub async fn validate_filter(
+        &self,
+        filter: &ConsumerFilter,
+    ) -> ClientResult<FilterValidation, T::Error> {
+        self.send_json(Method::Post, http::FILTER_VALIDATE_PATH.to_owned(), filter)
+            .await
+    }
+
+    /// `POST /agdx/filters/test`: evaluate a filter against one sample and
+    /// explain the verdict.
+    pub async fn test_filter(
+        &self,
+        body: &FilterTestBody,
+    ) -> ClientResult<FilterTestResult, T::Error> {
+        self.send_json(Method::Post, http::FILTER_TEST_PATH.to_owned(), body)
+            .await
+    }
+
+    /// `POST /agdx/filters/preview`: preview a filter over stored records of
+    /// one partition. Joins no group and stores no offset.
+    pub async fn preview_filter(
+        &self,
+        request: &FilterPreviewRequest,
+    ) -> ClientResult<FilterPreview, T::Error> {
+        self.send_json(Method::Post, http::FILTER_PREVIEW_PATH.to_owned(), request)
+            .await
+    }
+
+    /// `GET /agdx/filter-bindings`: list consumer-group filter bindings.
+    pub async fn list_filter_bindings(
+        &self,
+        query: &FilterBindingListQuery,
+    ) -> ClientResult<FilterBindingPage, T::Error> {
+        self.get(with_query(http::FILTER_BINDINGS_PATH, query)?)
+            .await
+    }
+
+    /// `GET /agdx/filter-bindings/{stream}/{topic}/{group}`: one group's
+    /// binding, or `None` when the group is not bound.
+    pub async fn get_filter_binding(
+        &self,
+        stream: &str,
+        topic: &str,
+        group: &str,
+    ) -> ClientResult<Option<FilterBinding>, T::Error> {
+        let response = self
+            .dispatch(
+                Method::Get,
+                http::filter_binding_path(stream, topic, group),
+                None,
+            )
+            .await?;
+        if response.status == 404 && response.body.is_empty() {
+            return Ok(None);
+        }
+        decode_ok(&response).map(Some)
+    }
+
     /// `GET /agdx/kv`: list the caller's namespaces and their entry counts.
     pub async fn kv_namespaces(&self) -> ClientResult<Vec<KvNamespaceInfo>, T::Error> {
         self.get(http::KV_PATH.to_owned()).await
@@ -1099,6 +1220,29 @@ mod tests {
             response: HttpResponse::new(404, body),
         });
         let error = block_on(client.list_forks()).expect_err("a 404 is an error");
+        assert_eq!(error.code(), Some(ResultCode::NotFound));
+    }
+
+    #[test]
+    fn given_a_missing_binding_when_fetched_then_should_distinguish_absence_from_missing_source() {
+        let absent = HttpClient::new(CannedTransport {
+            response: HttpResponse::new(404, Vec::new()),
+        });
+        assert!(
+            block_on(absent.get_filter_binding("stream", "topic", "group"))
+                .unwrap()
+                .is_none()
+        );
+        let body = serde_json::to_vec(&ErrorBody::new(
+            ResultCode::NotFound,
+            "topic does not exist",
+        ))
+        .unwrap();
+        let missing_source = HttpClient::new(CannedTransport {
+            response: HttpResponse::new(404, body),
+        });
+        let error =
+            block_on(missing_source.get_filter_binding("stream", "topic", "group")).unwrap_err();
         assert_eq!(error.code(), Some(ResultCode::NotFound));
     }
 

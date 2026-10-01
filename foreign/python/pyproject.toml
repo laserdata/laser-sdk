@@ -25,6 +25,7 @@ Homepage = "https://laserdata.com"
 Repository = "https://github.com/laserdata/laser-sdk"
 
 [project.optional-dependencies]
+examples = ["protobuf>=5,<8", "cbor2>=5,<7"]
 testing = [
     "maturin>=1.7,<2.0",
     "pytest>=9.0,<10.0",

@@ -1,6 +1,6 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
-use iggy::prelude::IggyMessage;
+use iggy::prelude::{ConsumerGroupClient, Identifier, IggyError, IggyMessage};
 use std::collections::BTreeMap;
 
 pub use iggy::prelude::{HeaderKey, HeaderValue};
@@ -187,6 +187,23 @@ impl Topic {
         self.laser
             .ensure_topic_on(&stream, &self.name, partitions)
             .await
+    }
+
+    /// Idempotently create the consumer group `name` on this topic without
+    /// joining it, so a binding or an operator can address it before any member
+    /// connects.
+    pub async fn ensure_consumer_group(&self, name: &str) -> Result<(), LaserError> {
+        let stream = Identifier::named(self.stream()?)?;
+        let topic = Identifier::named(&self.name)?;
+        match self
+            .laser
+            .client()
+            .create_consumer_group(&stream, &topic, name)
+            .await
+        {
+            Ok(_) | Err(IggyError::ConsumerGroupNameAlreadyExists(..)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The Iggy producer builder for this topic, the substrate front door:

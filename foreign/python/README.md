@@ -4,7 +4,7 @@ This package provides the Python Laser SDK for Apache Iggy. [LaserData, Inc.](ht
 
 Rust and Python share the data contract and Rust implementation. The bindings expose Python forms of the SDK operations, configuration, and errors. Shared examples and behavior scenarios cover language-neutral behavior.
 
-> The current release is `0.4.1`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` separates agent identity from its consumer group. The default group uses the agent ID spelling. Set `consumer_group` when the deployment needs a different group.
 
@@ -266,6 +266,35 @@ await kv.delete("user:42")
 `Lease` exposes `token`, `granted_ttl_secs`, and `MutationPosition`. After takeover, pass that position to `get_entry_at_least` to exclude state older than the grant. Request a lifetime from 1 second to 5 minutes. The store can grant less time, but never more. Values outside the range fail before sending.
 
 Renew a lease before its granted lifetime expires. Reacquisition does not extend a live lease. Acquisition uses a dedicated coordination connection. If the outcome is unknown, the SDK retires the connection and waits through the requested lifetime. It then raises an ambiguous-mutation error that requires operation-specific recovery.
+
+## Consumer filters
+
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
+
+A consumer filter runs on the streaming server, so a reader receives only the records it selects, with their original offsets:
+
+```python
+safe_mode = ls.ConsumerFilter.json(
+    ls.FilterExpr.all(
+        [
+            ls.FilterExpr.pred("table", "eq", "satellites"),
+            ls.FilterExpr.pred("changed", "contains", "mode"),
+            ls.FilterExpr.pred("after.mode", "eq", "safe"),
+        ]
+    )
+)
+reader = await laser.filters().reader(
+    "orbit", "fleet_changes", consumer="anomaly-desk", filter=safe_mode, start="first"
+)
+try:
+    record = await reader.next_record()
+    print(record.partition_id, record.offset, record.message.payload)
+    await reader.ack(record)
+finally:
+    await reader.close()
+```
+
+Use `next_page()` and `ack_page()` for batch handling. A page is a bounded poll result, not a separate transport. Pass `group=` or `group_id=` instead of `consumer=` to read a consumer group's assigned partitions. An acknowledgment stores a page's safe offset only after every earlier page is handled. `laser.filters().preview(..)` and `test(..)` judge records without storing progress, and `ConsumerFilter.evaluate(payload)` runs the same evaluator locally, with `explain(payload)` returning the verdict and its explanation tree. `with_fault_policy`, `with_foreign_policy`, and `with_mismatch_policy` decide what a record that does not decode, has another codec, or has a field of an unexpected type does. With a managed plane, `register`, `revise`, `describe`, `create_consumer_group`, `bind`, `unbind`, `unbind_binding`, `set_revision_enabled`, `archive`, and `delete` manage saved filters and group bindings, and `apply_as` or `mutate` with `wait_for_outcome` resume a mutation under a recorded operation id. Failures raise `FilterError` with a `reason`. A fault or oversized-record stop also sets `partition_id` and `offset`, and a fault stop sets `fault_reason`. Unknown header value kinds remain raw bytes. Malformed entries set `headers_malformed` while valid headers and the payload remain readable. A structurally truncated block has empty `message.headers`. A `next_record` call cancelled after it read a record yields that record again on the next call.
 
 ## Knowledge graph
 
@@ -661,3 +690,13 @@ See [connect timeout and cleanup](../../docs/connect-timeout.md).
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
 
 See [publish recovery and outage handling](../../docs/publish-recovery.md).
+
+## Consumer filter groups and offsets
+
+**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages=`, so a reader that never acknowledges stops at that bound instead of growing without limit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+**Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
+
+For an application checkpoint inside a filtered page, call `await reader.ack_through(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ack_page` when the whole page is complete.
+
+Consumer-filter local guards use the same evaluator as the server. They verify records marked unevaluated under the reported decoder bounds and require the applicable pass policy. JSON, CBOR, Avro, and Protobuf keep their original payload bytes. The CBOR evaluator builds its value directly to avoid an intermediate tree.

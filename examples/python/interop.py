@@ -121,7 +121,7 @@ async def main() -> None:
             )
             print(f"HITL decision: {bytes(decision).decode(errors='replace')}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 # The model behind every worker: a deterministic canned reply, the Python

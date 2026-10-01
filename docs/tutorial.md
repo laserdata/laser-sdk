@@ -1,6 +1,6 @@
 # LaserData - Laser SDK tutorial
 
-This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, and similarity reads. Chapter 9 adds agent coordination.
+This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, and similarity reads. Chapter 9 adds agent coordination, and Chapter 11 reads only matching records with a server-side filter.
 
 Prerequisites: the install snippet from the [README](../README.md) and Apache Iggy, either from the configured R2 release or a local Iggy binary.
 
@@ -696,6 +696,55 @@ The `orchestra` example runs all of this end to end (a directed contract, a scat
 
 ---
 
+## Chapter 11 - read only the records you need
+
+**Receive only the records your application needs.** An on-call reviewer follows failed and slow model calls. A consumer filter runs on the streaming server, so the reader receives only the matching `Inference` records, with their original offsets, and the rest never cross the network:
+
+```rust
+use laser_sdk::filters::{ConsumerFilter, FilterExpr, FilteredStart};
+use laser_sdk::query::CmpOp;
+use laser_sdk::wire::schema::TypedValue;
+
+let slow_or_failed = ConsumerFilter::json(FilterExpr::any([
+    FilterExpr::pred(
+        "outcome",
+        CmpOp::In,
+        TypedValue::List(vec!["error".into(), "timeout".into()]),
+    ),
+    FilterExpr::pred("latency_ms", CmpOp::Gt, 2_000),
+]));
+
+let mut reader = laser
+    .filters()
+    .reader("agent-telemetry", "inferences")
+    .consumer("on-call-review")
+    .inline(slow_or_failed)
+    .start(FilteredStart::First)
+    .build()
+    .await?;
+
+let record = reader.next_record().await?;
+println!("offset {}: {:?}", record.offset, record.message.payload);
+reader.ack(&record).await?;
+reader.close().await?;
+```
+
+An acknowledgment stores the page's safe offset, which covers the non-matching records the server scanned past, so a restart resumes after them. The filter is three-valued: a record without `latency_ms` is neither slow nor fast, and it is not selected by that branch.
+
+`preview` judges stored records and explains each verdict without storing progress, and `test` evaluates one sample record. With a managed plane, `register` saves the filter as a revision and `bind` pins a consumer group to it, so every member of the group runs the same filter.
+
+**The CDC example saves 98.5% of payload transfer:** the reader receives 4 of 240 records and 424 of 27,953 payload bytes. Run it in Rust, Python, or TypeScript. It also demonstrates one-byte numeric header routing, previews, saved revisions, and consumer group bindings.
+
+`next_record()` buffers bounded poll results internally. `next_page()` is the batch alternative. Both use the optional filtered-poll command over standard Iggy transport. A saved binding does not change ordinary polling.
+
+Run the Rust example:
+
+```sh
+cargo run --example cdc
+```
+
+---
+
 ## Running locally
 
 Use `just up` to start Apache Iggy for streaming, agents, provenance, cursors, and locally folded memory. The open integration tests use those features without a managed backend.
@@ -713,6 +762,7 @@ Queries, projections, KV, and forks require Laser Stack or LaserData Cloud. A ma
 | `Projection` + `ProjectionBinding` types | resolved from the cloud's deployment snapshots |
 | query DSL + request/reply envelope | served from the `_agdx` internal stream |
 | managed KV client (`kv` feature, `Laser::kv`) + registry browse (projections via `projections().get` / `projections().list`, writer schemas via `schemas().get` / `schemas().list`) | the `AGDX_KV_*` / `AGDX_*_PROJECTION` / `AGDX_*_SCHEMA` managed commands, served by Laser Stack or LaserData Cloud |
+| consumer filters (`filters` feature, `Laser::filters`): filtered readers with fenced acknowledgments, previews, tests, local evaluation, the catalog client | the `AGDX_FILTER*` commands evaluated by the LaserData Iggy fork next to the data, and the saved-filter catalog with group bindings kept by `laser-plane` |
 | `Codec<T>` trait + `Json` + `Msgpack` + `Cbor` + `Bson` | identical wire. Codecs run on the producer side. Schema-first codecs resolve their writer schema from the managed registry |
 | reliable agent runtime | same agent runtime can run inside cloud services |
 | example projector (header path) + test projector (registry path) | the long-running managed projector under Operator |

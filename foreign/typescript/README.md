@@ -4,7 +4,9 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> The current release is `0.4.1`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 ## Install
 
@@ -178,6 +180,34 @@ await incidents.remember(new TextEncoder().encode("checkout uses the read replic
 
 TypeScript duration inputs use milliseconds. `noExpiry()` keeps the raw memory history until ordinary topic retention removes it.
 
+A consumer filter runs on the streaming server, so a reader receives only the records it selects, with their original offsets:
+
+```ts
+const safeMode = ConsumerFilter.json(
+  FilterExpr.all([
+    FilterExpr.pred("table", "eq", "satellites"),
+    FilterExpr.pred("changed", "contains", "mode"),
+    FilterExpr.pred("after.mode", "eq", "safe")
+  ])
+)
+const reader = await laser
+  .filters()
+  .reader("orbit", "fleet_changes")
+  .consumer("anomaly-desk")
+  .inline(safeMode)
+  .start({ kind: "first" })
+  .build()
+try {
+  const record = await reader.nextRecord({ timeoutMs: 15_000 })
+  console.log(record.partitionId, record.offset, record.payload)
+  await reader.ack(record)
+} finally {
+  await reader.close()
+}
+```
+
+Use `nextPage()` and `ackPage()` for batch handling. A page is a bounded poll result, not a separate transport. Use `.group(name)` or `.groupId(id)` to read a consumer group's assigned partitions. `CompiledFilter.compile(filter).evaluate(record)` runs the evaluator locally with exact integers. `ConsumerFilter.withFaultPolicy`, `withForeignPolicy`, and `withMismatchPolicy` decide what a record that does not decode, has another codec, or has a field of an unexpected type does: stop or drop, or reach the reader with `evaluated` false. A record whose header block did not decode has `headersMalformed` set. `preview`, `test`, and the catalog verbs `register`, `revise`, `describe`, `createConsumerGroup`, `bind`, `unbind`, `unbindBinding`, `setRevisionEnabled`, `archive`, and `delete` live on `laser.filters()`. A server refusal throws `FilterExecutionError`, and a fault or oversized stop throws `FilterStopError`, whose `reason` names the stop. A group reader joins over its own connection, and a partition it gains on a rebalance resumes after the group's stored offset. Record timestamps are exact microseconds.
+
 ## Agents and coordination
 
 The agent layer adds record origins, typed AGDX messages, routing, discovery, retries, dead letters, contracts, and workflows. Consumers commit offsets after handling records. Workflow journals support replay, budgets, compensation, and fenced steps. Lease acquisition is not retried automatically after reconnect. If its outcome is unknown, it waits through the requested lifetime before returning `AmbiguousMutationError`. Workflows retain leases through verification and the completion journal write.
@@ -225,7 +255,7 @@ SDK failures extend `LaserError` and carry a stable `kind`. Separate subclasses 
 
 ## Examples and verification
 
-The examples in [`examples/typescript`](../../examples/typescript/README.md) cover eight focused operations and nine larger applications. The shared scenarios under [`bdd/scenarios`](../../bdd/scenarios) describe behavior across clients.
+The examples in [`examples/typescript`](../../examples/typescript/README.md) cover nine focused operations and nine larger applications. The shared scenarios under [`bdd/scenarios`](../../bdd/scenarios) describe behavior across clients.
 
 ```sh
 npm ci
@@ -249,3 +279,13 @@ See [connect timeout and cleanup](../../docs/connect-timeout.md).
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
 
 See [publish recovery and outage handling](../../docs/publish-recovery.md).
+
+## Consumer filter groups and offsets
+
+**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `maxUnackedPages`, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+**Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
+
+For an application checkpoint inside a filtered page, call `reader.ackThrough(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ackPage` when the whole page is complete. Regex predicates reject an enabled TypeScript local guard instead of silently skipping verification.
+
+Consumer-filter patterns use the server's bounded Rust regex engine. TypeScript validates structure and lets the server decide regex syntax. A local `CompiledFilter` refuses regex predicates, because only the server's engine defines their meaning. A filter permits four compiled glob or regex predicates, with a 256 KiB program budget each. Local guards reject regex filters explicitly. Guards verify unevaluated records under the server's reported decoder bounds and the applicable pass policy.

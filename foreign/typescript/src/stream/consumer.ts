@@ -1,10 +1,11 @@
+import { mintUlidValue } from "../runtime/ulid.js"
 import type {
   ConsumerTarget,
   IggyHeaderValue,
   LaserTransport,
   PolledMessage
 } from "../iggy/apache-iggy.js"
-import { CancelledError, InvalidError, UnsupportedError } from "../client/errors.js"
+import { CancelledError, InvalidError, TransportError, UnsupportedError } from "../client/errors.js"
 import type { PollingStrategy } from "./polling-strategy.js"
 
 export interface ConsumedMessage {
@@ -44,7 +45,11 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-/** Polls one partition or consumer group until shutdown. */
+/**
+ * Polls one partition or consumer group until shutdown. A purge restarts the
+ * partition at offset 0 without telling an open reader, which can keep its old
+ * position and skip the replacement records, so rebuild it after a purge.
+ */
 export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable {
   private readonly batchLength: number
   private readonly autoCommit: boolean
@@ -52,6 +57,12 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
   private readonly pollIntervalMs: number
   private buffer: PolledMessage[] = []
   private readonly consumedOffsets = new Map<number, bigint>()
+  private readonly explicitOffsets = new Map<number, bigint>()
+  private readonly nextOffsets = new Map<number, bigint>()
+  private assignedPartitions = new Set<number>()
+  private assignmentSeen = false
+  private partitionCursor = 0
+  private readonly gainedPartitions = new Set<number>()
   private started = false
   private shuttingDown = false
 
@@ -62,8 +73,10 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
     private readonly target: ConsumerTarget,
     options: ConsumerOptions = {}
   ) {
+    const anonymous = target.kind === "single" && target.name === undefined
+    if (anonymous) this.target = { ...target, name: `anonymous-${mintUlidValue().toString(16)}` }
     this.batchLength = options.batchLength ?? DEFAULT_BATCH_LENGTH
-    this.autoCommit = options.autoCommit ?? true
+    this.autoCommit = options.autoCommit ?? !anonymous
     this.startFrom = options.startFrom ?? DEFAULT_START_FROM
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     if (
@@ -99,7 +112,10 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
         throw new CancelledError("nextWithin aborted", { cause: options.signal.reason })
       }
       const message = this.buffer.shift()
-      if (message !== undefined) return message
+      if (message !== undefined) {
+        this.consumedOffsets.set(message.partitionId, message.offset)
+        return message
+      }
       await this.fillBuffer(options.signal)
       if (this.buffer.length > 0) continue
       const remaining = deadline - Date.now()
@@ -119,6 +135,7 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
       }
       const message = this.buffer.shift()
       if (message !== undefined) {
+        this.consumedOffsets.set(message.partitionId, message.offset)
         yield message
         continue
       }
@@ -137,6 +154,7 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
       message.partitionId,
       message.offset
     )
+    this.explicitOffsets.set(message.partitionId, message.offset)
   }
 
   lastConsumedOffset(partitionId: number): bigint | undefined {
@@ -170,8 +188,25 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return
     this.shuttingDown = true
-    if (this.target.kind === "group") {
-      await this.transport.leaveConsumerGroup(this.streamName, this.topicName, this.target.name)
+    try {
+      if (this.autoCommit) {
+        for (const [partition, offset] of this.consumedOffsets) {
+          const explicit = this.explicitOffsets.get(partition)
+          if (explicit === undefined || explicit < offset) {
+            await this.transport.storeOffset(
+              this.streamName,
+              this.topicName,
+              this.target,
+              partition,
+              offset
+            )
+          }
+        }
+      }
+    } finally {
+      if (this.target.kind === "group") {
+        await this.transport.leaveConsumerGroup(this.streamName, this.topicName, this.target.name)
+      }
     }
   }
 
@@ -184,17 +219,65 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
     if (signal?.aborted === true) {
       throw new CancelledError("consumer poll aborted", { cause: signal.reason })
     }
-    const strategy = this.started ? ({ kind: "next" } as const) : this.startFrom
-    this.started = true
+    let target = this.target
+    if (
+      target.kind === "group" &&
+      (this.startFrom.kind !== "next" || !this.autoCommit) &&
+      this.transport.syncConsumerGroup !== undefined
+    ) {
+      const assignment = await this.transport.syncConsumerGroup(
+        this.streamName,
+        this.topicName,
+        target.name
+      )
+      if (assignment === undefined)
+        throw new TransportError("the consumer group has no active assignment", true)
+      if (assignment.rejoined) {
+        this.nextOffsets.clear()
+        this.assignedPartitions.clear()
+      }
+      const assigned = new Set(assignment.partitions)
+      for (const partition of this.assignedPartitions) {
+        if (!assigned.has(partition)) {
+          this.nextOffsets.delete(partition)
+          this.gainedPartitions.delete(partition)
+        }
+      }
+      if (this.assignmentSeen) {
+        for (const partition of assigned) {
+          if (!this.assignedPartitions.has(partition)) this.gainedPartitions.add(partition)
+        }
+      }
+      this.assignedPartitions = assigned
+      this.assignmentSeen = true
+      if (assignment.partitions.length === 0) return
+      const partitionId =
+        assignment.partitions[this.partitionCursor++ % assignment.partitions.length]
+      if (partitionId === undefined) return
+      target = { ...target, partitionId }
+    }
+    const partition = target.partitionId
+    const next = partition === undefined ? undefined : this.nextOffsets.get(partition)
+    const strategy =
+      next !== undefined
+        ? { kind: "offset" as const, value: next }
+        : partition !== undefined
+          ? this.gainedPartitions.has(partition)
+            ? { kind: "next" as const }
+            : this.startFrom
+          : this.started
+            ? { kind: "next" as const }
+            : this.startFrom
     const polled = await this.transport.pollMessages(
       this.streamName,
       this.topicName,
-      this.target,
+      target,
       strategy,
       this.batchLength,
       this.autoCommit
     )
-    for (const message of polled) this.consumedOffsets.set(message.partitionId, message.offset)
+    this.started = true
+    for (const message of polled) this.nextOffsets.set(message.partitionId, message.offset + 1n)
     this.buffer.push(...polled)
   }
 }

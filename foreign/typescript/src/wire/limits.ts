@@ -51,3 +51,30 @@ export const MAX_GRAPH_TRAVERSE_DEPTH = 8
 export const MAX_GRAPH_RESULT_ELEMENTS = 10_000
 export const MAX_GRAPH_NODE_LABELS = 16
 export const MAX_SOURCE_REF_BYTES = 2 * MAX_KEY_BYTES
+
+export const MAX_FILTER_BYTES = 8192
+export const MAX_FILTER_NODES = 128
+export const MAX_FILTER_DEPTH = 8
+export const MAX_FILTER_PATH_SEGMENTS = 16
+export const MAX_FILTER_PATH_BYTES = 256
+export const MAX_FILTER_LIST_ITEMS = 64
+export const MAX_FILTER_STRING_BYTES = 1024
+export const MAX_FILTER_NAME_BYTES = 128
+export const MAX_FILTER_DESCRIPTION_BYTES = 1024
+export const MAX_FILTER_SOURCE_NAME_BYTES = 255
+export const MAX_FILTERED_PAGE_RECORDS = 1000
+export const MAX_FILTERED_PAGE_BYTES = 8 * 1024 * 1024
+export const MAX_FILTER_PREVIEW_EXAMINED = 10_000
+export const MAX_FILTER_PREVIEW_RECORDS = 100
+export const MAX_FILTER_PREVIEW_PAYLOAD_BYTES = 4096
+export const MAX_FILTER_SAMPLE_BYTES = 1024 * 1024
+export const MAX_FILTER_SAMPLE_HEADERS = 64
+export const MAX_FILTER_CATALOG_PAGE = 200
+/**
+ * Max JSON nesting depth a payload decoder accepts. Every server bound and SDK
+ * guard uses this one value, below the server parser's recursion limit.
+ */
+export const MAX_FILTER_PARSE_DEPTH = 127
+
+export const MAX_FILTER_SCHEMA_BYTES = 1024 * 1024
+export const MAX_FILTER_SCHEMA_DEPTH = 64

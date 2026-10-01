@@ -155,6 +155,7 @@ export class TestIggy {
 }
 
 export class TestIggyCluster {
+  private readonly overrides = new Map<number, NodeJS.ProcessEnv>()
   private readonly children: (ChildProcess | undefined)[] = [undefined, undefined, undefined]
   private readonly directories: string[] = []
   private readonly logs: FileHandle[] = []
@@ -199,6 +200,14 @@ export class TestIggyCluster {
       await cluster.close()
       throw error
     }
+  }
+
+  nodeEndpoint(replicaId: number): { readonly host: string; readonly port: number } {
+    return { host: "127.0.0.1", port: required(this.tcpPorts[replicaId], "node TCP port") }
+  }
+
+  setNodeEnvironment(replicaId: number, variables: NodeJS.ProcessEnv): void {
+    this.overrides.set(replicaId, variables)
   }
 
   async restartNode(replicaId: number): Promise<void> {
@@ -301,6 +310,7 @@ export class TestIggyCluster {
   private spawn(replicaId: number): void {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
+      ...this.overrides.get(replicaId),
       IGGY_PATH: this.directories[replicaId],
       IGGY_CLUSTER_ENABLED: "true",
       IGGY_CLUSTER_NAME: "laser-sdk-rolling-restart",

@@ -154,7 +154,7 @@ async def main() -> None:
         for agent in agents:
             await agent.shutdown()
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 def worker(name: str, skill: str, delay: float):

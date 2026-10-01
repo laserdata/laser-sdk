@@ -1,3 +1,4 @@
+import { Filters } from "../managed/filters.js"
 import { connectOptions, type ConnectOptions } from "./connect-options.js"
 import { publishOptions, type PublishOptions } from "./publish-options.js"
 import {
@@ -1361,6 +1362,38 @@ export class Laser implements AsyncDisposable {
 
   destinations(): Destinations {
     return new Destinations(this.managedTransport(), () => this.capabilities())
+  }
+
+  /**
+   * Server-side consumer filters: filtered readers, previews, sample tests, and
+   * the saved-filter catalog.
+   */
+  filters(): Filters {
+    const transport = this.transport
+    return new Filters(
+      {
+        sendManaged: this.managedTransport().sendManaged,
+        ensureConsumerGroup: (streamId, topicId, name) =>
+          transport.ensureConsumerGroup(streamId, topicId, name),
+        getTopicPartitionCount: (streamId, topicId) =>
+          transport.getTopicPartitionCount(streamId, topicId),
+        joinConsumerGroup: (streamId, topicId, name) =>
+          transport.joinConsumerGroup(streamId, topicId, name),
+        leaveConsumerGroup: (streamId, topicId, name) =>
+          transport.leaveConsumerGroup(streamId, topicId, name),
+        ...(transport.joinExistingConsumerGroup !== undefined
+          ? { joinExistingConsumerGroup: transport.joinExistingConsumerGroup.bind(transport) }
+          : {}),
+        ...(transport.openNodeConnection !== undefined
+          ? { openNodeConnection: transport.openNodeConnection.bind(transport) }
+          : {}),
+        ...(transport.openCoordinator !== undefined
+          ? { openCoordinator: transport.openCoordinator.bind(transport) }
+          : {}),
+        ...(transport.connectsNodes !== undefined ? { connectsNodes: transport.connectsNodes } : {})
+      },
+      () => this.capabilities()
+    )
   }
 
   kv(namespace: string): Kv {

@@ -63,7 +63,7 @@ async def main() -> None:
             span = f"{change.from_offset}..{change.to_offset}"
             print(f"  view advanced: {change.rows} row(s), source offsets {span}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import { run as runLog } from "../src/log/main.js"
 import { run as runRecall } from "../src/recall/main.js"
 import { run as runContext } from "../src/context/main.js"
 import { run as runAgent } from "../src/agent/main.js"
+import { run as runCdc } from "../src/cdc/main.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -87,6 +88,15 @@ void test(
   { concurrency: false, timeout: 30_000 },
   async () => {
     await withLaser("agent", (laser) => runAgent(laser, AbortSignal.timeout(25_000)))
+    assert.ok(true)
+  }
+)
+
+void test(
+  "given_the_fleet_change_feed_when_filtered_then_should_deliver_only_safe_mode_records",
+  { concurrency: false, timeout: 60_000 },
+  async () => {
+    await withLaser("cdc", (laser) => runCdc(laser, AbortSignal.timeout(55_000)))
     assert.ok(true)
   }
 )

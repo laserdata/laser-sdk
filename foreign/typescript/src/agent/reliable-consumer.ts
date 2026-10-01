@@ -1,5 +1,6 @@
 import {
   CodecError,
+  FilterExecutionError,
   HandlerError,
   InvalidError,
   LaserError,
@@ -375,6 +376,12 @@ export function isRetryable(error: LaserError): boolean {
         ["notLeader", "stale", "unavailable"].includes(
           String((error as { readonly detail?: { readonly kind?: unknown } }).detail?.kind)
         )
+      )
+    case "filter":
+      return (
+        error instanceof FilterExecutionError &&
+        error.detail.code.kind === "known" &&
+        ["Unavailable", "NotLeader", "Stale"].includes(error.detail.code.name)
       )
     case "timeout":
     case "handler":

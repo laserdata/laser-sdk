@@ -38,6 +38,7 @@ pub mod destinations;
 #[cfg(any(feature = "a2a-bridge", feature = "mcp-bridge"))]
 pub mod edge_auth;
 pub mod error;
+pub mod filters;
 pub mod fork;
 #[cfg(feature = "agent")]
 pub mod govern;
@@ -49,6 +50,7 @@ pub mod kv;
 #[cfg(feature = "streaming")]
 pub mod laser;
 #[cfg(any(
+    feature = "filters",
     feature = "fork",
     feature = "destinations",
     feature = "graph",

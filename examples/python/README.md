@@ -60,7 +60,7 @@ LASER_TOKEN='<token>' \
 | `LASER_TOKEN` | personal access token auth |
 | `LASER_USERNAME`, `LASER_PASSWORD` | username and password auth |
 | `LASER_NO_TLS=1` | disable the automatic TLS attach |
-| `LASER_STREAM` | override the data stream for every example (default: a per-invocation `laser-<example>-<token>` stream, so repeat and concurrent runs never share state, deleted when the run finishes) |
+| `LASER_STREAM` | override the data stream for every example (default: `laser-<example>-python`, reset at the start of a run and kept afterwards so the result stays on the server for inspection) |
 | `LASER_MESSAGES`, `LASER_BATCH` | volume knobs for the publishing examples |
 | `LASER_FIREHOSE_*` | the firehose's own knobs (`MESSAGES`, `ORGS`, `CONCURRENCY`, `PAYLOAD_BYTES`, `BATCH`, `PARTITIONS`, `REGISTER`, `QUERY`) |
 | `LASER_APPLY_PLAN=1` | the concierge acts on the speculative fork's verdict (promote or squash) instead of leaving it open |
@@ -77,6 +77,7 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 | [`query.py`](query.py) | Views | declare a view over a topic, publish orders, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch.py`](watch.py) | Change feed | react to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
 | [`kv.py`](kv.py) | State | set/get keyed JSON with a TTL, upgrade it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
+| [`cdc.py`](cdc.py) | Consumer filters | read four safe-mode events out of a 240-record feed of typed dataclasses, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (bindings need plane) | no | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
 | [`graph.py`](graph.py) | Graph | link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall.py`](recall.py) | Memory | all four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
 | [`context.py`](context.py) | Context | assemble one conversation under a last-N bound and a token budget | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
@@ -99,3 +100,9 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 | [`governance.py`](governance.py) | agentic | capability RBAC and agent governance, 1:1 with the Rust `governance`: define roles and bind them to an Iggy user when `authz` is served, then show deny-wins matching, on-behalf-of permission intersection, external-edge audience and step-up decisions, and budgeted run submission when the run registry is served |
 
 Every example runs green on a local Apache Iggy. The managed phases (query, key-value, graph, RBAC, and the run registry) print how to point at a deployment and skip when the connected server is Apache Iggy.
+
+**Consumer filters save 98.5% of payload transfer in the CDC example.** [cdc.py](cdc.py) reads 4 of 240 records from a shared feed. It uses dataclasses, record-by-record acknowledgments, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+The CDC managed phase also demonstrates **create-and-bind setup, numeric group IDs, and independent A/B groups**. Revision pause stops new reads while allowing in-flight acknowledgments, then resume continues the same policy.
+
+The CDC example also filters fields inside **CBOR, Avro, and Protobuf payloads** with matching typed fleet readings. Install its optional dependencies with `uv sync --extra examples` from `foreign/python`. The shared schemas live in `examples/shared/`. Avro and Protobuf require plane for writer-schema registration.

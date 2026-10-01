@@ -191,3 +191,50 @@ pub const MAX_GRAPH_NODE_LABELS: usize = 16;
 /// key-value source) names both a namespace and a key, far under the opaque
 /// value ceiling, as a source ref is a short pointer, not a payload.
 pub const MAX_SOURCE_REF_BYTES: usize = 2 * MAX_KEY_BYTES;
+
+// Consumer-filter caps. A filter is evaluated per record on a streaming server
+// shard, so its size and shape are bounded before it compiles.
+/// Maximum encoded writer schema used by a consumer-filter decoder.
+pub const MAX_FILTER_SCHEMA_BYTES: usize = 1024 * 1024;
+/// Maximum nesting in an Avro writer-schema document.
+pub const MAX_FILTER_SCHEMA_DEPTH: usize = 64;
+/// Max encoded bytes of one consumer filter.
+pub const MAX_FILTER_BYTES: usize = 8192;
+/// Max expression nodes in one filter, literals inside lists included.
+pub const MAX_FILTER_NODES: usize = 128;
+/// Max nesting depth of a filter expression.
+pub const MAX_FILTER_DEPTH: usize = 8;
+/// Max JSON nesting depth a payload decoder accepts. Every server bound and
+/// SDK guard uses this one value. It stays below the `serde_json` recursion
+/// limit, so an over-deep payload is reported as `too_deep`, not `malformed`.
+pub const MAX_FILTER_PARSE_DEPTH: usize = 127;
+/// Max segments in one field path.
+pub const MAX_FILTER_PATH_SEGMENTS: usize = 16;
+/// Max bytes in one field path or header key.
+pub const MAX_FILTER_PATH_BYTES: usize = 256;
+/// Max items in one `in` list.
+pub const MAX_FILTER_LIST_ITEMS: usize = 64;
+/// Max bytes in one string literal.
+pub const MAX_FILTER_STRING_BYTES: usize = 1024;
+/// Max bytes in a saved filter's name.
+pub const MAX_FILTER_NAME_BYTES: usize = 128;
+/// Max bytes in a saved filter's description.
+pub const MAX_FILTER_DESCRIPTION_BYTES: usize = 1024;
+/// Max bytes in a stream, topic, consumer, or group name a filtered read names.
+pub const MAX_FILTER_SOURCE_NAME_BYTES: usize = 255;
+/// Max records one filtered page returns.
+pub const MAX_FILTERED_PAGE_RECORDS: u32 = 1000;
+/// Max reply bytes one filtered page may carry.
+pub const MAX_FILTERED_PAGE_BYTES: u32 = 8 * 1024 * 1024;
+/// Max records one preview may examine.
+pub const MAX_FILTER_PREVIEW_EXAMINED: u32 = 10_000;
+/// Max records one preview returns.
+pub const MAX_FILTER_PREVIEW_RECORDS: u32 = 100;
+/// Max payload bytes a preview record carries as text.
+pub const MAX_FILTER_PREVIEW_PAYLOAD_BYTES: usize = 4096;
+/// Max payload bytes a supplied test sample may carry.
+pub const MAX_FILTER_SAMPLE_BYTES: usize = 1024 * 1024;
+/// Max headers a supplied test sample may carry.
+pub const MAX_FILTER_SAMPLE_HEADERS: usize = 64;
+/// Max page size of a catalog list.
+pub const MAX_FILTER_CATALOG_PAGE: u32 = 200;

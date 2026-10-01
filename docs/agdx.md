@@ -242,6 +242,9 @@ The core registry names operations and defines their meaning. Each binding maps 
 | `graph.query` / `neighbors` / `upsert` | views | knowledge-graph traversal, one-hop neighbors, node/edge upsert (A13). The graph name is at most 128 B, non-empty, control-character-free (`validate_graph_name`), enforced by the SDK edge and the serving plane |  |
 | `batch` | control | the mixed-operation batch: up to `MAX_BATCH_OPS` (64) managed requests in one round trip, each item carrying its own command code and encoded request, each result that op's own reply bytes in order. Amortizes the round trip and nothing else: items execute independently, a failed item fails alone (explicitly NOT atomic), a nested batch is rejected. An old backend answers the unknown code with the surface-agnostic `CommandError`, decoded client-side as the typed unsupported, so no capability bit is needed |  |
 | `agent.submit` / `cancel` / `status` / `list` | coordination | the run registry: submit records intent and mints the run identity (content-addressed, so a retried submit converges), delivery stays the envelope the SDK publishes, transitions are folded from the status records a registered run stamps with the `run` metadata key (A9.6), cancel records an intent flag the engine observes at a step boundary. `submit` MAY carry a multi-dimensional `RunBudget` (events, model calls, tool calls, patches, recursion depth, wall-clock, cost) the run fold accumulates, failing the run when a cap is crossed. It is a governance governor, not a grant. A managed read model over the log, never a second source of truth |  |
+| `filter.poll` / `ack` | streaming | read one bounded page of the records a consumer filter selects from one partition, and store its safe offset under a generation and ownership fence. Served by the streaming server itself (A14) |  |
+| `filter.preview` / `test` / `validate` | streaming | judge stored records without progress, evaluate one supplied record, compile a filter (A14) |  |
+| `filter.mutate` / `get` / `list` / `list_revisions` / `get_binding` / `list_bindings` / `operation` | streaming | the saved-filter catalog and consumer-group bindings, with operation-id idempotent mutations (A14.3) |  |
 | change feed (no request op) | views | change notification over the read model: a projection binding opts in with `notify`, the projector publishes one change record per committed batch on the changes channel (A11.8, B1.1), and a consumer reads it by offset like any topic. Gated by the `watch` feature bit (A12), it adds no request op, so there is no `watch`/`unwatch` verb to register |  |
 
 The memory API uses `remember`, `recall`, `improve`, and `forget`. These SDK methods combine `publish`, `query`, and `graph` operations (A13). They do not add wire operation codes.
@@ -724,14 +727,14 @@ The feed reports progress. Read-your-writes establishes whether the view include
 
 A single connection negotiates what is available. A managed feature works against a managed implementation or returns `unsupported`.
 
-- Run `hello` at connection time and again when refreshing capabilities. The reply reports versions for query, control, checkpoint, key-value, fork, agent, and graph, plus feature bits. The current versions are 1. A zero version means the operation group is unavailable. Fenced leases also require their feature bit.
+- Run `hello` at connection time and again when refreshing capabilities. The reply reports versions for query, control, checkpoint, key-value, fork, agent, graph, and the filter catalog, plus feature bits. The current versions are 1. A zero version means the operation group is unavailable. Fenced leases also require their feature bit.
 - `BackendDescriptor` reports versioned backend identity, mode, label, implementation, generations, configuration revisions, state, and readiness. It also reports materialization, query, type, time-travel, consistency, paging, cancellation, schema, maintenance, and limit support. It must not expose URLs, credentials, secrets, or mutable configuration requests.
 - Readiness reports the current backend condition through stable reason codes. Unavailable or degraded backends retain their identity and capability descriptions. Refresh capabilities after startup races, failover, or backend restarts.
-- SDK capabilities group features by their dependencies. `managed` indicates that a managed plane is connected. Managed groups include `query`, `destinations`, `kv`, `graph`, `forks`, and the A2A gateway. Platform-native groups include `sessions` and `durable_dedup`. Memory combines query and graph operations and has no separate capability.
+- SDK capabilities group features by their dependencies. `managed` indicates that a managed plane is connected. Managed groups include `query`, `destinations`, `kv`, `graph`, `forks`, the A2A gateway, and the saved-filter catalog (`filters.catalog`). Platform-native groups include `sessions`, `durable_dedup`, and native consumer filters (`filters.native`), which the streaming server serves itself. Memory combines query and graph operations and has no separate capability.
 
 `query.consistency` reports the strongest supported level: `eventual < read_your_writes < strong`. A stronger level includes the weaker levels. `kv.cas` reports conditional writes. `kv.cas_fenced` reports fence-protected writes. `kv.fenced_leases` reports holder-scoped acquisition, renewal, release, fenced CAS, and reads with a required mutation position.
 
-The wire reply retains the flat `features` bitset. Its bits include `kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`, `keyword_search`, `watch`, `authz`, `destinations`, and `kv_fenced_leases`. SDKs convert these bits into grouped capabilities. HTTP reports the grouped form (B4). Without managed support, the corresponding capabilities remain off and calls return unsupported.
+The wire reply retains the flat `features` bitset. Its bits include `kv_cas`, `read_your_writes`, `strong_consistency`, `kv_cas_fenced`, `agent_workflow`, `keyword_search`, `watch`, `authz`, `destinations`, `kv_fenced_leases`, and `consumer_filters`. `consumer_filters` is set by the streaming server itself when it serves filtered reads, with or without a managed plane, and the reply then names the served evaluator version and codecs (`filters`), so an SDK refuses to run a filter the server would evaluate differently. The saved-filter catalog additionally needs a ready backend that reports a nonzero `filter` version. SDKs convert these bits into grouped capabilities. HTTP reports the grouped form (B4). Without managed support, the corresponding capabilities remain off and calls return unsupported.
 - If the reported operation version differs from the SDK version, reject the call before sending. Return the typed version error for that operation group.
 - If an optional request field changes service behavior, require its capability before sending it. This includes the `consistency` field. A distinct command code can receive an explicit unsupported reply, but an unknown optional field can be ignored.
 
@@ -810,6 +813,81 @@ Conversation filters use the originating `gen_ai.conversation.id` value. Graph q
 These fields are optional and omitted when unset. They narrow results but do not prove authorship or grant access. The security profile in B1.1 defines those guarantees.
 
 ---
+
+## A14. Consumer filters
+
+A consumer filter selects records on the streaming server, so a reader receives only the records it asked for, with their original offsets, ids, timestamps, headers, and payload bytes. Filtering never changes stored data or the standard poll. It is a separate read command that returns a standard polled-messages body with the non-matching records left out.
+
+### A14.1 The filter
+
+A `ConsumerFilter` holds an expression, a payload codec, a fault policy, the wire version `v`, and the `evaluator_version`. The expression composes `all`, `any`, and `not` over leaves:
+
+| Leaf | Meaning |
+| --- | --- |
+| `pred` | Compare a payload field with `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `in`, `contains`, or `prefix` against a typed literal |
+| `pred_as` | Compare after an explicit coercion: `number` (exact decimal) or `timestamp` in `rfc3339`, `epoch_seconds`, `epoch_millis`, or `epoch_micros` |
+| `present` / `absent` | The payload path exists or does not. An explicit `null` is present |
+| `header` | Compare one typed user header, keyed exactly |
+| `text` / `header_text` | Match text by equality, prefix, suffix, contains, glob, or regex, with explicit case handling |
+
+A field path separates keys with `.` and selects array elements with `[n]`, so `after.ground_stations[0]` reads the first station. A literal `.`, `[`, `]`, or `\` inside a key is escaped with `\`. There is one text form per path.
+
+Truth is three-valued. A missing field or a type mismatch is unknown, `not` keeps unknown, and an unknown root selects nothing. `eq null` matches a missing field and `ne null` does not. Integers that fit 64 bits compare exactly, and an integer meets a double only when the double is an exact integer. Strings compare by code point. A numeric string is not a number and an RFC 3339 string is not an instant unless the filter says so with `pred_as`. An RFC 3339 value needs an explicit zone.
+
+The codec is `json`, `cbor`, `avro`, `protobuf`, or `headers_only`. Avro and Protobuf require nonempty, sorted, unique `schema_refs` containing registered writer-schema IDs. Other codecs require an empty list. Each schema-first record selects its writer through the unsigned `agdx.sid` header. Schema resolution and compilation occur before scanning. Missing or unlisted writer IDs follow `foreign_policy`. An incompatible registered schema is a `schema_mismatch` decode fault when decoding is needed. Schema IDs are included in the policy digest.
+
+CBOR accepts definite-length values with unique text map keys, no tags, and finite numbers. Bytes become integer arrays. Avro logical annotations use physical values. Protobuf uses schema field names, numeric enums, integer arrays for bytes, and exact signed/unsigned 64-bit integers. Proto3 scalar fields without presence tracking decode at their schema default, including zero and false. Unset fields with explicit presence and empty repeated/map fields remain absent. Legacy Protobuf groups are rejected. Schema definitions are bounded to 1 MiB and schema JSON nesting to 64.
+
+A `headers_only` filter uses only header predicates, so the payload can be any format. Header predicates run before the payload is touched, and the payload is decoded at most once, only when the headers do not decide the record.
+
+A payload that does not decode (malformed, over the size limit, or nested too deep) is a fault, separate from truth. The fault policy decides: `stop` (the default) ends the page in front of the record and leaves it unacknowledged, `pass` delivers it marked unevaluated, and `drop` skips it.
+
+`foreign_policy` covers records with another content type or an absent or unlisted writer schema. `mismatch_policy` covers incompatible field types when the root remains unknown. Both default to `reject`, which skips the record, and accept `pass`, which delivers it unevaluated. A missing field alone is not a type mismatch. These policies remain separate from malformed-payload handling.
+
+Text patterns support `equals`, `prefix`, `suffix`, `contains`, `glob`, and `regex`. Globs match the whole string with `*`, `?`, and escaped characters. Regex uses the server's bounded Rust engine. Rust and Python can evaluate it locally. TypeScript can submit it to the server, but explicitly refuses regex in local evaluation and local guards. Case-insensitive regex uses Unicode folding. Other text matches lowercase both sides.
+
+The digest is SHA-256 over the domain tag `agdx.consumer-filter.v1\0` and the canonical JSON of the filter. Every semantic field is covered, so two filters share a digest exactly when their encodings are equal. The shared evaluator corpus covers verdicts and fault reasons, including exactly representable integers above 2^53. Caps: 8 KiB encoded, 128 nodes, depth 8, 16 path segments, 256-byte paths, 64 `in` items, 1 KiB string literals, and four compiled glob or regex predicates with 256 KiB per program.
+
+### A14.2 Filtered reads
+
+A `FilteredPollRequest` names the source stream and topic, one partition, an independent consumer or a consumer group, the filter, a start, a record count, a reply byte cap, and a read mode. The filter is `inline` (needs no catalog), a saved `revision`, or `bound` (the group's binding). The start is `next`, `first`, `last`, an `offset`, a `timestamp`, or `continue` with the previous page's continuation.
+
+The server scans in bounded rounds and returns a `FilteredPage`: the matching records, the executed policy (digest, and filter id and revision for a saved one), the source generation, `next_scan_offset`, `safe_ack_offset`, the partition frontier, examined and matched counts, and the stop reason. A page stops when it is `filled`, when a `budget` is spent, at the `end_of_visible` records, at a `fault`, or at an `oversized_record` that alone exceeds the reply cap. A page can hold no records and still advance the scan. Pages with unevaluated records include optional `evaluation_limits` for the effective payload-byte and depth bounds. A local guard re-evaluates those records and requires a fault under the applicable `pass` policy. A legacy server without bounds cannot support local verification of pass-through decode faults.
+
+The `primary` read mode reads from the partition primary through a data connection attached to the coordinator's consumer session. The data connection signs in on the node it dialed and never moves to the metadata leader. The owner proves the page came from the generation it names. `local` reads whatever replica the connection reaches and serves diagnostics only: a local page carries no `safe_ack_offset`, because a lagging replica can still hold records from before a committed purge, and its continuation carries the read mode, so it never resumes a primary read.
+
+A `FilteredAck` submits the page's `safe_ack_offset` through a Primary data connection. The adapter checks the delivered source generation and the native offset attachment at owner admission, and a store that waits in the owner queue keeps the history it was admitted under and is refused at promotion after a purge. Stores are monotone. A revoked partition can finish accepted work while the native offset fence permits it.
+
+A reader keeps at most 1024 unacknowledged record-bearing pages per partition by default, configurable in every SDK, and does not read that partition past the bound until it acknowledges, so read-ahead memory is bounded. A group reader joins over its own coordinator connection, so two readers are two members and a dropped reader leaves with its connection. A partition the group hands a reader after its build resumes after the group's stored offset, whatever start the reader was built with. A partition that fails, faults, or blocks waits one idle interval before it is read again, so the other partitions keep reading and a block clears once its record ages out. A `source_changed` or `conflict` restarts the partition from its stored offset once and reaches the caller.
+
+Group pages, continuations, and acknowledgments also carry the actual `group_id`. An old page cannot acknowledge a deleted and recreated same-name group. The SDK keeps reader-instance ownership locally and rejects a page from another reader. These fields are part of the version-1 contract.
+
+A preview judges stored records of one partition and explains each verdict. It joins no group and stores no offset. A sample test evaluates one supplied record. Validation compiles a filter and reports its digest.
+
+### A14.3 The catalog and group bindings
+
+The managed backend keeps saved filters. Each filter has a name, a description, a state (`active`, `archived`, or `dropped`), and immutable revisions. A mutation (`register`, `revise`, `describe`, `set_revision_enabled`, `archive`, `drop`, `bind`, `unbind`) carries a caller-chosen `operation_id`. The catalog applies mutations in control-log order, authorizes each again against the catalog at that point of the log, and records each outcome, so a retry under the same id returns the first outcome. In JSON the `operation_id` is decimal text. Lists page newest first, and `before_id` pages stably while the catalog changes. The reply is `applied`, `rejected` with a typed error, or `pending` when the outcome is not recorded yet, and the operation id reads it later.
+
+A binding pins a consumer group to one revision. The streaming server stamps the group's identity from its own metadata (stream and topic ids and creation times, and the group id), so a recreated group with the same name never inherits a binding. Every filtered read of a bound group runs the bound revision, and a reader that brings a filter with another digest is refused with `conflict`. A bound filter cannot be dropped. Revisions, ids, and names are never reused.
+
+For cleanup, Rust and Python expose `unbind_binding(binding)` and TypeScript exposes `unbindBinding(binding)`. These methods send the returned binding's exact identity and digest. They can release a stale binding after its group has been deleted or recreated without releasing the replacement group. The name-based `unbind` resolves the current group and falls back to stored names after deletion. Use the exact binding form for unambiguous cleanup of historical groups. Releasing a binding does not erase its historical policy restriction.
+
+Catalog access uses the `filter` feature: `read` browses, `write` registers, revises, and describes, `delete` archives and drops, `admin` binds, unbinds, and enables or disables a revision. Filtered reads need only the ordinary Iggy permission to poll the source.
+
+### A14.4 Errors
+
+Every failure is a typed `FilterError` with a shared `ResultCode` (A7) and a reason: `invalid_request`, `unsupported`, `version_skew`, `not_found`, `conflict`, `source_changed`, `membership_stale`, `not_primary`, `catalog_unavailable`, `too_large`, `unauthenticated`, `forbidden`, `unavailable`, `revision_disabled`, `capacity_exhausted`, or `backend`. A reason a client does not know decodes as `unknown`, and its code still classifies it. A request of another filter op version answers `version_skew`. `not_primary` and `membership_stale` mean the reader must route again, and `source_changed` means the source history is gone.
+
+### A14.5 Catalog durability, identities, and reader checks
+
+Catalog outcome lookup is scoped to the originating user. Reusing an operation ID with different mutation content returns Conflict. The plane stores results durably, independently of the control topic's message retention and the bounded memory cache. There is no lifetime operation-count cap. The default cache limit is 256 results, and zero disables caching. The fold carries recent outcomes across batches up to the configured cache limit. A cache miss reads the durable outcome store. Concurrent mutation admission defaults to 32 per plane and 8 per caller, with retryable refusals until slots are released. Deployment configuration controls these settings and the catalog resource limits. The internal `FilterCatalogCommand.limits` records the definition, tombstone, revision, and group-identity limits used for each command. Older records without that field use the original defaults of 1024, 4096, 256, and 4096 respectively, so changing configuration does not reinterpret history. Zero disables a resource limit. Definitions, bindings, and operation results survive control-topic message expiry through the plane's database snapshots.
+
+Group consumers can be selected by name or numeric ID. `FilterConsumer::GroupId` serializes as `{ "kind": "group_id", "id": N }` and validates the native u32 offset-key range. Numeric membership, routing, acknowledgments, and page identity all use that ID. A same-name replacement group cannot inherit it.
+
+A revision has an `enabled` flag, defaulting to true when absent in older state. `SetRevisionEnabled` requires scoped filter administration and leaves executable content and digest unchanged. A disabled revision refuses new production policy resolution with `revision_disabled`, mapped to retryable Unavailable. Internal `ResolveFilterPolicy.allow_disabled` permits already-delivered acknowledgments and diagnostic previews. Ordinary clients cannot invoke that internal resolver. A/B variants use independent native groups bound to their chosen revisions, because one native group's shared offsets cannot safely carry different policies.
+
+
+Response validation always checks request identity, policy, source generation, mode, counts, and scan boundaries. The optional local guard adds payload re-evaluation. After membership loss, readers rejoin from committed progress and invalidate old page handles. Acknowledgment routing uses the native offset-routing operation so revoked partitions can drain without being pollable.
 
 # Part B. Bindings
 
@@ -919,6 +997,10 @@ The Iggy binding maps each registered operation to a `u32` command code. Origina
 | `fork.create` / `delete` / `promote` / `list` / `put` | 1_000_400 .. 1_000_404 |
 | `graph.query` / `upsert` / `neighbors` | 1_000_600 .. 1_000_602 |
 | `agent.submit` / `cancel` / `status` / `list` | 1_000_700 .. 1_000_703 |
+| `filter.poll` / `ack` / `preview` / `test` / `validate` (served by the streaming server itself) | 1_000_800 .. 1_000_804 |
+| `filter.mutate` / `get` / `list` / `list_revisions` / `get_binding` / `list_bindings` / `operation` | 1_000_810 .. 1_000_816 |
+| `filter.resolve_policy` (internal: the streaming server resolves a read's policy, never client-facing) | 1_000_817 |
+| `filter.watch_catalog` (internal: the streaming server watches the plane's catalog version, never client-facing) | 1_000_818 |
 
 Authorization and system management use the first management block, `+100`, after internal and discovery commands. Feature blocks follow it. The base value of one million avoids collisions with ordinary Iggy codes. Blocks are 100 codes wide. These fixed numbers belong to this binding and its reference tests.
 
@@ -926,7 +1008,7 @@ The server forwards CBOR requests to `laser-plane` through a local Unix socket. 
 
 Socket frames use `[len: u32 little-endian][named-field CBOR payload]` and a 64 MiB limit. `laser-plane` dispatches queries, registry reads, KV, forks, graphs, runs, and batches. Its projectors and state readers maintain models from the durable Iggy logs. Forwarded commands operate on those models.
 
-Managed access uses grants independently of ordinary Apache Iggy permissions. A grant has the form `effect feature:action [on resource-pattern]`. A matching deny takes precedence over allow. Features include `kv`, `memory`, `projection`, `graph`, `query`, `fork`, `agent`, `workflow`, `authz`, `kv_lease`, and `kv_fence`. Actions are the closed set `read`, `write`, `delete`, and `admin`. New capability meanings belong to features rather than new actions.
+Managed access uses grants independently of ordinary Apache Iggy permissions. A grant has the form `effect feature:action [on resource-pattern]`. A matching deny takes precedence over allow. Features include `kv`, `memory`, `projection`, `graph`, `query`, `fork`, `agent`, `workflow`, `authz`, `kv_lease`, `kv_fence`, and `filter`. Actions are the closed set `read`, `write`, `delete`, and `admin`. New capability meanings belong to features rather than new actions.
 
 Resource patterns are `all`, `literal`, or `prefix`. Only `all` matches a request without a keyed resource. Literal and prefix grants require a concrete resource and cannot authorize an entire list implicitly. `kv.lease`, `lease_renew`, and `release` require `kv_lease:admin` on the coordination namespace. Fenced CAS requires `kv:write` on the target and `kv_fence:read` on the coordination namespace.
 
@@ -998,6 +1080,10 @@ The HTTP binding maps managed operations to REST routes for browser and WebAssem
 | `graph.query` / `neighbors` | `POST /graph/{name}/query` (a `GraphQuery` JSON body) / `GET /graph/{name}/neighbors/{node}?dir=&edge_type=&depth=&limit=&as_of=&conversation=` |
 | `agent.list` / `submit` / `status` / `cancel` | `GET /runs?agent_id=&state=&limit=&cursor=` (a `RunPageView` page, cursor base64url) / `POST /runs` (a JSON `AgentSubmit` body) / `GET /runs/{id}` / `POST /runs/{id}/cancel` (cancel records the intent and returns the run) |
 | `registry.list_graphs` / `get` / register / drop graph projection | `GET /graphs?topic=&name_contains=&id_prefix=&search=` / `GET /graphs/{id}` / `POST /graphs` / `DELETE /graphs/{id}` (the projection listing narrowed to graph-kind projections, register and drop riding the control envelope) |
+| `filter.list` / `get` / `list_revisions` | `GET /filters?name_contains=&state=&before_id=&page=&page_size=` / `GET /filters/{id}` / `GET /filters/{id}/revisions?page=&page_size=` |
+| `filter.mutate` / `operation` | `POST /filters/mutations` (a `FilterMutationRequest` body with the `operation_id` as decimal text, `200` when applied, `202` while pending, the typed error status when rejected) / `GET /filters/operations/{operation_id}` |
+| `filter.validate` / `test` / `preview` | `POST /filters/validate` / `POST /filters/test` / `POST /filters/preview` (a preview stores no offset and joins no group) |
+| `filter.list_bindings` / `get_binding` | `GET /filter-bindings?filter_id=&stream=&topic=&page=&page_size=` / `GET /filter-bindings/{stream}/{topic}/{group}` |
 | `authz.whoami` / `list_roles` / `get_role` / define / delete role / `get_bindings` / bind roles | `GET /authz/whoami` / `GET /authz/roles` / `GET /authz/roles/{name}` / `PUT /authz/roles/{name}` / `DELETE /authz/roles/{name}` / `GET /authz/users/{id}/roles` / `PUT /authz/users/{id}/roles` (gated by the `authz` capability, B1.4. `whoami` reads the caller's own bound roles and effective grants, `list_roles` a JSON array of `Role` and `get_role` one `Role` or `404`. A role `PUT`/`DELETE` and a user bind (`PUT` a bare JSON array of role names) journal to the server-side authorization band, the reads forward like any managed read.) |
 
 `RegisterGraph` and `DropGraph` update graph projections through the control topic (A11.2). Row and graph projections share one registry. `/graphs` lists graph projections, and `/projections` lists row projections. An ID route returns `404` for the other kind. Both list routes use `list_projections` and filter by kind.

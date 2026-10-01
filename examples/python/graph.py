@@ -61,7 +61,7 @@ async def main() -> None:
         for node in purchases["nodes"]:
             print(f"    {entity_of(node)}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-use laser_examples::{PARTITIONS, init_tracing, laser, phase, release_after, stream_for};
+use laser_examples::{PARTITIONS, fresh_run, init_tracing, laser, phase, stream_for};
 use laser_sdk::prelude::full::*;
 
 // The Memory primitive: remember, recall, improve, forget. This file is
@@ -13,7 +13,7 @@ const FACT: &str = "Prefers aisle seats, travels monthly";
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("recall"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("recall"), async {
+    fresh_run(&laser, &stream_for("recall"), async {
         // Memory records ride the well-known agent topics, created once here.
         laser.bootstrap(PARTITIONS).await?;
         let conversation = ConversationId::new();

@@ -27,6 +27,7 @@ The contract includes binary managed commands, JSON HTTP views, headers, topics,
 - `query` owns query targets, DSL, typed parameters, paging, execution status and cancellation, positional typed results, execution evidence, and errors.
 - `control` and `browse` own projection, binding, writer-schema, and registry contracts.
 - `kv`, `fork`, `graph`, `batch`, `runs`, and `authz` own their managed surfaces.
+- `filter` owns consumer filters: `ConsumerFilter` and `FilterExpr` builders with record policies (`expr`), field paths, text matching, coercions, the filtered poll, acknowledgment, preview, and test types with their reason codes (`read`), the saved-filter catalog (`catalog`), the typed header dictionary (`headers`), the codec decoders (`codecs`), and the evaluator (`eval`, feature `filter-eval`). `wire/fixtures/filter_eval_cases.json`, `wire/fixtures/filter_codec_cases.json`, and `wire/tests/filter_eval_corpus.rs` are the cross-language corpus every evaluator must reproduce.
 - `agent`, `change`, `keys`, `mutation`, and `forward` own AGDX envelopes, change notifications, managed key records, mutation identity, and forwarded commands.
 - `headers`, `topics`, `content`, `limits`, and `result` own permanent dictionaries and shared result classification.
 - `http` owns `/agdx/*` routes, parameters, JSON views, and `ErrorBody`.

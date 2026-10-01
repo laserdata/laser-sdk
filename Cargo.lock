@@ -2028,11 +2028,13 @@ dependencies = [
 
 [[package]]
 name = "laser-examples"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
+ "ciborium",
  "futures",
  "laser-sdk",
+ "prost",
  "reqwest",
  "serde",
  "serde_json",
@@ -2044,7 +2046,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2056,6 +2058,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "iggy",
+ "iggy_binary_protocol",
  "iggy_common",
  "json-patch",
  "jsonschema",
@@ -2064,6 +2067,7 @@ dependencies = [
  "prost",
  "prost-reflect",
  "protox",
+ "secrecy",
  "serde",
  "serde_json",
  "serial_test",
@@ -2079,11 +2083,16 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
+ "apache-avro",
  "bon",
  "bson",
  "ciborium",
+ "memchr",
+ "ouroboros",
+ "prost-reflect",
+ "regex",
  "rmp-serde",
  "serde",
  "serde_json",

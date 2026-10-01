@@ -77,6 +77,21 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_AGENT_CANCEL_CODE, 1_000_701);
     assert_eq!(AGDX_AGENT_STATUS_CODE, 1_000_702);
     assert_eq!(AGDX_AGENT_LIST_CODE, 1_000_703);
+    assert_eq!(AGDX_DELIVERY_BASE, 1_000_800);
+    assert_eq!(AGDX_FILTERED_POLL_CODE, 1_000_800);
+    assert_eq!(AGDX_FILTERED_ACK_CODE, 1_000_801);
+    assert_eq!(AGDX_FILTER_PREVIEW_CODE, 1_000_802);
+    assert_eq!(AGDX_FILTER_TEST_CODE, 1_000_803);
+    assert_eq!(AGDX_FILTER_VALIDATE_CODE, 1_000_804);
+    assert_eq!(AGDX_FILTER_MUTATE_CODE, 1_000_810);
+    assert_eq!(AGDX_GET_FILTER_CODE, 1_000_811);
+    assert_eq!(AGDX_LIST_FILTERS_CODE, 1_000_812);
+    assert_eq!(AGDX_LIST_FILTER_REVISIONS_CODE, 1_000_813);
+    assert_eq!(AGDX_GET_FILTER_BINDING_CODE, 1_000_814);
+    assert_eq!(AGDX_LIST_FILTER_BINDINGS_CODE, 1_000_815);
+    assert_eq!(AGDX_FILTER_OPERATION_CODE, 1_000_816);
+    assert_eq!(AGDX_RESOLVE_FILTER_POLICY_CODE, 1_000_817);
+    assert_eq!(AGDX_WATCH_FILTER_CATALOG_CODE, 1_000_818);
 }
 
 #[test]
@@ -96,6 +111,8 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(CHECKPOINT_OP_VERSION, 1);
     assert_eq!(DESTINATION_HTTP_OP_VERSION, 1);
     assert_eq!(PRESENCE_OP_VERSION, 1);
+    assert_eq!(FILTER_OP_VERSION, 1);
+    assert_eq!(laser_wire::filter::FILTER_EVALUATOR_VERSION, 1);
 }
 
 #[test]
@@ -114,6 +131,7 @@ fn given_capability_feature_bits_when_compared_then_should_match_the_dictionary(
     assert_eq!(feature::AUTHZ, 1 << 7);
     assert_eq!(feature::DESTINATIONS, 1 << 8);
     assert_eq!(feature::KV_FENCED_LEASES, 1 << 9);
+    assert_eq!(feature::CONSUMER_FILTERS, 1 << 10);
 }
 
 #[test]
@@ -181,6 +199,24 @@ fn given_topic_names_when_compared_then_should_match_the_dictionary() {
 
 #[test]
 fn given_limits_when_compared_then_should_match_the_pinned_values() {
+    assert_eq!(limits::MAX_FILTER_BYTES, 8192);
+    assert_eq!(limits::MAX_FILTER_NODES, 128);
+    assert_eq!(limits::MAX_FILTER_DEPTH, 8);
+    assert_eq!(limits::MAX_FILTER_PATH_SEGMENTS, 16);
+    assert_eq!(limits::MAX_FILTER_PATH_BYTES, 256);
+    assert_eq!(limits::MAX_FILTER_LIST_ITEMS, 64);
+    assert_eq!(limits::MAX_FILTER_STRING_BYTES, 1024);
+    assert_eq!(limits::MAX_FILTER_NAME_BYTES, 128);
+    assert_eq!(limits::MAX_FILTER_DESCRIPTION_BYTES, 1024);
+    assert_eq!(limits::MAX_FILTER_SOURCE_NAME_BYTES, 255);
+    assert_eq!(limits::MAX_FILTERED_PAGE_RECORDS, 1000);
+    assert_eq!(limits::MAX_FILTERED_PAGE_BYTES, 8_388_608);
+    assert_eq!(limits::MAX_FILTER_PREVIEW_EXAMINED, 10_000);
+    assert_eq!(limits::MAX_FILTER_PREVIEW_RECORDS, 100);
+    assert_eq!(limits::MAX_FILTER_PREVIEW_PAYLOAD_BYTES, 4096);
+    assert_eq!(limits::MAX_FILTER_SAMPLE_BYTES, 1_048_576);
+    assert_eq!(limits::MAX_FILTER_SAMPLE_HEADERS, 64);
+    assert_eq!(limits::MAX_FILTER_CATALOG_PAGE, 200);
     assert_eq!(limits::MAX_PAGE_SIZE, 1000);
     assert_eq!(limits::DEFAULT_STREAM_PAGE_SIZE, 100);
     assert_eq!(limits::MAX_INDEX_ENTRIES_PER_RECORD, 32);

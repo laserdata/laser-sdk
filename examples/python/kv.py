@@ -114,7 +114,7 @@ async def main() -> None:
             applied = await fork.promote()
             print(f"  fork '{FORK_ID}' promoted, {applied} row(s) applied")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

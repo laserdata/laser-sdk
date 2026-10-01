@@ -7,6 +7,7 @@ import {
   HeaderValue as IggyHeaderValueFactory,
   Partitioning,
   PollingStrategy as IggyPollingStrategy,
+  ResponseError,
   SimpleClient,
   getRawClient
 } from "apache-iggy"
@@ -22,8 +23,10 @@ import { isIP } from "node:net"
 import {
   AmbiguousMutationError,
   ConfigError,
+  ProtocolError,
   TimeoutError,
-  TransportError
+  TransportError,
+  UnsupportedError
 } from "../client/errors.js"
 import { LASERDATA_ROOT_CA } from "../client/laserdata-ca.js"
 import type { PollingStrategy } from "../stream/polling-strategy.js"
@@ -40,7 +43,15 @@ export interface PolledMessage {
   readonly offset: bigint
   readonly timestampMicros?: bigint
   readonly headers: ReadonlyMap<string, IggyHeaderValue>
+  /**
+   * Why the header block did not decode, when it did not: its structure, the
+   * `agdx.ct` entry, or another entry. A valid content type can remain available.
+   */
+  readonly headersMalformed?: HeaderFault
 }
+
+/** The part of a user-header block that did not decode. */
+export type HeaderFault = "structure" | "content_type" | "entry"
 
 export type IggyClient = SimpleClient
 export type ClientOwnership = "owned" | "borrowed"
@@ -52,6 +63,12 @@ const LOGIN_STAGE = "Iggy login reply"
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
 const TRANSIENT_NOT_COMMITTED = 57
 const TRANSIENT_NOT_ACCEPTED = 58
+const POLLED_HEAD_BYTES = 16
+const BATCH_HEADER_BYTES = 256
+const FRAME_HEADER_BYTES = 48
+const STRING_HEADER_KIND = 2
+const CONTENT_TYPE_HEADER = "agdx.ct"
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true })
 
 export function toNodeBuffer(bytes: Uint8Array): Buffer {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
@@ -80,9 +97,11 @@ export type IggyHeaderValue =
   | { readonly kind: "float"; readonly value: number }
   | { readonly kind: "double"; readonly value: number }
 
+const SYNC_CONSUMER_GROUP_CODE = 606
+
 export type ConsumerTarget =
   | { readonly kind: "single"; readonly partitionId: number; readonly name?: string }
-  | { readonly kind: "group"; readonly name: string }
+  | { readonly kind: "group"; readonly name: string; readonly partitionId?: number }
 
 export type ConsumerOffsetTarget =
   | { readonly kind: "group"; readonly name: string }
@@ -100,6 +119,7 @@ export interface LaserTransport {
   ensureStream(name: string): Promise<void>
   deleteStream(name: string): Promise<boolean>
   ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void>
+  ensureConsumerGroup(streamId: string, topicId: string, name: string): Promise<void>
   ensureTopicWithExpiry?(
     streamId: string,
     topicId: string,
@@ -161,8 +181,53 @@ export interface LaserTransport {
     partitionId: number
   ): Promise<{ readonly storedOffset: bigint; readonly currentOffset: bigint } | undefined>
   joinConsumerGroup(streamId: string, topicId: string, name: string): Promise<void>
-  leaveConsumerGroup(streamId: string, topicId: string, name: string): Promise<void>
+  syncConsumerGroup?(
+    streamId: string,
+    topicId: string,
+    name: string
+  ): Promise<
+    | {
+        readonly generation: bigint
+        readonly partitions: readonly number[]
+        readonly rejoined?: boolean
+      }
+    | undefined
+  >
+  leaveConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
+  /** Join an existing consumer group without creating it. */
+  joinExistingConsumerGroup?(
+    streamId: string,
+    topicId: string,
+    name: string | number
+  ): Promise<void>
+  /**
+   * An ordinary authenticated connection to another node of this deployment,
+   * with the same credentials and TLS settings. A node that reports an
+   * unspecified address is reached through the host this transport connected to.
+   */
+  openNodeConnection?(ip: string, port: number): Promise<NodeConnection>
+  /**
+   * A second authenticated connection to the node this transport reaches,
+   * which holds its own consumer-group memberships and never rejoins them on
+   * its own. A group reader joins through it, so every reader is its own
+   * member and a dropped reader leaves with its connection.
+   */
+  openCoordinator?(): Promise<CoordinatorConnection>
+  /** Whether this transport can open node and coordinator connections of its own. */
+  readonly connectsNodes?: boolean
   close(): Promise<void>
+}
+
+/** A connection to one node, owned by its opener. */
+export interface NodeConnection {
+  send(code: number, payload: Uint8Array): Promise<Uint8Array>
+  close(): Promise<void>
+}
+
+/** A dedicated coordinator connection, owned by its opener. */
+export interface CoordinatorConnection extends NodeConnection {
+  joinConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
+  leaveConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
 }
 
 function toIggyConsumer(target: ConsumerTarget) {
@@ -345,9 +410,175 @@ function parsedHeadersToMap(
   return map
 }
 
+/** The Iggy error code a server reply carried, through any transport wrapping. */
+export function serverErrorCode(error: unknown): number | undefined {
+  for (let current: unknown = error; current !== undefined;) {
+    if (current instanceof ResponseError) return current.errorCode
+    current = current instanceof Error ? current.cause : undefined
+  }
+  return undefined
+}
+
+/**
+ * The records of a standard polled-messages body, decoded exactly as stored:
+ * original offsets, per-record microsecond timestamps, payloads, and typed
+ * user headers.
+ */
+export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
+  const malformed = (what: string): ProtocolError =>
+    new ProtocolError(`the polled record body has a malformed ${what}`)
+  if (body.byteLength < POLLED_HEAD_BYTES) throw malformed("head")
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
+  const partitionId = view.getUint32(0, true)
+  const messages: PolledMessage[] = []
+  let position = POLLED_HEAD_BYTES
+  while (position < body.byteLength) {
+    if (position + BATCH_HEADER_BYTES > body.byteLength) throw malformed("batch header")
+    const baseOffset = view.getBigUint64(position + 8, true)
+    const baseTimestamp = view.getBigUint64(position + 16, true)
+    const batchLength = view.getBigUint64(position + 32, true)
+    if (
+      batchLength < BigInt(BATCH_HEADER_BYTES) ||
+      batchLength > BigInt(body.byteLength - position)
+    )
+      throw malformed("batch length")
+    const batchEnd = position + Number(batchLength)
+    position += BATCH_HEADER_BYTES
+    while (position < batchEnd) {
+      if (position + FRAME_HEADER_BYTES > batchEnd) throw malformed("message frame")
+      const offsetDelta = view.getUint32(position + 24, true)
+      const headersLength = view.getUint32(position + 32, true)
+      const payloadLength = view.getUint32(position + 36, true)
+      const payloadStart = position + FRAME_HEADER_BYTES
+      const headersStart = payloadStart + payloadLength
+      const frameEnd = headersStart + headersLength
+      if (frameEnd > batchEnd) throw malformed("message frame")
+      const block = body.subarray(headersStart, frameEnd)
+      const headers = decodeUserHeaders(block)
+      const contentType = headers === "entry" ? decodeUserHeaders(block, true) : headers
+      messages.push({
+        payload: body.subarray(payloadStart, headersStart),
+        partitionId,
+        offset: baseOffset + BigInt(offsetDelta),
+        timestampMicros: baseTimestamp,
+        ...(typeof headers === "string"
+          ? {
+              headers: typeof contentType === "string" ? new Map() : contentType,
+              headersMalformed: typeof contentType === "string" ? contentType : headers
+            }
+          : { headers })
+      })
+      position = frameEnd
+    }
+  }
+  return messages
+}
+
+// The typed user headers as the server reads them for a filter: string keys
+// only, a kind this build does not know kept raw, a value that does not fit
+// its kind faulting the record, and the last of a repeated key kept. A structurally broken
+// block names what did not decode, which the server treats as a malformed
+// record when its filter needs that part.
+function decodeUserHeaders(
+  block: Uint8Array,
+  contentTypeOnly = false
+): ReadonlyMap<string, IggyHeaderValue> | HeaderFault {
+  const headers = new Map<string, IggyHeaderValue>()
+  const view = new DataView(block.buffer, block.byteOffset, block.byteLength)
+  let position = 0
+  while (position < block.byteLength) {
+    if (position + 5 > block.byteLength) return "structure"
+    const keyKind = view.getUint8(position)
+    const keyStart = position + 5
+    const keyEnd = keyStart + view.getUint32(position + 1, true)
+    if (
+      keyKind === 0 ||
+      keyEnd === keyStart ||
+      keyEnd - keyStart > 255 ||
+      keyEnd + 5 > block.byteLength
+    )
+      return "structure"
+    const valueKind = view.getUint8(keyEnd)
+    const valueStart = keyEnd + 5
+    const valueEnd = valueStart + view.getUint32(keyEnd + 1, true)
+    if (
+      valueKind === 0 ||
+      valueEnd === valueStart ||
+      valueEnd - valueStart > 255 ||
+      valueEnd > block.byteLength
+    )
+      return "structure"
+    position = valueEnd
+    if (keyKind !== STRING_HEADER_KIND) continue
+    if (
+      contentTypeOnly &&
+      (keyEnd - keyStart !== CONTENT_TYPE_HEADER.length ||
+        CONTENT_TYPE_HEADER.split("").some(
+          (character, index) => block[keyStart + index] !== character.charCodeAt(0)
+        ))
+    )
+      continue
+    let key: string
+    try {
+      key = STRICT_UTF8.decode(block.subarray(keyStart, keyEnd))
+    } catch {
+      return "entry"
+    }
+    const value = headerValueOf(valueKind, block.subarray(valueStart, valueEnd))
+    if (value === undefined) return key === CONTENT_TYPE_HEADER ? "content_type" : "entry"
+    headers.set(key, value)
+  }
+  return headers
+}
+
+function headerValueOf(kind: number, bytes: Uint8Array): IggyHeaderValue | undefined {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const sized = (size: number): boolean => bytes.byteLength === size
+  switch (kind) {
+    case STRING_HEADER_KIND:
+      try {
+        return { kind: "string", value: STRICT_UTF8.decode(bytes) }
+      } catch {
+        return undefined
+      }
+    case 3:
+      return sized(1) && (bytes[0] === 0 || bytes[0] === 1)
+        ? { kind: "bool", value: bytes[0] === 1 }
+        : undefined
+    case 4:
+      return sized(1) ? { kind: "int8", value: view.getInt8(0) } : undefined
+    case 5:
+      return sized(2) ? { kind: "int16", value: view.getInt16(0, true) } : undefined
+    case 6:
+      return sized(4) ? { kind: "int32", value: view.getInt32(0, true) } : undefined
+    case 7:
+      return sized(8) ? { kind: "int64", value: view.getBigInt64(0, true) } : undefined
+    case 8:
+      return sized(16) ? { kind: "int128", value: bytes.slice() } : undefined
+    case 9:
+      return sized(1) ? { kind: "uint8", value: view.getUint8(0) } : undefined
+    case 10:
+      return sized(2) ? { kind: "uint16", value: view.getUint16(0, true) } : undefined
+    case 11:
+      return sized(4) ? { kind: "uint32", value: view.getUint32(0, true) } : undefined
+    case 12:
+      return sized(8) ? { kind: "uint64", value: view.getBigUint64(0, true) } : undefined
+    case 13:
+      return sized(16) ? { kind: "uint128", value: bytes.slice() } : undefined
+    case 14:
+      return sized(4) ? { kind: "float", value: view.getFloat32(0, true) } : undefined
+    case 15:
+      return sized(8) ? { kind: "double", value: view.getFloat64(0, true) } : undefined
+    default:
+      return { kind: "raw", value: bytes.slice() }
+  }
+}
+
 interface ParsedConnectionString {
   readonly host: string
   readonly port: number
+  /** The TLS name to verify, when it differs from `host`. */
+  readonly servername?: string
   readonly credentials: ClientCredentials
   readonly tls: boolean
   readonly ca?: string
@@ -498,7 +729,8 @@ export function watchConnectionLoss(connection: ClientConnectionEvents, onLost: 
 
 async function connectSimpleClient(
   parsed: ParsedConnectionString,
-  deadline?: number
+  deadline?: number,
+  pinned = false
 ): Promise<ConnectedClient> {
   const config: ClientConfig = parsed.tls
     ? {
@@ -507,7 +739,11 @@ async function connectSimpleClient(
         options: {
           port: parsed.port,
           host: parsed.host,
-          ...(isIP(parsed.host) === 0 ? { servername: parsed.host } : {}),
+          ...(parsed.servername !== undefined
+            ? { servername: parsed.servername }
+            : isIP(parsed.host) === 0
+              ? { servername: parsed.host }
+              : {}),
           ...(parsed.ca !== undefined ? { ca: parsed.ca } : {})
         },
         credentials: parsed.credentials,
@@ -529,7 +765,7 @@ async function connectSimpleClient(
   }
   try {
     const connection = (raw as RawClient & RawClientConnection).connection
-    const client = new SimpleClient(raw)
+    const client = pinned ? pinnedClient(raw, deadline) : new SimpleClient(raw)
     // The client emits `connect` only once the transport, TLS included, is up, so it
     // separates a server that never accepts the socket from one that never answers login.
     let accepted = false
@@ -542,7 +778,16 @@ async function connectSimpleClient(
         reject(cause instanceof Error ? cause : new Error(String(cause)))
       }
       connection.once("error", failed)
-      client.client.getMe().then(() => {
+      const login = async (): Promise<void> => {
+        if (pinned) {
+          const connection = (raw as RawClient & PinnedRawClient).connection
+          await connection.connect(true)
+          if ("token" in parsed.credentials) await client.session.loginWithToken(parsed.credentials)
+          else await client.session.login(parsed.credentials)
+        }
+        await client.client.getMe()
+      }
+      login().then(() => {
         connection.off("error", failed)
         resolve()
       }, reject)
@@ -571,11 +816,65 @@ async function connectSimpleClient(
     return { client, raw }
   } catch (cause) {
     raw.destroy()
-    if (cause instanceof TimeoutError) throw cause
+    if (cause instanceof TimeoutError || cause instanceof UnsupportedError) throw cause
     throw new TransportError(`failed to connect to ${parsed.host}:${String(parsed.port)}`, true, {
       cause
     })
   }
+}
+
+interface PinnedRawClient {
+  readonly connection: ClientConnectionEvents & { connect(boundDial?: boolean): Promise<unknown> }
+  readonly _queueCommand?: (
+    code: number,
+    payload: Buffer,
+    handleResponse: boolean,
+    last: boolean,
+    followsLeaderMoves: boolean,
+    deadline: number
+  ) => ReturnType<RawClient["sendCommand"]>
+}
+
+// Use the same request queue the Apache Iggy SDK uses for its native partition
+// data connections. This bypasses coordinator login settlement on this connection.
+function pinnedClient(raw: RawClient, loginDeadline: number | undefined): SimpleClient {
+  const data = raw as RawClient & PinnedRawClient
+  const queue = data._queueCommand
+  if (typeof queue !== "function")
+    throw new UnsupportedError(
+      "this Apache Iggy SDK does not expose the partition data request queue required by filtered Primary reads"
+    )
+  const facade: RawClient = {
+    sendCommand(code, payload, options) {
+      return queue.call(
+        data,
+        code,
+        payload,
+        options?.handleResponse ?? true,
+        options?.last ?? true,
+        false,
+        options?.deadline ??
+          (raw.isAuthenticated
+            ? Date.now() + connectOptions().timeoutMs
+            : (loginDeadline ?? Date.now() + connectOptions().timeoutMs))
+      )
+    },
+    get isAuthenticated() {
+      return raw.isAuthenticated
+    },
+    authenticate: (credentials) => raw.authenticate(credentials),
+    destroy: () => {
+      raw.destroy()
+    },
+    on: (event, callback) => {
+      raw.on(event, callback)
+    },
+    once: (event, callback) => {
+      raw.once(event, callback)
+    },
+    getReadStream: () => raw.getReadStream()
+  }
+  return new SimpleClient(facade)
 }
 
 function serverResponseError(error: unknown): Error | undefined {
@@ -639,9 +938,16 @@ export class ApacheIggyTransport implements LaserTransport {
   private readonly reconnectLock = new Mutex()
   private readonly publishLane = new Mutex()
   private readonly disconnected = new WeakSet<SimpleClient>()
+  // Groups this transport rejoins after a reconnect. Setup helpers allow
+  // recreation, while joining an existing group keeps `create: false`.
   private readonly consumerGroups = new Map<
     string,
-    { readonly streamId: string; readonly topicId: string; readonly name: string }
+    {
+      readonly streamId: string
+      readonly topicId: string
+      readonly name: string | number
+      readonly create: boolean
+    }
   >()
   private readonly partitionCounts = new Map<string, number>()
   private readonly balancedCursors = new Map<string, number>()
@@ -656,6 +962,10 @@ export class ApacheIggyTransport implements LaserTransport {
 
   get iggyClient(): SimpleClient {
     return this.client
+  }
+
+  get connectsNodes(): boolean {
+    return this.connection !== undefined
   }
 
   static async connect(
@@ -697,7 +1007,11 @@ export class ApacheIggyTransport implements LaserTransport {
     const stale = this.client
     if (this.disconnected.has(stale)) {
       await this.reconnect(stale)
-      return operation(this.client)
+      try {
+        return await operation(this.client)
+      } catch (cause) {
+        throw new TransportError(message, serverResponseError(cause) === undefined, { cause })
+      }
     }
     try {
       return await operation(stale)
@@ -750,12 +1064,24 @@ export class ApacheIggyTransport implements LaserTransport {
             throw new TimeoutError("Iggy publish reconnect")
           const connected = await connectSimpleClient(this.connection, deadline)
           try {
-            for (const group of this.consumerGroups.values()) {
-              const join = connected.client.group.ensureAndJoin(
-                group.streamId,
-                group.topicId,
-                group.name
-              )
+            for (const [key, group] of [...this.consumerGroups]) {
+              const join: Promise<unknown> =
+                group.create && typeof group.name === "string"
+                  ? connected.client.group.ensureAndJoin(group.streamId, group.topicId, group.name)
+                  : connected.client.group
+                      .join({
+                        streamId: group.streamId,
+                        topicId: group.topicId,
+                        groupId: group.name
+                      })
+                      .then(
+                        () => undefined,
+                        // A deleted group is not recreated: its member finds out
+                        // on its next assignment read.
+                        () => {
+                          this.consumerGroups.delete(key)
+                        }
+                      )
               await (deadline === undefined
                 ? join
                 : publishWithin(join, Math.max(1, deadline - Date.now())))
@@ -852,6 +1178,13 @@ export class ApacheIggyTransport implements LaserTransport {
       for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key)
     }
     return deleted
+  }
+
+  async ensureConsumerGroup(streamId: string, topicId: string, name: string): Promise<void> {
+    await this.execute(
+      (client) => client.group.ensure(streamId, topicId, name),
+      `failed to ensure consumer group \`${name}\``
+    )
   }
 
   async ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void> {
@@ -1100,7 +1433,7 @@ export class ApacheIggyTransport implements LaserTransport {
         client.message.poll({
           streamId,
           topicId,
-          partitionId: target.kind === "single" ? target.partitionId : null,
+          partitionId: target.partitionId ?? null,
           consumer: toIggyConsumer(target),
           pollingStrategy: toIggyPollingStrategy(strategy),
           count,
@@ -1167,15 +1500,168 @@ export class ApacheIggyTransport implements LaserTransport {
       (client) => client.group.ensureAndJoin(streamId, topicId, name),
       `failed to join consumer group \`${name}\``
     )
-    this.consumerGroups.set(`${streamId}\0${topicId}\0${name}`, { streamId, topicId, name })
+    this.consumerGroups.set(`${streamId}\0${topicId}\0${name}`, {
+      streamId,
+      topicId,
+      name,
+      create: true
+    })
   }
 
-  async leaveConsumerGroup(streamId: string, topicId: string, name: string): Promise<void> {
+  async syncConsumerGroup(
+    streamId: string,
+    topicId: string,
+    name: string
+  ): Promise<
+    | {
+        readonly generation: bigint
+        readonly partitions: readonly number[]
+        readonly rejoined?: boolean
+      }
+    | undefined
+  > {
+    const identifiers = [streamId, topicId, name].map((value) => new TextEncoder().encode(value))
+    if (identifiers.some((value) => value.byteLength === 0 || value.byteLength > 255))
+      throw new ConfigError("consumer group identifiers must contain 1 to 255 UTF-8 bytes")
+    const payload = new Uint8Array(
+      identifiers.reduce((size, value) => size + 2 + value.byteLength, 0)
+    )
+    let offset = 0
+    for (const value of identifiers) {
+      payload.set([2, value.byteLength], offset)
+      payload.set(value, offset + 2)
+      offset += value.byteLength + 2
+    }
+    let reply = await this.sendManaged(SYNC_CONSUMER_GROUP_CODE, payload, {
+      retryAfterReconnect: true
+    })
+    let rejoined = false
+    if (reply.byteLength === 0) {
+      await this.joinConsumerGroup(streamId, topicId, name)
+      rejoined = true
+      reply = await this.sendManaged(SYNC_CONSUMER_GROUP_CODE, payload, {
+        retryAfterReconnect: true
+      })
+      if (reply.byteLength === 0) return undefined
+    }
+    if (reply.byteLength < 12) throw new ProtocolError("the consumer group assignment is truncated")
+    const view = new DataView(reply.buffer, reply.byteOffset, reply.byteLength)
+    const count = view.getUint32(8, true)
+    if (reply.byteLength !== 12 + count * 4)
+      throw new ProtocolError("the consumer group assignment length is invalid")
+    return {
+      generation: view.getBigUint64(0, true),
+      rejoined,
+      partitions: Array.from({ length: count }, (_, index) => view.getUint32(12 + index * 4, true))
+    }
+  }
+
+  async leaveConsumerGroup(
+    streamId: string,
+    topicId: string,
+    name: string | number
+  ): Promise<void> {
     await this.execute(
       (client) => client.group.leave({ streamId, topicId, groupId: name }),
-      `failed to leave consumer group \`${name}\``
+      `failed to leave consumer group \`${String(name)}\``
     )
-    this.consumerGroups.delete(`${streamId}\0${topicId}\0${name}`)
+    this.consumerGroups.delete(`${streamId}\0${topicId}\0${String(name)}`)
+  }
+
+  async joinExistingConsumerGroup(
+    streamId: string,
+    topicId: string,
+    name: string | number
+  ): Promise<void> {
+    await this.execute(
+      (client) => client.group.join({ streamId, topicId, groupId: name }),
+      `failed to join consumer group \`${String(name)}\``
+    )
+    this.consumerGroups.set(`${streamId}\0${topicId}\0${String(name)}`, {
+      streamId,
+      topicId,
+      name,
+      create: false
+    })
+  }
+
+  async openNodeConnection(ip: string, port: number): Promise<NodeConnection> {
+    if (this.connection === undefined) {
+      throw new ConfigError(
+        "a node connection needs a Laser connected from a connection string, not an injected client"
+      )
+    }
+    const unspecified = ip.length === 0 || ip === "0.0.0.0" || ip === "::" || ip === "[::]"
+    const host = unspecified ? this.connection.host : ip
+    const connected = await connectSimpleClient(
+      {
+        ...this.connection,
+        host,
+        port,
+        ...(isIP(this.connection.host) === 0 ? { servername: this.connection.host } : {})
+      },
+      Date.now() + connectOptions().timeoutMs,
+      true
+    )
+    const client = connected.client
+    return {
+      async send(code: number, payload: Uint8Array): Promise<Uint8Array> {
+        const reply = await client.sendBinaryRequest(code, toNodeBuffer(payload))
+        return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
+      },
+      async close(): Promise<void> {
+        await client.destroy().catch(() => undefined)
+      }
+    }
+  }
+
+  async openCoordinator(): Promise<CoordinatorConnection> {
+    if (this.connection === undefined) {
+      throw new ConfigError(
+        "a coordinator connection needs a Laser connected from a connection string, not an injected client"
+      )
+    }
+    const connected = await connectSimpleClient(
+      this.connection,
+      Date.now() + connectOptions().timeoutMs
+    )
+    const coordinator = new ApacheIggyTransport(
+      connected.client,
+      this.connection,
+      "owned",
+      this.publishConfig
+    )
+    coordinator.watch(connected)
+    return {
+      async send(code: number, payload: Uint8Array): Promise<Uint8Array> {
+        const reply = await coordinator.execute(
+          (client) => client.sendBinaryRequest(code, toNodeBuffer(payload)),
+          `coordinator command ${String(code)} failed`
+        )
+        return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
+      },
+      async joinConsumerGroup(
+        streamId: string,
+        topicId: string,
+        name: string | number
+      ): Promise<void> {
+        await coordinator.execute(
+          (client) => client.group.join({ streamId, topicId, groupId: name }),
+          `failed to join consumer group \`${String(name)}\``
+        )
+      },
+      async leaveConsumerGroup(
+        streamId: string,
+        topicId: string,
+        name: string | number
+      ): Promise<void> {
+        await coordinator.execute(
+          (client) => client.group.leave({ streamId, topicId, groupId: name }),
+          `failed to leave consumer group \`${String(name)}\``
+        )
+      },
+      close: () => coordinator.close()
+    }
   }
 
   async close(): Promise<void> {

@@ -4,6 +4,8 @@ The Rust examples share one connection helper. They run against Apache Iggy, Las
 
 Run the commands below from this directory (`examples/rust/`).
 
+**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
 ## Run locally
 
 Start Apache Iggy, then run an example.
@@ -67,11 +69,11 @@ Data-publishing examples also share four volume knobs, so the same binary runs a
 | `LASER_CONCURRENCY` | parallel publishers (where the example fans out) |
 | `LASER_PAYLOAD_BYTES` | approximate body size (where the example pads bodies) |
 
-Each run uses `laser-<example>-<token>` unless `LASER_STREAM` supplies a name. Managed indexes use the same run token. This keeps concurrent examples separate. Reuse an explicit stream only when shared history is intended. Every example deletes its per-run stream when it finishes, including after an error, so repeated runs do not pile up topics and partitions on the server. A stream supplied through `LASER_STREAM` is kept.
+Each example uses `laser-<example>-rust` unless `LASER_STREAM` supplies a name, so different examples never share agent topics or offsets. Managed indexes carry a per-run token so a rerun counts only its own rows. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. A stream supplied through `LASER_STREAM` is never deleted.
 
 ## Primitives - start here
 
-Eight focused examples cover the core data and agent primitives. Unsupported managed phases report the missing capability and exit cleanly.
+Nine focused examples cover the core data and agent primitives. Unsupported managed phases report the missing capability and exit cleanly.
 
 | binary | primitive | shows | run | docs |
 | --- | --- | --- | --- | --- |
@@ -79,6 +81,7 @@ Eight focused examples cover the core data and agent primitives. Unsupported man
 | [`query`](src/query/README.md) | Views | declare a view over a topic, then query the materialized rows (managed) | `cargo run --example query` | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch`](src/watch/README.md) | Change feed | react to an advancement record instead of re-querying blind (managed) | `cargo run --example watch` | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
 | [`kv`](src/kv/README.md) | State | set/get keyed JSON with a TTL, upgrade it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row (managed) | `cargo run --example kv` | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
+| [`cdc`](src/cdc/README.md) | Consumer filters | read four safe-mode events out of a 240-record feed of typed serde records, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (bindings managed) | `cargo run --example cdc` | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
 | [`graph`](src/graph/README.md) | Graph | relate entities, then traverse one relation out of a node (managed) | `cargo run --example graph` | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall`](src/recall/README.md) | Memory | all four durable verbs: remember, recall recent, improve, forget | `just up && cargo run --example recall` | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
 | [`context`](src/context/README.md) | Context | assemble one conversation under a last-N + token-budget policy | `just up && cargo run --example context` | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
@@ -88,7 +91,7 @@ Eight focused examples cover the core data and agent primitives. Unsupported man
 
 ## Deep-dive scenarios
 
-Nine deep-dive scenarios (the eight primitive examples above make seventeen runnable programs in total), green on an open server (cloud-gated phases print how to point at a deployment and skip). The workload examples scale with the volume knobs above. Every README follows the same shape: a tagline, What it does, Run it, Where to look (LaserData Cloud) where it produces managed artifacts, and Highlights. The concierge example is the full-AGDX showcase: it exercises every surface (streaming and the agent envelope, materialized views and query, key-value, and forks) in one story.
+Nine deep-dive scenarios (the nine primitive examples above make eighteen runnable programs in total), green on an open server (cloud-gated phases print how to point at a deployment and skip). The workload examples scale with the volume knobs above. Every README follows the same shape: a tagline, What it does, Run it, Where to look (LaserData Cloud) where it produces managed artifacts, and Highlights. The concierge example is the full-AGDX showcase: it exercises every surface (streaming and the agent envelope, materialized views and query, key-value, and forks) in one story.
 
 | binary | layer | shows |
 | --- | --- | --- |

@@ -6,22 +6,24 @@
 
 Laser SDK ships in independently adoptable layers:
 
-- streaming (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
-- managed platform (`managed` feature), projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack.
-- agentic (`agent` feature), reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
-- edges, the optional A2A, MCP, and AG-UI adapters.
+- **Streaming** (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
+- **Managed platform** (`managed` feature), consumer filters, projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack.
+- **Agentic** (`agent` feature), reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
+- **Edges**, the optional A2A, MCP, and AG-UI adapters.
 
 The SDK carries `gen_ai.*` provenance describing model calls but never makes them. It moves and coordinates messages only.
 
 The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded messages, schemas, command codes, limits, and reference test data. It supports WebAssembly and does not require an asynchronous runtime. Laser SDK exposes it as `laser_sdk::wire` and through the existing module paths.
 
+**Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
+
 ## Install
 
 ```toml
 [dependencies]
-laser-sdk = "0.4.1" # typed streaming plus provenance
+laser-sdk = "0.5.0" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.4.1", features = ["agent", "managed"] }
+laser-sdk = { version = "0.5.0", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -267,6 +269,7 @@ One connection can advertise one agent. A second advertisement receives `LaserEr
 | `laser.topic(name)` | a topic on the optional default stream | shorthand for the same verbs |
 | `laser.query(index)` | a materialized index | filters, aggregates, vector recall, the bounded `.max_rows(n).rows()` walk |
 | `laser.watch()` | the change feed | consume advancement records instead of re-querying blind |
+| `laser.filters()` | server-side consumer filters | filtered readers over a partition or a consumer group, previews, sample tests, the saved-filter catalog, group bindings |
 | `laser.kv(namespace)` | managed point state | get/set/delete/scan, compare-and-swap, leases |
 | `laser.fork(id)` | a copy-on-write branch | speculative writes, overlay queries, promote or squash |
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |
@@ -306,8 +309,9 @@ Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` 
 - `provenance`, wire contract + provenance encoding/decoding
 - `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
-- `managed` enables `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
+- `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
 - `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent().commit()`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
+- `filters` provides server-side consumer filters over the `AGDX_FILTER*` commands: `laser.filters().reader(stream, topic)` reads one partition set or a consumer group through the partition primary, stores progress only through fenced acknowledgments of completed pages, and reports fault and oversized stops as typed errors. A group reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset. `MatchedRecord::json::<T>()` decodes a delivered record into your type. `preview`, `test`, and `validate` run without progress. The catalog verbs `register`, `revise`, `bind`, `unbind`, `archive`, and `delete` wait for the authoritative outcome of each operation id, and `apply_as` sends a mutation under an id the caller recorded first. Filtered reads need a server that advertises `consumer_filters`, and the catalog also needs `laser-plane`.
 - capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
 - `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)
 - `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
@@ -333,7 +337,7 @@ tracing::subscriber::set_global_default(
 
 ## Prelude
 
-`use laser_sdk::prelude::*` imports the common accessors and types, about 35 items. `use laser_sdk::prelude::full::*` also imports bridge types, extension traits, projection types, and memory configuration. Prefer the smaller set and explicit imports for application code.
+`use laser_sdk::prelude::*` imports the common accessors and types, about 70 items. `use laser_sdk::prelude::full::*` also imports bridge types, extension traits, projection types, and memory configuration. Prefer the smaller set and explicit imports for application code.
 
 ## Documentation
 
@@ -356,3 +360,45 @@ See [connect timeout and cleanup](../docs/connect-timeout.md).
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
 
 See [publish recovery and outage handling](../docs/publish-recovery.md).
+
+## Consumer filters
+
+A consumer filter runs on the streaming server, so a reader receives only the records it selects, with their original offsets:
+
+```rust,no_run
+use laser_sdk::filters::{ConsumerFilter, FilterExpr, FilteredStart};
+use laser_sdk::prelude::*;
+use laser_sdk::query::CmpOp;
+
+#[tokio::main]
+async fn main() -> Result<(), LaserError> {
+    let laser = Laser::connect("iggy:iggy@127.0.0.1").await?;
+    let slow_or_failed = ConsumerFilter::json(FilterExpr::any([
+        FilterExpr::pred("outcome", CmpOp::Eq, "error"),
+        FilterExpr::pred("latency_ms", CmpOp::Gt, 2_000),
+    ]));
+    let mut reader = laser
+        .filters()
+        .reader("agent-telemetry", "inferences")
+        .consumer("on-call-review")
+        .inline(slow_or_failed)
+        .start(FilteredStart::First)
+        .build()
+        .await?;
+    let record = reader.next_record().await?;
+    println!("offset {}: {:?}", record.offset, record.message.payload);
+    reader.ack(&record).await?;
+    reader.close().await?;
+    Ok(())
+}
+```
+
+`next_page` and `ack_page` handle batches, `ack_through` stores an application checkpoint inside a page, and `CompiledFilter` from `laser_sdk::filters` runs the same evaluator locally. `with_fault_policy`, `with_foreign_policy`, and `with_mismatch_policy` decide what a record that does not decode, has another codec, or has a field of an unexpected type does: stop or drop, or reach the reader marked unevaluated.
+
+## Consumer filter groups and offsets
+
+**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages`, so a reader that never acknowledges stops at that bound instead of growing without limit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+**Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
+
+For an application checkpoint inside a filtered page, call `reader.ack_through(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ack_page` when the whole page is complete.

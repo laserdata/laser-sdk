@@ -77,6 +77,12 @@ pub struct LaserWorld {
     /// The governed `Laser` handle of the governance scenarios (the ungoverned
     /// `laser` stays available for reading the audit topic back).
     pub governed: Option<Laser>,
+    /// The filter under evaluation and the verdict of the last evaluation, for
+    /// the consumer-filter scenarios.
+    pub filter: Option<laser_sdk::filters::ConsumerFilter>,
+    pub verdict: Option<laser_sdk::filters::Verdict>,
+    /// Payloads a filtered read returned, in delivery order.
+    pub filtered_payloads: Vec<Vec<u8>>,
     pub bridge_hops: Vec<String>,
     pub bridge_loop_rejected: bool,
     pub bridge_task_state: Option<String>,

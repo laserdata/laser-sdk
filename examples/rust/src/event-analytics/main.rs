@@ -1,5 +1,5 @@
 use laser_examples::{
-    PARTITIONS, init_tracing, laser, managed_feature_ready, phase, release_after, start_projector,
+    PARTITIONS, fresh_run, init_tracing, laser, managed_feature_ready, phase, start_projector,
     stream_for,
 };
 use laser_sdk::prelude::full::*;
@@ -114,7 +114,7 @@ async fn main() -> Result<(), LaserError> {
     phase("warming up");
 
     let laser = laser(&stream_for("event-analytics"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("event-analytics"), async {
+    fresh_run(&laser, &stream_for("event-analytics"), async {
         laser.topic(TOPIC).ensure(PARTITIONS).await?;
         let query_available = laser.capabilities().await.query.available;
 

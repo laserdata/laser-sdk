@@ -1,4 +1,4 @@
-use laser_examples::{init_tracing, laser, phase, release_after, stream_for};
+use laser_examples::{fresh_run, init_tracing, laser, phase, stream_for};
 use laser_sdk::prelude::{
     Capabilities, CommitPolicy, Consumer, ConsumerStart, LaserError, Producer, ProducerMessage,
     Routing,
@@ -16,7 +16,7 @@ const PROGRESS_EVERY: usize = 100;
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("native-streaming"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("native-streaming"), async {
+    fresh_run(&laser, &stream_for("native-streaming"), async {
         let topic = laser.topic(TOPIC);
         let producer = topic
             .producer()

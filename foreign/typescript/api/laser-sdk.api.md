@@ -96,6 +96,16 @@ export interface A2aTask {
 export function acceptFence(highWater: Map<string, FenceEntry>, sweepState: FenceSweepState, taskKey: string, fence: bigint, nowMicros: bigint): boolean;
 
 // @public (undocumented)
+export interface AckReceipt {
+    // (undocumented)
+    readonly generation: SourceGeneration;
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+}
+
+// @public (undocumented)
 export type Action = "read" | "write" | "delete" | "admin" | "unrecognized";
 
 // @public (undocumented)
@@ -753,6 +763,18 @@ export class AmbiguousMutationError extends LaserError {
 export const ANY_ROUTE_POLICY: RoutePolicy;
 
 // @public (undocumented)
+export interface AppliedPolicy {
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly filterId?: number;
+    // (undocumented)
+    readonly groupId?: bigint;
+    // (undocumented)
+    readonly revision?: number;
+}
+
+// @public (undocumented)
 export function applyJsonPatch(document: unknown, patch: unknown): unknown;
 
 // @public (undocumented)
@@ -993,6 +1015,8 @@ export interface Capabilities {
     // (undocumented)
     readonly durableDedup: boolean;
     // (undocumented)
+    readonly filters: FilterCapabilities;
+    // (undocumented)
     readonly forks: boolean;
     // (undocumented)
     readonly graph: boolean;
@@ -1058,7 +1082,7 @@ export interface CapabilitySelector {
 export function capabilitySelector(skill: string, policy: RoutePolicy, principal?: PrincipalId): CapabilitySelector;
 
 // @public (undocumented)
-export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "kvFencedLeases" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz";
+export type CapabilitySurface = "managed" | "query" | "destinations" | "kv" | "kvCas" | "kvCasFenced" | "kvFencedLeases" | "graph" | "forks" | "agentWorkflow" | "watch" | "authz" | "filters" | "filterCatalog";
 
 // @public (undocumented)
 export type CasExpect = {
@@ -1067,6 +1091,14 @@ export type CasExpect = {
 } | {
     readonly kind: "absent";
 };
+
+// @public (undocumented)
+export interface CatalogPageOptions {
+    // (undocumented)
+    readonly page?: number;
+    // (undocumented)
+    readonly pageSize?: number;
+}
 
 // @public (undocumented)
 export function cborCodec<T>(decodeValue: ValueDecoder<T>): Codec<T>;
@@ -1235,6 +1267,49 @@ export class CodecError extends LaserError {
     readonly surface: string;
 }
 
+// @public
+export type Coerce = {
+    readonly kind: "timestamp";
+    readonly format: TimestampFormat;
+} | {
+    readonly kind: "number";
+};
+
+// @public (undocumented)
+export interface CoercedPredicate {
+    // (undocumented)
+    readonly coerce: Coerce;
+    // Warning: (ae-forgotten-export) The symbol "Predicate" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly pred: Predicate;
+}
+
+// @public
+export class CompiledFilter {
+    // (undocumented)
+    static compile(filter: ConsumerFilter, schemas?: readonly SchemaDef[]): CompiledFilter;
+    // (undocumented)
+    readonly digest: Uint8Array;
+    evaluate(record: FilterRecord, limits?: DecodeLimits): FilterVerdict;
+    explain(record: FilterRecord, limits?: DecodeLimits): FilterExplanation;
+    // (undocumented)
+    get faultPolicy(): FaultPolicy;
+    faultReason(record: FilterRecord, limits?: DecodeLimits): FaultReason | undefined;
+    // (undocumented)
+    readonly filter: ConsumerFilter;
+    get needsHeaders(): boolean;
+    outcomeOf(record: FilterRecord, limits?: DecodeLimits): {
+        verdict: FilterVerdict;
+        fault?: FaultReason;
+    };
+    policyFor(reason: FaultReason): FaultPolicy;
+    // (undocumented)
+    get readsHeaders(): boolean;
+    // (undocumented)
+    get readsPayload(): boolean;
+}
+
 // @public (undocumented)
 export class CompiledSchema {
     // (undocumented)
@@ -1330,6 +1405,42 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
         readonly signal?: AbortSignal;
     }): AsyncIterable<ConsumedMessage>;
 }
+
+// @public
+export interface ConsumerFilter {
+    // (undocumented)
+    readonly codec: FilterCodec;
+    // (undocumented)
+    readonly evaluatorVersion: number;
+    // (undocumented)
+    readonly expr: FilterExpr;
+    // (undocumented)
+    readonly faultPolicy: FaultPolicy;
+    readonly foreignPolicy?: RecordPolicy;
+    readonly mismatchPolicy?: RecordPolicy;
+    // (undocumented)
+    readonly schemaRefs: readonly number[];
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public
+export const ConsumerFilter: {
+    readonly json: (expr: FilterExpr, faultPolicy?: FaultPolicy) => ConsumerFilter;
+    readonly cbor: (expr: FilterExpr, faultPolicy?: FaultPolicy) => ConsumerFilter;
+    readonly avro: (expr: FilterExpr, schemaRefs: readonly number[], faultPolicy?: FaultPolicy) => ConsumerFilter;
+    readonly protobuf: (expr: FilterExpr, schemaRefs: readonly number[], faultPolicy?: FaultPolicy) => ConsumerFilter;
+    readonly headersOnly: (expr: FilterExpr, faultPolicy?: FaultPolicy) => ConsumerFilter;
+    readonly withFaultPolicy: (filter: ConsumerFilter, faultPolicy: FaultPolicy) => ConsumerFilter;
+    readonly withForeignPolicy: (filter: ConsumerFilter, foreignPolicy: RecordPolicy) => ConsumerFilter;
+    readonly withMismatchPolicy: (filter: ConsumerFilter, mismatchPolicy: RecordPolicy) => ConsumerFilter;
+};
+
+// @public
+export function consumerFilterDigest(filter: ConsumerFilter): Uint8Array;
+
+// @public
+export function consumerFilterJson(filter: ConsumerFilter): string;
 
 // @public (undocumented)
 export class ConsumerGroupName {
@@ -1470,6 +1581,19 @@ export class ContextScope {
     state<State>(topics: readonly string[], bound: ReplayBound, initial: State, fold: (state: State, message: ContextMessage) => State): Promise<State>;
     // (undocumented)
     stateWith<State>(store: SnapshotStore, topics: readonly string[], initial: State, decodeState: (bytes: Uint8Array) => State, fold: (state: State, message: ContextMessage) => State): Promise<State>;
+}
+
+// @public (undocumented)
+export interface Continuation {
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly generation: SourceGeneration;
+    // (undocumented)
+    readonly groupId?: bigint;
+    // (undocumented)
+    readonly nextScanOffset: bigint;
+    readonly readMode: ReadMode;
 }
 
 // @public (undocumented)
@@ -1624,6 +1748,9 @@ export class Decision {
 // @public (undocumented)
 export function decodeAgentMessage(received: ReceivedAgentMessage, understoodFeatures?: bigint): DecodedAgentMessage;
 
+// @public
+export function decodeConsumerFilterJson(text: string): ConsumerFilter;
+
 // @public (undocumented)
 export type DecodedAgentMessage = {
     readonly kind: "message";
@@ -1635,6 +1762,14 @@ export type DecodedAgentMessage = {
     readonly error: CodecError;
     readonly payload: Uint8Array;
 };
+
+// @public
+export interface DecodeLimits {
+    // (undocumented)
+    readonly maxDepth: number;
+    // (undocumented)
+    readonly maxPayloadBytes: number;
+}
 
 // @public (undocumented)
 export function decodePolicyEvidence(payload: Uint8Array): PolicyEvidence;
@@ -1658,7 +1793,13 @@ export const DEFAULT_CHUNK_FLUSH_BYTES = 512;
 export const DEFAULT_CHUNK_LINGER_MS = 20;
 
 // @public (undocumented)
+export const DEFAULT_DECODE_LIMITS: DecodeLimits;
+
+// @public (undocumented)
 export const DEFAULT_KEY_NAMESPACE = "agent.keys";
+
+// @public
+export const DEFAULT_OUTCOME_WAIT_MS = 30000;
 
 // @public (undocumented)
 export const DEFAULT_RETRY_POLICY: RetryPolicy;
@@ -1924,6 +2065,33 @@ export function envelopeToAgUi(envelope: AgentEnvelope): readonly AgUiEvent[];
 // @public (undocumented)
 export function eventEnvelope(record: RecordId, conversation: WireConversationId, source: AgentId_2, body: Uint8Array): AgentEnvelope;
 
+// @public
+export class ExactDecimal {
+    compare(other: ExactDecimal): number;
+    static fromDouble(value: number): ExactDecimal | undefined;
+    // (undocumented)
+    static fromInteger(value: bigint): ExactDecimal;
+    static parse(text: string): ExactDecimal | undefined;
+    // (undocumented)
+    toString(): string;
+}
+
+// @public (undocumented)
+export interface ExplainNode {
+    // (undocumented)
+    readonly children: readonly ExplainNode[];
+    // (undocumented)
+    readonly label: string;
+    // (undocumented)
+    readonly truth?: Truth;
+}
+
+// @public
+export type FaultPolicy = "stop" | "pass" | "drop";
+
+// @public (undocumented)
+export type FaultReason = "malformed" | "too_large" | "too_deep" | "missing_schema" | "schema_not_allowed" | "schema_mismatch" | "foreign_codec" | "type_mismatch";
+
 // @public (undocumented)
 export interface Feedback {
     // (undocumented)
@@ -1932,6 +2100,16 @@ export interface Feedback {
     readonly target: MemoryId;
     // (undocumented)
     readonly weight: number;
+}
+
+// @public
+export class FieldPath {
+    // (undocumented)
+    static parse(text: string): FieldPath;
+    // (undocumented)
+    readonly segments: readonly PathSegment[];
+    // (undocumented)
+    toString(): string;
 }
 
 // @public (undocumented)
@@ -1963,21 +2141,589 @@ export type Filter = {
 };
 
 // @public (undocumented)
+export const FILTER_EVALUATOR_VERSION = 1;
+
+// @public (undocumented)
 export function filterAll(filters: readonly Filter[]): Filter;
 
 // @public (undocumented)
 export function filterAny(filters: readonly Filter[]): Filter;
 
 // @public (undocumented)
+export interface FilterBinding {
+    // (undocumented)
+    readonly boundAtMicros: bigint;
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly filterId: number;
+    // (undocumented)
+    readonly group: FilterGroupRef;
+    // (undocumented)
+    readonly identity: FilterGroupIdentity;
+    // (undocumented)
+    readonly revision: number;
+}
+
+// @public (undocumented)
+export interface FilterBindingPage {
+    // (undocumented)
+    readonly items: readonly FilterBinding[];
+    // (undocumented)
+    readonly page: number;
+    // (undocumented)
+    readonly pageSize: number;
+    // (undocumented)
+    readonly total: number;
+}
+
+// @public (undocumented)
 export function filterCandidatesByPrincipal(candidates: readonly RegisteredCard[], required: PrincipalId, principalFor: (agent: AgentId) => PrincipalId | undefined): readonly RegisteredCard[];
+
+// @public
+export interface FilterCapabilities {
+    readonly catalog: boolean;
+    // Warning: (ae-forgotten-export) The symbol "FilterAnnounce" needs to be exported by the entry point index.d.ts
+    readonly evaluation?: FilterAnnounce;
+    readonly native: boolean;
+}
+
+// @public
+export type FilterCodec = "json" | "cbor" | "avro" | "protobuf" | "headers_only" | "unknown";
+
+// @public
+export type FilterConsumer = {
+    readonly kind: "group_id";
+    readonly id: bigint;
+} | {
+    readonly kind: "consumer";
+    readonly name: string;
+} | {
+    readonly kind: "group";
+    readonly name: string;
+};
+
+// @public (undocumented)
+export interface FilterDetail {
+    // (undocumented)
+    readonly bindings: readonly FilterBinding[];
+    // (undocumented)
+    readonly latest: FilterRevisionInfo;
+    // (undocumented)
+    readonly summary: FilterSummary;
+}
+
+// @public
+export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRecord> {
+    // (undocumented)
+    [Symbol.asyncDispose](): Promise<void>;
+    // (undocumented)
+    [Symbol.asyncIterator](): AsyncIterator<MatchedRecord>;
+    // Warning: (ae-forgotten-export) The symbol "ReaderSettings" needs to be exported by the entry point index.d.ts
+    constructor(settings: ReaderSettings);
+    ack(record: MatchedRecord): Promise<void>;
+    ackPage(page: MatchedPage): Promise<void>;
+    ackThrough(record: MatchedRecord): Promise<void>;
+    close(): Promise<void>;
+    dataConnectionsOpened(): number;
+    examinedInRound(): number;
+    idleIntervalMs(): number;
+    nextPage(options?: {
+        readonly timeoutMs?: number;
+    }): Promise<MatchedPage>;
+    nextRecord(options?: {
+        readonly timeoutMs?: number;
+    }): Promise<MatchedRecord>;
+    owns(value: MatchedPage | MatchedRecord): boolean;
+    partitions(): readonly number[];
+    readRound(): Promise<readonly [MatchedPage | undefined, boolean]>;
+    tryNextPage(): Promise<MatchedPage | undefined>;
+}
+
+// @public
+export class FilteredReaderBuilder {
+    constructor(transport: FilterTransport, capabilities: () => Promise<Capabilities>, filters: Filters, source: FilterSource);
+    // (undocumented)
+    build(): Promise<FilteredReader>;
+    consumer(name: string): this;
+    count(count: number): this;
+    filter(filter: FilterRef): this;
+    group(name: string): this;
+    groupId(id: bigint | number): this;
+    idleInterval(milliseconds: number): this;
+    inline(filter: ConsumerFilter): this;
+    localGuard(enabled: boolean): this;
+    maxReplyBytes(bytes: number): this;
+    maxUnackedPages(pages: number): this;
+    partition(partitionId: number): this;
+    readMode(mode: ReadMode): this;
+    revision(filterId: number, revision: number): this;
+    start(start: FilteredStart): this;
+}
+
+// @public
+export type FilteredStart = {
+    readonly kind: "next";
+} | {
+    readonly kind: "first";
+} | {
+    readonly kind: "last";
+} | {
+    readonly kind: "offset";
+    readonly offset: bigint;
+} | {
+    readonly kind: "timestamp";
+    readonly micros: bigint;
+} | {
+    readonly kind: "continue";
+    readonly continuation: Continuation;
+};
+
+// @public
+export interface FilterError {
+    // (undocumented)
+    readonly code: ResultCode;
+    // (undocumented)
+    readonly message: string;
+    // (undocumented)
+    readonly reason: FilterErrorReason;
+}
+
+// @public (undocumented)
+export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "not_primary" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
+/** A reason this build does not know. The error's `code` still classifies it. */
+| "unknown";
+
+// @public
+export class FilterExecutionError extends LaserError {
+    constructor(message: string, detail: FilterError, options?: {
+        cause?: unknown;
+    });
+    // (undocumented)
+    readonly detail: FilterError;
+    // (undocumented)
+    get reason(): FilterErrorReason;
+}
+
+// @public (undocumented)
+export interface FilterExplanation {
+    // (undocumented)
+    readonly fault?: FaultReason;
+    // (undocumented)
+    readonly root: ExplainNode;
+    // (undocumented)
+    readonly verdict: FilterVerdict;
+}
+
+// @public
+export type FilterExpr = {
+    readonly kind: "all";
+    readonly children: readonly FilterExpr[];
+} | {
+    readonly kind: "any";
+    readonly children: readonly FilterExpr[];
+} | {
+    readonly kind: "not";
+    readonly child: FilterExpr;
+} | {
+    readonly kind: "pred";
+    readonly predicate: Predicate;
+} | {
+    readonly kind: "pred_as";
+    readonly predicate: CoercedPredicate;
+} | {
+    readonly kind: "present";
+    readonly path: FieldPath;
+} | {
+    readonly kind: "absent";
+    readonly path: FieldPath;
+} | {
+    readonly kind: "header";
+    readonly predicate: HeaderPredicate;
+} | {
+    readonly kind: "text";
+    readonly predicate: TextPredicate;
+} | {
+    readonly kind: "header_text";
+    readonly predicate: TextPredicate;
+};
+
+// @public
+export const FilterExpr: {
+    readonly all: (children: readonly FilterExpr[]) => FilterExpr;
+    readonly any: (children: readonly FilterExpr[]) => FilterExpr;
+    readonly negate: (child: FilterExpr) => FilterExpr;
+    readonly pred: (fieldName: string, op: CmpOp, value: FilterLiteral) => FilterExpr;
+    readonly predAs: (fieldName: string, op: CmpOp, value: FilterLiteral, coerce: Coerce) => FilterExpr;
+    readonly present: (path: string) => FilterExpr;
+    readonly absent: (path: string) => FilterExpr;
+    readonly header: (key: string, op: CmpOp, value: FilterLiteral) => FilterExpr;
+    readonly text: (fieldName: string, kind: TextMatch, pattern: string, caseInsensitive?: boolean) => FilterExpr;
+    readonly headerText: (key: string, kind: TextMatch, pattern: string, caseInsensitive?: boolean) => FilterExpr;
+};
+
+// @public (undocumented)
+export interface FilterGroupIdentity {
+    // (undocumented)
+    readonly groupId: bigint;
+    // (undocumented)
+    readonly streamCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly topicId: number;
+}
+
+// @public (undocumented)
+export interface FilterGroupRef {
+    // (undocumented)
+    readonly group: string;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+}
+
+// @public (undocumented)
+export interface FilterHeader {
+    // (undocumented)
+    readonly key: string;
+    // (undocumented)
+    readonly value: HeaderScalar;
+}
+
+// @public (undocumented)
+export interface FilterListOptions {
+    readonly beforeId?: number;
+    // (undocumented)
+    readonly nameContains?: string;
+    // (undocumented)
+    readonly page?: number;
+    // (undocumented)
+    readonly pageSize?: number;
+    // (undocumented)
+    readonly state?: FilterState;
+}
+
+// @public
+export type FilterLiteral = string | number | bigint | boolean | null | TypedValue | readonly FilterLiteral[];
+
+// @public (undocumented)
+export type FilterMutation = {
+    readonly kind: "set_revision_enabled";
+    readonly filterId: number;
+    readonly revision: number;
+    readonly enabled: boolean;
+} | {
+    readonly kind: "register";
+    readonly name: string;
+    readonly description: string;
+    readonly filter: ConsumerFilter;
+} | {
+    readonly kind: "revise";
+    readonly filterId: number;
+    readonly expectedRevision: number;
+    readonly filter: ConsumerFilter;
+} | {
+    readonly kind: "describe";
+    readonly filterId: number;
+    readonly description: string;
+} | {
+    readonly kind: "archive";
+    readonly filterId: number;
+} | {
+    readonly kind: "drop";
+    readonly filterId: number;
+} | {
+    readonly kind: "bind";
+    readonly group: FilterGroupRef;
+    readonly filterId: number;
+    readonly revision: number;
+} | {
+    readonly kind: "unbind";
+    readonly group: FilterGroupRef;
+    readonly expectedDigest: Uint8Array;
+    readonly expectedIdentity?: FilterGroupIdentity;
+};
+
+// @public (undocumented)
+export interface FilterMutationOutcome {
+    // (undocumented)
+    readonly operationId: bigint;
+    // (undocumented)
+    readonly status: FilterMutationStatus;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+export type FilterMutationResult = {
+    readonly kind: "revision_state";
+    readonly filterId: number;
+    readonly revision: number;
+    readonly enabled: boolean;
+} | {
+    readonly kind: "registered";
+    readonly revision: FilterRevisionRef;
+} | {
+    readonly kind: "revised";
+    readonly revision: FilterRevisionRef;
+} | {
+    readonly kind: "described";
+    readonly filterId: number;
+} | {
+    readonly kind: "archived";
+    readonly filterId: number;
+} | {
+    readonly kind: "dropped";
+    readonly filterId: number;
+} | {
+    readonly kind: "bound";
+    readonly binding: FilterBinding;
+} | {
+    readonly kind: "unbound";
+    readonly binding: FilterBinding;
+};
+
+// @public (undocumented)
+export type FilterMutationStatus = {
+    readonly kind: "pending";
+} | {
+    readonly kind: "applied";
+    readonly result: FilterMutationResult;
+} | {
+    readonly kind: "rejected";
+    readonly error: FilterError;
+};
 
 // @public (undocumented)
 export function filterNegate(filter: Filter): Filter;
 
-// Warning: (ae-forgotten-export) The symbol "CmpOp" needs to be exported by the entry point index.d.ts
-//
+// @public (undocumented)
+export interface FilterPage {
+    // (undocumented)
+    readonly items: readonly FilterSummary[];
+    // (undocumented)
+    readonly page: number;
+    // (undocumented)
+    readonly pageSize: number;
+    // (undocumented)
+    readonly total: number;
+}
+
 // @public (undocumented)
 export function filterPred(fieldName: string, op: CmpOp, value: TypedValue): Filter;
+
+// @public (undocumented)
+export interface FilterPreview {
+    // (undocumented)
+    readonly examined: number;
+    // (undocumented)
+    readonly faults: number;
+    // (undocumented)
+    readonly frontier: bigint;
+    // (undocumented)
+    readonly matched: number;
+    // (undocumented)
+    readonly nextOffset?: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly policy: AppliedPolicy;
+    // (undocumented)
+    readonly readMode: ReadMode;
+    // (undocumented)
+    readonly records: readonly PreviewRecord[];
+    // (undocumented)
+    readonly stop: StopReason;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+export interface FilterPreviewOptions {
+    // (undocumented)
+    readonly explain?: boolean;
+    // (undocumented)
+    readonly fromOffset?: bigint;
+    // (undocumented)
+    readonly maxExamined?: number;
+    // (undocumented)
+    readonly maxRecords?: number;
+}
+
+// @public
+export interface FilterRecord {
+    // (undocumented)
+    readonly headers: readonly FilterHeader[];
+    // (undocumented)
+    readonly payload: Uint8Array;
+}
+
+// @public
+export type FilterRef = {
+    readonly kind: "inline";
+    readonly filter: ConsumerFilter;
+} | {
+    readonly kind: "revision";
+    readonly filterId: number;
+    readonly revision: number;
+} | {
+    readonly kind: "bound";
+};
+
+// @public (undocumented)
+export interface FilterRevisionInfo {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly enabled: boolean;
+    // (undocumented)
+    readonly filter: ConsumerFilter;
+    // (undocumented)
+    readonly revision: number;
+}
+
+// @public (undocumented)
+export interface FilterRevisionPage {
+    // (undocumented)
+    readonly filterId: number;
+    // (undocumented)
+    readonly items: readonly FilterRevisionInfo[];
+    // (undocumented)
+    readonly page: number;
+    // (undocumented)
+    readonly pageSize: number;
+    // (undocumented)
+    readonly total: number;
+}
+
+// @public (undocumented)
+export interface FilterRevisionRef {
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly filterId: number;
+    // (undocumented)
+    readonly revision: number;
+}
+
+// @public
+export class Filters {
+    constructor(transport: FilterTransport, capabilities: () => Promise<Capabilities>);
+    apply(mutation: FilterMutation): Promise<FilterMutationResult>;
+    applyAs(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationResult>;
+    archive(filterId: number): Promise<void>;
+    bind(group: FilterGroupRef, filterId: number, revision: number): Promise<FilterBinding>;
+    binding(group: FilterGroupRef): Promise<FilterBinding>;
+    bindings(options?: CatalogPageOptions & {
+        readonly filterId?: number;
+        readonly stream?: string;
+        readonly topic?: string;
+    }): Promise<FilterBindingPage>;
+    createConsumerGroup(group: FilterGroupRef, filterId: number, revision: number): Promise<FilterBinding>;
+    delete(filterId: number): Promise<void>;
+    describe(filterId: number, description: string): Promise<void>;
+    get(filterId: number): Promise<FilterDetail>;
+    list(options?: FilterListOptions): Promise<FilterPage>;
+    mutate(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationOutcome>;
+    operation(operationId: bigint): Promise<FilterMutationOutcome>;
+    preview(stream: string, topic: string, partitionId: number, filter: FilterRef, options?: FilterPreviewOptions): Promise<FilterPreview>;
+    reader(stream: string, topic: string): FilteredReaderBuilder;
+    register(name: string, filter: ConsumerFilter, options?: {
+        readonly description?: string;
+    }): Promise<FilterRevisionRef>;
+    revise(filterId: number, expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef>;
+    revisions(filterId: number, options?: CatalogPageOptions): Promise<FilterRevisionPage>;
+    setRevisionEnabled(filterId: number, revision: number, enabled: boolean): Promise<void>;
+    test(filter: FilterRef, payload: Uint8Array | string, headers?: readonly FilterHeader[]): Promise<FilterTestResult>;
+    unbind(group: FilterGroupRef, expectedDigest: Uint8Array): Promise<FilterBinding>;
+    unbindBinding(binding: FilterBinding): Promise<FilterBinding>;
+    validate(filter: ConsumerFilter): Promise<FilterValidation>;
+    waitForOutcome(operationId: bigint, timeoutMs: number): Promise<FilterMutationResult>;
+}
+
+// @public
+export interface FilterSource {
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+}
+
+// @public (undocumented)
+export type FilterState = "active" | "archived" | "dropped";
+
+// @public
+export class FilterStopError extends LaserError {
+    constructor(stop: "fault" | "oversized_record", partitionId: number, offset: bigint, faultReason?: FaultReason | undefined);
+    // (undocumented)
+    readonly faultReason?: FaultReason | undefined;
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    get reason(): "fault" | "oversized_record";
+    // (undocumented)
+    readonly stop: "fault" | "oversized_record";
+}
+
+// @public (undocumented)
+export interface FilterSummary {
+    // (undocumented)
+    readonly bindings: number;
+    // (undocumented)
+    readonly codec: FilterCodec;
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    // (undocumented)
+    readonly description: string;
+    // (undocumented)
+    readonly id: number;
+    // (undocumented)
+    readonly latestDigest: Uint8Array;
+    // (undocumented)
+    readonly latestRevision: number;
+    // (undocumented)
+    readonly name: string;
+    // (undocumented)
+    readonly state: FilterState;
+    // (undocumented)
+    readonly updatedAtMicros: bigint;
+}
+
+// @public (undocumented)
+export interface FilterTestResult {
+    // (undocumented)
+    readonly explanation: FilterExplanation;
+    // (undocumented)
+    readonly policy: AppliedPolicy;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public
+export type FilterTransport = Pick<LaserTransport, "sendManaged" | "getTopicPartitionCount" | "joinConsumerGroup" | "leaveConsumerGroup" | "joinExistingConsumerGroup" | "openNodeConnection" | "openCoordinator" | "connectsNodes"> & Partial<Pick<LaserTransport, "ensureConsumerGroup">>;
+
+// @public (undocumented)
+export interface FilterValidation {
+    // (undocumented)
+    readonly digest: Uint8Array;
+    // (undocumented)
+    readonly readsHeaders: boolean;
+    // (undocumented)
+    readonly readsPayload: boolean;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+export type FilterVerdict = "selected" | "rejected" | "fault";
 
 // @public (undocumented)
 export const FINISH_REASON_ABANDONED = "abandoned";
@@ -2371,6 +3117,37 @@ export type HandlerResult = {
 };
 
 // @public (undocumented)
+export interface HeaderPredicate {
+    // (undocumented)
+    readonly key: string;
+    // (undocumented)
+    readonly op: CmpOp;
+    // (undocumented)
+    readonly value: TypedValue;
+}
+
+// @public
+export type HeaderScalar = {
+    readonly kind: "bool";
+    readonly value: boolean;
+} | {
+    readonly kind: "int";
+    readonly value: bigint;
+} | {
+    readonly kind: "uint";
+    readonly value: bigint;
+} | {
+    readonly kind: "float";
+    readonly value: number;
+} | {
+    readonly kind: "string";
+    readonly value: string;
+} | {
+    readonly kind: "raw";
+    readonly value: Uint8Array;
+};
+
+// @public (undocumented)
 export const HeaderValue: {
     readonly string: (value: string) => IggyHeaderValue;
     readonly bool: (value: boolean) => IggyHeaderValue;
@@ -2632,6 +3409,9 @@ export interface JsonRpcResponse {
     // (undocumented)
     readonly result?: unknown;
 }
+
+// @public
+export type JsonValue = null | boolean | bigint | number | string | readonly JsonValue[] | ReadonlyMap<string, JsonValue>;
 
 // @public (undocumented)
 export const KeyKind: {
@@ -3043,6 +3823,7 @@ export class Laser implements AsyncDisposable {
     //
     // (undocumented)
     executeBatch(ops: readonly BatchItem[]): Promise<readonly Uint8Array[]>;
+    filters(): Filters;
     // (undocumented)
     fork(forkId: string): Fork;
     // (undocumented)
@@ -3206,7 +3987,7 @@ export class LaserError extends Error {
 }
 
 // @public (undocumented)
-export type LaserErrorKind = "config" | "no-stream" | "timeout" | "ambiguous-mutation" | "cancelled" | "unsupported" | "invalid" | "codec" | "typed-decode" | "protocol" | "transport" | "query" | "kv" | "fork" | "graph" | "authz" | "agent-workflow" | "routing" | "presence-conflict" | "signature" | "handler" | "handler-config" | "state-store" | "integrity" | "rejected" | "budget-exceeded" | "policy-blocked" | "step-up-required" | "policy-deferred";
+export type LaserErrorKind = "config" | "no-stream" | "timeout" | "ambiguous-mutation" | "cancelled" | "unsupported" | "invalid" | "codec" | "typed-decode" | "protocol" | "transport" | "query" | "kv" | "fork" | "graph" | "authz" | "filter" | "agent-workflow" | "routing" | "presence-conflict" | "signature" | "handler" | "handler-config" | "state-store" | "integrity" | "rejected" | "budget-exceeded" | "policy-blocked" | "step-up-required" | "policy-deferred";
 
 // @public (undocumented)
 export interface LaserObserver {
@@ -3343,6 +4124,44 @@ export class LogMemory implements Memory {
     readonly topic: string;
     // (undocumented)
     update(key: string, patch: Uint8Array): Promise<void>;
+}
+
+// @public
+export interface MatchedPage {
+    // (undocumented)
+    readonly [READER_TAG]?: ReaderTag;
+    // (undocumented)
+    readonly examined: number;
+    readonly frontier: bigint;
+    readonly generation: SourceGeneration;
+    // (undocumented)
+    readonly partitionId: number;
+    readonly policy: AppliedPolicy;
+    // (undocumented)
+    readonly records: readonly MatchedRecord[];
+    readonly safeAckOffset?: bigint;
+    // (undocumented)
+    readonly stop: StopReason;
+}
+
+// @public
+export interface MatchedRecord {
+    // (undocumented)
+    readonly [READER_TAG]?: ReaderTag;
+    readonly evaluated: boolean;
+    readonly frontier: bigint;
+    // (undocumented)
+    readonly headers: ReadonlyMap<string, IggyHeaderValue>;
+    // (undocumented)
+    readonly headersMalformed?: boolean;
+    json(): unknown;
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly payload: Uint8Array;
+    readonly timestampMicros?: bigint;
 }
 
 // @public (undocumented)
@@ -3791,6 +4610,15 @@ export interface Path {
     readonly nodes: readonly NodeId[];
 }
 
+// @public
+export type PathSegment = {
+    readonly kind: "key";
+    readonly key: string;
+} | {
+    readonly kind: "index";
+    readonly index: number;
+};
+
 // @public (undocumented)
 export const POLICY_DECISION_OPERATION = "policy_decision";
 
@@ -3892,6 +4720,24 @@ export interface PresenceEntry {
     readonly presence: AgentPresence;
     // (undocumented)
     readonly principal?: PrincipalId;
+}
+
+// @public (undocumented)
+export interface PreviewRecord {
+    // (undocumented)
+    readonly explanation?: FilterExplanation;
+    // (undocumented)
+    readonly fault?: FaultReason;
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly payloadText: string;
+    // (undocumented)
+    readonly payloadTruncated: boolean;
+    // (undocumented)
+    readonly timestampMicros: bigint;
+    // (undocumented)
+    readonly verdict: FilterVerdict;
 }
 
 // @public (undocumented)
@@ -4455,6 +5301,20 @@ export function quorumOf(needed: number): GatherPolicy;
 // @public
 export function quorumSatisfied(policy: GatherPolicy, successes: number): boolean;
 
+// @public
+export const READER_TAG: unique symbol;
+
+// @public
+export interface ReaderTag {
+    // (undocumented)
+    readonly owner: object;
+    // (undocumented)
+    readonly sequence: number;
+}
+
+// @public
+export type ReadMode = "primary" | "local";
+
 // @public (undocumented)
 export class RecallBuilder {
     constructor(handle: MemoryHandle);
@@ -4540,6 +5400,14 @@ class Record_2 {
 export { Record_2 as Record }
 
 // @public (undocumented)
+export interface RecordFault {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly reason: FaultReason;
+}
+
+// @public (undocumented)
 export function recordHeaders(record: Record_2): ReadonlyMap<string, IggyHeaderValue>;
 
 // @public (undocumented)
@@ -4553,6 +5421,9 @@ export class RecordId extends WireId<"RecordId"> {
     // (undocumented)
     static tryParse(text: string): RecordId | undefined;
 }
+
+// @public
+export type RecordPolicy = "reject" | "pass";
 
 // @public (undocumented)
 export interface RegisteredCard {
@@ -4999,7 +5870,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.4.1";
+export const SDK_VERSION = "0.5.0";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;
@@ -5145,6 +6016,24 @@ export interface SnapshotStore {
     save(snapshot: FoldSnapshot): Promise<void>;
 }
 
+// @public
+export interface SourceGeneration {
+    // (undocumented)
+    readonly partitionCreatedRevision: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly purgeGeneration: bigint;
+    // (undocumented)
+    readonly streamCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+    // (undocumented)
+    readonly topicId: number;
+}
+
 // @public (undocumented)
 export interface SourceSelector {
     // (undocumented)
@@ -5223,6 +6112,9 @@ export class StepUpRequiredError extends LaserError {
     // (undocumented)
     readonly scope: string;
 }
+
+// @public (undocumented)
+export type StopReason = "filled" | "budget" | "end_of_visible" | "fault" | "oversized_record";
 
 // @public (undocumented)
 export class Stream {
@@ -5333,12 +6225,30 @@ export class TestClock implements Clock {
     set(nowMicros: bigint): void;
 }
 
+// @public
+export type TextMatch = "equals" | "prefix" | "suffix" | "contains" | "glob" | "regex";
+
+// @public
+export interface TextPredicate {
+    // (undocumented)
+    readonly caseInsensitive?: boolean;
+    // (undocumented)
+    readonly field: string;
+    // (undocumented)
+    readonly kind: TextMatch;
+    // (undocumented)
+    readonly pattern: string;
+}
+
 // @public (undocumented)
 export class TimeoutError extends LaserError {
     constructor(message: string, options?: {
         cause?: unknown;
     });
 }
+
+// @public
+export type TimestampFormat = "rfc3339" | "epoch_seconds" | "epoch_millis" | "epoch_micros";
 
 // @public (undocumented)
 export function toContextBlock(items: readonly MemoryItem[], tokenBudget?: number): string;
@@ -5383,6 +6293,7 @@ export class Topic {
     // (undocumented)
     consumerGroup(name: string, options?: ConsumerOptions): Promise<Consumer>;
     ensure(partitions?: number, options?: TopicEnsureOptions): Promise<void>;
+    ensureConsumerGroup(name: string): Promise<void>;
     // (undocumented)
     json<T>(codec: Codec<T>): TypedTopic<T>;
     // (undocumented)
@@ -5442,6 +6353,9 @@ export class TransportError extends LaserError {
     // (undocumented)
     readonly retryable: boolean;
 }
+
+// @public (undocumented)
+export type Truth = "match" | "no_match" | "unknown";
 
 // @public (undocumented)
 export class TypedDecodeError extends LaserError {
@@ -5774,15 +6688,15 @@ export class ZeroEmbedder implements Embedder {
 
 // Warnings were encountered during analysis:
 //
-// src/agent/reliable-consumer.ts:158:7 - (ae-forgotten-export) The symbol "SignatureContext" needs to be exported by the entry point index.d.ts
+// src/agent/reliable-consumer.ts:159:7 - (ae-forgotten-export) The symbol "SignatureContext" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:71:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:71:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:363:7 - (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:364:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:369:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:374:7 - (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
+// src/wire/filter.ts:307:40 - (ae-forgotten-export) The symbol "CmpOp" needs to be exported by the entry point index.d.ts
 // src/wire/query.ts:44:7 - (ae-forgotten-export) The symbol "SnapshotSelector" needs to be exported by the entry point index.d.ts
-// src/wire/query.ts:64:30 - (ae-forgotten-export) The symbol "Predicate" needs to be exported by the entry point index.d.ts
 // src/wire/schema.ts:124:33 - (ae-forgotten-export) The symbol "DecimalValue" needs to be exported by the entry point index.d.ts
 // src/wire/schema.ts:127:32 - (ae-forgotten-export) The symbol "FieldValue" needs to be exported by the entry point index.d.ts
 // src/wire/schema.ts:129:29 - (ae-forgotten-export) The symbol "MapEntry" needs to be exported by the entry point index.d.ts

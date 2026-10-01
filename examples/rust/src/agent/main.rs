@@ -1,4 +1,4 @@
-use laser_examples::{PARTITIONS, init_tracing, laser, phase, release_after, stream_for};
+use laser_examples::{PARTITIONS, fresh_run, init_tracing, laser, phase, stream_for};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::CapabilityDescriptor;
 use std::time::Duration;
@@ -25,7 +25,7 @@ impl AgentHandler for Triage {
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("agent"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("agent"), async {
+    fresh_run(&laser, &stream_for("agent"), async {
         // The well-known agent topics (commands, responses, registry, ...) must
         // exist before an agent's consumer group joins one.
         laser.bootstrap(PARTITIONS).await?;

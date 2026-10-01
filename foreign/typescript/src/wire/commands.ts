@@ -55,6 +55,32 @@ import {
 } from "./browse.js"
 import { decodeOne, encodeNamed, expectMap } from "./cbor.js"
 import {
+  type ConsumerFilter,
+  type FilterCatalogReply,
+  type FilterMutationRequest,
+  type FilterPreviewRequest,
+  type FilterReply,
+  type FilterTestRequest,
+  type GetFilter,
+  type GetFilterBinding,
+  type GetFilterOperation,
+  type ListFilterBindings,
+  type ListFilterRevisions,
+  type ListFilters,
+  decodeFilterCatalogReply,
+  decodeFilterReply,
+  encodeConsumerFilter,
+  encodeFilterMutationRequest,
+  encodeFilterPreviewRequest,
+  encodeFilterTestRequest,
+  encodeGetFilter,
+  encodeGetFilterBinding,
+  encodeGetFilterOperation,
+  encodeListFilterBindings,
+  encodeListFilterRevisions,
+  encodeListFilters
+} from "./filter.js"
+import {
   type CheckpointReadReply,
   type CheckpointReply,
   type CheckpointRequestEnvelope,
@@ -91,11 +117,18 @@ import {
   AGDX_DESTINATION_GET_CODE,
   AGDX_DESTINATION_LIST_CODE,
   AGDX_DECODE_RECORD_CODE,
+  AGDX_FILTER_MUTATE_CODE,
+  AGDX_FILTER_OPERATION_CODE,
+  AGDX_FILTER_PREVIEW_CODE,
+  AGDX_FILTER_TEST_CODE,
+  AGDX_FILTER_VALIDATE_CODE,
   AGDX_FORK_CREATE_CODE,
   AGDX_FORK_DELETE_CODE,
   AGDX_FORK_LIST_CODE,
   AGDX_FORK_PROMOTE_CODE,
   AGDX_FORK_PUT_CODE,
+  AGDX_GET_FILTER_BINDING_CODE,
+  AGDX_GET_FILTER_CODE,
   AGDX_GET_PROJECTION_CODE,
   AGDX_GET_SCHEMA_CODE,
   AGDX_GRAPH_NEIGHBORS_CODE,
@@ -117,6 +150,9 @@ import {
   AGDX_KV_RELEASE_CODE,
   AGDX_KV_SCAN_CODE,
   AGDX_KV_SET_CODE,
+  AGDX_LIST_FILTER_BINDINGS_CODE,
+  AGDX_LIST_FILTER_REVISIONS_CODE,
+  AGDX_LIST_FILTERS_CODE,
   AGDX_LIST_PROJECTIONS_CODE,
   AGDX_LIST_SCHEMAS_CODE,
   AGDX_QUERY_CODE,
@@ -126,6 +162,7 @@ import {
   AGDX_QUERY_STATUS_CODE,
   AGDX_REGISTER_SCHEMA_CODE,
   CHECKPOINT_OP_VERSION,
+  FILTER_OP_VERSION,
   FORK_OP_VERSION,
   GRAPH_OP_VERSION,
   KV_OP_VERSION,
@@ -217,7 +254,7 @@ import {
 
 export type VersionSurface = keyof Pick<
   OpVersions,
-  "query" | "control" | "kv" | "fork" | "graph" | "checkpoint"
+  "query" | "control" | "kv" | "fork" | "graph" | "checkpoint" | "filter"
 >
 
 export interface ManagedCommand<Request, Reply> {
@@ -251,6 +288,75 @@ const kvVersion = { surface: "kv", expected: KV_OP_VERSION } as const
 const forkVersion = { surface: "fork", expected: FORK_OP_VERSION } as const
 const graphVersion = { surface: "graph", expected: GRAPH_OP_VERSION } as const
 const checkpointVersion = { surface: "checkpoint", expected: CHECKPOINT_OP_VERSION } as const
+const filterVersion = { surface: "filter", expected: FILTER_OP_VERSION } as const
+
+export const FilterValidateCommand = framed<ConsumerFilter, FilterReply>(
+  AGDX_FILTER_VALIDATE_CODE,
+  "filters",
+  encodeConsumerFilter,
+  decodeFilterReply
+)
+export const FilterTestCommand = framed<FilterTestRequest, FilterReply>(
+  AGDX_FILTER_TEST_CODE,
+  "filters",
+  encodeFilterTestRequest,
+  decodeFilterReply
+)
+export const FilterPreviewCommand = framed<FilterPreviewRequest, FilterReply>(
+  AGDX_FILTER_PREVIEW_CODE,
+  "filters",
+  encodeFilterPreviewRequest,
+  decodeFilterReply
+)
+export const FilterMutateCommand = framed<FilterMutationRequest, FilterCatalogReply>(
+  AGDX_FILTER_MUTATE_CODE,
+  "filterCatalog",
+  encodeFilterMutationRequest,
+  decodeFilterCatalogReply,
+  filterVersion
+)
+export const GetFilterCommand = framed<GetFilter, FilterCatalogReply>(
+  AGDX_GET_FILTER_CODE,
+  "filterCatalog",
+  encodeGetFilter,
+  decodeFilterCatalogReply,
+  filterVersion
+)
+export const ListFiltersCommand = framed<ListFilters, FilterCatalogReply>(
+  AGDX_LIST_FILTERS_CODE,
+  "filterCatalog",
+  encodeListFilters,
+  decodeFilterCatalogReply,
+  filterVersion
+)
+export const ListFilterRevisionsCommand = framed<ListFilterRevisions, FilterCatalogReply>(
+  AGDX_LIST_FILTER_REVISIONS_CODE,
+  "filterCatalog",
+  encodeListFilterRevisions,
+  decodeFilterCatalogReply,
+  filterVersion
+)
+export const GetFilterBindingCommand = framed<GetFilterBinding, FilterCatalogReply>(
+  AGDX_GET_FILTER_BINDING_CODE,
+  "filterCatalog",
+  encodeGetFilterBinding,
+  decodeFilterCatalogReply,
+  filterVersion
+)
+export const ListFilterBindingsCommand = framed<ListFilterBindings, FilterCatalogReply>(
+  AGDX_LIST_FILTER_BINDINGS_CODE,
+  "filterCatalog",
+  encodeListFilterBindings,
+  decodeFilterCatalogReply,
+  filterVersion
+)
+export const FilterOperationCommand = framed<GetFilterOperation, FilterCatalogReply>(
+  AGDX_FILTER_OPERATION_CODE,
+  "filterCatalog",
+  encodeGetFilterOperation,
+  decodeFilterCatalogReply,
+  filterVersion
+)
 
 export const WhoamiCommand = framed<undefined, AuthzReply>(
   AGDX_AUTHZ_WHOAMI_CODE,

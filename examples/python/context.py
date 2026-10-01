@@ -53,7 +53,7 @@ async def main() -> None:
         for turn in turns:
             print(f"    {bytes(turn.payload).decode()}")
     finally:
-        await _common.release_stream(laser, EXAMPLE)
+        await laser.close()
 
 
 if __name__ == "__main__":

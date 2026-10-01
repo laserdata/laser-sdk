@@ -1,5 +1,6 @@
 use crate::destination::{BackendResourceId, FileFormat, TableFormat};
 use crate::error::InvalidError;
+use crate::filter::{FILTER_EVALUATOR_VERSION, FilterCodec};
 use crate::query::{Consistency, SqlDialect};
 use crate::schema::LogicalTypeKind;
 use crate::topology::WireTopology;
@@ -41,6 +42,13 @@ pub mod feature {
     /// send the reshaped lease ops (or a barriered read) to a server without
     /// this bit, which would silently decode them under the old contract.
     pub const KV_FENCED_LEASES: u64 = 1 << 9;
+    /// The streaming server serves consumer filters: filtered reads, fenced
+    /// acknowledgments, previews, sample tests, and validation
+    /// (`AGDX_FILTERED_POLL` and the rest of the delivery band's server-native
+    /// decade). Server-native, so it holds with the managed backend disabled.
+    /// The saved-filter catalog additionally needs the backend's `filter` op
+    /// version.
+    pub const CONSUMER_FILTERS: u64 = 1 << 10;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability
@@ -67,6 +75,10 @@ pub struct OpVersions {
     /// Destination and checkpoint operation version. Zero means not served.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub checkpoint: u32,
+    /// The consumer-filter catalog op version served by the managed backend. Zero
+    /// means the catalog (saved filters and group bindings) is not served.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub filter: u32,
     /// Capability feature bits (see [`feature`]): managed sub-features served
     /// beyond the base surface (compare-and-swap, read-your-writes, strong
     /// consistency). `0` (the default) is skipped on encode, so a pre-feature
@@ -96,6 +108,7 @@ impl OpVersions {
             agent: 0,
             graph: 0,
             checkpoint: 0,
+            filter: 0,
             features: 0,
         }
     }
@@ -118,6 +131,13 @@ impl OpVersions {
     #[must_use]
     pub fn with_checkpoint(mut self, checkpoint: u32) -> Self {
         self.checkpoint = checkpoint;
+        self
+    }
+
+    /// Returns a copy advertising the consumer-filter catalog version served.
+    #[must_use]
+    pub fn with_filter(mut self, filter: u32) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -581,6 +601,44 @@ pub struct BackendAnnounce {
     /// own [`WireTopology::default`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<WireTopology>,
+    /// The consumer-filter evaluation the streaming server serves, set with
+    /// the `CONSUMER_FILTERS` bit. Absent from an older server, whose client
+    /// then assumes its own evaluator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<FilterAnnounce>,
+}
+
+/// The consumer-filter evaluation a server serves. A client refuses to run a
+/// filter under another evaluator version or with a codec the server does not
+/// list, so a version gap fails before the first page instead of filtering
+/// differently.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterAnnounce {
+    pub evaluator_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<FilterCodec>,
+}
+
+impl FilterAnnounce {
+    /// What this build of the evaluator serves.
+    pub fn served() -> Self {
+        Self {
+            evaluator_version: FILTER_EVALUATOR_VERSION,
+            codecs: vec![
+                FilterCodec::Json,
+                FilterCodec::HeadersOnly,
+                FilterCodec::Avro,
+                FilterCodec::Protobuf,
+                FilterCodec::Cbor,
+            ],
+        }
+    }
+
+    /// Whether a filter with `evaluator_version` and `codec` evaluates here
+    /// exactly as it would in the client that built it.
+    pub fn evaluates(&self, evaluator_version: u32, codec: FilterCodec) -> bool {
+        self.evaluator_version == evaluator_version && self.codecs.contains(&codec)
+    }
 }
 
 impl BackendAnnounce {
@@ -591,7 +649,15 @@ impl BackendAnnounce {
             ready: true,
             backends: Vec::new(),
             topology: None,
+            filters: None,
         }
+    }
+
+    /// Returns a copy announcing the served consumer-filter evaluation.
+    #[must_use]
+    pub fn with_filters(mut self, filters: FilterAnnounce) -> Self {
+        self.filters = Some(filters);
+        self
     }
 
     #[must_use]
@@ -802,5 +868,21 @@ mod tests {
         let plain = HelloReply::new(OpVersions::new(1, 1, 1, 1));
         let json = serde_json::to_string(&plain).expect("json");
         assert!(!json.contains("features"), "zero features omitted: {json}");
+    }
+
+    #[test]
+    fn given_announced_filter_evaluation_when_round_tripped_then_should_gate_codecs_and_versions() {
+        let announce = BackendAnnounce::new(OpVersions::new(1, 1, 1, 1))
+            .with_filters(FilterAnnounce::served());
+        let bytes = encode_named(&announce).expect("serializes");
+        let back: BackendAnnounce = decode_named(&bytes).expect("deserializes");
+        let filters = back.filters.expect("the evaluation is announced");
+        assert!(filters.evaluates(FILTER_EVALUATOR_VERSION, FilterCodec::Json));
+        assert!(!filters.evaluates(FILTER_EVALUATOR_VERSION + 1, FilterCodec::Json));
+        assert!(!filters.evaluates(FILTER_EVALUATOR_VERSION, FilterCodec::Unknown));
+        let plain =
+            encode_named(&BackendAnnounce::new(OpVersions::new(1, 1, 1, 1))).expect("serializes");
+        let older: BackendAnnounce = decode_named(&plain).expect("deserializes");
+        assert_eq!(older.filters, None);
     }
 }

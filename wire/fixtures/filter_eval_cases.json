@@ -1,0 +1,3722 @@
+{
+  "evaluator_version": 1,
+  "limits": {
+    "max_payload_bytes": 1048576,
+    "max_depth": 64
+  },
+  "cases": [
+    {
+      "name": "strict safe-mode filter on update with changed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "value-only safe-mode filter on update with changed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "strict safe-mode filter on update without changed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "value-only safe-mode filter on update without changed",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "strict safe-mode filter on delete",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"d\",\"table\":\"satellites\",\"committed_at\":\"2026-09-21T18:07:03.001000\",\"before\":{\"id\":\"sat-042\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "value-only safe-mode filter on delete",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"d\",\"table\":\"satellites\",\"committed_at\":\"2026-09-21T18:07:03.001000\",\"before\":{\"id\":\"sat-042\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "strict safe-mode filter on telemetry event safe",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":\"safe\"},\"timestamp_ms\":1758470652331}",
+      "expected": "selected"
+    },
+    {
+      "name": "value-only safe-mode filter on telemetry event safe",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":\"safe\"},\"timestamp_ms\":1758470652331}",
+      "expected": "rejected"
+    },
+    {
+      "name": "strict safe-mode filter on telemetry event nominal",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":\"nominal\"},\"timestamp_ms\":1758470652331}",
+      "expected": "selected"
+    },
+    {
+      "name": "value-only safe-mode filter on telemetry event nominal",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":\"nominal\"},\"timestamp_ms\":1758470652331}",
+      "expected": "rejected"
+    },
+    {
+      "name": "strict safe-mode filter on telemetry event null",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":null},\"timestamp_ms\":1758470652331}",
+      "expected": "selected"
+    },
+    {
+      "name": "value-only safe-mode filter on telemetry event null",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":null},\"timestamp_ms\":1758470652331}",
+      "expected": "rejected"
+    },
+    {
+      "name": "strict safe-mode filter on telemetry event other field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"battery_pct\":58},\"timestamp_ms\":1758470652331}",
+      "expected": "rejected"
+    },
+    {
+      "name": "value-only safe-mode filter on telemetry event other field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"battery_pct\":58},\"timestamp_ms\":1758470652331}",
+      "expected": "rejected"
+    },
+    {
+      "name": "strict safe-mode filter on changed names another field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"battery_pct\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "value-only safe-mode filter on changed names another field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"battery_pct\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "strict safe-mode filter on ground station noise",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "u"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "changed",
+                    "op": "contains",
+                    "value": {
+                      "kind": "string",
+                      "value": "mode"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "after.mode",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "safe"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "table",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellites"
+                    }
+                  }
+                },
+                {
+                  "pred": {
+                    "field": "op",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "d"
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "all": [
+                {
+                  "pred": {
+                    "field": "event",
+                    "op": "eq",
+                    "value": {
+                      "kind": "string",
+                      "value": "satellite.telemetry_changed"
+                    }
+                  }
+                },
+                {
+                  "present": "fields.mode"
+                }
+              ]
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"ground_stations\",\"changed\":[\"status\"],\"after\":{\"id\":\"svalbard\",\"status\":\"online\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "value-only safe-mode filter on ground station noise",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "u"
+                }
+              }
+            },
+            {
+              "pred": {
+                "field": "after.mode",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "safe"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"ground_stations\",\"changed\":[\"status\"],\"after\":{\"id\":\"svalbard\",\"status\":\"online\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "eq null matches a missing field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "missing",
+            "op": "eq",
+            "value": {
+              "kind": "null"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{}",
+      "expected": "selected"
+    },
+    {
+      "name": "eq null matches an explicit null",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "v",
+            "op": "eq",
+            "value": {
+              "kind": "null"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":null}",
+      "expected": "selected"
+    },
+    {
+      "name": "ne null rejects an explicit null",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "v",
+            "op": "ne",
+            "value": {
+              "kind": "null"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":null}",
+      "expected": "rejected"
+    },
+    {
+      "name": "ne null rejects a missing field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "v",
+            "op": "ne",
+            "value": {
+              "kind": "null"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{}",
+      "expected": "rejected"
+    },
+    {
+      "name": "ne null selects a present value",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "v",
+            "op": "ne",
+            "value": {
+              "kind": "null"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":0}",
+      "expected": "selected"
+    },
+    {
+      "name": "eq on a missing field is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "v",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "x"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{}",
+      "expected": "rejected"
+    },
+    {
+      "name": "not keeps unknown for a missing field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "not": {
+            "pred": {
+              "field": "v",
+              "op": "eq",
+              "value": {
+                "kind": "string",
+                "value": "x"
+              }
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{}",
+      "expected": "rejected"
+    },
+    {
+      "name": "eq on an explicit null is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "not": {
+            "pred": {
+              "field": "v",
+              "op": "eq",
+              "value": {
+                "kind": "string",
+                "value": "x"
+              }
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":null}",
+      "expected": "rejected"
+    },
+    {
+      "name": "not of a real mismatch selects",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "not": {
+            "pred": {
+              "field": "v",
+              "op": "eq",
+              "value": {
+                "kind": "string",
+                "value": "x"
+              }
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":\"y\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "present selects an explicit null",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "present": "v"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":null}",
+      "expected": "selected"
+    },
+    {
+      "name": "absent rejects an explicit null",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "absent": "v"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"v\":null}",
+      "expected": "rejected"
+    },
+    {
+      "name": "absent selects a missing field",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "absent": "v"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"w\":1}",
+      "expected": "selected"
+    },
+    {
+      "name": "either of two presences",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "present": "fields.mode"
+            },
+            {
+              "present": "fields.battery_pct"
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"battery_pct\":58},\"timestamp_ms\":1758470652331}",
+      "expected": "selected"
+    },
+    {
+      "name": "a path through a scalar is missing",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "a.b.c",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 1
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"a\":{\"b\":\"text\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "large integers compare exactly",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 9007199254740993
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"id\":9007199254740993}",
+      "expected": "selected"
+    },
+    {
+      "name": "large integer neighbors differ",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 9007199254740993
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"id\":9007199254740992}",
+      "expected": "rejected"
+    },
+    {
+      "name": "integer equals an exact double",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "port",
+            "op": "eq",
+            "value": {
+              "kind": "double",
+              "value": 8443.0
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"port\":8443}",
+      "expected": "selected"
+    },
+    {
+      "name": "an inexact integer against a double is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "eq",
+            "value": {
+              "kind": "double",
+              "value": 1.0
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"id\":9007199254740993}",
+      "expected": "rejected"
+    },
+    {
+      "name": "a numeric string is not a number",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "port",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 8443
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"port\":\"8443\"}",
+      "expected": "rejected"
+    },
+    {
+      "name": "integer ordering",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "port",
+            "op": "gt",
+            "value": {
+              "kind": "long",
+              "value": 5000
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"port\":8443}",
+      "expected": "selected"
+    },
+    {
+      "name": "negative ordering",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "delta",
+            "op": "lt",
+            "value": {
+              "kind": "long",
+              "value": -1
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"delta\":-2}",
+      "expected": "selected"
+    },
+    {
+      "name": "strings order bytewise",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "name",
+            "op": "gt",
+            "value": {
+              "kind": "string",
+              "value": "a"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"name\":\"b\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "uppercase sorts before lowercase",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "name",
+            "op": "lt",
+            "value": {
+              "kind": "string",
+              "value": "a"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"name\":\"Z\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "unicode strings compare exactly",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "city",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "Kraków"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"city\":\"Krak\\u00f3w\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "contains is a literal substring",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "name",
+            "op": "contains",
+            "value": {
+              "kind": "string",
+              "value": "_%"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"name\":\"a_%b\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "contains does not treat wildcards as patterns",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "name",
+            "op": "contains",
+            "value": {
+              "kind": "string",
+              "value": "a%b"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"name\":\"axxb\"}",
+      "expected": "rejected"
+    },
+    {
+      "name": "contains on a missing array is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "ground_stations",
+            "op": "contains",
+            "value": {
+              "kind": "string",
+              "value": "svalbard"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "contains on a nested array",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "after.ground_stations",
+            "op": "contains",
+            "value": {
+              "kind": "string",
+              "value": "svalbard"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "contains matches typed array elements",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "tags",
+            "op": "contains",
+            "value": {
+              "kind": "long",
+              "value": 2
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"tags\":[1,2,3]}",
+      "expected": "selected"
+    },
+    {
+      "name": "contains does not coerce array elements",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "tags",
+            "op": "contains",
+            "value": {
+              "kind": "long",
+              "value": 2
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"tags\":[\"2\"]}",
+      "expected": "rejected"
+    },
+    {
+      "name": "prefix on a missing field is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "prefix",
+            "value": {
+              "kind": "string",
+              "value": "sat-04"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "prefix on a nested name",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "after.id",
+            "op": "prefix",
+            "value": {
+              "kind": "string",
+              "value": "sat-04"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "in selects a listed value",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "table",
+            "op": "in",
+            "value": {
+              "kind": "list",
+              "value": [
+                {
+                  "kind": "string",
+                  "value": "satellites"
+                },
+                {
+                  "kind": "string",
+                  "value": "ground_stations"
+                }
+              ]
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"table\":\"ground_stations\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "in rejects an unlisted value",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "table",
+            "op": "in",
+            "value": {
+              "kind": "list",
+              "value": [
+                {
+                  "kind": "string",
+                  "value": "satellites"
+                },
+                {
+                  "kind": "string",
+                  "value": "ground_stations"
+                }
+              ]
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"table\":\"launches\"}",
+      "expected": "rejected"
+    },
+    {
+      "name": "an index selects an array element",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "after.ground_stations[0]",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "svalbard"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "selected"
+    },
+    {
+      "name": "an out of range index is missing",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "after.ground_stations[5]",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "x"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "an escaped dot addresses a dotted key",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "a\\.b",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 1
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"a.b\":1}",
+      "expected": "selected"
+    },
+    {
+      "name": "a digit key is a key",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "codes.200",
+            "op": "eq",
+            "value": {
+              "kind": "long",
+              "value": 3
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"codes\":{\"200\":3}}",
+      "expected": "selected"
+    },
+    {
+      "name": "comparing an object is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "after",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "x"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "duplicate keys keep the last value",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "kind",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "B"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"kind\":\"A\",\"kind\":\"B\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "rfc3339 instants compare across offsets",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "at",
+              "op": "eq",
+              "value": {
+                "kind": "string",
+                "value": "2026-09-21T18:04:12.331Z"
+              }
+            },
+            "coerce": {
+              "kind": "timestamp",
+              "format": "rfc3339"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"at\":\"2026-09-21T20:04:12.331+02:00\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "rfc3339 without a zone is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "committed_at",
+              "op": "gt",
+              "value": {
+                "kind": "string",
+                "value": "2026-09-21T00:00:00Z"
+              }
+            },
+            "coerce": {
+              "kind": "timestamp",
+              "format": "rfc3339"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"op\":\"u\",\"table\":\"satellites\",\"changed\":[\"mode\"],\"committed_at\":\"2026-09-21T18:04:12.331000\",\"after\":{\"id\":\"sat-042\",\"name\":\"Kestrel-42\",\"mode\":\"safe\",\"orbit\":\"leo\",\"ground_stations\":[\"svalbard\"],\"thrusters_armed\":false,\"battery_pct\":61},\"source\":{\"db\":\"mission_ops\",\"lsn\":\"112352528325\"}}",
+      "expected": "rejected"
+    },
+    {
+      "name": "epoch millis compare as instants",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "timestamp_ms",
+              "op": "gte",
+              "value": {
+                "kind": "long",
+                "value": 1758470652331
+              }
+            },
+            "coerce": {
+              "kind": "timestamp",
+              "format": "epoch_millis"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"event\":\"satellite.telemetry_changed\",\"satellite_id\":\"sat-042\",\"fields\":{\"mode\":\"safe\"},\"timestamp_ms\":1758470652331}",
+      "expected": "selected"
+    },
+    {
+      "name": "epoch seconds from an integer string",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "at",
+              "op": "lt",
+              "value": {
+                "kind": "long",
+                "value": 1758470653
+              }
+            },
+            "coerce": {
+              "kind": "timestamp",
+              "format": "epoch_seconds"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"at\":\"1758470652\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "number coercion compares decimal strings exactly",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "amount",
+              "op": "gt",
+              "value": {
+                "kind": "string",
+                "value": "9007199254740992"
+              }
+            },
+            "coerce": {
+              "kind": "number"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"amount\":\"9007199254740993\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "number coercion normalizes trailing zeros",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "amount",
+              "op": "eq",
+              "value": {
+                "kind": "string",
+                "value": "12.5"
+              }
+            },
+            "coerce": {
+              "kind": "number"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"amount\":\"12.50\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "number coercion reads json numbers",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "amount",
+              "op": "eq",
+              "value": {
+                "kind": "long",
+                "value": 12
+              }
+            },
+            "coerce": {
+              "kind": "number"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "number coercion rejects non numbers",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "amount",
+              "op": "eq",
+              "value": {
+                "kind": "long",
+                "value": 12
+              }
+            },
+            "coerce": {
+              "kind": "number"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"amount\":\"twelve\"}",
+      "expected": "rejected"
+    },
+    {
+      "name": "coerced in lists",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred_as": {
+            "pred": {
+              "field": "amount",
+              "op": "in",
+              "value": {
+                "kind": "list",
+                "value": [
+                  {
+                    "kind": "string",
+                    "value": "1.0"
+                  },
+                  {
+                    "kind": "long",
+                    "value": 2
+                  }
+                ]
+              }
+            },
+            "coerce": {
+              "kind": "number"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"amount\":\"2\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "header string equality",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "table",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "satellites"
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "opaque protobuf bytes",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "table",
+          "value": {
+            "kind": "string",
+            "value": "satellites"
+          }
+        }
+      ]
+    },
+    {
+      "name": "header int ordering",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "attempt",
+            "op": "gt",
+            "value": {
+              "kind": "long",
+              "value": 2
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "attempt",
+          "value": {
+            "kind": "int",
+            "value": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "header uint ordering",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "size",
+            "op": "gte",
+            "value": {
+              "kind": "long",
+              "value": 10
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "size",
+          "value": {
+            "kind": "uint",
+            "value": 10
+          }
+        }
+      ]
+    },
+    {
+      "name": "header raw utf8 equality",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "tag",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "abc"
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "tag",
+          "value": {
+            "kind": "raw",
+            "value": [
+              97,
+              98,
+              99
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "a missing header is unknown",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "table",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "satellites"
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "",
+      "expected": "rejected",
+      "headers": [
+        {
+          "key": "other",
+          "value": {
+            "kind": "string",
+            "value": "x"
+          }
+        }
+      ]
+    },
+    {
+      "name": "headers decide before a malformed payload",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "d"
+                }
+              }
+            },
+            {
+              "header": {
+                "key": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "not json",
+      "expected": "rejected",
+      "headers": [
+        {
+          "key": "table",
+          "value": {
+            "kind": "string",
+            "value": "ground_stations"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an any with a matching header skips the payload",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "any": [
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "d"
+                }
+              }
+            },
+            {
+              "header": {
+                "key": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "not json",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "table",
+          "value": {
+            "kind": "string",
+            "value": "satellites"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a needed malformed payload faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "all": [
+            {
+              "pred": {
+                "field": "op",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "d"
+                }
+              }
+            },
+            {
+              "header": {
+                "key": "table",
+                "op": "eq",
+                "value": {
+                  "kind": "string",
+                  "value": "satellites"
+                }
+              }
+            }
+          ]
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "not json",
+      "expected": "fault",
+      "headers": [
+        {
+          "key": "table",
+          "value": {
+            "kind": "string",
+            "value": "satellites"
+          }
+        }
+      ]
+    },
+    {
+      "name": "malformed json faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "present": "a"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"a\":",
+      "expected": "fault"
+    },
+    {
+      "name": "an over deep payload faults",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "present": "a"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"a\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+      "expected": "fault"
+    },
+    {
+      "name": "brackets inside strings do not count as depth",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "present": "a"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"a\":\"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "an empty payload faults under json",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "present": "a"
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "",
+      "expected": "fault"
+    },
+    {
+      "name": "large power of two equals its exact double",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "eq",
+            "value": {
+              "kind": "double",
+              "value": 1.8014398509481984e+16
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"id\":18014398509481984}",
+      "expected": "selected"
+    },
+    {
+      "name": "minimum signed integer equals its exact double",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "eq",
+            "value": {
+              "kind": "double",
+              "value": -9.223372036854776e+18
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"id\":-9223372036854775808}",
+      "expected": "selected"
+    },
+    {
+      "name": "unused number overflow",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "mode",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "safe"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"mode\":\"safe\",\"unused\":1e400}",
+      "headers": [],
+      "expected": "fault"
+    },
+    {
+      "name": "unused lone surrogate",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "mode",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "safe"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"mode\":\"safe\",\"unused\":\"\\ud800\"}",
+      "headers": [],
+      "expected": "fault"
+    },
+    {
+      "name": "unused array number overflow",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "mode.value",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "safe"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"mode\":[1e400]}",
+      "headers": [],
+      "expected": "fault"
+    },
+    {
+      "name": "text equals",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "equals",
+            "pattern": "billing.invoice.v1.created"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text prefix",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "prefix",
+            "pattern": "billing."
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text suffix",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "suffix",
+            "pattern": ".created"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text suffix miss",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "suffix",
+            "pattern": ".deleted"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "rejected"
+    },
+    {
+      "name": "text contains subdomain",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "contains",
+            "pattern": ".v1."
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text glob",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "glob",
+            "pattern": "billing.*.v?.created"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text glob whole value",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "glob",
+            "pattern": "invoice.*"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "rejected"
+    },
+    {
+      "name": "text regex",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "regex",
+            "pattern": "^billing\\.[a-z]+\\.v[0-9]+\\."
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text equals ignoring case",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "equals",
+            "pattern": "BILLING.INVOICE.V1.CREATED",
+            "case_insensitive": true
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text glob ignoring case",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "glob",
+            "pattern": "BILLING.*",
+            "case_insensitive": true
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "selected"
+    },
+    {
+      "name": "text on a number is a rejected mismatch",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "amount",
+            "kind": "prefix",
+            "pattern": "1"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "rejected",
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "text on a number passes under mismatch pass",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "amount",
+            "kind": "prefix",
+            "pattern": "1"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "fault"
+    },
+    {
+      "name": "eq string against number rejected",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "amount",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "Abc"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "rejected",
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "eq string against number passes",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "amount",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "Abc"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "fault"
+    },
+    {
+      "name": "missing field is not a mismatch",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "absent",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "Abc"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "expected": "rejected"
+    },
+    {
+      "name": "header text on a mixed log",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header_text": {
+            "field": "event.type",
+            "kind": "contains",
+            "pattern": ".v1."
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "opaque bytes",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "event.type",
+          "value": {
+            "kind": "string",
+            "value": "billing.invoice.v1.created"
+          }
+        }
+      ]
+    },
+    {
+      "name": "foreign codec rejected before decoding",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "type",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "billing"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "not json",
+      "expected": "rejected",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 6
+          }
+        }
+      ],
+      "fault": "foreign_codec"
+    },
+    {
+      "name": "foreign codec passes under foreign pass",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "type",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "billing"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "foreign_policy": "pass"
+      },
+      "payload": "not json",
+      "expected": "fault",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 6
+          }
+        }
+      ]
+    },
+    {
+      "name": "declared json decodes",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "type",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "billing"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing\"}",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "unknown content type code decodes",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "type",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "billing"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing\"}",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 200
+          }
+        }
+      ]
+    },
+    {
+      "name": "header text on a numeric header is a rejected mismatch",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header_text": {
+            "field": "event.type",
+            "kind": "prefix",
+            "pattern": "billing."
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "opaque",
+      "expected": "rejected",
+      "headers": [
+        {
+          "key": "event.type",
+          "value": {
+            "kind": "uint",
+            "value": 7
+          }
+        }
+      ],
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "text on an explicit null is unknown, not a mismatch",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "contains",
+            "pattern": ".v1."
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"type\":null}",
+      "expected": "rejected"
+    },
+    {
+      "name": "an int kind content type also names the codec",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "type",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "billing"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "not json",
+      "expected": "rejected",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "int",
+            "value": 6
+          }
+        }
+      ],
+      "fault": "foreign_codec"
+    },
+    {
+      "name": "glob with an escaped star",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "glob",
+            "pattern": "a\\*b"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"a*b\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "glob with an escaped star rejects a literal x",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "glob",
+            "pattern": "a\\*b"
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"axb\"}",
+      "expected": "rejected"
+    },
+    {
+      "name": "case insensitive regex",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "type",
+            "kind": "regex",
+            "pattern": "^BILLING",
+            "case_insensitive": true
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing.invoice\"}",
+      "expected": "selected"
+    },
+    {
+      "name": "cbor filter meets a json content type",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "type",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "billing"
+            }
+          }
+        },
+        "codec": "cbor",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"type\":\"billing\"}",
+      "expected": "rejected",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        }
+      ],
+      "fault": "foreign_codec"
+    },
+    {
+      "name": "a big integer against a double is undecidable, not a mismatch",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "id",
+            "op": "eq",
+            "value": {
+              "kind": "double",
+              "value": 1.0
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"id\":9007199254740993}",
+      "expected": "rejected"
+    },
+    {
+      "name": "a mixed in list with no comparable item is a mismatch",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "code",
+            "op": "in",
+            "value": {
+              "kind": "list",
+              "value": [
+                {
+                  "kind": "string",
+                  "value": "a"
+                },
+                {
+                  "kind": "string",
+                  "value": "b"
+                }
+              ]
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"code\":4}",
+      "expected": "fault",
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "duplicate header keys resolve to the last one",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "priority",
+            "op": "eq",
+            "value": {
+              "kind": "int",
+              "value": 2
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "opaque",
+      "expected": "selected",
+      "headers": [
+        {
+          "key": "priority",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        },
+        {
+          "key": "priority",
+          "value": {
+            "kind": "uint",
+            "value": 2
+          }
+        }
+      ]
+    },
+    {
+      "name": "mismatch pass keeps undecidable numeric kinds rejected",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "value",
+            "op": "eq",
+            "value": {
+              "kind": "double",
+              "value": 9007199254740992.0
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"value\":9007199254740993}",
+      "expected": "rejected",
+      "fault": null
+    },
+    {
+      "name": "mismatch pass reports incompatible scalar kinds",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "value",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "one"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop",
+        "mismatch_policy": "pass"
+      },
+      "payload": "{\"value\":1}",
+      "expected": "fault",
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "mismatch reject explains incompatible scalar kinds",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "value",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "one"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"value\":1}",
+      "expected": "rejected",
+      "fault": "type_mismatch"
+    },
+    {
+      "name": "duplicate user headers keep the last value",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "header": {
+            "key": "mode",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "unsafe"
+            }
+          }
+        },
+        "codec": "headers_only",
+        "fault_policy": "stop"
+      },
+      "payload": "",
+      "headers": [
+        {
+          "key": "mode",
+          "value": {
+            "kind": "string",
+            "value": "safe"
+          }
+        },
+        {
+          "key": "mode",
+          "value": {
+            "kind": "string",
+            "value": "unsafe"
+          }
+        }
+      ],
+      "expected": "selected",
+      "fault": null
+    },
+    {
+      "name": "duplicate content type uses the last declared codec",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "pred": {
+            "field": "mode",
+            "op": "eq",
+            "value": {
+              "kind": "string",
+              "value": "safe"
+            }
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"mode\":\"safe\"}",
+      "headers": [
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 1
+          }
+        },
+        {
+          "key": "agdx.ct",
+          "value": {
+            "kind": "uint",
+            "value": 3
+          }
+        }
+      ],
+      "expected": "rejected",
+      "fault": "foreign_codec"
+    },
+    {
+      "name": "case insensitive glob preserves expanding Unicode lowercase",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "value",
+            "kind": "glob",
+            "pattern": "İ?",
+            "case_insensitive": true
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"value\":\"İx\"}",
+      "expected": "selected",
+      "fault": null
+    },
+    {
+      "name": "case insensitive glob folds each Greek literal",
+      "filter": {
+        "v": 1,
+        "evaluator_version": 1,
+        "expr": {
+          "text": {
+            "field": "road",
+            "kind": "glob",
+            "pattern": "ΟΔΟΣ*",
+            "case_insensitive": true
+          }
+        },
+        "codec": "json",
+        "fault_policy": "stop"
+      },
+      "payload": "{\"road\": \"ΟΔΟΣΑ\"}",
+      "expected": "selected"
+    }
+  ]
+}

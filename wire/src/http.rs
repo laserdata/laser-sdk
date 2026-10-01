@@ -7,7 +7,7 @@ use crate::destination::{
 };
 use crate::fork::{ForkError, ForkKind};
 use crate::graph::SourceRef;
-use crate::hello::{BackendDescriptor, OpVersions};
+use crate::hello::{BackendDescriptor, FilterAnnounce, OpVersions};
 use crate::kv::KvError;
 use crate::query::{Consistency, QueryError, QueryExecutionId, QueryExecutionStatus, QueryResult};
 use crate::result::ResultCode;
@@ -48,6 +48,60 @@ pub const RUNS_PATH: &str = "/agdx/runs";
 pub const AUTHZ_WHOAMI_PATH: &str = "/agdx/authz/whoami";
 /// `GET /agdx/authz/roles`: list governance roles.
 pub const AUTHZ_ROLES_PATH: &str = "/agdx/authz/roles";
+/// `GET /agdx/filters`: list saved consumer filters.
+pub const FILTERS_PATH: &str = "/agdx/filters";
+pub const FILTER_METRICS_PATH: &str = "/agdx/filters/metrics";
+/// `POST /agdx/filters/mutations`: one catalog mutation with its outcome.
+pub const FILTER_MUTATIONS_PATH: &str = "/agdx/filters/mutations";
+/// `POST /agdx/filters/validate`: validate and compile a filter.
+pub const FILTER_VALIDATE_PATH: &str = "/agdx/filters/validate";
+/// `POST /agdx/filters/test`: evaluate a filter against a supplied sample.
+pub const FILTER_TEST_PATH: &str = "/agdx/filters/test";
+/// `POST /agdx/filters/preview`: preview a filter over stored records.
+pub const FILTER_PREVIEW_PATH: &str = "/agdx/filters/preview";
+/// `GET /agdx/filter-bindings`: list consumer-group filter bindings.
+pub const FILTER_BINDINGS_PATH: &str = "/agdx/filter-bindings";
+
+/// `GET /agdx/filters/{id}`.
+pub fn filter_path(id: u32) -> String {
+    format!("{FILTERS_PATH}/{id}")
+}
+
+/// `GET /agdx/filters/{id}/revisions`.
+pub fn filter_revisions_path(id: u32) -> String {
+    format!("{FILTERS_PATH}/{id}/revisions")
+}
+
+/// `GET /agdx/filters/operations/{operation_id}`.
+pub fn filter_operation_path(operation_id: u128) -> String {
+    format!("{FILTERS_PATH}/operations/{operation_id}")
+}
+
+/// `GET /agdx/filter-bindings/{stream}/{topic}/{group}`. Each name is
+/// percent-encoded as one path segment, because Iggy names can hold `/`, `?`,
+/// or `#`.
+pub fn filter_binding_path(stream: &str, topic: &str, group: &str) -> String {
+    format!(
+        "{FILTER_BINDINGS_PATH}/{}/{}/{}",
+        path_segment(stream),
+        path_segment(topic),
+        path_segment(group)
+    )
+}
+
+/// Percent-encode `text` as one URL path segment: every byte outside the
+/// RFC 3986 unreserved set becomes `%XX`.
+pub fn path_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
 
 pub fn destination_path(id: DestinationId) -> String {
     format!("{DESTINATIONS_PATH}/{id}")
@@ -506,6 +560,10 @@ pub struct Capabilities {
     /// console can show its roles and bindings surface. Off by default.
     #[serde(default)]
     pub authz: bool,
+    /// Consumer filters: server-side evaluation and the saved-filter catalog,
+    /// reported separately.
+    #[serde(default)]
+    pub filters: FilterCapsView,
     pub versions: OpVersions,
     /// Materialization backends the server currently exposes, so a client can
     /// show what it may route to. Identity only (id + engine kind), no settings
@@ -574,6 +632,66 @@ pub struct DestinationCapsView {
     pub strongest_consistency: crate::checkpoint::CheckpointReadConsistency,
 }
 
+/// Consumer filters on the HTTP capabilities reply. Native evaluation is served
+/// by the streaming server itself and holds with the managed backend off. The
+/// catalog (saved filters and group bindings) needs the backend.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterCapsView {
+    /// Filtered reads, fenced acknowledgments, sample tests, and validation.
+    #[serde(default)]
+    pub native: bool,
+    /// Bounded previews over stored records.
+    #[serde(default)]
+    pub preview: bool,
+    /// Filtered reads from the partition primary through an attached session.
+    #[serde(default)]
+    pub primary_routing: bool,
+    /// Saved filters, revisions, and mutation outcomes.
+    #[serde(default)]
+    pub catalog: bool,
+    /// Consumer groups bound to a saved revision.
+    #[serde(default)]
+    pub managed_groups: bool,
+    /// The evaluation rules served (`0` when native evaluation is off).
+    #[serde(default)]
+    pub evaluator_version: u32,
+    /// The payload codecs a filter may select.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<crate::filter::FilterCodec>,
+}
+
+impl FilterCapsView {
+    /// The view a server serving native evaluation (`native`) and, with it, the
+    /// catalog (`catalog`) advertises.
+    pub fn served(native: bool, catalog: bool) -> Self {
+        let evaluation = native.then(FilterAnnounce::served);
+        Self {
+            native,
+            preview: native,
+            primary_routing: native,
+            catalog: native && catalog,
+            managed_groups: native && catalog,
+            evaluator_version: evaluation
+                .as_ref()
+                .map_or(0, |evaluation| evaluation.evaluator_version),
+            codecs: evaluation
+                .map(|evaluation| evaluation.codecs)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Returns a copy reporting the evaluation a server announced instead of
+    /// this build's own.
+    #[must_use]
+    pub fn with_evaluation(mut self, evaluation: FilterAnnounce) -> Self {
+        if self.native {
+            self.evaluator_version = evaluation.evaluator_version;
+            self.codecs = evaluation.codecs;
+        }
+        self
+    }
+}
+
 /// The managed key-value surface on the HTTP capabilities reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCapsView {
@@ -638,10 +756,18 @@ impl Capabilities {
             agent_workflow: false,
             watch: false,
             authz: false,
+            filters: FilterCapsView::default(),
             versions,
             backends: Vec::new(),
             topology: None,
         }
+    }
+
+    /// Advertise the consumer-filter surface.
+    #[must_use]
+    pub fn with_filters(mut self, filters: FilterCapsView) -> Self {
+        self.filters = filters;
+        self
     }
 
     /// Advertise that the knowledge-graph ops are served. Off by default: a
@@ -784,6 +910,10 @@ impl Capabilities {
             // The graph surface needs a backend that serves it, advertised as a
             // non-zero graph op version, so it is gated on that rather than implied.
             .with_graph(enabled && versions.graph > 0)
+            .with_filters(FilterCapsView::served(
+                versions.has_feature(feature::CONSUMER_FILTERS),
+                enabled && versions.filter > 0,
+            ))
     }
 }
 
@@ -1048,6 +1178,13 @@ impl From<&QueryError> for ErrorBody {
     }
 }
 
+impl From<&crate::filter::FilterError> for ErrorBody {
+    fn from(error: &crate::filter::FilterError) -> Self {
+        Self::new(error.code, error.message.clone())
+            .with_detail(serde_json::json!({ "reason": error.reason }))
+    }
+}
+
 impl From<&KvError> for ErrorBody {
     fn from(error: &KvError) -> Self {
         Self::new(ResultCode::from(error), error.to_string())
@@ -1130,6 +1267,59 @@ pub struct ProjectionListQuery {
 pub struct SchemaListQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_contains: Option<String>,
+}
+
+/// `GET /agdx/filters` query parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<crate::filter::FilterState>,
+    /// Only filters with a lower id, for stable paging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+}
+
+/// `GET /agdx/filters/{id}/revisions` query parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterRevisionListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+}
+
+/// `GET /agdx/filter-bindings` query parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterBindingListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+}
+
+/// `POST /agdx/filters/test` body. The sample payload is given either as
+/// base64url bytes or as UTF-8 text, never both.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FilterTestBody {
+    pub filter: crate::filter::FilterRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<crate::filter::FilterHeader>,
 }
 
 /// `GET /agdx/kv/{namespace}` scan filters. The byte-valued bounds
@@ -1396,6 +1586,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "http-client")]
+    fn given_names_with_reserved_characters_when_building_a_binding_path_then_should_encode_each_segment()
+     {
+        assert_eq!(
+            filter_binding_path("orbit", "fleet/changes", "desk?x#1"),
+            "/agdx/filter-bindings/orbit/fleet%2Fchanges/desk%3Fx%231"
+        );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
     fn given_list_filters_when_url_encoded_then_field_names_match_the_param_consts() {
         let projections = ProjectionListQuery {
             name_contains: Some("order".to_owned()),

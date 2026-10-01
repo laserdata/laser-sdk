@@ -1,0 +1,54 @@
+{
+  "v": 1,
+  "operation_id": "10",
+  "mutation": {
+    "unbind": {
+      "group": {
+        "stream": "orbit",
+        "topic": "fleet_changes",
+        "group": "anomaly-desk"
+      },
+      "expected_digest": [
+        66,
+        237,
+        252,
+        100,
+        0,
+        234,
+        124,
+        122,
+        99,
+        36,
+        154,
+        107,
+        96,
+        99,
+        240,
+        16,
+        108,
+        39,
+        86,
+        145,
+        172,
+        228,
+        139,
+        178,
+        8,
+        134,
+        213,
+        25,
+        226,
+        129,
+        178,
+        216
+      ],
+      "expected_identity": {
+        "stream_id": 1,
+        "stream_created_at_micros": 1717171717000000,
+        "topic_id": 2,
+        "topic_created_at_micros": 1717171717000001,
+        "group_id": 3
+      }
+    }
+  }
+}

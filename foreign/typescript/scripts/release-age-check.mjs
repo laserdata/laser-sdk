@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from "node:fs"
 
 const MINIMUM_RELEASE_AGE_DAYS = Number(process.env.MINIMUM_RELEASE_AGE_DAYS ?? "7")
 const REGISTRY = "https://registry.npmjs.org"
+const REGISTRY_ORIGIN = new URL(REGISTRY).origin
 const CONCURRENCY = 16
 
 // Packages released in step with the streaming server the SDK is developed
@@ -21,12 +22,23 @@ function exemptFromCooldown({ name }) {
   return SERVER_LOCKSTEP_COOLDOWN_EXEMPT.has(name)
 }
 
+// True when `resolved` is served by the public npm registry. The parsed origin
+// is compared, not a string prefix, so a host such as
+// `registry.npmjs.org.example.com` is never taken for the registry.
+function fromRegistry(resolved) {
+  try {
+    return new URL(resolved).origin === REGISTRY_ORIGIN
+  } catch {
+    return false
+  }
+}
+
 function lockedVersions(lockPath) {
   const lock = JSON.parse(readFileSync(lockPath, "utf8"))
   const locked = new Map()
   for (const [path, metadata] of Object.entries(lock.packages)) {
     if (path === "" || metadata.link === true) continue
-    if (typeof metadata.resolved === "string" && !metadata.resolved.startsWith(REGISTRY)) continue
+    if (typeof metadata.resolved === "string" && !fromRegistry(metadata.resolved)) continue
     const name =
       metadata.name ?? path.slice(path.lastIndexOf("node_modules/") + "node_modules/".length)
     locked.set(`${name}@${metadata.version}`, { name, version: metadata.version })

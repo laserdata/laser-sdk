@@ -14,7 +14,7 @@ Read [AGENTS.md](../../../AGENTS.md) and [laser-sdk-overview](../laser-sdk-overv
 - `foreign/typescript/src/stream`, `managed`, `agent`, `memory`, `bridges`: public behavior by layer
 - `foreign/typescript/test`: unit, wire, robustness, and real-Iggy integration
 - `bdd/typescript`: every shared Gherkin scenario, no copied features
-- `examples/typescript`: eight primitive and nine deep-dive mirrors
+- `examples/typescript`: nine primitive and nine deep-dive mirrors
 
 Public bytes are `Uint8Array`. Wire-sized u64 and u128 values are `bigint`. Public JSON is `unknown` until validated. Source is strict ESM, semicolon-free, has no public `any`, and uses no default exports. Managed operations negotiate capabilities and return `UnsupportedError` on Apache Iggy.
 

@@ -24,9 +24,9 @@ The maintained artifact versions are:
 
 | Binary | Version |
 | --- | --- |
-| Iggy server | `0.9.0-ld` |
+| Iggy server | `0.9.1-ld` |
 | `iggy-bench` | `0.6.0` |
-| plane | `0.19.0` |
+| plane | `0.20.0` |
 
 ## Default Campaign
 
@@ -121,9 +121,9 @@ Artifact mode downloads binaries and adjacent Minisign signatures from `https://
 [provisioning]
 mode = "artifact"
 cpu_target = "skylake"
-iggy_server_version = "0.9.0-ld"
+iggy_server_version = "0.9.1-ld"
 iggy_bench_version = "0.6.0"
-plane_version = "0.19.0"
+plane_version = "0.20.0"
 ```
 
 Path mode runs caller-provided native binaries and records their digests:
@@ -173,3 +173,9 @@ The compile-only benchmark gate uses the development profile. Measurement comman
 The root Rust CI runs these detached workspace gates explicitly.
 
 Zed loads both the published workspace and the detached benchmark workspace through `.zed/settings.json`, so navigation, diagnostics, and references work inside `bench/` without adding benchmark dependencies to the published Cargo graph.
+
+## Consumer-filter evaluation paths
+
+`cargo bench --manifest-path bench/Cargo.toml --bench filter_paths` measures every case in the shared JSON and codec corpora. Each case checks its frozen expected verdict before measurement. Compilation stays outside the measured loop. This covers typed headers, fields, boolean expressions, missing values, coercions, text predicates, and codec error paths. These are evaluator component costs, not network latency or server throughput.
+
+`cargo bench --manifest-path bench/Cargo.toml --bench glob` compares the compiled glob matcher with the preserved original algorithm on identical inputs. It includes a normal event name, Unicode, and repeated-prefix rejection at 1 KiB and 64 KiB. The comparison asserts identical results before timing.

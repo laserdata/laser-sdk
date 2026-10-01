@@ -1,8 +1,10 @@
 # LaserData -Laser SDK examples - TypeScript
 
-The TypeScript examples mirror the Rust and Python catalog: eight tiny primitive examples plus the nine non-benchmark deep-dive scenarios. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
+The TypeScript examples mirror the Rust and Python catalog: nine tiny primitive examples plus the nine non-benchmark deep-dive scenarios. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
 
 Run the commands below from `examples/typescript`.
+
+**Consumer filters: 98.5% less payload transfer in the CDC example.** The reader receives 4 of 240 records from the shared feed, with original bytes and offsets. The example also covers typed records, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
 
 ## Setup
 
@@ -22,7 +24,7 @@ Start Apache Iggy, then run any example. The SDK uses Iggy's native VSR transpor
 npm run example:native-streaming
 ```
 
-With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each invocation gets its own `laser-<example>-<token>` stream so the agent topics, consumer offsets, and managed views never collide, even across repeat runs. The run deletes that stream when it finishes, including after an error. A stream supplied through `LASER_STREAM` is kept.
+With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each example uses its own `laser-<example>-typescript` stream so the agent topics, consumer offsets, and managed views of different examples never collide. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. Managed index names carry a per-run token. A stream supplied through `LASER_STREAM` is never deleted.
 
 For the complete managed surface, start Laser Stack with `./scripts/up` from its checkout and use the `LASER_CONNECTION_STRING` it prints.
 
@@ -67,7 +69,7 @@ The firehose also accepts `LASER_FIREHOSE_MESSAGES`, `LASER_FIREHOSE_ORGS`, `LAS
 
 ## Primitives - start here
 
-One tiny, single-primitive example each, 25-75 lines including imports. Read one in 30 seconds, then jump to the deep-dive scenario that uses the same primitive in anger.
+One tiny, single-primitive example each, most under 100 lines including imports. `cdc` is longer because it walks every filter phase. Read one in a minute, then jump to the deep-dive scenario that uses the same primitive in anger.
 
 | Example | Primitive | What it shows | Needs Cloud? | Docs |
 | --- | --- | --- | --- | --- |
@@ -75,6 +77,7 @@ One tiny, single-primitive example each, 25-75 lines including imports. Read one
 | [`query`](src/query/README.md) | Views | Declare a view over a topic, publish orders, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch`](src/watch/README.md) | Change feed | React to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
 | [`kv`](src/kv/README.md) | State | Set/get keyed JSON with a TTL, upgrade it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
+| [`cdc`](src/cdc/README.md) | Consumer filters | Read four safe-mode events out of a 240-record feed of typed records, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (bindings need plane) | no | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
 | [`graph`](src/graph/README.md) | Graph | Link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall`](src/recall/README.md) | Memory | All four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
 | [`context`](src/context/README.md) | Context | Assemble one conversation under a `LastN` + `TokenBudget` policy chain | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |

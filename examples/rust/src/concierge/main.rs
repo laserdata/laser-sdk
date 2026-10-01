@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use futures::future::join_all;
 use laser_examples::{
-    LlmClient, PARTITIONS, batch, default_llm, env_bool, init_tracing, laser,
-    managed_feature_ready, messages, phase, release_after, start_projector, stream_for,
+    LlmClient, PARTITIONS, batch, default_llm, env_bool, fresh_run, init_tracing, laser,
+    managed_feature_ready, messages, phase, start_projector, stream_for,
 };
 use laser_sdk::iggy::prelude::IggyTimestamp;
 use laser_sdk::prelude::full::*;
@@ -152,7 +152,7 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     phase("warming up");
     let laser = laser(&stream_for("concierge"), Capabilities::OPEN).await?;
-    release_after(&laser, &stream_for("concierge"), async {
+    fresh_run(&laser, &stream_for("concierge"), async {
         laser.bootstrap(PARTITIONS).await?;
         laser.topic(TICKETS_TOPIC).ensure(PARTITIONS).await?;
         let capabilities = laser.capabilities().await;

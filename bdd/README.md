@@ -18,6 +18,8 @@ bdd/
 │   ├── capabilities.feature           negotiation + the Unsupported boundary
 │   ├── capabilities_injected.feature  the read-consistency pre-gate under injected caps
 │   ├── data_stack.feature              schemas, typed query, destinations, checkpoints, and Arrow
+│   ├── filters.feature                consumer-filter evaluation rules (shared evaluator)
+│   ├── filters_live.feature           server-side filtered reads + the catalog Unsupported boundary
 │   ├── governance.feature             action governance at the effect boundary
 │   ├── graph.feature                  knowledge graph traversal semantics (reference engine)
 │   ├── kv_cas.feature                 compare-and-swap semantics (reference engine)
@@ -38,6 +40,8 @@ Streaming, provenance, and agent scenarios run against open Apache Iggy. Managed
 ## What is NOT here, and why
 
 KV and forks use managed commands through `send_raw_with_response`. Apache Iggy without a managed backend rejects these calls. Reference files cover their bytes, and `kv_cas.feature` tests behavior through the reference engine in `bdd/rust/src/kv_engine.rs`. Full managed execution needs Laser Stack or LaserData Cloud. The default BDD suite uses Apache Iggy and local reference engines.
+
+`filters.feature` runs each SDK's own evaluator against named records, with no server. Rust and Python use the shared Rust evaluator, and TypeScript runs its port. The same cases live in `wire/fixtures/filter_eval_cases.json` for the unit suites. `filters_live.feature` needs a server that serves consumer filters, and checks that the saved-filter catalog is refused without a managed plane.
 
 A new client must pass the shared reference files and applicable behavior scenarios.
 
