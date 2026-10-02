@@ -27,7 +27,7 @@ LASER_CONNECTION_STRING='user:pwd@iggy-host:8090' \
 ## Highlights
 
 - `topic.producer()` exposes direct batching, linger, retries, topology, and per-send key or partition routing.
-- `topic.consumer_group()` returns a `futures::Stream` with configurable start, polling, replay, retries, group creation, and commit policy.
+- `topic.consumer_group().consumer().build().await` returns a `futures::Stream` with configurable start, polling, replay, retries, group creation, and commit policy.
 - Iterate with `while let Some(message) = consumer.next().await`, or Python `async for message in consumer`. For a bounded single-record wait, use `Consumer::next_within(timeout)`.
 - Use `CommitPolicy::Disabled` with `consumer.commit(&message)` to store an offset after handling. Shutdown does not commit an unhandled record. Each explicit commit requires a `store_offset` round trip, so it can be slower than batched commits.
 - `ConsumerMessage` preserves the raw payload, typed headers, timestamps, partition, and exact log offset.

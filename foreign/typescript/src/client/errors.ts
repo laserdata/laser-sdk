@@ -1,4 +1,9 @@
-import type { FaultReason, FilterError, FilterErrorReason } from "../wire/filter.js"
+import type {
+  FaultReason,
+  FilterError,
+  FilterErrorReason,
+  FilterGroupIdentity
+} from "../wire/filter.js"
 
 export type LaserErrorKind =
   | "config"
@@ -232,6 +237,31 @@ export class FilterStopError extends LaserError {
 
   get reason(): "fault" | "oversized_record" {
     return this.stop
+  }
+}
+
+/**
+ * The consumer group exists, but its filter was not configured. The group
+ * stays as it is, unbound unless it ran a policy before, and no reader joined
+ * it. `cause` is the catalog refusal or the transport failure, and `reason`
+ * the catalog's reason when there is one.
+ */
+export class ConsumerGroupSetupError extends LaserError {
+  constructor(
+    readonly groupId: number,
+    readonly groupName: string,
+    readonly identity: FilterGroupIdentity,
+    cause: unknown
+  ) {
+    super(
+      `consumer group ${String(groupId)} (${groupName}) exists but its filter was not configured: ${cause instanceof Error ? cause.message : String(cause)}`,
+      "filter",
+      { cause }
+    )
+  }
+
+  get reason(): FilterErrorReason | undefined {
+    return this.cause instanceof FilterExecutionError ? this.cause.reason : undefined
   }
 }
 

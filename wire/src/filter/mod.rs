@@ -14,13 +14,14 @@ pub mod read;
 pub mod text;
 
 pub use catalog::{
-    FilterBinding, FilterBindingPage, FilterCatalogCommand, FilterCatalogLimits,
+    CatalogPosition, FilterBinding, FilterBindingPage, FilterCatalogCommand, FilterCatalogLimits,
     FilterCatalogOutcome, FilterCatalogReply, FilterCatalogVersion, FilterDetail,
     FilterGroupIdentity, FilterGroupRef, FilterMutation, FilterMutationOutcome,
     FilterMutationRequest, FilterMutationResult, FilterMutationStatus, FilterPage, FilterPolicyRef,
     FilterRevisionInfo, FilterRevisionPage, FilterRevisionRef, FilterState, FilterSummary,
-    GetFilter, GetFilterBinding, GetFilterOperation, ListFilterBindings, ListFilterRevisions,
-    ListFilters, ResolveFilterPolicy, ResolvedFilterPolicy, WatchFilterCatalog,
+    GetFilter, GetFilterBinding, GetFilterOperation, GroupFilterSpec, GroupPolicyUnbound,
+    ListFilterBindings, ListFilterRevisions, ListFilters, ResolveFilterPolicy,
+    ResolvedFilterPolicy, WatchFilterCatalog,
 };
 pub use coerce::{ExactDecimal, TimestampFormat};
 pub use expr::{
@@ -29,10 +30,10 @@ pub use expr::{
 };
 pub use path::{FieldPath, PathSegment};
 pub use read::{
-    AckReceipt, AppliedPolicy, Continuation, ExplainNode, FaultReason, FilterConsumer,
-    FilterDecodeLimits, FilterError, FilterErrorReason, FilterExplanation, FilterHeader,
-    FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply, FilterSource,
-    FilterTestRequest, FilterTestResult, FilterValidation, FilteredAck, FilteredPage,
+    AckReceipt, AppliedPolicy, Continuation, ExecutionMode, ExplainNode, FaultReason,
+    FilterConsumer, FilterDecodeLimits, FilterError, FilterErrorReason, FilterExplanation,
+    FilterHeader, FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
+    FilterSource, FilterTestRequest, FilterTestResult, FilterValidation, FilteredAck, FilteredPage,
     FilteredPollRequest, FilteredStart, HeaderScalar, PreviewRecord, ReadMode, RecordFault,
     SourceGeneration, StopReason, Truth, Verdict,
 };

@@ -25,13 +25,11 @@ async def wait_for_schema(laser: ls.Laser, schema_id: int) -> None:
         await asyncio.sleep(0.05)
 
 
-async def run_codecs(laser: ls.Laser, stream: str, catalog: bool) -> None:
+async def run_codecs(laser: ls.Laser) -> None:
     _common.phase("select typed records inside CBOR, Avro, and Protobuf payloads")
     registered = []
     try:
         for codec in ("cbor", "avro", "protobuf"):
-            if codec != "cbor" and not catalog:
-                continue
             source = None
             message_type = None
             if codec == "avro":
@@ -78,14 +76,9 @@ async def run_codecs(laser: ls.Laser, stream: str, catalog: bool) -> None:
                 if codec == "cbor"
                 else getattr(ls.ConsumerFilter, codec)(expr, [schema_id])
             )
-            reader = await laser.filters().reader(
-                stream,
-                topic_name,
-                consumer=f"safe-{codec}",
-                filter=filter,
-                start="first",
-                local_guard=True,
-            )
+            group = topic.consumer_group(f"safe-{codec}")
+            await group.create(filter=filter)
+            reader = await group.reader(start="first", local_guard=True)
             try:
                 record = await asyncio.wait_for(reader.next_record(), 15)
                 value = (
@@ -101,6 +94,7 @@ async def run_codecs(laser: ls.Laser, stream: str, catalog: bool) -> None:
                 await reader.ack(record)
             finally:
                 await reader.close()
+                await group.filter().release()
     except BaseException:
         for schema_id in registered:
             with suppress(Exception):

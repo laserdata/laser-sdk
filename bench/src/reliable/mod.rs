@@ -360,6 +360,7 @@ async fn start_consumer(
     if case.variant == ReliableVariant::PlainGroup {
         let consumer = topic
             .consumer_group("laser-bench-plain")
+            .consumer()
             .batch_length(128)
             .without_poll_interval()
             .commit_policy(CommitPolicy::Disabled)

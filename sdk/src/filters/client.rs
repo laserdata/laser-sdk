@@ -1,30 +1,29 @@
 use crate::error::{LaserError, decode_managed_reply};
-use crate::filters::reader::FilteredReaderBuilder;
 use crate::laser::Laser;
+#[cfg(feature = "filters")]
+use laser_wire::codes::AGDX_LIST_FILTER_BINDINGS_CODE;
 use laser_wire::codes::{
     AGDX_FILTER_MUTATE_CODE, AGDX_FILTER_OPERATION_CODE, AGDX_FILTER_PREVIEW_CODE,
-    AGDX_FILTER_TEST_CODE, AGDX_FILTER_VALIDATE_CODE, AGDX_GET_FILTER_BINDING_CODE,
-    AGDX_GET_FILTER_CODE, AGDX_LIST_FILTER_BINDINGS_CODE, AGDX_LIST_FILTER_REVISIONS_CODE,
-    AGDX_LIST_FILTERS_CODE, FILTER_OP_VERSION,
+    AGDX_FILTER_TEST_CODE, AGDX_GET_FILTER_BINDING_CODE, AGDX_LIST_FILTER_REVISIONS_CODE,
+    FILTER_OP_VERSION,
 };
 use laser_wire::filter::{
-    ConsumerFilter, FilterBinding, FilterBindingPage, FilterCatalogOutcome, FilterCatalogReply,
-    FilterDetail, FilterError, FilterErrorReason, FilterGroupRef, FilterHeader, FilterMutation,
+    CatalogPosition, ConsumerFilter, FilterBinding, FilterCatalogOutcome, FilterCatalogReply,
+    FilterError, FilterErrorReason, FilterGroupRef, FilterHeader, FilterMutation,
     FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
-    FilterOutcome, FilterPage, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
-    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterState, FilterTestRequest,
-    FilterTestResult, FilterValidation, GetFilter, GetFilterBinding, GetFilterOperation,
-    ListFilterBindings, ListFilterRevisions, ListFilters,
+    FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply, FilterRevisionPage,
+    FilterRevisionRef, FilterSource, FilterTestRequest, FilterTestResult, GetFilterBinding,
+    GetFilterOperation, GroupFilterSpec, ListFilterRevisions,
 };
+#[cfg(feature = "filters")]
+use laser_wire::filter::{FilterBindingPage, ListFilterBindings};
 use laser_wire::framing::encode_named;
 use laser_wire::limits::{MAX_FILTER_PREVIEW_EXAMINED, MAX_FILTER_PREVIEW_RECORDS};
-use laser_wire::schema::Digest32;
 use laser_wire::validate::Validate;
 use serde::Serialize;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
-const DEFAULT_PAGE_SIZE: u32 = 50;
 const DEFAULT_PREVIEW_RECORDS: u32 = 20;
 const MUTATION_ATTEMPTS: u32 = 3;
 const MUTATION_RETRY_BACKOFF: Duration = Duration::from_millis(200);
@@ -34,46 +33,29 @@ const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DEFAULT_OUTCOME_WAIT: Duration = Duration::from_secs(30);
 
 impl Laser {
-    /// Server-side consumer filters: filtered readers, previews, sample tests,
-    /// and the saved-filter catalog. Native reads need a server that advertises
-    /// consumer filters. The catalog also needs a managed plane. Either missing
-    /// answers `LaserError::Unsupported`.
-    pub fn filters(&self) -> Filters<'_> {
+    /// The catalog and native filter commands behind a consumer group's
+    /// filter handle. Native commands need a server that advertises consumer
+    /// filters. The catalog also needs a managed plane. Either missing answers
+    /// `LaserError::Unsupported`.
+    pub(crate) fn filters(&self) -> Filters<'_> {
         Filters { laser: self }
     }
 }
 
-/// A handle to consumer filters. Build it with [`Laser::filters`].
-pub struct Filters<'a> {
+/// The catalog and native filter commands. Reached through
+/// [`ConsumerGroup::filter`](crate::stream::ConsumerGroup::filter).
+pub(crate) struct Filters<'a> {
     laser: &'a Laser,
 }
 
+/// A mutation's recorded result and the control-log position it was applied
+/// at.
+pub(crate) struct AppliedMutation {
+    pub(crate) result: FilterMutationResult,
+    pub(crate) catalog_position: Option<CatalogPosition>,
+}
+
 impl<'a> Filters<'a> {
-    /// A filtered reader over `stream` / `topic`. Pick an independent consumer
-    /// and partition, or a consumer group, then a filter and a start.
-    pub fn reader(
-        &self,
-        stream: impl Into<String>,
-        topic: impl Into<String>,
-    ) -> FilteredReaderBuilder<'a> {
-        FilteredReaderBuilder::new(
-            self.laser,
-            FilterSource {
-                stream: stream.into(),
-                topic: topic.into(),
-            },
-        )
-    }
-
-    /// Validate and compile `filter` on the server without running it.
-    pub async fn validate(&self, filter: &ConsumerFilter) -> Result<FilterValidation, LaserError> {
-        filter.validate()?;
-        match self.native(AGDX_FILTER_VALIDATE_CODE, filter).await? {
-            FilterOutcome::Validated(validation) => Ok(validation),
-            _ => Err(unexpected("validate")),
-        }
-    }
-
     /// Evaluate `filter` against one supplied record and explain the verdict.
     /// Nothing is read from a stream and nothing is stored.
     pub async fn test(
@@ -122,33 +104,6 @@ impl<'a> Filters<'a> {
         }
     }
 
-    /// One saved filter with its latest revision and bindings.
-    pub async fn get(&self, filter_id: u32) -> Result<FilterDetail, LaserError> {
-        let request = GetFilter {
-            v: FILTER_OP_VERSION,
-            filter_id,
-        };
-        match self.catalog(AGDX_GET_FILTER_CODE, &request).await? {
-            FilterCatalogOutcome::Filter(detail) => Ok(detail),
-            _ => Err(unexpected("get")),
-        }
-    }
-
-    /// Saved filters, newest first. Narrow and page with the returned builder.
-    pub fn list(&self) -> FilterList<'a> {
-        FilterList {
-            filters: Filters { laser: self.laser },
-            request: ListFilters {
-                v: FILTER_OP_VERSION,
-                name_contains: None,
-                state: None,
-                before_id: None,
-                page: 0,
-                page_size: DEFAULT_PAGE_SIZE,
-            },
-        }
-    }
-
     /// One page of a filter's revisions, newest first.
     pub async fn revisions(
         &self,
@@ -188,6 +143,7 @@ impl<'a> Filters<'a> {
 
     /// One page of bindings, optionally narrowed to one filter, one stream,
     /// or one stream and topic.
+    #[cfg(feature = "filters")]
     pub async fn bindings(
         &self,
         filter_id: Option<u32>,
@@ -227,24 +183,6 @@ impl<'a> Filters<'a> {
         }
     }
 
-    /// Save a new filter as revision 1.
-    pub async fn register(
-        &self,
-        name: impl Into<String>,
-        filter: ConsumerFilter,
-        description: impl Into<String>,
-    ) -> Result<FilterRevisionRef, LaserError> {
-        let mutation = FilterMutation::Register {
-            name: name.into(),
-            description: description.into(),
-            filter,
-        };
-        match self.apply(mutation).await? {
-            FilterMutationResult::Registered(revision) => Ok(revision),
-            _ => Err(unexpected("register")),
-        }
-    }
-
     /// Add a revision. `expected_revision` must still be the latest one.
     pub async fn revise(
         &self,
@@ -257,74 +195,39 @@ impl<'a> Filters<'a> {
             expected_revision,
             filter,
         };
-        match self.apply(mutation).await? {
+        match self.apply(mutation).await?.result {
             FilterMutationResult::Revised(revision) => Ok(revision),
             _ => Err(unexpected("revise")),
         }
     }
 
-    /// Replace a filter's description. Its revisions are unchanged.
-    pub async fn describe(
-        &self,
-        filter_id: u32,
-        description: impl Into<String>,
-    ) -> Result<(), LaserError> {
-        let mutation = FilterMutation::Describe {
-            filter_id,
-            description: description.into(),
-        };
-        self.apply(mutation).await.map(|_| ())
-    }
-
-    /// Hide a filter from new bindings. Existing bindings keep executing.
-    pub async fn archive(&self, filter_id: u32) -> Result<(), LaserError> {
-        self.apply(FilterMutation::Archive { filter_id })
-            .await
-            .map(|_| ())
-    }
-
-    /// Delete a filter. Its id and name are never reused. `Conflict` while any
-    /// consumer group is bound to it.
-    pub async fn delete(&self, filter_id: u32) -> Result<(), LaserError> {
-        self.apply(FilterMutation::Drop { filter_id })
-            .await
-            .map(|_| ())
-    }
-
-    /// Pin an existing consumer group to one revision. Every filtered read of
-    /// the group then runs that revision.
-    pub async fn bind(
+    /// Give `group` its policy in one catalog transaction: a definition saved
+    /// as the group's own filter, or one of its existing revisions. A repeat
+    /// with the same digest keeps the binding, another digest conflicts. The
+    /// returned position is where the fold applied it, carried by the group's
+    /// reads so they never see this configuration as absent.
+    pub(crate) async fn configure_group(
         &self,
         group: FilterGroupRef,
-        filter_id: u32,
-        revision: u32,
-    ) -> Result<FilterBinding, LaserError> {
-        let mutation = FilterMutation::Bind {
-            group,
-            filter_id,
-            revision,
-        };
-        match self.apply(mutation).await? {
-            FilterMutationResult::Bound(binding) => Ok(binding),
-            _ => Err(unexpected("bind")),
-        }
-    }
-
-    /// Create the group if absent, then bind it to a saved revision. A failed
-    /// bind can leave an unbound group. Retrying preserves an existing binding.
-    pub async fn create_consumer_group(
-        &self,
-        group: FilterGroupRef,
-        filter_id: u32,
-        revision: u32,
-    ) -> Result<FilterBinding, LaserError> {
-        self.catalog_capabilities().await?;
-        self.laser
-            .stream(&group.stream)
-            .topic(&group.topic)
-            .ensure_consumer_group(&group.group)
+        policy: GroupFilterSpec,
+        operation_id: Option<u128>,
+        expected_identity: laser_wire::filter::FilterGroupIdentity,
+    ) -> Result<(FilterBinding, Option<CatalogPosition>), LaserError> {
+        let operation_id = operation_id.unwrap_or_else(|| u128::from(ulid::Ulid::generate()));
+        let applied = self
+            .apply_positioned(
+                operation_id,
+                FilterMutation::ConfigureGroup {
+                    group,
+                    policy,
+                    expected_identity: Some(expected_identity),
+                },
+            )
             .await?;
-        self.bind(group, filter_id, revision).await
+        match applied.result {
+            FilterMutationResult::Bound(binding) => Ok((binding, applied.catalog_position)),
+            _ => Err(unexpected("configure_group")),
+        }
     }
 
     /// Pause or resume a saved revision. Executable content and its digest
@@ -344,76 +247,52 @@ impl<'a> Filters<'a> {
         .map(|_| ())
     }
 
-    /// Release a consumer group, only while it is still bound to
-    /// `expected_digest`.
-    pub async fn unbind(
-        &self,
-        group: FilterGroupRef,
-        expected_digest: Digest32,
-    ) -> Result<FilterBinding, LaserError> {
-        let mutation = FilterMutation::Unbind {
-            group,
-            expected_digest,
-            expected_identity: None,
-        };
-        match self.apply(mutation).await? {
-            FilterMutationResult::Unbound(binding) => Ok(binding),
-            _ => Err(unexpected("unbind")),
-        }
-    }
-
     /// Release this exact saved binding, including a group incarnation that
-    /// was deleted and recreated under the same name.
-    pub async fn unbind_binding(
+    /// was deleted and recreated under the same name, and return the
+    /// control-log position the release was applied at.
+    pub(crate) async fn release_group(
         &self,
         binding: FilterBinding,
-    ) -> Result<FilterBinding, LaserError> {
-        match self
-            .apply(FilterMutation::Unbind {
-                group: binding.group,
-                expected_digest: binding.digest,
-                expected_identity: Some(binding.identity),
-            })
-            .await?
-        {
-            FilterMutationResult::Unbound(binding) => Ok(binding),
+    ) -> Result<(FilterBinding, Option<CatalogPosition>), LaserError> {
+        let applied = self
+            .apply_positioned(
+                u128::from(ulid::Ulid::generate()),
+                FilterMutation::Unbind {
+                    group: binding.group,
+                    expected_digest: binding.digest,
+                    expected_identity: Some(binding.identity),
+                },
+            )
+            .await?;
+        match applied.result {
+            FilterMutationResult::Unbound(binding) => Ok((binding, applied.catalog_position)),
             _ => Err(unexpected("unbind")),
         }
     }
 
-    /// Submit a mutation under a new operation id and wait for its
-    /// authoritative outcome. A lost reply is retried under the same id, which
-    /// the catalog answers with the first attempt's outcome. A rejection is a
-    /// typed `LaserError::Filter`. An outcome still pending after
-    /// [`DEFAULT_OUTCOME_WAIT`] is `LaserError::AmbiguousMutation`. To recover
-    /// such an outcome, or to resume the same mutation after a restart, use
-    /// [`apply_as`](Self::apply_as) with an id you record first.
-    pub async fn apply(
-        &self,
-        mutation: FilterMutation,
-    ) -> Result<FilterMutationResult, LaserError> {
-        self.apply_as(u128::from(ulid::Ulid::generate()), mutation)
+    // Apply `mutation` under a fresh operation id and wait for its outcome.
+    async fn apply(&self, mutation: FilterMutation) -> Result<AppliedMutation, LaserError> {
+        self.apply_positioned(u128::from(ulid::Ulid::generate()), mutation)
             .await
     }
 
-    /// [`apply`](Self::apply) under a caller-chosen `operation_id`, so a
-    /// caller that records the id first can resume the same mutation after a
-    /// crash.
-    pub async fn apply_as(
+    async fn apply_positioned(
         &self,
         operation_id: u128,
         mutation: FilterMutation,
-    ) -> Result<FilterMutationResult, LaserError> {
+    ) -> Result<AppliedMutation, LaserError> {
         let outcome = self.submit(operation_id, mutation).await?;
-        let status = match outcome.status {
+        let outcome = match outcome.status {
             FilterMutationStatus::Pending => {
-                return self
-                    .wait_for_outcome(operation_id, DEFAULT_OUTCOME_WAIT)
-                    .await;
+                self.wait_outcome(operation_id, DEFAULT_OUTCOME_WAIT)
+                    .await?
             }
-            status => status,
+            _ => outcome,
         };
-        settled(operation_id, status)
+        Ok(AppliedMutation {
+            result: settled(operation_id, outcome.status)?,
+            catalog_position: outcome.catalog_position,
+        })
     }
 
     /// Send one mutation under a caller-chosen `operation_id`. The returned
@@ -436,12 +315,11 @@ impl<'a> Filters<'a> {
         }
     }
 
-    /// Wait for the outcome of `operation_id` for at most `timeout`.
-    pub async fn wait_for_outcome(
+    async fn wait_outcome(
         &self,
         operation_id: u128,
         timeout: Duration,
-    ) -> Result<FilterMutationResult, LaserError> {
+    ) -> Result<FilterMutationOutcome, LaserError> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.operation(operation_id).await {
@@ -449,7 +327,7 @@ impl<'a> Filters<'a> {
                     status: FilterMutationStatus::Pending,
                     ..
                 }) => {}
-                Ok(outcome) => return settled(operation_id, outcome.status),
+                Ok(outcome) => return Ok(outcome),
                 Err(error) if error.is_not_found() || error.is_retryable() => {}
                 Err(error) => return Err(error),
             }
@@ -504,9 +382,9 @@ impl<'a> Filters<'a> {
         }
     }
 
-    async fn catalog_capabilities(&self) -> Result<(), LaserError> {
+    pub(crate) async fn catalog_capabilities(&self) -> Result<(), LaserError> {
         let capabilities = self.laser.capabilities().await;
-        if !capabilities.filters.native || !capabilities.filters.catalog {
+        if !capabilities.filters.catalog {
             return Err(LaserError::unsupported_feature(
                 "filters",
                 "catalog",
@@ -588,56 +466,6 @@ impl FilterPreviewBuilder<'_> {
         {
             FilterOutcome::Preview(preview) => Ok(preview),
             _ => Err(unexpected("preview")),
-        }
-    }
-}
-
-/// A saved-filter list request. Build it with [`Filters::list`].
-pub struct FilterList<'a> {
-    filters: Filters<'a>,
-    request: ListFilters,
-}
-
-impl FilterList<'_> {
-    /// Only filters whose name contains `text`.
-    #[must_use]
-    pub fn name_contains(mut self, text: impl Into<String>) -> Self {
-        self.request.name_contains = Some(text.into());
-        self
-    }
-
-    /// Only filters in `state`.
-    #[must_use]
-    pub fn state(mut self, state: FilterState) -> Self {
-        self.request.state = Some(state);
-        self
-    }
-
-    /// Only filters with an id below `filter_id`. Pass the last id of the
-    /// previous page, with page 0, to page stably while the catalog changes.
-    #[must_use]
-    pub const fn before(mut self, filter_id: u32) -> Self {
-        self.request.before_id = Some(filter_id);
-        self
-    }
-
-    /// The zero-based page and its size.
-    #[must_use]
-    pub fn page(mut self, page: u32, page_size: u32) -> Self {
-        self.request.page = page;
-        self.request.page_size = page_size;
-        self
-    }
-
-    pub async fn send(self) -> Result<FilterPage, LaserError> {
-        self.request.validate()?;
-        match self
-            .filters
-            .catalog(AGDX_LIST_FILTERS_CODE, &self.request)
-            .await?
-        {
-            FilterCatalogOutcome::Filters(page) => Ok(page),
-            _ => Err(unexpected("list")),
         }
     }
 }

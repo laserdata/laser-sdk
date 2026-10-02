@@ -6,6 +6,7 @@ import type {
   MessageWithHeaders,
   SendMessagesResponse
 } from "../iggy/apache-iggy.js"
+import { ProducerRecorder } from "./producer-statistics.js"
 import type { Routing } from "./routing.js"
 
 export interface ProducerOptions {
@@ -58,6 +59,7 @@ export class Producer implements AsyncDisposable {
   private readonly retries: number
   private readonly retryIntervalMs: number
   private closed = false
+  private readonly statistics: ProducerRecorder
 
   constructor(
     private readonly transport: LaserTransport,
@@ -65,6 +67,7 @@ export class Producer implements AsyncDisposable {
     private readonly topicName: string,
     private readonly options: ProducerOptions = {}
   ) {
+    this.statistics = new ProducerRecorder(streamName, topicName, transport)
     this.routing =
       options.routing?.kind === "key"
         ? { kind: "key", key: options.routing.key.slice() }
@@ -152,6 +155,7 @@ export class Producer implements AsyncDisposable {
   /** Rejects future sends. Safe to call more than once. */
   shutdown(): Promise<void> {
     this.closed = true
+    this.statistics.closed = true
     return Promise.resolve()
   }
 
@@ -165,6 +169,24 @@ export class Producer implements AsyncDisposable {
   }
 
   private async sendWithRetry(
+    messages: readonly MessageWithHeaders[],
+    routing: Routing
+  ): Promise<SendMessagesResponse> {
+    const finish = this.statistics.begin(
+      messages.length,
+      messages.reduce((total, message) => total + message.payload.byteLength, 0)
+    )
+    try {
+      const result = await this.sendAttempts(messages, routing)
+      finish(true)
+      return result
+    } catch (error) {
+      finish(false)
+      throw error
+    }
+  }
+
+  private async sendAttempts(
     messages: readonly MessageWithHeaders[],
     routing: Routing
   ): Promise<SendMessagesResponse> {

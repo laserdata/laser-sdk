@@ -11,7 +11,7 @@ async function receive(
   manualCommit: boolean,
   signal: AbortSignal
 ): Promise<number> {
-  await using consumer: Consumer = await laser.topic(TOPIC).consumerGroup(group, {
+  await using consumer: Consumer = await laser.topic(TOPIC).consumerGroup(group).consumer({
     batchLength: Math.min(100, expected),
     autoCommit: !manualCommit,
     startFrom: { kind: "first" },

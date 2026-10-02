@@ -23,6 +23,7 @@ __all__ = [
     "CompiledSchema",
     "Consumer",
     "ConsumerFilter",
+    "ConsumerGroup",
     "ConsumerMessage",
     "ContextScope",
     "CrashContext",
@@ -33,12 +34,12 @@ __all__ = [
     "FilterAnnounce",
     "FilterExpr",
     "FilteredReader",
-    "Filters",
     "ForkHandle",
     "ForkPutRequest",
     "GovernedAction",
     "Grant",
     "Graph",
+    "GroupFilter",
     "InMemoryStore",
     "Intent",
     "IntentPolicy",
@@ -680,13 +681,20 @@ class Capabilities:
     @property
     def filters(self) -> builtins.bool:
         r"""
-        Consumer filters are served by the streaming server (`Laser.filters()`
-        readers, previews, sample tests, validation).
+        Consumer filters are served by the streaming server (group readers,
+        previews, sample tests).
         """
     @property
     def filters_catalog(self) -> builtins.bool:
         r"""
-        The saved-filter catalog and group bindings are served.
+        The group filter catalog is served, so a consumer group can carry a
+        filter policy.
+        """
+    @property
+    def filters_group_policy_reads(self) -> builtins.bool:
+        r"""
+        The streaming server resolves a consumer group's own policy, so a
+        group consumer runs the group's filter, or none, without naming one.
         """
     @property
     def a2a_gateway(self) -> builtins.bool:
@@ -874,10 +882,12 @@ class CompiledSchema:
 class Consumer:
     r"""
     A Laser partition or consumer-group reader. It is an async iterator and
-    exposes manual offset storage for commit-after-handle delivery. A purge
-    restarts the partition at offset 0 without telling an open reader, which
-    can keep its old position and skip the replacement records, so rebuild it
-    after a purge.
+    exposes manual offset storage for commit-after-handle delivery. A group
+    consumer on a server that resolves group policies runs the group's
+    filter, or none, without naming one, and commits through the group's
+    fenced acknowledgments. A purge restarts the partition at offset 0
+    without telling an open reader, which can keep its old position and skip
+    the replacement records, so rebuild it after a purge.
     """
     @property
     def name(self) -> builtins.str:
@@ -896,16 +906,22 @@ class Consumer:
     def store_offset(self, offset: builtins.int, *, partition: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Store `offset` on the server for the message partition. With no
-        `partition`, Iggy uses the consumer's current partition.
+        `partition`, Iggy uses the consumer's current partition. A group
+        consumer on a server that resolves group policies refuses it, because
+        an arbitrary offset bypasses the group's acknowledgment contract.
+        Commit a delivered message instead.
         """
     def commit(self, message: ConsumerMessage) -> typing.Any:
         r"""
-        Store a successfully handled message's offset on the server.
+        Store a successfully handled message's offset on the server. A group
+        consumer on a server that resolves group policies stores the
+        contiguous prefix of the partition through this message.
         """
     def delete_offset(self, *, partition: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Delete the stored server offset for one partition or the consumer's
-        current partition.
+        current partition. Refused like `store_offset` by a policy-aware group
+        consumer.
         """
     def last_consumed_offset(self, partition: builtins.int) -> typing.Any:
         r"""
@@ -913,15 +929,18 @@ class Consumer:
         """
     def last_stored_offset(self, partition: builtins.int) -> typing.Any:
         r"""
-        Local Iggy SDK offset bookkeeping. An initial zero does not prove a
-        durable checkpoint exists. Use `next` polling for server-side resume.
+        Local offset bookkeeping: the native SDK's stored offset, whose initial
+        zero does not prove a durable checkpoint exists, or the last offset a
+        policy-aware group consumer acknowledged. Use `next` polling for
+        server-side resume.
         """
     def shutdown(self) -> typing.Any:
         r"""
-        Stop polling and leave the group. Automatic policies delegate final
-        offset handling to the Iggy SDK. Polling commits before delivery, so
-        shutdown is not a processing checkpoint. Disabled auto-commit preserves
-        the last explicit commit.
+        Stop polling and leave the group. Automatic policies store the handled
+        prefix first. On the native path, Polling commits before delivery.
+        On the group-aware path it commits the delivered prefix. Disabled
+        auto-commit preserves the last explicit commit. Use explicit commits
+        when shutdown must preserve only successfully processed records.
         """
     def __aiter__(self) -> Consumer: ...
     def __anext__(self) -> typing.Any: ...
@@ -1006,6 +1025,73 @@ class ConsumerFilter:
         explanation tree with one node per predicate.
         """
     def __eq__(self, other: ConsumerFilter) -> builtins.bool: ...
+
+@typing.final
+class ConsumerGroup:
+    r"""
+    One consumer group of a topic. The group owns its filter policy: consumers
+    and readers built from this handle run whatever the group is configured
+    with, a filter or none, and never name a filter themselves. Build it with
+    `Topic.consumer_group` or `Topic.consumer_group_id`.
+    """
+    @property
+    def name(self) -> typing.Optional[builtins.str]:
+        r"""
+        The group name, `None` for a handle addressed by numeric id.
+        """
+    @property
+    def id(self) -> typing.Optional[builtins.int]:
+        r"""
+        The native numeric id, `None` for a handle addressed by name.
+        """
+    def create(self, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, operation_id: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Create the group, with an optional filter policy configured in the
+        same call: a `filter` definition saved as the group's own filter, or
+        one of its own revisions as `filter_id` and `revision`. Idempotent: an
+        existing group is kept and the same policy keeps its binding. A group
+        that runs another policy raises `FilterError` with reason `conflict`.
+        Pass `operation_id` to resume the same configuration after a crash.
+        Returns a dict with `id`, `name`, `identity`, and `filter` (the
+        binding, or `None` for an unbound group).
+        """
+    def info(self) -> typing.Any:
+        r"""
+        The group as the server knows it: `id`, `name`, `identity`, and
+        `filter` (the active binding, or `None`).
+        """
+    def filter(self) -> GroupFilter:
+        r"""
+        The group's filter policy: configure it, inspect it, draft and pause
+        revisions, release it, preview and sample-test it.
+        """
+    def consumer(self, *, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 1000, commit_every: typing.Optional[builtins.int] = None, auto_join_group: builtins.bool = True, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
+        r"""
+        Build a live, load-balanced consumer of this group with server-backed
+        offsets. On a server that resolves group policies the consumer runs
+        the group's filter, or none, and commits through the group's fenced
+        acknowledgments. On Apache Iggy it is the native group consumer. It
+        supports the same polling, batching, replay, retry, and commit modes
+        as the Rust builder. Use `auto_commit="disabled"` plus
+        `commit(message)` for commit-after-handle delivery. `batch_length`
+        also bounds the source records one partition poll examines.
+        """
+    def reader(self, *, start: builtins.str = 'next', start_offset: typing.Optional[builtins.int] = None, start_timestamp_micros: typing.Optional[builtins.int] = None, count: typing.Optional[builtins.int] = None, max_examined: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, read_mode: builtins.str = 'primary', local_guard: builtins.bool = False, idle_interval: typing.Optional[builtins.float] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None) -> typing.Any:
+        r"""
+        Pages selected by the group's policy with original offsets, an independent
+        scan budget, and explicit acknowledgments. An unbound group returns every
+        record without evaluating its payload.
+        `start` is `next` (the default), `first`, or `last`, or use
+        `start_offset` / `start_timestamp_micros`.
+        `count` bounds records per page, default 100. `max_examined` bounds
+        the source records one page examines, independent of `count`.
+        `max_reply_bytes` bounds record bytes per page.
+        `max_unacked_pages` bounds outstanding pages per partition, default 1024.
+        `read_mode` is primary or local. Local reads cannot acknowledge.
+        `local_guard` checks delivered records against the filter locally.
+        `idle_interval` is seconds, finite and non-negative.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class ConsumerMessage:
@@ -1367,8 +1453,8 @@ class FilterExpr:
 @typing.final
 class FilteredReader:
     r"""
-    Reads only the records a consumer filter selects and stores progress
-    through fenced acknowledgments. Build it with `Filters.reader`. Drive one
+    Reads the records a consumer group's filter selects and stores progress
+    through fenced acknowledgments. Build it with `ConsumerGroup.reader`. Drive one
     reader from one task. `async for record in reader` yields matching records
     until the task is cancelled. A record whose `next_record` call is cancelled
     after it was read is yielded again by the next call, so a cancellation never
@@ -1435,144 +1521,6 @@ class FilteredReader:
         """
     def __aiter__(self) -> FilteredReader: ...
     def __anext__(self) -> typing.Any: ...
-
-@typing.final
-class Filters:
-    r"""
-    Consumer filters on one connection. Build it with `Laser.filters()`.
-    Catalog replies are dicts in the wire shape.
-    """
-    def reader(self, stream: builtins.str, topic: builtins.str, *, consumer: typing.Optional[builtins.str] = None, group: typing.Optional[builtins.str] = None, group_id: typing.Optional[builtins.int] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, start: builtins.str = 'next', start_offset: typing.Optional[builtins.int] = None, start_timestamp_micros: typing.Optional[builtins.int] = None, count: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, read_mode: builtins.str = 'primary', local_guard: builtins.bool = False, idle_interval: typing.Optional[builtins.float] = None) -> typing.Any:
-        r"""
-        A filtered reader over `stream` / `topic`. Name an independent
-        `consumer` (every partition unless `partitions` is given) or a
-        consumer `group` or numeric `group_id` (its assigned partitions). Pass
-        an inline `filter`, a
-        saved `filter_id` and `revision`, or nothing for a group's binding.
-        `start` is `next` (the default), `first`, or `last`, or use
-        `start_offset` / `start_timestamp_micros`.
-        `read_mode` is primary or local. Local reads cannot acknowledge.
-        `local_guard` checks delivered records against the filter locally.
-        `idle_interval` is seconds, finite and non-negative.
-        `count` bounds records per page, default 100.
-        `max_reply_bytes` bounds record bytes per page.
-        `max_unacked_pages` bounds outstanding pages per partition, default 1024.
-        A numeric `group_id` identifies an existing group in this source incarnation.
-        """
-    def validate(self, filter: ConsumerFilter) -> typing.Any:
-        r"""
-        Validate and compile `filter` on the server without running it.
-        """
-    def test(self, payload: typing.Any, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, headers: typing.Optional[dict] = None) -> typing.Any:
-        r"""
-        Evaluate a filter against one supplied `payload` and optional typed
-        `headers`, and explain the verdict. Nothing is read or stored.
-        """
-    def preview(self, stream: builtins.str, topic: builtins.str, partition_id: builtins.int, *, filter: typing.Optional[ConsumerFilter] = None, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, from_offset: builtins.int = 0, max_examined: typing.Optional[builtins.int] = None, max_records: typing.Optional[builtins.int] = None, explain: builtins.bool = False) -> typing.Any:
-        r"""
-        Preview a filter over stored records of one partition. A preview joins
-        no group and stores no offset.
-        """
-    def get(self, filter_id: builtins.int) -> typing.Any:
-        r"""
-        One saved filter with its latest revision and bindings.
-        """
-    def list(self, *, name_contains: typing.Optional[builtins.str] = None, state: typing.Optional[builtins.str] = None, before_id: typing.Optional[builtins.int] = None, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
-        r"""
-        One page of saved filters, newest first. Pass the last `id` of a page
-        as `before_id` to read the next one stably while the catalog changes.
-        """
-    def revisions(self, filter_id: builtins.int, *, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
-        r"""
-        One page of a filter's revisions, newest first.
-        """
-    def binding(self, stream: builtins.str, topic: builtins.str, group: builtins.str) -> typing.Any:
-        r"""
-        The binding of one consumer group. Raises `FilterError` with reason
-        `not_found` when the group is unbound.
-        """
-    def bindings(self, *, filter_id: typing.Optional[builtins.int] = None, stream: typing.Optional[builtins.str] = None, topic: typing.Optional[builtins.str] = None, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
-        r"""
-        One page of bindings, optionally narrowed to one filter, one
-        `stream`, or one `stream` and `topic`.
-        """
-    def apply(self, mutation: typing.Any) -> typing.Any:
-        r"""
-        Apply one catalog `mutation` (a wire dict such as
-        `{"archive": {"filter_id": 7}}`) under a fresh operation id, wait for
-        its outcome, and return the applied result dict. A rejection raises
-        `FilterError`, and an outcome still pending after the wait raises an
-        error that names the operation id.
-        """
-    def apply_as(self, operation_id: builtins.int, mutation: typing.Any) -> typing.Any:
-        r"""
-        apply under a caller-chosen `operation_id`, so a
-        caller that records the id first can resume the same mutation after a
-        crash.
-        """
-    def mutate(self, operation_id: builtins.int, mutation: typing.Any) -> typing.Any:
-        r"""
-        Send one catalog `mutation` (a wire dict such as
-        `{"archive": {"filter_id": 7}}`) under a caller-chosen `operation_id`
-        and return its outcome dict, which may be `pending`. Retrying with the
-        same id never applies it twice.
-        """
-    def wait_for_outcome(self, operation_id: builtins.int, *, timeout: builtins.float = 30.0) -> typing.Any:
-        r"""
-        Wait up to `timeout` seconds for the outcome of `operation_id`, for
-        example the id an ambiguous mutation error names. Returns the applied
-        result dict, raises `FilterError` for a rejection, and
-        raises an error while it stays pending.
-        """
-    def operation(self, operation_id: builtins.int) -> typing.Any:
-        r"""
-        The recorded outcome of the mutation `operation_id`.
-        """
-    def register(self, name: builtins.str, filter: ConsumerFilter, *, description: builtins.str = '') -> typing.Any:
-        r"""
-        Save a new filter as revision 1 and wait for the applied outcome.
-        Returns the revision dict (`filter_id`, `revision`, `digest`).
-        """
-    def revise(self, filter_id: builtins.int, expected_revision: builtins.int, filter: ConsumerFilter) -> typing.Any:
-        r"""
-        Add a revision. `expected_revision` must still be the latest one.
-        """
-    def describe(self, filter_id: builtins.int, description: builtins.str) -> typing.Any:
-        r"""
-        Replace a filter's description.
-        """
-    def archive(self, filter_id: builtins.int) -> typing.Any:
-        r"""
-        Hide a filter from new bindings. Existing bindings keep executing.
-        """
-    def delete(self, filter_id: builtins.int) -> typing.Any:
-        r"""
-        Delete a filter. Raises `FilterError` with reason `conflict` while a
-        consumer group is bound to it.
-        """
-    def bind(self, stream: builtins.str, topic: builtins.str, group: builtins.str, filter_id: builtins.int, revision: builtins.int) -> typing.Any:
-        r"""
-        Pin an existing consumer group to one revision. Returns the binding dict.
-        """
-    def create_consumer_group(self, stream: builtins.str, topic: builtins.str, group: builtins.str, filter_id: builtins.int, revision: builtins.int) -> typing.Any:
-        r"""
-        Create the consumer group if absent and bind it to a saved revision.
-        A failed bind can leave an unbound group. Returns the binding dict.
-        """
-    def set_revision_enabled(self, filter_id: builtins.int, revision: builtins.int, enabled: builtins.bool) -> typing.Any:
-        r"""
-        Pause or resume a revision while preserving its content and digest.
-        """
-    def unbind_binding(self, binding: typing.Any) -> typing.Any:
-        r"""
-        Release exactly the group incarnation a binding dict (from `binding` or
-        `bindings`) names, by its stored identity and digest. A group deleted
-        and recreated under the same name keeps its own binding.
-        """
-    def unbind(self, stream: builtins.str, topic: builtins.str, group: builtins.str, expected_digest: typing.Sequence[builtins.int]) -> typing.Any:
-        r"""
-        Release the currently named group, conditional on its digest.
-        """
 
 @typing.final
 class ForkHandle:
@@ -1804,6 +1752,59 @@ class Graph:
         `"triplets"`, or `"paths"`. `as_of` (epoch micros) follows only edges
         valid at that instant.
         Returns a `{"nodes": [...], "edges": [...], "paths": [...]}` dict.
+        """
+
+@typing.final
+class GroupFilter:
+    r"""
+    A consumer group's filter policy. Build it with `ConsumerGroup.filter`.
+    Every verb needs a managed plane that serves the filter catalog. Catalog
+    replies are dicts in the wire shape.
+    """
+    def configure(self, filter: typing.Optional[ConsumerFilter] = None, *, filter_id: typing.Optional[builtins.int] = None, revision: typing.Optional[builtins.int] = None, operation_id: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Give the group its policy: a `filter` definition saved as the group's
+        own filter, or one of its own revisions as `filter_id` and `revision`.
+        The group is bound in one catalog transaction. The same digest again
+        keeps the binding. Another digest on a group that runs a policy raises
+        `FilterError` with reason `conflict`: create a new group for another
+        policy. Pass `operation_id` to resume the same configuration after a
+        crash. Returns the binding dict.
+        """
+    def get(self) -> typing.Any:
+        r"""
+        The active binding dict, `None` for an unbound group.
+        """
+    def revisions(self, *, page: builtins.int = 0, page_size: builtins.int = 50) -> typing.Any:
+        r"""
+        One page of the group's own filter revisions, newest first.
+        """
+    def revise(self, expected_revision: builtins.int, filter: ConsumerFilter) -> typing.Any:
+        r"""
+        Draft a revision of the group's own filter. Readers keep running the
+        active revision. `expected_revision` must still be the latest.
+        """
+    def set_revision_enabled(self, revision: builtins.int, enabled: builtins.bool) -> typing.Any:
+        r"""
+        Pause or resume a revision of the group's own filter. A paused active
+        revision refuses new reads, while records already delivered can still
+        be acknowledged.
+        """
+    def release(self) -> typing.Any:
+        r"""
+        Release the group's policy. Its readers then receive every record. A
+        released group may only be configured with the digest it ran. Returns
+        the released binding dict.
+        """
+    def preview(self, partition_id: builtins.int, *, from_offset: builtins.int = 0, max_examined: typing.Optional[builtins.int] = None, max_records: typing.Optional[builtins.int] = None, explain: builtins.bool = False) -> typing.Any:
+        r"""
+        Preview the active policy over the stored records of one partition. A
+        preview joins no group and stores no offset.
+        """
+    def test(self, payload: typing.Any, *, headers: typing.Optional[dict] = None) -> typing.Any:
+        r"""
+        Evaluate the active policy against one supplied `payload` and optional
+        typed `headers`, and explain the verdict. Nothing is read or stored.
         """
 
 @typing.final
@@ -2389,7 +2390,7 @@ class Laser:
         A clone whose change-feed records publish to `changes_topic` on the ops
         stream instead of the default `changes`.
         """
-    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, filters: typing.Optional[builtins.bool] = None, filters_catalog: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
+    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, filters: typing.Optional[builtins.bool] = None, filters_catalog: typing.Optional[builtins.bool] = None, filters_group_policy_reads: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
         r"""
         Return a clone with selected negotiated capabilities overridden. This is
         intended for bring-your-own backends and deterministic pre-gate tests.
@@ -2441,13 +2442,6 @@ class Laser:
     def destinations(self) -> Destinations:
         r"""
         Open the managed materialization destination and query-route surface.
-        """
-    def filters(self) -> Filters:
-        r"""
-        Server-side consumer filters: filtered readers, previews, sample tests,
-        and the saved-filter catalog. Native reads need a server that serves
-        consumer filters. The catalog also needs a managed plane. Either missing
-        raises `UnsupportedError`.
         """
     def fork(self, fork_id: builtins.str) -> ForkHandle:
         r"""
@@ -3967,10 +3961,16 @@ class Topic:
         as the Rust builder. Use `auto_commit="disabled"` plus
         `commit(message)` for commit-after-handle delivery.
         """
-    def consumer_group(self, group: builtins.str, *, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 1000, commit_every: typing.Optional[builtins.int] = None, auto_join_group: builtins.bool = True, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer_group(self, group: builtins.str) -> ConsumerGroup:
         r"""
-        Build a Laser consumer-group reader. Group creation/joining is
-        configurable, and offsets are stored under `group` on the server.
+        The consumer group `group` of this topic: the handle that owns the
+        group's filter policy and builds its consumers and readers. Free and
+        synchronous, IO happens at the verbs.
+        """
+    def consumer_group_id(self, id: builtins.int) -> ConsumerGroup:
+        r"""
+        `consumer_group` by the group's native numeric id. The id names a
+        group inside this topic incarnation only.
         """
     def replay(self, *, batch: typing.Optional[builtins.int] = None, from_offsets: typing.Optional[typing.Sequence[builtins.int]] = None) -> Cursor:
         r"""

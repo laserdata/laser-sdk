@@ -1,29 +1,45 @@
-// Consumer-group filtered reads against the fork with a stand-in catalog. The
-// stand-in answers the backend probe and resolves every group binding to one
-// saved revision, which is all a bound read asks the catalog. It runs on its
-// own thread and runtime because the server outlives each test's runtime.
+// Consumer groups that own their filter policy, against the fork with a
+// stand-in catalog. The stand-in answers the backend probe and keeps the
+// group policies the tests configure: a group's own filter and revisions, its
+// binding with a policy generation, and the unbound answer for a group
+// without one. It runs on its own thread and runtime because the server
+// outlives each test's runtime.
 
 use crate::harness;
 use crate::test_iggy::TestIggy;
+use laser_sdk::capabilities::{Capabilities, HelloOutcome};
 use laser_sdk::filters::{
-    ConsumerFilter, FilterErrorReason, FilterExpr, FilterState, FilteredStart,
+    CatalogPosition, ConsumerFilter, ExecutionMode, FaultReason, FilterBinding, FilterBindingPage,
+    FilterError, FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef,
+    FilterMutation, FilterMutationOutcome, FilterMutationResult, FilterMutationStatus,
+    FilterRevisionInfo, FilterRevisionPage, FilterRevisionRef, FilterState, FilteredStart,
+    GroupFilterSpec, GroupPolicyUnbound,
 };
 use laser_sdk::iggy::prelude::{
-    Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, PartitionClient,
+    Consumer, ConsumerGroupClient, ConsumerOffsetClient, HeaderKey, HeaderValue, Identifier,
+    PartitionClient,
 };
-use laser_sdk::prelude::full::Laser;
-use laser_sdk::prelude::{ProducerMessage, Routing};
+use laser_sdk::prelude::full::{ConsumerGroup, Laser, LaserError};
+use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::query::CmpOp;
 use laser_sdk::wire::codes::{
-    AGDX_BACKEND_HELLO_CODE, AGDX_RESOLVE_FILTER_POLICY_CODE, CONTROL_OP_VERSION,
-    FILTER_OP_VERSION, FORK_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
+    AGDX_BACKEND_HELLO_CODE, AGDX_FILTER_MUTATE_CODE, AGDX_FILTER_OPERATION_CODE,
+    AGDX_GET_FILTER_BINDING_CODE, AGDX_LIST_FILTER_BINDINGS_CODE, AGDX_LIST_FILTER_REVISIONS_CODE,
+    AGDX_RESOLVE_FILTER_POLICY_CODE, CONTROL_OP_VERSION, FILTER_OP_VERSION, FORK_OP_VERSION,
+    KV_OP_VERSION, QUERY_OP_VERSION,
 };
-use laser_sdk::wire::filter::{FilterCatalogOutcome, FilterCatalogReply, ResolvedFilterPolicy};
+use laser_sdk::wire::filter::FilterMutationRequest;
+use laser_sdk::wire::filter::{
+    FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterPolicyRef,
+    GetFilterBinding, ListFilterBindings, ListFilterRevisions, ResolveFilterPolicy,
+    ResolvedFilterPolicy,
+};
+use laser_sdk::wire::forward::ForwardedCommand;
 use laser_sdk::wire::framing::{decode_named, encode_named};
 use laser_sdk::wire::hello::{BackendAnnounce, OpVersions};
-use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -40,12 +56,6 @@ const GROUND_STATION: &str = r#"{"op":"u","table":"ground_stations","changed":["
 
 static CATALOG_SERVER: OnceCell<(TestIggy, tempfile::TempDir)> = OnceCell::const_new();
 
-// The fields of the server's forwarded frame this stand-in reads.
-#[derive(Deserialize)]
-struct ForwardedCommand {
-    command_code: u32,
-}
-
 fn bound_filter() -> ConsumerFilter {
     ConsumerFilter::json(FilterExpr::any([
         FilterExpr::pred("op", CmpOp::Eq, "d"),
@@ -53,24 +63,383 @@ fn bound_filter() -> ConsumerFilter {
     ]))
 }
 
-async fn catalog_server() -> &'static TestIggy {
-    let (server, _socket_dir) = CATALOG_SERVER
-        .get_or_init(|| async {
-            let socket_dir = tempfile::tempdir().expect("socket directory");
-            let socket = socket_dir.path().join("plane.sock");
-            spawn_catalog(socket.clone());
-            let server = TestIggy::start_with(vec![
-                ("IGGY_PLANE_ENABLED".to_owned(), "true".to_owned()),
-                (
-                    "IGGY_PLANE_SOCKET_PATH".to_owned(),
-                    socket.display().to_string(),
+/// The group policies the stand-in holds.
+#[derive(Default)]
+struct CatalogState {
+    next_filter_id: u32,
+    offset: u64,
+    filters: HashMap<u32, Vec<FilterRevisionInfo>>,
+    owners: HashMap<FilterGroupIdentity, u32>,
+    bindings: HashMap<FilterGroupIdentity, FilterBinding>,
+    generations: HashMap<FilterGroupIdentity, u64>,
+}
+
+impl CatalogState {
+    fn bump(&mut self, identity: FilterGroupIdentity) -> u64 {
+        let generation = self.generations.entry(identity).or_default();
+        *generation += 1;
+        *generation
+    }
+
+    fn mutate(
+        &mut self,
+        command: FilterCatalogCommand,
+    ) -> Result<FilterMutationResult, FilterError> {
+        match command.mutation {
+            FilterMutation::ConfigureGroup {
+                group,
+                policy,
+                expected_identity,
+            } => {
+                let identity = command.identity.ok_or_else(|| {
+                    FilterError::new(
+                        FilterErrorReason::InvalidRequest,
+                        "the streaming server stamps the group identity",
+                    )
+                })?;
+                if expected_identity.is_some_and(|expected| expected != identity) {
+                    return Err(FilterError::new(
+                        FilterErrorReason::SourceChanged,
+                        "the group incarnation changed before configuration",
+                    ));
+                }
+                let (filter_id, revision, digest) = match policy {
+                    GroupFilterSpec::Definition(filter) => {
+                        let digest = filter.digest();
+                        if let Some(existing) = self.bindings.get(&identity) {
+                            if existing.digest == digest {
+                                return Ok(FilterMutationResult::Bound(existing.clone()));
+                            }
+                            return Err(FilterError::new(
+                                FilterErrorReason::Conflict,
+                                "the group already runs another policy",
+                            ));
+                        }
+                        let filter_id = match self.owners.get(&identity) {
+                            Some(filter_id) => *filter_id,
+                            None => {
+                                self.next_filter_id += 1;
+                                self.owners.insert(identity, self.next_filter_id);
+                                self.next_filter_id
+                            }
+                        };
+                        let revisions = self.filters.entry(filter_id).or_default();
+                        let revision = match revisions.iter().find(|info| info.digest == digest) {
+                            Some(info) => info.revision,
+                            None => {
+                                let revision = revisions.len() as u32 + 1;
+                                revisions.push(FilterRevisionInfo {
+                                    enabled: true,
+                                    revision,
+                                    digest: digest.clone(),
+                                    filter,
+                                    created_at_micros: 1,
+                                });
+                                revision
+                            }
+                        };
+                        (filter_id, revision, digest)
+                    }
+                    GroupFilterSpec::Revision {
+                        filter_id,
+                        revision,
+                    } => {
+                        if self.owners.get(&identity) != Some(&filter_id) {
+                            return Err(FilterError::new(
+                                FilterErrorReason::Conflict,
+                                "not the group's own filter",
+                            ));
+                        }
+                        let digest = self
+                            .filters
+                            .get(&filter_id)
+                            .and_then(|revisions| {
+                                revisions.iter().find(|info| info.revision == revision)
+                            })
+                            .map(|info| info.digest.clone())
+                            .ok_or_else(|| {
+                                FilterError::new(FilterErrorReason::NotFound, "no such revision")
+                            })?;
+                        if let Some(existing) = self.bindings.get(&identity) {
+                            if existing.digest == digest {
+                                return Ok(FilterMutationResult::Bound(existing.clone()));
+                            }
+                            return Err(FilterError::new(
+                                FilterErrorReason::Conflict,
+                                "the group already runs another policy",
+                            ));
+                        }
+                        (filter_id, revision, digest)
+                    }
+                };
+                let binding = FilterBinding {
+                    group,
+                    identity,
+                    filter_id,
+                    revision,
+                    digest,
+                    bound_at_micros: 1,
+                    policy_generation: self.bump(identity),
+                };
+                self.bindings.insert(identity, binding.clone());
+                Ok(FilterMutationResult::Bound(binding))
+            }
+            FilterMutation::Revise {
+                filter_id,
+                expected_revision,
+                filter,
+            } => {
+                let revisions = self.filters.get_mut(&filter_id).ok_or_else(|| {
+                    FilterError::new(FilterErrorReason::NotFound, "no such filter")
+                })?;
+                let latest = revisions.last().map_or(0, |info| info.revision);
+                if latest != expected_revision {
+                    return Err(FilterError::new(
+                        FilterErrorReason::Conflict,
+                        "not the latest revision",
+                    ));
+                }
+                let digest = filter.digest();
+                revisions.push(FilterRevisionInfo {
+                    enabled: true,
+                    revision: latest + 1,
+                    digest: digest.clone(),
+                    filter,
+                    created_at_micros: 1,
+                });
+                Ok(FilterMutationResult::Revised(FilterRevisionRef {
+                    filter_id,
+                    revision: latest + 1,
+                    digest,
+                }))
+            }
+            FilterMutation::SetRevisionEnabled {
+                filter_id,
+                revision,
+                enabled,
+            } => {
+                let info = self
+                    .filters
+                    .get_mut(&filter_id)
+                    .and_then(|revisions| {
+                        revisions.iter_mut().find(|info| info.revision == revision)
+                    })
+                    .ok_or_else(|| {
+                        FilterError::new(FilterErrorReason::NotFound, "no such revision")
+                    })?;
+                info.enabled = enabled;
+                Ok(FilterMutationResult::RevisionState {
+                    filter_id,
+                    revision,
+                    enabled,
+                })
+            }
+            FilterMutation::Unbind {
+                expected_digest,
+                expected_identity,
+                ..
+            } => {
+                let identity = expected_identity.or(command.identity).ok_or_else(|| {
+                    FilterError::new(FilterErrorReason::InvalidRequest, "no identity")
+                })?;
+                let binding = self.bindings.get(&identity).cloned().ok_or_else(|| {
+                    FilterError::new(FilterErrorReason::NotFound, "the group is not bound")
+                })?;
+                if binding.digest != expected_digest {
+                    return Err(FilterError::new(
+                        FilterErrorReason::Conflict,
+                        "bound to another digest",
+                    ));
+                }
+                self.bindings.remove(&identity);
+                self.bump(identity);
+                Ok(FilterMutationResult::Unbound(binding))
+            }
+            _ => Err(FilterError::new(
+                FilterErrorReason::Unsupported,
+                "the stand-in catalog serves group policies only",
+            )),
+        }
+    }
+
+    fn resolve(&self, request: &ResolveFilterPolicy) -> Result<FilterCatalogOutcome, FilterError> {
+        let (filter_id, revision, policy_generation) = match request.policy {
+            FilterPolicyRef::Binding(identity) => match self.bindings.get(&identity) {
+                Some(binding) => (
+                    binding.filter_id,
+                    binding.revision,
+                    binding.policy_generation,
                 ),
-            ])
-            .await;
-            (server, socket_dir)
-        })
-        .await;
+                None if request.allow_unbound => {
+                    return Ok(FilterCatalogOutcome::Unbound(GroupPolicyUnbound {
+                        identity,
+                        policy_generation: self.generations.get(&identity).copied().unwrap_or(0),
+                    }));
+                }
+                None => {
+                    return Err(FilterError::new(
+                        FilterErrorReason::NotFound,
+                        "this consumer group has no filter binding",
+                    ));
+                }
+            },
+            FilterPolicyRef::Revision {
+                filter_id,
+                revision,
+            } => (filter_id, revision, 0),
+        };
+        let info = self
+            .filters
+            .get(&filter_id)
+            .and_then(|revisions| revisions.iter().find(|info| info.revision == revision))
+            .ok_or_else(|| FilterError::new(FilterErrorReason::NotFound, "no such revision"))?;
+        if !info.enabled && !request.allow_disabled {
+            return Err(FilterError::new(
+                FilterErrorReason::RevisionDisabled,
+                "the revision is paused",
+            ));
+        }
+        Ok(FilterCatalogOutcome::Policy(ResolvedFilterPolicy {
+            filter_id,
+            revision,
+            digest: info.digest.clone(),
+            state: FilterState::Active,
+            filter: info.filter.clone(),
+            policy_generation,
+        }))
+    }
+
+    fn answer(&mut self, forwarded: &ForwardedCommand) -> Option<Vec<u8>> {
+        let reply = match forwarded.command_code {
+            AGDX_BACKEND_HELLO_CODE => {
+                return encode_named(&BackendAnnounce::new(
+                    OpVersions::new(
+                        QUERY_OP_VERSION,
+                        CONTROL_OP_VERSION,
+                        KV_OP_VERSION,
+                        FORK_OP_VERSION,
+                    )
+                    .with_filter(FILTER_OP_VERSION),
+                ))
+                .ok();
+            }
+            AGDX_FILTER_MUTATE_CODE => {
+                let command: FilterCatalogCommand = decode_named(&forwarded.payload).ok()?;
+                let operation_id = command.operation_id;
+                let status = match self.mutate(command) {
+                    Ok(result) => FilterMutationStatus::Applied(result),
+                    Err(error) => FilterMutationStatus::Rejected(error),
+                };
+                self.offset += 1;
+                FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Mutation(
+                    FilterMutationOutcome {
+                        v: FILTER_OP_VERSION,
+                        operation_id,
+                        status,
+                        catalog_position: Some(CatalogPosition {
+                            partition_id: 1,
+                            offset: self.offset,
+                            operation_id: Some(operation_id),
+                        }),
+                    },
+                )))
+            }
+            AGDX_RESOLVE_FILTER_POLICY_CODE => {
+                let request: ResolveFilterPolicy = decode_named(&forwarded.payload).ok()?;
+                match self.resolve(&request) {
+                    Ok(outcome) => FilterCatalogReply::Ok(Box::new(outcome)),
+                    Err(error) => FilterCatalogReply::Err(error),
+                }
+            }
+            AGDX_GET_FILTER_BINDING_CODE => {
+                let request: GetFilterBinding = decode_named(&forwarded.payload).ok()?;
+                match request
+                    .identity
+                    .and_then(|identity| self.bindings.get(&identity))
+                {
+                    Some(binding) => FilterCatalogReply::Ok(Box::new(
+                        FilterCatalogOutcome::Binding(binding.clone()),
+                    )),
+                    None => FilterCatalogReply::Err(FilterError::new(
+                        FilterErrorReason::NotFound,
+                        "the group is not bound",
+                    )),
+                }
+            }
+            AGDX_LIST_FILTER_REVISIONS_CODE => {
+                let request: ListFilterRevisions = decode_named(&forwarded.payload).ok()?;
+                let mut items = self
+                    .filters
+                    .get(&request.filter_id)
+                    .cloned()
+                    .unwrap_or_default();
+                items.reverse();
+                let total = items.len() as u32;
+                FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Revisions(
+                    FilterRevisionPage {
+                        filter_id: request.filter_id,
+                        items,
+                        page: request.page,
+                        page_size: request.page_size,
+                        total,
+                    },
+                )))
+            }
+            AGDX_LIST_FILTER_BINDINGS_CODE => {
+                let request: ListFilterBindings = decode_named(&forwarded.payload).ok()?;
+                let items: Vec<FilterBinding> = self
+                    .bindings
+                    .values()
+                    .filter(|binding| {
+                        request
+                            .stream
+                            .as_ref()
+                            .is_none_or(|stream| *stream == binding.group.stream)
+                            && request
+                                .topic
+                                .as_ref()
+                                .is_none_or(|topic| *topic == binding.group.topic)
+                    })
+                    .cloned()
+                    .collect();
+                let total = items.len() as u32;
+                FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Bindings(
+                    FilterBindingPage {
+                        items,
+                        page: request.page,
+                        page_size: request.page_size,
+                        total,
+                    },
+                )))
+            }
+            AGDX_FILTER_OPERATION_CODE => FilterCatalogReply::Err(FilterError::new(
+                FilterErrorReason::NotFound,
+                "the stand-in applies every mutation at once",
+            )),
+            _ => return None,
+        };
+        encode_named(&reply).ok()
+    }
+}
+
+async fn catalog_server() -> &'static TestIggy {
+    let (server, _socket_dir) = CATALOG_SERVER.get_or_init(start_catalog_server).await;
     server
+}
+
+async fn start_catalog_server() -> (TestIggy, tempfile::TempDir) {
+    let socket_dir = tempfile::tempdir().expect("socket directory");
+    let socket = socket_dir.path().join("plane.sock");
+    spawn_catalog(socket.clone());
+    let server = TestIggy::start_with(vec![
+        ("IGGY_PLANE_ENABLED".to_owned(), "true".to_owned()),
+        (
+            "IGGY_PLANE_SOCKET_PATH".to_owned(),
+            socket.display().to_string(),
+        ),
+    ])
+    .await;
+    (server, socket_dir)
 }
 
 fn spawn_catalog(socket: PathBuf) {
@@ -78,6 +447,7 @@ fn spawn_catalog(socket: PathBuf) {
     listener
         .set_nonblocking(true)
         .expect("nonblocking catalog socket");
+    let state = Arc::new(Mutex::new(CatalogState::default()));
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -86,20 +456,13 @@ fn spawn_catalog(socket: PathBuf) {
         runtime.block_on(async move {
             let listener = UnixListener::from_std(listener).expect("adopt the catalog socket");
             while let Ok((socket, _)) = listener.accept().await {
-                tokio::spawn(serve(socket));
+                tokio::spawn(serve(socket, Arc::clone(&state)));
             }
         });
     });
 }
 
-async fn serve(mut socket: UnixStream) {
-    let policy = ResolvedFilterPolicy {
-        filter_id: 1,
-        revision: 1,
-        digest: bound_filter().digest(),
-        state: FilterState::Active,
-        filter: bound_filter(),
-    };
+async fn serve(mut socket: UnixStream, state: Arc<Mutex<CatalogState>>) {
     loop {
         let mut length = [0u8; 4];
         if socket.read_exact(&mut length).await.is_err() {
@@ -112,22 +475,13 @@ async fn serve(mut socket: UnixStream) {
         let Ok(forwarded) = decode_named::<ForwardedCommand>(&frame) else {
             return;
         };
-        let reply = match forwarded.command_code {
-            AGDX_BACKEND_HELLO_CODE => encode_named(&BackendAnnounce::new(
-                OpVersions::new(
-                    QUERY_OP_VERSION,
-                    CONTROL_OP_VERSION,
-                    KV_OP_VERSION,
-                    FORK_OP_VERSION,
-                )
-                .with_filter(FILTER_OP_VERSION),
-            )),
-            AGDX_RESOLVE_FILTER_POLICY_CODE => encode_named(&FilterCatalogReply::Ok(Box::new(
-                FilterCatalogOutcome::Policy(policy.clone()),
-            ))),
-            _ => return,
-        }
-        .expect("the reply encodes");
+        let reply = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .answer(&forwarded);
+        let Some(reply) = reply else {
+            return;
+        };
         let written = socket
             .write_all(
                 &u32::try_from(reply.len())
@@ -141,46 +495,403 @@ async fn serve(mut socket: UnixStream) {
     }
 }
 
-async fn group_source(laser: &Laser) -> String {
-    let stream = laser.default_stream().expect("stream").to_owned();
+async fn publish(laser: &Laser, topic: &str, payloads: &[&str], partition: u32) {
     let producer = laser
-        .topic(TOPIC)
+        .topic(topic)
         .producer()
-        .partitions(1)
+        .partitions(partition + 1)
         .build()
         .await
         .expect("the producer initializes");
     producer
         .send_batch_with_routing(
-            [SAFE_MODE, GROUND_STATION, DECOMMISSION]
+            payloads
                 .iter()
-                .map(|payload| ProducerMessage::new(payload.as_bytes())),
-            Some(Routing::Partition(0)),
+                .map(|payload| ProducerMessage::new(payload.as_bytes().to_vec())),
+            Some(Routing::Partition(partition)),
         )
         .await
         .expect("the fixtures publish");
+}
+
+/// Publish the three fixtures on partition 0 and return the stream name.
+async fn group_source(laser: &Laser) -> String {
+    publish(laser, TOPIC, &[SAFE_MODE, GROUND_STATION, DECOMMISSION], 0).await;
+    laser.default_stream().expect("stream").to_owned()
+}
+
+/// Create `GROUP` with the bound filter as its policy.
+async fn bound_group(laser: &Laser) -> ConsumerGroup {
+    let group = laser.topic(TOPIC).consumer_group(GROUP);
+    let created = group
+        .create()
+        .filter(bound_filter())
+        .build()
+        .await
+        .expect("the group is created with its filter");
+    assert_eq!(
+        created.filter.as_ref().map(|binding| binding.revision),
+        Some(1)
+    );
+    group
+}
+
+async fn stored_group_offset(laser: &Laser, stream: &str, partition: u32) -> Option<u64> {
     laser
         .client()
-        .create_consumer_group(
-            &Identifier::named(&stream).expect("stream name"),
+        .get_consumer_offset(
+            &Consumer::group(Identifier::named(GROUP).expect("group name")),
+            &Identifier::named(stream).expect("stream name"),
             &Identifier::named(TOPIC).expect("topic name"),
-            GROUP,
+            Some(partition),
         )
         .await
-        .expect("the consumer group is created");
-    stream
+        .expect("the group offset reads")
+        .map(|offset| offset.stored_offset)
+}
+
+fn offsets(page: &laser_sdk::filters::MatchedPage) -> Vec<u64> {
+    page.records.iter().map(|record| record.offset).collect()
 }
 
 #[tokio::test]
-async fn given_a_bound_group_when_reading_then_should_run_the_bound_revision_and_store_group_progress()
+async fn given_a_group_created_with_a_filter_when_consumed_then_should_deliver_only_matches_and_commit_the_scanned_prefix()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    assert!(laser.capabilities().await.filters.group_policy_reads);
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Disabled)
+        .poll_interval(Duration::from_millis(5))
+        .build()
+        .await
+        .expect("the group consumer builds");
+    let mut delivered = Vec::new();
+    for _ in 0..2 {
+        let message = consumer
+            .next_within(READ_TIMEOUT)
+            .await
+            .expect("a matching record arrives");
+        consumer.commit(&message).await.expect("the record commits");
+        delivered.push(message.position.offset);
+    }
+    assert_eq!(delivered, vec![0, 2], "the server ran the group's policy");
+    assert_eq!(consumer.last_consumed_offset(0), Some(2));
+    assert_eq!(consumer.last_stored_offset(0), Some(2));
+    assert!(
+        matches!(
+            consumer.store_offset(1, Some(0)).await,
+            Err(LaserError::Invalid(_))
+        ),
+        "explicit offsets bypass the acknowledgment contract"
+    );
+    consumer.shutdown().await.expect("the consumer shuts down");
+
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
+    let info = group.info().await.expect("the group exists");
+    assert_eq!(
+        info.filter.map(|binding| binding.policy_generation),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn given_an_unbound_group_when_consumed_then_should_deliver_every_record_through_the_group_engine()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = laser.topic(TOPIC).consumer_group(GROUP);
+    let created = group.create().build().await.expect("a plain group");
+    assert!(created.filter.is_none());
+
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Each)
+        .poll_interval(Duration::from_millis(5))
+        .build()
+        .await
+        .expect("the group consumer builds");
+    let mut delivered = Vec::new();
+    for _ in 0..3 {
+        let message = consumer
+            .next_within(READ_TIMEOUT)
+            .await
+            .expect("a record arrives");
+        delivered.push(message.position.offset);
+    }
+    consumer.shutdown().await.expect("the consumer shuts down");
+
+    assert_eq!(
+        delivered,
+        vec![0, 1, 2],
+        "an unbound group receives everything"
+    );
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
+}
+
+#[tokio::test]
+async fn given_an_unbound_group_when_reading_pages_then_should_return_records_without_evaluating() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = laser.topic(TOPIC).consumer_group(GROUP);
+    group.create().build().await.expect("plain group");
+    let mut reader = group
+        .reader()
+        .expect("group source")
+        .start(FilteredStart::First)
+        .count(3)
+        .max_examined(3)
+        .build()
+        .await
+        .expect("an automatic group reader accepts an unbound group");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("page deadline")
+        .expect("page");
+    assert_eq!(offsets(&page), vec![0, 1, 2]);
+    assert_eq!(page.policy.mode, ExecutionMode::Unfiltered);
+    assert!(page.records.iter().all(|record| !record.evaluated));
+    reader.ack_page(&page).await.expect("acknowledge");
+    reader.close().await.expect("close");
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
+}
+
+#[tokio::test]
+async fn given_automatic_commit_policies_when_delivering_a_record_then_should_not_store_it_before_returning()
+ {
+    for policy in [
+        CommitPolicy::Each,
+        CommitPolicy::All,
+        CommitPolicy::Every(1),
+        CommitPolicy::Interval(Duration::from_millis(1)),
+        CommitPolicy::IntervalOrEach(Duration::from_millis(1)),
+        CommitPolicy::Polling,
+    ] {
+        let laser = harness::connected_laser_on(catalog_server().await).await;
+        let stream = group_source(&laser).await;
+        let group = bound_group(&laser).await;
+        let mut consumer = group
+            .consumer()
+            .start_at(ConsumerStart::First)
+            .batch_length(2)
+            .commit_policy(policy)
+            .build()
+            .await
+            .expect("group consumer");
+        let first = consumer
+            .next_within(READ_TIMEOUT)
+            .await
+            .expect("first delivery");
+        assert_eq!(first.position.offset, 0);
+        assert_eq!(
+            stored_group_offset(&laser, &stream, 0).await,
+            None,
+            "{policy:?}"
+        );
+        consumer.shutdown().await.expect("clean stop");
+        assert_eq!(
+            stored_group_offset(&laser, &stream, 0).await,
+            Some(1),
+            "{policy:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_an_interval_policy_when_the_partition_is_idle_then_should_store_the_delivered_prefix_before_the_next_page()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Interval(Duration::from_millis(100)))
+        .poll_interval(Duration::from_millis(10))
+        .build()
+        .await
+        .expect("group consumer");
+    consumer.next_within(READ_TIMEOUT).await.expect("first");
+    let last = consumer.next_within(READ_TIMEOUT).await.expect("second");
+    assert_eq!(last.position.offset, 2);
+    assert!(matches!(
+        consumer.next_within(Duration::from_millis(600)).await,
+        Err(LaserError::Timeout(_))
+    ));
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        Some(3),
+        "the interval stores the handled prefix while the partition is idle"
+    );
+    consumer.shutdown().await.expect("clean stop");
+}
+
+#[tokio::test]
+async fn given_a_timed_out_next_when_manually_committing_then_should_release_the_in_flight_read_lock()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Disabled)
+        .poll_interval(Duration::from_millis(5))
+        .build()
+        .await
+        .expect("consumer");
+    consumer.next_within(READ_TIMEOUT).await.expect("first");
+    let second = consumer.next_within(READ_TIMEOUT).await.expect("second");
+    assert!(matches!(
+        consumer.next_within(Duration::from_millis(50)).await,
+        Err(LaserError::Timeout(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(2), consumer.commit(&second))
+        .await
+        .expect("manual commit must not wait for another read to complete")
+        .expect("commit");
+    consumer.shutdown().await.expect("close");
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
+}
+
+#[tokio::test]
+async fn given_a_native_group_by_numeric_id_when_consuming_then_should_resolve_its_name() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    group_source(&laser).await;
+    let mut capabilities = Capabilities::OPEN;
+    capabilities.hello = HelloOutcome::Rejected;
+    let native = laser.with_capabilities(capabilities);
+    let info = native
+        .topic(TOPIC)
+        .consumer_group(GROUP)
+        .create()
+        .build()
+        .await
+        .expect("native group");
+    let mut consumer = native
+        .topic(TOPIC)
+        .consumer_group_id(u64::from(info.id))
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Disabled)
+        .build()
+        .await
+        .expect("a numeric group can use the native fallback");
+    let first = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect("native delivery");
+    assert_eq!(first.position.offset, 0);
+    consumer.commit(&first).await.expect("native commit");
+    consumer.shutdown().await.expect("native close");
+}
+
+#[tokio::test]
+async fn given_a_cancelled_binding_delivery_when_returned_then_should_redeliver_without_acknowledging()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Each)
+        .build()
+        .await
+        .expect("consumer");
+    let original = consumer.next_within(READ_TIMEOUT).await.expect("first");
+    consumer
+        .return_delivery(original)
+        .await
+        .expect("cancelled handoff is returned");
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
+    let repeated = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect("returned delivery");
+    assert_eq!(repeated.position.offset, 0);
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
+    consumer
+        .return_delivery(repeated)
+        .await
+        .expect("return again");
+    consumer.shutdown().await.expect("close");
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        None,
+        "shutdown cannot acknowledge an undelivered binding result"
+    );
+}
+
+#[tokio::test]
+async fn given_a_changed_policy_when_an_automatic_ack_is_refused_then_should_resume_without_the_stale_buffer()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Each)
+        .poll_interval(Duration::from_millis(5))
+        .build()
+        .await
+        .expect("consumer");
+    assert_eq!(
+        consumer
+            .next_within(READ_TIMEOUT)
+            .await
+            .expect("first")
+            .position
+            .offset,
+        0
+    );
+    group
+        .filter()
+        .release()
+        .await
+        .expect("release while reading");
+    let refused = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect_err("old policy ack is fenced");
+    assert_eq!(refused.filter_reason(), Some(FilterErrorReason::Conflict));
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
+    let repeated = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect("fresh unbound read");
+    assert_eq!(
+        repeated.position.offset, 0,
+        "the unacknowledged record is redelivered"
+    );
+    assert_eq!(
+        consumer
+            .next_within(READ_TIMEOUT)
+            .await
+            .expect("newly included record")
+            .position
+            .offset,
+        1
+    );
+    consumer.shutdown().await.expect("close");
+}
+
+#[tokio::test]
+async fn given_a_bound_group_when_reading_pages_then_should_run_the_bound_revision_and_store_group_progress()
  {
     let laser = harness::connected_laser_on(catalog_server().await).await;
     assert!(laser.capabilities().await.filters.catalog);
     let stream = group_source(&laser).await;
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group(GROUP)
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
         .start(FilteredStart::First)
         .build()
         .await
@@ -192,59 +903,79 @@ async fn given_a_bound_group_when_reading_then_should_run_the_bound_revision_and
         .expect("a page arrives")
         .expect("the bound read succeeds");
 
-    let offsets: Vec<u64> = page.records.iter().map(|record| record.offset).collect();
-    assert_eq!(offsets, vec![0, 2]);
-    assert_eq!(page.policy.filter_id, Some(1));
+    assert_eq!(offsets(&page), vec![0, 2]);
+    let binding = group
+        .filter()
+        .get()
+        .await
+        .expect("readable")
+        .expect("bound");
+    assert_eq!(page.policy.filter_id, Some(binding.filter_id));
     assert_eq!(page.policy.revision, Some(1));
+    assert_eq!(page.policy.digest, Some(binding.digest));
+    assert_eq!(page.policy.mode, ExecutionMode::Filtered);
+    assert_eq!(page.policy.policy_generation, 1);
     reader.ack_page(&page).await.expect("the page acknowledges");
     reader.close().await.expect("the reader closes");
-    let stored = laser
-        .client()
-        .get_consumer_offset(
-            &Consumer::group(Identifier::named(GROUP).expect("group name")),
-            &Identifier::named(&stream).expect("stream name"),
-            &Identifier::named(TOPIC).expect("topic name"),
-            Some(0),
-        )
-        .await
-        .expect("the group offset reads")
-        .map(|offset| offset.stored_offset);
-    assert_eq!(stored, Some(2));
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
 }
 
 #[tokio::test]
-async fn given_a_bound_group_when_a_reader_brings_another_filter_then_should_conflict() {
+async fn given_a_configured_group_when_created_again_then_should_keep_its_binding_and_refuse_another_policy()
+ {
     let laser = harness::connected_laser_on(catalog_server().await).await;
-    let stream = group_source(&laser).await;
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group(GROUP)
-        .inline(ConsumerFilter::json(FilterExpr::present("kind")))
-        .start(FilteredStart::First)
+    group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let first = group
+        .filter()
+        .get()
+        .await
+        .expect("readable")
+        .expect("bound");
+
+    let again = group
+        .create()
+        .filter(bound_filter())
         .build()
         .await
-        .expect("the group reader builds");
+        .expect("the same policy is idempotent");
+    assert_eq!(again.filter, Some(first.clone()));
 
-    let refused = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+    let refused = group
+        .create()
+        .filter(ConsumerFilter::json(FilterExpr::present("kind")))
+        .build()
         .await
-        .expect("the read answers");
-
-    assert!(matches!(
-        refused,
-        Err(ref error) if error.filter_reason() == Some(FilterErrorReason::Conflict)
-    ));
-    reader.close().await.expect("the reader closes");
+        .expect_err("another policy conflicts");
+    match refused {
+        LaserError::ConsumerGroupSetup {
+            group_id,
+            name,
+            identity,
+            source,
+        } => {
+            assert_eq!(name, GROUP);
+            assert_eq!(u64::from(group_id), identity.group_id);
+            assert_eq!(identity, first.identity);
+            assert_eq!(source.filter_reason(), Some(FilterErrorReason::Conflict));
+        }
+        other => panic!("a group setup failure, got {other:?}"),
+    }
+    assert_eq!(
+        group.filter().get().await.expect("readable"),
+        Some(first),
+        "the running policy is preserved"
+    );
 }
 
 #[tokio::test]
 async fn given_lost_membership_when_reading_again_then_should_rejoin_from_committed_progress() {
     let laser = harness::connected_laser_on(catalog_server().await).await;
     let stream = group_source(&laser).await;
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group(GROUP)
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
         .start(FilteredStart::First)
         .build()
         .await
@@ -266,31 +997,12 @@ async fn given_lost_membership_when_reading_again_then_should_rejoin_from_commit
         )
         .await
         .expect("membership removed");
-    let producer = laser
-        .topic(TOPIC)
-        .producer()
-        .partitions(1)
-        .build()
-        .await
-        .expect("producer");
-    producer
-        .send_batch_with_routing(
-            [ProducerMessage::new(DECOMMISSION.as_bytes())],
-            Some(Routing::Partition(0)),
-        )
-        .await
-        .expect("new record");
+    publish(&laser, TOPIC, &[DECOMMISSION], 0).await;
     let next = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
         .await
         .expect("rejoin and read timely")
         .expect("read after rejoin");
-    assert_eq!(
-        next.records
-            .iter()
-            .map(|record| record.offset)
-            .collect::<Vec<_>>(),
-        vec![3]
-    );
+    assert_eq!(offsets(&next), vec![3]);
     assert!(
         reader.ack_page(&page).await.is_err(),
         "old membership pages cannot acknowledge the new reader epoch"
@@ -302,7 +1014,8 @@ async fn given_lost_membership_when_reading_again_then_should_rejoin_from_commit
 #[tokio::test]
 async fn given_two_partitions_on_one_node_when_reading_many_pages_then_should_keep_one_data_connection()
  {
-    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let (server, _socket_dir) = start_catalog_server().await;
+    let laser = harness::connected_laser_on(&server).await;
     let stream = group_source(&laser).await;
     let stream_id = Identifier::named(&stream).expect("stream");
     let topic_id = Identifier::named(TOPIC).expect("topic");
@@ -311,26 +1024,19 @@ async fn given_two_partitions_on_one_node_when_reading_many_pages_then_should_ke
         .create_partitions(&stream_id, &topic_id, 1)
         .await
         .expect("second partition");
-    let producer = laser
-        .topic(TOPIC)
-        .producer()
-        .partitions(2)
-        .build()
-        .await
-        .expect("producer");
     for partition in 0..2 {
-        producer
-            .send_batch_with_routing(
-                (0..PAGES_PER_PARTITION).map(|_| ProducerMessage::new(SAFE_MODE.as_bytes())),
-                Some(Routing::Partition(partition)),
-            )
-            .await
-            .expect("the partition fixtures publish");
+        publish(
+            &laser,
+            TOPIC,
+            &vec![SAFE_MODE; PAGES_PER_PARTITION as usize],
+            partition,
+        )
+        .await;
     }
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group(GROUP)
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
         .start(FilteredStart::First)
         .count(1)
         .build()
@@ -366,24 +1072,11 @@ async fn given_a_revoked_partition_when_draining_then_should_route_acknowledgmen
         .create_partitions(&stream_id, &topic_id, 1)
         .await
         .expect("second partition");
-    let producer = laser
-        .topic(TOPIC)
-        .producer()
-        .partitions(2)
-        .build()
-        .await
-        .expect("producer");
-    producer
-        .send_batch_with_routing(
-            [ProducerMessage::new(SAFE_MODE.as_bytes())],
-            Some(Routing::Partition(1)),
-        )
-        .await
-        .expect("partition one fixture");
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group(GROUP)
+    publish(&laser, TOPIC, &[SAFE_MODE], 1).await;
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
         .start(FilteredStart::First)
         .build()
         .await
@@ -430,18 +1123,10 @@ async fn given_a_revoked_partition_when_draining_then_should_route_acknowledgmen
         .ack_page(page)
         .await
         .expect("revoked partition can drain through offset routing");
-    let stored = peer
-        .client()
-        .get_consumer_offset(
-            &Consumer::group(Identifier::named(GROUP).expect("group")),
-            &stream_id,
-            &topic_id,
-            Some(revoked),
-        )
-        .await
-        .expect("offset reads")
-        .expect("offset stored");
-    assert_eq!(Some(stored.stored_offset), page.safe_ack_offset);
+    assert_eq!(
+        stored_group_offset(&laser, &stream, revoked).await,
+        page.safe_ack_offset
+    );
     reader.close().await.expect("reader closes");
     peer.close().await.expect("peer closes");
 }
@@ -454,10 +1139,10 @@ async fn given_a_recreated_group_when_acknowledging_an_old_page_then_should_not_
     let stream_id = Identifier::named(&stream).expect("stream");
     let topic_id = Identifier::named(TOPIC).expect("topic");
     let group_id = Identifier::named(GROUP).expect("group");
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group(GROUP)
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
         .start(FilteredStart::First)
         .build()
         .await
@@ -486,39 +1171,94 @@ async fn given_a_recreated_group_when_acknowledging_an_old_page_then_should_not_
         matches!(result, Err(ref error) if error.filter_reason() == Some(FilterErrorReason::SourceChanged)),
         "old page cannot acknowledge a new group: {result:?}"
     );
-    let stored = laser
-        .client()
-        .get_consumer_offset(
-            &Consumer::group(group_id),
-            &stream_id,
-            &topic_id,
-            Some(page.partition_id),
-        )
-        .await
-        .expect("read new group offset");
-    assert!(stored.is_none(), "new group has no acknowledged records");
+    assert!(
+        stored_group_offset(&laser, &stream, page.partition_id)
+            .await
+            .is_none(),
+        "new group has no acknowledged records"
+    );
+    assert_eq!(
+        group.filter().get().await.expect("readable"),
+        None,
+        "a recreated group inherits no policy"
+    );
     let _ = reader.close().await;
 }
 
 #[tokio::test]
-async fn given_a_numeric_group_when_selecting_a_revision_then_should_keep_the_binding_and_identity()
-{
+async fn given_a_recreated_group_when_configuring_with_its_old_identity_then_should_leave_the_replacement_unbound()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let original = group.info().await.expect("original group");
+    laser
+        .client()
+        .delete_consumer_group(
+            &Identifier::named(&stream).expect("stream"),
+            &Identifier::named(TOPIC).expect("topic"),
+            &Identifier::named(GROUP).expect("group"),
+        )
+        .await
+        .expect("delete original group");
+    let replacement = group.create().build().await.expect("replacement group");
+    assert_ne!(replacement.identity, original.identity);
+    let mutation = FilterMutationRequest {
+        v: FILTER_OP_VERSION,
+        operation_id: u128::from(ulid::Ulid::generate()),
+        mutation: FilterMutation::ConfigureGroup {
+            group: FilterGroupRef {
+                stream,
+                topic: TOPIC.to_owned(),
+                group: GROUP.to_owned(),
+            },
+            policy: GroupFilterSpec::Definition(bound_filter()),
+            expected_identity: Some(original.identity),
+        },
+    };
+    let reply = laser
+        .client()
+        .send_binary_request(
+            AGDX_FILTER_MUTATE_CODE,
+            encode_named(&mutation).expect("mutation encodes").into(),
+        )
+        .await
+        .expect("typed refusal");
+    let reply: FilterCatalogReply = decode_named(&reply).expect("mutation reply");
+    assert!(
+        matches!(reply, FilterCatalogReply::Err(error) if error.reason == FilterErrorReason::SourceChanged)
+    );
+    assert!(
+        group
+            .filter()
+            .get()
+            .await
+            .expect("replacement policy reads")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn given_a_numeric_group_handle_when_reading_then_should_pin_the_topic_incarnation() {
     let laser = harness::connected_laser_on(catalog_server().await).await;
     let stream = group_source(&laser).await;
     let stream_id = Identifier::named(&stream).expect("stream");
     let topic_id = Identifier::named(TOPIC).expect("topic");
     let named = Identifier::named(GROUP).expect("group");
-    let group = laser
-        .client()
-        .get_consumer_group(&stream_id, &topic_id, &named)
+    let created = bound_group(&laser)
         .await
-        .expect("group lookup")
-        .expect("group");
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group_id(u64::from(group.id))
-        .revision(1, 1)
+        .info()
+        .await
+        .expect("the group exists");
+    let by_id = laser.topic(TOPIC).consumer_group_id(u64::from(created.id));
+    assert_eq!(
+        by_id.filter().get().await.expect("readable"),
+        created.filter,
+        "a numeric handle reads the same policy"
+    );
+    let mut reader = by_id
+        .reader()
+        .expect("a stream is set")
         .start(FilteredStart::First)
         .build()
         .await
@@ -527,23 +1267,9 @@ async fn given_a_numeric_group_when_selecting_a_revision_then_should_keep_the_bi
         .await
         .expect("deadline")
         .expect("page");
-    assert_eq!(page.policy.group_id, Some(u64::from(group.id)));
+    assert_eq!(page.policy.group_id, Some(u64::from(created.id)));
     reader.ack_page(&page).await.expect("ack");
     reader.close().await.expect("close");
-    let mut mismatch = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .group_id(u64::from(group.id))
-        .revision(1, 2)
-        .build()
-        .await
-        .expect("reader");
-    let error = tokio::time::timeout(READ_TIMEOUT, mismatch.next_page())
-        .await
-        .expect("deadline")
-        .expect_err("another revision is refused");
-    assert_eq!(error.filter_reason(), Some(FilterErrorReason::Conflict));
-    mismatch.close().await.expect("close");
     laser
         .client()
         .delete_consumer_group(&stream_id, &topic_id, &named)
@@ -555,13 +1281,293 @@ async fn given_a_numeric_group_when_selecting_a_revision_then_should_keep_the_bi
         .await
         .expect("recreate name");
     assert!(
-        laser
-            .filters()
-            .reader(&stream, TOPIC)
-            .group_id(u64::from(group.id))
+        by_id
+            .reader()
+            .expect("a stream is set")
             .build()
             .await
             .is_err(),
         "old id must not join the replacement group"
     );
+}
+
+#[tokio::test]
+async fn given_out_of_order_acks_when_acknowledging_then_should_store_only_the_completed_prefix() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .count(1)
+        .build()
+        .await
+        .expect("the reader builds");
+    let first = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("a record arrives")
+        .expect("the read succeeds");
+    let second = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("a record arrives")
+        .expect("the read succeeds");
+    assert_eq!((first.offset, second.offset), (0, 2));
+
+    reader
+        .ack(&second)
+        .await
+        .expect("the later record acknowledges");
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        None,
+        "the earlier record is still open"
+    );
+    reader
+        .ack(&first)
+        .await
+        .expect("the earlier record acknowledges");
+
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
+    reader.close().await.expect("the reader closes");
+}
+
+#[tokio::test]
+async fn given_a_malformed_record_under_stop_when_reading_then_should_deliver_earlier_matches_then_the_fault()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    publish(&laser, TOPIC, &[SAFE_MODE, "not json", DECOMMISSION], 0).await;
+    let stream = laser.default_stream().expect("stream").to_owned();
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("the reader builds");
+
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the read succeeds");
+    assert_eq!(offsets(&page), vec![0]);
+    reader.ack_page(&page).await.expect("the page acknowledges");
+    let fault = reader
+        .next_page()
+        .await
+        .expect_err("the fault stops the reader");
+
+    assert!(matches!(
+        fault,
+        LaserError::FilterFault {
+            partition_id: 0,
+            offset: 1,
+            reason: FaultReason::Malformed,
+        }
+    ));
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        Some(0),
+        "the fault stays unacknowledged"
+    );
+    reader.close().await.expect("the reader closes");
+}
+
+#[tokio::test]
+async fn given_a_local_guard_when_reading_then_should_agree_with_the_server() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .local_guard(true)
+        .build()
+        .await
+        .expect("the reader builds");
+
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("a page arrives")
+        .expect("the local evaluation agrees");
+
+    assert_eq!(offsets(&page), vec![0, 2]);
+    reader.close().await.expect("the reader closes");
+}
+
+#[tokio::test]
+async fn given_a_paused_revision_when_reading_then_should_refuse_new_reads_until_resumed() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .count(1)
+        .build()
+        .await
+        .expect("the reader builds");
+    let first = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("a record arrives")
+        .expect("the read succeeds");
+    group
+        .filter()
+        .set_revision_enabled(1, false)
+        .await
+        .expect("the revision pauses");
+    reader
+        .ack(&first)
+        .await
+        .expect("delivered work still acknowledges");
+    let refused = reader.try_next_page().await.expect_err("new reads stop");
+    assert_eq!(
+        refused.filter_reason(),
+        Some(FilterErrorReason::RevisionDisabled)
+    );
+    group
+        .filter()
+        .set_revision_enabled(1, true)
+        .await
+        .expect("the revision resumes");
+    let second = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("a record arrives")
+        .expect("reads resume");
+    assert_eq!(second.offset, 2);
+    let revisions = group
+        .filter()
+        .revisions(0, 10)
+        .await
+        .expect("revisions list");
+    assert_eq!(revisions.total, 1);
+    reader.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn given_a_released_group_when_consumed_then_should_deliver_every_record_and_keep_its_digest()
+{
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let released = group.filter().release().await.expect("the policy releases");
+    assert_eq!(released.policy_generation, 1);
+    assert_eq!(group.filter().get().await.expect("readable"), None);
+
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::All)
+        .poll_interval(Duration::from_millis(5))
+        .build()
+        .await
+        .expect("the group consumer builds");
+    let mut delivered = Vec::new();
+    for _ in 0..3 {
+        delivered.push(
+            consumer
+                .next_within(READ_TIMEOUT)
+                .await
+                .expect("a record arrives")
+                .position
+                .offset,
+        );
+    }
+    consumer.shutdown().await.expect("shutdown");
+    assert_eq!(
+        delivered,
+        vec![0, 1, 2],
+        "a released group receives everything"
+    );
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, Some(2));
+
+    let again = group
+        .filter()
+        .configure(bound_filter())
+        .await
+        .expect("the digest it ran binds again");
+    assert_eq!(again.policy_generation, 3);
+    let refused = group
+        .filter()
+        .configure(ConsumerFilter::json(FilterExpr::present("kind")))
+        .await
+        .expect_err("another digest conflicts");
+    assert_eq!(refused.filter_reason(), Some(FilterErrorReason::Conflict));
+}
+
+#[tokio::test]
+async fn given_typed_custom_headers_when_filtered_then_should_preserve_types_and_payload() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let producer = laser
+        .topic(TOPIC)
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("producer");
+    for priority in [
+        HeaderValue::from(1_u8),
+        HeaderValue::from(2_u8),
+        HeaderValue::try_from("2").expect("text"),
+    ] {
+        let message = ProducerMessage::new(vec![0xff, 0x00])
+            .header(
+                HeaderKey::try_from("routing.priority").expect("key"),
+                priority,
+            )
+            .header(
+                HeaderKey::try_from("armed").expect("key"),
+                HeaderValue::from(true),
+            )
+            .header(
+                HeaderKey::try_from("temperature").expect("key"),
+                HeaderValue::from(-1.5_f32),
+            )
+            .header(
+                HeaderKey::try_from("sequence").expect("key"),
+                HeaderValue::from(u64::MAX),
+            );
+        producer
+            .send_to_partition(message, 0)
+            .await
+            .expect("publish");
+    }
+    let group = laser.topic(TOPIC).consumer_group("typed-headers");
+    group
+        .create()
+        .filter(ConsumerFilter::headers_only(FilterExpr::all([
+            FilterExpr::header("routing.priority", CmpOp::Eq, 2_i32),
+            FilterExpr::header("armed", CmpOp::Eq, true),
+            FilterExpr::header("temperature", CmpOp::Lt, 0_i32),
+            FilterExpr::header("sequence", CmpOp::Gt, i64::MAX),
+        ])))
+        .build()
+        .await
+        .expect("the group is created with its filter");
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .local_guard(true)
+        .build()
+        .await
+        .expect("reader");
+    let record = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+        .await
+        .expect("read deadline")
+        .expect("record");
+    assert_eq!(record.offset, 1);
+    assert_eq!(record.message.payload.as_ref(), &[0xff, 0x00]);
+    reader.ack(&record).await.expect("acknowledge");
+    assert!(
+        reader
+            .try_next_page()
+            .await
+            .expect("remaining records")
+            .is_none()
+    );
+    reader.close().await.expect("close");
 }

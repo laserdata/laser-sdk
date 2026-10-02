@@ -72,7 +72,7 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- Python follows the shared workspace version, currently `0.5.0`. Its dependency must select the matching Rust `laser-sdk` crate.
+- Python follows the shared workspace version, currently `0.5.1`. Its dependency must select the matching Rust `laser-sdk` crate.
 
 ## Working on it
 
@@ -90,3 +90,7 @@ Publish attempts default to 60 seconds with three retries. Retry delays start at
 Connect budgets use Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout`, overriding `LASER_CONNECT_TIMEOUT_MS` (default 30000, see [connect timeout and cleanup](../../../docs/connect-timeout.md)). Rust builder methods are `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff`. Python `Laser.connect` keywords are `publish_timeout_ms`, `publish_max_retries`, and `publish_retry_backoff_ms`. TypeScript builder methods are `publishTimeout`, `publishMaxRetries`, and `publishRetryBackoff`. Explicit configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.
 
 Exhausted retries return an error for the application to handle. They do not exit the process. Preserve message identity and confirmed chunks across retries. See [publish recovery](../../../docs/publish-recovery.md).
+
+## Consumer-group filter ownership
+
+Consumer group handles live under topics. Filter setup and revisions live under each group. Normal and advanced consumers use the group's policy and return all records for an authoritatively unbound group. Follow the consumer-filters skill for scan budgets, progress, cancellation, capability failures and cross-language test parity. Do not reintroduce a top-level filter service.

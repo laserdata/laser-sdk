@@ -1,5 +1,6 @@
 import type { LaserTransport } from "../iggy/apache-iggy.js"
 import { Topic } from "./topic.js"
+import type { GroupContext } from "./consumer-group.js"
 import type { GovernPublish, ObserveEffect, ResolveSchema } from "./topic.js"
 
 export class Stream {
@@ -9,11 +10,20 @@ export class Stream {
     private readonly govern?: GovernPublish,
     private readonly resolveSchema?: ResolveSchema,
     private readonly observe?: ObserveEffect,
-    private readonly onDelete?: () => void
+    private readonly onDelete?: () => void,
+    private readonly groups?: GroupContext
   ) {}
 
   topic(name: string): Topic {
-    return new Topic(this.transport, this.name, name, this.govern, this.resolveSchema, this.observe)
+    return new Topic(
+      this.transport,
+      this.name,
+      name,
+      this.govern,
+      this.resolveSchema,
+      this.observe,
+      this.groups
+    )
   }
 
   async ensure(): Promise<void> {

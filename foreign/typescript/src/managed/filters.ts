@@ -1,4 +1,3 @@
-import { requireCapability } from "../client/capabilities.js"
 import { resultCodeIsRetryable } from "../wire/result.js"
 import { jsonCodec } from "../stream/codecs.js"
 import { decodeBrowseReply, encodeGetSchema } from "../wire/browse.js"
@@ -41,24 +40,23 @@ import {
   FilterOperationCommand,
   FilterPreviewCommand,
   FilterTestCommand,
-  FilterValidateCommand,
   GetFilterBindingCommand,
-  GetFilterCommand,
   ListFilterBindingsCommand,
-  ListFilterRevisionsCommand,
-  ListFiltersCommand
+  ListFilterRevisionsCommand
 } from "../wire/commands.js"
 import { CompiledFilter, usesRegex, type DecodeLimits } from "../wire/filter-eval.js"
 import {
   type AppliedPolicy,
+  type CatalogPosition,
   type ConsumerFilter,
+  type ExecutionMode,
   type FaultReason,
   type FilterBinding,
   type FilterBindingPage,
   type FilterCatalogOutcome,
   type FilterCatalogReply,
   type FilterConsumer,
-  type FilterDetail,
+  type FilterGroupIdentity,
   type FilterGroupRef,
   type FilterHeader,
   type FilterMutation,
@@ -66,37 +64,32 @@ import {
   type FilterMutationResult,
   type FilterMutationStatus,
   type FilterOutcome,
-  type FilterPage,
   type FilterPreview,
   type FilterRef,
   type FilterReply,
   type FilterRevisionPage,
   type FilterRevisionRef,
   type FilterSource,
-  type FilterState,
   type FilterTestResult,
-  type FilterValidation,
   type FilteredAck,
   type FilteredPage,
   type FilteredPollRequest,
   type FilteredStart,
+  type GroupFilterSpec,
   type ReadMode,
   type SourceGeneration,
   type StopReason,
-  consumerFilterDigest,
   decodeFilterReply,
   encodeFilteredAck,
   encodeFilteredPollRequest,
   nextFilteredStart,
   validateCatalogPage,
-  validateConsumerFilter,
   validateFilterGroupRef,
   validateFilterMutationRequest,
   validateFilterPreviewRequest,
   validateFilterTestRequest,
   validateFilteredPollRequest
 } from "../wire/filter.js"
-import { filterAnnounceEvaluates } from "../wire/hello.js"
 import {
   MAX_FILTER_CATALOG_PAGE,
   MAX_FILTER_PARSE_DEPTH,
@@ -120,6 +113,7 @@ export const DEFAULT_OUTCOME_WAIT_MS = 30_000
 
 const GET_STREAM_CODE = 200
 const GET_TOPIC_CODE = 300
+const GET_CONSUMER_GROUP_CODE = 600
 const ATTACH_CONSUMER_SESSION_CODE = 14
 const SYNC_CONSUMER_GROUP_CODE = 606
 const GET_CONSUMER_OFFSET_ROUTING_CODE = 123
@@ -149,19 +143,17 @@ export interface ReaderTag {
   readonly sequence: number
 }
 
-/** The transport a filters handle needs. */
+/** The transport a consumer group's filter handle and readers need. */
 export type FilterTransport = Pick<
   LaserTransport,
   | "sendManaged"
-  | "getTopicPartitionCount"
   | "joinConsumerGroup"
   | "leaveConsumerGroup"
   | "joinExistingConsumerGroup"
   | "openNodeConnection"
   | "openCoordinator"
   | "connectsNodes"
-> &
-  Partial<Pick<LaserTransport, "ensureConsumerGroup">>
+>
 
 /** One page of matching records from one partition. */
 export interface MatchedPage {
@@ -208,24 +200,21 @@ export interface FilterPreviewOptions {
   readonly explain?: boolean
 }
 
-export interface FilterListOptions {
-  readonly nameContains?: string
-  readonly state?: FilterState
-  /** Only filters with a lower id. Pass the last id of a page, with page 0, to page stably. */
-  readonly beforeId?: number
-  readonly page?: number
-  readonly pageSize?: number
-}
-
 export interface CatalogPageOptions {
   readonly page?: number
   readonly pageSize?: number
 }
 
+/** A group mutation's binding with the control-log position the fold applied it at. */
+export interface ConfiguredGroup {
+  readonly binding: FilterBinding
+  readonly catalogPosition?: CatalogPosition
+}
+
 /**
- * Server-side consumer filters: filtered readers, previews, sample tests, and
- * the saved-filter catalog. Build it with `Laser.filters()`. Native reads need
- * a server that serves consumer filters. The catalog also needs a managed
+ * The catalog and native filter commands behind a consumer group's filter
+ * handle, reached through `ConsumerGroup.filter()`. Native commands need a
+ * server that serves consumer filters. The catalog also needs a managed
  * plane. Either missing throws `UnsupportedError`.
  */
 export class Filters {
@@ -234,17 +223,10 @@ export class Filters {
     private readonly capabilities: () => Promise<Capabilities>
   ) {}
 
-  /** A filtered reader over `stream` / `topic`. */
-  reader(stream: string, topic: string): FilteredReaderBuilder {
-    return new FilteredReaderBuilder(this.transport, this.capabilities, this, { stream, topic })
-  }
-
-  /** Validate and compile `filter` on the server without running it. */
-  async validate(filter: ConsumerFilter): Promise<FilterValidation> {
-    validateConsumerFilter(filter)
-    const outcome = await this.native(FilterValidateCommand, filter)
-    if (outcome.kind === "validated") return outcome.validation
-    throw unexpected("validate")
+  /** Throws `UnsupportedError` unless the group filter catalog is served. */
+  async requireCatalog(): Promise<void> {
+    const capabilities = await this.capabilities()
+    requireManagedCommand(capabilities, FilterMutateCommand)
   }
 
   /** Evaluate a filter against one supplied record and explain the verdict. */
@@ -287,29 +269,6 @@ export class Filters {
     const outcome = await this.native(FilterPreviewCommand, request)
     if (outcome.kind === "preview") return outcome.preview
     throw unexpected("preview")
-  }
-
-  /** One saved filter with its latest revision and bindings. */
-  async get(filterId: number): Promise<FilterDetail> {
-    const outcome = await this.catalog(GetFilterCommand, { v: FILTER_OP_VERSION, filterId })
-    if (outcome.kind === "filter") return outcome.detail
-    throw unexpected("get")
-  }
-
-  /** One page of saved filters, newest first. */
-  async list(options: FilterListOptions = {}): Promise<FilterPage> {
-    const request = {
-      v: FILTER_OP_VERSION,
-      ...(options.nameContains !== undefined ? { nameContains: options.nameContains } : {}),
-      ...(options.state !== undefined ? { state: options.state } : {}),
-      ...(options.beforeId !== undefined ? { beforeId: options.beforeId } : {}),
-      page: options.page ?? 0,
-      pageSize: options.pageSize ?? DEFAULT_PAGE_SIZE
-    }
-    validateCatalogPage(request.page, request.pageSize)
-    const outcome = await this.catalog(ListFiltersCommand, request)
-    if (outcome.kind === "filters") return outcome.page
-    throw unexpected("list")
   }
 
   /** One page of a filter's revisions, newest first. */
@@ -362,24 +321,8 @@ export class Filters {
       v: FILTER_OP_VERSION,
       operationId
     })
-    if (outcome.kind === "mutation") return outcome.outcome
+    if (outcome.kind === "mutation") return checkedMutationOutcome(operationId, outcome.outcome)
     throw unexpected("operation")
-  }
-
-  /** Save a new filter as revision 1. */
-  async register(
-    name: string,
-    filter: ConsumerFilter,
-    options: { readonly description?: string } = {}
-  ): Promise<FilterRevisionRef> {
-    const result = await this.apply({
-      kind: "register",
-      name,
-      description: options.description ?? "",
-      filter
-    })
-    if (result.kind === "registered") return result.revision
-    throw unexpected("register")
   }
 
   /** Add a revision. `expectedRevision` must still be the latest one. */
@@ -388,89 +331,9 @@ export class Filters {
     expectedRevision: number,
     filter: ConsumerFilter
   ): Promise<FilterRevisionRef> {
-    const result = await this.apply({ kind: "revise", filterId, expectedRevision, filter })
-    if (result.kind === "revised") return result.revision
+    const applied = await this.apply({ kind: "revise", filterId, expectedRevision, filter })
+    if (applied.result.kind === "revised") return applied.result.revision
     throw unexpected("revise")
-  }
-
-  /** Replace a filter's description. */
-  async describe(filterId: number, description: string): Promise<void> {
-    await this.apply({ kind: "describe", filterId, description })
-  }
-
-  /** Hide a filter from new bindings. Existing bindings keep executing. */
-  async archive(filterId: number): Promise<void> {
-    await this.apply({ kind: "archive", filterId })
-  }
-
-  /** Delete a filter. Throws with reason `conflict` while a consumer group is bound to it. */
-  async delete(filterId: number): Promise<void> {
-    await this.apply({ kind: "drop", filterId })
-  }
-
-  /** Pin an existing consumer group to one revision. */
-  async bind(group: FilterGroupRef, filterId: number, revision: number): Promise<FilterBinding> {
-    const result = await this.apply({ kind: "bind", group, filterId, revision })
-    if (result.kind === "bound") return result.binding
-    throw unexpected("bind")
-  }
-
-  /** Release a consumer group while it is still bound to `expectedDigest`. */
-  async unbind(group: FilterGroupRef, expectedDigest: Uint8Array): Promise<FilterBinding> {
-    const result = await this.apply({ kind: "unbind", group, expectedDigest })
-    if (result.kind === "unbound") return result.binding
-    throw unexpected("unbind")
-  }
-
-  /** Release this exact saved binding, even after its group name was reused. */
-  async unbindBinding(binding: FilterBinding): Promise<FilterBinding> {
-    const result = await this.apply({
-      kind: "unbind",
-      group: binding.group,
-      expectedDigest: binding.digest,
-      expectedIdentity: binding.identity
-    })
-    if (result.kind === "unbound") return result.binding
-    throw unexpected("unbind")
-  }
-
-  /**
-   * Submit a mutation under a new operation id and wait for its authoritative
-   * outcome. A lost reply is retried under the same id, which the catalog
-   * answers with the first attempt's outcome. A rejection throws
-   * `FilterExecutionError`. An outcome still pending after
-   * {@link DEFAULT_OUTCOME_WAIT_MS} throws `AmbiguousMutationError` naming the
-   * operation id.
-   */
-  async apply(mutation: FilterMutation): Promise<FilterMutationResult> {
-    return this.applyAs(mintUlidValue(), mutation)
-  }
-
-  /**
-   * {@link Filters.apply} under a caller-chosen `operationId`, so a caller that
-   * records the id first can resume the same mutation after a crash.
-   */
-  async applyAs(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationResult> {
-    const outcome = await this.submit(operationId, mutation)
-    if (outcome.status.kind === "pending") {
-      return this.waitForOutcome(operationId, DEFAULT_OUTCOME_WAIT_MS)
-    }
-    return settled(operationId, outcome.status)
-  }
-
-  /** Create the group if absent, then bind it. A failed bind can leave an unbound group. */
-  async createConsumerGroup(
-    group: FilterGroupRef,
-    filterId: number,
-    revision: number
-  ): Promise<FilterBinding> {
-    const capabilities = await this.capabilities()
-    requireCapability(capabilities, "filters")
-    requireManagedCommand(capabilities, FilterMutateCommand)
-    if (this.transport.ensureConsumerGroup === undefined)
-      throw new ConfigError("this transport cannot create consumer groups")
-    await this.transport.ensureConsumerGroup(group.stream, group.topic, group.group)
-    return this.bind(group, filterId, revision)
   }
 
   /** Pause or resume a revision without changing its executable content or digest. */
@@ -478,22 +341,82 @@ export class Filters {
     await this.apply({ kind: "set_revision_enabled", filterId, revision, enabled })
   }
 
+  /**
+   * Give `group` its policy in one catalog transaction: a definition saved as
+   * the group's own filter, or one of its existing revisions. A repeat with
+   * the same digest keeps the binding, another digest conflicts. The returned
+   * position is where the fold applied it, carried by the group's reads so
+   * they never see this configuration as absent.
+   */
+  async configureGroup(
+    group: FilterGroupRef,
+    policy: GroupFilterSpec,
+    operationId: bigint = mintUlidValue(),
+    expectedIdentity?: FilterGroupIdentity
+  ): Promise<ConfiguredGroup> {
+    const identity =
+      expectedIdentity ?? (await nativeGroup(this.transport, group, group.group)).identity
+    const applied = await this.apply(
+      { kind: "configure_group", group, policy, expectedIdentity: identity },
+      operationId
+    )
+    if (applied.result.kind === "bound") return bound(applied.result.binding, applied)
+    throw unexpected("configure_group")
+  }
+
+  /**
+   * Release this exact saved binding, including a group incarnation that was
+   * deleted and recreated under the same name.
+   */
+  async releaseGroup(binding: FilterBinding): Promise<ConfiguredGroup> {
+    const applied = await this.apply({
+      kind: "unbind",
+      group: binding.group,
+      expectedDigest: binding.digest,
+      expectedIdentity: binding.identity
+    })
+    if (applied.result.kind === "unbound") return bound(applied.result.binding, applied)
+    throw unexpected("unbind")
+  }
+
   /** Send one mutation under a caller-chosen `operationId`. The outcome may be pending. */
   async mutate(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationOutcome> {
     const request = { v: FILTER_OP_VERSION, operationId, mutation }
     validateFilterMutationRequest(request)
     const outcome = await this.catalog(FilterMutateCommand, request)
-    if (outcome.kind === "mutation") return outcome.outcome
+    if (outcome.kind === "mutation") return checkedMutationOutcome(operationId, outcome.outcome)
     throw unexpected("mutate")
   }
 
-  /** Wait for the outcome of `operationId` for at most `timeoutMs`. */
-  async waitForOutcome(operationId: bigint, timeoutMs: number): Promise<FilterMutationResult> {
+  // Submit a mutation and wait for its authoritative outcome. A lost reply is
+  // retried under the same id, which the catalog answers with the first
+  // attempt's outcome. A rejection throws `FilterExecutionError`. An outcome
+  // still pending after `DEFAULT_OUTCOME_WAIT_MS` throws
+  // `AmbiguousMutationError` naming the operation id.
+  private async apply(
+    mutation: FilterMutation,
+    operationId: bigint = mintUlidValue()
+  ): Promise<AppliedMutation> {
+    const submitted = await this.submit(operationId, mutation)
+    const outcome =
+      submitted.status.kind === "pending"
+        ? await this.waitForOutcome(operationId, DEFAULT_OUTCOME_WAIT_MS)
+        : submitted
+    return {
+      result: settled(operationId, outcome.status),
+      ...(outcome.catalogPosition !== undefined ? { catalogPosition: outcome.catalogPosition } : {})
+    }
+  }
+
+  private async waitForOutcome(
+    operationId: bigint,
+    timeoutMs: number
+  ): Promise<FilterMutationOutcome> {
     const deadline = Date.now() + timeoutMs
     for (;;) {
       try {
         const outcome = await this.operation(operationId)
-        if (outcome.status.kind !== "pending") return settled(operationId, outcome.status)
+        if (outcome.status.kind !== "pending") return outcome
       } catch (error) {
         if (!isNotYetApplied(error)) throw error
       }
@@ -545,81 +468,79 @@ export class Filters {
   }
 }
 
-/** Builds a {@link FilteredReader}. Start from `Filters.reader`. */
+interface AppliedMutation {
+  readonly result: FilterMutationResult
+  readonly catalogPosition?: CatalogPosition
+}
+
+function checkedMutationOutcome(
+  operationId: bigint,
+  outcome: FilterMutationOutcome
+): FilterMutationOutcome {
+  if (
+    outcome.v !== FILTER_OP_VERSION ||
+    outcome.operationId !== operationId ||
+    (outcome.catalogPosition?.operationId !== undefined &&
+      outcome.catalogPosition.operationId !== operationId)
+  ) {
+    throw new ProtocolError("filter mutation outcome does not match the requested operation")
+  }
+  return outcome
+}
+
+function bound(binding: FilterBinding, applied: AppliedMutation): ConfiguredGroup {
+  return {
+    binding,
+    ...(applied.catalogPosition !== undefined ? { catalogPosition: applied.catalogPosition } : {})
+  }
+}
+
+/** Builds a {@link FilteredReader} over one consumer group. Start from `ConsumerGroup.reader()`. */
 export class FilteredReaderBuilder {
-  private consumerName?: FilterConsumer
-  private readonly partitionIds: number[] = []
-  private filterRef?: FilterRef
   private startAt: FilteredStart = { kind: "next" }
   private pageCount = DEFAULT_COUNT
+  private examinedBudget?: number
   private replyBytes = DEFAULT_MAX_REPLY_BYTES
   private mode: ReadMode = "primary"
   private guarded = false
   private idleMs = DEFAULT_IDLE_INTERVAL_MS
   private maxUnacked = DEFAULT_MAX_UNACKED_PAGES
+  private readonly selectedPartitions = new Set<number>()
 
-  constructor(
+  private constructor(
     private readonly transport: FilterTransport,
     private readonly capabilities: () => Promise<Capabilities>,
     private readonly filters: Filters,
-    private readonly source: FilterSource
+    private readonly source: FilterSource,
+    private readonly consumer: Exclude<FilterConsumer, { readonly kind: "consumer" }>,
+    private readonly filter: Extract<FilterRef, { readonly kind: "bound" | "group" }>,
+    private readonly minCatalogPosition?: CatalogPosition
   ) {}
 
-  /** Read as the independent consumer `name`. */
-  consumer(name: string): this {
-    this.consumerName = { kind: "consumer", name }
-    return this
-  }
-
-  /**
-   * Read as a member of the existing consumer group `name`. A reader built
-   * from a connection string joins over its own connection, so every reader
-   * is its own member.
-   */
-  group(name: string): this {
-    this.consumerName = { kind: "group", name }
-    return this
-  }
-
-  /** Read the existing group by its native numeric identity. */
-  groupId(id: bigint | number): this {
-    if (typeof id === "number" && !Number.isSafeInteger(id))
-      throw new InvalidError("consumer group id must be an integer")
-    const value = BigInt(id)
-    if (value < 0n || value > 0xffff_ffffn)
-      throw new InvalidError("consumer group id exceeds 32 bits")
-    this.consumerName = { kind: "group_id", id: value }
-    return this
-  }
-
-  /**
-   * Read only `partitionId`. Repeat for more. An independent consumer reads
-   * every partition when none is named, including partitions added later.
-   */
-  partition(partitionId: number): this {
-    this.partitionIds.push(partitionId)
-    return this
-  }
-
-  /** Which filter runs. A group defaults to its bound revision. */
-  filter(filter: FilterRef): this {
-    this.filterRef = filter
-    return this
-  }
-
-  /** Run `filter` from the request. Needs no catalog. */
-  inline(filter: ConsumerFilter): this {
-    return this.filter({ kind: "inline", filter })
-  }
-
-  /** Run a saved revision. */
-  revision(filterId: number, revision: number): this {
-    return this.filter({ kind: "revision", filterId, revision })
+  /** @internal */
+  static create(
+    transport: FilterTransport,
+    capabilities: () => Promise<Capabilities>,
+    filters: Filters,
+    source: FilterSource,
+    consumer: Exclude<FilterConsumer, { readonly kind: "consumer" }>,
+    filter: Extract<FilterRef, { readonly kind: "bound" | "group" }>,
+    minCatalogPosition?: CatalogPosition
+  ): FilteredReaderBuilder {
+    return new FilteredReaderBuilder(
+      transport,
+      capabilities,
+      filters,
+      source,
+      consumer,
+      filter,
+      minCatalogPosition
+    )
   }
 
   /**
    * Where each partition read at the build starts. Defaults to after the
-   * stored offset. A partition a group hands this reader later always resumes
+   * stored offset. A partition the group hands this reader later always resumes
    * after the group's stored offset, so the previous owner's unacknowledged
    * backlog is read, not skipped.
    */
@@ -628,9 +549,29 @@ export class FilteredReaderBuilder {
     return this
   }
 
+  /** Read this partition only while the group assigns it to this member. Repeat for several. */
+  partition(partitionId: number): this {
+    if (!Number.isSafeInteger(partitionId) || partitionId < 0 || partitionId > 0xffff_ffff) {
+      throw new InvalidError("partition must be an unsigned 32-bit integer")
+    }
+    this.selectedPartitions.add(partitionId)
+    return this
+  }
+
   /** Most matching records per page. */
   count(count: number): this {
     this.pageCount = count
+    return this
+  }
+
+  /**
+   * Most source records one page examines, independent of `count`. Without it
+   * the server's own budget bounds the scan. A page that examines its budget
+   * without a match returns empty and the reader continues from where it
+   * stopped.
+   */
+  maxExamined(records: number): this {
+    this.examinedBudget = records
     return this
   }
 
@@ -677,108 +618,75 @@ export class FilteredReaderBuilder {
 
   async build(): Promise<FilteredReader> {
     const capabilities = await this.capabilities()
-    if (!capabilities.filters.native) {
-      throw new UnsupportedError("consumer filters are not served by this server")
-    }
-    const evaluation = capabilities.filters.evaluation
-    if (
-      this.filterRef?.kind === "inline" &&
-      evaluation !== undefined &&
-      !filterAnnounceEvaluates(
-        evaluation,
-        this.filterRef.filter.evaluatorVersion,
-        this.filterRef.filter.codec
-      )
-    ) {
+    if (this.filter.kind === "group" && !capabilities.filters.groupPolicyReads) {
       throw new UnsupportedError(
-        `this server does not evaluate ${this.filterRef.filter.codec} filters of evaluator version ${String(this.filterRef.filter.evaluatorVersion)}`
+        "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK"
       )
+    }
+    if (this.filter.kind !== "group" && !capabilities.filters.native) {
+      throw new UnsupportedError("consumer filters are not served by this server")
     }
     if (this.mode === "primary" && this.transport.connectsNodes !== true) {
       throw new ConfigError(
-        "primary filtered reads open data connections, so they need a Laser connected from a connection string. Read in local mode for an injected client"
+        "primary group reads open data connections, so they need a Laser connected from a connection string. Read in local mode for an injected client"
       )
     }
-    const consumer = this.consumerName
-    if (consumer === undefined) {
-      throw new ConfigError(
-        "a filtered reader needs .consumer(name), .group(name), or .groupId(id)"
-      )
-    }
-    const filter: FilterRef | undefined =
-      this.filterRef ?? (consumer.kind !== "consumer" ? { kind: "bound" } : undefined)
-    if (filter === undefined) {
-      throw new ConfigError(
-        "an independent filtered reader needs .inline(..), .revision(..), or .filter(..)"
-      )
-    }
+    const consumer = this.consumer
     const request: FilteredPollRequest = {
       v: FILTER_OP_VERSION,
       source: this.source,
       partitionId: 0,
       consumer,
-      filter,
+      filter: this.filter,
       start: this.startAt,
       count: this.pageCount,
       maxReplyBytes: this.replyBytes,
-      readMode: this.mode
+      readMode: this.mode,
+      ...(this.examinedBudget !== undefined ? { maxExamined: this.examinedBudget } : {}),
+      ...(this.minCatalogPosition !== undefined
+        ? { minCatalogPosition: this.minCatalogPosition }
+        : {})
     }
     validateFilteredPollRequest(request)
-    const guard =
-      this.guarded && filter.kind !== "bound"
-        ? await compileGuard(this.transport, await definition(this.filters, filter))
-        : undefined
-    if (consumer.kind !== "consumer" && this.partitionIds.length > 0) {
-      throw new ConfigError("a group reader reads the partitions the group assigns it")
-    }
     const pinnedSource =
       consumer.kind === "group_id"
         ? await sourceIncarnation(this.transport, this.source)
         : undefined
+    // A group reader owns the connection that holds its membership, so two
+    // readers are two members. An injected client has only the shared one.
     const coordinator =
-      consumer.kind !== "consumer" &&
-      this.transport.connectsNodes === true &&
-      this.transport.openCoordinator !== undefined
+      this.transport.connectsNodes === true && this.transport.openCoordinator !== undefined
         ? await this.transport.openCoordinator()
         : sharedCoordinator(this.transport)
-    let membership: Membership | undefined
-    let partitionIds: readonly number[]
-    let discovers = false
+    let membership: Membership
     try {
-      if (consumer.kind !== "consumer") {
-        membership = await Membership.join(
-          coordinator,
-          this.source,
-          consumer.kind === "group_id" ? Number(consumer.id) : consumer.name,
-          this.transport,
-          pinnedSource
-        )
-        partitionIds = membership.partitions
-      } else if (this.partitionIds.length > 0) {
-        partitionIds = this.partitionIds
-      } else {
-        partitionIds = await topicPartitions(this.transport, this.source)
-        discovers = true
-      }
+      membership = await Membership.join(
+        coordinator,
+        this.source,
+        consumer.kind === "group_id" ? Number(consumer.id) : consumer.name,
+        this.transport,
+        pinnedSource
+      )
     } catch (error) {
       await coordinator.close()
       throw error
     }
-    return new FilteredReader({
+    return FilteredReader.create({
       transport: this.transport,
       ...(pinnedSource === undefined ? {} : { pinnedSource }),
       filters: this.filters,
       coordinator,
       request,
-      inlineDigest: filter.kind === "inline" ? consumerFilterDigest(filter.filter) : undefined,
       start: this.startAt,
       idleIntervalMs: this.idleMs,
       maxUnackedPages: this.maxUnacked,
-      guard,
+      guard: undefined,
       guardEnabled: this.guarded,
       membership,
-      discovers,
-      partitionIds
+      selectedPartitions: new Set(this.selectedPartitions),
+      partitionIds: membership.partitions.filter(
+        (partition) => this.selectedPartitions.size === 0 || this.selectedPartitions.has(partition)
+      )
     })
   }
 }
@@ -795,15 +703,14 @@ interface ReaderSettings {
   readonly filters: Filters
   readonly coordinator: CoordinatorConnection
   readonly request: FilteredPollRequest
-  readonly inlineDigest: Uint8Array | undefined
   readonly start: FilteredStart
   readonly idleIntervalMs: number
   readonly maxUnackedPages?: number
   readonly guard: CompiledFilter | undefined
   readonly guardEnabled?: boolean
   readonly membership: Membership | undefined
-  readonly discovers: boolean
   readonly partitionIds: readonly number[]
+  readonly selectedPartitions?: ReadonlySet<number>
 }
 
 type Read =
@@ -812,7 +719,7 @@ type Read =
   | { readonly kind: "saturated" }
 
 /**
- * Reads only the records a consumer filter selects, with their original
+ * Reads the records a consumer group's policy selects, with their original
  * offsets, and stores progress through fenced acknowledgments. Pages are read
  * ahead of acknowledgments, and a page's safe offset is stored only after it
  * and every earlier page of the partition are fully handled. Pages that
@@ -833,7 +740,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   private sequence = 0
   private owner: object = {}
   private readonly retiredOwners = new WeakSet<object>()
-  private listedAt: number | undefined
   private closed = false
   private deferredError: unknown
   private pinnedSource: SourceIncarnation | undefined
@@ -841,14 +747,18 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   // Partitions whose last read lost its route, for an independent reader.
   private readonly lostRoutes = new Set<number>()
 
-  constructor(private readonly settings: ReaderSettings) {
+  private constructor(private readonly settings: ReaderSettings) {
     this.routes = new Routes(settings.transport, settings.coordinator)
     this.guard = settings.guard
     this.pinnedSource = settings.pinnedSource
-    this.listedAt = settings.discovers ? performance.now() : undefined
     for (const partitionId of settings.partitionIds) {
       this.progress.set(partitionId, new PartitionProgress(settings.start))
     }
+  }
+
+  /** @internal */
+  static create(settings: ReaderSettings): FilteredReader {
+    return new FilteredReader(settings)
   }
 
   /** The next page with at least one match. Waits while nothing is new, up to `timeoutMs` when given. */
@@ -923,6 +833,42 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     const sequence = this.requireSequence(page)
     this.partitionProgress(page.partitionId).completePage(sequence)
     await this.flush(page.partitionId)
+  }
+
+  /**
+   * Mark this partition's records through `record` handled without storing
+   * yet. The normal consumer delivers in order, so every delivery completes
+   * the prefix through it, and it stores that prefix on its own cadence
+   * through `flushCompleted`.
+   *
+   * @internal
+   */
+  handled(record: MatchedRecord): void {
+    const tag = record[READER_TAG]
+    if (tag?.owner !== this.owner) return
+    this.progress.get(record.partitionId)?.completeThrough(tag.sequence, record.offset)
+  }
+
+  /**
+   * Store every completed prefix now.
+   *
+   * @internal
+   */
+  async flushCompleted(): Promise<void> {
+    if (this.settings.request.readMode !== "primary") return
+    let failure: unknown
+    for (const partitionId of [...this.progress.keys()]) {
+      try {
+        await this.flush(partitionId)
+      } catch (error) {
+        failure ??= error
+      }
+    }
+    if (failure !== undefined) {
+      throw failure instanceof Error
+        ? failure
+        : new TransportError("storing group progress failed", true, { cause: failure })
+    }
   }
 
   /** The partitions this reader reads now. */
@@ -1012,9 +958,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         : new TransportError("a filtered partition failed", true, { cause: error })
     }
     if (this.settings.membership?.isDue() === true) await this.refreshMembership()
-    if (this.listedAt !== undefined && performance.now() - this.listedAt >= ASSIGNMENT_REFRESH_MS) {
-      await this.refreshPartitions()
-    }
     const readable = this.partitions()
     if (readable.length === 0) return { kind: "idle" }
     const now = performance.now()
@@ -1099,7 +1042,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     if (recordHead.getUint32(12, true) !== page.matched || page.matched > request.count)
       throw new ProtocolError("filtered record body has invalid counts")
     const messages = decodePolledBody(page.records)
-    validatePage(request, this.settings.inlineDigest, page, messages)
+    validatePage(request, page, messages)
     if (request.consumer.kind === "group_id") {
       const pinned = this.pinnedSource
       const current = page.generation
@@ -1119,18 +1062,21 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       this.pinnedSource ??= current
     }
     const unevaluated = new Set(page.unevaluated)
-    if (this.settings.guardEnabled && this.guard === undefined) {
-      this.guard = await compileGuard(
-        this.settings.transport,
-        await boundDefinition(this.settings.filters, request.source, page)
-      )
-    }
-    if (this.guard !== undefined) {
-      try {
-        checkGuard(this.guard, page, messages, unevaluated)
-      } catch (error) {
-        this.restartAfter(partitionId, error)
-        throw error
+    // An unfiltered page ran no filter, so there is nothing to check.
+    if (page.policy.mode === "filtered") {
+      if (this.settings.guardEnabled && this.guard === undefined) {
+        this.guard = await compileGuard(
+          this.settings.transport,
+          await boundDefinition(this.settings.filters, request.source, page)
+        )
+      }
+      if (this.guard !== undefined) {
+        try {
+          checkGuard(this.guard, page, messages, unevaluated)
+        } catch (error) {
+          this.restartAfter(partitionId, error)
+          throw error
+        }
       }
     }
     this.sequence += 1
@@ -1160,7 +1106,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       partitionId,
       offset: message.offset,
       frontier: page.frontier,
-      evaluated: !unevaluated.has(message.offset),
+      evaluated: page.policy.mode === "filtered" && !unevaluated.has(message.offset),
       payload: message.payload,
       headers: message.headers,
       headersMalformed: message.headersMalformed !== undefined,
@@ -1199,8 +1145,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (this.buffered[index]?.partitionId === partitionId) this.buffered.splice(index, 1)
     }
     if (error.reason === "source_changed") this.settings.membership?.expire()
-    const request = this.settings.request
-    if (request.filter.kind === "bound") this.guard = undefined
+    if (this.settings.guardEnabled) this.guard = undefined
   }
 
   // Store the completed prefix of one partition. A lost reply keeps the target
@@ -1219,8 +1164,10 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       partitionId,
       consumer: request.consumer,
       generation: target.generation,
-      digest: target.digest,
-      offset: target.offset
+      ...(target.digest === undefined ? {} : { digest: target.digest }),
+      offset: target.offset,
+      mode: target.mode,
+      policyGeneration: target.policyGeneration
     }
     const encoded = encodeFilteredAck(ack)
     for (let rerouted = false; ; rerouted = true) {
@@ -1240,6 +1187,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         if (revoked) await this.routes.release(partitionId)
         return
       } catch (error) {
+        this.restartAfter(partitionId, error)
         if (rerouted || !isRouteLost(error)) throw error
       }
     }
@@ -1285,11 +1233,17 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     const membership = this.settings.membership
     if (membership === undefined || !(await membership.sync())) return
     this.requireOpen()
-    const assigned = new Set(membership.partitions)
+    const selection = this.settings.selectedPartitions
+    const assigned = new Set(
+      membership.partitions.filter(
+        (partition) => selection === undefined || selection.size === 0 || selection.has(partition)
+      )
+    )
     const rejoined = membership.takeRejoined()
     const stale = rejoined ? this.routes.detach() : []
     if (rejoined) {
-      if (this.settings.request.filter.kind === "bound") this.guard = undefined
+      // A rejoin can land in a recreated group with another binding.
+      if (this.settings.guardEnabled) this.guard = undefined
       this.retiredOwners.add(this.owner)
       this.owner = {}
       this.progress.clear()
@@ -1315,18 +1269,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     }
     await Promise.all(stale.map((connection) => connection.close()))
     for (const partitionId of left) await this.routes.release(partitionId)
-  }
-
-  // An independent reader of every partition picks up partitions added to
-  // the topic since the build, resuming their stored progress.
-  private async refreshPartitions(): Promise<void> {
-    const listed = await topicPartitions(this.settings.transport, this.settings.request.source)
-    this.listedAt = performance.now()
-    for (const partitionId of listed) {
-      if (!this.progress.has(partitionId)) {
-        this.progress.set(partitionId, new PartitionProgress({ kind: "next" }))
-      }
-    }
   }
 
   // Forget a revoked partition once nothing of it is in flight.
@@ -1396,7 +1338,9 @@ interface AckTarget {
   readonly groupId?: bigint
   readonly offset: bigint
   readonly generation: SourceGeneration
-  readonly digest: Uint8Array
+  readonly digest?: Uint8Array
+  readonly mode: ExecutionMode
+  readonly policyGeneration: bigint
 }
 
 interface PendingPage {
@@ -1498,7 +1442,9 @@ class PartitionProgress {
         : {
             offset: page.safeAckOffset,
             generation: page.generation,
-            digest: page.policy.digest,
+            ...(page.policy.digest === undefined ? {} : { digest: page.policy.digest }),
+            mode: page.policy.mode,
+            policyGeneration: page.policy.policyGeneration,
             ...(page.policy.groupId !== undefined ? { groupId: page.policy.groupId } : {})
           }
     const newest = this.pages.at(-1)
@@ -1722,7 +1668,7 @@ async function attach(
 }
 
 // The shared transport as a coordinator, for a reader that has no connection
-// of its own: an injected client, or an independent reader.
+// of its own: an injected client.
 function sharedCoordinator(transport: FilterTransport): CoordinatorConnection {
   return {
     send: (code, payload) => transport.sendManaged(code, payload),
@@ -1738,14 +1684,6 @@ function sharedCoordinator(transport: FilterTransport): CoordinatorConnection {
       transport.leaveConsumerGroup(streamId, topicId, name),
     close: () => Promise.resolve()
   }
-}
-
-async function topicPartitions(
-  transport: FilterTransport,
-  source: FilterSource
-): Promise<number[]> {
-  const count = await transport.getTopicPartitionCount(source.stream, source.topic)
-  return Array.from({ length: count }, (_, index) => index)
 }
 
 /** This reader's membership of a consumer group, held by its coordinator connection. */
@@ -1865,7 +1803,7 @@ interface PollRoute {
 }
 
 async function sourceIncarnation(
-  transport: FilterTransport,
+  transport: Pick<FilterTransport, "sendManaged">,
   source: FilterSource
 ): Promise<SourceIncarnation> {
   // Native metadata responses begin with id:u32 and created_at:u64. Reading
@@ -1890,6 +1828,51 @@ async function sourceIncarnation(
     streamCreatedAtMicros: stream.created,
     topicId: topic.id,
     topicCreatedAtMicros: topic.created
+  }
+}
+
+/** A consumer group as the server stores it, with its exact identity. */
+export interface NativeGroup {
+  readonly id: number
+  readonly name: string
+  readonly identity: FilterGroupIdentity
+}
+
+/**
+ * Read a consumer group's native id and name, and the stream and topic
+ * incarnations that scope it. Throws with reason `not_found` when the group
+ * does not exist.
+ */
+export async function nativeGroup(
+  transport: Pick<FilterTransport, "sendManaged">,
+  source: FilterSource,
+  group: string | number
+): Promise<NativeGroup> {
+  const incarnation = await sourceIncarnation(transport, source)
+  const reply = await transport.sendManaged(
+    GET_CONSUMER_GROUP_CODE,
+    concat([identifier(source.stream), identifier(source.topic), identifier(group)])
+  )
+  // The reply begins with id:u32, partitions:u32, members:u32, then the name
+  // as one length byte and its bytes. A missing group answers an empty body.
+  if (reply.byteLength === 0)
+    throw filterError({
+      code: { kind: "known", name: "NotFound" },
+      reason: "not_found",
+      message: `consumer group ${String(group)} does not exist`
+    })
+  if (reply.byteLength < 13) throw new ProtocolError("consumer group metadata is truncated")
+  const view = new DataView(reply.buffer, reply.byteOffset, reply.byteLength)
+  const id = view.getUint32(0, true)
+  if (typeof group === "number" && id !== group)
+    throw new ProtocolError("consumer group metadata identifies another group")
+  const length = view.getUint8(12)
+  if (reply.byteLength < 13 + length)
+    throw new ProtocolError("consumer group metadata is truncated")
+  return {
+    id,
+    name: new TextDecoder().decode(reply.subarray(13, 13 + length)),
+    identity: { ...incarnation, groupId: BigInt(id) }
   }
 }
 
@@ -2024,7 +2007,7 @@ function checkGuard(
   }[],
   unevaluated: ReadonlySet<bigint>
 ): void {
-  if (!sameBytes(page.policy.digest, guard.digest)) {
+  if (page.policy.digest === undefined || !sameBytes(page.policy.digest, guard.digest)) {
     throw filterError({
       code: { kind: "known", name: "Conflict" },
       reason: "conflict",
@@ -2187,7 +2170,7 @@ async function boundDefinition(
         identity.topicCreatedAtMicros === source.topicCreatedAtMicros
     )
     if (binding !== undefined) {
-      if (!sameBytes(binding.digest, page.policy.digest))
+      if (page.policy.digest === undefined || !sameBytes(binding.digest, page.policy.digest))
         throw new ProtocolError("served policy differs from the group's catalog binding")
       return definition(filters, {
         kind: "revision",
@@ -2206,7 +2189,8 @@ async function boundDefinition(
 
 async function definition(filters: Filters, filter: FilterRef): Promise<ConsumerFilter> {
   if (filter.kind === "inline") return filter.filter
-  if (filter.kind === "bound") throw new ConfigError("resolve a bound guard from the served page")
+  if (filter.kind === "bound" || filter.kind === "group")
+    throw new ConfigError("resolve a group guard from the served page")
   const { filterId, revision } = filter
   for (let page = 0; ; page += 1) {
     const revisions = await filters.revisions(filterId, { page, pageSize: MAX_FILTER_CATALOG_PAGE })
@@ -2287,7 +2271,6 @@ function sameGeneration(left: SourceGeneration, right: SourceGeneration): boolea
 
 function validatePage(
   request: FilteredPollRequest,
-  inlineDigest: Uint8Array | undefined,
   page: FilteredPage,
   messages: readonly PolledMessage[]
 ): void {
@@ -2303,14 +2286,21 @@ function validatePage(
     page.matched !== messages.length ||
     page.matched > request.count ||
     page.matched > page.examined ||
-    page.policy.digest.length !== 32 ||
+    (request.maxExamined !== undefined && page.examined > request.maxExamined) ||
+    (page.policy.mode === "filtered") !== (page.policy.digest !== undefined) ||
+    (page.policy.digest !== undefined && page.policy.digest.length !== 32) ||
+    (page.policy.mode === "unfiltered" && page.policy.groupId === undefined) ||
+    (page.policy.mode === "unfiltered" && page.matched !== page.examined) ||
+    (page.policy.mode === "unfiltered" &&
+      (page.policy.filterId !== undefined || page.policy.revision !== undefined)) ||
+    // A strict group read runs a binding and never accepts an unfiltered page.
+    (page.policy.mode === "unfiltered" && request.filter.kind !== "group") ||
     (request.consumer.kind !== "consumer") !== (page.policy.groupId !== undefined)
   )
     invalid()
   const body = new DataView(page.records.buffer, page.records.byteOffset, page.records.byteLength)
   if (body.getUint32(0, true) !== page.partitionId || body.getBigUint64(4, true) !== page.frontier)
     invalid()
-  if (inlineDigest !== undefined && !sameBytes(inlineDigest, page.policy.digest)) invalid()
   if (
     request.filter.kind === "revision" &&
     (page.policy.filterId !== request.filter.filterId ||
@@ -2323,7 +2313,12 @@ function validatePage(
     if (
       !sameGeneration(cursor.generation, page.generation) ||
       cursor.groupId !== page.policy.groupId ||
-      !sameBytes(cursor.digest, page.policy.digest) ||
+      cursor.mode !== page.policy.mode ||
+      cursor.policyGeneration !== page.policy.policyGeneration ||
+      (cursor.digest === undefined) !== (page.policy.digest === undefined) ||
+      (cursor.digest !== undefined &&
+        page.policy.digest !== undefined &&
+        !sameBytes(cursor.digest, page.policy.digest)) ||
       cursor.readMode !== request.readMode
     )
       invalid()

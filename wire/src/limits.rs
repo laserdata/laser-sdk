@@ -226,6 +226,9 @@ pub const MAX_FILTER_SOURCE_NAME_BYTES: usize = 255;
 pub const MAX_FILTERED_PAGE_RECORDS: u32 = 1000;
 /// Max reply bytes one filtered page may carry.
 pub const MAX_FILTERED_PAGE_BYTES: u32 = 8 * 1024 * 1024;
+/// Max source records one filtered page may ask to examine. The server
+/// lowers it to its own budget.
+pub const MAX_FILTERED_PAGE_EXAMINED: u32 = 100_000;
 /// Max records one preview may examine.
 pub const MAX_FILTER_PREVIEW_EXAMINED: u32 = 10_000;
 /// Max records one preview returns.

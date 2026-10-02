@@ -17,6 +17,7 @@ import {
   FilterExpr,
   consumerFilterDigest,
   consumerFilterJson,
+  decodeCatalogPosition,
   decodeConsumerFilter,
   decodeFilterCatalogReply,
   decodeFilterMutationRequest,
@@ -25,6 +26,7 @@ import {
   decodeFilteredPollRequest,
   decodeHeaderScalar,
   encodeConsumerFilter,
+  encodeCatalogPosition,
   encodeFilterCatalogReply,
   encodeFilterMutationRequest,
   encodeFilterReply,
@@ -84,6 +86,25 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     encodeFilteredPollRequest
   )
   assert.deepEqual(byId.consumer, { kind: "group_id", id: 3n })
+  const automatic = await assertRoundTrip(
+    "filter_poll_request_group_auto.bin",
+    decodeFilteredPollRequest,
+    encodeFilteredPollRequest
+  )
+  assert.deepEqual(automatic.filter, { kind: "group" })
+  assert.equal(automatic.maxExamined, 100)
+  assert.deepEqual(automatic.minCatalogPosition, { partitionId: 0, offset: 41n, operationId: 11n })
+  const configure = await assertRoundTrip(
+    "filter_mutation_configure_group.bin",
+    decodeFilterMutationRequest,
+    encodeFilterMutationRequest
+  )
+  assert.equal(configure.mutation.kind, "configure_group")
+  const configureJson = decodeFilterMutationRequest(
+    parseCanonicalJson(await readText("filter_mutation_configure_group.json")),
+    "configure group"
+  )
+  assert.deepEqual(configureJson, configure)
   await assertRoundTrip(
     "filter_mutation_revision_state.bin",
     decodeFilterMutationRequest,
@@ -99,7 +120,28 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     revision: 2,
     enabled: false
   })
-  await assertRoundTrip("filter_ack.bin", decodeFilteredAck, encodeFilteredAck)
+  const ack = await assertRoundTrip("filter_ack.bin", decodeFilteredAck, encodeFilteredAck)
+  assert.equal(ack.mode, "filtered")
+  assert.equal(ack.policyGeneration, 1n)
+  const unfilteredAck = await assertRoundTrip(
+    "filter_ack_unfiltered.bin",
+    decodeFilteredAck,
+    encodeFilteredAck
+  )
+  assert.equal(unfilteredAck.mode, "unfiltered")
+  assert.equal(unfilteredAck.digest, undefined)
+  const unfilteredPage = await assertRoundTrip(
+    "filter_reply_page_unfiltered.bin",
+    decodeFilterReply,
+    encodeFilterReply
+  )
+  if (unfilteredPage.kind === "ok" && unfilteredPage.outcome.kind === "page") {
+    assert.equal(unfilteredPage.outcome.page.policy.mode, "unfiltered")
+    assert.equal(unfilteredPage.outcome.page.policy.digest, undefined)
+    assert.equal(unfilteredPage.outcome.page.matched, unfilteredPage.outcome.page.examined)
+  } else {
+    assert.fail("the unfiltered fixture is a page")
+  }
   for (const name of [
     "filter_reply_page.bin",
     "filter_reply_acknowledged.bin",
@@ -110,6 +152,8 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
   }
   for (const name of [
     "filter_catalog_reply_bound.bin",
+    "filter_catalog_reply_configured.bin",
+    "filter_catalog_reply_unbound.bin",
     "filter_catalog_reply_registered.bin",
     "filter_catalog_reply_revision_state.bin",
     "filter_catalog_reply_revisions.bin"
@@ -125,6 +169,25 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
   assert.deepEqual(
     Buffer.from(encodeNamed(encodeControlEnvelope(envelope))),
     Buffer.from(controlBytes)
+  )
+})
+
+void test("given_a_catalog_position_with_a_maximum_operation_id_when_round_tripped_then_should_preserve_its_causal_proof", () => {
+  const operationId = (1n << 128n) - 1n
+  const position = { partitionId: 2, offset: 41n, operationId }
+  const encoded = encodeNamed(encodeCatalogPosition(position))
+  assert.deepEqual(decodeCatalogPosition(decodeOne(encoded, "position"), "position"), position)
+  const json = parseCanonicalJson(
+    `{"partition_id":2,"offset":41,"operation_id":"${operationId.toString()}"}`
+  )
+  assert.deepEqual(decodeCatalogPosition(json, "position"), position)
+  const oldPosition = { partitionId: 2, offset: 41n }
+  assert.deepEqual(
+    decodeCatalogPosition(
+      decodeOne(encodeNamed(encodeCatalogPosition(oldPosition)), "position"),
+      "position"
+    ),
+    oldPosition
   )
 })
 

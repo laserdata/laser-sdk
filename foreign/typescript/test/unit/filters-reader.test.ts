@@ -2,14 +2,15 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, type Capabilities } from "../../src/client/capabilities.js"
 import {
-  ConfigError,
   FilterExecutionError,
   InvalidError,
-  ProtocolError
+  ProtocolError,
+  UnsupportedError
 } from "../../src/client/errors.js"
 import type { CoordinatorConnection, NodeConnection } from "../../src/iggy/apache-iggy.js"
 import {
   FilteredReader,
+  FilteredReaderBuilder,
   Filters,
   sessionReuse,
   type FilterTransport
@@ -50,7 +51,7 @@ const generation = {
 }
 const capabilities: Capabilities = {
   ...OPEN_CAPABILITIES,
-  filters: { native: true, catalog: false }
+  filters: { native: true, catalog: false, groupPolicyReads: true }
 }
 
 // A standard polled-messages body with one batch holding `offsets`.
@@ -88,7 +89,7 @@ function page(
   return {
     v: FILTER_OP_VERSION,
     partitionId,
-    policy: { digest: consumerFilterDigest(filter) },
+    policy: { digest: consumerFilterDigest(filter), mode: "filtered", policyGeneration: 0n },
     generation: { ...generation, partitionId },
     readMode: mode,
     nextScanOffset,
@@ -154,7 +155,6 @@ function pollOf(payload: Uint8Array): FilteredPollRequest {
 function baseTransport(sendManaged: FilterTransport["sendManaged"]): FilterTransport {
   return {
     sendManaged,
-    getTopicPartitionCount: () => Promise.resolve(1),
     joinConsumerGroup: () => Promise.resolve(),
     leaveConsumerGroup: () => Promise.resolve(),
     connectsNodes: true
@@ -173,10 +173,11 @@ function coordinatorOf(transport: FilterTransport): CoordinatorConnection {
 function reader(
   transport: FilterTransport,
   mode: ReadMode,
-  guarded?: ConsumerFilter
+  guarded?: ConsumerFilter,
+  layout: { readonly partitionIds?: readonly number[]; readonly idleIntervalMs?: number } = {}
 ): FilteredReader {
   const start: FilteredStart = { kind: "first" }
-  return new FilteredReader({
+  return FilteredReader.create({
     transport,
     filters: new Filters(transport, () => Promise.resolve(capabilities)),
     coordinator: coordinatorOf(transport),
@@ -191,13 +192,11 @@ function reader(
       maxReplyBytes: 1024 * 1024,
       readMode: mode
     },
-    inlineDigest: consumerFilterDigest(guarded ?? filter),
     start,
-    idleIntervalMs: 1,
+    idleIntervalMs: layout.idleIntervalMs ?? 1,
     guard: guarded === undefined ? undefined : CompiledFilter.compile(guarded),
     membership: undefined,
-    discovers: false,
-    partitionIds: [0]
+    partitionIds: layout.partitionIds ?? [0]
   })
 }
 
@@ -207,30 +206,158 @@ function groupReader(coordinator: CoordinatorConnection, data: NodeConnection) {
     openCoordinator: () => Promise.resolve(coordinator),
     openNodeConnection: () => Promise.resolve(data)
   }
-  return new Filters(transport, () => Promise.resolve(capabilities))
-    .reader("orbit", "fleet_changes")
-    .group("anomaly-desk")
-    .inline(filter)
+  return FilteredReaderBuilder.create(
+    transport,
+    () => Promise.resolve(capabilities),
+    new Filters(transport, () => Promise.resolve(capabilities)),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "bound" }
+  )
 }
 
-void test("given_a_regex_filter_when_a_local_guard_is_requested_then_should_reject_before_joining", async () => {
+void test("given_a_server_without_group_reads_when_an_automatic_reader_is_built_then_should_reject_before_joining", async () => {
   let joined = false
   const transport = baseTransport(() => Promise.reject(new Error("no command is needed")))
   transport.joinConsumerGroup = () => {
     joined = true
     return Promise.resolve()
   }
-  const filters = new Filters(transport, () => Promise.resolve(capabilities))
-  await assert.rejects(
-    filters
-      .reader("orbit", "fleet_changes")
-      .group("anomaly-desk")
-      .inline(ConsumerFilter.json(FilterExpr.text("mode", "regex", "\\A\\p{Greek}+\\z")))
-      .localGuard(true)
-      .build(),
-    ConfigError
+  const outdated = (): Promise<Capabilities> =>
+    Promise.resolve({
+      ...capabilities,
+      filters: { native: true, catalog: false, groupPolicyReads: false }
+    })
+  const automatic = FilteredReaderBuilder.create(
+    transport,
+    outdated,
+    new Filters(transport, outdated),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "group" }
   )
+  await assert.rejects(automatic.build(), UnsupportedError)
   assert.equal(joined, false)
+})
+
+void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_group_read_that_delivered_everything", async () => {
+  const unfiltered = (overrides: Partial<FilteredPage> = {}) =>
+    page("local", {
+      offsets: [0n],
+      policy: { groupId: 3n, mode: "unfiltered", policyGeneration: 2n },
+      ...overrides
+    })
+  const read = async (kind: "bound" | "group", served: FilteredPage) => {
+    const transport = baseTransport(() => Promise.resolve(pageReply(served)))
+    const filtered = FilteredReader.create({
+      transport,
+      filters: new Filters(transport, () => Promise.resolve(capabilities)),
+      coordinator: coordinatorOf(transport),
+      request: {
+        v: FILTER_OP_VERSION,
+        source: { stream: "orbit", topic: "fleet_changes" },
+        partitionId: 0,
+        consumer: { kind: "group", name: "anomaly-desk" },
+        filter: { kind },
+        start: { kind: "first" },
+        count: 10,
+        maxReplyBytes: 1024 * 1024,
+        readMode: "local"
+      },
+      start: { kind: "first" },
+      idleIntervalMs: 1,
+      guard: undefined,
+      membership: undefined,
+      partitionIds: [0]
+    })
+    try {
+      return await filtered.tryNextPage()
+    } finally {
+      await filtered.close()
+    }
+  }
+  const found = await read("group", unfiltered())
+  assert.equal(found?.policy.mode, "unfiltered")
+  assert.equal(found.policy.digest, undefined)
+  assert.equal(found.policy.policyGeneration, 2n)
+  assert.equal(found.records[0]?.evaluated, false, "an unbound group evaluates no filter")
+  await assert.rejects(
+    read("bound", unfiltered()),
+    ProtocolError,
+    "a strict read never accepts an unfiltered page"
+  )
+  await assert.rejects(
+    read("group", unfiltered({ examined: 3 })),
+    ProtocolError,
+    "an unfiltered page delivers everything it examined"
+  )
+})
+
+void test("given_an_over_budget_page_when_a_bounded_group_read_returns_then_should_reject_the_progress", async () => {
+  const transport = baseTransport(() =>
+    Promise.resolve(
+      pageReply(
+        page("local", {
+          offsets: [],
+          examined: 3,
+          nextScanOffset: 3n,
+          policy: {
+            groupId: 3n,
+            digest: consumerFilterDigest(filter),
+            mode: "filtered",
+            policyGeneration: 0n
+          }
+        })
+      )
+    )
+  )
+  const filtered = FilteredReader.create({
+    transport,
+    filters: new Filters(transport, () => Promise.resolve(capabilities)),
+    coordinator: coordinatorOf(transport),
+    request: {
+      v: FILTER_OP_VERSION,
+      source: { stream: "orbit", topic: "fleet_changes" },
+      partitionId: 0,
+      consumer: { kind: "group", name: "anomaly-desk" },
+      filter: { kind: "group" },
+      start: { kind: "first" },
+      count: 2,
+      maxExamined: 2,
+      maxReplyBytes: 1024,
+      readMode: "local"
+    },
+    start: { kind: "first" },
+    idleIntervalMs: 1,
+    guard: undefined,
+    membership: undefined,
+    partitionIds: [0]
+  })
+  try {
+    await assert.rejects(filtered.readRound(), ProtocolError)
+  } finally {
+    await filtered.close()
+  }
+})
+
+void test("given_group_policy_reads_without_an_evaluator_when_an_automatic_reader_is_built_then_should_allow_unbound_reads", async () => {
+  const transport = baseTransport(() => Promise.resolve(assignment(1n, [])))
+  const withoutEvaluator = (): Promise<Capabilities> =>
+    Promise.resolve({
+      ...capabilities,
+      filters: { native: false, catalog: false, groupPolicyReads: true }
+    })
+  const automatic = FilteredReaderBuilder.create(
+    transport,
+    withoutEvaluator,
+    new Filters(transport, withoutEvaluator),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "group" }
+  )
+  const built = await automatic.build()
+  assert.equal(await built.tryNextPage(), undefined)
+  await built.close()
 })
 
 void test("given_inconsistent_reply_metadata_when_reading_without_a_guard_then_should_reject", async () => {
@@ -242,7 +369,7 @@ void test("given_inconsistent_reply_metadata_when_reading_without_a_guard_then_s
     { safeAckOffset: 0n },
     { partitionId: 1 },
     { matched: 1 },
-    { policy: { digest: new Uint8Array(32) } },
+    { policy: { mode: "filtered", policyGeneration: 0n } },
     { examined: 0 }
   ]
   for (const variant of variants) {
@@ -420,7 +547,12 @@ void test("given_a_rebalance_when_a_partition_is_gained_then_should_start_it_at_
       return Promise.resolve(
         pageReply({
           ...unscanned,
-          policy: { digest: consumerFilterDigest(filter), groupId: 3n },
+          policy: {
+            digest: consumerFilterDigest(filter),
+            groupId: 3n,
+            mode: "filtered",
+            policyGeneration: 0n
+          },
           examined: 0
         })
       )
@@ -467,7 +599,12 @@ void test("given_a_rejoin_when_an_old_record_is_acknowledged_then_should_name_th
       return Promise.resolve(
         pageReply({
           ...page("primary", { offsets: [0n] }),
-          policy: { digest: consumerFilterDigest(filter), groupId: 3n }
+          policy: {
+            digest: consumerFilterDigest(filter),
+            groupId: 3n,
+            mode: "filtered",
+            policyGeneration: 0n
+          }
         })
       )
     }
@@ -489,7 +626,6 @@ void test("given_a_rejoin_when_an_old_record_is_acknowledged_then_should_name_th
 void test("given_one_failing_partition_when_reading_then_should_still_read_the_others", async () => {
   const transport: FilterTransport = {
     ...baseTransport(() => Promise.resolve(route())),
-    getTopicPartitionCount: () => Promise.resolve(2),
     openNodeConnection: () =>
       Promise.resolve({
         close: () => Promise.resolve(),
@@ -501,13 +637,10 @@ void test("given_one_failing_partition_when_reading_then_should_still_read_the_o
         }
       })
   }
-  const filtered = await new Filters(transport, () => Promise.resolve(capabilities))
-    .reader("orbit", "fleet_changes")
-    .consumer("reader")
-    .inline(filter)
-    .start({ kind: "first" })
-    .idleInterval(60_000)
-    .build()
+  const filtered = reader(transport, "primary", undefined, {
+    partitionIds: [0, 1],
+    idleIntervalMs: 60_000
+  })
   const found = await filtered.tryNextPage()
   assert.equal(found?.partitionId, 1, "the failing partition does not starve the healthy one")
   await assert.rejects(filtered.tryNextPage(), /filtered command/)
@@ -590,7 +723,6 @@ void test("given_two_partitions_on_one_node_and_a_rising_watermark_when_reading_
       reply.set(session(7n, 3n, watermark), 0)
       return Promise.resolve(reply)
     }),
-    getTopicPartitionCount: () => Promise.resolve(2),
     openNodeConnection: () => {
       opened += 1
       return Promise.resolve({
@@ -626,11 +758,7 @@ void test("given_two_partitions_on_one_node_and_a_rising_watermark_when_reading_
       })
     }
   }
-  const filtered = new Filters(transport, () => Promise.resolve(capabilities))
-    .reader("orbit", "fleet_changes")
-    .consumer("reader")
-    .inline(filter)
-  const built = await filtered.build()
+  const built = reader(transport, "primary", undefined, { partitionIds: [0, 1] })
   for (let read = 0; read < 8; read += 1) {
     await built.tryNextPage()
   }
@@ -652,7 +780,11 @@ void test("given_unevaluated_records_when_guarded_then_should_require_a_reproduc
         pageReply(
           page("local", {
             offsets: [0n],
-            policy: { digest: consumerFilterDigest(definition) },
+            policy: {
+              digest: consumerFilterDigest(definition),
+              mode: "filtered",
+              policyGeneration: 0n
+            },
             unevaluated: [0n],
             evaluationLimits: { maxPayloadBytes: limit, maxDepth: 64 }
           })
@@ -694,7 +826,12 @@ void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_
           page("primary", {
             offsets: [0n],
             stop: "filled",
-            policy: { digest: consumerFilterDigest(filter), groupId: 3n }
+            policy: {
+              digest: consumerFilterDigest(filter),
+              groupId: 3n,
+              mode: "filtered",
+              policyGeneration: 0n
+            }
           })
         )
       )

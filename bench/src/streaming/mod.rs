@@ -1238,9 +1238,9 @@ async fn build_consumers(
             StreamingConsumerPath::StreamConsumerPartition => {
                 laser_topic.consumer(format!("laser-bench-sdk-{lane}"), partition)
             }
-            StreamingConsumerPath::StreamConsumerGroup => {
-                laser_topic.consumer_group("laser-bench-sdk-group")
-            }
+            StreamingConsumerPath::StreamConsumerGroup => laser_topic
+                .consumer_group("laser-bench-sdk-group")
+                .consumer(),
             StreamingConsumerPath::StreamCursor => {
                 return Err(BenchError::Invalid(
                     "cursor replay does not use a live consumer".to_owned(),

@@ -199,6 +199,7 @@ export interface KvCapsView {
 
 export interface FilterCapsView {
   readonly native: boolean
+  readonly groupPolicyReads: boolean
   readonly preview: boolean
   readonly primaryRouting: boolean
   readonly catalog: boolean
@@ -1268,6 +1269,7 @@ function decodeFilterCaps(map: CborMap | undefined, context: string): FilterCaps
     map === undefined ? false : (field.optionalBoolean(map, key, context) ?? false)
   return {
     native: flag("native"),
+    groupPolicyReads: flag("group_policy_reads"),
     preview: flag("preview"),
     primaryRouting: flag("primary_routing"),
     catalog: flag("catalog"),
@@ -1286,6 +1288,7 @@ function decodeFilterCaps(map: CborMap | undefined, context: string): FilterCaps
 function encodeFilterCaps(value: FilterCapsView): Map<string, unknown> {
   const map = new Map<string, unknown>([
     ["native", value.native],
+    ["group_policy_reads", value.groupPolicyReads],
     ["preview", value.preview],
     ["primary_routing", value.primaryRouting],
     ["catalog", value.catalog],

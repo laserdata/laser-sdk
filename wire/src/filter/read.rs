@@ -1,10 +1,11 @@
 use crate::codes::FILTER_OP_VERSION;
 use crate::error::InvalidError;
+use crate::filter::catalog::CatalogPosition;
 use crate::filter::expr::ConsumerFilter;
 use crate::limits::{
     MAX_FILTER_PREVIEW_EXAMINED, MAX_FILTER_PREVIEW_RECORDS, MAX_FILTER_SAMPLE_BYTES,
     MAX_FILTER_SAMPLE_HEADERS, MAX_FILTER_SOURCE_NAME_BYTES, MAX_FILTERED_PAGE_BYTES,
-    MAX_FILTERED_PAGE_RECORDS,
+    MAX_FILTERED_PAGE_EXAMINED, MAX_FILTERED_PAGE_RECORDS,
 };
 use crate::result::ResultCode;
 use crate::schema::Digest32;
@@ -91,8 +92,13 @@ pub enum FilterRef {
     Inline(ConsumerFilter),
     /// A saved revision from the catalog.
     Revision { filter_id: u32, revision: u32 },
-    /// Whatever revision the consumer group is bound to. Groups only.
+    /// Whatever revision the consumer group is bound to. Groups only. An
+    /// unbound group is refused.
     Bound,
+    /// Whatever policy the consumer group has. Groups only. A bound group is
+    /// filtered by its revision, an unbound group receives every record. Needs
+    /// a server that advertises `GROUP_POLICY_READS`.
+    Group,
 }
 
 /// Where a filtered read starts.
@@ -131,6 +137,43 @@ impl ReadMode {
     }
 }
 
+/// How the server selected the records of a page. `Unfiltered` is the explicit
+/// policy of a group without a binding, never a fallback: it carries no digest
+/// and the page holds every record the owner read returned.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ExecutionMode {
+    #[default]
+    Filtered,
+    Unfiltered,
+}
+
+impl ExecutionMode {
+    pub const fn is_filtered(&self) -> bool {
+        matches!(self, Self::Filtered)
+    }
+}
+
+/// A filtered policy names its digest and an unfiltered one has none.
+fn validate_policy_identity(
+    mode: ExecutionMode,
+    digest: Option<&Digest32>,
+) -> Result<(), InvalidError> {
+    match (mode, digest) {
+        (ExecutionMode::Filtered, Some(digest)) => digest.validate(),
+        (ExecutionMode::Filtered, None) => {
+            Err(InvalidError::new("a filtered policy names its digest"))
+        }
+        (ExecutionMode::Unfiltered, None) => Ok(()),
+        (ExecutionMode::Unfiltered, Some(_)) => {
+            Err(InvalidError::new("an unfiltered policy carries no digest"))
+        }
+    }
+}
+
 /// The exact source history a page was read from. A purge or a recreated
 /// stream, topic, or partition changes it, so a continuation or acknowledgment
 /// from an older history is rejected rather than applied to new records.
@@ -152,11 +195,19 @@ pub struct Continuation {
     pub group_id: Option<u64>,
     pub next_scan_offset: u64,
     pub generation: SourceGeneration,
-    pub digest: Digest32,
+    /// The digest of the filter the page ran, absent for an unfiltered page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Digest32>,
     /// The route the page was read on. A continuation from a local page never
     /// resumes a primary read, because a local replica can lag a purge.
     #[serde(default, skip_serializing_if = "ReadMode::is_primary")]
     pub read_mode: ReadMode,
+    #[serde(default)]
+    pub mode: ExecutionMode,
+    /// The group's policy generation the page ran under, zero for an
+    /// independent consumer.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// Read one bounded page of matching records from one partition.
@@ -174,6 +225,15 @@ pub struct FilteredPollRequest {
     pub max_reply_bytes: u32,
     #[serde(default)]
     pub read_mode: ReadMode,
+    /// Most source records to examine. The server lowers it to its own
+    /// budget. Absent means the server budget alone. A normal consumer sets
+    /// it to `count`, so a batch of 100 examines at most 100 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_examined: Option<u32>,
+    /// Serve only once the catalog has been examined through this position,
+    /// so a reader sees the configuration its application just made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_catalog_position: Option<CatalogPosition>,
 }
 
 /// Why a page stopped scanning.
@@ -249,11 +309,63 @@ pub struct FilterDecodeLimits {
 pub struct AppliedPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<u64>,
-    pub digest: Digest32,
+    /// The digest of the filter that ran, absent for an unfiltered page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Digest32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    #[serde(default)]
+    pub mode: ExecutionMode,
+    /// The group's policy generation, zero for an independent consumer.
+    #[serde(default)]
+    pub policy_generation: u64,
+}
+
+impl AppliedPolicy {
+    /// The policy an independent consumer or a bound group ran: one filter.
+    #[must_use]
+    pub fn filtered(group_id: Option<u64>, digest: Digest32) -> Self {
+        Self {
+            group_id,
+            digest: Some(digest),
+            filter_id: None,
+            revision: None,
+            mode: ExecutionMode::Filtered,
+            policy_generation: 0,
+        }
+    }
+
+    /// The policy of a group without a binding: every record.
+    #[must_use]
+    pub const fn unfiltered(group_id: u64, policy_generation: u64) -> Self {
+        Self {
+            group_id: Some(group_id),
+            digest: None,
+            filter_id: None,
+            revision: None,
+            mode: ExecutionMode::Unfiltered,
+            policy_generation,
+        }
+    }
+}
+
+impl Validate for AppliedPolicy {
+    fn validate(&self) -> Result<(), InvalidError> {
+        validate_policy_identity(self.mode, self.digest.as_ref())?;
+        if self.mode == ExecutionMode::Unfiltered {
+            if self.group_id.is_none() {
+                return Err(InvalidError::new("only a consumer group runs unfiltered"));
+            }
+            if self.filter_id.is_some() || self.revision.is_some() {
+                return Err(InvalidError::new(
+                    "an unfiltered policy has no filter reference",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One page of a filtered read.
@@ -304,6 +416,8 @@ impl FilteredPage {
                 generation: self.generation,
                 digest: self.policy.digest.clone(),
                 read_mode: self.read_mode,
+                mode: self.policy.mode,
+                policy_generation: self.policy.policy_generation,
             }),
             None => original.clone(),
         }
@@ -322,8 +436,16 @@ pub struct FilteredAck {
     pub partition_id: u32,
     pub consumer: FilterConsumer,
     pub generation: SourceGeneration,
-    pub digest: Digest32,
+    /// The digest of the filter the page ran, absent for an unfiltered page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Digest32>,
     pub offset: u64,
+    #[serde(default)]
+    pub mode: ExecutionMode,
+    /// The group's policy generation the page ran under. The server refuses
+    /// the acknowledgment when the group's generation moved on.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// A stored acknowledgment.
@@ -642,7 +764,7 @@ impl Validate for FilterRef {
     fn validate(&self) -> Result<(), InvalidError> {
         match self {
             Self::Inline(filter) => filter.validate(),
-            Self::Revision { .. } | Self::Bound => Ok(()),
+            Self::Revision { .. } | Self::Bound | Self::Group => Ok(()),
         }
     }
 }
@@ -653,12 +775,21 @@ impl Validate for FilteredPollRequest {
         self.source.validate()?;
         self.consumer.validate()?;
         self.filter.validate()?;
-        if matches!(self.filter, FilterRef::Bound) && !self.consumer.is_group() {
-            return Err(InvalidError::new("a `bound` filter needs a consumer group"));
+        if matches!(self.filter, FilterRef::Bound | FilterRef::Group) && !self.consumer.is_group() {
+            return Err(InvalidError::new(
+                "a `bound` or `group` filter needs a consumer group",
+            ));
         }
         if self.count == 0 || self.count > MAX_FILTERED_PAGE_RECORDS {
             return Err(InvalidError::new(format!(
                 "count must be 1..={MAX_FILTERED_PAGE_RECORDS}"
+            )));
+        }
+        if let Some(max_examined) = self.max_examined
+            && (max_examined == 0 || max_examined > MAX_FILTERED_PAGE_EXAMINED)
+        {
+            return Err(InvalidError::new(format!(
+                "max_examined must be 1..={MAX_FILTERED_PAGE_EXAMINED}"
             )));
         }
         if self.max_reply_bytes == 0 || self.max_reply_bytes > MAX_FILTERED_PAGE_BYTES {
@@ -667,7 +798,10 @@ impl Validate for FilteredPollRequest {
             )));
         }
         if let FilteredStart::Continue(continuation) = &self.start {
-            continuation.digest.validate()?;
+            validate_policy_identity(continuation.mode, continuation.digest.as_ref())?;
+            if continuation.mode == ExecutionMode::Unfiltered && !self.consumer.is_group() {
+                return Err(InvalidError::new("only a consumer group runs unfiltered"));
+            }
             if self.consumer.is_group() != continuation.group_id.is_some() {
                 return Err(InvalidError::new(
                     "a group continuation must retain its group identity",
@@ -688,7 +822,10 @@ impl Validate for FilteredAck {
         validate_version(self.v)?;
         self.source.validate()?;
         self.consumer.validate()?;
-        self.digest.validate()?;
+        validate_policy_identity(self.mode, self.digest.as_ref())?;
+        if self.mode == ExecutionMode::Unfiltered && !self.consumer.is_group() {
+            return Err(InvalidError::new("only a consumer group runs unfiltered"));
+        }
         if self.consumer.is_group() != self.group_id.is_some() {
             return Err(InvalidError::new(
                 "a group acknowledgment must retain its group identity",
@@ -708,7 +845,7 @@ impl Validate for FilterPreviewRequest {
         validate_version(self.v)?;
         self.source.validate()?;
         self.filter.validate()?;
-        if matches!(self.filter, FilterRef::Bound) {
+        if matches!(self.filter, FilterRef::Bound | FilterRef::Group) {
             return Err(InvalidError::new(
                 "a preview executes an inline filter or a saved revision",
             ));
@@ -731,7 +868,7 @@ impl Validate for FilterTestRequest {
     fn validate(&self) -> Result<(), InvalidError> {
         validate_version(self.v)?;
         self.filter.validate()?;
-        if matches!(self.filter, FilterRef::Bound) {
+        if matches!(self.filter, FilterRef::Bound | FilterRef::Group) {
             return Err(InvalidError::new(
                 "a sample test executes an inline filter or a saved revision",
             ));
@@ -795,6 +932,8 @@ mod tests {
             count: 100,
             max_reply_bytes: 1024 * 1024,
             read_mode: ReadMode::Primary,
+            max_examined: None,
+            min_catalog_position: None,
         }
     }
 
@@ -819,12 +958,78 @@ mod tests {
                 partition_id: 5,
                 ..generation()
             },
-            digest: Digest32::new([1; 32]),
+            digest: Some(Digest32::new([1; 32])),
             read_mode: ReadMode::Primary,
+            mode: ExecutionMode::Filtered,
+            policy_generation: 0,
         });
-        for request in [bound_consumer, zero, huge, other_partition] {
+        let mut group_consumer = request();
+        group_consumer.filter = FilterRef::Group;
+        group_consumer.consumer = FilterConsumer::Consumer("one".to_owned());
+        let mut over_examined = request();
+        over_examined.max_examined = Some(MAX_FILTERED_PAGE_EXAMINED + 1);
+        let mut zero_examined = request();
+        zero_examined.max_examined = Some(0);
+        let mut unfiltered_with_digest = request();
+        unfiltered_with_digest.start = FilteredStart::Continue(Continuation {
+            group_id: Some(3),
+            next_scan_offset: 7,
+            generation: generation(),
+            digest: Some(Digest32::new([1; 32])),
+            read_mode: ReadMode::Primary,
+            mode: ExecutionMode::Unfiltered,
+            policy_generation: 1,
+        });
+        for request in [
+            bound_consumer,
+            zero,
+            huge,
+            other_partition,
+            group_consumer,
+            over_examined,
+            zero_examined,
+            unfiltered_with_digest,
+        ] {
             assert!(request.validate().is_err(), "{request:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn given_an_automatic_group_read_with_an_examined_bound_when_validated_then_should_pass() {
+        let mut automatic = request();
+        automatic.filter = FilterRef::Group;
+        automatic.max_examined = Some(100);
+        automatic.min_catalog_position = Some(CatalogPosition {
+            partition_id: 0,
+            offset: 41,
+            operation_id: Some(11),
+        });
+        automatic.validate().expect("valid");
+    }
+
+    #[test]
+    fn given_an_unfiltered_policy_when_validated_then_should_need_a_group_and_no_digest() {
+        AppliedPolicy::unfiltered(3, 1).validate().expect("valid");
+        assert!(
+            AppliedPolicy::filtered(Some(3), Digest32::new([1; 32]))
+                .validate()
+                .is_ok()
+        );
+        let mut no_group = AppliedPolicy::unfiltered(3, 1);
+        no_group.group_id = None;
+        assert!(no_group.validate().is_err());
+        let mut with_digest = AppliedPolicy::unfiltered(3, 1);
+        with_digest.digest = Some(Digest32::new([1; 32]));
+        assert!(with_digest.validate().is_err());
+        let mut with_reference = AppliedPolicy::unfiltered(3, 1);
+        with_reference.filter_id = Some(1);
+        assert!(with_reference.validate().is_err());
+        with_reference.filter_id = None;
+        with_reference.revision = Some(1);
+        assert!(with_reference.validate().is_err());
+        let mut without_digest = AppliedPolicy::filtered(None, Digest32::new([1; 32]));
+        without_digest.digest = None;
+        assert!(without_digest.validate().is_err());
     }
 
     #[test]
@@ -834,9 +1039,11 @@ mod tests {
             partition_id: 0,
             policy: AppliedPolicy {
                 group_id: None,
-                digest: Digest32::new([9; 32]),
+                digest: Some(Digest32::new([9; 32])),
                 filter_id: Some(3),
                 revision: Some(1),
+                mode: ExecutionMode::Filtered,
+                policy_generation: 0,
             },
             generation: generation(),
             read_mode: ReadMode::Primary,
@@ -857,8 +1064,10 @@ mod tests {
                 group_id: None,
                 next_scan_offset: 1397,
                 generation: generation(),
-                digest: Digest32::new([9; 32]),
+                digest: Some(Digest32::new([9; 32])),
                 read_mode: ReadMode::Primary,
+                mode: ExecutionMode::Filtered,
+                policy_generation: 0,
             })
         );
         let empty = FilteredPage {
@@ -884,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn given_samples_and_previews_when_validated_then_should_reject_bound_filters() {
+    fn given_samples_and_previews_when_validated_then_should_reject_group_selectors() {
         let inline = FilterRef::Inline(ConsumerFilter::json(FilterExpr::pred(
             "kind",
             CmpOp::Eq,
@@ -897,22 +1106,26 @@ mod tests {
             headers: Vec::new(),
         };
         test.validate().expect("valid sample");
-        let bound = FilterTestRequest {
-            filter: FilterRef::Bound,
-            ..test
-        };
-        assert!(bound.validate().is_err());
-        let preview = FilterPreviewRequest {
+        let mut preview = FilterPreviewRequest {
             v: FILTER_OP_VERSION,
             source: request().source,
             partition_id: 0,
             filter: inline,
             from_offset: 0,
-            max_examined: MAX_FILTER_PREVIEW_EXAMINED + 1,
+            max_examined: 100,
             max_records: 10,
             explain: false,
         };
-        assert!(preview.validate().is_err());
+        preview.validate().expect("valid preview");
+        for selector in [FilterRef::Bound, FilterRef::Group] {
+            let sample = FilterTestRequest {
+                filter: selector.clone(),
+                ..test.clone()
+            };
+            assert!(sample.validate().is_err());
+            preview.filter = selector;
+            assert!(preview.validate().is_err());
+        }
     }
 
     #[test]

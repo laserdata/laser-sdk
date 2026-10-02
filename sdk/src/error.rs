@@ -94,6 +94,19 @@ pub enum LaserError {
         "the record at offset {offset} on partition {partition_id} exceeds the filtered reply cap"
     )]
     FilterOversizedRecord { partition_id: u32, offset: u64 },
+    /// The consumer group was created, or already existed, but its filter
+    /// could not be configured. The group stays as it is, unbound unless it
+    /// ran a policy before, and no reader joined it. `source` is the typed
+    /// catalog refusal or transport failure.
+    #[error(
+        "consumer group {group_id} ({name}) exists but its filter was not configured: {source}"
+    )]
+    ConsumerGroupSetup {
+        group_id: u32,
+        name: String,
+        identity: laser_wire::filter::FilterGroupIdentity,
+        source: Box<LaserError>,
+    },
     /// Iggy answered a destination or checkpoint operation with a typed failure.
     #[error("checkpoint: {0}")]
     Checkpoint(Box<laser_wire::checkpoint::CheckpointError>),
@@ -267,17 +280,7 @@ impl From<CommandError> for LaserError {
 /// as an opaque codec error instead of a clean classification. The two shapes
 /// are disjoint (an enum-tagged reply versus a `{code, message}` map), so the
 /// fallback never misfires on a genuine reply.
-#[cfg(any(
-    feature = "filters",
-    feature = "fork",
-    feature = "destinations",
-    feature = "graph",
-    feature = "kv",
-    feature = "projections",
-    feature = "query",
-    feature = "rbac",
-    feature = "runs"
-))]
+#[cfg(feature = "streaming")]
 pub(crate) fn decode_managed_reply<R: serde::de::DeserializeOwned>(
     payload: &[u8],
 ) -> Result<R, LaserError> {
@@ -359,6 +362,7 @@ impl LaserError {
             Self::Graph(error) => ResultCode::from(error).is_retryable(),
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()).is_retryable(),
             Self::Filter(error) => error.code.is_retryable(),
+            Self::ConsumerGroupSetup { source, .. } => source.is_retryable(),
             Self::Handler(_)
             | Self::Timeout(_)
             | Self::PolicyDeferred(_)
@@ -547,6 +551,7 @@ impl LaserError {
             Self::Filter(error) => error.code,
             Self::FilterFault { .. } => ResultCode::InvalidArgument,
             Self::FilterOversizedRecord { .. } => ResultCode::TooLarge,
+            Self::ConsumerGroupSetup { source, .. } => source.code(),
             Self::Query(error) => ResultCode::from(error),
             Self::Kv(error) => ResultCode::from(error),
             Self::Fork(error) => ResultCode::from(error),

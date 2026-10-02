@@ -20,7 +20,7 @@ Chapters 1-8 use streaming and managed data operations. Chapter 9 adds the agent
 
 Apache Iggy provides the log and transport. Laser Stack or LaserData Cloud adds managed projections, queries, KV, and forks on the same connection. `Topic::producer()` and `consumer_group()` provide continuous streaming. `Topic::replay()` provides a cursor with client-owned offsets. `StateStore` can save checkpoints and duplicate-suppression keys.
 
-For ordinary streaming, use `topic.producer()`, `topic.consumer(..)`, and `topic.consumer_group(..)`. They provide batching, delays, retries, routing, groups, and automatic or explicit commits. The [`native-streaming`](../examples/rust/src/native-streaming/README.md) example demonstrates both commit modes. For detailed Iggy configuration, use `topic.iggy_producer()`, `topic.iggy_consumer_group(..)`, or `laser.client()`. Import matching Iggy types through `laser_sdk::iggy`.
+For ordinary streaming, use `topic.producer()`, `topic.consumer(..)`, and `topic.consumer_group(..).consumer()`. They provide batching, delays, retries, routing, groups, and automatic or explicit commits. The [`native-streaming`](../examples/rust/src/native-streaming/README.md) example demonstrates both commit modes. For detailed Iggy configuration, use `topic.iggy_producer()`, `topic.iggy_consumer_group(..)`, or `laser.client()`. Import matching Iggy types through `laser_sdk::iggy`.
 
 VSR is the only supported Rust, Python, and TypeScript transport. It requires no Cargo feature or TypeScript connection option. Standard commands, unknown managed codes, and dedicated replicated authorization operations all use the same client connection. The server remains authoritative for custom command classification.
 
@@ -698,44 +698,41 @@ The `orchestra` example runs all of this end to end (a directed contract, a scat
 
 ## Chapter 11 - read only the records you need
 
-**Receive only the records your application needs.** An on-call reviewer follows failed and slow model calls. A consumer filter runs on the streaming server, so the reader receives only the matching `Inference` records, with their original offsets, and the rest never cross the network:
+**Configure a consumer group once, then consume using its ID.** A group-owned policy runs on the streaming server. Normal group consumers and advanced readers receive matching records. An unbound group receives every record without payload evaluation.
 
 ```rust
-use laser_sdk::filters::{ConsumerFilter, FilterExpr, FilteredStart};
+use laser_sdk::filters::{ConsumerFilter, FilterExpr};
+use laser_sdk::prelude::CommitPolicy;
 use laser_sdk::query::CmpOp;
-use laser_sdk::wire::schema::TypedValue;
 
-let slow_or_failed = ConsumerFilter::json(FilterExpr::any([
-    FilterExpr::pred(
-        "outcome",
-        CmpOp::In,
-        TypedValue::List(vec!["error".into(), "timeout".into()]),
-    ),
-    FilterExpr::pred("latency_ms", CmpOp::Gt, 2_000),
-]));
+let topic = laser.stream("agent-telemetry").topic("inferences");
+let group = topic.consumer_group("on-call-review");
+let policy = ConsumerFilter::json(FilterExpr::pred("latency_ms", CmpOp::Gt, 2_000));
+let info = group.create().filter(policy).build().await?;
 
-let mut reader = laser
-    .filters()
-    .reader("agent-telemetry", "inferences")
-    .consumer("on-call-review")
-    .inline(slow_or_failed)
-    .start(FilteredStart::First)
+let mut consumer = topic.consumer_group_id(u64::from(info.id))
+    .consumer()
+    .batch_length(100)
+    .commit_policy(CommitPolicy::Disabled)
     .build()
     .await?;
-
-let record = reader.next_record().await?;
-println!("offset {}: {:?}", record.offset, record.message.payload);
-reader.ack(&record).await?;
-reader.close().await?;
+while let Some(record) = consumer.next().await {
+    let record = record?;
+    println!("{} {}", record.partition_id, record.position.offset);
+    consumer.commit(&record).await?;
+}
+consumer.shutdown().await?;
 ```
 
-An acknowledgment stores the page's safe offset, which covers the non-matching records the server scanned past, so a restart resumes after them. The filter is three-valued: a record without `latency_ms` is neither slow nor fast, and it is not selected by that branch.
+The setup can run separately from every consumer instance. The consumer needs no filter definition, ID or revision. Several instances in the group share native partition assignments. Different groups keep independent progress.
 
-`preview` judges stored records and explains each verdict without storing progress, and `test` evaluates one sample record. With a managed plane, `register` saves the filter as a revision and `bind` pins a consumer group to it, so every member of the group runs the same filter.
+**Batch length 100 examines at most 100 source records per partition request.** It can deliver zero through 100 records. Empty selections retain progress and do not mean end of stream. The advanced `group.reader()` uses a separate matching-record `count` and `max_examined` scan budget. It also supports unbound groups. Its acknowledgment includes skipped records only through completed work.
 
-**The CDC example saves 98.5% of payload transfer:** the reader receives 4 of 240 records and 424 of 27,953 payload bytes. Run it in Rust, Python, or TypeScript. It also demonstrates one-byte numeric header routing, previews, saved revisions, and consumer group bindings.
+Use `group.filter().configure(...)` for later setup and its `preview`, `test`, `revisions`, `revise` and `set_revision_enabled` methods for diagnostics and administration. A draft revision does not replace a group's active policy. Use another group for a different A/B policy.
 
-`next_record()` buffers bounded poll results internally. `next_page()` is the batch alternative. Both use the optional filtered-poll command over standard Iggy transport. A saved binding does not change ordinary polling.
+**The recorded CDC example saves 98.5% of payload transfer:** 4 of 240 records and 424 of 27,953 payload bytes. The example exists in Rust, Python and TypeScript. It demonstrates change evidence, numeric headers and JSON, CBOR, Avro and Protobuf policies.
+
+This uses standard Iggy transport and native source reads through the optional group-aware command. Raw Iggy polling retains its standard behavior. Failed policy resolution never silently broadens a group read. Server CPU, memory and latency costs must be measured with the traffic savings.
 
 Run the Rust example:
 
@@ -762,7 +759,7 @@ Queries, projections, KV, and forks require Laser Stack or LaserData Cloud. A ma
 | `Projection` + `ProjectionBinding` types | resolved from the cloud's deployment snapshots |
 | query DSL + request/reply envelope | served from the `_agdx` internal stream |
 | managed KV client (`kv` feature, `Laser::kv`) + registry browse (projections via `projections().get` / `projections().list`, writer schemas via `schemas().get` / `schemas().list`) | the `AGDX_KV_*` / `AGDX_*_PROJECTION` / `AGDX_*_SCHEMA` managed commands, served by Laser Stack or LaserData Cloud |
-| consumer filters (`filters` feature, `Laser::filters`): filtered readers with fenced acknowledgments, previews, tests, local evaluation, the catalog client | the `AGDX_FILTER*` commands evaluated by the LaserData Iggy fork next to the data, and the saved-filter catalog with group bindings kept by `laser-plane` |
+| group-owned consumer policies: normal and advanced readers with fenced acknowledgments, preview/test and revision management, with optional local evaluation under `filters` | the `AGDX_FILTER*` commands evaluated by the LaserData Iggy fork next to the data, and the saved-filter catalog with group bindings kept by `laser-plane` |
 | `Codec<T>` trait + `Json` + `Msgpack` + `Cbor` + `Bson` | identical wire. Codecs run on the producer side. Schema-first codecs resolve their writer schema from the managed registry |
 | reliable agent runtime | same agent runtime can run inside cloud services |
 | example projector (header path) + test projector (registry path) | the long-running managed projector under Operator |

@@ -218,7 +218,13 @@ pub(crate) async fn execute_native_run(
     )
     .await?;
     let plane = start_plane(execution, &services, &server, plane_socket).await?;
-    execute_started_run(execution, server, plane, Some(server_manifest)).await
+    Box::pin(execute_started_run(
+        execution,
+        server,
+        plane,
+        Some(server_manifest),
+    ))
+    .await
 }
 
 pub(crate) async fn execute_compose_run(
@@ -256,7 +262,7 @@ pub(crate) async fn execute_compose_run(
         scenario_requires_plane(execution.scenario),
         execution.manifest.environment.plane_profile,
     )?;
-    let result = execute_started_run(execution, server, plane, None).await;
+    let result = Box::pin(execute_started_run(execution, server, plane, None)).await;
     let shutdown = compose.shutdown();
     result.and_then(|result| shutdown.map(|()| result))
 }

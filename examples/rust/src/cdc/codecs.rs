@@ -17,14 +17,11 @@ struct Reading {
     battery: i32,
 }
 
-pub async fn run(laser: &Laser, stream: &str, catalog: bool) -> Result<(), LaserError> {
+pub async fn run(laser: &Laser, stream: &str) -> Result<(), LaserError> {
     phase("select typed records inside CBOR, Avro, and Protobuf payloads");
     let mut registered = Vec::new();
     let result = async {
         for codec in ["cbor", "avro", "protobuf"] {
-            if codec != "cbor" && !catalog {
-                continue;
-            }
             let source = match codec {
                 "avro" => Some(SchemaSource::Avro {
                     schema: include_str!("../../../shared/fleet-reading.avsc").to_owned(),
@@ -102,11 +99,13 @@ pub async fn run(laser: &Laser, stream: &str, catalog: bool) -> Result<(), Laser
                 "protobuf" => ConsumerFilter::protobuf(expr, [schema.as_ref().expect("schema").0]),
                 _ => ConsumerFilter::cbor(expr),
             };
-            let mut reader = laser
-                .filters()
-                .reader(stream, &topic_name)
-                .consumer(format!("safe-{codec}"))
-                .inline(filter)
+            let group = laser
+                .stream(stream)
+                .topic(&topic_name)
+                .consumer_group(format!("safe-{codec}"));
+            group.create().filter(filter).build().await?;
+            let mut reader = group
+                .reader()?
                 .start(FilteredStart::First)
                 .local_guard(true)
                 .build()
@@ -131,7 +130,8 @@ pub async fn run(laser: &Laser, stream: &str, catalog: bool) -> Result<(), Laser
             }
             .await;
             let closed = reader.close().await;
-            outcome.and(closed)?;
+            let released = group.filter().release().await.map(|_| ());
+            outcome.and(closed).and(released)?;
         }
         Ok(())
     }

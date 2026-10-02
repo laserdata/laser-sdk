@@ -1,45 +1,12 @@
-use crate::capabilities::Capabilities;
+use crate::capabilities::{Capabilities, HelloOutcome};
 use crate::connect_options::{ConnectOptions, connect_before};
 use crate::error::LaserError;
 pub use crate::publish_options::PublishOptions;
-#[cfg(any(
-    feature = "filters",
-    feature = "fork",
-    feature = "destinations",
-    feature = "graph",
-    feature = "kv",
-    feature = "projections",
-    feature = "query",
-    feature = "rbac",
-    feature = "runs"
-))]
 use bytes::Bytes;
 use dashmap::DashMap;
 #[cfg(feature = "streaming")]
 use iggy::prelude::*;
-#[cfg(any(
-    feature = "filters",
-    feature = "fork",
-    feature = "destinations",
-    feature = "graph",
-    feature = "kv",
-    feature = "projections",
-    feature = "query",
-    feature = "rbac",
-    feature = "runs"
-))]
 use laser_wire::framing::decode_named;
-#[cfg(any(
-    feature = "filters",
-    feature = "fork",
-    feature = "destinations",
-    feature = "graph",
-    feature = "kv",
-    feature = "projections",
-    feature = "query",
-    feature = "rbac",
-    feature = "runs"
-))]
 use laser_wire::validate::Validate;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -116,13 +83,13 @@ struct LaserInner {
     // The normalized connection string, when this handle built its own client.
     // Dedicated connections (fenced-lease coordination, partition-primary data
     // connections for filtered reads) reuse its credentials and TLS settings.
-    #[cfg(any(feature = "filters", feature = "kv"))]
     connection_string: Option<String>,
     #[cfg(feature = "kv")]
     coordination: OnceCell<Arc<crate::kv::FencedLeaseClient<crate::kv::DedicatedKvTransport>>>,
     #[cfg(feature = "kv")]
     coordination_acquire_gate: tokio::sync::Mutex<()>,
     producers: DashMap<ProducerKey, ProducerCell>,
+    pub(crate) producer_statistics: Arc<crate::stream::producer_statistics::ProducerRegistry>,
     negotiated: std::sync::RwLock<NegotiatedState>,
     // The agent registry read model's per-stream cache, so a fresh `AgentRegistry`
     // resumes the card fold instead of re-reading the registry topic from offset 0.
@@ -275,13 +242,13 @@ impl Laser {
                 publish_options: PublishOptions::default(),
                 reconnect_gate: tokio::sync::Mutex::new(()),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(any(feature = "filters", feature = "kv"))]
                 connection_string: None,
                 #[cfg(feature = "kv")]
                 coordination: OnceCell::new(),
                 #[cfg(feature = "kv")]
                 coordination_acquire_gate: tokio::sync::Mutex::new(()),
                 producers: DashMap::new(),
+                producer_statistics: Default::default(),
                 negotiated: std::sync::RwLock::new(NegotiatedState {
                     configured_capabilities: Capabilities::OPEN,
                     capabilities: Capabilities::OPEN,
@@ -418,6 +385,7 @@ impl Laser {
 
     /// Close the shared connection. Every clone of this `Laser`, and every consumer or reply reader riding it, loses the connection too. A fenced-lease coordination connection this handle opened closes with it. Safe to call more than once.
     pub async fn close(&self) -> Result<(), LaserError> {
+        self.inner.producer_statistics.close();
         #[cfg(feature = "kv")]
         if self.inner.connection_string.is_some() {
             self.coordination_client().await?.close().await;
@@ -455,7 +423,12 @@ impl Laser {
 
     /// The connection string this handle connected with, or `None` for a
     /// bring-your-own client.
-    #[cfg(feature = "filters")]
+    pub(crate) fn producer_statistics_registry(
+        &self,
+    ) -> &Arc<crate::stream::producer_statistics::ProducerRegistry> {
+        &self.inner.producer_statistics
+    }
+
     pub(crate) fn connection_string(&self) -> Option<&str> {
         self.inner.connection_string.as_deref()
     }
@@ -631,19 +604,14 @@ impl Laser {
             .clone();
         #[allow(unused_mut)]
         let mut topology = None;
-        #[cfg(any(
-            feature = "filters",
-            feature = "fork",
-            feature = "graph",
-            feature = "kv",
-            feature = "projections",
-            feature = "query",
-            feature = "rbac",
-            feature = "runs"
-        ))]
-        if let Some(announce) = probe_managed_host(&self.client()).await {
-            merge_announcement(&mut capabilities, &announce);
-            topology = announce.topology;
+        match probe_managed_host(&self.client()).await {
+            Ok(Some(announce)) => {
+                merge_announcement(&mut capabilities, &announce);
+                topology = announce.topology;
+                capabilities.hello = HelloOutcome::Answered;
+            }
+            Ok(None) => capabilities.hello = HelloOutcome::Rejected,
+            Err(()) => capabilities.hello = HelloOutcome::Failed,
         }
         let mut negotiated = self
             .inner
@@ -829,16 +797,6 @@ impl Laser {
     /// `AGDX_HELLO`. Every managed command is non-replicated from Iggy's
     /// perspective. Idempotent writes carry a stable operation identity so
     /// Plane can append them to its standard Iggy mutation topics.
-    #[cfg(any(
-        feature = "filters",
-        feature = "fork",
-        feature = "graph",
-        feature = "kv",
-        feature = "projections",
-        feature = "query",
-        feature = "rbac",
-        feature = "runs"
-    ))]
     #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed"))]
     pub(crate) async fn send_raw_with_response(
         &self,
@@ -1381,7 +1339,6 @@ impl LaserBuilder {
         let connect_deadline =
             tokio::time::Instant::now() + ConnectOptions::from_env(self.connect_timeout)?.timeout;
         let stream = self.stream.filter(|value| !value.is_empty());
-        #[cfg_attr(not(any(feature = "filters", feature = "kv")), allow(unused_variables))]
         let (client, connection_string) = match self.connection {
             ConnectionConfig::Unset => {
                 return Err(LaserError::Config(
@@ -1428,30 +1385,23 @@ impl LaserBuilder {
         // The caller's set is the starting point, never a ceiling: the probe's
         // surfaces are added on top, so a builder that passes `Capabilities::OPEN`
         // still lights up the managed surfaces the connected deployment serves.
-        #[allow(unused_mut)]
         let configured_capabilities = self.capabilities.clone().unwrap_or(Capabilities::OPEN);
         let mut capabilities = configured_capabilities.clone();
         let mut topology = laser_wire::topology::WireTopology::default();
-        #[cfg(any(
-            feature = "filters",
-            feature = "fork",
-            feature = "graph",
-            feature = "kv",
-            feature = "projections",
-            feature = "query",
-            feature = "rbac",
-            feature = "runs"
-        ))]
-        {
-            // A probe still unanswered at the connect deadline leaves the set open-only, like any other probe failure.
-            if let Ok(Some(announce)) =
-                tokio::time::timeout_at(connect_deadline, probe_managed_host(&client)).await
-            {
+        // A probe still unanswered at the connect deadline leaves the set
+        // open-only, like any other probe failure, and the outcome records
+        // that nothing was established, so a group consumer does not read a
+        // deployment it could not classify as unfiltered.
+        match tokio::time::timeout_at(connect_deadline, probe_managed_host(&client)).await {
+            Ok(Ok(Some(announce))) => {
                 if let Some(announced) = announce.topology.clone() {
                     topology = announced;
                 }
                 merge_announcement(&mut capabilities, &announce);
+                capabilities.hello = HelloOutcome::Answered;
             }
+            Ok(Ok(None)) => capabilities.hello = HelloOutcome::Rejected,
+            Ok(Err(())) | Err(_) => capabilities.hello = HelloOutcome::Failed,
         }
         Ok(Laser {
             inner: Arc::new(LaserInner {
@@ -1459,13 +1409,13 @@ impl LaserBuilder {
                 publish_options,
                 reconnect_gate: tokio::sync::Mutex::new(()),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(any(feature = "filters", feature = "kv"))]
                 connection_string,
                 #[cfg(feature = "kv")]
                 coordination: OnceCell::new(),
                 #[cfg(feature = "kv")]
                 coordination_acquire_gate: tokio::sync::Mutex::new(()),
                 producers: DashMap::new(),
+                producer_statistics: Default::default(),
                 negotiated: std::sync::RwLock::new(NegotiatedState {
                     configured_capabilities,
                     capabilities,
@@ -1506,42 +1456,28 @@ impl LaserBuilder {
 // Older servers answer with an empty body, which leaves the versions
 // unadvertised (`None`), the backends empty, and the SDK skips fail-fast version
 // checks.
-#[cfg(any(
-    feature = "filters",
-    feature = "fork",
-    feature = "destinations",
-    feature = "graph",
-    feature = "kv",
-    feature = "projections",
-    feature = "query",
-    feature = "rbac",
-    feature = "runs"
-))]
-async fn probe_managed_host(client: &IggyClient) -> Option<laser_wire::hello::BackendAnnounce> {
+// `Ok(None)` is a server that answered without a managed announcement, Apache
+// Iggy refusing the command or an older server's empty body, so the managed
+// surfaces are positively absent. `Err` is a probe that established nothing:
+// the transport failed or the reply did not decode.
+async fn probe_managed_host(
+    client: &IggyClient,
+) -> Result<Option<laser_wire::hello::BackendAnnounce>, ()> {
     match client
         .send_binary_request(laser_wire::codes::AGDX_HELLO_CODE, Bytes::new())
         .await
     {
-        Ok(reply) if !reply.is_empty() => {
-            decode_named::<laser_wire::hello::BackendAnnounce>(&reply)
-                .ok()
-                .filter(|announce| announce.validate().is_ok())
-        }
-        Ok(_) | Err(_) => None,
+        Ok(reply) if reply.is_empty() => Ok(None),
+        Ok(reply) => decode_named::<laser_wire::hello::BackendAnnounce>(&reply)
+            .ok()
+            .filter(|announce| announce.validate().is_ok())
+            .map(Some)
+            .ok_or(()),
+        Err(IggyError::InvalidCommand) => Ok(None),
+        Err(_) => Err(()),
     }
 }
 
-#[cfg(any(
-    feature = "filters",
-    feature = "fork",
-    feature = "destinations",
-    feature = "graph",
-    feature = "kv",
-    feature = "projections",
-    feature = "query",
-    feature = "rbac",
-    feature = "runs"
-))]
 fn merge_announcement(
     capabilities: &mut Capabilities,
     announce: &laser_wire::hello::BackendAnnounce,
@@ -1552,6 +1488,10 @@ fn merge_announcement(
     capabilities.authz |= versions.has_feature(laser_wire::hello::feature::AUTHZ);
     capabilities.filters.native |=
         versions.has_feature(laser_wire::hello::feature::CONSUMER_FILTERS);
+    // Served by the streaming server itself, like the native reads: a server
+    // without a managed plane resolves every group as unbound.
+    capabilities.filters.group_policy_reads |=
+        versions.has_feature(laser_wire::hello::feature::GROUP_POLICY_READS);
     if capabilities.filters.native {
         capabilities
             .filters
@@ -1560,7 +1500,9 @@ fn merge_announcement(
     }
     if announce.ready {
         capabilities.managed = true;
-        capabilities.filters.catalog |= capabilities.filters.native && versions.filter > 0;
+        capabilities.filters.catalog |= (capabilities.filters.native
+            || capabilities.filters.group_policy_reads)
+            && versions.filter > 0;
         capabilities.kv.available |= versions.kv > 0;
         capabilities.forks |= versions.fork > 0;
         capabilities.graph |= versions.graph > 0;
@@ -1733,16 +1675,6 @@ mod announcement_tests {
     // Gated exactly like `merge_announcement` itself: with none of the managed
     // surface features enabled the function does not exist, so neither can its
     // tests.
-    #[cfg(any(
-        feature = "filters",
-        feature = "fork",
-        feature = "graph",
-        feature = "kv",
-        feature = "projections",
-        feature = "query",
-        feature = "rbac",
-        feature = "runs"
-    ))]
     #[test]
     fn given_a_ready_backend_when_merged_then_should_enable_advertised_plane_surfaces() {
         let announce = BackendAnnounce::new(
@@ -1855,7 +1787,6 @@ fn has_query_param(connection_string: &str, key: &str) -> bool {
 // The same connection string aimed at another node of the deployment. Only the
 // host and port change. A TLS connection keeps verifying the original host
 // name, which the node certificates carry, instead of the node's address.
-#[cfg(feature = "filters")]
 pub(crate) fn with_endpoint(connection_string: &str, endpoint: &str) -> String {
     let rest = after_scheme(connection_string);
     let start = connection_string.len() - rest.len() + authority_start(rest);
@@ -2288,7 +2219,6 @@ mod connection_string_tests {
         normalize_connection_string, resolve_tls, resolve_tls_with,
     };
 
-    #[cfg(feature = "filters")]
     #[test]
     fn given_another_node_when_aimed_at_then_should_keep_credentials_and_options() {
         assert_eq!(
@@ -2300,7 +2230,6 @@ mod connection_string_tests {
         );
     }
 
-    #[cfg(feature = "filters")]
     #[test]
     fn given_a_tls_connection_when_aimed_at_another_node_then_should_verify_the_original_host() {
         assert_eq!(

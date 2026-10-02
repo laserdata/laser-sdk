@@ -7,7 +7,7 @@
 Laser SDK ships in independently adoptable layers:
 
 - **Streaming** (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
-- **Managed platform** (`managed` feature), consumer filters, projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack.
+- **Managed platform** (`managed` feature), projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack. Consumer-group policies and reads are part of `streaming`.
 - **Agentic** (`agent` feature), reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
 - **Edges**, the optional A2A, MCP, and AG-UI adapters.
 
@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.5.0" # typed streaming plus provenance
+laser-sdk = "0.5.1" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.5.0", features = ["agent", "managed"] }
+laser-sdk = { version = "0.5.1", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -76,7 +76,7 @@ Set `LASER_TLS_CERT=<path>` to use an explicit CA with any host. Set `LASER_NO_T
 
 ## Batch and any payload
 
-`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. Before dropping a background producer, call `Producer::shutdown()` to flush its messages. Otherwise, unflushed messages can be lost. `topic.consumer_group()` provides continuous reads with offsets stored on the server.
+`publish_batch` groups typed records for sending. A service can use `topic.producer()` for batching, delays, retries, and routing. `.background(BackgroundConfig::builder()..)` selects buffered sends through Apache Iggy. Before dropping a background producer, call `Producer::shutdown()` to flush its messages. Otherwise, unflushed messages can be lost. `topic.consumer_group(name)` selects a group. `group.consumer().build().await` starts continuous reads with offsets stored on the server.
 
 A replay cursor reads a bounded set of records and keeps its offsets in the client. Save those offsets to resume later. Failed or canceled polls do not advance the saved offsets. Each partition read returns at most 10,000 messages, even when the configured request batch is larger.
 
@@ -269,7 +269,7 @@ One connection can advertise one agent. A second advertisement receives `LaserEr
 | `laser.topic(name)` | a topic on the optional default stream | shorthand for the same verbs |
 | `laser.query(index)` | a materialized index | filters, aggregates, vector recall, the bounded `.max_rows(n).rows()` walk |
 | `laser.watch()` | the change feed | consume advancement records instead of re-querying blind |
-| `laser.filters()` | server-side consumer filters | filtered readers over a partition or a consumer group, previews, sample tests, the saved-filter catalog, group bindings |
+| `topic.consumer_group(name).filter()` | one group's server-side policy | configure, inspect and draft revisions, pause/resume, release, preview and sample-test |
 | `laser.kv(namespace)` | managed point state | get/set/delete/scan, compare-and-swap, leases |
 | `laser.fork(id)` | a copy-on-write branch | speculative writes, overlay queries, promote or squash |
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |
@@ -294,7 +294,7 @@ Choose the read API that provides the behavior your application needs.
 
 | Rung | Call | You get |
 | --- | --- | --- |
-| live consumer | `topic.consumer(..)` / `consumer_group(..)` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait |
+| live consumer | `topic.consumer(..)` / `topic.consumer_group(..).consumer()` | a Laser async `Stream` over Apache Iggy with batching, polling, replay, retries, groups, automatic or explicit server offset commits, and `next_within(timeout)` for a bounded single-record wait |
 | replay | `topic.replay()` | a resumable `Cursor` by explicit offsets: bounded, restartable, nothing consumed (`topic.json::<T>().records(reader_name)` is the same rung, typed) |
 | change feed | `laser.watch()` | lightweight advancement records, so feed-poll-then-query replaces repeated blind queries |
 | reliable consumer | `Agent::builder` / `ReliableConsumer` | consumer-group delivery plus dedup, retry, deadline, and dead-lettering |
@@ -311,7 +311,7 @@ Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` 
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
 - `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
 - `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent().commit()`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
-- `filters` provides server-side consumer filters over the `AGDX_FILTER*` commands: `laser.filters().reader(stream, topic)` reads one partition set or a consumer group through the partition primary, stores progress only through fenced acknowledgments of completed pages, and reports fault and oversized stops as typed errors. A group reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset. `MatchedRecord::json::<T>()` decodes a delivered record into your type. `preview`, `test`, and `validate` run without progress. The catalog verbs `register`, `revise`, `bind`, `unbind`, `archive`, and `delete` wait for the authoritative outcome of each operation id, and `apply_as` sends a mutation under an id the caller recorded first. Filtered reads need a server that advertises `consumer_filters`, and the catalog also needs `laser-plane`.
+- `streaming` includes consumer-group policies, group-aware consumers, explicit acknowledgment readers and group filter administration. The supporting server selects matching records for a bound group and returns all records for an unbound group. Configuration needs a ready catalog. `filters` adds only the local evaluator and the advanced reader's optional `local_guard` check. A reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset.
 - capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
 - `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)
 - `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
@@ -363,10 +363,10 @@ See [publish recovery and outage handling](../docs/publish-recovery.md).
 
 ## Consumer filters
 
-A consumer filter runs on the streaming server, so a reader receives only the records it selects, with their original offsets:
+**Configure the group once, then consume using only its name or ID.** The filter runs on the server. Matching records retain their original payloads, headers and offsets. An unbound group receives all records through the same consumer API:
 
 ```rust,no_run
-use laser_sdk::filters::{ConsumerFilter, FilterExpr, FilteredStart};
+use laser_sdk::filters::{ConsumerFilter, FilterExpr};
 use laser_sdk::prelude::*;
 use laser_sdk::query::CmpOp;
 
@@ -377,27 +377,32 @@ async fn main() -> Result<(), LaserError> {
         FilterExpr::pred("outcome", CmpOp::Eq, "error"),
         FilterExpr::pred("latency_ms", CmpOp::Gt, 2_000),
     ]));
-    let mut reader = laser
-        .filters()
-        .reader("agent-telemetry", "inferences")
-        .consumer("on-call-review")
-        .inline(slow_or_failed)
-        .start(FilteredStart::First)
-        .build()
-        .await?;
-    let record = reader.next_record().await?;
-    println!("offset {}: {:?}", record.offset, record.message.payload);
-    reader.ack(&record).await?;
-    reader.close().await?;
+    let topic = laser.stream("agent-telemetry").topic("inferences");
+    let setup = topic.consumer_group("on-call-review");
+    let created = setup.create().filter(slow_or_failed).build().await?;
+
+    let group = topic.consumer_group_id(u64::from(created.id));
+    let mut consumer = group.consumer()
+        .commit_policy(CommitPolicy::Disabled)
+        .batch_length(100)
+        .build().await?;
+    let record = consumer.next_within(std::time::Duration::from_secs(10)).await?;
+    println!("offset {}: {:?}", record.position.offset, record.payload);
+    consumer.commit(&record).await?;
+    consumer.shutdown().await?;
     Ok(())
 }
 ```
 
-`next_page` and `ack_page` handle batches, `ack_through` stores an application checkpoint inside a page, and `CompiledFilter` from `laser_sdk::filters` runs the same evaluator locally. `with_fault_policy`, `with_foreign_policy`, and `with_mismatch_policy` decide what a record that does not decode, has another codec, or has a field of an unexpected type does: stop or drop, or reach the reader marked unevaluated.
+Use `group.create().build().await` for a plain group, and `group.filter().configure(filter).await` to configure it afterward. The advanced `group.reader()?.build().await` also resolves the group's policy and accepts an unbound group. `next_page` and `ack_page` handle its batches, while `ack_through` stores a checkpoint inside a page. `CompiledFilter`, with the optional `filters` feature, runs the evaluator locally. Fault, foreign-codec and type-mismatch policies decide whether an unevaluable record stops the read, is dropped or is delivered with `evaluated == false`.
+
+**A normal consumer's `batch_length(100)` examines at most 100 source records per partition request and returns zero to 100 matches.** The iterator continues through empty selections without sleeping until it reaches visible data's end. The advanced reader has separate `count` and `max_examined` limits for match-oriented scans.
 
 ## Consumer filter groups and offsets
 
-**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages`, so a reader that never acknowledges stops at that bound instead of growing without limit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+**All consumers in the same group share its policy and divide the partitions.** Use separate groups for A/B policies and independent offsets. Drafting a revision does not activate it. Configuring another digest on an already-used group returns a conflict. A fresh group using `Next` starts at the first retained record.
+
+Group consumers acknowledge through the fenced group contract. Automatic policies treat the previous delivery as handled when the application requests another record or shuts down cleanly. Use `CommitPolicy::Disabled` and `commit(&record)` for an explicit processing checkpoint. On original Apache Iggy, native consumers retain their existing commit behavior. Advanced group readers acknowledge explicitly and keep at most 1024 unacknowledged record-bearing pages per partition by default, configured with `max_unacked_pages`. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
 
 **Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
 

@@ -197,6 +197,28 @@ pub mod u128_text {
     }
 }
 
+pub(crate) mod opt_u128_text {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    struct OperationId(#[serde(with = "super::u128_text")] u128);
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<u128>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(OperationId).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u128>, D::Error> {
+        Option::<OperationId>::deserialize(deserializer)
+            .map(|value| value.map(|operation| operation.0))
+    }
+}
+
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use crate::framing::{decode_named, encode_named};

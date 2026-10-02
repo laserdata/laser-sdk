@@ -85,7 +85,7 @@ void test(
       await within(laser.stream(stream).ensure(), 3_000)
       const topic = laser.topic("pulse")
       await within(topic.ensure(1), 3_000)
-      consumer = await topic.consumerGroup("restart-workers", {
+      consumer = await topic.consumerGroup("restart-workers").consumer({
         batchLength: 10,
         startFrom: { kind: "first" },
         pollIntervalMs: 10
@@ -112,7 +112,7 @@ void test(
       assert.ok(
         records.some((record) => new TextDecoder().decode(record.payload) === "after-restart")
       )
-      consumer = await topic.consumerGroup("restart-workers", {
+      consumer = await topic.consumerGroup("restart-workers").consumer({
         batchLength: 10,
         startFrom: { kind: "next" },
         pollIntervalMs: 10

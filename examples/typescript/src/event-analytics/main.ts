@@ -339,7 +339,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   await laser.topic(TOPIC).ensure(PARTITIONS)
   if (capabilities.query.available) await registerProjection(laser, TOPIC)
 
-  await using live = await laser.topic(TOPIC).consumerGroup(LIVE_GROUP, {
+  await using live = await laser.topic(TOPIC).consumerGroup(LIVE_GROUP).consumer({
     batchLength: 100,
     pollIntervalMs: 5
   })

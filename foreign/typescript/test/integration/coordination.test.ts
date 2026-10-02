@@ -23,7 +23,7 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
     const [published] = await cursor.poll()
     assert.ok(published !== undefined)
     const groupName = `probe-${randomUUID()}`
-    const consumer = await topic.consumerGroup(groupName, {
+    const consumer = await topic.consumerGroup(groupName).consumer({
       autoCommit: false,
       startFrom: { kind: "first" }
     })

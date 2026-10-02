@@ -1,11 +1,13 @@
-import { Filters } from "../managed/filters.js"
+import { closeProducerStatistics } from "../stream/producer-statistics.js"
+import type { GroupContext } from "../stream/consumer-group.js"
 import { connectOptions, type ConnectOptions } from "./connect-options.js"
 import { publishOptions, type PublishOptions } from "./publish-options.js"
 import {
   ApacheIggyTransport,
   type ClientOwnership,
   type IggyClient,
-  type LaserTransport
+  type LaserTransport,
+  serverErrorCode
 } from "../iggy/apache-iggy.js"
 import { createAgdx, type Agdx } from "../agent/agdx.js"
 import { decodeAgentMessage, type AgentMessage } from "../agent/reliable-consumer.js"
@@ -141,6 +143,8 @@ import {
 } from "./capabilities.js"
 
 const LOCAL_CONNECTION_STRING = "iggy:iggy@127.0.0.1:8090"
+// The Iggy error code a server answers an unknown command with.
+const INVALID_COMMAND = 3
 
 interface LaserTopology {
   readonly opsStream: string
@@ -451,20 +455,27 @@ function metadataActionFields(envelope: AgentEnvelope): {
   }
 }
 
+// A server that answers without a managed announcement, Apache Iggy refusing
+// the command or an older server's empty body, positively lacks the managed
+// surfaces. A transport failure or a reply that does not decode established
+// nothing, so a group consumer must not treat the deployment as unfiltered.
 async function probeCapabilities(transport: ManagedTransport): Promise<Capabilities> {
   let reply: Uint8Array
   try {
     reply = await transport.sendManaged(AGDX_HELLO_CODE, new Uint8Array())
-  } catch {
-    return OPEN_CAPABILITIES
+  } catch (error) {
+    return {
+      ...OPEN_CAPABILITIES,
+      hello: serverErrorCode(error) === INVALID_COMMAND ? "rejected" : "failed"
+    }
   }
   if (reply.byteLength === 0) {
-    return OPEN_CAPABILITIES
+    return { ...OPEN_CAPABILITIES, hello: "rejected" }
   }
   try {
     return managedCapabilitiesFrom(decodeBackendAnnounce(reply))
   } catch {
-    return OPEN_CAPABILITIES
+    return { ...OPEN_CAPABILITIES, hello: "failed" }
   }
 }
 
@@ -756,7 +767,7 @@ export class Laser implements AsyncDisposable {
       const expired = new Promise<Capabilities>((resolve) => {
         timer = setTimeout(
           () => {
-            resolve(OPEN_CAPABILITIES)
+            resolve({ ...OPEN_CAPABILITIES, hello: "failed" })
           },
           Math.max(0, deadline - Date.now())
         )
@@ -869,7 +880,8 @@ export class Laser implements AsyncDisposable {
             () => undefined
           )
         }
-      }
+      },
+      this.groupContext()
     )
   }
 
@@ -1364,19 +1376,13 @@ export class Laser implements AsyncDisposable {
     return new Destinations(this.managedTransport(), () => this.capabilities())
   }
 
-  /**
-   * Server-side consumer filters: filtered readers, previews, sample tests, and
-   * the saved-filter catalog.
-   */
-  filters(): Filters {
+  // What a consumer group needs to reach its filter policy and read through
+  // the partition primaries.
+  private groupContext(): GroupContext {
     const transport = this.transport
-    return new Filters(
-      {
+    return {
+      transport: {
         sendManaged: this.managedTransport().sendManaged,
-        ensureConsumerGroup: (streamId, topicId, name) =>
-          transport.ensureConsumerGroup(streamId, topicId, name),
-        getTopicPartitionCount: (streamId, topicId) =>
-          transport.getTopicPartitionCount(streamId, topicId),
         joinConsumerGroup: (streamId, topicId, name) =>
           transport.joinConsumerGroup(streamId, topicId, name),
         leaveConsumerGroup: (streamId, topicId, name) =>
@@ -1392,8 +1398,8 @@ export class Laser implements AsyncDisposable {
           : {}),
         ...(transport.connectsNodes !== undefined ? { connectsNodes: transport.connectsNodes } : {})
       },
-      () => this.capabilities()
-    )
+      capabilities: () => this.capabilities()
+    }
   }
 
   kv(namespace: string): Kv {
@@ -1582,6 +1588,7 @@ export class Laser implements AsyncDisposable {
         )
       }
       this.shared.replyHubs.clear()
+      await closeProducerStatistics(this.transport)
       await this.observe("laser.close", { operation: "close" }, () => this.transport.close())
     })()
     await this.shared.closing

@@ -4,8 +4,7 @@ use laser_examples::{
     fresh_run, init_tracing, laser, managed_feature_ready, phase, run_token, stream_for,
 };
 use laser_sdk::filters::{
-    ConsumerFilter, FilterErrorReason, FilterExpr, FilterGroupRef, FilterRef, FilteredReader,
-    FilteredStart, MatchedRecord,
+    ConsumerFilter, FilterErrorReason, FilterExpr, FilteredReader, FilteredStart, MatchedRecord,
 };
 use laser_sdk::iggy::prelude::{HeaderKey, HeaderValue};
 use laser_sdk::prelude::full::*;
@@ -16,13 +15,13 @@ use std::time::Duration;
 // A satellite fleet streams the change feed of its mission-ops database: every
 // battery reading, orbit maneuver, and ground-station status flip. The anomaly
 // desk only wants satellites entering safe mode or leaving the fleet. The
-// server evaluates the filter next to the data, so the desk receives a handful
-// of records out of hundreds, and everything else never leaves the broker.
+// desk's consumer group owns that filter: the server evaluates it next to the
+// data, so the desk receives a handful of records out of hundreds, and
+// everything else never leaves the broker.
 const TOPIC: &str = "fleet_changes";
 const ALERTS: &str = "fleet_alerts";
 const PARTITIONS: u32 = 3;
 const GROUP: &str = "anomaly-desk";
-const BACKFILL: &str = "safe-mode-backfill";
 const SATELLITES: usize = 8;
 const FEED_SIZE: usize = 240;
 const ROUTINE: u8 = 1;
@@ -36,7 +35,8 @@ async fn main() -> Result<(), LaserError> {
     let laser = laser(&stream, Capabilities::OPEN).await?;
     fresh_run(&laser, &stream, async {
         let capabilities = laser.capabilities().await;
-        if !managed_feature_ready(capabilities.filters.native, "consumer filters", "cdc") {
+        if !managed_feature_ready(capabilities.filters.catalog, "consumer group filters", "cdc")
+        {
             return Ok(());
         }
 
@@ -62,54 +62,81 @@ async fn main() -> Result<(), LaserError> {
             feed.strict_matches
         );
 
-        phase("read only the safe-mode or decommission events, no catalog needed");
-        let mut backfill = laser
-            .filters()
-            .reader(&stream, TOPIC)
-            .consumer(BACKFILL)
-            .inline(safe_mode_filter())
-            .start(FilteredStart::First)
+        phase("create the anomaly desk group with its filter");
+        let desk_name = format!("{GROUP}-{}", run_token());
+        let desk = topic.consumer_group(&desk_name);
+        let created = desk.create().filter(safe_mode_filter()).build().await?;
+        let binding = created
+            .filter
+            .clone()
+            .ok_or_else(|| LaserError::Invalid("the group was created unbound".to_owned()))?;
+        println!(
+            "  group {} ({}) runs revision {} of its own filter from now on",
+            created.name, created.id, binding.revision
+        );
+
+        phase("consume as the group: the application names the group, the server runs its filter");
+        let mut consumer = desk
+            .consumer()
+            .start_at(ConsumerStart::First)
+            .commit_policy(CommitPolicy::Disabled)
             .build()
             .await?;
-        let delivered = read_matches(&mut backfill, feed.strict_matches).await;
-        backfill.close().await?;
-        let delivered = delivered?;
-        let delivered_bytes: usize = delivered
-            .iter()
-            .map(|record| record.message.payload.len())
-            .sum();
+        let consumed = async {
+            let mut delivered_bytes = 0;
+            for _ in 0..feed.strict_matches {
+                let message = consumer.next_within(READ_TIMEOUT).await?;
+                let change: FleetChange = message.json()?;
+                println!(
+                    "  partition {} offset {}: {}",
+                    message.partition_id,
+                    message.position.offset,
+                    change.describe()
+                );
+                delivered_bytes += message.payload.len();
+                consumer.commit(&message).await?;
+            }
+            Ok::<usize, LaserError>(delivered_bytes)
+        }
+        .await;
+        consumer.shutdown().await?;
+        let delivered_bytes = consumed?;
         println!(
             "  delivered {} of {} records, {delivered_bytes} of {published_bytes} payload bytes: {:.1}% stayed on the broker",
-            delivered.len(),
+            feed.strict_matches,
             feed.records.len(),
             100.0 * (published_bytes - delivered_bytes) as f64 / published_bytes.max(1) as f64
         );
 
-        phase("test both filters against a battery update of a satellite already in safe mode");
+        phase("page the matches again with the group reader and its own scan budget");
+        let mut pager = desk
+            .reader()?
+            .start(FilteredStart::First)
+            .count(10)
+            .max_examined(100)
+            .local_guard(true)
+            .build()
+            .await?;
+        let paged = read_matches(&mut pager, feed.strict_matches).await;
+        pager.close().await?;
+        println!(
+            "  the reader handed out {} matches in pages, each acknowledged after handling",
+            paged?.len()
+        );
+
+        phase("test the group's filter against a battery update of a satellite already in safe mode");
         let still_safe = satellite_update(2, Mode::Safe, 58, Column::BatteryPct);
         let sample = serde_json::to_string(&still_safe)
             .map_err(|error| LaserError::Codec(error.to_string()))?;
-        for (name, filter) in [
-            ("strict, transitions only", safe_mode_filter()),
-            ("values only, current state", safe_mode_values_filter()),
-        ] {
-            let tested = laser
-                .filters()
-                .test(FilterRef::Inline(filter), sample.clone(), Vec::new())
-                .await?;
-            println!("  {name}: {}", tested.explanation.verdict);
-        }
+        let tested = desk.filter().test(sample, Vec::new()).await?;
+        println!("  strict, transitions only: {}", tested.explanation.verdict);
 
         phase("preview every partition, nothing is stored");
         for partition_id in 0..PARTITIONS {
-            let preview = laser
-                .filters()
-                .preview(
-                    &stream,
-                    TOPIC,
-                    partition_id,
-                    FilterRef::Inline(safe_mode_filter()),
-                )
+            let preview = desk
+                .filter()
+                .preview(partition_id)
+                .await?
                 .max_records(10)
                 .send()
                 .await?;
@@ -121,22 +148,18 @@ async fn main() -> Result<(), LaserError> {
 
         phase("route binary alerts on a header, their payload is never decoded");
         route_alerts(&laser, &stream).await?;
-        codecs::run(&laser, &stream, capabilities.filters.catalog).await?;
+        codecs::run(&laser, &stream).await?;
 
-        if !capabilities.filters.catalog {
-            println!("  the saved-filter catalog needs a managed plane, skipping group bindings");
-            return Ok(());
-        }
-        manage_group(&laser, &stream, feed.strict_matches).await
+        manage_revisions(&laser, &desk, &binding, feed.strict_matches).await
     })
     .await
 }
 
-// Binary alert frames carry their priority as a header. A headers-only filter
-// selects the critical ones without decoding a payload, so the alert topic can
-// hold any format.
+// Binary alert frames carry their priority as a header. A pager group with a
+// headers-only filter selects the critical ones without decoding a payload,
+// so the alert topic can hold any format.
 async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
-    let alerts = laser.topic(ALERTS);
+    let alerts = laser.stream(stream).topic(ALERTS);
     alerts.ensure(1).await?;
     let producer = alerts.producer().build().await?;
     for (priority, satellite_id) in [
@@ -153,15 +176,18 @@ async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
         );
         producer.send_keyed(message, satellite_id).await?;
     }
-    let mut pager = laser
-        .filters()
-        .reader(stream, ALERTS)
-        .consumer(format!("{BACKFILL}-pager"))
-        .inline(ConsumerFilter::headers_only(FilterExpr::header(
+    let pager_group = alerts.consumer_group(format!("{GROUP}-pager-{}", run_token()));
+    pager_group
+        .create()
+        .filter(ConsumerFilter::headers_only(FilterExpr::header(
             "priority",
             CmpOp::Eq,
             i32::from(CRITICAL),
         )))
+        .build()
+        .await?;
+    let mut pager = pager_group
+        .reader()?
         .start(FilteredStart::First)
         .build()
         .await?;
@@ -181,151 +207,111 @@ async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
     }
     .await;
     pager.close().await?;
+    pager_group.filter().release().await?;
     paged
 }
 
-// Save both filters, bind the anomaly desk to the strict one, consume as the
-// group, then release everything this run created, also when a step fails.
-async fn manage_group(laser: &Laser, stream: &str, expected: usize) -> Result<(), LaserError> {
-    phase("save both filters in the catalog");
-    let filters = laser.filters();
-    let mut saved = Vec::new();
-    let mut bindings = Vec::new();
-    let outcome = async {
-        let strict = filters
-            .register(
-                format!("sats-safe-mode-{}", run_token()),
-                safe_mode_filter(),
-                "Satellites entering safe mode, reporting it, or leaving the fleet",
-            )
-            .await?;
-        saved.push(strict.filter_id);
-        let values = filters
-            .register(
-                format!("sats-safe-mode-values-{}", run_token()),
-                safe_mode_values_filter(),
-                "Every update of a satellite whose current mode is safe",
-            )
-            .await?;
-        saved.push(values.filter_id);
-        println!(
-            "  strict is filter {} revision {}, values only is filter {} revision {}",
-            strict.filter_id, strict.revision, values.filter_id, values.revision
-        );
+// Draft a stricter revision on the desk's own filter, run the variant in its
+// own group, pause and resume it, then release both policies, also when a
+// step fails.
+async fn manage_revisions(
+    laser: &Laser,
+    desk: &ConsumerGroup,
+    binding: &FilterBinding,
+    expected: usize,
+) -> Result<(), LaserError> {
+    phase("draft a stricter revision: readers keep running the active one");
+    let draft = desk
+        .filter()
+        .revise(
+            binding.revision,
+            ConsumerFilter::json(safe_mode_transition()),
+        )
+        .await?;
+    let revisions = desk.filter().revisions(0, 10).await?;
+    println!(
+        "  revision {} drafted, the group lists {} revisions and still runs revision {}",
+        draft.revision, revisions.total, binding.revision
+    );
 
-        phase("bind the anomaly desk group to the strict filter");
-        let group = FilterGroupRef {
-            stream: stream.to_owned(),
-            topic: TOPIC.to_owned(),
-            group: GROUP.to_owned(),
-        };
-        let bound = filters
-            .create_consumer_group(group, strict.filter_id, strict.revision)
-            .await?;
-        println!("  {GROUP} runs revision {} from now on", bound.revision);
-        let group_id = bound.identity.group_id;
-        bindings.push(bound);
+    phase("A/B: the transitions-only variant runs in its own group");
+    let variant_name = format!("{GROUP}-transitions-{}", run_token());
+    let variant = laser.topic(TOPIC).consumer_group(&variant_name);
+    let variant_created = variant
+        .create()
+        .filter(ConsumerFilter::json(safe_mode_transition()))
+        .build()
+        .await?;
+    let variant_binding = variant_created
+        .filter
+        .ok_or_else(|| LaserError::Invalid("the variant was created unbound".to_owned()))?;
+    let mut reader = variant
+        .reader()?
+        .count(1)
+        .local_guard(true)
+        .start(FilteredStart::First)
+        .build()
+        .await?;
+    let compared = async {
+        let first = tokio::time::timeout(READ_TIMEOUT, reader.next_record())
+            .await
+            .map_err(|_| LaserError::Timeout("the A/B record"))??;
+        let change: FleetChange = first.json()?;
+        println!("  {variant_name}: {}", change.describe());
 
-        phase("consume as the group and acknowledge");
-        let mut desk = filters
-            .reader(stream, TOPIC)
-            .group_id(group_id)
-            .local_guard(true)
-            .start(FilteredStart::First)
-            .build()
+        phase("pause the variant: new reads stop, in-flight work still acknowledges");
+        variant
+            .filter()
+            .set_revision_enabled(variant_binding.revision, false)
             .await?;
-        let handled = read_matches(&mut desk, expected).await;
-        desk.close().await?;
-        println!(
-            "  the desk handled {} safe-mode or decommission events",
-            handled?.len()
-        );
-
-        phase("A/B: a second revision runs in its own group");
-        let second = filters
-            .revise(
-                strict.filter_id,
-                strict.revision,
-                ConsumerFilter::json(safe_mode_transition()),
-            )
-            .await?;
-        let variant_group = FilterGroupRef {
-            stream: stream.to_owned(),
-            topic: TOPIC.to_owned(),
-            group: format!("{GROUP}-transitions"),
-        };
-        let variant_binding = filters
-            .create_consumer_group(variant_group, second.filter_id, second.revision)
-            .await?;
-        let variant_id = variant_binding.identity.group_id;
-        bindings.push(variant_binding);
-        let mut variant = filters
-            .reader(stream, TOPIC)
-            .group_id(variant_id)
-            .count(1)
-            .local_guard(true)
-            .start(FilteredStart::First)
-            .build()
-            .await?;
-        let compared = async {
-            let first = tokio::time::timeout(READ_TIMEOUT, variant.next_record())
-                .await
-                .map_err(|_| LaserError::Timeout("the A/B record"))??;
-            let change: FleetChange = first.json()?;
-            println!("  revision {}: {}", second.revision, change.describe());
-            filters
-                .set_revision_enabled(second.filter_id, second.revision, false)
-                .await?;
-            variant.ack(&first).await?;
-            match variant.try_next_page().await {
-                Err(error)
-                    if error.filter_reason() == Some(FilterErrorReason::RevisionDisabled) =>
-                {
-                    println!("  paused: new reads stop, in-flight work can still be acknowledged")
-                }
-                Err(error) => return Err(error),
-                Ok(_) => {
-                    return Err(LaserError::Invalid(
-                        "a disabled revision kept reading".to_owned(),
-                    ));
-                }
+        reader.ack(&first).await?;
+        match reader.try_next_page().await {
+            Err(error) if error.filter_reason() == Some(FilterErrorReason::RevisionDisabled) => {
+                println!("  paused: the server refuses new reads with revision_disabled")
             }
-            filters
-                .set_revision_enabled(second.filter_id, second.revision, true)
-                .await?;
-            read_matches(&mut variant, 1).await?;
-            println!(
-                "  A/B groups handled {expected} broad events and 2 transitions independently"
-            );
-            Ok(())
-        }
-        .await;
-        let closed = variant.close().await;
-        compared.and(closed)?;
-
-        phase("a bound filter cannot be deleted");
-        match filters.delete(strict.filter_id).await {
-            Err(error) if error.filter_reason() == Some(FilterErrorReason::Conflict) => {
-                println!("  refused with conflict while {GROUP} is bound");
-                Ok(())
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(LaserError::Invalid(
+                    "a disabled revision kept reading".to_owned(),
+                ));
             }
-            Err(error) => Err(error),
-            Ok(()) => Err(LaserError::Invalid("a bound filter was deleted".to_owned())),
         }
+        variant
+            .filter()
+            .set_revision_enabled(variant_binding.revision, true)
+            .await?;
+        read_matches(&mut reader, 1).await?;
+        println!("  resumed: the desk handled {expected} broad events, the variant 2 transitions");
+        Ok(())
     }
     .await;
+    let closed = reader.close().await;
+    compared.and(closed)?;
 
-    phase("unbind, archive, delete");
-    let mut cleanup = Ok(());
-    for binding in bindings {
-        cleanup = cleanup.and(filters.unbind_binding(binding).await.map(|_| ()));
+    phase("a group that runs a policy cannot be switched to another one");
+    match desk
+        .filter()
+        .configure(ConsumerFilter::json(safe_mode_transition()))
+        .await
+    {
+        Err(error) if error.filter_reason() == Some(FilterErrorReason::Conflict) => {
+            println!("  refused with conflict: create a new group for another policy");
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(LaserError::Invalid(
+                "a running policy was replaced".to_owned(),
+            ));
+        }
     }
-    for filter_id in saved {
-        cleanup = cleanup.and(filters.archive(filter_id).await);
-        cleanup = cleanup.and(filters.delete(filter_id).await);
-    }
-    outcome.and(cleanup)?;
-    println!("  both filters are gone, their names are never reused");
+
+    phase("release both policies");
+    let released = desk.filter().release().await?;
+    variant.filter().release().await?;
+    println!(
+        "  {} is unbound again and receives every record, its filter stays saved as revision {}",
+        released.group.group, released.revision
+    );
     Ok(())
 }
 
@@ -374,15 +360,6 @@ fn safe_mode_transition() -> FilterExpr {
         FilterExpr::pred("changed", CmpOp::Contains, "mode"),
         FilterExpr::pred("after.mode", CmpOp::Eq, "safe"),
     ])
-}
-
-// Values only: any update of a satellite whose current mode is safe.
-fn safe_mode_values_filter() -> ConsumerFilter {
-    ConsumerFilter::json(FilterExpr::all([
-        FilterExpr::pred("table", CmpOp::Eq, "satellites"),
-        FilterExpr::pred("op", CmpOp::Eq, "u"),
-        FilterExpr::pred("after.mode", CmpOp::Eq, "safe"),
-    ]))
 }
 
 /// One record of the change feed: a row change captured from the mission-ops

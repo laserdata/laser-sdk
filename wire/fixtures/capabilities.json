@@ -34,6 +34,7 @@
   "authz": false,
   "filters": {
     "native": false,
+    "group_policy_reads": false,
     "preview": false,
     "primary_routing": false,
     "catalog": false,

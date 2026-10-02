@@ -1,7 +1,8 @@
 """cdc (Consumer filters primitive): read only the change-feed records you care about.
 
-The server selects the matching records of a change feed, so the reader
-receives only those records, with their original offsets. A satellite fleet
+A consumer group owns its filter. The server selects the matching records of a
+change feed for the group, so its consumers receive only those records, with
+their original offsets, and never name a filter themselves. A satellite fleet
 streams the change feed of its mission-ops database: every battery reading,
 orbit maneuver, and ground-station status flip. The anomaly desk wants the
 satellites that enter safe mode or leave the fleet, a handful of records out
@@ -10,26 +11,26 @@ of hundreds, and everything else never leaves the broker.
 What it shows:
   - publish a busy feed of typed change records, dataclasses keyed by
     satellite (`topic.publish(record).partition_key(key)`)
-  - read with an inline filter that needs no catalog, decode every delivered
-    record back into its dataclass, and see how much of the feed stayed on
-    the broker
-  - test a strict filter and a values-only filter on the same record
-  - preview every partition without storing progress
-  - route binary alerts on a `priority` header with a headers-only filter,
-    on their own topic, without decoding a payload
-  - with laser-plane: save filters, create and bind independent A/B groups,
-    read by numeric group ID, pause and resume revisions, see a bound filter
-    refuse deletion, release exact bindings, then archive and delete
+  - create the anomaly desk group with its filter in one call
+  - consume as the group with the normal consumer, decode every delivered
+    record back into its dataclass, commit after handling, and see how much
+    of the feed stayed on the broker
+  - page the matches again with the group reader and its own scan budget
+  - test the group's filter on one record and preview every partition
+    without storing progress
+  - route binary alerts on a `priority` header with a headers-only group
+    filter, on their own topic, without decoding a payload
   - filter typed CBOR, Avro, and Protobuf readings, using registered writer
     schemas for Avro and Protobuf
+  - draft a stricter revision, run the variant in its own A/B group, pause
+    and resume it, see a running policy refuse another one, and release both
 
-Consumer filters need a server that serves them, as the LaserData Iggy fork in
-Laser Stack or LaserData Cloud does, and skip elsewhere. Saved filters and
-group bindings also need laser-plane.
+Consumer group filters need laser-plane, as Laser Stack or LaserData Cloud
+runs it, and skip elsewhere.
 
 **The sample saves 98.5% of payload transfer: 424 of 27,953 bytes.**
-The reader receives 4 of 240 records, processes each typed change, then
-acknowledges it. Binary alerts use a one-byte uint8 priority header.
+The desk receives 4 of 240 records, processes each typed change, then
+commits it. Binary alerts use a one-byte uint8 priority header.
 
 Run it:
     LASER_CONNECTION_STRING=user:pwd@your-host python3 cdc.py
@@ -54,7 +55,6 @@ TOPIC = "fleet_changes"
 ALERTS = "fleet_alerts"
 PARTITIONS = 3
 GROUP = "anomaly-desk"
-BACKFILL = "safe-mode-backfill"
 SATELLITES = 8
 FEED_SIZE = 240
 ROUTINE = 1
@@ -260,19 +260,6 @@ def safe_mode_transition() -> ls.FilterExpr:
     )
 
 
-def safe_mode_values_filter() -> ls.ConsumerFilter:
-    """Values only: any update of a satellite whose current mode is safe."""
-    return ls.ConsumerFilter.json(
-        ls.FilterExpr.all(
-            [
-                ls.FilterExpr.pred("table", "eq", "satellites"),
-                ls.FilterExpr.pred("op", "eq", "u"),
-                ls.FilterExpr.pred("after.mode", "eq", "safe"),
-            ]
-        )
-    )
-
-
 async def read_matches(reader: ls.FilteredReader, expected: int) -> list[ls.MatchedRecord]:
     """Process each typed change before acknowledging it."""
     delivered: list[ls.MatchedRecord] = []
@@ -285,10 +272,10 @@ async def read_matches(reader: ls.FilteredReader, expected: int) -> list[ls.Matc
     return delivered
 
 
-async def route_alerts(laser: ls.Laser, stream: str) -> None:
-    """Binary alert frames carry their priority as a header. A headers-only
-    filter selects the critical ones without decoding a payload, so the alert
-    topic can hold any format."""
+async def route_alerts(laser: ls.Laser) -> None:
+    """Binary alert frames carry their priority as a header. A pager group
+    with a headers-only filter selects the critical ones without decoding a
+    payload, so the alert topic can hold any format."""
     alerts = laser.topic(ALERTS)
     await alerts.ensure(1)
     producer = alerts.producer(partitions=1)
@@ -300,14 +287,11 @@ async def route_alerts(laser: ls.Laser, stream: str) -> None:
     ]:
         frame = b"\x0a\x07" + satellite_id.encode()
         await producer.send(frame, headers={"priority": ("uint8", priority)}, key=satellite_id)
-    pager = await laser.filters().reader(
-        stream,
-        ALERTS,
-        consumer=f"{BACKFILL}-pager",
-        filter=ls.ConsumerFilter.headers_only(ls.FilterExpr.header("priority", "eq", CRITICAL)),
-        start="first",
+    pager_group = alerts.consumer_group(f"{GROUP}-pager-{_common.run_token()}")
+    await pager_group.create(
+        filter=ls.ConsumerFilter.headers_only(ls.FilterExpr.header("priority", "eq", CRITICAL))
     )
-
+    pager = await pager_group.reader(start="first")
     try:
         for _ in range(2):
             record = await asyncio.wait_for(pager.next_record(), READ_TIMEOUT)
@@ -318,131 +302,74 @@ async def route_alerts(laser: ls.Laser, stream: str) -> None:
             await pager.ack(record)
     finally:
         await pager.close()
+        await pager_group.filter().release()
 
 
-async def manage_group(laser: ls.Laser, stream: str, expected: int) -> None:
-    """Save both filters, bind the anomaly desk to the strict one, consume as
-    the group, then release everything this run created, also when a step
-    fails."""
-    _common.phase("save both filters in the catalog")
-    filters = laser.filters()
-    bindings: list = []
-    filter_ids: list = []
+async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) -> None:
+    """Draft a stricter revision on the desk's own filter, run the variant in
+    its own group, pause and resume it, then release both policies."""
+    _common.phase("draft a stricter revision: readers keep running the active one")
+    draft = await desk.filter().revise(
+        binding["revision"], ls.ConsumerFilter.json(safe_mode_transition())
+    )
+    revisions = await desk.filter().revisions(page=0, page_size=10)
+    print(
+        f"  revision {draft['revision']} drafted, the group lists {revisions['total']} "
+        f"revisions and still runs revision {binding['revision']}"
+    )
+
+    _common.phase("A/B: the transitions-only variant runs in its own group")
+    variant_name = f"{GROUP}-transitions-{_common.run_token()}"
+    variant = laser.topic(TOPIC).consumer_group(variant_name)
+    created = await variant.create(filter=ls.ConsumerFilter.json(safe_mode_transition()))
+    variant_binding = created["filter"]
+    reader = await variant.reader(count=1, local_guard=True, start="first")
     try:
-        strict = await filters.register(
-            f"sats-safe-mode-{_common.run_token()}",
-            safe_mode_filter(),
-            description="Satellites entering safe mode, reporting it, or leaving the fleet",
-        )
-        filter_ids.append(strict["filter_id"])
-        values = await filters.register(
-            f"sats-safe-mode-values-{_common.run_token()}",
-            safe_mode_values_filter(),
-            description="Every update of a satellite whose current mode is safe",
-        )
-        filter_ids.append(values["filter_id"])
-        print(
-            f"  strict is filter {strict['filter_id']} revision {strict['revision']}, "
-            f"values only is filter {values['filter_id']} revision {values['revision']}"
-        )
+        first = await asyncio.wait_for(reader.next_record(), READ_TIMEOUT)
+        change = fleet_change(first.message.json())
+        print(f"  {variant_name}: {change.describe()}")
 
-        _common.phase("bind the anomaly desk group to the strict filter")
-        binding = await filters.create_consumer_group(
-            stream, TOPIC, GROUP, strict["filter_id"], strict["revision"]
-        )
-        bindings.append(binding)
-        print(f"  {GROUP} runs revision {binding['revision']} from now on")
-
-        _common.phase("consume as the group and acknowledge")
-        desk = await filters.reader(
-            stream, TOPIC, group_id=binding["identity"]["group_id"], start="first", local_guard=True
-        )
+        _common.phase("pause the variant: new reads stop, in-flight work still acknowledges")
+        await variant.filter().set_revision_enabled(variant_binding["revision"], False)
+        await reader.ack(first)
         try:
-            handled = await read_matches(desk, expected)
-            print(f"  the desk handled {len(handled)} safe-mode or decommission events")
-        finally:
-            await desk.close()
-
-        _common.phase("A/B: a second revision runs in its own group")
-        second = await filters.revise(
-            strict["filter_id"], strict["revision"], ls.ConsumerFilter.json(safe_mode_transition())
-        )
-        variant_binding = await filters.create_consumer_group(
-            stream, TOPIC, f"{GROUP}-transitions", second["filter_id"], second["revision"]
-        )
-        bindings.append(variant_binding)
-        variant = await filters.reader(
-            stream,
-            TOPIC,
-            group_id=variant_binding["identity"]["group_id"],
-            count=1,
-            local_guard=True,
-            start="first",
-        )
-        try:
-            first = await asyncio.wait_for(variant.next_record(), READ_TIMEOUT)
-            change = fleet_change(first.message.json())
-            print(f"  revision {second['revision']}: {change.describe()}")
-            await filters.set_revision_enabled(second["filter_id"], second["revision"], False)
-            await variant.ack(first)
-            try:
-                await variant.try_next_page()
-            except ls.FilterError as error:
-                if error.reason != "revision_disabled":
-                    raise
-                print("  paused: new reads stop, in-flight work can still be acknowledged")
-            else:
-                raise RuntimeError("a disabled revision kept reading")
-            await filters.set_revision_enabled(second["filter_id"], second["revision"], True)
-            await read_matches(variant, 1)
-            print(f"  A/B groups handled {expected} broad events and 2 transitions independently")
-        finally:
-            await variant.close()
-
-        _common.phase("a bound filter cannot be deleted")
-        try:
-            await filters.delete(strict["filter_id"])
+            await reader.try_next_page()
         except ls.FilterError as error:
-            if error.reason != "conflict":
+            if error.reason != "revision_disabled":
                 raise
-            print(f"  refused with conflict while {GROUP} is bound")
+            print("  paused: the server refuses new reads with revision_disabled")
         else:
-            raise RuntimeError("a bound filter was deleted")
-    except BaseException:
-        await release(filters, bindings, filter_ids)
-        raise
-    error = await release(filters, bindings, filter_ids)
-    if error is not None:
-        raise error
-    print("  both filters are gone, their names are never reused")
+            raise RuntimeError("a disabled revision kept reading")
+        await variant.filter().set_revision_enabled(variant_binding["revision"], True)
+        await read_matches(reader, 1)
+        print(f"  resumed: the desk handled {expected} broad events, the variant 2 transitions")
+    finally:
+        await reader.close()
 
+    _common.phase("a group that runs a policy cannot be switched to another one")
+    try:
+        await desk.filter().configure(ls.ConsumerFilter.json(safe_mode_transition()))
+    except ls.FilterError as error:
+        if error.reason != "conflict":
+            raise
+        print("  refused with conflict: create a new group for another policy")
+    else:
+        raise RuntimeError("a running policy was replaced")
 
-async def release(filters, bindings: list, filter_ids: list) -> Exception | None:
-    """Release every binding in creation order, then archive and delete each
-    filter, also when a step fails. Every step runs, the first error is
-    returned, as the Rust and TypeScript examples do."""
-    _common.phase("unbind, archive, delete")
-    first_error: Exception | None = None
-    for binding in bindings:
-        try:
-            await filters.unbind_binding(binding)
-        except Exception as error:
-            first_error = first_error or error
-    for filter_id in filter_ids:
-        for step in (filters.archive, filters.delete):
-            try:
-                await step(filter_id)
-            except Exception as error:
-                first_error = first_error or error
-    return first_error
+    _common.phase("release both policies")
+    released = await desk.filter().release()
+    await variant.filter().release()
+    print(
+        f"  {released['group']['group']} is unbound again and receives every record, "
+        f"its filter stays saved as revision {released['revision']}"
+    )
 
 
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
-    stream = _common.stream_for(EXAMPLE)
     try:
         caps = await laser.capabilities()
-        if not _common.managed_gate(caps.filters, "consumer filters", EXAMPLE):
+        if not _common.managed_gate(caps.filters_catalog, "consumer group filters", EXAMPLE):
             return
 
         _common.phase("publish a busy fleet change feed, keyed by satellite")
@@ -459,53 +386,70 @@ async def main() -> None:
             f"station flips, and {strict_matches} safe-mode or decommission events"
         )
 
-        _common.phase("read only the safe-mode or decommission events, no catalog needed")
-        backfill = await laser.filters().reader(
-            stream, TOPIC, consumer=BACKFILL, filter=safe_mode_filter(), start="first"
+        _common.phase("create the anomaly desk group with its filter")
+        desk = topic.consumer_group(f"{GROUP}-{_common.run_token()}")
+        created = await desk.create(filter=safe_mode_filter())
+        binding = created["filter"]
+        print(
+            f"  group {created['name']} ({created['id']}) runs revision "
+            f"{binding['revision']} of its own filter from now on"
         )
+
+        _common.phase(
+            "consume as the group: the application names the group, the server runs its filter"
+        )
+        consumer = desk.consumer(polling="first", auto_commit="disabled")
+        delivered_bytes = 0
         try:
-            delivered = await read_matches(backfill, strict_matches)
+            for _ in range(strict_matches):
+                message = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
+                change = fleet_change(message.json())
+                print(
+                    f"  partition {message.partition_id} offset {message.offset}: "
+                    f"{change.describe()}"
+                )
+                delivered_bytes += len(message.payload)
+                await consumer.commit(message)
         finally:
-            await backfill.close()
-        delivered_bytes = sum(len(record.message.payload) for record in delivered)
+            await consumer.shutdown()
         kept = 100 * (published_bytes - delivered_bytes) / max(published_bytes, 1)
         print(
-            f"  delivered {len(delivered)} of {len(feed)} records, "
+            f"  delivered {strict_matches} of {len(feed)} records, "
             f"{delivered_bytes} of {published_bytes} payload bytes: "
             f"{kept:.1f}% stayed on the broker"
         )
 
+        _common.phase("page the matches again with the group reader and its own scan budget")
+        pager = await desk.reader(start="first", count=10, max_examined=100, local_guard=True)
+        try:
+            paged = await read_matches(pager, strict_matches)
+        finally:
+            await pager.close()
+        print(
+            f"  the reader handed out {len(paged)} matches in pages, "
+            f"each acknowledged after handling"
+        )
+
         _common.phase(
-            "test both filters against a battery update of a satellite already in safe mode"
+            "test the group's filter against a battery update of a satellite already in safe mode"
         )
         still_safe = satellite_update(2, "safe", 58, "battery_pct").to_dict()
-        for name, candidate in [
-            ("strict, transitions only", safe_mode_filter()),
-            ("values only, current state", safe_mode_values_filter()),
-        ]:
-            tested = await laser.filters().test(
-                json.dumps(still_safe, separators=(",", ":")), filter=candidate
-            )
-            print(f"  {name}: {tested['explanation']['verdict']}")
+        tested = await desk.filter().test(json.dumps(still_safe, separators=(",", ":")))
+        print(f"  strict, transitions only: {tested['explanation']['verdict']}")
 
         _common.phase("preview every partition, nothing is stored")
         for partition_id in range(PARTITIONS):
-            preview = await laser.filters().preview(
-                stream, TOPIC, partition_id, filter=safe_mode_filter(), max_records=10
-            )
+            preview = await desk.filter().preview(partition_id, max_records=10)
             print(
                 f"  partition {partition_id}: examined {preview['examined']}, "
                 f"matched {preview['matched']}, stopped at {preview['stop']}"
             )
 
         _common.phase("route binary alerts on a header, their payload is never decoded")
-        await route_alerts(laser, stream)
-        await run_codecs(laser, stream, caps.filters_catalog)
+        await route_alerts(laser)
+        await run_codecs(laser)
 
-        if not caps.filters_catalog:
-            print("  the saved-filter catalog needs a managed plane, skipping group bindings")
-            return
-        await manage_group(laser, stream, strict_matches)
+        await manage_revisions(laser, desk, binding, strict_matches)
     finally:
         await laser.close()
 

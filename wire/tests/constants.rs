@@ -293,6 +293,14 @@ fn given_http_routes_when_compared_then_should_match_the_router() {
     assert_eq!(laser_wire::http::PROJECTIONS_PATH, "/agdx/projections");
     assert_eq!(laser_wire::http::BINDINGS_PATH, "/agdx/bindings");
     assert_eq!(laser_wire::http::SCHEMAS_PATH, "/agdx/schemas");
+    assert_eq!(
+        laser_wire::http::GROUP_POLICIES_PATH,
+        "/agdx/group-policies"
+    );
+    assert_eq!(
+        laser_wire::http::group_policy_path("fleet", "changes/telemetry", "safety?check"),
+        "/agdx/group-policies/fleet/changes%2Ftelemetry/safety%3Fcheck"
+    );
     assert_eq!(laser_wire::http::KV_PATH, "/agdx/kv");
     assert_eq!(laser_wire::http::FORKS_PATH, "/agdx/forks");
     assert_eq!(laser_wire::http::CLIENTS_PATH, "/agdx/clients");

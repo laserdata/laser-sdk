@@ -34,6 +34,7 @@ async fn main() -> Result<(), LaserError> {
         phase("consumer: production interval-or-each auto commit");
         let auto = topic
             .consumer_group("auto-workers")
+            .consumer()
             .batch_length(BATCH as u32)
             .poll_interval(Duration::from_millis(5))
             .start_at(ConsumerStart::First)
@@ -46,6 +47,7 @@ async fn main() -> Result<(), LaserError> {
         phase("consumer: commit after successful handling (one round-trip per message)");
         let manual = topic
             .consumer_group("manual-workers")
+            .consumer()
             .batch_length(BATCH as u32)
             .poll_interval(Duration::from_millis(5))
             .start_at(ConsumerStart::First)

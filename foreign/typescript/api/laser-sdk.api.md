@@ -764,12 +764,15 @@ export const ANY_ROUTE_POLICY: RoutePolicy;
 
 // @public (undocumented)
 export interface AppliedPolicy {
-    // (undocumented)
-    readonly digest: Uint8Array;
+    readonly digest?: Uint8Array;
     // (undocumented)
     readonly filterId?: number;
     // (undocumented)
     readonly groupId?: bigint;
+    // (undocumented)
+    readonly mode: ExecutionMode;
+    // (undocumented)
+    readonly policyGeneration: bigint;
     // (undocumented)
     readonly revision?: number;
 }
@@ -1020,6 +1023,10 @@ export interface Capabilities {
     readonly forks: boolean;
     // (undocumented)
     readonly graph: boolean;
+    // Warning: (ae-forgotten-export) The symbol "HelloOutcome" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly hello: HelloOutcome;
     // Warning: (ae-forgotten-export) The symbol "KvCapabilities" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
@@ -1098,6 +1105,15 @@ export interface CatalogPageOptions {
     readonly page?: number;
     // (undocumented)
     readonly pageSize?: number;
+}
+
+// @public
+export interface CatalogPosition {
+    // (undocumented)
+    readonly offset: bigint;
+    readonly operationId?: bigint;
+    // (undocumented)
+    readonly partitionId: number;
 }
 
 // @public (undocumented)
@@ -1385,8 +1401,7 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
     // (undocumented)
     [Symbol.asyncIterator](): AsyncIterator<ConsumedMessage>;
     // Warning: (ae-forgotten-export) The symbol "ConsumerTarget" needs to be exported by the entry point index.d.ts
-    constructor(transport: LaserTransport, streamName: string, topicName: string, target: ConsumerTarget, options?: ConsumerOptions);
-    // (undocumented)
+    constructor(transport: LaserTransport, streamName: string, topicName: string, target: ConsumerTarget, options?: ConsumerOptions, reader?: FilteredReader | undefined);
     commit(message: ConsumedMessage): Promise<void>;
     // (undocumented)
     lastConsumedOffset(partitionId: number): bigint | undefined;
@@ -1442,6 +1457,32 @@ export function consumerFilterDigest(filter: ConsumerFilter): Uint8Array;
 // @public
 export function consumerFilterJson(filter: ConsumerFilter): string;
 
+// @public
+export class ConsumerGroup {
+    // Warning: (ae-forgotten-export) The symbol "GroupContext" needs to be exported by the entry point index.d.ts
+    constructor(transport: LaserTransport, streamName: string, topicName: string, target: GroupTarget, context?: GroupContext | undefined);
+    consumer(options?: ConsumerOptions): Promise<Consumer>;
+    create(options?: CreateConsumerGroupOptions): Promise<ConsumerGroupInfo>;
+    filter(): GroupFilter;
+    get id(): bigint | undefined;
+    info(): Promise<ConsumerGroupInfo>;
+    get name(): string | undefined;
+    reader(): FilteredReaderBuilder;
+    // (undocumented)
+    readonly streamName: string;
+    // (undocumented)
+    readonly topicName: string;
+}
+
+// @public
+export interface ConsumerGroupInfo {
+    readonly filter?: FilterBinding;
+    readonly id: number;
+    readonly identity: FilterGroupIdentity;
+    // (undocumented)
+    readonly name: string;
+}
+
 // @public (undocumented)
 export class ConsumerGroupName {
     // (undocumented)
@@ -1452,6 +1493,19 @@ export class ConsumerGroupName {
     static new(name: string): ConsumerGroupName;
     // (undocumented)
     toString(): string;
+}
+
+// @public
+export class ConsumerGroupSetupError extends LaserError {
+    constructor(groupId: number, groupName: string, identity: FilterGroupIdentity, cause: unknown);
+    // (undocumented)
+    readonly groupId: number;
+    // (undocumented)
+    readonly groupName: string;
+    // (undocumented)
+    readonly identity: FilterGroupIdentity;
+    // (undocumented)
+    get reason(): FilterErrorReason | undefined;
 }
 
 // @public (undocumented)
@@ -1585,14 +1639,17 @@ export class ContextScope {
 
 // @public (undocumented)
 export interface Continuation {
-    // (undocumented)
-    readonly digest: Uint8Array;
+    readonly digest?: Uint8Array;
     // (undocumented)
     readonly generation: SourceGeneration;
     // (undocumented)
     readonly groupId?: bigint;
     // (undocumented)
+    readonly mode: ExecutionMode;
+    // (undocumented)
     readonly nextScanOffset: bigint;
+    // (undocumented)
+    readonly policyGeneration: bigint;
     readonly readMode: ReadMode;
 }
 
@@ -1682,6 +1739,14 @@ export class CrashContext {
     readonly lastDecision?: PolicyEvidence | undefined;
     // (undocumented)
     summarize(): string;
+}
+
+// @public (undocumented)
+export interface CreateConsumerGroupOptions {
+    readonly filter?: ConsumerFilter;
+    readonly operationId?: bigint;
+    // Warning: (ae-forgotten-export) The symbol "GroupFilterSpec" needs to be exported by the entry point index.d.ts
+    readonly policy?: GroupFilterSpec;
 }
 
 // @public (undocumented)
@@ -2076,6 +2141,9 @@ export class ExactDecimal {
     toString(): string;
 }
 
+// @public
+export type ExecutionMode = "filtered" | "unfiltered";
+
 // @public (undocumented)
 export interface ExplainNode {
     // (undocumented)
@@ -2161,6 +2229,7 @@ export interface FilterBinding {
     readonly group: FilterGroupRef;
     // (undocumented)
     readonly identity: FilterGroupIdentity;
+    readonly policyGeneration: bigint;
     // (undocumented)
     readonly revision: number;
 }
@@ -2185,6 +2254,7 @@ export interface FilterCapabilities {
     readonly catalog: boolean;
     // Warning: (ae-forgotten-export) The symbol "FilterAnnounce" needs to be exported by the entry point index.d.ts
     readonly evaluation?: FilterAnnounce;
+    readonly groupPolicyReads: boolean;
     readonly native: boolean;
 }
 
@@ -2219,8 +2289,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     [Symbol.asyncDispose](): Promise<void>;
     // (undocumented)
     [Symbol.asyncIterator](): AsyncIterator<MatchedRecord>;
-    // Warning: (ae-forgotten-export) The symbol "ReaderSettings" needs to be exported by the entry point index.d.ts
-    constructor(settings: ReaderSettings);
     ack(record: MatchedRecord): Promise<void>;
     ackPage(page: MatchedPage): Promise<void>;
     ackThrough(record: MatchedRecord): Promise<void>;
@@ -2242,22 +2310,16 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
 
 // @public
 export class FilteredReaderBuilder {
-    constructor(transport: FilterTransport, capabilities: () => Promise<Capabilities>, filters: Filters, source: FilterSource);
     // (undocumented)
     build(): Promise<FilteredReader>;
-    consumer(name: string): this;
     count(count: number): this;
-    filter(filter: FilterRef): this;
-    group(name: string): this;
-    groupId(id: bigint | number): this;
     idleInterval(milliseconds: number): this;
-    inline(filter: ConsumerFilter): this;
     localGuard(enabled: boolean): this;
+    maxExamined(records: number): this;
     maxReplyBytes(bytes: number): this;
     maxUnackedPages(pages: number): this;
     partition(partitionId: number): this;
     readMode(mode: ReadMode): this;
-    revision(filterId: number, revision: number): this;
     start(start: FilteredStart): this;
 }
 
@@ -2394,19 +2456,6 @@ export interface FilterHeader {
     readonly value: HeaderScalar;
 }
 
-// @public (undocumented)
-export interface FilterListOptions {
-    readonly beforeId?: number;
-    // (undocumented)
-    readonly nameContains?: string;
-    // (undocumented)
-    readonly page?: number;
-    // (undocumented)
-    readonly pageSize?: number;
-    // (undocumented)
-    readonly state?: FilterState;
-}
-
 // @public
 export type FilterLiteral = string | number | bigint | boolean | null | TypedValue | readonly FilterLiteral[];
 
@@ -2446,10 +2495,16 @@ export type FilterMutation = {
     readonly group: FilterGroupRef;
     readonly expectedDigest: Uint8Array;
     readonly expectedIdentity?: FilterGroupIdentity;
+} | {
+    readonly kind: "configure_group";
+    readonly group: FilterGroupRef;
+    readonly policy: GroupFilterSpec;
+    readonly expectedIdentity?: FilterGroupIdentity;
 };
 
 // @public (undocumented)
 export interface FilterMutationOutcome {
+    readonly catalogPosition?: CatalogPosition;
     // (undocumented)
     readonly operationId: bigint;
     // (undocumented)
@@ -2572,6 +2627,13 @@ export type FilterRef = {
     readonly revision: number;
 } | {
     readonly kind: "bound";
+}
+/**
+* Whatever policy the consumer group has: its revision when bound, every
+* record when unbound. Needs a server with the `GROUP_POLICY_READS` bit.
+*/
+| {
+    readonly kind: "group";
 };
 
 // @public (undocumented)
@@ -2610,41 +2672,6 @@ export interface FilterRevisionRef {
     readonly filterId: number;
     // (undocumented)
     readonly revision: number;
-}
-
-// @public
-export class Filters {
-    constructor(transport: FilterTransport, capabilities: () => Promise<Capabilities>);
-    apply(mutation: FilterMutation): Promise<FilterMutationResult>;
-    applyAs(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationResult>;
-    archive(filterId: number): Promise<void>;
-    bind(group: FilterGroupRef, filterId: number, revision: number): Promise<FilterBinding>;
-    binding(group: FilterGroupRef): Promise<FilterBinding>;
-    bindings(options?: CatalogPageOptions & {
-        readonly filterId?: number;
-        readonly stream?: string;
-        readonly topic?: string;
-    }): Promise<FilterBindingPage>;
-    createConsumerGroup(group: FilterGroupRef, filterId: number, revision: number): Promise<FilterBinding>;
-    delete(filterId: number): Promise<void>;
-    describe(filterId: number, description: string): Promise<void>;
-    get(filterId: number): Promise<FilterDetail>;
-    list(options?: FilterListOptions): Promise<FilterPage>;
-    mutate(operationId: bigint, mutation: FilterMutation): Promise<FilterMutationOutcome>;
-    operation(operationId: bigint): Promise<FilterMutationOutcome>;
-    preview(stream: string, topic: string, partitionId: number, filter: FilterRef, options?: FilterPreviewOptions): Promise<FilterPreview>;
-    reader(stream: string, topic: string): FilteredReaderBuilder;
-    register(name: string, filter: ConsumerFilter, options?: {
-        readonly description?: string;
-    }): Promise<FilterRevisionRef>;
-    revise(filterId: number, expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef>;
-    revisions(filterId: number, options?: CatalogPageOptions): Promise<FilterRevisionPage>;
-    setRevisionEnabled(filterId: number, revision: number, enabled: boolean): Promise<void>;
-    test(filter: FilterRef, payload: Uint8Array | string, headers?: readonly FilterHeader[]): Promise<FilterTestResult>;
-    unbind(group: FilterGroupRef, expectedDigest: Uint8Array): Promise<FilterBinding>;
-    unbindBinding(binding: FilterBinding): Promise<FilterBinding>;
-    validate(filter: ConsumerFilter): Promise<FilterValidation>;
-    waitForOutcome(operationId: bigint, timeoutMs: number): Promise<FilterMutationResult>;
 }
 
 // @public
@@ -2708,7 +2735,7 @@ export interface FilterTestResult {
 }
 
 // @public
-export type FilterTransport = Pick<LaserTransport, "sendManaged" | "getTopicPartitionCount" | "joinConsumerGroup" | "leaveConsumerGroup" | "joinExistingConsumerGroup" | "openNodeConnection" | "openCoordinator" | "connectsNodes"> & Partial<Pick<LaserTransport, "ensureConsumerGroup">>;
+export type FilterTransport = Pick<LaserTransport, "sendManaged" | "joinConsumerGroup" | "leaveConsumerGroup" | "joinExistingConsumerGroup" | "openNodeConnection" | "openCoordinator" | "connectsNodes">;
 
 // @public (undocumented)
 export interface FilterValidation {
@@ -3092,6 +3119,29 @@ export type GraphStart = {
     readonly kind: "nearest";
     readonly embedding: readonly number[];
     readonly k: number;
+};
+
+// @public
+export class GroupFilter {
+    configure(filter: ConsumerFilter): Promise<FilterBinding>;
+    configureAs(operationId: bigint | undefined, policy: GroupFilterSpec): Promise<FilterBinding>;
+    configureWith(policy: GroupFilterSpec): Promise<FilterBinding>;
+    get(): Promise<FilterBinding | undefined>;
+    preview(partitionId: number, options?: FilterPreviewOptions): Promise<FilterPreview>;
+    release(): Promise<FilterBinding>;
+    revise(expectedRevision: number, filter: ConsumerFilter): Promise<FilterRevisionRef>;
+    revisions(options?: CatalogPageOptions): Promise<FilterRevisionPage>;
+    setRevisionEnabled(revision: number, enabled: boolean): Promise<void>;
+    test(payload: Uint8Array | string, headers?: readonly FilterHeader[]): Promise<FilterTestResult>;
+}
+
+// @public
+export type GroupTarget = {
+    readonly kind: "name";
+    readonly name: string;
+} | {
+    readonly kind: "id";
+    readonly id: bigint;
 };
 
 // @public (undocumented)
@@ -3823,7 +3873,6 @@ export class Laser implements AsyncDisposable {
     //
     // (undocumented)
     executeBatch(ops: readonly BatchItem[]): Promise<readonly Uint8Array[]>;
-    filters(): Filters;
     // (undocumented)
     fork(forkId: string): Fork;
     // (undocumented)
@@ -5870,7 +5919,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.5.0";
+export const SDK_VERSION = "0.5.1";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;
@@ -6121,7 +6170,7 @@ export class Stream {
     // Warning: (ae-forgotten-export) The symbol "GovernPublish" needs to be exported by the entry point index.d.ts
     // Warning: (ae-forgotten-export) The symbol "ResolveSchema" needs to be exported by the entry point index.d.ts
     // Warning: (ae-forgotten-export) The symbol "ObserveEffect" needs to be exported by the entry point index.d.ts
-    constructor(transport: LaserTransport, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined, onDelete?: (() => void) | undefined);
+    constructor(transport: LaserTransport, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined, onDelete?: (() => void) | undefined, groups?: GroupContext | undefined);
     delete(): Promise<boolean>;
     // (undocumented)
     ensure(): Promise<void>;
@@ -6281,7 +6330,7 @@ export function toolResultFromEnvelope(envelope: AgentEnvelope): McpToolResult;
 
 // @public (undocumented)
 export class Topic {
-    constructor(transport: LaserTransport, streamName: string, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined);
+    constructor(transport: LaserTransport, streamName: string, name: string, govern?: GovernPublish | undefined, resolveSchema?: ResolveSchema | undefined, observe?: ObserveEffect | undefined, groups?: GroupContext | undefined);
     // (undocumented)
     batch(payloads: readonly BytesLike[], options?: RawSendOptions): Promise<SendMessagesResponse>;
     // (undocumented)
@@ -6290,8 +6339,8 @@ export class Topic {
     consumer(partitionId: number, options?: ConsumerOptions): Consumer;
     // (undocumented)
     consumer(name: string, partitionId: number, options?: ConsumerOptions): Consumer;
-    // (undocumented)
-    consumerGroup(name: string, options?: ConsumerOptions): Promise<Consumer>;
+    consumerGroup(name: string): ConsumerGroup;
+    consumerGroupId(id: bigint | number): ConsumerGroup;
     ensure(partitions?: number, options?: TopicEnsureOptions): Promise<void>;
     ensureConsumerGroup(name: string): Promise<void>;
     // (undocumented)
@@ -6695,7 +6744,7 @@ export class ZeroEmbedder implements Embedder {
 // src/wire/checkpoint.ts:364:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:369:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:374:7 - (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
-// src/wire/filter.ts:307:40 - (ae-forgotten-export) The symbol "CmpOp" needs to be exported by the entry point index.d.ts
+// src/wire/filter.ts:308:40 - (ae-forgotten-export) The symbol "CmpOp" needs to be exported by the entry point index.d.ts
 // src/wire/query.ts:44:7 - (ae-forgotten-export) The symbol "SnapshotSelector" needs to be exported by the entry point index.d.ts
 // src/wire/schema.ts:124:33 - (ae-forgotten-export) The symbol "DecimalValue" needs to be exported by the entry point index.d.ts
 // src/wire/schema.ts:127:32 - (ae-forgotten-export) The symbol "FieldValue" needs to be exported by the entry point index.d.ts

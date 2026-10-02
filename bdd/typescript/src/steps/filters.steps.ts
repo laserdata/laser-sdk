@@ -89,7 +89,10 @@ function named<T>(catalogue: Readonly<Record<string, T>>, name: string): T {
 
 function evaluate(world: LaserWorld, payload: Uint8Array, headers: readonly FilterHeader[]): void {
   if (world.filter === undefined) throw new Error("scenario has no filter")
-  world.verdict = CompiledFilter.compile(world.filter).evaluate({ payload, headers })
+  world.verdict = CompiledFilter.compile(world.filter).evaluate({
+    payload,
+    headers
+  })
 }
 
 Given(/^the "([^"]+)" filter$/, function (this: LaserWorld, name: string) {
@@ -133,13 +136,9 @@ Given("a fresh fleet change feed", async function (this: LaserWorld) {
 When(
   /^the anomaly desk reads the feed with the "([^"]+)" filter$/,
   async function (this: LaserWorld, name: string) {
-    const reader = await this.requireLaser()
-      .filters()
-      .reader(this.stream ?? "", TOPIC)
-      .consumer("anomaly-desk")
-      .inline(named(FILTERS, name)())
-      .start({ kind: "first" })
-      .build()
+    const group = this.requireLaser().topic(TOPIC).consumerGroup("anomaly-desk")
+    await group.create({ filter: named(FILTERS, name)() })
+    const reader = await group.reader().start({ kind: "first" }).build()
     const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     await reader.ackPage(page)
     await reader.close()
@@ -159,7 +158,7 @@ Then(
 
 When("the anomaly desk lists its saved filters", async function (this: LaserWorld) {
   try {
-    await this.requireLaser().filters().list()
+    await this.requireLaser().topic(TOPIC).consumerGroup("anomaly-desk").filter().revisions()
     this.error = undefined
   } catch (error) {
     if (!(error instanceof UnsupportedError)) throw error
@@ -171,26 +170,161 @@ Then("the catalog is refused as unsupported", function (this: LaserWorld) {
   assert.ok(this.error instanceof UnsupportedError)
 })
 
-When("the anomaly desk manages a saved policy by numeric group id", async function (this: LaserWorld) {
-  const filters = this.requireLaser().filters()
-  const stream = this.stream ?? ""
-  const operationId = BigInt(`0x${randomUUID().replaceAll("-", "")}`)
-  const mutation = { kind: "register" as const, name: `bdd-${stream}`, description: "", filter: safeMode() }
-  const first = await filters.applyAs(operationId, mutation)
-  assert.deepEqual(await filters.applyAs(operationId, mutation), first)
-  assert.equal(first.kind, "registered")
-  if (first.kind !== "registered") throw new Error("registration result expected")
-  const saved = first.revision
-  const binding = await filters.createConsumerGroup({ stream, topic: TOPIC, group: "managed-desk" }, saved.filterId, saved.revision)
-  await using reader = await filters.reader(stream, TOPIC).groupId(binding.identity.groupId).build()
-  const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS })
-  await filters.setRevisionEnabled(saved.filterId, saved.revision, false)
-  await reader.ackPage(page)
-  await assert.rejects(reader.tryNextPage(), /revision_disabled/)
-  await filters.setRevisionEnabled(saved.filterId, saved.revision, true)
-  this.filtered = page.records.map((record) => record.payload)
-  await reader.close()
-  await filters.unbindBinding(binding)
-  await filters.archive(saved.filterId)
-  await filters.delete(saved.filterId)
+When(
+  "the anomaly desk manages a saved policy by numeric group id",
+  async function (this: LaserWorld) {
+    const topic = this.requireLaser().topic(TOPIC)
+    const group = topic.consumerGroup("managed-desk")
+    const operationId = BigInt(`0x${randomUUID().replaceAll("-", "")}`)
+    const first = await group.create({ filter: safeMode(), operationId })
+    assert.deepEqual(await group.create({ filter: safeMode(), operationId }), first)
+    const binding = first.filter
+    assert.ok(binding !== undefined)
+    const byId = topic.consumerGroupId(first.id)
+    const consumer = await byId.consumer({ autoCommit: false })
+    const delivered: Uint8Array[] = []
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        const record = await consumer.nextWithin(READ_TIMEOUT_MS)
+        assert.ok(record !== null)
+        delivered.push(record.payload)
+        await consumer.commit(record)
+      }
+    } finally {
+      await consumer.shutdown()
+    }
+    this.filtered = delivered
+    await using reader = await byId.reader().start({ kind: "first" }).build()
+    const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS })
+    await group.filter().setRevisionEnabled(binding.revision, false)
+    await reader.ackPage(page)
+    await assert.rejects(reader.tryNextPage(), /revision_disabled/)
+    await group.filter().setRevisionEnabled(binding.revision, true)
+    assert.deepEqual(
+      page.records.map((record) => record.payload),
+      delivered
+    )
+    await reader.close()
+    await group.filter().release()
+  }
+)
+
+When(
+  "the anomaly desk reads every record through an unbound consumer group",
+  async function (this: LaserWorld) {
+    const group = this.requireLaser().topic(TOPIC).consumerGroup("unbound-consumers")
+    const info = await group.create()
+    const consumer = await this.requireLaser()
+      .topic(TOPIC)
+      .consumerGroupId(info.id)
+      .consumer({ autoCommit: false, batchLength: 2 })
+    const delivered: Uint8Array[] = []
+    try {
+      for (const _ of FEED) {
+        const record = await consumer.nextWithin(READ_TIMEOUT_MS)
+        assert.ok(record !== null)
+        delivered.push(record.payload)
+        await consumer.commit(record)
+      }
+    } finally {
+      await consumer.shutdown()
+    }
+    this.filtered = delivered
+  }
+)
+
+When(
+  "the anomaly desk reads every record through an unbound group reader",
+  async function (this: LaserWorld) {
+    const group = this.requireLaser().topic(TOPIC).consumerGroup("unbound-readers")
+    await group.create()
+    await using reader = await group.reader().count(2).maxExamined(2).build()
+    const delivered: Uint8Array[] = []
+    while (delivered.length < FEED.length) {
+      const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS })
+      assert.equal(page.policy.mode, "unfiltered")
+      assert.equal(page.examined, page.records.length)
+      assert.ok(page.records.length <= 2)
+      assert.ok(page.records.every((record) => !record.evaluated))
+      delivered.push(...page.records.map((record) => record.payload))
+      await reader.ackPage(page)
+    }
+    this.filtered = delivered
+  }
+)
+
+Then("it receives every original feed record", function (this: LaserWorld) {
+  assert.deepEqual(
+    this.filtered.map((record) => [...record]),
+    FEED.map((name) => [...named(RECORDS, name)])
+  )
 })
+
+When(
+  "the anomaly desk scans a hundred non-matches before its first match",
+  async function (this: LaserWorld) {
+    const topic = this.requireLaser().topic("sparse_changes")
+    await topic.ensure(1)
+    const nonmatch = named(RECORDS, "ground station update")
+    for (let index = 0; index < 100; index += 1) await topic.send(nonmatch, { partition: 0 })
+    await topic.send(named(RECORDS, "mode update"), { partition: 0 })
+    const group = topic.consumerGroup("bounded-readers")
+    await group.create({ filter: safeMode() })
+    await using reader = await group
+      .reader()
+      .start({ kind: "first" })
+      .count(1)
+      .maxExamined(100)
+      .build()
+    const [empty, more] = await reader.readRound()
+    assert.equal(empty, undefined)
+    assert.equal(more, true)
+    assert.equal(reader.examinedInRound(), 100)
+    const [matched] = await reader.readRound()
+    assert.ok(matched !== undefined)
+    assert.equal(reader.examinedInRound(), 1)
+    assert.deepEqual(
+      matched.records.map((record) => record.offset),
+      [100n]
+    )
+    await reader.ackPage(matched)
+    this.filtered = matched.records.map((record) => record.payload)
+  }
+)
+
+Then("its first match follows an empty scan of one hundred records", function (this: LaserWorld) {
+  assert.deepEqual(
+    this.filtered.map((record) => [...record]),
+    [[...named(RECORDS, "mode update")]]
+  )
+})
+
+When(
+  "the anomaly desk consumes a hundred non-matches before its first match",
+  async function (this: LaserWorld) {
+    const topic = this.requireLaser().topic("sparse_changes")
+    await topic.ensure(1)
+    for (let index = 0; index < 100; index += 1)
+      await topic.send(named(RECORDS, "ground station update"), {
+        partition: 0
+      })
+    await topic.send(named(RECORDS, "mode update"), { partition: 0 })
+    const group = topic.consumerGroup("sparse-consumers")
+    await group.create({ filter: safeMode() })
+    const consumer = await group.consumer({
+      batchLength: 100,
+      autoCommit: false,
+      startFrom: { kind: "first" }
+    })
+    try {
+      const record = await consumer.nextWithin(READ_TIMEOUT_MS)
+      assert.ok(record !== null)
+      assert.equal(record.offset, 100n)
+      assert.equal((await consumer.storedOffset(0))?.storedOffset, 99n)
+      await consumer.commit(record)
+      this.filtered = [record.payload]
+    } finally {
+      await consumer.shutdown()
+    }
+  }
+)

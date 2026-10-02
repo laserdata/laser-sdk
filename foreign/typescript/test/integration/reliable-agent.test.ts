@@ -111,10 +111,13 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
     )
     await handle.shutdown()
 
-    const rejoined = await laser.topic(AgentTopic.Commands).consumerGroup("retry-worker", {
-      autoCommit: false,
-      startFrom: { kind: "next" }
-    })
+    const rejoined = await laser
+      .topic(AgentTopic.Commands)
+      .consumerGroup("retry-worker")
+      .consumer({
+        autoCommit: false,
+        startFrom: { kind: "next" }
+      })
     try {
       assert.equal(await rejoined.nextWithin(100), null)
     } finally {
@@ -562,10 +565,13 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
     assert.equal(durableSinkCalls, 1)
     await replacement.shutdown()
 
-    const rejoined = await laser.topic(AgentTopic.Commands).consumerGroup("dlq-failure-worker", {
-      autoCommit: false,
-      startFrom: { kind: "next" }
-    })
+    const rejoined = await laser
+      .topic(AgentTopic.Commands)
+      .consumerGroup("dlq-failure-worker")
+      .consumer({
+        autoCommit: false,
+        startFrom: { kind: "next" }
+      })
     try {
       assert.equal(await rejoined.nextWithin(100), null)
     } finally {
@@ -615,9 +621,12 @@ void test("given_a_retryable_handler_that_never_succeeds_when_consumed_then_shou
     assert.equal(attempts, 3)
     await handle.shutdown()
 
-    const rejoined = await laser.topic(AgentTopic.Commands).consumerGroup("exhausted-worker", {
-      autoCommit: false
-    })
+    const rejoined = await laser
+      .topic(AgentTopic.Commands)
+      .consumerGroup("exhausted-worker")
+      .consumer({
+        autoCommit: false
+      })
     try {
       assert.equal(await rejoined.nextWithin(100), null)
     } finally {

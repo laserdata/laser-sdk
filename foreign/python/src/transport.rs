@@ -1,24 +1,24 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning};
 use crate::convert::payload_bytes;
 use crate::errors::{InvalidError, to_pyerr};
-use futures::StreamExt;
 use iggy::prelude::{
-    AutoCommit, AutoCommitWhen, ConsumerGroupClient, HeaderKey, HeaderKind, HeaderValue,
-    Identifier, IggyConsumer, IggyConsumerBuilder, IggyDuration, IggyMessage, IggyProducer,
-    IggyTimestamp, NonZeroIggyDuration, Partitioning, PollingStrategy, ReceivedMessage,
-    SendMessagesConfirmationResponse, SendMessagesResponse,
+    HeaderKey, HeaderKind, HeaderValue, IggyDuration, IggyMessage, IggyProducer,
+    NonZeroIggyDuration, Partitioning, SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use laser_sdk::error::LaserError;
-use laser_sdk::laser::Laser;
+use laser_sdk::stream::{CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Poll, ready};
 use std::time::Duration;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
     to_pyerr(error.into())
@@ -181,29 +181,31 @@ pub(crate) struct ConsumerConfig<'a> {
     pub allow_replay: bool,
 }
 
+/// Apply the Python keyword options to a Laser consumer builder. The consumer
+/// itself is built on first use, so construction stays synchronous.
 pub(crate) fn configure_consumer(
-    mut builder: IggyConsumerBuilder,
+    mut builder: ConsumerBuilder,
+    name: String,
     config: ConsumerConfig<'_>,
     group: bool,
-    shutdown_target: Option<PyConsumerGroupTarget>,
 ) -> PyResult<PyConsumer> {
     if config.batch_length == 0 {
         return Err(InvalidError::new_err(
             "consumer batch_length must be greater than zero",
         ));
     }
-    let polling = match (config.offset, config.timestamp_micros) {
+    let start = match (config.offset, config.timestamp_micros) {
         (Some(_), Some(_)) => {
             return Err(InvalidError::new_err(
                 "offset and timestamp_micros are mutually exclusive",
             ));
         }
-        (Some(offset), None) => PollingStrategy::offset(offset),
-        (None, Some(timestamp)) => PollingStrategy::timestamp(IggyTimestamp::from(timestamp)),
+        (Some(offset), None) => ConsumerStart::Offset(offset),
+        (None, Some(timestamp)) => ConsumerStart::TimestampMicros(timestamp),
         (None, None) => match config.polling.parse::<PollingMode>()? {
-            PollingMode::First => PollingStrategy::first(),
-            PollingMode::Last => PollingStrategy::last(),
-            PollingMode::Next => PollingStrategy::next(),
+            PollingMode::First => ConsumerStart::First,
+            PollingMode::Last => ConsumerStart::Last,
+            PollingMode::Next => ConsumerStart::Next,
             PollingMode::Offset => {
                 return Err(InvalidError::new_err("polling='offset' requires offset"));
             }
@@ -214,80 +216,67 @@ pub(crate) fn configure_consumer(
             }
         },
     };
-    let mode = config.auto_commit.parse::<CommitMode>()?;
-    let commit_when = match mode {
-        CommitMode::Polling => Some(AutoCommitWhen::PollingMessages),
-        CommitMode::All => Some(AutoCommitWhen::ConsumingAllMessages),
-        CommitMode::Each => Some(AutoCommitWhen::ConsumingEachMessage),
-        CommitMode::Every => {
+    let interval = Duration::from_millis(config.commit_interval_ms);
+    let commit = match (
+        config.auto_commit.parse::<CommitMode>()?,
+        interval.is_zero(),
+    ) {
+        (CommitMode::Disabled, _) => CommitPolicy::Disabled,
+        (CommitMode::Interval, true) => {
+            return Err(InvalidError::new_err(
+                "auto_commit='interval' requires commit_interval_ms > 0",
+            ));
+        }
+        (CommitMode::Interval, false) => CommitPolicy::Interval(interval),
+        (CommitMode::Polling, true) => CommitPolicy::Polling,
+        (CommitMode::Polling, false) => CommitPolicy::IntervalOrPolling(interval),
+        (CommitMode::All, true) => CommitPolicy::All,
+        (CommitMode::All, false) => CommitPolicy::IntervalOrAll(interval),
+        (CommitMode::Each, true) => CommitPolicy::Each,
+        (CommitMode::Each, false) => CommitPolicy::IntervalOrEach(interval),
+        (CommitMode::Every, zero) => {
             let every = config
                 .commit_every
                 .filter(|value| *value > 0)
                 .ok_or_else(|| {
                     InvalidError::new_err("auto_commit='every' requires commit_every > 0")
                 })?;
-            Some(AutoCommitWhen::ConsumingEveryNthMessage(every))
+            if zero {
+                CommitPolicy::Every(every)
+            } else {
+                CommitPolicy::IntervalOrEvery(interval, every)
+            }
         }
-        CommitMode::Disabled | CommitMode::Interval => None,
     };
-    let auto_commit = match (mode, config.commit_interval_ms, commit_when) {
-        (CommitMode::Disabled, _, _) => AutoCommit::Disabled,
-        (CommitMode::Interval, 0, _) => {
-            return Err(InvalidError::new_err(
-                "auto_commit='interval' requires commit_interval_ms > 0",
-            ));
-        }
-        (CommitMode::Interval, interval, _) => {
-            AutoCommit::Interval(positive_duration_ms(interval, "commit_interval_ms")?)
-        }
-        (_, 0, Some(mode)) => AutoCommit::When(mode),
-        (_, interval, Some(mode)) => {
-            AutoCommit::IntervalOrWhen(positive_duration_ms(interval, "commit_interval_ms")?, mode)
-        }
-        _ => unreachable!("commit modes are exhaustively mapped"),
-    };
+    positive_duration_ms(
+        config.polling_retry_interval_ms,
+        "polling_retry_interval_ms",
+    )?;
     builder = builder
         .batch_length(config.batch_length)
-        .polling_strategy(polling)
-        .auto_commit(auto_commit)
-        .polling_retry_interval(positive_duration_ms(
-            config.polling_retry_interval_ms,
-            "polling_retry_interval_ms",
-        )?);
+        .start_at(start)
+        .commit_policy(commit)
+        .polling_retry_interval(Duration::from_millis(config.polling_retry_interval_ms));
     builder = match config.poll_interval_ms {
-        Some(interval) => builder.poll_interval(duration_ms(interval)),
+        Some(interval) => builder.poll_interval(Duration::from_millis(interval)),
         None => builder.without_poll_interval(),
     };
     if group {
-        builder = if config.auto_join_group {
-            builder.auto_join_consumer_group()
-        } else {
-            builder.do_not_auto_join_consumer_group()
-        };
-        builder = if config.create_group {
-            builder.create_consumer_group_if_not_exists()
-        } else {
-            builder.do_not_create_consumer_group_if_not_exists()
-        };
+        builder = builder
+            .auto_join_group(config.auto_join_group)
+            .create_group(config.create_group);
     }
     if let Some(retries) = config.init_retries {
+        positive_duration_ms(config.init_retry_interval_ms, "init_retry_interval_ms")?;
         builder = builder.init_retries(
             retries,
-            positive_duration_ms(config.init_retry_interval_ms, "init_retry_interval_ms")?,
+            Duration::from_millis(config.init_retry_interval_ms),
         );
     }
     if config.allow_replay {
         builder = builder.allow_replay();
     }
-    let manual_commit = matches!(mode, CommitMode::Disabled);
-    let shutdown_target = (manual_commit && config.auto_join_group)
-        .then_some(shutdown_target)
-        .flatten();
-    Ok(PyConsumer::new(
-        builder.build(),
-        manual_commit,
-        shutdown_target,
-    ))
+    Ok(PyConsumer::new(name, builder))
 }
 
 pub(crate) fn partitioning(
@@ -466,11 +455,15 @@ fn messages(values: &Bound<'_, PyAny>) -> PyResult<Vec<IggyMessage>> {
 #[pyclass(name = "Producer")]
 pub struct PyProducer {
     inner: Arc<IggyProducer>,
+    statistics: Arc<std::sync::OnceLock<laser_sdk::stream::producer_statistics::ProducerRecorder>>,
+    laser: laser_sdk::laser::Laser,
 }
 
 impl PyProducer {
-    pub(crate) fn new(inner: IggyProducer) -> Self {
+    pub(crate) fn new(inner: IggyProducer, laser: &laser_sdk::laser::Laser) -> Self {
         Self {
+            statistics: Arc::new(std::sync::OnceLock::new()),
+            laser: laser.clone(),
             inner: Arc::new(inner),
         }
     }
@@ -507,11 +500,24 @@ impl PyProducer {
             _ => Some(Arc::new(partitioning(key, partition)?)),
         };
         let producer = self.inner.clone();
+        let statistics = self.statistics.clone();
+        let laser = self.laser.clone();
         future_into_py(py, async move {
             producer.init().await.map_err(transport_error)?;
-            producer
+            let statistics = statistics.get_or_init(|| {
+                laser_sdk::stream::producer_statistics::ProducerRecorder::new(
+                    &laser,
+                    producer.stream().to_string(),
+                    producer.topic().to_string(),
+                    true,
+                )
+            });
+            let observation = statistics.begin(1, message.payload.len() as u64);
+            let result = producer
                 .send_with_partitioning(vec![message], partitioning)
-                .await
+                .await;
+            observation.finish(result.is_ok());
+            result
                 .map(PySendMessagesResponse::from)
                 .map_err(transport_error)
         })
@@ -534,11 +540,30 @@ impl PyProducer {
             _ => Some(Arc::new(partitioning(key, partition)?)),
         };
         let producer = self.inner.clone();
+        let statistics = self.statistics.clone();
+        let laser = self.laser.clone();
         future_into_py(py, async move {
             producer.init().await.map_err(transport_error)?;
-            producer
+            let statistics = statistics.get_or_init(|| {
+                laser_sdk::stream::producer_statistics::ProducerRecorder::new(
+                    &laser,
+                    producer.stream().to_string(),
+                    producer.topic().to_string(),
+                    true,
+                )
+            });
+            let observation = statistics.begin(
+                messages.len() as u64,
+                messages
+                    .iter()
+                    .map(|message| message.payload.len() as u64)
+                    .sum(),
+            );
+            let result = producer
                 .send_with_partitioning(messages, partitioning)
-                .await
+                .await;
+            observation.finish(result.is_ok());
+            result
                 .map(PySendMessagesResponse::from)
                 .map_err(transport_error)
         })
@@ -688,18 +713,9 @@ pub struct PyConsumerMessage {
     /// A structurally truncated block has no decoded headers.
     #[pyo3(get)]
     pub headers_malformed: bool,
-}
-
-impl TryFrom<ReceivedMessage> for PyConsumerMessage {
-    type Error = laser_sdk::iggy::prelude::IggyError;
-
-    fn try_from(received: ReceivedMessage) -> Result<Self, Self::Error> {
-        Self::of(
-            &received.message,
-            received.partition_id,
-            received.current_offset,
-        )
-    }
+    // The record as the Laser consumer delivered it, which a commit names.
+    // Absent on a record read through another path.
+    delivered: Option<ConsumerMessage>,
 }
 
 impl PyConsumerMessage {
@@ -724,7 +740,28 @@ impl PyConsumerMessage {
             partition_id,
             timestamp_micros: message.header.timestamp,
             origin_timestamp_micros: message.header.origin_timestamp,
+            delivered: None,
         })
+    }
+
+    /// A record a Laser consumer delivered, kept so a commit can name it.
+    pub(crate) fn from_delivered(message: ConsumerMessage) -> Self {
+        let (headers, headers_malformed) =
+            received_headers(message.user_headers.as_deref().unwrap_or_default())
+                .unwrap_or_else(|| (BTreeMap::new(), true));
+        Self {
+            payload: message.payload.clone(),
+            message_id: message.message_id.to_string(),
+            headers,
+            headers_malformed,
+            checksum: message.checksum,
+            offset: message.position.offset,
+            current_offset: message.current_offset,
+            partition_id: message.partition_id,
+            timestamp_micros: message.timestamp_micros,
+            origin_timestamp_micros: message.origin_timestamp_micros,
+            delivered: Some(message),
+        }
     }
 }
 
@@ -789,65 +826,103 @@ impl PyConsumerMessage {
 }
 
 /// A Laser partition or consumer-group reader. It is an async iterator and
-/// exposes manual offset storage for commit-after-handle delivery. A purge
-/// restarts the partition at offset 0 without telling an open reader, which
-/// can keep its old position and skip the replacement records, so rebuild it
-/// after a purge.
+/// exposes manual offset storage for commit-after-handle delivery. A group
+/// consumer on a server that resolves group policies runs the group's
+/// filter, or none, without naming one, and commits through the group's
+/// fenced acknowledgments. A purge restarts the partition at offset 0
+/// without telling an open reader, which can keep its old position and skip
+/// the replacement records, so rebuild it after a purge.
 #[gen_stub_pyclass]
 #[pyclass(name = "Consumer")]
 pub struct PyConsumer {
     name: String,
-    inner: Arc<Mutex<Option<IggyConsumer>>>,
+    state: Arc<Mutex<ConsumerState>>,
+    receiving: Arc<Mutex<()>>,
+    changed: Arc<Notify>,
     shutdown: watch::Sender<bool>,
-    manual_commit: bool,
-    yielded_zero: Arc<Mutex<std::collections::BTreeSet<u32>>>,
-    shutdown_target: Option<PyConsumerGroupTarget>,
+    returned: Arc<std::sync::Mutex<VecDeque<ConsumerMessage>>>,
+}
+
+// The consumer is built on first use: joining a group and resolving its
+// policy are round trips, and construction is synchronous.
+enum ConsumerState {
+    Unbuilt(Box<ConsumerBuilder>),
+    Built(Box<Consumer>),
+    Closed,
+}
+
+impl ConsumerState {
+    async fn built(&mut self) -> PyResult<&mut Consumer> {
+        if let Self::Unbuilt(builder) = self {
+            let consumer = builder.as_ref().clone().build().await.map_err(to_pyerr)?;
+            *self = Self::Built(Box::new(consumer));
+        }
+        match self {
+            Self::Built(consumer) => Ok(consumer),
+            Self::Unbuilt(_) | Self::Closed => {
+                Err(InvalidError::new_err("consumer has been shut down"))
+            }
+        }
+    }
 }
 
 impl PyConsumer {
-    pub(crate) fn new(
-        inner: IggyConsumer,
-        manual_commit: bool,
-        shutdown_target: Option<PyConsumerGroupTarget>,
-    ) -> Self {
+    pub(crate) fn new(name: String, builder: ConsumerBuilder) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
-            name: inner.name().to_owned(),
-            inner: Arc::new(Mutex::new(Some(inner))),
+            name,
+            state: Arc::new(Mutex::new(ConsumerState::Unbuilt(Box::new(builder)))),
+            receiving: Arc::default(),
+            changed: Arc::default(),
             shutdown,
-            manual_commit,
-            yielded_zero: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
-            shutdown_target,
+            returned: Arc::default(),
         }
     }
 
     async fn receive(
-        inner: Arc<Mutex<Option<IggyConsumer>>>,
+        state: Arc<Mutex<ConsumerState>>,
+        receiving: Arc<Mutex<()>>,
+        changed: Arc<Notify>,
         shutdown: watch::Sender<bool>,
-        yielded_zero: Arc<Mutex<std::collections::BTreeSet<u32>>>,
+        returned: Arc<std::sync::Mutex<VecDeque<ConsumerMessage>>>,
     ) -> PyResult<Option<PyConsumerMessage>> {
-        if *shutdown.borrow() {
+        let mut shutdown_rx = shutdown.subscribe();
+        if *shutdown_rx.borrow() {
             return Ok(None);
         }
-        let mut inner = inner.lock().await;
-        let Some(consumer) = inner.as_mut() else {
-            return Ok(None);
-        };
-        consumer.init().await.map_err(transport_error)?;
-        let mut shutdown_rx = shutdown.subscribe();
         tokio::select! {
-            received = consumer.next() => match received {
-                Some(Ok(received)) => {
-                    let partition = received.partition_id;
-                    let offset = received.message.header.offset;
-                    let message = received.try_into().map_err(transport_error)?;
-                    let mut zeros = yielded_zero.lock().await;
-                    if offset == 0 { zeros.insert(partition); } else { zeros.remove(&partition); }
-                    Ok(Some(message))
-                },
-                Some(Err(error)) => Err(transport_error(error)),
-                None => Ok(None),
-            },
+            received = async {
+                let _receiving = receiving.lock().await;
+                {
+                    let mut state = state.lock().await;
+                    if matches!(*state, ConsumerState::Closed) {
+                        return Ok(None);
+                    }
+                    return_deliveries(state.built().await?, &returned).await?;
+                }
+                let mut locked = pin!(Arc::clone(&state).lock_owned());
+                let message = loop {
+                    let notified = changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    tokio::select! {
+                        message = poll_fn(|context| {
+                            let mut guard = ready!(locked.as_mut().poll(context));
+                            locked.set(Arc::clone(&state).lock_owned());
+                            match &mut *guard {
+                                ConsumerState::Built(consumer) => pin!(consumer.next()).poll(context),
+                                ConsumerState::Unbuilt(_) | ConsumerState::Closed => Poll::Ready(None),
+                            }
+                        }) => break message,
+                        () = notified => {}
+                    }
+                };
+                match message {
+                    Some(Ok(message)) => Ok(Some(PyConsumerMessage::from_delivered(message))),
+                    Some(Err(error)) => Err(to_pyerr(error)),
+                    None => Ok(None),
+                }
+            } => received,
             result = shutdown_rx.changed() => {
                 let _ = result;
                 Ok(None)
@@ -856,10 +931,265 @@ impl PyConsumer {
     }
 }
 
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyConsumer {
+    /// Consumer or group name.
+    #[getter]
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// Initialize and join/create the configured group. Reads initialize lazily
+    /// too, so call this when startup should fail before accepting work.
+    fn init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            state.lock().await.built().await?;
+            Ok(())
+        })
+    }
+
+    /// Wait for the next message. Returns `None` after shutdown.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        let shutdown = self.shutdown.clone();
+        future_into_py_returning(
+            py,
+            Self::receive(
+                state,
+                Arc::clone(&self.receiving),
+                Arc::clone(&self.changed),
+                shutdown,
+                Arc::clone(&self.returned),
+            ),
+            give_back_delivery(Arc::clone(&self.returned)),
+        )
+    }
+
+    /// Store `offset` on the server for the message partition. With no
+    /// `partition`, Iggy uses the consumer's current partition. A group
+    /// consumer on a server that resolves group policies refuses it, because
+    /// an arbitrary offset bypasses the group's acknowledgment contract.
+    /// Commit a delivered message instead.
+    #[pyo3(signature = (offset, *, partition=None))]
+    fn store_offset<'py>(
+        &self,
+        py: Python<'py>,
+        offset: u64,
+        partition: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            state
+                .lock()
+                .await
+                .built()
+                .await?
+                .store_offset(offset, partition)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Store a successfully handled message's offset on the server. A group
+    /// consumer on a server that resolves group policies stores the
+    /// contiguous prefix of the partition through this message.
+    fn commit<'py>(
+        &self,
+        py: Python<'py>,
+        message: &PyConsumerMessage,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        let changed = Arc::clone(&self.changed);
+        let delivered = message.delivered.clone();
+        let offset = message.offset;
+        let partition = message.partition_id;
+        future_into_py(py, async move {
+            let mut state = state.lock().await;
+            let consumer = state.built().await?;
+            let result = match delivered {
+                Some(message) => consumer.commit(&message).await,
+                None => consumer.store_offset(offset, Some(partition)).await,
+            }
+            .map_err(to_pyerr);
+            drop(state);
+            changed.notify_one();
+            result
+        })
+    }
+
+    /// Delete the stored server offset for one partition or the consumer's
+    /// current partition. Refused like `store_offset` by a policy-aware group
+    /// consumer.
+    #[pyo3(signature = (*, partition=None))]
+    fn delete_offset<'py>(
+        &self,
+        py: Python<'py>,
+        partition: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            state
+                .lock()
+                .await
+                .built()
+                .await?
+                .delete_offset(partition)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Last message offset yielded locally for `partition`.
+    fn last_consumed_offset<'py>(
+        &self,
+        py: Python<'py>,
+        partition: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            Ok(match &*state.lock().await {
+                ConsumerState::Built(consumer) => consumer.last_consumed_offset(partition),
+                ConsumerState::Unbuilt(_) | ConsumerState::Closed => None,
+            })
+        })
+    }
+
+    /// Local offset bookkeeping: the native SDK's stored offset, whose initial
+    /// zero does not prove a durable checkpoint exists, or the last offset a
+    /// policy-aware group consumer acknowledged. Use `next` polling for
+    /// server-side resume.
+    fn last_stored_offset<'py>(
+        &self,
+        py: Python<'py>,
+        partition: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            Ok(match &*state.lock().await {
+                ConsumerState::Built(consumer) => consumer.last_stored_offset(partition),
+                ConsumerState::Unbuilt(_) | ConsumerState::Closed => None,
+            })
+        })
+    }
+
+    /// Stop polling and leave the group. Automatic policies store the handled
+    /// prefix first. On the native path, Polling commits before delivery.
+    /// On the group-aware path it commits the delivered prefix. Disabled
+    /// auto-commit preserves the last explicit commit. Use explicit commits
+    /// when shutdown must preserve only successfully processed records.
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let already_shutdown = self.shutdown.send_replace(true);
+        let state = self.state.clone();
+        let returned = Arc::clone(&self.returned);
+        future_into_py(py, async move {
+            if already_shutdown {
+                return Ok(());
+            }
+            let taken = std::mem::replace(&mut *state.lock().await, ConsumerState::Closed);
+            match taken {
+                ConsumerState::Built(mut consumer) => {
+                    return_deliveries(&mut consumer, &returned).await?;
+                    consumer.shutdown().await.map_err(to_pyerr)
+                }
+                ConsumerState::Unbuilt(_) | ConsumerState::Closed => Ok(()),
+            }
+        })
+    }
+
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        let shutdown = self.shutdown.clone();
+        let returned = Arc::clone(&self.returned);
+        let receiving = Arc::clone(&self.receiving);
+        let changed = Arc::clone(&self.changed);
+        future_into_py_returning(
+            py,
+            async move {
+                match Self::receive(state, receiving, changed, shutdown, returned).await? {
+                    Some(message) => Ok(message),
+                    None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+                }
+            },
+            give_back_delivery(Arc::clone(&self.returned)),
+        )
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Consumer(name={})", self.name)
+    }
+}
+
+fn give_back_delivery(returned: Arc<std::sync::Mutex<VecDeque<ConsumerMessage>>>) -> Undelivered {
+    Box::new(move |py, value| {
+        let Ok(message) = value.extract::<PyRef<'_, PyConsumerMessage>>(py) else {
+            return;
+        };
+        if let Some(message) = &message.delivered {
+            returned
+                .lock()
+                .expect("consumer returned-delivery lock")
+                .push_back(message.clone());
+        }
+    })
+}
+
+async fn return_deliveries(
+    consumer: &mut Consumer,
+    returned: &std::sync::Mutex<VecDeque<ConsumerMessage>>,
+) -> PyResult<()> {
+    let messages = returned
+        .lock()
+        .expect("consumer returned-delivery lock")
+        .drain(..)
+        .collect::<Vec<_>>();
+    for message in messages.into_iter().rev() {
+        consumer.return_delivery(message).await.map_err(to_pyerr)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PyConsumerMessage, PyHeaderValue, positive_duration_ms};
+    use super::{
+        ConsumerState, PyConsumer, PyConsumerMessage, PyHeaderValue, positive_duration_ms,
+    };
     use iggy::prelude::IggyMessage;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{Mutex, watch};
+
+    #[tokio::test]
+    async fn given_shutdown_while_waiting_for_consumer_state_when_signalled_then_should_cancel_the_wait()
+     {
+        let state = Arc::new(Mutex::new(ConsumerState::Closed));
+        let guard = state.lock().await;
+        let (shutdown, _) = watch::channel(false);
+        let received = PyConsumer::receive(
+            Arc::clone(&state),
+            Arc::default(),
+            Arc::default(),
+            shutdown.clone(),
+            Arc::default(),
+        );
+        tokio::pin!(received);
+        tokio::select! {
+            _ = &mut received => panic!("the state lock is still held"),
+            () = tokio::task::yield_now() => {},
+        }
+        shutdown.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut received)
+            .await
+            .expect("shutdown cancels the state wait")
+            .expect("shutdown succeeds");
+        assert!(result.is_none());
+        drop(guard);
+    }
 
     #[test]
     fn given_unknown_header_values_when_a_record_is_exposed_then_should_preserve_raw_and_known_entries()
@@ -918,211 +1248,5 @@ mod tests {
     fn given_retry_intervals_when_converted_then_zero_should_be_rejected() {
         assert!(positive_duration_ms(1, "retry_interval_ms").is_ok());
         assert!(positive_duration_ms(0, "retry_interval_ms").is_err());
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct PyConsumerGroupTarget {
-    pub laser: Laser,
-    pub stream: String,
-    pub topic: String,
-    pub group: String,
-}
-
-#[gen_stub_pymethods]
-#[pymethods]
-impl PyConsumer {
-    /// Consumer or group name.
-    #[getter]
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    /// Initialize and join/create the configured group. Reads initialize lazily
-    /// too, so call this when startup should fail before accepting work.
-    fn init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            let mut inner = inner.lock().await;
-            let consumer = inner
-                .as_mut()
-                .ok_or_else(|| InvalidError::new_err("consumer has been shut down"))?;
-            consumer.init().await.map_err(transport_error)
-        })
-    }
-
-    /// Wait for the next message. Returns `None` after shutdown.
-    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let shutdown = self.shutdown.clone();
-        let yielded_zero = self.yielded_zero.clone();
-        future_into_py(py, async move {
-            Self::receive(inner, shutdown, yielded_zero).await
-        })
-    }
-
-    /// Store `offset` on the server for the message partition. With no
-    /// `partition`, Iggy uses the consumer's current partition.
-    #[pyo3(signature = (offset, *, partition=None))]
-    fn store_offset<'py>(
-        &self,
-        py: Python<'py>,
-        offset: u64,
-        partition: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            let inner = inner.lock().await;
-            inner
-                .as_ref()
-                .ok_or_else(|| InvalidError::new_err("consumer has been shut down"))?
-                .store_offset(offset, partition)
-                .await
-                .map_err(transport_error)
-        })
-    }
-
-    /// Store a successfully handled message's offset on the server.
-    fn commit<'py>(
-        &self,
-        py: Python<'py>,
-        message: &PyConsumerMessage,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let offset = message.offset;
-        let partition = message.partition_id;
-        future_into_py(py, async move {
-            let inner = inner.lock().await;
-            inner
-                .as_ref()
-                .ok_or_else(|| InvalidError::new_err("consumer has been shut down"))?
-                .store_offset(offset, Some(partition))
-                .await
-                .map_err(transport_error)
-        })
-    }
-
-    /// Delete the stored server offset for one partition or the consumer's
-    /// current partition.
-    #[pyo3(signature = (*, partition=None))]
-    fn delete_offset<'py>(
-        &self,
-        py: Python<'py>,
-        partition: Option<u32>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            let inner = inner.lock().await;
-            inner
-                .as_ref()
-                .ok_or_else(|| InvalidError::new_err("consumer has been shut down"))?
-                .delete_offset(partition)
-                .await
-                .map_err(transport_error)
-        })
-    }
-
-    /// Last message offset yielded locally for `partition`.
-    fn last_consumed_offset<'py>(
-        &self,
-        py: Python<'py>,
-        partition: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            Ok(inner
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|consumer| consumer.get_last_consumed_offset(partition)))
-        })
-    }
-
-    /// Local Iggy SDK offset bookkeeping. An initial zero does not prove a
-    /// durable checkpoint exists. Use `next` polling for server-side resume.
-    fn last_stored_offset<'py>(
-        &self,
-        py: Python<'py>,
-        partition: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            Ok(inner
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|consumer| consumer.get_last_stored_offset(partition)))
-        })
-    }
-
-    /// Stop polling and leave the group. Automatic policies delegate final
-    /// offset handling to the Iggy SDK. Polling commits before delivery, so
-    /// shutdown is not a processing checkpoint. Disabled auto-commit preserves
-    /// the last explicit commit.
-    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let already_shutdown = self.shutdown.send_replace(true);
-        let inner = self.inner.clone();
-        let manual_commit = self.manual_commit;
-        let yielded_zero = self.yielded_zero.clone();
-        let shutdown_target = self.shutdown_target.clone();
-        future_into_py(py, async move {
-            if already_shutdown {
-                return Ok(());
-            }
-            if manual_commit {
-                drop(inner.lock().await.take());
-                if let Some(target) = shutdown_target {
-                    target
-                        .laser
-                        .client()
-                        .leave_consumer_group(
-                            &Identifier::try_from(target.stream).map_err(transport_error)?,
-                            &Identifier::try_from(target.topic).map_err(transport_error)?,
-                            &Identifier::try_from(target.group).map_err(transport_error)?,
-                        )
-                        .await
-                        .map_err(transport_error)?;
-                }
-                return Ok(());
-            }
-            let mut inner = inner.lock().await;
-            let outcome = if let Some(consumer) = inner.as_mut() {
-                let mut stored = Ok(());
-                for partition in yielded_zero.lock().await.iter() {
-                    if consumer
-                        .get_last_stored_offset(*partition)
-                        .is_none_or(|offset| offset == 0)
-                    {
-                        stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
-                    }
-                }
-                let stopped = consumer.shutdown().await;
-                stored.and(stopped)
-            } else {
-                Ok(())
-            };
-            inner.take();
-            outcome.map_err(transport_error)
-        })
-    }
-
-    fn __aiter__(slf: Py<Self>) -> Py<Self> {
-        slf
-    }
-
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let shutdown = self.shutdown.clone();
-        let yielded_zero = self.yielded_zero.clone();
-        future_into_py(py, async move {
-            match Self::receive(inner, shutdown, yielded_zero).await? {
-                Some(message) => Ok(message),
-                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
-            }
-        })
-    }
-
-    fn __repr__(&self) -> String {
-        format!("Consumer(name={})", self.name)
     }
 }

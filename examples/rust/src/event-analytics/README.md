@@ -35,7 +35,7 @@ LASER_MESSAGES=2000000 LASER_BATCH=1000 cargo run --release --example event-anal
 
 ## Highlights
 
-- `topic.consumer_group(group)` with `CommitPolicy::Polling` for server-side commit-on-poll delivery.
+- `topic.consumer_group(group).consumer()` with `CommitPolicy::Polling` for server-side commit-on-poll delivery.
 - `laser.topic(topic).publish_batch()` chunked indexed publishing (each chunk one `send_messages` call, spread across partitions by the balanced partitioner).
 - `query(..)` aggregates: `count` / `group_by` / `time_range` windows over the `message_type` and `ts` convention fields.
 - `Cursor` + `StateStore` checkpointing for resumable downstream jobs.

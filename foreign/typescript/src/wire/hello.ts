@@ -17,7 +17,8 @@ export const Feature = {
   AUTHZ: 1n << 7n,
   DESTINATIONS: 1n << 8n,
   KV_FENCED_LEASES: 1n << 9n,
-  CONSUMER_FILTERS: 1n << 10n
+  CONSUMER_FILTERS: 1n << 10n,
+  GROUP_POLICY_READS: 1n << 11n
 } as const
 
 export interface OpVersions {

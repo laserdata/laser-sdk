@@ -1,4 +1,7 @@
+use crate::capabilities::{Capabilities, HelloOutcome};
 use crate::error::LaserError;
+use crate::filters::reader::{DEFAULT_IDLE_INTERVAL, Delivery, FilteredReader, MatchedRecord};
+use crate::stream::consumer_group::ConsumerGroup;
 use crate::stream::{HeaderKey, HeaderValue, Topic};
 use crate::types::MessageId;
 use bytes::Bytes;
@@ -8,12 +11,15 @@ use iggy::prelude::{
     IggyConsumer, IggyConsumerBuilder, IggyExpiry, IggyMessage, IggyProducer, IggyTimestamp,
     MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage, SendMessagesResponse,
 };
+use laser_wire::filter::{FilterRef, FilteredStart};
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::time::{Instant, sleep};
 
 const DEFAULT_BATCH_LENGTH: u32 = 1000;
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -65,6 +71,16 @@ pub enum ConsumerStart {
 }
 
 impl ConsumerStart {
+    const fn into_filtered(self) -> FilteredStart {
+        match self {
+            Self::First => FilteredStart::First,
+            Self::Last => FilteredStart::Last,
+            Self::Next => FilteredStart::Next,
+            Self::Offset(offset) => FilteredStart::Offset(offset),
+            Self::TimestampMicros(timestamp) => FilteredStart::Timestamp(timestamp),
+        }
+    }
+
     fn into_polling(self) -> PollingStrategy {
         match self {
             Self::First => PollingStrategy::first(),
@@ -87,7 +103,10 @@ pub enum CommitPolicy {
     /// Store offsets on a fixed interval.
     Interval(Duration),
     /// Commit the current polled batch on the server before delivery. A crash
-    /// can skip records the application has not processed.
+    /// can skip records the application has not processed. A policy-aware
+    /// group consumer stores the delivered prefix when it polls again and at
+    /// shutdown instead, so a crash redelivers the current batch and never
+    /// skips it.
     #[default]
     Polling,
     /// Store on an interval or commit the current batch during polling.
@@ -368,7 +387,14 @@ impl ProducerBuilder {
         };
         let producer = builder.build();
         producer.init().await?;
+        let statistics = super::producer_statistics::ProducerRecorder::new(
+            &self.topic.laser,
+            producer.stream().to_string(),
+            producer.topic().to_string(),
+            !background,
+        );
         Ok(Producer {
+            statistics,
             inner: Arc::new(producer),
             laser: self.topic.laser.clone(),
             publish_options,
@@ -385,6 +411,7 @@ impl ProducerBuilder {
 #[derive(Clone)]
 /// A cloneable, initialized streaming producer.
 pub struct Producer {
+    statistics: super::producer_statistics::ProducerRecorder,
     inner: Arc<IggyProducer>,
     laser: crate::laser::Laser,
     publish_options: crate::laser::PublishOptions,
@@ -473,6 +500,23 @@ impl Producer {
 
     async fn send_iggy(
         &self,
+        messages: Vec<IggyMessage>,
+        routing: Option<Arc<Partitioning>>,
+    ) -> Result<SendMessagesResponse, LaserError> {
+        let observation = self.statistics.begin(
+            messages.len() as u64,
+            messages
+                .iter()
+                .map(|message| message.payload.len() as u64)
+                .sum(),
+        );
+        let result = self.send_iggy_observed(messages, routing).await;
+        observation.finish(result.is_ok());
+        result
+    }
+
+    async fn send_iggy_observed(
+        &self,
         mut messages: Vec<IggyMessage>,
         routing: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, LaserError> {
@@ -536,12 +580,21 @@ impl Producer {
     }
 }
 
+#[derive(Clone)]
 enum ConsumerTarget {
     Partition { name: String, partition: u32 },
-    Group { name: String },
+    Group(Box<ConsumerGroup>),
 }
 
 /// Configures a live partition or consumer-group reader.
+///
+/// A group consumer on a server that resolves group policies reads through
+/// the group-aware engine: the server runs the group's policy, filtered or
+/// unfiltered, and the consumer acknowledges through the fenced group
+/// contract. On Apache Iggy, or a managed server whose probe positively
+/// announced no filters, it is the native Iggy group consumer. Every option
+/// below applies to both, except where noted.
+#[derive(Clone)]
 pub struct ConsumerBuilder {
     topic: Topic,
     target: ConsumerTarget,
@@ -567,8 +620,11 @@ impl ConsumerBuilder {
         )
     }
 
-    pub(crate) fn group(topic: Topic, name: impl Into<String>) -> Self {
-        Self::new(topic, ConsumerTarget::Group { name: name.into() })
+    pub(crate) fn group(group: ConsumerGroup) -> Self {
+        Self::new(
+            group.topic().clone(),
+            ConsumerTarget::Group(Box::new(group)),
+        )
     }
 
     fn new(topic: Topic, target: ConsumerTarget) -> Self {
@@ -587,18 +643,25 @@ impl ConsumerBuilder {
         }
     }
 
+    /// Most records one poll returns. A policy-aware group consumer also
+    /// examines at most this many source records per partition poll, so a
+    /// selective policy returns fewer records, down to none, while progress
+    /// still advances.
     #[must_use]
     pub fn batch_length(mut self, batch_length: u32) -> Self {
         self.batch_length = batch_length;
         self
     }
 
+    /// How long the consumer waits after a poll that found nothing new.
     #[must_use]
     pub fn poll_interval(mut self, poll_interval: Duration) -> Self {
         self.poll_interval = Some(poll_interval);
         self
     }
 
+    /// Poll again at once after an empty poll. A policy-aware group consumer
+    /// keeps a short wait so an idle partition is not spun on.
     #[must_use]
     pub fn without_poll_interval(mut self) -> Self {
         self.poll_interval = None;
@@ -617,6 +680,7 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Native only. A policy-aware group consumer always joins its group.
     #[must_use]
     pub fn auto_join_group(mut self, auto_join: bool) -> Self {
         self.auto_join_group = auto_join;
@@ -629,6 +693,7 @@ impl ConsumerBuilder {
         self
     }
 
+    /// How long a failed poll waits before it is retried.
     #[must_use]
     pub fn polling_retry_interval(mut self, interval: Duration) -> Self {
         self.polling_retry_interval = interval;
@@ -641,6 +706,8 @@ impl ConsumerBuilder {
         self
     }
 
+    /// Native only. A policy-aware group consumer honors its start position
+    /// as given.
     #[must_use]
     pub fn allow_replay(mut self) -> Self {
         self.allow_replay = true;
@@ -653,24 +720,115 @@ impl ConsumerBuilder {
                 "consumer batch length must be greater than zero".to_owned(),
             ));
         }
-        let group = matches!(self.target, ConsumerTarget::Group { .. });
+        if let ConsumerTarget::Group(group) = &self.target {
+            let mut capabilities = self.topic.laser().capabilities().await;
+            if capabilities.hello == HelloOutcome::Unknown {
+                capabilities = self.topic.laser().refresh_capabilities().await;
+            }
+            if policy_aware(&capabilities)? {
+                let group = group.as_ref().clone();
+                return self.build_group(group).await;
+            }
+        }
+        self.build_native().await
+    }
+
+    async fn build_group(self, group: ConsumerGroup) -> Result<Consumer, LaserError> {
+        self.commit.into_auto_commit()?;
+        if !self.auto_join_group {
+            return Err(LaserError::Invalid(
+                "a policy-aware group consumer always joins its group, remove auto_join_group(false)"
+                    .to_owned(),
+            ));
+        }
+        if self.create_group && group.name().is_some() {
+            group.ensure_native().await?;
+        }
+        let polling_retry_interval = positive_duration(
+            self.polling_retry_interval,
+            "consumer polling retry interval must be greater than zero",
+        )?;
+        let mut retries_left = self.init_retries;
+        let reader = loop {
+            let built = group
+                .reader_with(FilterRef::Group)?
+                .start(self.start.into_filtered())
+                .count(self.batch_length)
+                .max_examined(self.batch_length)
+                .idle_interval(self.poll_interval.unwrap_or(DEFAULT_IDLE_INTERVAL))
+                .retry_interval(polling_retry_interval)
+                .build()
+                .await;
+            match built {
+                Ok(reader) => break reader,
+                Err(error)
+                    if error.is_retryable()
+                        && retries_left.is_some_and(|(retries, _)| retries > 0) =>
+                {
+                    let (retries, interval) = retries_left.unwrap_or_default();
+                    retries_left = Some((retries - 1, interval));
+                    sleep(positive_duration(
+                        interval,
+                        "consumer initialization retry interval must be greater than zero",
+                    )?)
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let offsets = Arc::new(std::sync::Mutex::new(GroupOffsets::default()));
+        Ok(Consumer {
+            yielded_zero: BTreeSet::new(),
+            inner: Some(ConsumerInner::Group(Arc::new(tokio::sync::Mutex::new(
+                GroupEngine {
+                    reader,
+                    commit: self.commit,
+                    buffered: VecDeque::new(),
+                    pending_delivery: None,
+                    pending_flush: None,
+                    returned: VecDeque::new(),
+                    yielded_since_flush: 0,
+                    last_flush: Instant::now(),
+                    offsets: Arc::clone(&offsets),
+                },
+            )))),
+            manual_commit: self.commit == CommitPolicy::Disabled,
+            shutdown_target: None,
+            next_future: std::sync::Mutex::new(None),
+            offsets: Some(offsets),
+            returned_native: std::sync::Mutex::new(VecDeque::new()),
+        })
+    }
+
+    async fn build_native(self) -> Result<Consumer, LaserError> {
         let manual_commit = self.commit == CommitPolicy::Disabled;
+        let native_group = match &self.target {
+            ConsumerTarget::Group(group) => Some(group.native_name().await?),
+            ConsumerTarget::Partition { .. } => None,
+        };
         let shutdown_target = match &self.target {
-            ConsumerTarget::Group { name } if manual_commit && self.auto_join_group => {
+            ConsumerTarget::Group(_) if manual_commit && self.auto_join_group => {
                 Some(ConsumerGroupTarget {
                     laser: self.topic.laser.clone(),
                     stream: self.topic.stream()?.to_owned(),
                     topic: self.topic.name.clone(),
-                    group: name.clone(),
+                    group: native_group
+                        .clone()
+                        .ok_or(LaserError::Config("consumer group name is absent"))?,
                 })
             }
             _ => None,
         };
+        let group = matches!(self.target, ConsumerTarget::Group(_));
         let mut builder: IggyConsumerBuilder = match &self.target {
             ConsumerTarget::Partition { name, partition } => {
                 self.topic.iggy_consumer(name, *partition)?
             }
-            ConsumerTarget::Group { name } => self.topic.iggy_consumer_group(name)?,
+            ConsumerTarget::Group(_) => self.topic.iggy_consumer_group(
+                native_group
+                    .as_deref()
+                    .ok_or(LaserError::Config("consumer group name is absent"))?,
+            )?,
         };
         builder = builder
             .batch_length(self.batch_length)
@@ -712,10 +870,79 @@ impl ConsumerBuilder {
         consumer.init().await?;
         Ok(Consumer {
             yielded_zero: BTreeSet::new(),
-            inner: Some(consumer),
+            inner: Some(ConsumerInner::Native(Box::new(consumer))),
             manual_commit,
             shutdown_target,
+            next_future: std::sync::Mutex::new(None),
+            offsets: None,
+            returned_native: std::sync::Mutex::new(VecDeque::new()),
         })
+    }
+}
+
+/// Whether a group consumer reads through the group-aware engine. A server
+/// that advertises group-aware reads does. A server that serves consumer
+/// filters without them must be upgraded, because its groups may be bound
+/// and a native poll would read past their policies. A probe that
+/// established nothing is not a server without filters. Only a server whose
+/// announcement, or refusal to announce, positively lacks filters reads
+/// natively.
+fn policy_aware(capabilities: &Capabilities) -> Result<bool, LaserError> {
+    if capabilities.filters.group_policy_reads {
+        return Ok(true);
+    }
+    if capabilities.filters.native {
+        return Err(LaserError::unsupported_feature(
+            "filters",
+            "group_policy_reads",
+            "this server serves consumer filters but not group-aware reads, upgrade it before consuming groups through the Laser SDK",
+        ));
+    }
+    match capabilities.hello {
+        HelloOutcome::Unknown | HelloOutcome::Failed => Err(LaserError::Timeout(
+            "the managed probe that decides whether this server resolves consumer group policies, reconnect and build the consumer again",
+        )),
+        HelloOutcome::Answered | HelloOutcome::Rejected => Ok(false),
+    }
+}
+
+/// When the group engine asks whether to store the handled prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitPoint {
+    /// A record was just delivered, `last_of_page` when it ended its poll.
+    Delivered { last_of_page: bool },
+    /// The next poll is about to start.
+    Poll,
+}
+
+/// Whether an automatic commit policy stores the handled prefix now.
+/// `yielded` counts records delivered since the last store and `elapsed` the
+/// time since it.
+const fn commit_due(
+    commit: CommitPolicy,
+    yielded: u32,
+    elapsed: Duration,
+    point: CommitPoint,
+) -> bool {
+    let polling = matches!(point, CommitPoint::Poll) && yielded > 0;
+    let last_of_page = matches!(point, CommitPoint::Delivered { last_of_page: true });
+    let delivered = matches!(point, CommitPoint::Delivered { .. });
+    match commit {
+        CommitPolicy::Disabled => false,
+        CommitPolicy::Polling => polling,
+        CommitPolicy::Interval(interval) => elapsed.as_nanos() >= interval.as_nanos(),
+        CommitPolicy::IntervalOrPolling(interval) => {
+            polling || elapsed.as_nanos() >= interval.as_nanos()
+        }
+        CommitPolicy::All => last_of_page,
+        CommitPolicy::IntervalOrAll(interval) => {
+            last_of_page || elapsed.as_nanos() >= interval.as_nanos()
+        }
+        CommitPolicy::Each | CommitPolicy::IntervalOrEach(_) => delivered && yielded > 0,
+        CommitPolicy::Every(every) => delivered && yielded >= every,
+        CommitPolicy::IntervalOrEvery(interval, every) => {
+            (delivered && yielded >= every) || elapsed.as_nanos() >= interval.as_nanos()
+        }
     }
 }
 
@@ -731,6 +958,15 @@ pub struct ConsumerMessage {
     pub partition_id: u32,
     pub timestamp_micros: u64,
     pub origin_timestamp_micros: u64,
+    /// The header block exactly as stored, for a caller that decodes its
+    /// entries itself.
+    pub user_headers: Option<Bytes>,
+    /// True when the header block does not decode. `headers` is then empty
+    /// and the payload stays readable.
+    pub headers_malformed: bool,
+    // The delivery handle a policy-aware group consumer commits by. Absent
+    // on a native record.
+    pub(crate) delivery: Option<Delivery>,
 }
 
 impl ConsumerMessage {
@@ -738,25 +974,46 @@ impl ConsumerMessage {
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, LaserError> {
         serde_json::from_slice(&self.payload).map_err(|error| LaserError::Codec(error.to_string()))
     }
-}
 
-impl TryFrom<ReceivedMessage> for ConsumerMessage {
-    type Error = LaserError;
-
-    fn try_from(received: ReceivedMessage) -> Result<Self, Self::Error> {
-        let headers = received.message.user_headers_map()?.unwrap_or_default();
-        let header = received.message.header;
-        Ok(Self {
-            payload: received.message.payload,
+    // A record whose header block does not decode is still delivered: its
+    // payload and position are intact, and dropping it would lose a record a
+    // commit before delivery already covered.
+    fn of(
+        message: IggyMessage,
+        partition_id: u32,
+        current_offset: u64,
+        delivery: Option<Delivery>,
+    ) -> Self {
+        let (headers, headers_malformed) = match message.user_headers_map() {
+            Ok(headers) => (headers.unwrap_or_default(), false),
+            Err(_) => (Headers::new(), true),
+        };
+        let header = message.header;
+        Self {
+            payload: message.payload,
             headers,
             message_id: header.id,
             checksum: header.checksum,
-            position: MessageId::new(received.partition_id, header.offset),
-            current_offset: received.current_offset,
-            partition_id: received.partition_id,
+            position: MessageId::new(partition_id, header.offset),
+            current_offset,
+            partition_id,
             timestamp_micros: header.timestamp,
             origin_timestamp_micros: header.origin_timestamp,
-        })
+            user_headers: message.user_headers,
+            headers_malformed,
+            delivery,
+        }
+    }
+}
+
+impl From<ReceivedMessage> for ConsumerMessage {
+    fn from(received: ReceivedMessage) -> Self {
+        Self::of(
+            received.message,
+            received.partition_id,
+            received.current_offset,
+            None,
+        )
     }
 }
 
@@ -766,9 +1023,21 @@ impl TryFrom<ReceivedMessage> for ConsumerMessage {
 /// purge.
 pub struct Consumer {
     yielded_zero: BTreeSet<u32>,
-    inner: Option<IggyConsumer>,
+    inner: Option<ConsumerInner>,
     manual_commit: bool,
     shutdown_target: Option<ConsumerGroupTarget>,
+    // The group engine's read in flight. Behind a lock only so the consumer
+    // stays `Sync`: it is reached through `&mut self` alone.
+    next_future: std::sync::Mutex<Option<NextFuture>>,
+    offsets: Option<Arc<std::sync::Mutex<GroupOffsets>>>,
+    returned_native: std::sync::Mutex<VecDeque<ConsumerMessage>>,
+}
+
+type NextFuture = Pin<Box<dyn Future<Output = Option<Result<ConsumerMessage, LaserError>>> + Send>>;
+
+enum ConsumerInner {
+    Native(Box<IggyConsumer>),
+    Group(Arc<tokio::sync::Mutex<GroupEngine>>),
 }
 
 struct ConsumerGroupTarget {
@@ -778,10 +1047,185 @@ struct ConsumerGroupTarget {
     group: String,
 }
 
+/// The offsets a policy-aware group consumer reports: the last record it
+/// yielded and the last one it stored, per partition.
+#[derive(Default)]
+struct GroupOffsets {
+    consumed: BTreeMap<u32, u64>,
+    stored: BTreeMap<u32, u64>,
+}
+
+/// The group-aware delivery engine behind a policy-aware group consumer: the
+/// group reader with the commit policy applied on top of its fenced
+/// acknowledgments. A new read or graceful shutdown marks the previous
+/// delivery handled, and the policy decides when that prefix is stored.
+struct GroupEngine {
+    reader: FilteredReader,
+    commit: CommitPolicy,
+    buffered: VecDeque<MatchedRecord>,
+    pending_delivery: Option<(Delivery, bool)>,
+    pending_flush: Option<CommitPoint>,
+    returned: VecDeque<(ConsumerMessage, bool)>,
+    yielded_since_flush: u32,
+    last_flush: Instant,
+    offsets: Arc<std::sync::Mutex<GroupOffsets>>,
+}
+
+impl GroupEngine {
+    async fn next(&mut self) -> Option<Result<ConsumerMessage, LaserError>> {
+        if let Err(error) = self.finish_delivery().await {
+            return Some(Err(error));
+        }
+        loop {
+            if let Some((message, last_of_page)) = self.returned.pop_front() {
+                if let Some(delivery) = &message.delivery {
+                    self.pending_delivery = Some((delivery.clone(), last_of_page));
+                }
+                return Some(Ok(message));
+            }
+            if let Some(record) = self.buffered.pop_front() {
+                let delivery = record.delivery();
+                self.pending_delivery = Some((delivery.clone(), self.buffered.is_empty()));
+                self.offsets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .consumed
+                    .insert(delivery.partition_id, delivery.offset);
+                return Some(Ok(ConsumerMessage::of(
+                    record.message,
+                    record.partition_id,
+                    record.frontier,
+                    Some(delivery),
+                )));
+            }
+            // One bounded round at a time, so an interval policy stores the
+            // handled prefix while the partitions stay idle instead of
+            // waiting for the next page to arrive.
+            let page = loop {
+                if let Err(error) = self.flush_if_due(CommitPoint::Poll).await {
+                    return Some(Err(error));
+                }
+                match self.reader.read_round().await {
+                    Ok((Some(page), _)) => break page,
+                    Ok((None, true)) => {}
+                    Ok((None, false)) => sleep(self.reader.idle_interval()).await,
+                    Err(error) => {
+                        self.sync_stored();
+                        return Some(Err(error));
+                    }
+                }
+            };
+            self.sync_stored();
+            self.buffered.extend(page.records);
+        }
+    }
+
+    async fn finish_delivery(&mut self) -> Result<(), LaserError> {
+        if let Some((delivery, last_of_page)) = self.pending_delivery.take()
+            && self.commit != CommitPolicy::Disabled
+        {
+            self.reader.handled(&delivery);
+            self.yielded_since_flush = self.yielded_since_flush.saturating_add(1);
+            self.pending_flush = Some(CommitPoint::Delivered { last_of_page });
+        }
+        if let Some(point) = self.pending_flush {
+            self.flush_if_due(point).await?;
+            self.pending_flush = None;
+        }
+        Ok(())
+    }
+
+    async fn flush_if_due(&mut self, point: CommitPoint) -> Result<(), LaserError> {
+        if !commit_due(
+            self.commit,
+            self.yielded_since_flush,
+            self.last_flush.elapsed(),
+            point,
+        ) {
+            return Ok(());
+        }
+        if let Err(error) = self.reader.flush_completed().await {
+            if matches!(
+                error.filter_reason(),
+                Some(
+                    laser_wire::filter::FilterErrorReason::Conflict
+                        | laser_wire::filter::FilterErrorReason::SourceChanged
+                )
+            ) {
+                self.buffered
+                    .retain(|record| self.reader.owns_record(record));
+                self.pending_flush = None;
+                self.yielded_since_flush = 0;
+            }
+            self.sync_stored();
+            return Err(error);
+        }
+        self.yielded_since_flush = 0;
+        self.last_flush = Instant::now();
+        self.sync_stored();
+        Ok(())
+    }
+
+    async fn commit(&mut self, delivery: &Delivery) -> Result<(), LaserError> {
+        self.reader.ack_through_delivery(delivery).await?;
+        self.sync_stored();
+        Ok(())
+    }
+
+    fn sync_stored(&self) {
+        self.offsets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stored = self.reader.stored_offsets();
+    }
+}
+
 impl Consumer {
     /// Wait for the next record.
     pub async fn next(&mut self) -> Option<Result<ConsumerMessage, LaserError>> {
         futures::StreamExt::next(self).await
+    }
+
+    /// Return a delivery that a language binding could not hand to its caller.
+    #[doc(hidden)]
+    pub async fn return_delivery(&self, message: ConsumerMessage) -> Result<(), LaserError> {
+        match self.inner.as_ref() {
+            Some(ConsumerInner::Group(engine)) => {
+                *self
+                    .next_future
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                let mut engine = engine.lock().await;
+                let pending = engine.pending_delivery.as_ref().ok_or_else(|| {
+                    LaserError::Invalid(
+                        "only the latest unhandled delivery can be returned".to_owned(),
+                    )
+                })?;
+                if !message
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| pending.0.same(delivery))
+                {
+                    return Err(LaserError::Invalid(
+                        "the delivery is not the latest one from this consumer".to_owned(),
+                    ));
+                }
+                let last_of_page = pending.1;
+                engine.pending_delivery = None;
+                engine.returned.push_front((message, last_of_page));
+                Ok(())
+            }
+            Some(ConsumerInner::Native(_)) => {
+                self.returned_native
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_front(message);
+                Ok(())
+            }
+            None => Err(LaserError::Invalid(
+                "consumer has been shut down".to_owned(),
+            )),
+        }
     }
 
     /// Wait for the next record, bounding how long a caller sits idle: a typed
@@ -804,89 +1248,151 @@ impl Consumer {
             .ok_or_else(|| LaserError::Invalid("the live consumer stream ended".to_owned()))?
     }
 
-    /// Store a handled record's offset on the server.
+    /// Store a handled record's offset on the server. A policy-aware group
+    /// consumer stores the contiguous prefix of its partition through this
+    /// record, so earlier records yielded out of order cannot be skipped.
     pub async fn commit(&self, message: &ConsumerMessage) -> Result<(), LaserError> {
-        self.store_offset(message.position.offset, Some(message.partition_id))
-            .await
+        match self.inner.as_ref() {
+            Some(ConsumerInner::Group(engine)) => {
+                let delivery = message.delivery.as_ref().ok_or_else(|| {
+                    LaserError::Invalid(
+                        "the record was not delivered by this group consumer".to_owned(),
+                    )
+                })?;
+                *self
+                    .next_future
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                engine.lock().await.commit(delivery).await
+            }
+            _ => {
+                self.store_offset(message.position.offset, Some(message.partition_id))
+                    .await
+            }
+        }
     }
 
-    /// Store an explicit server offset.
+    /// Store an explicit server offset. Native only: a policy-aware group
+    /// consumer refuses it, because an arbitrary offset bypasses the group's
+    /// acknowledgment contract. Commit a delivered record instead.
     pub async fn store_offset(
         &self,
         offset: u64,
         partition: Option<u32>,
     ) -> Result<(), LaserError> {
-        self.inner()?.store_offset(offset, partition).await?;
+        self.native()?.store_offset(offset, partition).await?;
         Ok(())
     }
 
     /// Delete the server offset for a partition or the current partition.
+    /// Native only, like [`store_offset`](Self::store_offset).
     pub async fn delete_offset(&self, partition: Option<u32>) -> Result<(), LaserError> {
-        self.inner()?.delete_offset(partition).await?;
+        self.native()?.delete_offset(partition).await?;
         Ok(())
     }
 
     /// Return the last locally yielded offset for a partition.
     pub fn last_consumed_offset(&self, partition: u32) -> Option<u64> {
-        self.inner
-            .as_ref()
-            .and_then(|consumer| consumer.get_last_consumed_offset(partition))
+        match self.inner.as_ref() {
+            Some(ConsumerInner::Native(consumer)) => consumer.get_last_consumed_offset(partition),
+            Some(ConsumerInner::Group(_)) => self.offsets.as_ref().and_then(|offsets| {
+                offsets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .consumed
+                    .get(&partition)
+                    .copied()
+            }),
+            None => None,
+        }
     }
 
-    /// Return local Iggy SDK offset bookkeeping. Its initial zero does not
-    /// prove a durable checkpoint exists. Use `Next` for server-side resume.
+    /// Return local offset bookkeeping: the native SDK's stored offset, whose
+    /// initial zero does not prove a durable checkpoint exists, or the last
+    /// offset a policy-aware group consumer acknowledged. Use `Next` for
+    /// server-side resume.
     pub fn last_stored_offset(&self, partition: u32) -> Option<u64> {
-        self.inner
-            .as_ref()
-            .and_then(|consumer| consumer.get_last_stored_offset(partition))
+        match self.inner.as_ref() {
+            Some(ConsumerInner::Native(consumer)) => consumer.get_last_stored_offset(partition),
+            Some(ConsumerInner::Group(_)) => self.offsets.as_ref().and_then(|offsets| {
+                offsets
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .stored
+                    .get(&partition)
+                    .copied()
+            }),
+            None => None,
+        }
     }
 
-    /// Stop polling and leave the group. Automatic policies delegate final
-    /// offset handling to the Iggy SDK. Polling commits before delivery, so
+    /// Stop polling and leave the group. Automatic policies store the handled
+    /// prefix first. For group consumers, a clean stop marks the last
+    /// delivery handled. Native polling commits before delivery, so its
     /// shutdown is not a processing checkpoint. [`CommitPolicy::Disabled`]
     /// preserves the last explicit commit.
     pub async fn shutdown(&mut self) -> Result<(), LaserError> {
-        if self.manual_commit {
-            drop(self.inner.take());
-            if let Some(target) = self.shutdown_target.take() {
-                target
-                    .laser
-                    .client()
-                    .leave_consumer_group(
-                        &Identifier::try_from(target.stream)?,
-                        &Identifier::try_from(target.topic)?,
-                        &Identifier::try_from(target.group)?,
-                    )
-                    .await?;
+        *self
+            .next_future
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        match self.inner.take() {
+            None => Ok(()),
+            Some(ConsumerInner::Group(engine)) => {
+                self.shutdown_target.take();
+                let engine = Arc::try_unwrap(engine).map_err(|_| {
+                    LaserError::Invalid("the consumer is still being polled".to_owned())
+                })?;
+                let mut engine = engine.into_inner();
+                let completed = engine.finish_delivery().await;
+                let closed = engine.reader.close().await;
+                completed.and(closed)
             }
-            return Ok(());
-        }
-        let outcome = if let Some(consumer) = self.inner.as_mut() {
-            let mut stored = Ok(());
-            for partition in &self.yielded_zero {
-                if consumer
-                    .get_last_stored_offset(*partition)
-                    .is_none_or(|offset| offset == 0)
-                {
-                    // The native shutdown treats an unset stored offset as zero.
-                    // Explicitly store a delivered zero for automatic policies.
-                    stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
+            Some(ConsumerInner::Native(mut consumer)) => {
+                if self.manual_commit {
+                    drop(consumer);
+                    if let Some(target) = self.shutdown_target.take() {
+                        target
+                            .laser
+                            .client()
+                            .leave_consumer_group(
+                                &Identifier::try_from(target.stream)?,
+                                &Identifier::try_from(target.topic)?,
+                                &Identifier::try_from(target.group)?,
+                            )
+                            .await?;
+                    }
+                    return Ok(());
                 }
+                let mut stored = Ok(());
+                for partition in &self.yielded_zero {
+                    if consumer
+                        .get_last_stored_offset(*partition)
+                        .is_none_or(|offset| offset == 0)
+                    {
+                        // The native shutdown treats an unset stored offset as zero.
+                        // Explicitly store a delivered zero for automatic policies.
+                        stored = stored.and(consumer.store_offset(0, Some(*partition)).await);
+                    }
+                }
+                let stopped = consumer.shutdown().await;
+                self.shutdown_target.take();
+                stored.and(stopped).map_err(Into::into)
             }
-            let stopped = consumer.shutdown().await;
-            stored.and(stopped)
-        } else {
-            Ok(())
-        };
-        self.inner.take();
-        self.shutdown_target.take();
-        outcome.map_err(Into::into)
+        }
     }
 
-    fn inner(&self) -> Result<&IggyConsumer, LaserError> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| LaserError::Invalid("consumer has been shut down".to_owned()))
+    fn native(&self) -> Result<&IggyConsumer, LaserError> {
+        match self.inner.as_ref() {
+            Some(ConsumerInner::Native(consumer)) => Ok(consumer),
+            Some(ConsumerInner::Group(_)) => Err(LaserError::Invalid(
+                "explicit offsets bypass the group's acknowledgment contract, commit a delivered record instead"
+                    .to_owned(),
+            )),
+            None => Err(LaserError::Invalid(
+                "consumer has been shut down".to_owned(),
+            )),
+        }
     }
 }
 
@@ -894,23 +1400,46 @@ impl Stream for Consumer {
     type Item = Result<ConsumerMessage, LaserError>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match Pin::new(inner).poll_next(context) {
-            Poll::Ready(Some(Ok(message))) => {
-                let converted: Result<ConsumerMessage, LaserError> = message.try_into();
-                if let Ok(message) = &converted {
-                    if message.position.offset == 0 {
-                        self.yielded_zero.insert(message.partition_id);
-                    } else {
-                        self.yielded_zero.remove(&message.partition_id);
+        if matches!(self.inner, Some(ConsumerInner::Native(_)))
+            && let Some(message) = self
+                .returned_native
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+        {
+            return Poll::Ready(Some(Ok(message)));
+        }
+        let engine = match self.inner.as_mut() {
+            None => return Poll::Ready(None),
+            Some(ConsumerInner::Native(inner)) => {
+                return match Pin::new(inner).poll_next(context) {
+                    Poll::Ready(Some(Ok(message))) => {
+                        let message = ConsumerMessage::from(message);
+                        if message.position.offset == 0 {
+                            self.yielded_zero.insert(message.partition_id);
+                        } else {
+                            self.yielded_zero.remove(&message.partition_id);
+                        }
+                        Poll::Ready(Some(Ok(message)))
                     }
-                }
-                Poll::Ready(Some(converted))
+                    Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                };
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Some(ConsumerInner::Group(engine)) => Arc::clone(engine),
+        };
+        let in_flight = self
+            .next_future
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = in_flight
+            .get_or_insert_with(|| Box::pin(async move { engine.lock().await.next().await }));
+        match next.as_mut().poll(context) {
+            Poll::Ready(item) => {
+                *in_flight = None;
+                Poll::Ready(item)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -919,6 +1448,162 @@ impl Stream for Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_consumer_when_shared_across_tasks_then_should_be_send_and_sync() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Consumer>();
+        shared::<ConsumerBuilder>();
+        shared::<ConsumerMessage>();
+    }
+
+    #[test]
+    fn given_a_server_with_group_reads_when_classified_then_should_use_the_group_engine() {
+        let capabilities = Capabilities::OPEN.with_filters(true, true);
+        assert!(policy_aware(&capabilities).expect("classified"));
+    }
+
+    #[test]
+    fn given_group_reads_without_an_evaluator_when_classified_then_should_preserve_group_policy() {
+        let mut capabilities = Capabilities::OPEN;
+        capabilities.filters.group_policy_reads = true;
+        assert!(policy_aware(&capabilities).expect("group policy resolves without evaluation"));
+    }
+
+    #[test]
+    fn given_a_server_serving_filters_without_group_reads_when_classified_then_should_require_an_upgrade()
+     {
+        let mut capabilities = Capabilities::OPEN.with_filters(true, true);
+        capabilities.filters.group_policy_reads = false;
+        let error = policy_aware(&capabilities).expect_err("an old server is refused");
+        assert!(matches!(
+            error,
+            LaserError::Unsupported {
+                feature: Some("group_policy_reads"),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn given_a_probe_that_established_nothing_when_classified_then_should_not_read_natively() {
+        let mut capabilities = Capabilities::OPEN;
+        for hello in [HelloOutcome::Unknown, HelloOutcome::Failed] {
+            capabilities.hello = hello;
+            assert!(matches!(
+                policy_aware(&capabilities),
+                Err(LaserError::Timeout(_))
+            ));
+        }
+        for hello in [HelloOutcome::Rejected, HelloOutcome::Answered] {
+            capabilities.hello = hello;
+            assert!(
+                !policy_aware(&capabilities).expect("positively absent"),
+                "{hello:?} without filters reads natively"
+            );
+        }
+    }
+
+    #[test]
+    fn given_each_commit_policy_when_a_record_is_yielded_then_should_store_on_its_own_cadence() {
+        let second = Duration::from_secs(1);
+        let middle = CommitPoint::Delivered {
+            last_of_page: false,
+        };
+        let last = CommitPoint::Delivered { last_of_page: true };
+        assert!(!commit_due(CommitPolicy::Disabled, 5, second, last));
+        assert!(!commit_due(
+            CommitPolicy::Disabled,
+            5,
+            second,
+            CommitPoint::Poll
+        ));
+        assert!(commit_due(CommitPolicy::Each, 1, Duration::ZERO, middle));
+        assert!(!commit_due(
+            CommitPolicy::Each,
+            1,
+            Duration::ZERO,
+            CommitPoint::Poll
+        ));
+        assert!(commit_due(CommitPolicy::All, 1, Duration::ZERO, last));
+        assert!(!commit_due(CommitPolicy::All, 1, Duration::ZERO, middle));
+        assert!(commit_due(
+            CommitPolicy::Every(3),
+            3,
+            Duration::ZERO,
+            middle
+        ));
+        assert!(!commit_due(
+            CommitPolicy::Every(3),
+            2,
+            Duration::ZERO,
+            middle
+        ));
+        assert!(commit_due(
+            CommitPolicy::Interval(second),
+            0,
+            second,
+            CommitPoint::Poll
+        ));
+        assert!(!commit_due(
+            CommitPolicy::Interval(second),
+            9,
+            Duration::from_millis(999),
+            last
+        ));
+        assert!(commit_due(
+            CommitPolicy::IntervalOrEvery(second, 10),
+            10,
+            Duration::ZERO,
+            middle
+        ));
+        assert!(commit_due(
+            CommitPolicy::IntervalOrAll(second),
+            1,
+            Duration::ZERO,
+            last
+        ));
+    }
+
+    #[test]
+    fn given_the_polling_policy_when_the_next_poll_starts_then_should_store_the_delivered_prefix() {
+        let last = CommitPoint::Delivered { last_of_page: true };
+        assert!(
+            !commit_due(CommitPolicy::Polling, 4, Duration::ZERO, last),
+            "a delivered record alone stores nothing"
+        );
+        assert!(commit_due(
+            CommitPolicy::Polling,
+            4,
+            Duration::ZERO,
+            CommitPoint::Poll
+        ));
+        assert!(
+            !commit_due(CommitPolicy::Polling, 0, Duration::ZERO, CommitPoint::Poll),
+            "an idle poll has nothing to store"
+        );
+        assert!(commit_due(
+            CommitPolicy::IntervalOrPolling(Duration::from_secs(1)),
+            0,
+            Duration::from_secs(1),
+            last
+        ));
+    }
+
+    #[test]
+    fn given_every_start_when_mapped_to_a_group_read_then_should_keep_its_meaning() {
+        assert_eq!(ConsumerStart::First.into_filtered(), FilteredStart::First);
+        assert_eq!(ConsumerStart::Last.into_filtered(), FilteredStart::Last);
+        assert_eq!(ConsumerStart::Next.into_filtered(), FilteredStart::Next);
+        assert_eq!(
+            ConsumerStart::Offset(7).into_filtered(),
+            FilteredStart::Offset(7)
+        );
+        assert_eq!(
+            ConsumerStart::TimestampMicros(9).into_filtered(),
+            FilteredStart::Timestamp(9)
+        );
+    }
 
     #[test]
     fn given_zero_frequency_when_building_commit_policy_then_should_reject_it() {

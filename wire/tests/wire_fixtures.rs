@@ -52,12 +52,13 @@ use laser_wire::destination::{
     QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
 };
 use laser_wire::filter::{
-    AckReceipt, AppliedPolicy, ConsumerFilter, FilterBinding, FilterCatalogCommand,
-    FilterCatalogOutcome, FilterCatalogReply, FilterConsumer, FilterError, FilterErrorReason,
-    FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterMutation, FilterMutationOutcome,
-    FilterMutationRequest, FilterMutationResult, FilterMutationStatus, FilterOutcome, FilterRef,
-    FilterReply, FilterRevisionRef, FilterSource, FilterValidation, FilteredAck, FilteredPage,
-    FilteredPollRequest, FilteredStart, ReadMode, SourceGeneration, StopReason,
+    AckReceipt, AppliedPolicy, CatalogPosition, ConsumerFilter, ExecutionMode, FilterBinding,
+    FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterConsumer, FilterError,
+    FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterMutation,
+    FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
+    FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource, FilterValidation,
+    FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart, GroupFilterSpec,
+    GroupPolicyUnbound, ReadMode, SourceGeneration, StopReason,
 };
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
@@ -2977,6 +2978,8 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             count: 200,
             max_reply_bytes: 1024 * 1024,
             read_mode: ReadMode::Primary,
+            max_examined: None,
+            min_catalog_position: None,
         },
     );
     assert_frame(
@@ -2994,6 +2997,31 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             count: 200,
             max_reply_bytes: 1024 * 1024,
             read_mode: ReadMode::Primary,
+            max_examined: None,
+            min_catalog_position: None,
+        },
+    );
+    assert_frame(
+        "filter_poll_request_group_auto.bin",
+        &FilteredPollRequest {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            partition_id: 0,
+            consumer: FilterConsumer::GroupId(3),
+            filter: FilterRef::Group,
+            start: FilteredStart::Next,
+            count: 100,
+            max_reply_bytes: 1024 * 1024,
+            read_mode: ReadMode::Primary,
+            max_examined: Some(100),
+            min_catalog_position: Some(CatalogPosition {
+                partition_id: 0,
+                offset: 41,
+                operation_id: Some(11),
+            }),
         },
     );
     assert_frame(
@@ -3010,9 +3038,11 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             partition_id: 0,
             policy: AppliedPolicy {
                 group_id: Some(canonical_identity().group_id),
-                digest: filter.digest(),
+                digest: Some(filter.digest()),
                 filter_id: Some(1),
                 revision: Some(1),
+                mode: ExecutionMode::Filtered,
+                policy_generation: 1,
             },
             generation: canonical_generation(),
             read_mode: ReadMode::Primary,
@@ -3022,6 +3052,30 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             examined: 397,
             matched: 0,
             stop: StopReason::Budget,
+            fault: None,
+            unevaluated: Vec::new(),
+            evaluation_limits: None,
+            records: {
+                let mut body = vec![0; 16];
+                body[4..12].copy_from_slice(&2000_u64.to_le_bytes());
+                body
+            },
+        })),
+    );
+    assert_frame(
+        "filter_reply_page_unfiltered.bin",
+        &FilterReply::Ok(FilterOutcome::Page(FilteredPage {
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            partition_id: 0,
+            policy: AppliedPolicy::unfiltered(canonical_identity().group_id, 0),
+            generation: canonical_generation(),
+            read_mode: ReadMode::Primary,
+            next_scan_offset: Some(100),
+            safe_ack_offset: Some(99),
+            frontier: 2000,
+            examined: 100,
+            matched: 100,
+            stop: StopReason::Filled,
             fault: None,
             unevaluated: Vec::new(),
             evaluation_limits: None,
@@ -3044,8 +3098,28 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             partition_id: 0,
             consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
             generation: canonical_generation(),
-            digest: filter.digest(),
+            digest: Some(filter.digest()),
             offset: 1396,
+            mode: ExecutionMode::Filtered,
+            policy_generation: 1,
+        },
+    );
+    assert_frame(
+        "filter_ack_unfiltered.bin",
+        &FilteredAck {
+            group_id: Some(canonical_identity().group_id),
+            v: laser_wire::codes::FILTER_OP_VERSION,
+            source: FilterSource {
+                stream: "orbit".to_owned(),
+                topic: "fleet_changes".to_owned(),
+            },
+            partition_id: 0,
+            consumer: FilterConsumer::GroupId(canonical_identity().group_id),
+            generation: canonical_generation(),
+            digest: None,
+            offset: 99,
+            mode: ExecutionMode::Unfiltered,
+            policy_generation: 0,
         },
     );
     assert_frame(
@@ -3097,6 +3171,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
         revision: 1,
         digest: filter.digest(),
         bound_at_micros: TIMESTAMP_MICROS,
+        policy_generation: 1,
     };
     assert_frame(
         "filter_catalog_reply_bound.bin",
@@ -3104,7 +3179,43 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
             FilterMutationOutcome {
                 v: laser_wire::codes::FILTER_OP_VERSION,
                 operation_id: 7,
+                status: FilterMutationStatus::Applied(FilterMutationResult::Bound(binding.clone())),
+                catalog_position: None,
+            },
+        ))),
+    );
+    let configure = FilterMutationRequest {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        operation_id: 11,
+        mutation: FilterMutation::ConfigureGroup {
+            group: canonical_group(),
+            policy: GroupFilterSpec::Definition(filter.clone()),
+            expected_identity: Some(canonical_identity()),
+        },
+    };
+    assert_frame("filter_mutation_configure_group.bin", &configure);
+    assert_json("filter_mutation_configure_group.json", &configure);
+    assert_frame(
+        "filter_catalog_reply_configured.bin",
+        &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Mutation(
+            FilterMutationOutcome {
+                v: laser_wire::codes::FILTER_OP_VERSION,
+                operation_id: 11,
                 status: FilterMutationStatus::Applied(FilterMutationResult::Bound(binding)),
+                catalog_position: Some(CatalogPosition {
+                    partition_id: 0,
+                    offset: 41,
+                    operation_id: Some(11),
+                }),
+            },
+        ))),
+    );
+    assert_frame(
+        "filter_catalog_reply_unbound.bin",
+        &FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Unbound(
+            GroupPolicyUnbound {
+                identity: canonical_identity(),
+                policy_generation: 0,
             },
         ))),
     );
@@ -3121,6 +3232,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
                         digest: filter.digest(),
                     },
                 )),
+                catalog_position: None,
             },
         ))),
     );
@@ -3146,6 +3258,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
                     revision: 2,
                     enabled: false,
                 }),
+                catalog_position: None,
             },
         ))),
     );

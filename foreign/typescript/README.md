@@ -4,7 +4,7 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> The current release is `0.5.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.1`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
@@ -180,7 +180,7 @@ await incidents.remember(new TextEncoder().encode("checkout uses the read replic
 
 TypeScript duration inputs use milliseconds. `noExpiry()` keeps the raw memory history until ordinary topic retention removes it.
 
-A consumer filter runs on the streaming server, so a reader receives only the records it selects, with their original offsets:
+**Filter before the network.** Configure a consumer group's policy once. Its ordinary consumers and page readers then receive the selected records with their original payloads, headers and offsets. The shared CDC feed delivers **4 of 240 records**, saving **98.5% of payload transfer**. An unbound group receives all records without payload decoding.
 
 ```ts
 const safeMode = ConsumerFilter.json(
@@ -190,23 +190,30 @@ const safeMode = ConsumerFilter.json(
     FilterExpr.pred("after.mode", "eq", "safe")
   ])
 )
-const reader = await laser
-  .filters()
-  .reader("orbit", "fleet_changes")
-  .consumer("anomaly-desk")
-  .inline(safeMode)
-  .start({ kind: "first" })
-  .build()
+const topic = laser.stream("orbit").topic("fleet_changes")
+const group = topic.consumerGroup("anomaly-desk")
+await group.create({ filter: safeMode }) // Run once during setup.
+
+// Every consumer instance needs only the group name or the returned group ID.
+const consumer = await group.consumer({ batchLength: 100, autoCommit: false })
 try {
-  const record = await reader.nextRecord({ timeoutMs: 15_000 })
-  console.log(record.partitionId, record.offset, record.payload)
-  await reader.ack(record)
+  const record = await consumer.nextWithin(15_000)
+  if (record !== null) {
+    console.log(record.partitionId, record.offset, record.payload)
+    await consumer.commit(record)
+  }
 } finally {
-  await reader.close()
+  await consumer.shutdown()
 }
 ```
 
-Use `nextPage()` and `ackPage()` for batch handling. A page is a bounded poll result, not a separate transport. Use `.group(name)` or `.groupId(id)` to read a consumer group's assigned partitions. `CompiledFilter.compile(filter).evaluate(record)` runs the evaluator locally with exact integers. `ConsumerFilter.withFaultPolicy`, `withForeignPolicy`, and `withMismatchPolicy` decide what a record that does not decode, has another codec, or has a field of an unexpected type does: stop or drop, or reach the reader with `evaluated` false. A record whose header block did not decode has `headersMalformed` set. `preview`, `test`, and the catalog verbs `register`, `revise`, `describe`, `createConsumerGroup`, `bind`, `unbind`, `unbindBinding`, `setRevisionEnabled`, `archive`, and `delete` live on `laser.filters()`. A server refusal throws `FilterExecutionError`, and a fault or oversized stop throws `FilterStopError`, whose `reason` names the stop. A group reader joins over its own connection, and a partition it gains on a rebalance resumes after the group's stored offset. Record timestamps are exact microseconds.
+**`batchLength: 100` examines at most 100 source records per partition request.** It may deliver fewer matches, including none. An empty scan advances over rejected records and does not mean end of stream. The consumer continues bounded scans and waits only when caught up. Manual `commit(record)` stores safe contiguous progress after processing. The default automatic mode stores the delivered prefix before the next poll and at shutdown.
+
+For batch handling, build `await group.reader().count(100).maxExamined(1000).build()`, then use `nextPage()` and `ackPage()`. Here `count` limits returned records, while `maxExamined` independently limits the scan. An unbound group returns all records. Each reader joins as a member, and Iggy distributes partitions across instances. Acknowledgments preserve pending earlier work and reject stale source or policy generations.
+
+`group.filter()` provides `configure`, `get`, `revisions`, `revise`, `setRevisionEnabled`, `release`, `preview` and `test`. Use `configureAs(operationId, policy)` when setup must resume with the same operation ID after a lost reply. `topic.consumerGroupId(id)` addresses the same saved group by numeric ID. Catalog failures, denied reads and paused revisions never broaden into unfiltered delivery. Original Apache Iggy uses native group consumption, while an older managed server without group-aware reads returns an explicit upgrade error.
+
+Filters support JSON, CBOR, Avro, Protobuf and typed headers. `CompiledFilter.compile(filter).evaluate(record)` checks records locally with exact integers. `ConsumerFilter.withFaultPolicy`, `withForeignPolicy` and `withMismatchPolicy` control invalid records. Passed invalid records and unfiltered records have `evaluated` false. Malformed headers set `headersMalformed` without discarding valid entries or the payload. Server refusals throw `FilterExecutionError`, and fault or oversized stops throw `FilterStopError` with the stop reason. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 ## Agents and coordination
 

@@ -82,3 +82,7 @@ The fixture manifest is closed. Added or removed files fail TypeScript tests unt
 ## Review focus
 
 Reject defaults that broaden a query or weaken consistency. Reject malformed success data, missing target evidence, and confusion between public requests and committed state. Do not trust Arrow metadata without parsing its stream. Keep wire u64 and u128 values exact in TypeScript.
+
+## Consumer-group filter ownership
+
+Consumer group handles live under topics. Filter setup and revisions live under each group. Normal and advanced consumers use the group's policy and return all records for an authoritatively unbound group. Follow the consumer-filters skill for scan budgets, progress, cancellation, capability failures and cross-language test parity. Do not reintroduce a top-level filter service.

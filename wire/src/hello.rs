@@ -49,6 +49,13 @@ pub mod feature {
     /// The saved-filter catalog additionally needs the backend's `filter` op
     /// version.
     pub const CONSUMER_FILTERS: u64 = 1 << 10;
+    /// The streaming server serves group-aware reads: `FilterRef::Group`
+    /// resolves a consumer group's own policy, an unbound group is delivered
+    /// unfiltered without payload decoding, pages and acknowledgments carry the
+    /// execution mode and policy generation, and the request may bound the
+    /// examined records and wait for a catalog position. A client must not send
+    /// the automatic selector to a server without this bit.
+    pub const GROUP_POLICY_READS: u64 = 1 << 11;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability

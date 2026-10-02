@@ -1,8 +1,126 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
+import { CancelledError } from "../../src/client/errors.js"
 import type { LaserTransport } from "../../src/iggy/apache-iggy.js"
+import type { FilteredReader, MatchedPage, MatchedRecord } from "../../src/managed/filters.js"
 import { Consumer } from "../../src/stream/consumer.js"
+
+function matched(offset: bigint): MatchedRecord {
+  return {
+    partitionId: 0,
+    offset,
+    frontier: 10n,
+    evaluated: false,
+    payload: new Uint8Array([Number(offset)]),
+    headers: new Map(),
+    json: () => Number(offset)
+  }
+}
+
+function matchedPage(records: readonly MatchedRecord[]): MatchedPage {
+  return {
+    partitionId: 0,
+    records,
+    policy: { groupId: 7n, mode: "unfiltered", policyGeneration: 0n },
+    generation: {
+      streamId: 1,
+      streamCreatedAtMicros: 1n,
+      topicId: 1,
+      topicCreatedAtMicros: 1n,
+      partitionId: 0,
+      partitionCreatedRevision: 1n,
+      purgeGeneration: 0n
+    },
+    stop: "end_of_visible",
+    examined: records.length,
+    frontier: 10n
+  }
+}
+
+void test("given_a_group_backlog_without_matches_when_next_times_out_then_should_yield_between_bounded_rounds", async () => {
+  let rounds = 0
+  let yielded = false
+  const timer = setTimeout(() => {
+    yielded = true
+  }, 1)
+  const reader = {
+    owns: () => true,
+    readRound: () => {
+      rounds += 1
+      return Promise.resolve([undefined, true] as const)
+    }
+  } as unknown as FilteredReader
+  const consumer = new Consumer(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    { autoCommit: false, pollIntervalMs: 60_000 },
+    reader
+  )
+  try {
+    assert.equal(await consumer.nextWithin(20), null)
+    assert.equal(yielded, true, "busy scans let timers and cancellation run")
+    assert.ok(rounds > 1, "busy scans do not use the idle wait")
+  } finally {
+    clearTimeout(timer)
+  }
+})
+
+void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_record_for_the_next_call", async () => {
+  const controller = new AbortController()
+  const handled: bigint[] = []
+  const reader = {
+    owns: () => true,
+    readRound: () => {
+      controller.abort()
+      return Promise.resolve([matchedPage([matched(0n)]), false] as const)
+    },
+    handled: (record: MatchedRecord) => handled.push(record.offset),
+    close: () => Promise.resolve()
+  } as unknown as FilteredReader
+  const consumer = new Consumer(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    {},
+    reader
+  )
+  await assert.rejects(consumer.nextWithin(100, { signal: controller.signal }), CancelledError)
+  assert.deepEqual(handled, [])
+  assert.equal((await consumer.nextWithin(100))?.offset, 0n)
+  assert.deepEqual(handled, [], "delivery stays pending until the next call or shutdown")
+  await consumer.shutdown()
+  assert.deepEqual(handled, [0n])
+})
+
+void test("given_an_automatic_group_consumer_when_shutdown_with_buffered_records_then_should_store_only_delivered_records", async () => {
+  const handled: bigint[] = []
+  const reader = {
+    owns: () => true,
+    readRound: () =>
+      Promise.resolve([matchedPage([matched(0n), matched(1n), matched(2n)]), false] as const),
+    handled: (record: MatchedRecord) => handled.push(record.offset),
+    close: () => Promise.resolve()
+  } as unknown as FilteredReader
+  const consumer = new Consumer(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    {},
+    reader
+  )
+  assert.equal((await consumer.nextWithin(100))?.offset, 0n)
+  assert.deepEqual(handled, [])
+  assert.equal((await consumer.nextWithin(100))?.offset, 1n)
+  assert.deepEqual(handled, [0n])
+  await consumer.shutdown()
+  assert.deepEqual(handled, [0n, 1n], "offset two was never delivered")
+  assert.equal(await consumer.nextWithin(100), null)
+})
 
 void test("given_a_group_consumer_when_asynchronously_disposed_then_should_leave_once", async () => {
   let leaves = 0

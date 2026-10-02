@@ -1,5 +1,6 @@
 use crate::error::{LaserError, decode_managed_reply};
-use crate::filters::group::{ASSIGNMENT_REFRESH, Membership};
+use crate::filters::group::Membership;
+#[cfg(feature = "filters")]
 use crate::filters::guard::LocalGuard;
 use crate::filters::progress::{Blocked, PartitionProgress};
 use crate::filters::route::{RouteTo, Routes};
@@ -12,14 +13,16 @@ use bytes::Bytes;
 use iggy_binary_protocol::batch::{BatchIntegrity, decode_batch_slice_with};
 use iggy_common::Identifier;
 use laser_wire::codes::{AGDX_FILTERED_ACK_CODE, AGDX_FILTERED_POLL_CODE, FILTER_OP_VERSION};
+#[cfg(feature = "filters")]
+use laser_wire::filter::ConsumerFilter;
 use laser_wire::filter::{
-    AppliedPolicy, ConsumerFilter, FilterConsumer, FilterError, FilterErrorReason, FilterOutcome,
-    FilterRef, FilterReply, FilterSource, FilteredAck, FilteredPage, FilteredPollRequest,
-    FilteredStart, ReadMode, SourceGeneration, StopReason,
+    AppliedPolicy, CatalogPosition, ExecutionMode, FilterConsumer, FilterError, FilterErrorReason,
+    FilterOutcome, FilterRef, FilterReply, FilterSource, FilteredAck, FilteredPage,
+    FilteredPollRequest, FilteredStart, ReadMode, SourceGeneration, StopReason,
 };
 use laser_wire::framing::encode_named;
+#[cfg(feature = "filters")]
 use laser_wire::limits::MAX_FILTER_CATALOG_PAGE;
-use laser_wire::schema::Digest32;
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -29,26 +32,31 @@ use tokio::time::{Instant, sleep};
 
 const DEFAULT_COUNT: u32 = 100;
 const DEFAULT_MAX_REPLY_BYTES: u32 = 1024 * 1024;
-const DEFAULT_IDLE_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const DEFAULT_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_MAX_UNACKED_PAGES: usize = 1024;
 
-/// Builds a [`FilteredReader`]. Start from [`Filters::reader`](crate::filters::Filters::reader).
+/// Builds a [`FilteredReader`] over one consumer group. Start from
+/// [`ConsumerGroup::reader`](crate::stream::ConsumerGroup::reader).
 pub struct FilteredReaderBuilder<'a> {
     laser: &'a Laser,
     source: FilterSource,
-    consumer: Option<FilterConsumer>,
-    partitions: Vec<u32>,
-    filter: Option<FilterRef>,
+    consumer: FilterConsumer,
+    filter: FilterRef,
+    min_catalog_position: Option<CatalogPosition>,
     start: FilteredStart,
     count: u32,
+    max_examined: Option<u32>,
     max_reply_bytes: u32,
     read_mode: ReadMode,
+    #[cfg(feature = "filters")]
     local_guard: bool,
     idle_interval: Duration,
+    retry_interval: Option<Duration>,
     max_unacked_pages: usize,
+    selected_partitions: BTreeSet<u32>,
 }
 
-/// Reads only the records a consumer filter selects, with their original
+/// Reads the records a consumer group's policy selects, with their original
 /// offsets, and stores progress through fenced acknowledgments.
 ///
 /// Pages are read ahead of acknowledgments. An acknowledgment stores a page's
@@ -72,19 +80,19 @@ pub struct FilteredReader {
     coordinator: Arc<IggyClient>,
     consumer: FilterConsumer,
     // The request every read sends, with the partition and the start set per
-    // read, so the filter is encoded without a copy.
+    // read.
     request: FilteredPollRequest,
-    inline_digest: Option<Digest32>,
     idle_interval: Duration,
+    retry_interval: Duration,
     max_unacked_pages: usize,
+    #[cfg(feature = "filters")]
     guard: Option<LocalGuard>,
+    #[cfg(feature = "filters")]
     guard_enabled: bool,
     membership: Option<Membership>,
-    // Set for an independent reader of every partition, which lists the topic
-    // again so it also reads partitions added after the build.
-    listed_at: Option<Instant>,
     partitions: BTreeMap<u32, PartitionProgress>,
     revoked: BTreeSet<u32>,
+    selected_partitions: BTreeSet<u32>,
     routes: Routes,
     // Data connections opened by routes this reader already retired on a rejoin.
     retired_connections: u64,
@@ -141,6 +149,19 @@ impl SourceIncarnation {
     }
 }
 
+impl SourceIncarnation {
+    /// The exact identity of group `group_id` inside this incarnation.
+    pub(crate) const fn identity(self, group_id: u64) -> laser_wire::filter::FilterGroupIdentity {
+        laser_wire::filter::FilterGroupIdentity {
+            stream_id: self.stream_id,
+            stream_created_at_micros: self.stream_created_at_micros,
+            topic_id: self.topic_id,
+            topic_created_at_micros: self.topic_created_at_micros,
+            group_id,
+        }
+    }
+}
+
 impl From<SourceGeneration> for SourceIncarnation {
     fn from(generation: SourceGeneration) -> Self {
         Self {
@@ -187,7 +208,26 @@ pub struct MatchedRecord {
     owner: Arc<()>,
 }
 
+/// The handle a delivered record is acknowledged by: the partition read it
+/// came from and the reader membership that read it.
+#[derive(Clone, Debug)]
+pub(crate) struct Delivery {
+    pub(crate) partition_id: u32,
+    pub(crate) offset: u64,
+    sequence: u64,
+    owner: Arc<()>,
+}
+
 impl MatchedRecord {
+    pub(crate) fn delivery(&self) -> Delivery {
+        Delivery {
+            partition_id: self.partition_id,
+            offset: self.offset,
+            sequence: self.sequence,
+            owner: Arc::clone(&self.owner),
+        }
+    }
+
     /// Decode the record's payload as JSON into `T`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, LaserError> {
         serde_json::from_slice(&self.message.payload)
@@ -198,6 +238,15 @@ impl MatchedRecord {
     /// readable, and `message.user_headers_map()` returns the decode error.
     pub fn headers_malformed(&self) -> bool {
         self.message.user_headers_map().is_err()
+    }
+}
+
+impl Delivery {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.partition_id == other.partition_id
+            && self.offset == other.offset
+            && self.sequence == other.sequence
+            && Arc::ptr_eq(&self.owner, &other.owner)
     }
 }
 
@@ -217,81 +266,35 @@ enum Round {
 }
 
 impl<'a> FilteredReaderBuilder<'a> {
-    pub(crate) fn new(laser: &'a Laser, source: FilterSource) -> Self {
+    pub(crate) fn new(
+        laser: &'a Laser,
+        source: FilterSource,
+        consumer: FilterConsumer,
+        filter: FilterRef,
+        min_catalog_position: Option<CatalogPosition>,
+    ) -> Self {
         Self {
             laser,
             source,
-            consumer: None,
-            partitions: Vec::new(),
-            filter: None,
+            consumer,
+            filter,
+            min_catalog_position,
             start: FilteredStart::Next,
             count: DEFAULT_COUNT,
+            max_examined: None,
             max_reply_bytes: DEFAULT_MAX_REPLY_BYTES,
             read_mode: ReadMode::Primary,
+            #[cfg(feature = "filters")]
             local_guard: false,
             idle_interval: DEFAULT_IDLE_INTERVAL,
+            retry_interval: None,
             max_unacked_pages: DEFAULT_MAX_UNACKED_PAGES,
+            selected_partitions: BTreeSet::new(),
         }
     }
 
-    /// Read as the independent consumer `name`. Its stored offset per
-    /// partition is its progress.
-    #[must_use]
-    pub fn consumer(mut self, name: impl Into<String>) -> Self {
-        self.consumer = Some(FilterConsumer::Consumer(name.into()));
-        self
-    }
-
-    /// Read as a member of the existing consumer group `name`. The group's
-    /// assignment decides the partitions, and its binding the default filter.
-    /// A reader built from a connection string joins over its own connection,
-    /// so every reader is its own member.
-    #[must_use]
-    pub fn group(mut self, name: impl Into<String>) -> Self {
-        self.consumer = Some(FilterConsumer::Group(name.into()));
-        self
-    }
-
-    /// Read the existing group by its native numeric identity.
-    #[must_use]
-    pub fn group_id(mut self, id: u64) -> Self {
-        self.consumer = Some(FilterConsumer::GroupId(id));
-        self
-    }
-
-    /// Read only `partition_id`. Repeat for more. An independent consumer
-    /// reads every partition of the topic when none is named, including
-    /// partitions added later.
-    #[must_use]
-    pub fn partition(mut self, partition_id: u32) -> Self {
-        self.partitions.push(partition_id);
-        self
-    }
-
-    /// Which filter runs. A group defaults to its bound revision.
-    #[must_use]
-    pub fn filter(mut self, filter: FilterRef) -> Self {
-        self.filter = Some(filter);
-        self
-    }
-
-    /// Run `filter` from the request. Needs no catalog.
-    #[must_use]
-    pub fn inline(self, filter: ConsumerFilter) -> Self {
-        self.filter(FilterRef::Inline(filter))
-    }
-
-    /// Run a saved revision.
-    #[must_use]
-    pub fn revision(self, filter_id: u32, revision: u32) -> Self {
-        self.filter(FilterRef::Revision {
-            filter_id,
-            revision,
-        })
-    }
-
     /// Where each partition read at the build starts. Defaults to after the
-    /// stored offset. A partition a group hands this reader later always
+    /// stored offset. A partition the group hands this reader later always
     /// resumes after the group's stored offset, so the backlog the previous
     /// owner left unacknowledged is read, not skipped.
     #[must_use]
@@ -300,10 +303,28 @@ impl<'a> FilteredReaderBuilder<'a> {
         self
     }
 
+    /// Restrict reads to this partition when the group assigns it to this
+    /// member. Repeat for several partitions. Native ownership stays unchanged.
+    #[must_use]
+    pub fn partition(mut self, partition_id: u32) -> Self {
+        self.selected_partitions.insert(partition_id);
+        self
+    }
+
     /// Most matching records per page.
     #[must_use]
     pub fn count(mut self, count: u32) -> Self {
         self.count = count;
+        self
+    }
+
+    /// Most source records one page examines, independent of
+    /// [`count`](Self::count). Without it the server's own budget bounds the
+    /// scan. A page that examines its budget without a match returns empty
+    /// and the reader continues from where it stopped.
+    #[must_use]
+    pub fn max_examined(mut self, records: u32) -> Self {
+        self.max_examined = Some(records);
         self
     }
 
@@ -326,6 +347,7 @@ impl<'a> FilteredReaderBuilder<'a> {
 
     /// Re-evaluate every returned record locally with the shared evaluator
     /// and fail the page on any disagreement, before the caller sees it.
+    #[cfg(feature = "filters")]
     #[must_use]
     pub fn local_guard(mut self, enabled: bool) -> Self {
         self.local_guard = enabled;
@@ -333,11 +355,19 @@ impl<'a> FilteredReaderBuilder<'a> {
     }
 
     /// How long [`FilteredReader::next_page`] waits after a round that found
-    /// nothing new, and how long a failing or blocked partition waits before
-    /// it is read again.
+    /// nothing new, and how long a blocked partition waits before it is read
+    /// again.
     #[must_use]
     pub fn idle_interval(mut self, interval: Duration) -> Self {
         self.idle_interval = interval;
+        self
+    }
+
+    /// How long a partition whose read failed waits before it is read again.
+    /// Defaults to the idle interval.
+    #[must_use]
+    pub(crate) fn retry_interval(mut self, interval: Duration) -> Self {
+        self.retry_interval = Some(interval);
         self
     }
 
@@ -355,101 +385,66 @@ impl<'a> FilteredReaderBuilder<'a> {
             return Err(LaserError::Config("max_unacked_pages must be positive"));
         }
         let capabilities = self.laser.capabilities().await;
-        if !capabilities.filters.native {
+        if !matches!(self.filter, FilterRef::Group) && !capabilities.filters.native {
             return Err(LaserError::unsupported(
                 "filters",
                 "consumer filters are not served by this server",
             ));
         }
-        if let Some(FilterRef::Inline(inline)) = &self.filter
-            && !capabilities
-                .filters
-                .evaluates(inline.evaluator_version, inline.codec)
-        {
-            return Err(LaserError::unsupported(
+        if matches!(self.filter, FilterRef::Group) && !capabilities.filters.group_policy_reads {
+            return Err(LaserError::unsupported_feature(
                 "filters",
-                format!(
-                    "this server does not evaluate {:?} filters of evaluator version {}",
-                    inline.codec, inline.evaluator_version
-                ),
+                "group_policy_reads",
+                "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK",
             ));
         }
         if self.read_mode == ReadMode::Primary && self.laser.connection_string().is_none() {
             return Err(LaserError::Config(
-                "primary filtered reads open data connections, so they need a Laser built from a connection string. Read in ReadMode::Local for a bring-your-own client",
+                "primary group reads open data connections, so they need a Laser built from a connection string. Read in ReadMode::Local for a bring-your-own client",
             ));
         }
-        let consumer = self.consumer.ok_or(LaserError::Config(
-            "a filtered reader needs .consumer(name), .group(name), or .group_id(id)",
-        ))?;
-        let filter = match (self.filter, &consumer) {
-            (Some(filter), _) => filter,
-            (None, FilterConsumer::Group(_) | FilterConsumer::GroupId(_)) => FilterRef::Bound,
-            (None, FilterConsumer::Consumer(_)) => {
-                return Err(LaserError::Config(
-                    "an independent filtered reader needs .inline(..), .revision(..), or .filter(..)",
-                ));
-            }
-        };
+        let consumer = self.consumer;
         let request = FilteredPollRequest {
             v: FILTER_OP_VERSION,
             source: self.source,
             partition_id: 0,
             consumer: consumer.clone(),
-            filter,
+            filter: self.filter,
             start: self.start.clone(),
             count: self.count,
             max_reply_bytes: self.max_reply_bytes,
             read_mode: self.read_mode,
+            max_examined: self.max_examined,
+            min_catalog_position: self.min_catalog_position,
         };
         request.validate()?;
-        let inline_digest = match &request.filter {
-            FilterRef::Inline(filter) => Some(filter.digest()),
-            _ => None,
-        };
-        let guard = if self.local_guard && !matches!(request.filter, FilterRef::Bound) {
-            let definition = definition(self.laser, &request.filter).await?;
-            Some(LocalGuard::load(self.laser, &definition).await?)
-        } else {
-            None
-        };
         let pinned_source = if matches!(consumer, FilterConsumer::GroupId(_)) {
             Some(SourceIncarnation::read(&self.laser.client(), &request.source).await?)
         } else {
             None
         };
-        let coordinator = match (&consumer, self.laser.connection_string()) {
-            (FilterConsumer::Group(_) | FilterConsumer::GroupId(_), Some(connection_string)) => {
+        // A group reader owns the connection that holds its membership, so
+        // two readers are two members. Without a connection string the
+        // shared client is the only one there is.
+        let coordinator = match self.laser.connection_string() {
+            Some(connection_string) => {
                 let client =
                     IggyClientBuilder::from_connection_string(connection_string)?.build()?;
                 client.connect().await?;
                 Arc::new(client)
             }
-            _ => self.laser.client(),
+            None => self.laser.client(),
         };
-        let (membership, listed_at, partition_ids) = match &consumer {
-            FilterConsumer::Group(_) | FilterConsumer::GroupId(_) => {
-                if !self.partitions.is_empty() {
-                    return Err(LaserError::Config(
-                        "a group reader reads the partitions the group assigns it",
-                    ));
-                }
-                let membership =
-                    Membership::join(&coordinator, &request.source, &consumer, pinned_source)
-                        .await?;
-                let assigned = membership.partitions().to_vec();
-                (Some(membership), None, assigned)
-            }
-            FilterConsumer::Consumer(_) if self.partitions.is_empty() => (
-                None,
-                Some(Instant::now()),
-                topic_partitions(self.laser, &request.source).await?,
-            ),
-            FilterConsumer::Consumer(_) => (None, None, self.partitions),
-        };
-        let partitions = partition_ids
-            .into_iter()
-            .map(|partition_id| (partition_id, PartitionProgress::new(self.start.clone())))
+        let membership =
+            Membership::join(&coordinator, &request.source, &consumer, pinned_source).await?;
+        let partitions = membership
+            .partitions()
+            .iter()
+            .filter(|partition_id| {
+                self.selected_partitions.is_empty()
+                    || self.selected_partitions.contains(partition_id)
+            })
+            .map(|partition_id| (*partition_id, PartitionProgress::new(self.start.clone())))
             .collect();
         Ok(FilteredReader {
             owner: Arc::new(()),
@@ -457,15 +452,17 @@ impl<'a> FilteredReaderBuilder<'a> {
             coordinator,
             consumer,
             request,
-            inline_digest,
             idle_interval: self.idle_interval,
+            retry_interval: self.retry_interval.unwrap_or(self.idle_interval),
             max_unacked_pages: self.max_unacked_pages,
-            guard,
+            #[cfg(feature = "filters")]
+            guard: None,
+            #[cfg(feature = "filters")]
             guard_enabled: self.local_guard,
-            membership,
-            listed_at,
+            membership: Some(membership),
             partitions,
             revoked: BTreeSet::new(),
+            selected_partitions: self.selected_partitions,
             routes: Routes::default(),
             retired_connections: 0,
             cursor: 0,
@@ -545,6 +542,14 @@ impl FilteredReader {
                 .is_some_and(|progress| progress.knows(page.sequence))
     }
 
+    pub(crate) fn owns_record(&self, record: &MatchedRecord) -> bool {
+        Arc::ptr_eq(&self.owner, &record.owner)
+            && self
+                .partitions
+                .get(&record.partition_id)
+                .is_some_and(|progress| progress.knows(record.sequence))
+    }
+
     /// The next matching record, one at a time over [`next_page`](Self::next_page).
     pub async fn next_record(&mut self) -> Result<MatchedRecord, LaserError> {
         loop {
@@ -593,6 +598,52 @@ impl FilteredReader {
         self.progress(page.partition_id)?
             .complete_page(page.sequence);
         self.flush(page.partition_id).await
+    }
+
+    /// Mark the partition's records through `delivery` handled without
+    /// storing yet. The normal consumer yields in order, so every yield
+    /// completes the prefix through it, also inside a page, and its automatic
+    /// commit policies store that prefix on their own cadence through
+    /// [`flush_completed`](Self::flush_completed).
+    pub(crate) fn handled(&mut self, delivery: &Delivery) {
+        if !Arc::ptr_eq(&self.owner, &delivery.owner) {
+            return;
+        }
+        if let Some(progress) = self.partitions.get_mut(&delivery.partition_id) {
+            progress.complete_through(delivery.sequence, delivery.offset);
+        }
+    }
+
+    /// Acknowledge every record on the partition through `delivery`, the
+    /// normal consumer's manual commit.
+    pub(crate) async fn ack_through_delivery(
+        &mut self,
+        delivery: &Delivery,
+    ) -> Result<(), LaserError> {
+        self.require_acknowledgments()?;
+        self.require_owner(&delivery.owner)?;
+        self.require_sequence(delivery.partition_id, delivery.sequence)?;
+        if !self
+            .progress(delivery.partition_id)?
+            .complete_through(delivery.sequence, delivery.offset)
+        {
+            return Err(LaserError::Invalid(
+                "the record is past the page acknowledgment boundary".to_owned(),
+            ));
+        }
+        self.flush(delivery.partition_id).await
+    }
+
+    /// The newest offset this reader stored per partition.
+    pub(crate) fn stored_offsets(&self) -> BTreeMap<u32, u64> {
+        self.partitions
+            .iter()
+            .filter_map(|(partition_id, progress)| {
+                progress
+                    .stored_offset()
+                    .map(|offset| (*partition_id, offset))
+            })
+            .collect()
     }
 
     /// Data connections this reader opened to partition primaries. A healthy
@@ -657,12 +708,6 @@ impl FilteredReader {
         if self.membership.as_ref().is_some_and(Membership::is_due) {
             self.refresh_membership().await?;
         }
-        if self
-            .listed_at
-            .is_some_and(|listed_at| listed_at.elapsed() >= ASSIGNMENT_REFRESH)
-        {
-            self.refresh_partitions().await?;
-        }
         let readable = self.partitions();
         if readable.is_empty() {
             return Ok(Round::Idle);
@@ -686,7 +731,7 @@ impl FilteredReader {
                 Ok(Read::Empty { more }) => busy |= more,
                 Ok(Read::Saturated) => saturated.push(partition_id),
                 Err(error) => {
-                    let retry_at = now + self.idle_interval;
+                    let retry_at = now + self.retry_interval;
                     if let Ok(progress) = self.progress(partition_id) {
                         progress.defer(retry_at);
                     }
@@ -744,22 +789,25 @@ impl FilteredReader {
         }
         validate_record_body(&self.request, &page)?;
         let polled = PolledMessages::from_bytes(Bytes::from(std::mem::take(&mut page.records)))?;
-        validate_page(&self.request, self.inline_digest.as_ref(), &page, &polled)?;
+        validate_page(&self.request, &page, &polled)?;
         self.pin_source(&page)?;
         let messages = polled.messages;
-        if self.guard_enabled && self.guard.is_none() {
-            self.guard = Some(
-                LocalGuard::load(
-                    &self.laser,
-                    &bound_definition(&self.laser, &page, &self.request.source).await?,
-                )
-                .await?,
-            );
-        }
-        if let Some(guard) = &self.guard
-            && let Err(error) = guard.check(&page, &messages)
-        {
-            return Err(self.restart_after(partition_id, error));
+        #[cfg(feature = "filters")]
+        if page.policy.mode.is_filtered() {
+            if self.guard_enabled && self.guard.is_none() {
+                self.guard = Some(
+                    LocalGuard::load(
+                        &self.laser,
+                        &bound_definition(&self.laser, &page, &self.request.source).await?,
+                    )
+                    .await?,
+                );
+            }
+            if let Some(guard) = &self.guard
+                && let Err(error) = guard.check(&page, &messages)
+            {
+                return Err(self.restart_after(partition_id, error));
+            }
         }
         self.sequence += 1;
         let sequence = self.sequence;
@@ -799,7 +847,8 @@ impl FilteredReader {
                 partition_id,
                 offset: message.header.offset,
                 frontier: page.frontier,
-                evaluated: !unevaluated.contains(&message.header.offset),
+                evaluated: page.policy.mode.is_filtered()
+                    && !unevaluated.contains(&message.header.offset),
                 message,
                 sequence,
                 owner: Arc::clone(&self.owner),
@@ -843,10 +892,10 @@ impl FilteredReader {
         {
             membership.expire();
         }
-        if matches!(self.request.filter, FilterRef::Bound) {
+        #[cfg(feature = "filters")]
+        {
             self.guard = None;
         }
-
         error
     }
 
@@ -867,6 +916,8 @@ impl FilteredReader {
             generation: target.generation,
             digest: target.digest.clone(),
             offset: target.offset,
+            mode: target.mode,
+            policy_generation: target.policy_generation,
         };
         let payload = encode_named(&ack)
             .map_err(|error| LaserError::Codec(format!("encode filter request: {error}")))?;
@@ -895,7 +946,7 @@ impl FilteredReader {
                 }
                 Ok(_) => return Err(unexpected("filtered acknowledgment")),
                 Err(error) if is_route_lost(&error) && !rerouted => rerouted = true,
-                Err(error) => return Err(error),
+                Err(error) => return Err(self.restart_after(partition_id, error)),
             }
         }
     }
@@ -959,7 +1010,14 @@ impl FilteredReader {
         if !membership.sync(&self.coordinator).await? {
             return Ok(());
         }
-        let assigned: BTreeSet<u32> = membership.partitions().iter().copied().collect();
+        let assigned: BTreeSet<u32> = membership
+            .partitions()
+            .iter()
+            .copied()
+            .filter(|partition| {
+                self.selected_partitions.is_empty() || self.selected_partitions.contains(partition)
+            })
+            .collect();
         let stale_routes = if membership.take_rejoined() {
             self.owner = Arc::new(());
             self.partitions.clear();
@@ -992,8 +1050,9 @@ impl FilteredReader {
                     .insert(partition_id, PartitionProgress::new(FilteredStart::Next));
             }
         }
-        if stale_routes.is_some() && matches!(self.request.filter, FilterRef::Bound) {
-            // A rejoin can land in a recreated group with another binding.
+        // A rejoin can land in a recreated group with another binding.
+        #[cfg(feature = "filters")]
+        if stale_routes.is_some() {
             self.guard = None;
         }
         let retired: Vec<_> = left
@@ -1006,21 +1065,6 @@ impl FilteredReader {
         }
         for client in retired {
             let _ = client.shutdown().await;
-        }
-        Ok(())
-    }
-
-    // An independent reader of every partition picks up partitions added to
-    // the topic since the build. They start at `Next`: the build's start names
-    // a position in the partitions that existed then, and an `Offset` start
-    // applied to a new partition would skip its first records.
-    async fn refresh_partitions(&mut self) -> Result<(), LaserError> {
-        let listed = topic_partitions(&self.laser, &self.request.source).await?;
-        self.listed_at = Some(Instant::now());
-        for partition_id in listed {
-            self.partitions
-                .entry(partition_id)
-                .or_insert_with(|| PartitionProgress::new(FilteredStart::Next));
         }
         Ok(())
     }
@@ -1110,6 +1154,7 @@ impl FilteredReader {
 }
 
 // The full definition a reader executes, for the local guard.
+#[cfg(feature = "filters")]
 async fn bound_definition(
     laser: &Laser,
     page: &FilteredPage,
@@ -1135,7 +1180,7 @@ async fn bound_definition(
                 && id.topic_id == source.topic_id
                 && id.topic_created_at_micros == source.topic_created_at_micros
         }) {
-            if binding.digest != page.policy.digest {
+            if Some(&binding.digest) != page.policy.digest.as_ref() {
                 return Err(LaserError::Protocol(
                     "served policy differs from the group's catalog binding".to_owned(),
                 ));
@@ -1160,6 +1205,7 @@ async fn bound_definition(
     .into())
 }
 
+#[cfg(feature = "filters")]
 async fn definition(laser: &Laser, filter: &FilterRef) -> Result<ConsumerFilter, LaserError> {
     let (filter_id, revision) = match filter {
         FilterRef::Inline(filter) => return Ok(filter.clone()),
@@ -1167,9 +1213,9 @@ async fn definition(laser: &Laser, filter: &FilterRef) -> Result<ConsumerFilter,
             filter_id,
             revision,
         } => (*filter_id, *revision),
-        FilterRef::Bound => {
+        FilterRef::Bound | FilterRef::Group => {
             return Err(LaserError::Config(
-                "resolve a bound guard from the served page",
+                "resolve a group guard from the served page",
             ));
         }
     };
@@ -1195,17 +1241,6 @@ async fn definition(laser: &Laser, filter: &FilterRef) -> Result<ConsumerFilter,
             .into());
         }
     }
-}
-
-async fn topic_partitions(laser: &Laser, source: &FilterSource) -> Result<Vec<u32>, LaserError> {
-    let stream = Identifier::named(&source.stream)?;
-    let topic = Identifier::named(&source.topic)?;
-    let details = laser
-        .client()
-        .get_topic(&stream, &topic)
-        .await?
-        .ok_or_else(|| IggyError::TopicNameNotFound(source.topic.clone(), source.stream.clone()))?;
-    Ok((0..details.partitions_count).collect())
 }
 
 // The data connection no longer reaches the partition primary for this
@@ -1283,7 +1318,6 @@ fn validate_record_body(
 
 fn validate_page(
     request: &FilteredPollRequest,
-    inline_digest: Option<&Digest32>,
     page: &FilteredPage,
     polled: &PolledMessages,
 ) -> Result<(), LaserError> {
@@ -1298,9 +1332,26 @@ fn validate_page(
         || polled.current_offset != page.frontier
         || page.matched as usize != polled.messages.len()
         || page.matched > page.examined
-        || page.policy.digest.validate().is_err()
+        || request
+            .max_examined
+            .is_some_and(|maximum| page.examined > maximum)
+        || page.policy.validate().is_err()
     {
         return Err(invalid());
+    }
+    // A strict group read runs a binding. An unfiltered page is the whole
+    // examined range, so nothing was selected out of it.
+    match page.policy.mode {
+        ExecutionMode::Filtered => {}
+        ExecutionMode::Unfiltered
+            if matches!(request.filter, FilterRef::Bound)
+                || page.matched != page.examined
+                || page.policy.filter_id.is_some()
+                || page.policy.revision.is_some() =>
+        {
+            return Err(invalid());
+        }
+        ExecutionMode::Unfiltered => {}
     }
     if let FilterConsumer::GroupId(id) = request.consumer
         && page.policy.group_id != Some(id)
@@ -1312,23 +1363,14 @@ fn validate_page(
     if request.consumer.is_group() != page.policy.group_id.is_some() {
         return Err(invalid());
     }
-    if inline_digest.is_some_and(|digest| *digest != page.policy.digest) {
-        return Err(invalid());
-    }
-    if let FilterRef::Revision {
-        filter_id,
-        revision,
-    } = &request.filter
-        && (page.policy.filter_id != Some(*filter_id) || page.policy.revision != Some(*revision))
-    {
-        return Err(invalid());
-    }
     let start = match &request.start {
         FilteredStart::Continue(cursor) => {
             if cursor.generation != page.generation
                 || cursor.digest != page.policy.digest
                 || cursor.group_id != page.policy.group_id
                 || cursor.read_mode != request.read_mode
+                || cursor.mode != page.policy.mode
+                || cursor.policy_generation != page.policy.policy_generation
             {
                 return Err(invalid());
             }
@@ -1407,7 +1449,7 @@ mod tests {
     use laser_wire::filter::{FilterExpr, FilteredPage};
 
     fn sample() -> (FilteredPollRequest, FilteredPage, PolledMessages) {
-        let filter = ConsumerFilter::json(FilterExpr::present("mode"));
+        let filter = laser_wire::filter::ConsumerFilter::json(FilterExpr::present("mode"));
         let request = FilteredPollRequest {
             v: FILTER_OP_VERSION,
             source: FilterSource {
@@ -1415,21 +1457,25 @@ mod tests {
                 topic: "fleet_changes".to_owned(),
             },
             partition_id: 0,
-            consumer: FilterConsumer::Consumer("reader".to_owned()),
-            filter: FilterRef::Inline(filter.clone()),
+            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+            filter: FilterRef::Bound,
             start: FilteredStart::First,
             count: 10,
             max_reply_bytes: 1024,
             read_mode: ReadMode::Primary,
+            max_examined: None,
+            min_catalog_position: None,
         };
         let page = FilteredPage {
             v: FILTER_OP_VERSION,
             partition_id: 0,
             policy: AppliedPolicy {
-                group_id: None,
-                digest: filter.digest(),
-                filter_id: None,
-                revision: None,
+                group_id: Some(9),
+                digest: Some(filter.digest()),
+                filter_id: Some(1),
+                revision: Some(1),
+                mode: ExecutionMode::Filtered,
+                policy_generation: 1,
             },
             generation: SourceGeneration {
                 stream_id: 1,
@@ -1464,37 +1510,81 @@ mod tests {
     #[test]
     fn given_empty_scanned_pages_when_validated_then_should_accept_only_consistent_progress() {
         let (request, page, polled) = sample();
-        let digest = page.policy.digest.clone();
-        validate_page(&request, Some(&digest), &page, &polled).expect("valid scanned range");
+        validate_page(&request, &page, &polled).expect("valid scanned range");
         let mut malformed = page.clone();
         malformed.safe_ack_offset = Some(10);
-        assert!(validate_page(&request, Some(&digest), &malformed, &polled).is_err());
+        assert!(validate_page(&request, &malformed, &polled).is_err());
         malformed = page.clone();
         malformed.read_mode = ReadMode::Local;
-        assert!(validate_page(&request, Some(&digest), &malformed, &polled).is_err());
+        assert!(validate_page(&request, &malformed, &polled).is_err());
         malformed = page.clone();
-        malformed.policy.digest = ConsumerFilter::json(FilterExpr::present("other")).digest();
-        assert!(validate_page(&request, Some(&digest), &malformed, &polled).is_err());
+        malformed.policy.digest = None;
+        assert!(
+            validate_page(&request, &malformed, &polled).is_err(),
+            "a filtered page names the digest it ran"
+        );
         malformed = page.clone();
         malformed.partition_id = 1;
-        assert!(validate_page(&request, Some(&digest), &malformed, &polled).is_err());
+        assert!(validate_page(&request, &malformed, &polled).is_err());
         malformed = page;
         malformed.examined = 0;
-        assert!(validate_page(&request, Some(&digest), &malformed, &polled).is_err());
+        assert!(validate_page(&request, &malformed, &polled).is_err());
     }
 
     #[test]
-    fn given_a_continuation_when_the_reply_changes_history_then_should_reject() {
+    fn given_an_unfiltered_page_when_validated_then_should_need_a_group_read_without_a_digest() {
         let (mut request, mut page, polled) = sample();
-        request.start = FilteredStart::Continue(laser_wire::filter::Continuation {
-            group_id: None,
+        page.policy = AppliedPolicy::unfiltered(9, 0);
+        page.matched = 0;
+        page.examined = 0;
+        page.safe_ack_offset = None;
+        page.next_scan_offset = Some(0);
+        assert!(
+            validate_page(&request, &page, &polled).is_err(),
+            "a strict read never accepts an unfiltered page"
+        );
+        request.filter = FilterRef::Group;
+        validate_page(&request, &page, &polled).expect("an automatic read may run unfiltered");
+        page.examined = 3;
+        page.next_scan_offset = Some(3);
+        page.safe_ack_offset = Some(2);
+        assert!(
+            validate_page(&request, &page, &polled).is_err(),
+            "an unfiltered page delivers everything it examined"
+        );
+    }
+
+    #[test]
+    fn given_a_continuation_when_the_reply_changes_history_or_policy_then_should_reject() {
+        let (mut request, mut page, polled) = sample();
+        let cursor = laser_wire::filter::Continuation {
+            group_id: Some(9),
             next_scan_offset: 0,
             generation: page.generation,
             digest: page.policy.digest.clone(),
             read_mode: ReadMode::Primary,
-        });
+            mode: ExecutionMode::Filtered,
+            policy_generation: 1,
+        };
+        request.start = FilteredStart::Continue(cursor.clone());
+        validate_page(&request, &page, &polled).expect("the same history and policy continue");
         page.generation.purge_generation = 1;
-        assert!(validate_page(&request, None, &page, &polled).is_err());
+        assert!(validate_page(&request, &page, &polled).is_err());
+        page.generation.purge_generation = 0;
+        page.policy.policy_generation = 2;
+        assert!(
+            validate_page(&request, &page, &polled).is_err(),
+            "a page under another policy generation does not continue this cursor"
+        );
+    }
+
+    #[test]
+    fn given_an_examined_limit_when_a_reply_exceeds_it_then_should_refuse_the_page() {
+        let (mut request, page, polled) = sample();
+        request.max_examined = Some(page.examined);
+        validate_page(&request, &page, &polled).expect("the scan reaches its limit");
+        request.max_examined = Some(page.examined - 1);
+        assert!(validate_page(&request, &page, &polled).is_err());
     }
 
     #[test]
@@ -1511,10 +1601,10 @@ mod tests {
         request.read_mode = ReadMode::Local;
         page.read_mode = ReadMode::Local;
         page.safe_ack_offset = None;
-        validate_page(&request, None, &page, &polled).expect("a scanned local page");
+        validate_page(&request, &page, &polled).expect("a scanned local page");
         page.safe_ack_offset = Some(9);
         assert!(
-            validate_page(&request, None, &page, &polled).is_err(),
+            validate_page(&request, &page, &polled).is_err(),
             "a local page never offers an acknowledgment"
         );
     }
@@ -1525,8 +1615,8 @@ mod tests {
         page.examined = 0;
         page.safe_ack_offset = None;
         page.next_scan_offset = Some(0);
-        validate_page(&request, None, &page, &polled).expect("an empty scan repeats its start");
+        validate_page(&request, &page, &polled).expect("an empty scan repeats its start");
         page.next_scan_offset = Some(5);
-        assert!(validate_page(&request, None, &page, &polled).is_err());
+        assert!(validate_page(&request, &page, &polled).is_err());
     }
 }

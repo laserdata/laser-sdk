@@ -5,6 +5,7 @@ mod async_bridge;
 mod blob;
 mod chunks;
 mod client;
+mod consumer_group;
 mod context;
 mod convert;
 mod crash_context;
@@ -73,7 +74,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<kv::PyKvSet>()?;
     module.add_class::<kv::PyKvScan>()?;
     module.add_class::<kv::PyKvDeleteMany>()?;
-    module.add_class::<filters::PyFilters>()?;
+    module.add_class::<consumer_group::PyConsumerGroup>()?;
+    module.add_class::<consumer_group::PyGroupFilter>()?;
     module.add_class::<filters::PyFilterExpr>()?;
     module.add_class::<filters::PyConsumerFilter>()?;
     module.add_class::<filters::PyFilteredReader>()?;

@@ -16,6 +16,7 @@ export {
   KvExecutionError,
   ForkExecutionError,
   AuthzExecutionError,
+  ConsumerGroupSetupError,
   FilterExecutionError,
   FilterStopError,
   AgentWorkflowExecutionError,
@@ -129,12 +130,10 @@ export {
   DEFAULT_OUTCOME_WAIT_MS,
   FilteredReader,
   FilteredReaderBuilder,
-  Filters,
   READER_TAG
 } from "./managed/filters.js"
 export type {
   CatalogPageOptions,
-  FilterListOptions,
   FilterPreviewOptions,
   FilterTransport,
   MatchedPage,
@@ -154,9 +153,11 @@ export {
 export type {
   AckReceipt,
   AppliedPolicy,
+  CatalogPosition,
   Coerce,
   CoercedPredicate,
   Continuation,
+  ExecutionMode,
   ExplainNode,
   FaultPolicy,
   FaultReason,
@@ -543,6 +544,12 @@ export { Topic } from "./stream/topic.js"
 export type { TopicEnsureOptions } from "./stream/topic.js"
 export { Consumer } from "./stream/consumer.js"
 export type { ConsumedMessage, ConsumerOptions } from "./stream/consumer.js"
+export { ConsumerGroup, GroupFilter } from "./stream/consumer-group.js"
+export type {
+  ConsumerGroupInfo,
+  CreateConsumerGroupOptions,
+  GroupTarget
+} from "./stream/consumer-group.js"
 export type { PollingStrategy } from "./stream/polling-strategy.js"
 export { Producer } from "./stream/producer.js"
 export type { ProducerMessage, ProducerOptions, ProducerSendOptions } from "./stream/producer.js"

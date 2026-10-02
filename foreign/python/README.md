@@ -4,7 +4,7 @@ This package provides the Python Laser SDK for Apache Iggy. [LaserData, Inc.](ht
 
 Rust and Python share the data contract and Rust implementation. The bindings expose Python forms of the SDK operations, configuration, and errors. Shared examples and behavior scenarios cover language-neutral behavior.
 
-> The current release is `0.5.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.1`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` separates agent identity from its consumer group. The default group uses the agent ID spelling. Set `consumer_group` when the deployment needs a different group.
 
@@ -271,7 +271,7 @@ Renew a lease before its granted lifetime expires. Reacquisition does not extend
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
-A consumer filter runs on the streaming server, so a reader receives only the records it selects, with their original offsets:
+Configure a consumer group's policy once. Its ordinary consumers and page readers then use that saved policy. An unbound group receives all records without payload decoding.
 
 ```python
 safe_mode = ls.ConsumerFilter.json(
@@ -283,18 +283,27 @@ safe_mode = ls.ConsumerFilter.json(
         ]
     )
 )
-reader = await laser.filters().reader(
-    "orbit", "fleet_changes", consumer="anomaly-desk", filter=safe_mode, start="first"
-)
+topic = laser.stream("orbit").topic("fleet_changes")
+group = topic.consumer_group("anomaly-desk")
+await group.create(filter=safe_mode)  # Run once during setup.
+
+# Every consumer instance needs only the group name or the returned group ID.
+consumer = group.consumer(batch_length=100, auto_commit="disabled")
 try:
-    record = await reader.next_record()
-    print(record.partition_id, record.offset, record.message.payload)
-    await reader.ack(record)
+    record = await consumer.next()
+    print(record.partition_id, record.offset, record.payload)
+    await consumer.commit(record)
 finally:
-    await reader.close()
+    await consumer.shutdown()
 ```
 
-Use `next_page()` and `ack_page()` for batch handling. A page is a bounded poll result, not a separate transport. Pass `group=` or `group_id=` instead of `consumer=` to read a consumer group's assigned partitions. An acknowledgment stores a page's safe offset only after every earlier page is handled. `laser.filters().preview(..)` and `test(..)` judge records without storing progress, and `ConsumerFilter.evaluate(payload)` runs the same evaluator locally, with `explain(payload)` returning the verdict and its explanation tree. `with_fault_policy`, `with_foreign_policy`, and `with_mismatch_policy` decide what a record that does not decode, has another codec, or has a field of an unexpected type does. With a managed plane, `register`, `revise`, `describe`, `create_consumer_group`, `bind`, `unbind`, `unbind_binding`, `set_revision_enabled`, `archive`, and `delete` manage saved filters and group bindings, and `apply_as` or `mutate` with `wait_for_outcome` resume a mutation under a recorded operation id. Failures raise `FilterError` with a `reason`. A fault or oversized-record stop also sets `partition_id` and `offset`, and a fault stop sets `fault_reason`. Unknown header value kinds remain raw bytes. Malformed entries set `headers_malformed` while valid headers and the payload remain readable. A structurally truncated block has empty `message.headers`. A `next_record` call cancelled after it read a record yields that record again on the next call.
+**`batch_length=100` examines at most 100 source records per partition request.** It may deliver fewer matches, including none. An empty scan advances over rejected records and does not mean end of stream. The consumer continues bounded scans and waits only when caught up. Manual `commit(record)` stores safe contiguous progress after processing. Automatic policies commit the delivered prefix at their configured cadence and at shutdown. The native Apache Iggy path retains its own documented commit timing.
+
+For batch handling, build `await group.reader(count=100, max_examined=1000)`, then use `next_page()` and `ack_page()`. Here `count` limits returned records, while `max_examined` independently limits the scan. An unbound group returns all records. Each reader joins as a member, and Iggy distributes partitions across instances. Acknowledgments preserve pending earlier work and reject stale source or policy generations.
+
+`group.filter()` provides `configure`, `get`, `revisions`, `revise`, `set_revision_enabled`, `release`, `preview` and `test`. Pass `operation_id` to configuration when setup must resume with the same operation ID after a lost reply. `topic.consumer_group_id(id)` addresses the saved group by numeric ID. Catalog failures, denied reads and paused revisions never broaden into unfiltered delivery. Original Apache Iggy uses native group consumption, while an older managed server without group-aware reads returns an explicit upgrade error.
+
+Filters support JSON, CBOR, Avro, Protobuf and typed headers. `ConsumerFilter.evaluate(payload)` runs the evaluator locally, and `explain(payload)` returns its verdict tree. `with_fault_policy`, `with_foreign_policy` and `with_mismatch_policy` control invalid records. Passed invalid records and unfiltered records have `evaluated` false. Failures raise `FilterError` with a `reason`. A fault or oversized stop also sets `partition_id` and `offset`. Unknown header value kinds remain raw bytes. Malformed entries set `headers_malformed` while valid headers and the payload remain readable. A structurally truncated block has empty headers. A `next_record` call cancelled after it read a record yields that record again on the next call.
 
 ## Knowledge graph
 

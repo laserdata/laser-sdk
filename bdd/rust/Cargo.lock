@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "apache-avro",
  "bon",

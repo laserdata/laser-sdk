@@ -1,31 +1,35 @@
 ---
 name: consumer-filters
-description: Server-side consumer filters - `sdk/src/filters/` (feature `filters`) over the `wire/src/filter/` contract, with the TypeScript peer in `foreign/typescript/src/managed/filters.ts` and the Python peer in `foreign/python/src/filters.rs`. Use when changing `Laser::filters()`, the filtered reader and its acknowledgments, previews and tests, the saved-filter catalog and group bindings, the evaluator, or the `cdc` examples. Wire in the AGDX spec section A14
+description: Consumer-group-owned server filtering, normal and advanced group readers, safe progress, revisions and previews across Rust, Python and TypeScript. Use for Topic and ConsumerGroup filter APIs, wire/filter and the CDC examples.
 ---
 
-# Consumer filters
+# Consumer-group filters
 
-A consumer filter selects records on the LaserData Iggy fork before they cross the network. The reader receives only the matching records, with their original offsets, headers, and payload bytes. The fork evaluates the filter next to the data. The saved-filter catalog and consumer group bindings live in `laser-plane`.
+Load the SDK overview first. The public hierarchy is `Laser → stream → topic → producer` and `Laser → stream → topic → consumer group → filter`. There is no public top-level filter service. Pure filter values remain reusable types.
 
-## Where the code is
+## Implementation map
 
-- `wire/src/filter/`: the contract. `expr.rs` holds `ConsumerFilter`, `FilterExpr`, coercions, and the fault, foreign, and mismatch record policies. `text.rs` holds the six text match kinds. `read.rs` holds the filtered poll, acknowledgment, preview, and test types and the reason codes. `catalog.rs` holds saved filters, revisions, bindings, mutations, and outcomes. `headers.rs` holds the typed header dictionary. `codecs.rs` decodes JSON, CBOR, Avro, and Protobuf. `eval.rs` is the compiled evaluator (feature `filter-eval`).
-- `sdk/src/filters/`: `client.rs` (`Filters`: validate, test, preview, the catalog verbs, `apply`, `apply_as`, `wait_for_outcome`), `reader.rs` (`FilteredReaderBuilder`, `FilteredReader`, `MatchedPage`, `MatchedRecord`, `ack`, `ack_through`, `ack_page`, `read_round`, `examined_in_round`, `owns`, the outstanding-page bound `max_unacked_pages`, default 1024), `group.rs` (membership and the rejoin refusal on a recreated source), `guard.rs` (the local re-check), `progress.rs`, `route.rs`.
-- `foreign/typescript/src/wire/filter.ts`, `filter-eval.ts`, `filter-codecs.ts`, and `foreign/typescript/src/managed/filters.ts`. The TypeScript guard refuses regex filters at build.
-- `foreign/python/src/filters.rs` plus the stubs in `foreign/python/laser_sdk.pyi`. Complex shapes cross through serde.
+- `sdk/src/stream/consumer_group.rs` owns group handles, optional setup policies, creation outcomes and group-scoped administration.
+- `sdk/src/stream/transport.rs` owns normal streaming, group-aware delivery, commit policies, cancellation and shutdown.
+- `sdk/src/filters/` holds internal catalog clients, routing, membership, advanced readers, bounded outstanding pages, progress and optional local guards.
+- `wire/src/filter/` defines policies, codecs, requests, replies, revisions and durable operation results. `read.rs` includes automatic group execution, scan ceilings, source history and policy generations.
+- `foreign/python/src/consumer_group.rs`, `filters.rs` and `transport.rs` bind the same behavior through Rust. Regenerate the Python stubs.
+- `foreign/typescript/src/stream/consumer-group.ts`, `consumer.ts`, `managed/filters.ts` and the wire modules implement the native TypeScript peer. Regenerate both API reports.
 
-## Rules
+## Invariants
 
-- Rust defines the behavior. TypeScript and Python expose the same builders, reader methods, catalog verbs, record fields, and error reasons. A change to one language changes all three, the stubs, the TypeScript API reports (`npm run api:report`), and the docs listed below, in one change.
-- Verdicts are identical across languages. Add a case to `wire/fixtures/filter_eval_cases.json` or `filter_codec_cases.json` for every evaluator change and keep `wire/tests/filter_eval_corpus.rs`, the TypeScript wire tests, and the Python corpus test green.
-- Progress is stored only through acknowledgments of completed work. A page from another reader, or from this reader before a rejoin, is refused. Never store an offset the application has not handled.
-- Group bindings are immutable per group incarnation. A numeric group id names one incarnation of a stream and topic, and a recreated source refuses the rejoin.
-- Reason codes, operation versions, and limits are literals pinned by tests. Never bump an op version for an unreleased shape change.
+A normal group consumer executes its group's policy. The advanced group reader does too. An unbound group returns all records without payload evaluation. Explicitly selected saved revisions stay strict. A failed catalog or capability lookup never becomes an unfiltered success.
 
-## Docs that must move with the code
+Normal batch length limits examined source records per partition request. Advanced `count` limits matches, and `max_examined` is independent. Empty scan results keep progress and distinguish remaining work from end of visible data.
 
-`README.md`, `sdk/README.md`, `wire/README.md`, `foreign/typescript/README.md`, `foreign/python/README.md`, `docs/agdx.md` section A14, `docs/tutorial.md` chapter 11, `AGENTS.md`, the `cdc` example READMEs under `examples/*/`, and the published consumer-filters guide.
+Acknowledge only completed contiguous work under the delivered group/source identity, mode and policy generation. Do not commit a record before it is delivered unless an explicitly documented pre-delivery mode requires that behavior. Cancellation must retain recovered deliveries. Do not treat offset zero as an unset checkpoint.
 
-## Examples
+A reused name or offset is not proof of the same history. Catalog freshness uses primary history verification and durable configuration receipts. Group bindings remain immutable per used incarnation. New draft revisions do not activate themselves. Use separate groups for A/B policies.
 
-The `cdc` example exists in Rust, Python, and TypeScript with the same phases in the same order: publish, inline read, sample test, preview, header routing, CBOR, Avro, and Protobuf, catalog, A/B revisions, delete refusal, cleanup. Its figures (4 of 240 records, 424 of 27,953 payload bytes, 98.5%) come from the shared feed generator and are stated identically everywhere.
+Rust defines behavior. Python and TypeScript must implement equivalent limits, errors, setup outcomes, commit timing and lifecycle. Public changes update exports, stubs, API reports and tests together. Keep operation versions at 1.
+
+## Validation and documentation
+
+Use the shared evaluator/codec corpus for verdict parity. Add wire fixtures for intentional shape changes and shared BDD cases for normal and advanced group reads. Verify unbound groups, sparse/empty batches, setup retries, cancellation, multiple members, restart, pause, policy changes and native Iggy compatibility. Cluster claims require actual cluster evidence.
+
+Update root/crate/language READMEs, API documentation, `docs/agdx.md` A14, the tutorial, contributor guidance, focused skills, all three CDC examples and the public Consumer Filters guide. Never describe a proposed endpoint or a skipped test as shipped or passing.

@@ -77,3 +77,7 @@ Connect budgets use Rust `connect_timeout`, Python `connect_timeout_ms`, and Typ
 Exhausted retries return an error for the application to handle. They do not exit the process. Preserve message identity and confirmed chunks across retries. See [publish recovery](../../../docs/publish-recovery.md).
 
 In `foreign/typescript/src/iggy/apache-iggy.ts`, a socket replacement during a leader change does not count as a lost connection. Allow the current send to finish. Run only one publish attempt per connection at a time. The Apache Iggy client resends all queued commands when it changes nodes. A second queued send can return the connection to the metadata leader. The three-node reconnect test depends on both rules.
+
+## Consumer-group filter ownership
+
+Consumer group handles live under topics. Filter setup and revisions live under each group. Normal and advanced consumers use the group's policy and return all records for an authoritatively unbound group. Follow the consumer-filters skill for scan budgets, progress, cancellation, capability failures and cross-language test parity. Do not reintroduce a top-level filter service.

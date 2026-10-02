@@ -266,6 +266,7 @@ async fn live_monitor(laser: &Laser, expected: usize) -> Result<(), LaserError> 
         .stream(stream_for("event-analytics"))
         .topic(TOPIC)
         .consumer_group(LIVE_GROUP)
+        .consumer()
         .commit_policy(CommitPolicy::Polling)
         .start_at(ConsumerStart::Next)
         .poll_interval(Duration::from_millis(5))

@@ -315,6 +315,7 @@ async fn build_book_consumer(laser: &Laser, data_stream: &str) -> Result<Consume
         .stream(data_stream)
         .topic(FEED_TOPIC)
         .consumer_group(FEED_GROUP)
+        .consumer()
         .commit_policy(CommitPolicy::Polling)
         .start_at(ConsumerStart::Next)
         .poll_interval(Duration::from_millis(1))

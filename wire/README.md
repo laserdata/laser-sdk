@@ -82,3 +82,5 @@ Reference files define the expected encoded bytes. If a wire change is intention
 Apache-2.0. Copyright LaserData, Inc.
 
 Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of these marks does not imply endorsement by the Apache Software Foundation.
+
+Consumer-group reads use `FilterRef::Group`. A bound group runs its saved revision, while an explicitly unbound group returns original records without evaluating payloads. Pages, continuations and acknowledgments carry execution mode, policy generation and source identity. `count` limits delivered records and `max_examined` independently limits source records scanned. `CatalogPosition` carries an optional `operation_id` as durable proof of configuration across control-log recreation. JSON encodes this 128-bit ID as decimal text, while CBOR retains the integer. `GROUP_POLICIES_PATH` and `group_policy_path` address the confirmed HTTP group-policy endpoint.

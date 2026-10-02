@@ -7,7 +7,7 @@ import {
   NoStreamError,
   TransportError
 } from "../client/errors.js"
-import { INTERNAL_TRANSPORT } from "../client/internals.js"
+import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import type { IggyHeaderValue, LaserTransport } from "../iggy/apache-iggy.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
@@ -678,11 +678,10 @@ export class ReliableConsumer {
     const pollIntervalMs = this.options.pollIntervalMs ?? 10
     const deduplicator =
       this.options.deduplicator ?? new SlidingWindow(this.options.dedupWindow ?? 10_000)
+    // The runtime owns its delivery contract over the native group consumer.
+    const group = laser.topic(this.options.topic).consumerGroup(this.options.group.asString())
     const openConsumer = (): Promise<Consumer> =>
-      laser.topic(this.options.topic).consumerGroup(this.options.group.asString(), {
-        autoCommit: false,
-        pollIntervalMs
-      })
+      group[INTERNAL_NATIVE_CONSUMER]({ autoCommit: false, pollIntervalMs })
     let consumer = await openConsumer()
     if (this.options.warmDedup === true) {
       await this.warmDedup(laser, deduplicator, this.options.dedupWindow ?? 10_000)

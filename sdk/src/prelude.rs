@@ -22,8 +22,8 @@ pub use crate::context_scope::{ContextScope, ScopedMemory};
 pub use crate::cursor::Cursor;
 #[cfg(feature = "destinations")]
 pub use crate::destinations::Destinations;
-#[cfg(feature = "filters")]
-pub use crate::filters::{FilteredReader, Filters};
+#[cfg(feature = "streaming")]
+pub use crate::filters::FilteredReader;
 #[cfg(feature = "fork")]
 pub use crate::fork::ForkHandle;
 #[cfg(feature = "kv")]
@@ -44,8 +44,9 @@ pub use crate::runs::Runs;
 pub use crate::stream::ContentType;
 #[cfg(feature = "streaming")]
 pub use crate::stream::{
-    CommitPolicy, Consumer, ConsumerMessage, ConsumerStart, Producer, ProducerMessage, Routing,
-    SendMessagesConfirmationResponse, SendMessagesResponse, Stream, Topic,
+    CommitPolicy, Consumer, ConsumerGroup, ConsumerMessage, ConsumerStart, GroupFilter, Producer,
+    ProducerMessage, Routing, SendMessagesConfirmationResponse, SendMessagesResponse, Stream,
+    Topic,
 };
 #[cfg(feature = "streaming")]
 pub use crate::typed::{TypedDecodeError, TypedRecord, TypedRecords, TypedTopic};
@@ -90,10 +91,11 @@ pub mod full {
     pub use crate::context::{
         Chain, ContextAssembler, ContextMessage, ContextPolicy, LastN, RoleFilter, TokenBudget,
     };
-    #[cfg(feature = "filters")]
+    #[cfg(feature = "streaming")]
     pub use crate::filters::{
-        ConsumerFilter, FaultPolicy, FilterBinding, FilterExpr, FilterGroupRef, FilterRef,
-        FilteredReaderBuilder, FilteredStart, MatchedPage, MatchedRecord, ReadMode,
+        ConsumerFilter, ExecutionMode, FaultPolicy, FilterBinding, FilterExpr, FilterGroupRef,
+        FilteredReaderBuilder, FilteredStart, GroupFilterSpec, MatchedPage, MatchedRecord,
+        ReadMode,
     };
     #[cfg(feature = "fork")]
     pub use crate::fork::{ForkInfo, ForkKind, ForkStatus};
@@ -143,6 +145,8 @@ pub mod full {
         IggyConsumer, IggyConsumerBuilder, IggyProducer, IggyProducerBuilder, OrderedSharding,
         PublishRequest, Record, RecordBuilder, Sharding,
     };
+    #[cfg(feature = "streaming")]
+    pub use crate::stream::{ConsumerGroupInfo, CreateConsumerGroup, GroupTarget};
     #[cfg(feature = "runs")]
     pub use laser_wire::agent_workflow::{AgentRunInfo, RunPage};
     #[cfg(feature = "destinations")]

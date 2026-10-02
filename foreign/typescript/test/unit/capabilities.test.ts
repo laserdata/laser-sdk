@@ -11,9 +11,38 @@ import {
   servesConsistency,
   unreadyBackends
 } from "../../src/client/capabilities.js"
-import { UnsupportedError } from "../../src/client/errors.js"
+import { policyAware } from "../../src/stream/consumer-group.js"
+import { TransportError, UnsupportedError } from "../../src/client/errors.js"
 import { BackendResourceId } from "../../src/wire/ids.js"
 import { Feature, newBackendDescriptor, newOpVersions } from "../../src/wire/hello.js"
+
+void test("given_group_reads_without_an_evaluator_when_announced_then_should_preserve_catalog_and_policy_aware_consumption", () => {
+  const capabilities = managedCapabilitiesFrom({
+    versions: { ...newOpVersions(1, 1, 1, 1), filter: 1, features: Feature.GROUP_POLICY_READS },
+    ready: true,
+    backends: []
+  })
+  assert.equal(capabilities.filters.native, false)
+  assert.equal(capabilities.filters.catalog, true)
+  assert.equal(capabilities.filters.groupPolicyReads, true)
+  assert.equal(policyAware(capabilities), true)
+  const unavailable = managedCapabilitiesFrom({
+    versions: { ...newOpVersions(1, 1, 1, 1), filter: 1, features: Feature.GROUP_POLICY_READS },
+    ready: false,
+    backends: []
+  })
+  assert.equal(unavailable.filters.catalog, false)
+  assert.equal(unavailable.filters.groupPolicyReads, true)
+})
+
+void test("given_an_unconfirmed_probe_when_building_a_group_consumer_then_should_refuse_native_fallback", () => {
+  for (const hello of ["unknown", "failed"] as const) {
+    assert.throws(() => policyAware({ ...OPEN_CAPABILITIES, hello }), TransportError)
+  }
+  for (const hello of ["answered", "rejected"] as const) {
+    assert.equal(policyAware({ ...OPEN_CAPABILITIES, hello }), false)
+  }
+})
 
 void test("open capabilities reject every managed surface", () => {
   for (const surface of ["query", "destinations", "kv", "forks", "graph", "authz"] as const) {

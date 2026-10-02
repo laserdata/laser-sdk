@@ -1,4 +1,6 @@
-use laser_wire::filter::{FaultReason, FilteredPage, FilteredStart, SourceGeneration, StopReason};
+use laser_wire::filter::{
+    ExecutionMode, FaultReason, FilteredPage, FilteredStart, SourceGeneration, StopReason,
+};
 use laser_wire::schema::Digest32;
 use std::collections::{BTreeSet, VecDeque};
 use tokio::time::Instant;
@@ -13,6 +15,7 @@ pub(crate) struct PartitionProgress {
     start: FilteredStart,
     pages: VecDeque<PendingPage>,
     unstored: Option<AckTarget>,
+    stored_offset: Option<u64>,
     blocked: Option<Blocked>,
     retry_at: Option<Instant>,
     first_sequence: Option<u64>,
@@ -20,13 +23,15 @@ pub(crate) struct PartitionProgress {
 }
 
 /// The offset a completed prefix of pages makes safe to store, with the
-/// history and filter it was read under.
+/// history and the policy it was read under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AckTarget {
     pub(crate) group_id: Option<u64>,
     pub(crate) offset: u64,
     pub(crate) generation: SourceGeneration,
-    pub(crate) digest: Digest32,
+    pub(crate) digest: Option<Digest32>,
+    pub(crate) mode: ExecutionMode,
+    pub(crate) policy_generation: u64,
 }
 
 /// Why a partition cannot be read past its current position.
@@ -49,6 +54,7 @@ impl PartitionProgress {
             start,
             pages: VecDeque::new(),
             unstored: None,
+            stored_offset: None,
             blocked: None,
             retry_at: None,
             first_sequence: None,
@@ -119,6 +125,8 @@ impl PartitionProgress {
             offset,
             generation: page.generation,
             digest: page.policy.digest.clone(),
+            mode: page.policy.mode,
+            policy_generation: page.policy.policy_generation,
         });
         let outstanding: BTreeSet<u64> = offsets.into_iter().collect();
         match self.pages.back_mut() {
@@ -191,9 +199,18 @@ impl PartitionProgress {
 
     /// `target` is stored. A newer target completed meanwhile stays pending.
     pub(crate) fn stored(&mut self, target: &AckTarget) {
+        self.stored_offset = Some(
+            self.stored_offset
+                .map_or(target.offset, |stored| stored.max(target.offset)),
+        );
         if self.unstored.as_ref() == Some(target) {
             self.unstored = None;
         }
+    }
+
+    /// The newest offset this reader stored for the partition.
+    pub(crate) const fn stored_offset(&self) -> Option<u64> {
+        self.stored_offset
     }
 
     // Retire the completed prefix. Its newest safe offset supersedes any older
@@ -238,9 +255,11 @@ mod tests {
             partition_id: 0,
             policy: AppliedPolicy {
                 group_id: None,
-                digest: Digest32::new([7; 32]),
+                digest: Some(Digest32::new([7; 32])),
                 filter_id: None,
                 revision: None,
+                mode: ExecutionMode::Filtered,
+                policy_generation: 0,
             },
             generation: generation(),
             read_mode: ReadMode::Primary,
@@ -343,8 +362,10 @@ mod tests {
                 group_id: None,
                 next_scan_offset: 42,
                 generation: generation(),
-                digest: Digest32::new([7; 32]),
+                digest: Some(Digest32::new([7; 32])),
                 read_mode: ReadMode::Primary,
+                mode: ExecutionMode::Filtered,
+                policy_generation: 0,
             })
         );
     }

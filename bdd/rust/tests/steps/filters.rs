@@ -3,11 +3,12 @@ use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_bdd::filter_fixtures::{feed, filter, record};
 use laser_sdk::filters::{FaultPolicy, FilterHeader, FilteredStart, HeaderScalar, Verdict};
-use laser_sdk::prelude::{ProducerMessage, Routing};
+use laser_sdk::iggy::prelude::{Consumer, ConsumerOffsetClient, Identifier};
+use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::types::MintUlid;
 use laser_sdk::wire::filter::ConsumerFilter;
 use laser_sdk::wire::filter::eval::{CompiledFilter, DecodeLimits, FilterRecord, HeaderRef};
-use laser_sdk::wire::filter::{FilterGroupRef, FilterMutation, FilterMutationResult};
+use laser_sdk::wire::filter::{ExecutionMode, GroupFilterSpec};
 use std::time::Duration;
 
 const TOPIC: &str = "fleet_changes";
@@ -102,19 +103,20 @@ async fn fresh_feed(world: &mut LaserWorld) {
 #[when(regex = r#"^the anomaly desk reads the feed with the "([^"]+)" filter$"#)]
 async fn read_feed(world: &mut LaserWorld, name: String) {
     let laser = world.laser().clone();
-    let stream = laser
-        .default_stream()
-        .expect("the feed has a stream")
-        .to_owned();
-    let mut reader = laser
-        .filters()
-        .reader(&stream, TOPIC)
-        .consumer("anomaly-desk")
-        .inline(filter(&name))
+    let group = laser.topic(TOPIC).consumer_group("anomaly-desk");
+    group
+        .create()
+        .filter(filter(&name))
+        .build()
+        .await
+        .expect("group policy configured");
+    let mut reader = group
+        .reader()
+        .expect("group source")
         .start(FilteredStart::First)
         .build()
         .await
-        .expect("the reader builds");
+        .expect("reader builds");
     let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
         .await
         .expect("a page arrives")
@@ -139,7 +141,13 @@ async fn receives(world: &mut LaserWorld, first: String, second: String, third: 
 
 #[when("the anomaly desk lists its saved filters")]
 async fn list_filters(world: &mut LaserWorld) {
-    let result = world.laser().filters().list().send().await;
+    let result = world
+        .laser()
+        .topic(TOPIC)
+        .consumer_group("anomaly-desk")
+        .filter()
+        .revisions(0, 10)
+        .await;
     world.last_result = Some(result.map(|_| ()).map_err(|error| {
         if error.is_unsupported() {
             "unsupported".to_owned()
@@ -157,43 +165,37 @@ async fn catalog_unsupported(world: &mut LaserWorld) {
 #[when("the anomaly desk manages a saved policy by numeric group id")]
 async fn managed_group(world: &mut LaserWorld) {
     let laser = world.laser().clone();
-    let stream = laser.default_stream().expect("stream").to_owned();
-    let filters = laser.filters();
+    let named = laser.topic(TOPIC).consumer_group("managed-desk");
     let operation_id = laser_sdk::wire::agent::RecordId::mint().as_u128();
-    let mutation = FilterMutation::Register {
-        name: format!("bdd-{stream}"),
-        description: String::new(),
-        filter: filter("safe mode"),
-    };
-    let first = filters
-        .apply_as(operation_id, mutation.clone())
+    let first = named
+        .create()
+        .filter(filter("safe mode"))
+        .operation_id(operation_id)
+        .build()
         .await
-        .expect("register");
-    assert_eq!(
-        filters
-            .apply_as(operation_id, mutation)
-            .await
-            .expect("retry"),
-        first
-    );
-    let FilterMutationResult::Registered(saved) = first else {
-        panic!("registration result");
-    };
-    let binding = filters
-        .create_consumer_group(
-            FilterGroupRef {
-                stream: stream.clone(),
-                topic: TOPIC.to_owned(),
-                group: "managed-desk".to_owned(),
-            },
-            saved.filter_id,
-            saved.revision,
+        .expect("configure group");
+    let retry = named
+        .create()
+        .filter(filter("safe mode"))
+        .operation_id(operation_id)
+        .build()
+        .await
+        .expect("retry original configuration");
+    assert_eq!(retry, first);
+    let active = first.filter.expect("group is bound");
+    let group = laser.topic(TOPIC).consumer_group_id(u64::from(first.id));
+    let same = group
+        .filter()
+        .configure_as(
+            Some(operation_id),
+            GroupFilterSpec::Definition(filter("safe mode")),
         )
         .await
-        .expect("create and bind");
-    let mut reader = filters
-        .reader(&stream, TOPIC)
-        .group_id(binding.identity.group_id)
+        .expect("repeat saved operation");
+    assert_eq!(same, active);
+    let mut reader = group
+        .reader()
+        .expect("group source")
         .build()
         .await
         .expect("numeric group");
@@ -201,8 +203,9 @@ async fn managed_group(world: &mut LaserWorld) {
         .await
         .expect("read timeout")
         .expect("read");
-    filters
-        .set_revision_enabled(saved.filter_id, saved.revision, false)
+    group
+        .filter()
+        .set_revision_enabled(active.revision, false)
         .await
         .expect("pause");
     reader
@@ -214,8 +217,9 @@ async fn managed_group(world: &mut LaserWorld) {
         .await
         .expect_err("paused revision refuses new work");
     assert!(refusal.to_string().contains("revision_disabled"));
-    filters
-        .set_revision_enabled(saved.filter_id, saved.revision, true)
+    group
+        .filter()
+        .set_revision_enabled(active.revision, true)
         .await
         .expect("resume");
     reader.close().await.expect("close");
@@ -224,10 +228,191 @@ async fn managed_group(world: &mut LaserWorld) {
         .iter()
         .map(|record| record.message.payload.to_vec())
         .collect();
-    filters
-        .unbind_binding(binding)
+    group.filter().release().await.expect("release binding");
+}
+
+#[when("the anomaly desk reads every record through an unbound consumer group")]
+async fn unbound_consumer(world: &mut LaserWorld) {
+    let group = world.laser().topic(TOPIC).consumer_group("unbound-desk");
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .commit_policy(CommitPolicy::Disabled)
+        .build()
         .await
-        .expect("release binding");
-    filters.archive(saved.filter_id).await.expect("archive");
-    filters.delete(saved.filter_id).await.expect("drop");
+        .expect("unbound consumer");
+    world.filtered_payloads.clear();
+    for _ in feed() {
+        let message = consumer
+            .next_within(READ_TIMEOUT)
+            .await
+            .expect("original record");
+        world.filtered_payloads.push(message.payload.to_vec());
+        consumer
+            .commit(&message)
+            .await
+            .expect("acknowledge original record");
+    }
+    consumer.shutdown().await.expect("close");
+}
+
+#[when("the anomaly desk reads every record through an unbound group reader")]
+async fn unbound_reader(world: &mut LaserWorld) {
+    let group = world.laser().topic(TOPIC).consumer_group("unbound-desk");
+    group.create().build().await.expect("plain group");
+    let mut reader = group
+        .reader()
+        .expect("group source")
+        .start(FilteredStart::First)
+        .count(100)
+        .max_examined(100)
+        .build()
+        .await
+        .expect("unbound reader");
+    world.filtered_payloads.clear();
+    while world.filtered_payloads.len() < feed().len() {
+        let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+            .await
+            .expect("page deadline")
+            .expect("unbound page");
+        assert_eq!(page.policy.mode, ExecutionMode::Unfiltered);
+        assert!(page.records.iter().all(|record| !record.evaluated));
+        world.filtered_payloads.extend(
+            page.records
+                .iter()
+                .map(|record| record.message.payload.to_vec()),
+        );
+        reader
+            .ack_page(&page)
+            .await
+            .expect("acknowledge original records");
+    }
+    reader.close().await.expect("close");
+}
+
+#[then("it receives every original feed record")]
+async fn every_original_record(world: &mut LaserWorld) {
+    let expected: Vec<_> = feed().iter().map(|name| record(name).to_vec()).collect();
+    assert_eq!(world.filtered_payloads, expected);
+}
+
+#[when("the anomaly desk scans a hundred non-matches before its first match")]
+async fn hundred_non_matches(world: &mut LaserWorld) {
+    let topic = world.laser().topic("sparse_changes");
+    let producer = topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("producer");
+    let messages = (0..100)
+        .map(|_| ProducerMessage::new(record("ground station update").to_vec()))
+        .chain([ProducerMessage::new(record("mode update").to_vec())]);
+    producer
+        .send_batch_with_routing(messages, Some(Routing::Partition(0)))
+        .await
+        .expect("sparse feed publishes");
+    let group = topic.consumer_group("sparse-desk");
+    group
+        .create()
+        .filter(filter("safe mode"))
+        .build()
+        .await
+        .expect("configured group");
+    let mut reader = group
+        .reader()
+        .expect("group source")
+        .start(FilteredStart::First)
+        .count(1)
+        .max_examined(100)
+        .build()
+        .await
+        .expect("bounded reader");
+    let (empty, more) = reader.read_round().await.expect("first bounded scan");
+    assert!(empty.is_none() && more);
+    assert_eq!(reader.examined_in_round(), 100);
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("next slice deadline")
+        .expect("matching page");
+    assert_eq!(page.examined, 1);
+    assert_eq!(page.records[0].offset, 100);
+    world.filtered_payloads = page
+        .records
+        .iter()
+        .map(|record| record.message.payload.to_vec())
+        .collect();
+    reader
+        .ack_page(&page)
+        .await
+        .expect("scanned prefix acknowledges");
+    reader.close().await.expect("close");
+    world.last_batch_count = Some(100);
+}
+
+#[then("its first match follows an empty scan of one hundred records")]
+async fn match_after_empty_scan(world: &mut LaserWorld) {
+    assert_eq!(world.last_batch_count, Some(100));
+    assert_eq!(
+        world.filtered_payloads,
+        vec![record("mode update").to_vec()]
+    );
+}
+
+#[when("the anomaly desk consumes a hundred non-matches before its first match")]
+async fn hundred_non_matches_consumer(world: &mut LaserWorld) {
+    let laser = world.laser().clone();
+    let topic = laser.topic("sparse_changes");
+    let producer = topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("producer");
+    let messages = (0..100)
+        .map(|_| ProducerMessage::new(record("ground station update").to_vec()))
+        .chain([ProducerMessage::new(record("mode update").to_vec())]);
+    producer
+        .send_batch_with_routing(messages, Some(Routing::Partition(0)))
+        .await
+        .expect("sparse feed publishes");
+    let group = topic.consumer_group("normal-sparse-desk");
+    group
+        .create()
+        .filter(filter("safe mode"))
+        .build()
+        .await
+        .expect("configured group");
+    let mut consumer = group
+        .consumer()
+        .start_at(ConsumerStart::First)
+        .batch_length(100)
+        .commit_policy(CommitPolicy::Disabled)
+        .build()
+        .await
+        .expect("normal group consumer");
+    let message = consumer
+        .next_within(READ_TIMEOUT)
+        .await
+        .expect("first matching record");
+    assert_eq!(message.position.offset, 100);
+    let stored = laser
+        .client()
+        .get_consumer_offset(
+            &Consumer::group(Identifier::named("normal-sparse-desk").expect("group")),
+            &Identifier::named(laser.default_stream().expect("stream")).expect("stream id"),
+            &Identifier::named("sparse_changes").expect("topic"),
+            Some(0),
+        )
+        .await
+        .expect("group offset")
+        .expect("empty slice made safe progress");
+    assert_eq!(stored.stored_offset, 99);
+    world.filtered_payloads = vec![message.payload.to_vec()];
+    world.last_batch_count = Some(100);
+    consumer
+        .commit(&message)
+        .await
+        .expect("acknowledge matching work");
+    consumer.shutdown().await.expect("close");
 }

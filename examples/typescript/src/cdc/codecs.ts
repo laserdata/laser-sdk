@@ -14,13 +14,12 @@ function reading(value: unknown): Reading {
   return { satellite: item["satellite"], mode: item["mode"], battery: item["battery"] }
 }
 
-export async function runCodecs(laser: Laser, stream: string, catalog: boolean): Promise<void> {
+export async function runCodecs(laser: Laser, stream: string): Promise<void> {
   phase("select typed records inside CBOR, Avro, and Protobuf payloads")
   const registered: number[] = []
   let failure: unknown
   try {
     for (const codec of ["cbor", "avro", "protobuf"] as const) {
-      if (codec !== "cbor" && !catalog) continue
       let source: SchemaSource | undefined
       if (codec === "avro") source = { kind: "avro", schema: await readFile(new URL("../../../../shared/fleet-reading.avsc", import.meta.url), "utf8") }
       if (codec === "protobuf") source = { kind: "protobuf", descriptorSet: await readFile(new URL("../../../../shared/fleet-reading.desc", import.meta.url)), messageType: "fleet.Reading" }
@@ -55,12 +54,17 @@ export async function runCodecs(laser: Laser, stream: string, catalog: boolean):
       const schemaRefs = id === undefined ? [] : [id]
       const filter = codec === "cbor" ? ConsumerFilter.cbor(expr)
         : codec === "avro" ? ConsumerFilter.avro(expr, schemaRefs) : ConsumerFilter.protobuf(expr, schemaRefs)
-      await using reader = await laser.filters().reader(stream, topicName).consumer(`safe-${codec}`)
-        .inline(filter).start({ kind: "first" }).localGuard(true).build()
-      const record = await reader.nextRecord({ timeoutMs: 15_000 })
-      const selected = compiled === undefined ? cbor.decode(record.payload) : reading(compiled.decode(record.payload))
-      console.log(`  ${codec}: ${selected.satellite} entered ${selected.mode} mode at ${String(selected.battery)}% battery, 1 of 3 records delivered`)
-      await reader.ack(record)
+      const group = laser.stream(stream).topic(topicName).consumerGroup(`safe-${codec}`)
+      await group.create({ filter })
+      try {
+        await using reader = await group.reader().start({ kind: "first" }).localGuard(true).build()
+        const record = await reader.nextRecord({ timeoutMs: 15_000 })
+        const selected = compiled === undefined ? cbor.decode(record.payload) : reading(compiled.decode(record.payload))
+        console.log(`  ${codec}: ${selected.satellite} entered ${selected.mode} mode at ${String(selected.battery)}% battery, 1 of 3 records delivered`)
+        await reader.ack(record)
+      } finally {
+        await group.filter().release()
+      }
     }
   } catch (error) { failure = error }
   for (const id of registered) {

@@ -72,7 +72,7 @@ impl LocalGuard {
         page: &FilteredPage,
         messages: &[IggyMessage],
     ) -> Result<(), LaserError> {
-        if page.policy.digest != *self.compiled.digest() {
+        if page.policy.digest.as_ref() != Some(self.compiled.digest()) {
             return Err(FilterError::new(
                 FilterErrorReason::Conflict,
                 "the server ran another filter than the one the local guard checks",
@@ -168,9 +168,11 @@ mod tests {
             partition_id: 0,
             policy: AppliedPolicy {
                 group_id: None,
-                digest,
+                digest: Some(digest),
                 filter_id: None,
                 revision: None,
+                mode: laser_wire::filter::ExecutionMode::Filtered,
+                policy_generation: 0,
             },
             generation: SourceGeneration {
                 stream_id: 1,

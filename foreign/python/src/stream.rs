@@ -1,11 +1,12 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
+use crate::consumer_group::PyConsumerGroup;
 use crate::errors::{InvalidError, to_pyerr};
 use crate::publish::{PyBatchPublish, PyPublish};
 use crate::reader::PyCursor;
 use crate::transport::{
-    ConsumerConfig, PyConsumer, PyConsumerGroupTarget, PyProducer, configure_consumer, duration_ms,
-    partitioning, positive_duration_ms,
+    ConsumerConfig, PyConsumer, PyProducer, configure_consumer, duration_ms, partitioning,
+    positive_duration_ms,
 };
 use crate::typed::{PyTypedRecords, body_to_json};
 use iggy::prelude::{DirectConfig, IggyExpiry, MaxTopicSize};
@@ -229,7 +230,7 @@ impl PyTopic {
         } else {
             builder.do_not_create_topic_if_not_exists()
         };
-        Ok(PyProducer::new(builder.build()))
+        Ok(PyProducer::new(builder.build(), &self.laser))
     }
 
     /// Build a Laser reader for one partition. It is an async iterator
@@ -259,9 +260,9 @@ impl PyTopic {
             Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
             None => self.laser.topic(&*self.name),
         };
-        let builder = handle.iggy_consumer(name, partition).map_err(to_pyerr)?;
         configure_consumer(
-            builder,
+            handle.consumer(name, partition),
+            name.to_owned(),
             ConsumerConfig {
                 batch_length,
                 poll_interval_ms,
@@ -279,70 +280,28 @@ impl PyTopic {
                 allow_replay,
             },
             false,
-            None,
         )
     }
 
-    /// Build a Laser consumer-group reader. Group creation/joining is
-    /// configurable, and offsets are stored under `group` on the server.
-    #[pyo3(signature = (group, *, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=1000, commit_every=None, auto_join_group=true, create_group=true, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
-    #[allow(clippy::too_many_arguments)]
-    fn consumer_group(
-        &self,
-        group: &str,
-        batch_length: u32,
-        poll_interval_ms: Option<u64>,
-        polling: &str,
-        offset: Option<u64>,
-        timestamp_micros: Option<u64>,
-        auto_commit: &str,
-        commit_interval_ms: u64,
-        commit_every: Option<u32>,
-        auto_join_group: bool,
-        create_group: bool,
-        polling_retry_interval_ms: u64,
-        init_retries: Option<u32>,
-        init_retry_interval_ms: u64,
-        allow_replay: bool,
-    ) -> PyResult<PyConsumer> {
-        let stream = self
-            .stream
-            .as_deref()
-            .or_else(|| self.laser.default_stream())
-            .ok_or_else(|| to_pyerr(laser_sdk::error::LaserError::NoStream))?
-            .to_owned();
-        let shutdown_target = PyConsumerGroupTarget {
-            laser: self.laser.clone(),
-            stream,
-            topic: self.name.clone(),
-            group: group.to_owned(),
-        };
+    /// The consumer group `group` of this topic: the handle that owns the
+    /// group's filter policy and builds its consumers and readers. Free and
+    /// synchronous, IO happens at the verbs.
+    fn consumer_group(&self, group: String) -> PyConsumerGroup {
         let handle = match &self.stream {
             Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
             None => self.laser.topic(&*self.name),
         };
-        let builder = handle.iggy_consumer_group(group).map_err(to_pyerr)?;
-        configure_consumer(
-            builder,
-            ConsumerConfig {
-                batch_length,
-                poll_interval_ms,
-                polling,
-                offset,
-                timestamp_micros,
-                auto_commit,
-                commit_interval_ms,
-                commit_every,
-                auto_join_group,
-                create_group,
-                polling_retry_interval_ms,
-                init_retries,
-                init_retry_interval_ms,
-                allow_replay,
-            },
-            true,
-            Some(shutdown_target),
-        )
+        PyConsumerGroup::new(handle.consumer_group(group))
+    }
+
+    /// `consumer_group` by the group's native numeric id. The id names a
+    /// group inside this topic incarnation only.
+    fn consumer_group_id(&self, id: u64) -> PyConsumerGroup {
+        let handle = match &self.stream {
+            Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
+            None => self.laser.topic(&*self.name),
+        };
+        PyConsumerGroup::new(handle.consumer_group_id(id))
     }
 
     /// A resumable, offset-addressable reader over this topic. Each `poll()`

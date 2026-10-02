@@ -102,6 +102,48 @@ pub struct FilterBinding {
     pub revision: u32,
     pub digest: Digest32,
     pub bound_at_micros: u64,
+    /// The group's policy generation this binding established. Every
+    /// effective policy change of the group increments it, so a page or
+    /// acknowledgment names the exact policy it ran under.
+    #[serde(default)]
+    pub policy_generation: u64,
+}
+
+/// A position in the catalog's control log: the partition and the offset of
+/// the record whose fold produced an outcome. A group read may require the
+/// serving plane to have examined the log through this position before it
+/// answers, which gives the application that configured the group a
+/// read-your-writes guarantee through any node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CatalogPosition {
+    pub partition_id: u32,
+    pub offset: u64,
+    /// The durable operation whose outcome proves this position was folded.
+    /// Keeps read-your-writes valid when the control log is recreated.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::opt_u128_text"
+    )]
+    pub operation_id: Option<u128>,
+}
+
+/// The policy a group is configured with in one step: a definition saved for
+/// this group alone, or a revision that already exists.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupFilterSpec {
+    Definition(ConsumerFilter),
+    Revision { filter_id: u32, revision: u32 },
+}
+
+/// A verified consumer group that has no filter policy. Readers of the group
+/// receive every record. `policy_generation` fences a later binding against
+/// acknowledgments of pages delivered unfiltered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPolicyUnbound {
+    pub identity: FilterGroupIdentity,
+    pub policy_generation: u64,
 }
 
 /// One catalog change.
@@ -142,6 +184,17 @@ pub enum FilterMutation {
     Unbind {
         group: FilterGroupRef,
         expected_digest: Digest32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_identity: Option<FilterGroupIdentity>,
+    },
+    /// Configure a group's policy in one catalog transaction: save the
+    /// definition under a name derived from the group's verified identity,
+    /// or take an existing revision, then bind the group to it. A repeat with
+    /// the same digest returns the existing binding.
+    ConfigureGroup {
+        group: FilterGroupRef,
+        policy: GroupFilterSpec,
+        /// Refuse a deleted or recreated group before configuring its policy.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_identity: Option<FilterGroupIdentity>,
     },
@@ -263,6 +316,9 @@ pub struct FilterMutationOutcome {
     #[serde(with = "crate::encoding::u128_text")]
     pub operation_id: u128,
     pub status: FilterMutationStatus,
+    /// Where the fold applied the mutation. Absent while it is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_position: Option<CatalogPosition>,
 }
 
 /// Read one saved filter.
@@ -375,6 +431,18 @@ pub struct ResolveFilterPolicy {
     pub allow_disabled: bool,
     pub v: u32,
     pub policy: FilterPolicyRef,
+    /// A binding lookup may answer `Unbound` for a group without a binding.
+    /// Without it the lookup fails with `not_found`, the strict behavior.
+    #[serde(default)]
+    pub allow_unbound: bool,
+    /// Answer only once the plane has examined the control log through this
+    /// position, otherwise `catalog_unavailable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_catalog_position: Option<CatalogPosition>,
+    /// Answer only once the plane has examined the control log through the
+    /// head it reads from the control partition primary now.
+    #[serde(default)]
+    pub confirm_head: bool,
 }
 
 /// Internal: wait until the catalog version differs from `since`, or the wait
@@ -402,6 +470,9 @@ pub struct ResolvedFilterPolicy {
     pub digest: Digest32,
     pub state: FilterState,
     pub filter: ConsumerFilter,
+    /// The group's policy generation, zero for a revision lookup.
+    #[serde(default)]
+    pub policy_generation: u64,
 }
 
 /// A successful catalog reply.
@@ -415,6 +486,9 @@ pub enum FilterCatalogOutcome {
     Bindings(FilterBindingPage),
     Mutation(FilterMutationOutcome),
     Policy(ResolvedFilterPolicy),
+    /// The group exists and has no policy. Only answered to a binding lookup
+    /// that allowed it.
+    Unbound(GroupPolicyUnbound),
 }
 
 /// The reply to every catalog command.
@@ -492,6 +566,29 @@ impl Validate for FilterMutation {
                 group.validate()?;
                 expected_digest.validate()
             }
+            Self::ConfigureGroup {
+                group,
+                policy,
+                expected_identity,
+            } => {
+                group.validate()?;
+                if expected_identity.is_some_and(|identity| identity.group_id > u64::from(u32::MAX))
+                {
+                    return Err(InvalidError::new(
+                        "consumer group id exceeds the native offset-key range",
+                    ));
+                }
+                match policy {
+                    GroupFilterSpec::Definition(filter) => filter.validate(),
+                    GroupFilterSpec::Revision { revision, .. } => {
+                        if *revision == 0 {
+                            Err(InvalidError::new("revision must be positive"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -568,6 +665,39 @@ mod tests {
     #[test]
     fn given_a_register_mutation_when_validated_then_should_pass() {
         register().validate().expect("valid");
+    }
+
+    #[test]
+    fn given_a_catalog_position_when_encoded_as_json_then_should_preserve_its_full_operation_id() {
+        let position = CatalogPosition {
+            partition_id: 0,
+            offset: 41,
+            operation_id: Some(u128::MAX),
+        };
+        let json = serde_json::to_value(position).expect("position encodes");
+        assert_eq!(json["operation_id"], u128::MAX.to_string());
+        assert_eq!(
+            serde_json::from_value::<CatalogPosition>(json).expect("position decodes"),
+            position
+        );
+        let legacy: CatalogPosition = serde_json::from_str(r#"{"partition_id":0,"offset":41}"#)
+            .expect("a position without operation proof decodes");
+        assert_eq!(legacy.operation_id, None);
+    }
+
+    #[cfg(feature = "cbor")]
+    #[test]
+    fn given_a_catalog_position_when_encoded_as_cbor_then_should_preserve_its_full_operation_id() {
+        let position = CatalogPosition {
+            partition_id: 0,
+            offset: 41,
+            operation_id: Some(u128::MAX),
+        };
+        let bytes = crate::framing::encode_named(&position).expect("position encodes");
+        assert_eq!(
+            crate::framing::decode_named::<CatalogPosition>(&bytes).expect("position decodes"),
+            position
+        );
     }
 
     #[test]

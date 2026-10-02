@@ -61,6 +61,8 @@ pub const FILTER_TEST_PATH: &str = "/agdx/filters/test";
 pub const FILTER_PREVIEW_PATH: &str = "/agdx/filters/preview";
 /// `GET /agdx/filter-bindings`: list consumer-group filter bindings.
 pub const FILTER_BINDINGS_PATH: &str = "/agdx/filter-bindings";
+/// `GET /agdx/group-policies/{stream}/{topic}/{group}`: confirmed group policy.
+pub const GROUP_POLICIES_PATH: &str = "/agdx/group-policies";
 
 /// `GET /agdx/filters/{id}`.
 pub fn filter_path(id: u32) -> String {
@@ -83,6 +85,15 @@ pub fn filter_operation_path(operation_id: u128) -> String {
 pub fn filter_binding_path(stream: &str, topic: &str, group: &str) -> String {
     format!(
         "{FILTER_BINDINGS_PATH}/{}/{}/{}",
+        path_segment(stream),
+        path_segment(topic),
+        path_segment(group)
+    )
+}
+
+pub fn group_policy_path(stream: &str, topic: &str, group: &str) -> String {
+    format!(
+        "{GROUP_POLICIES_PATH}/{}/{}/{}",
         path_segment(stream),
         path_segment(topic),
         path_segment(group)
@@ -640,6 +651,9 @@ pub struct FilterCapsView {
     /// Filtered reads, fenced acknowledgments, sample tests, and validation.
     #[serde(default)]
     pub native: bool,
+    /// Group-aware reads, including pass-through when no policy is bound.
+    #[serde(default)]
+    pub group_policy_reads: bool,
     /// Bounded previews over stored records.
     #[serde(default)]
     pub preview: bool,
@@ -661,16 +675,16 @@ pub struct FilterCapsView {
 }
 
 impl FilterCapsView {
-    /// The view a server serving native evaluation (`native`) and, with it, the
-    /// catalog (`catalog`) advertises.
+    /// The view a server serving native evaluation and a ready catalog advertises.
     pub fn served(native: bool, catalog: bool) -> Self {
         let evaluation = native.then(FilterAnnounce::served);
         Self {
             native,
+            group_policy_reads: false,
             preview: native,
             primary_routing: native,
-            catalog: native && catalog,
-            managed_groups: native && catalog,
+            catalog,
+            managed_groups: catalog,
             evaluator_version: evaluation
                 .as_ref()
                 .map_or(0, |evaluation| evaluation.evaluator_version),
@@ -678,6 +692,12 @@ impl FilterCapsView {
                 .map(|evaluation| evaluation.codecs)
                 .unwrap_or_default(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_group_policy_reads(mut self, served: bool) -> Self {
+        self.group_policy_reads = served;
+        self
     }
 
     /// Returns a copy reporting the evaluation a server announced instead of
@@ -910,10 +930,13 @@ impl Capabilities {
             // The graph surface needs a backend that serves it, advertised as a
             // non-zero graph op version, so it is gated on that rather than implied.
             .with_graph(enabled && versions.graph > 0)
-            .with_filters(FilterCapsView::served(
-                versions.has_feature(feature::CONSUMER_FILTERS),
-                enabled && versions.filter > 0,
-            ))
+            .with_filters(
+                FilterCapsView::served(
+                    versions.has_feature(feature::CONSUMER_FILTERS),
+                    enabled && versions.filter > 0,
+                )
+                .with_group_policy_reads(versions.has_feature(feature::GROUP_POLICY_READS)),
+            )
     }
 }
 
@@ -1472,6 +1495,22 @@ mod tests {
             caps.kv.cas_fenced,
             "the full fenced-lease contract subsumes fenced CAS"
         );
+    }
+
+    #[test]
+    fn given_group_reads_without_evaluation_when_building_http_capabilities_then_should_keep_catalog_available()
+     {
+        let versions = OpVersions::new(1, 1, 1, 1)
+            .with_filter(crate::codes::FILTER_OP_VERSION)
+            .with_features(crate::hello::feature::GROUP_POLICY_READS);
+        let caps = Capabilities::from_versions(true, versions);
+        assert!(caps.filters.group_policy_reads);
+        assert!(caps.filters.catalog && caps.filters.managed_groups);
+        assert!(!caps.filters.native && !caps.filters.preview);
+        assert_eq!(caps.filters.evaluator_version, 0);
+        assert!(caps.filters.codecs.is_empty());
+        let absent = Capabilities::from_versions(false, OpVersions::new(1, 1, 1, 1));
+        assert!(!absent.filters.group_policy_reads && !absent.filters.catalog);
     }
 
     #[test]

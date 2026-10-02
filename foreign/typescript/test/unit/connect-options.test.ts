@@ -144,11 +144,11 @@ void test(
     } as unknown as IggyClient
     const laser = await Laser.builder().iggyClient(client).connectTimeout(30).connect()
     const originalOpsStream = laser.opsStream
-    assert.deepEqual(await laser.capabilities(), OPEN_CAPABILITIES)
+    assert.deepEqual(await laser.capabilities(), { ...OPEN_CAPABILITIES, hello: "failed" })
     assert.equal(probes, 1)
     finishProbe(reply)
     await new Promise<void>((resolve) => setImmediate(resolve))
-    assert.deepEqual(await laser.capabilities(), OPEN_CAPABILITIES)
+    assert.deepEqual(await laser.capabilities(), { ...OPEN_CAPABILITIES, hello: "failed" })
     assert.equal(laser.opsStream, originalOpsStream)
     assert.equal((await laser.refreshCapabilities()).managed, true)
     assert.equal(laser.opsStream, "late-ops")

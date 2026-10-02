@@ -119,7 +119,7 @@ impl PyLaser {
     /// intended for bring-your-own backends and deterministic pre-gate tests.
     /// Omitted fields preserve the current capability set.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, filters=None, filters_catalog=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
     fn with_capabilities<'py>(
         &self,
         py: Python<'py>,
@@ -140,6 +140,7 @@ impl PyLaser {
         authz: Option<bool>,
         filters: Option<bool>,
         filters_catalog: Option<bool>,
+        filters_group_policy_reads: Option<bool>,
         a2a_gateway: Option<bool>,
         sessions: Option<bool>,
         durable_dedup: Option<bool>,
@@ -214,6 +215,9 @@ impl PyLaser {
             }
             if let Some(value) = filters_catalog {
                 capabilities.filters.catalog = value;
+            }
+            if let Some(value) = filters_group_policy_reads {
+                capabilities.filters.group_policy_reads = value;
             }
             if let Some(value) = a2a_gateway {
                 capabilities.a2a_gateway = value;
@@ -418,11 +422,15 @@ pub struct PyCapabilities {
     /// The authorization control surface is served (`Laser.whoami()` and the
     /// role/binding verbs).
     pub authz: bool,
-    /// Consumer filters are served by the streaming server (`Laser.filters()`
-    /// readers, previews, sample tests, validation).
+    /// Consumer filters are served by the streaming server (group readers,
+    /// previews, sample tests).
     pub filters: bool,
-    /// The saved-filter catalog and group bindings are served.
+    /// The group filter catalog is served, so a consumer group can carry a
+    /// filter policy.
     pub filters_catalog: bool,
+    /// The streaming server resolves a consumer group's own policy, so a
+    /// group consumer runs the group's filter, or none, without naming one.
+    pub filters_group_policy_reads: bool,
     /// A managed A2A gateway is available.
     pub a2a_gateway: bool,
     /// Platform-native session lifecycle.
@@ -467,6 +475,7 @@ impl From<Capabilities> for PyCapabilities {
             authz: value.authz,
             filters: value.filters.native,
             filters_catalog: value.filters.catalog,
+            filters_group_policy_reads: value.filters.group_policy_reads,
             evaluation: value.filters.evaluation.map(PyFilterAnnounce::from),
             a2a_gateway: value.a2a_gateway,
             sessions: value.sessions,

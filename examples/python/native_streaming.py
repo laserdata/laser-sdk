@@ -81,8 +81,7 @@ async def main() -> None:
 
         _common.phase("consumer: production automatic offset commits")
         await receive_all(
-            topic.consumer_group(
-                "auto-workers",
+            topic.consumer_group("auto-workers").consumer(
                 batch_length=BATCH,
                 poll_interval_ms=5,
                 polling="first",
@@ -95,8 +94,7 @@ async def main() -> None:
 
         _common.phase("consumer: commit after successful handling")
         await receive_all(
-            topic.consumer_group(
-                "manual-workers",
+            topic.consumer_group("manual-workers").consumer(
                 batch_length=BATCH,
                 poll_interval_ms=5,
                 polling="first",

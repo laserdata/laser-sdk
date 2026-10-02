@@ -64,6 +64,8 @@ export const MAX_FILTER_DESCRIPTION_BYTES = 1024
 export const MAX_FILTER_SOURCE_NAME_BYTES = 255
 export const MAX_FILTERED_PAGE_RECORDS = 1000
 export const MAX_FILTERED_PAGE_BYTES = 8 * 1024 * 1024
+/** Max source records one filtered page may ask to examine. */
+export const MAX_FILTERED_PAGE_EXAMINED = 100_000
 export const MAX_FILTER_PREVIEW_EXAMINED = 10_000
 export const MAX_FILTER_PREVIEW_RECORDS = 100
 export const MAX_FILTER_PREVIEW_PAYLOAD_BYTES = 4096

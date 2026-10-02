@@ -38,15 +38,11 @@ agent = [
     "provenance",
     "streaming",
 ]
-# Server-side consumer filters: filtered reads with fenced acknowledgments,
-# the saved-filter catalog, group bindings, previews, and the shared evaluator
-# for local checks, over the `AGDX_FILTER*` delivery commands.
-filters = [
-    "dep:iggy_binary_protocol",
-    "dep:secrecy",
-    "laser-wire/filter-eval",
-    "streaming",
-]
+# Local verification of server-side consumer filters: the shared evaluator
+# behind the group reader's local guard. Group policies themselves, the
+# group-aware reads with fenced acknowledgments, previews, sample tests and
+# the group's filter administration are part of `streaming`.
+filters = ["laser-wire/filter-eval", "streaming"]
 # Copy-on-write forks of the materialized read model: the `ForkHandle` and its
 # fluent builders over the `AGDX_FORK` managed commands.
 fork = ["streaming"]
@@ -113,7 +109,9 @@ query = ["laser-wire/bson", "streaming"]
 streaming = [
     "dep:dashmap",
     "dep:futures",
+    "dep:iggy_binary_protocol",
     "dep:iggy_common",
+    "dep:secrecy",
     "dep:serde_json",
     "dep:tokio",
     "dep:tracing",

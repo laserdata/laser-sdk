@@ -112,8 +112,7 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
     assert batch_send.confirmations[0].partition_id == 0
     assert batch_send.confirmations[0].base_offset > first_send.confirmations[0].base_offset
 
-    uncommitted = topic.consumer_group(
-        "uncommitted-workers",
+    uncommitted = topic.consumer_group("uncommitted-workers").consumer(
         poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
@@ -122,8 +121,7 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
         first = await asyncio.wait_for(uncommitted.next(), timeout=10)
     finally:
         await uncommitted.shutdown()
-    uncommitted = topic.consumer_group(
-        "uncommitted-workers",
+    uncommitted = topic.consumer_group("uncommitted-workers").consumer(
         poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
@@ -138,8 +136,7 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
     finally:
         await uncommitted.shutdown()
 
-    consumer = topic.consumer_group(
-        "manual-workers",
+    consumer = topic.consumer_group("manual-workers").consumer(
         batch_length=32,
         poll_interval_ms=1,
         polling="first",
@@ -163,8 +160,7 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
         await consumer.shutdown()
 
     await producer.send(b"manual-resumed")
-    resumed = topic.consumer_group(
-        "manual-workers",
+    resumed = topic.consumer_group("manual-workers").consumer(
         poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
@@ -175,8 +171,7 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
     finally:
         await resumed.shutdown()
 
-    auto_consumer = topic.consumer_group(
-        "auto-workers",
+    auto_consumer = topic.consumer_group("auto-workers").consumer(
         batch_length=32,
         poll_interval_ms=1,
         polling="first",
@@ -188,15 +183,23 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
         await auto_consumer.init()
         received = [await asyncio.wait_for(auto_consumer.next(), timeout=10) for _ in range(4)]
         last = received[-1]
-        async with asyncio.timeout(10):
-            while await auto_consumer.last_stored_offset(0) != last.offset:
-                await asyncio.sleep(0.01)
+        # The next read completes the preceding delivery before it polls again.
+        waiting = asyncio.ensure_future(auto_consumer.next())
+        try:
+            async with asyncio.timeout(10):
+                while (
+                    await asyncio.wait_for(auto_consumer.last_stored_offset(0), timeout=1)
+                    != last.offset
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
     finally:
         await auto_consumer.shutdown()
 
     await producer.send(b"auto-resumed")
-    resumed = topic.consumer_group(
-        "auto-workers",
+    resumed = topic.consumer_group("auto-workers").consumer(
         poll_interval_ms=1,
         polling="next",
         auto_commit="disabled",
@@ -1320,14 +1323,14 @@ async def test_given_each_commit_policy_when_shutdown_after_zero_then_should_res
     if mode == "every":
         options["commit_every"] = 10
     first = (
-        topic.consumer_group("worker", **options)
+        topic.consumer_group("worker").consumer(**options)
         if group
         else topic.consumer("worker", partition=0, **options)
     )
     assert (await asyncio.wait_for(first.next(), 10)).offset == 0
     await first.shutdown()
     resumed = (
-        topic.consumer_group("worker", auto_commit="disabled")
+        topic.consumer_group("worker").consumer(auto_commit="disabled")
         if group
         else topic.consumer("worker", partition=0, auto_commit="disabled")
     )
@@ -1337,3 +1340,40 @@ async def test_given_each_commit_policy_when_shutdown_after_zero_then_should_res
         )
     finally:
         await resumed.shutdown()
+
+
+async def test_given_pending_reads_when_inspected_then_should_allow_cancel_and_shutdown(
+    laser,
+):
+    topic = laser.topic("pending-group-reads")
+    await topic.ensure(1)
+    producer = topic.producer(partition=0, partitions=1)
+    await producer.send(b"initial")
+    consumer = topic.consumer_group("pending-read-workers").consumer(
+        polling="first", auto_commit="disabled", allow_replay=True
+    )
+    await consumer.init()
+    initial = await asyncio.wait_for(consumer.next(), timeout=10)
+    assert initial.payload == b"initial"
+    first = asyncio.ensure_future(consumer.next())
+    second = asyncio.ensure_future(consumer.next())
+    try:
+        await asyncio.wait_for(consumer.last_consumed_offset(0), timeout=1)
+        await asyncio.wait_for(consumer.commit(initial), timeout=1)
+        await producer.send(b"first")
+        delivered = await asyncio.wait_for(first, timeout=10)
+        assert delivered.payload == b"first"
+        await asyncio.wait_for(consumer.last_stored_offset(0), timeout=1)
+        second.cancel()
+        await asyncio.gather(second, return_exceptions=True)
+        await producer.send(b"second")
+        delivered = await asyncio.wait_for(consumer.next(), timeout=10)
+        assert delivered.payload == b"second"
+        waiting = asyncio.ensure_future(consumer.next())
+        await asyncio.wait_for(consumer.shutdown(), timeout=1)
+        assert await asyncio.wait_for(waiting, timeout=1) is None
+    finally:
+        first.cancel()
+        second.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await consumer.shutdown()

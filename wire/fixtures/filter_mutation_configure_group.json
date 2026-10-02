@@ -1,0 +1,117 @@
+{
+  "v": 1,
+  "operation_id": "11",
+  "mutation": {
+    "configure_group": {
+      "group": {
+        "stream": "orbit",
+        "topic": "fleet_changes",
+        "group": "anomaly-desk"
+      },
+      "policy": {
+        "definition": {
+          "v": 1,
+          "evaluator_version": 1,
+          "expr": {
+            "any": [
+              {
+                "all": [
+                  {
+                    "pred": {
+                      "field": "table",
+                      "op": "eq",
+                      "value": {
+                        "kind": "string",
+                        "value": "satellites"
+                      }
+                    }
+                  },
+                  {
+                    "pred": {
+                      "field": "op",
+                      "op": "eq",
+                      "value": {
+                        "kind": "string",
+                        "value": "u"
+                      }
+                    }
+                  },
+                  {
+                    "pred": {
+                      "field": "changed",
+                      "op": "contains",
+                      "value": {
+                        "kind": "string",
+                        "value": "mode"
+                      }
+                    }
+                  },
+                  {
+                    "pred": {
+                      "field": "after.mode",
+                      "op": "eq",
+                      "value": {
+                        "kind": "string",
+                        "value": "safe"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "all": [
+                  {
+                    "pred": {
+                      "field": "table",
+                      "op": "eq",
+                      "value": {
+                        "kind": "string",
+                        "value": "satellites"
+                      }
+                    }
+                  },
+                  {
+                    "pred": {
+                      "field": "op",
+                      "op": "eq",
+                      "value": {
+                        "kind": "string",
+                        "value": "d"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "all": [
+                  {
+                    "pred": {
+                      "field": "event",
+                      "op": "eq",
+                      "value": {
+                        "kind": "string",
+                        "value": "satellite.telemetry_changed"
+                      }
+                    }
+                  },
+                  {
+                    "present": "fields.mode"
+                  }
+                ]
+              }
+            ]
+          },
+          "codec": "json",
+          "fault_policy": "stop"
+        }
+      },
+      "expected_identity": {
+        "stream_id": 1,
+        "stream_created_at_micros": 1717171717000000,
+        "topic_id": 2,
+        "topic_created_at_micros": 1717171717000001,
+        "group_id": 3
+      }
+    }
+  }
+}

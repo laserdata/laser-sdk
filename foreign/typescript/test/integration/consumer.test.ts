@@ -222,7 +222,7 @@ void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_a
         await topic.send(utf8(value))
       const open = () =>
         group
-          ? topic.consumerGroup("ground-station", { ...options, batchLength: 3 })
+          ? topic.consumerGroup("ground-station").consumer({ ...options, batchLength: 3 })
           : Promise.resolve(topic.consumer("ground-station", 0, { ...options, batchLength: 3 }))
       const before = await open()
       for (let expected = 0n; expected < 3n; expected++) {

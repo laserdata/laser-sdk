@@ -11,7 +11,7 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::test]
 async fn given_production_profile_when_streaming_then_should_preserve_delivery_and_offsets() {
-    let laser = harness::laser().await;
+    let laser = harness::connected_laser().await;
     let topic = laser.topic("production-streaming");
     let producer = topic
         .producer()
@@ -51,6 +51,7 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
 
     let mut consumer = topic
         .consumer_group("production-auto-workers")
+        .consumer()
         .batch_length(1000)
         .poll_interval(Duration::from_millis(5))
         .commit_policy(CommitPolicy::IntervalOrEach(Duration::from_secs(1)))
@@ -77,6 +78,10 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         .await
         .expect("the Laser consumer should receive the batch message");
     assert_eq!(batch.payload.as_ref(), b"production-batch");
+    assert!(matches!(
+        consumer.next_within(Duration::from_millis(50)).await,
+        Err(laser_sdk::LaserError::Timeout(_))
+    ));
     harness::eventually(|| async {
         (consumer.last_stored_offset(batch.partition_id) == Some(batch.position.offset))
             .then_some(())
@@ -92,6 +97,7 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         .expect("the resume marker should publish");
     let mut resumed = topic
         .consumer_group("production-auto-workers")
+        .consumer()
         .poll_interval(Duration::from_millis(5))
         .commit_policy(CommitPolicy::Disabled)
         .start_at(ConsumerStart::Next)
@@ -110,6 +116,7 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
 
     let mut uncommitted = topic
         .consumer_group("production-uncommitted-workers")
+        .consumer()
         .poll_interval(Duration::from_millis(5))
         .commit_policy(CommitPolicy::Disabled)
         .start_at(ConsumerStart::Next)
@@ -126,6 +133,7 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         .expect("the uncommitted group should shut down without committing");
     let mut uncommitted = topic
         .consumer_group("production-uncommitted-workers")
+        .consumer()
         .poll_interval(Duration::from_millis(5))
         .commit_policy(CommitPolicy::Disabled)
         .start_at(ConsumerStart::Next)
@@ -148,6 +156,7 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
 
     let mut manual = topic
         .consumer_group("production-manual-workers")
+        .consumer()
         .batch_length(1000)
         .poll_interval(Duration::from_millis(5))
         .commit_policy(CommitPolicy::Disabled)
@@ -179,6 +188,7 @@ async fn given_production_profile_when_streaming_then_should_preserve_delivery_a
         .expect("the manual resume marker should publish");
     let mut manual = topic
         .consumer_group("production-manual-workers")
+        .consumer()
         .poll_interval(Duration::from_millis(5))
         .commit_policy(CommitPolicy::Disabled)
         .start_at(ConsumerStart::Next)
@@ -433,7 +443,8 @@ async fn given_default_polling_when_shutdown_after_offset_zero_then_should_resum
 #[tokio::test]
 async fn given_each_commit_policy_when_shutdown_after_zero_then_should_preserve_its_resume_contract()
  {
-    let laser = harness::laser().await;
+    let server = crate::test_iggy::TestIggy::start_pinned().await;
+    let laser = harness::connected_laser_on(&server).await;
     let interval = Duration::from_secs(60);
     let policies = [
         CommitPolicy::Disabled,
@@ -467,7 +478,7 @@ async fn given_each_commit_policy_when_shutdown_after_zero_then_should_preserve_
                 .await
                 .expect("publish");
             let builder = if group {
-                topic.consumer_group("worker")
+                topic.consumer_group("worker").consumer()
             } else {
                 topic.consumer("worker", 0)
             };
@@ -488,7 +499,7 @@ async fn given_each_commit_policy_when_shutdown_after_zero_then_should_preserve_
             );
             first.shutdown().await.expect("shutdown");
             let builder = if group {
-                topic.consumer_group("worker")
+                topic.consumer_group("worker").consumer()
             } else {
                 topic.consumer("worker", 0)
             };
@@ -516,7 +527,7 @@ async fn given_each_commit_policy_when_shutdown_after_zero_then_should_preserve_
 #[tokio::test]
 async fn given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_the_new_offset_zero()
  {
-    let laser = harness::laser().await;
+    let laser = harness::connected_laser().await;
     let stream = laser
         .default_stream()
         .expect("the test laser names its stream")
@@ -556,7 +567,7 @@ async fn given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_
                 .await
                 .expect("publish before purge");
             let builder = if group {
-                topic.consumer_group("ground-station")
+                topic.consumer_group("ground-station").consumer()
             } else {
                 topic.consumer("ground-station", 0)
             };
@@ -618,7 +629,7 @@ async fn given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_
                 .expect("publish after purge");
 
             let builder = if group {
-                topic.consumer_group("ground-station")
+                topic.consumer_group("ground-station").consumer()
             } else {
                 topic.consumer("ground-station", 0)
             };

@@ -1,6 +1,6 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
-use iggy::prelude::{ConsumerGroupClient, Identifier, IggyError, IggyMessage};
+use iggy::prelude::IggyMessage;
 use std::collections::BTreeMap;
 
 pub use iggy::prelude::{HeaderKey, HeaderValue};
@@ -22,10 +22,15 @@ pub use laser_wire::headers::{
 };
 pub use laser_wire::limits::MAX_INDEX_ENTRIES_PER_RECORD;
 
+mod consumer_group;
+pub mod producer_statistics;
 mod publish;
 mod record;
-mod transport;
+pub(crate) mod transport;
 
+pub use consumer_group::{
+    ConsumerGroup, ConsumerGroupInfo, CreateConsumerGroup, GroupFilter, GroupTarget,
+};
 pub use publish::{BatchPublishRequest, PublishRequest};
 pub use record::{Record, RecordBuilder};
 pub use transport::{
@@ -190,20 +195,11 @@ impl Topic {
     }
 
     /// Idempotently create the consumer group `name` on this topic without
-    /// joining it, so a binding or an operator can address it before any member
-    /// connects.
+    /// joining it or giving it a filter policy, so an operator can address it
+    /// before any member connects. [`ConsumerGroup::create`] configures a
+    /// policy in the same step.
     pub async fn ensure_consumer_group(&self, name: &str) -> Result<(), LaserError> {
-        let stream = Identifier::named(self.stream()?)?;
-        let topic = Identifier::named(&self.name)?;
-        match self
-            .laser
-            .client()
-            .create_consumer_group(&stream, &topic, name)
-            .await
-        {
-            Ok(_) | Err(IggyError::ConsumerGroupNameAlreadyExists(..)) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        self.consumer_group(name).create().build().await.map(|_| ())
     }
 
     /// The Iggy producer builder for this topic, the substrate front door:
@@ -244,10 +240,17 @@ impl Topic {
         ConsumerBuilder::partition(self.clone(), name, partition)
     }
 
-    /// Build a live, load-balanced Laser consumer group with server-backed
-    /// offsets. The built consumer implements `futures::Stream`.
-    pub fn consumer_group(&self, group: impl Into<String>) -> ConsumerBuilder {
-        ConsumerBuilder::group(self.clone(), group)
+    /// The consumer group `group` of this topic: the handle that owns the
+    /// group's filter policy and builds its consumers and readers. Free and
+    /// synchronous, IO happens at the verbs.
+    pub fn consumer_group(&self, group: impl Into<String>) -> ConsumerGroup {
+        ConsumerGroup::new(self.clone(), GroupTarget::Name(group.into()))
+    }
+
+    /// [`consumer_group`](Self::consumer_group) by the group's native numeric
+    /// id. The id names a group inside this topic incarnation only.
+    pub fn consumer_group_id(&self, id: u64) -> ConsumerGroup {
+        ConsumerGroup::new(self.clone(), GroupTarget::Id(id))
     }
 
     /// This topic's name.
@@ -255,12 +258,11 @@ impl Topic {
         &self.name
     }
 
-    #[cfg(feature = "schema-codecs")]
     pub(crate) fn laser(&self) -> &Laser {
         &self.laser
     }
 
-    fn stream(&self) -> Result<&str, LaserError> {
+    pub(crate) fn stream(&self) -> Result<&str, LaserError> {
         self.stream.as_deref().ok_or(LaserError::NoStream)
     }
 }

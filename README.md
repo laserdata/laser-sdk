@@ -110,7 +110,7 @@ An accessor selects a feature on the connected client. A method performs an acti
 | `laser.destinations()` | Destinations | declare materialization targets, change desired state, inspect checkpoints and query routes |
 | `laser.graph(name)` | Graph | link entities, traverse, find neighbors and nearest vectors |
 | `laser.watch()` | Change feed | consume advancement records instead of re-querying blind |
-| `laser.filters()` | [Consumer filters](https://docs.laserdata.cloud/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
+| `topic.consumer_group(...).filter()` | [Consumer filters](https://docs.laserdata.cloud/laser-sdk/consumer-filters) | read only the records a filter selects, on the server, with fenced acknowledgments, previews, saved filters, and bound consumer groups |
 | `laser.kv(namespace)` / `laser.fork(id)` | State | point reads and writes, CAS, leases, copy-on-write branches |
 | `laser.memory(scope)` | Memory | remember, recall (semantic / keyword / hybrid), consolidate |
 | `laser.context(id)` | Context | append and assemble one conversation's record, and scope its memory to that conversation |
@@ -261,7 +261,7 @@ const run = await laser.runs().submit("refund", task)
 
 - Accessors are free to construct. IO starts at terminal verbs such as `.send()` and `.fetch()`.
 - `topic.producer()` supports batching, linger, retries, and key or partition routing.
-- `topic.consumer(..)` and `topic.consumer_group(..)` provide live reads, replay, polling control, and automatic or explicit offset commits.
+- `topic.consumer(..)` and `topic.consumer_group(..).consumer()` provide live reads, replay, polling control, and automatic or explicit offset commits.
 - `ConsumerMessage` preserves the exact Apache Iggy headers and log position.
 - `topic.iggy_producer()`, `topic.iggy_consumer_group()`, `laser.client()`, and `laser_sdk::iggy` expose Apache Iggy directly when the Laser surface is not enough.
 
@@ -335,6 +335,7 @@ Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the p
 - [Building agents](docs/building-agents.md): a recipe guide that works one multi-agent scenario end to end, including governed agents, managed-surface RBAC, and concrete SDK calls.
 - [AGDX notes](docs/agdx.md): an in-repo development reference for the Agent Data Exchange Protocol the SDK implements (the envelope, Apache Iggy binding, the surfaces). The protocol home is [agdxprotocol.ai](https://agdxprotocol.ai).
 - [Interop](docs/interop.md): the A2A / MCP / AG-UI edge bridges over AGDX.
+- [Producer statistics](docs/producer-statistics.md): optional per-handle send counters and latency percentiles, what they do and do not prove.
 - [Examples](examples/README.md): aligned Rust, Python, and TypeScript systems runnable against Apache Iggy, Laser Stack, or LaserData Cloud.
 - [`wire/README.md`](wire/README.md): the contract crate and its compatibility rules.
 
@@ -406,8 +407,14 @@ Publish attempts default to 60 seconds with three retries. Retry delays start at
 
 See [publish recovery and outage handling](docs/publish-recovery.md).
 
+## Producer statistics
+
+Producers can report submitted, confirmed, and failed sends plus publish latency percentiles over a separate observer connection. Set `LASER_PRODUCER_TELEMETRY_INTERVAL_MS` (default 10000, zero disables) and `LASER_PRODUCER_TELEMETRY_MAX_PRODUCERS` (default 32) before creating producers. A telemetry error never fails a publish. The Producers tab of a topic in Stream UI shows the reports of the connected node.
+
+See [producer statistics](docs/producer-statistics.md).
+
 ## Consumer filter groups and offsets
 
-**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages` in Rust and Python and `maxUnackedPages` in TypeScript, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh consumer using `Next` starts at the first retained record. Native consumers can commit a polled batch before delivery under the polling policy. Group-aware automatic commits advance only the delivered prefix on the next read or shutdown. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages` in Rust and Python and `maxUnackedPages` in TypeScript, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
 
 **Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.

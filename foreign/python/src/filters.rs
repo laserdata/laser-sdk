@@ -1,19 +1,14 @@
 use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning};
-use crate::client::PyLaser;
-use crate::convert::{duration_seconds, payload_bytes, py_to_de, py_to_typed_value, ser_to_py};
+use crate::convert::{payload_bytes, py_to_de, py_to_typed_value, ser_to_py};
 use crate::errors::{ConfigError, InvalidError, to_pyerr};
 use crate::transport::PyConsumerMessage;
 use laser_sdk::filters::{
-    Coerce, ConsumerFilter, FaultPolicy, FilterExpr, FilterGroupRef, FilterHeader, FilterRef,
-    FilterState, FilteredReader, FilteredStart, HeaderScalar, MatchedPage, MatchedRecord, ReadMode,
-    RecordPolicy, TextMatch, TimestampFormat,
+    Coerce, ConsumerFilter, FaultPolicy, FilterExpr, FilterHeader, FilteredReader, FilteredStart,
+    HeaderScalar, MatchedPage, MatchedRecord, RecordPolicy, TextMatch, TimestampFormat,
 };
-use laser_sdk::laser::Laser;
 use laser_sdk::query::CmpOp;
 use laser_sdk::wire::filter::FieldPath;
-use laser_sdk::wire::filter::FilterMutation;
 use laser_sdk::wire::filter::eval::{CompiledFilter, DecodeLimits, FilterRecord, HeaderRef};
-use laser_sdk::wire::schema::Digest32;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -23,20 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
-
-#[gen_stub_pymethods]
-#[pymethods]
-impl PyLaser {
-    /// Server-side consumer filters: filtered readers, previews, sample tests,
-    /// and the saved-filter catalog. Native reads need a server that serves
-    /// consumer filters. The catalog also needs a managed plane. Either missing
-    /// raises `UnsupportedError`.
-    fn filters(&self) -> PyFilters {
-        PyFilters {
-            laser: self.inner.clone(),
-        }
-    }
-}
 
 /// One predicate or a composition of predicates over a record. Build it with
 /// the static constructors: `FilterExpr.pred("after.mode", "eq", "safe")`.
@@ -185,7 +166,7 @@ impl PyFilterExpr {
 #[pyclass(name = "ConsumerFilter", frozen, from_py_object)]
 #[derive(Clone)]
 pub struct PyConsumerFilter {
-    inner: ConsumerFilter,
+    pub(crate) inner: ConsumerFilter,
     // Compiled on the first local evaluation and reused after it.
     compiled: OnceLock<Arc<CompiledFilter>>,
 }
@@ -400,656 +381,8 @@ impl PyConsumerFilter {
     }
 }
 
-/// Consumer filters on one connection. Build it with `Laser.filters()`.
-/// Catalog replies are dicts in the wire shape.
-#[gen_stub_pyclass]
-#[pyclass(name = "Filters", frozen)]
-pub struct PyFilters {
-    laser: Laser,
-}
-
-#[gen_stub_pymethods]
-#[pymethods]
-impl PyFilters {
-    /// A filtered reader over `stream` / `topic`. Name an independent
-    /// `consumer` (every partition unless `partitions` is given) or a
-    /// consumer `group` or numeric `group_id` (its assigned partitions). Pass
-    /// an inline `filter`, a
-    /// saved `filter_id` and `revision`, or nothing for a group's binding.
-    /// `start` is `next` (the default), `first`, or `last`, or use
-    /// `start_offset` / `start_timestamp_micros`.
-    /// `read_mode` is primary or local. Local reads cannot acknowledge.
-    /// `local_guard` checks delivered records against the filter locally.
-    /// `idle_interval` is seconds, finite and non-negative.
-    /// `count` bounds records per page, default 100.
-    /// `max_reply_bytes` bounds record bytes per page.
-    /// `max_unacked_pages` bounds outstanding pages per partition, default 1024.
-    /// A numeric `group_id` identifies an existing group in this source incarnation.
-    #[pyo3(signature = (
-        stream,
-        topic,
-        *,
-        consumer=None,
-        group=None,
-        group_id=None,
-        partitions=None,
-        filter=None,
-        filter_id=None,
-        revision=None,
-        start="next",
-        start_offset=None,
-        start_timestamp_micros=None,
-        count=None,
-        max_reply_bytes=None,
-        max_unacked_pages=None,
-        read_mode="primary",
-        local_guard=false,
-        idle_interval=None,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn reader<'py>(
-        &self,
-        py: Python<'py>,
-        stream: String,
-        topic: String,
-        consumer: Option<String>,
-        group: Option<String>,
-        group_id: Option<u64>,
-        partitions: Option<Vec<u32>>,
-        filter: Option<PyConsumerFilter>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
-        start: &str,
-        start_offset: Option<u64>,
-        start_timestamp_micros: Option<u64>,
-        count: Option<u32>,
-        max_reply_bytes: Option<u32>,
-        max_unacked_pages: Option<usize>,
-        read_mode: &str,
-        local_guard: bool,
-        idle_interval: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let filter = filter_ref(filter, filter_id, revision)?;
-        let start = filtered_start(start, start_offset, start_timestamp_micros)?;
-        let read_mode = match read_mode {
-            "primary" => ReadMode::Primary,
-            "local" => ReadMode::Local,
-            other => {
-                return Err(InvalidError::new_err(format!(
-                    "read_mode must be `primary` or `local`, got `{other}`"
-                )));
-            }
-        };
-        let idle_interval = idle_interval
-            .map(|seconds| duration_seconds(seconds, "idle_interval"))
-            .transpose()?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let filters = laser.filters();
-            let mut builder = filters
-                .reader(stream, topic)
-                .start(start)
-                .read_mode(read_mode)
-                .local_guard(local_guard);
-            builder = match (consumer, group, group_id) {
-                (Some(consumer), None, None) => builder.consumer(consumer),
-                (None, Some(group), None) => builder.group(group),
-                (None, None, Some(group_id)) => builder.group_id(group_id),
-                _ => {
-                    return Err(ConfigError::new_err(
-                        "name exactly one of `consumer`, `group`, or `group_id`",
-                    ));
-                }
-            };
-            for partition_id in partitions.unwrap_or_default() {
-                builder = builder.partition(partition_id);
-            }
-            if let Some(filter) = filter {
-                builder = builder.filter(filter);
-            }
-            if let Some(count) = count {
-                builder = builder.count(count);
-            }
-            if let Some(max_reply_bytes) = max_reply_bytes {
-                builder = builder.max_reply_bytes(max_reply_bytes);
-            }
-            if let Some(pages) = max_unacked_pages {
-                builder = builder.max_unacked_pages(pages);
-            }
-            if let Some(idle_interval) = idle_interval {
-                builder = builder.idle_interval(idle_interval);
-            }
-            let reader = builder.build().await.map_err(to_pyerr)?;
-            let examined = Arc::new(AtomicU64::new(0));
-            Ok(PyFilteredReader {
-                examined: examined.clone(),
-                state: Arc::new(Mutex::new(ReaderState {
-                    idle_interval: reader.idle_interval(),
-                    more: false,
-                    examined,
-                    reader: Some(reader),
-                    buffered: VecDeque::new(),
-                })),
-                returned: Arc::new(SyncMutex::new(VecDeque::new())),
-                returned_pages: Arc::new(SyncMutex::new(VecDeque::new())),
-            })
-        })
-    }
-
-    /// Validate and compile `filter` on the server without running it.
-    fn validate<'py>(
-        &self,
-        py: Python<'py>,
-        filter: PyConsumerFilter,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let validation = laser
-                .filters()
-                .validate(&filter.inner)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &validation))
-        })
-    }
-
-    /// Evaluate a filter against one supplied `payload` and optional typed
-    /// `headers`, and explain the verdict. Nothing is read or stored.
-    #[pyo3(signature = (payload, *, filter=None, filter_id=None, revision=None, headers=None))]
-    fn test<'py>(
-        &self,
-        py: Python<'py>,
-        payload: &Bound<'_, PyAny>,
-        filter: Option<PyConsumerFilter>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
-        headers: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let filter = filter_ref(filter, filter_id, revision)?
-            .ok_or_else(|| InvalidError::new_err("pass `filter` or `filter_id` and `revision`"))?;
-        let payload = payload_bytes(payload)?;
-        let headers = filter_headers(headers)?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let result = laser
-                .filters()
-                .test(filter, payload, headers)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &result))
-        })
-    }
-
-    /// Preview a filter over stored records of one partition. A preview joins
-    /// no group and stores no offset.
-    #[pyo3(signature = (
-        stream,
-        topic,
-        partition_id,
-        *,
-        filter=None,
-        filter_id=None,
-        revision=None,
-        from_offset=0,
-        max_examined=None,
-        max_records=None,
-        explain=false,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn preview<'py>(
-        &self,
-        py: Python<'py>,
-        stream: String,
-        topic: String,
-        partition_id: u32,
-        filter: Option<PyConsumerFilter>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
-        from_offset: u64,
-        max_examined: Option<u32>,
-        max_records: Option<u32>,
-        explain: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let filter = filter_ref(filter, filter_id, revision)?
-            .ok_or_else(|| InvalidError::new_err("pass `filter` or `filter_id` and `revision`"))?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let mut request = laser
-                .filters()
-                .preview(stream, topic, partition_id, filter)
-                .from_offset(from_offset)
-                .explain(explain);
-            if let Some(max_examined) = max_examined {
-                request = request.max_examined(max_examined);
-            }
-            if let Some(max_records) = max_records {
-                request = request.max_records(max_records);
-            }
-            let preview = request.send().await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &preview))
-        })
-    }
-
-    /// One saved filter with its latest revision and bindings.
-    fn get<'py>(&self, py: Python<'py>, filter_id: u32) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let detail = laser.filters().get(filter_id).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &detail))
-        })
-    }
-
-    /// One page of saved filters, newest first. Pass the last `id` of a page
-    /// as `before_id` to read the next one stably while the catalog changes.
-    #[pyo3(signature = (*, name_contains=None, state=None, before_id=None, page=0, page_size=50))]
-    fn list<'py>(
-        &self,
-        py: Python<'py>,
-        name_contains: Option<String>,
-        state: Option<String>,
-        before_id: Option<u32>,
-        page: u32,
-        page_size: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let state = state
-            .map(|state| {
-                state.parse::<FilterState>().map_err(|_| {
-                    InvalidError::new_err("state must be `active`, `archived`, or `dropped`")
-                })
-            })
-            .transpose()?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let filters = laser.filters();
-            let mut request = filters.list().page(page, page_size);
-            if let Some(name_contains) = name_contains {
-                request = request.name_contains(name_contains);
-            }
-            if let Some(state) = state {
-                request = request.state(state);
-            }
-            if let Some(before_id) = before_id {
-                request = request.before(before_id);
-            }
-            let listed = request.send().await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &listed))
-        })
-    }
-
-    /// One page of a filter's revisions, newest first.
-    #[pyo3(signature = (filter_id, *, page=0, page_size=50))]
-    fn revisions<'py>(
-        &self,
-        py: Python<'py>,
-        filter_id: u32,
-        page: u32,
-        page_size: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let revisions = laser
-                .filters()
-                .revisions(filter_id, page, page_size)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &revisions))
-        })
-    }
-
-    /// The binding of one consumer group. Raises `FilterError` with reason
-    /// `not_found` when the group is unbound.
-    fn binding<'py>(
-        &self,
-        py: Python<'py>,
-        stream: String,
-        topic: String,
-        group: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let binding = laser
-                .filters()
-                .binding(FilterGroupRef {
-                    stream,
-                    topic,
-                    group,
-                })
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &binding))
-        })
-    }
-
-    /// One page of bindings, optionally narrowed to one filter, one
-    /// `stream`, or one `stream` and `topic`.
-    #[pyo3(signature = (*, filter_id=None, stream=None, topic=None, page=0, page_size=50))]
-    fn bindings<'py>(
-        &self,
-        py: Python<'py>,
-        filter_id: Option<u32>,
-        stream: Option<String>,
-        topic: Option<String>,
-        page: u32,
-        page_size: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let bindings = laser
-                .filters()
-                .bindings(
-                    filter_id,
-                    stream.as_deref(),
-                    topic.as_deref(),
-                    page,
-                    page_size,
-                )
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &bindings))
-        })
-    }
-
-    /// Apply one catalog `mutation` (a wire dict such as
-    /// `{"archive": {"filter_id": 7}}`) under a fresh operation id, wait for
-    /// its outcome, and return the applied result dict. A rejection raises
-    /// `FilterError`, and an outcome still pending after the wait raises an
-    /// error that names the operation id.
-    fn apply<'py>(
-        &self,
-        py: Python<'py>,
-        mutation: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mutation: FilterMutation = py_to_de(mutation)?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let result = laser.filters().apply(mutation).await.map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &result))
-        })
-    }
-
-    /// apply under a caller-chosen `operation_id`, so a
-    /// caller that records the id first can resume the same mutation after a
-    /// crash.
-    fn apply_as<'py>(
-        &self,
-        py: Python<'py>,
-        operation_id: u128,
-        mutation: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mutation: FilterMutation = py_to_de(mutation)?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let result = laser
-                .filters()
-                .apply_as(operation_id, mutation)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &result))
-        })
-    }
-
-    /// Send one catalog `mutation` (a wire dict such as
-    /// `{"archive": {"filter_id": 7}}`) under a caller-chosen `operation_id`
-    /// and return its outcome dict, which may be `pending`. Retrying with the
-    /// same id never applies it twice.
-    fn mutate<'py>(
-        &self,
-        py: Python<'py>,
-        operation_id: u128,
-        mutation: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mutation: FilterMutation = py_to_de(mutation)?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let outcome = laser
-                .filters()
-                .mutate(operation_id, mutation)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &outcome))
-        })
-    }
-
-    /// Wait up to `timeout` seconds for the outcome of `operation_id`, for
-    /// example the id an ambiguous mutation error names. Returns the applied
-    /// result dict, raises `FilterError` for a rejection, and
-    /// raises an error while it stays pending.
-    #[pyo3(signature = (operation_id, *, timeout=30.0))]
-    fn wait_for_outcome<'py>(
-        &self,
-        py: Python<'py>,
-        operation_id: u128,
-        timeout: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let timeout = duration_seconds(timeout, "timeout")?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let result = laser
-                .filters()
-                .wait_for_outcome(operation_id, timeout)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &result))
-        })
-    }
-
-    /// The recorded outcome of the mutation `operation_id`.
-    fn operation<'py>(&self, py: Python<'py>, operation_id: u128) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let outcome = laser
-                .filters()
-                .operation(operation_id)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &outcome))
-        })
-    }
-
-    /// Save a new filter as revision 1 and wait for the applied outcome.
-    /// Returns the revision dict (`filter_id`, `revision`, `digest`).
-    #[pyo3(signature = (name, filter, *, description=String::new()))]
-    fn register<'py>(
-        &self,
-        py: Python<'py>,
-        name: String,
-        filter: PyConsumerFilter,
-        description: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let revision = laser
-                .filters()
-                .register(name, filter.inner, description)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &revision))
-        })
-    }
-
-    /// Add a revision. `expected_revision` must still be the latest one.
-    fn revise<'py>(
-        &self,
-        py: Python<'py>,
-        filter_id: u32,
-        expected_revision: u32,
-        filter: PyConsumerFilter,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let revision = laser
-                .filters()
-                .revise(filter_id, expected_revision, filter.inner)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &revision))
-        })
-    }
-
-    /// Replace a filter's description.
-    fn describe<'py>(
-        &self,
-        py: Python<'py>,
-        filter_id: u32,
-        description: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            laser
-                .filters()
-                .describe(filter_id, description)
-                .await
-                .map_err(to_pyerr)
-        })
-    }
-
-    /// Hide a filter from new bindings. Existing bindings keep executing.
-    fn archive<'py>(&self, py: Python<'py>, filter_id: u32) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            laser.filters().archive(filter_id).await.map_err(to_pyerr)
-        })
-    }
-
-    /// Delete a filter. Raises `FilterError` with reason `conflict` while a
-    /// consumer group is bound to it.
-    fn delete<'py>(&self, py: Python<'py>, filter_id: u32) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            laser.filters().delete(filter_id).await.map_err(to_pyerr)
-        })
-    }
-
-    /// Pin an existing consumer group to one revision. Returns the binding dict.
-    fn bind<'py>(
-        &self,
-        py: Python<'py>,
-        stream: String,
-        topic: String,
-        group: String,
-        filter_id: u32,
-        revision: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let binding = laser
-                .filters()
-                .bind(
-                    FilterGroupRef {
-                        stream,
-                        topic,
-                        group,
-                    },
-                    filter_id,
-                    revision,
-                )
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &binding))
-        })
-    }
-
-    /// Create the consumer group if absent and bind it to a saved revision.
-    /// A failed bind can leave an unbound group. Returns the binding dict.
-    fn create_consumer_group<'py>(
-        &self,
-        py: Python<'py>,
-        stream: String,
-        topic: String,
-        group: String,
-        filter_id: u32,
-        revision: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let binding = laser
-                .filters()
-                .create_consumer_group(
-                    FilterGroupRef {
-                        stream,
-                        topic,
-                        group,
-                    },
-                    filter_id,
-                    revision,
-                )
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &binding))
-        })
-    }
-
-    /// Pause or resume a revision while preserving its content and digest.
-    fn set_revision_enabled<'py>(
-        &self,
-        py: Python<'py>,
-        filter_id: u32,
-        revision: u32,
-        enabled: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            laser
-                .filters()
-                .set_revision_enabled(filter_id, revision, enabled)
-                .await
-                .map_err(to_pyerr)
-        })
-    }
-
-    /// Release exactly the group incarnation a binding dict (from `binding` or
-    /// `bindings`) names, by its stored identity and digest. A group deleted
-    /// and recreated under the same name keeps its own binding.
-    fn unbind_binding<'py>(
-        &self,
-        py: Python<'py>,
-        binding: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let binding: laser_sdk::wire::filter::FilterBinding = py_to_de(binding)?;
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let released = laser
-                .filters()
-                .unbind_binding(binding)
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &released))
-        })
-    }
-
-    /// Release the currently named group, conditional on its digest.
-    fn unbind<'py>(
-        &self,
-        py: Python<'py>,
-        stream: String,
-        topic: String,
-        group: String,
-        expected_digest: Vec<u8>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let expected_digest = Digest32::new(expected_digest.try_into().map_err(|_| {
-            InvalidError::new_err("expected_digest must be the 32-byte filter digest")
-        })?);
-        let laser = self.laser.clone();
-        future_into_py(py, async move {
-            let binding = laser
-                .filters()
-                .unbind(
-                    FilterGroupRef {
-                        stream,
-                        topic,
-                        group,
-                    },
-                    expected_digest,
-                )
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| ser_to_py(py, &binding))
-        })
-    }
-}
-
-/// Reads only the records a consumer filter selects and stores progress
-/// through fenced acknowledgments. Build it with `Filters.reader`. Drive one
+/// Reads the records a consumer group's filter selects and stores progress
+/// through fenced acknowledgments. Build it with `ConsumerGroup.reader`. Drive one
 /// reader from one task. `async for record in reader` yields matching records
 /// until the task is cancelled. A record whose `next_record` call is cancelled
 /// after it was read is yielded again by the next call, so a cancellation never
@@ -1070,6 +403,24 @@ struct ReaderState {
     buffered: VecDeque<PyMatchedRecord>,
     idle_interval: Duration,
     more: bool,
+}
+
+impl PyFilteredReader {
+    pub(crate) fn new(reader: FilteredReader) -> Self {
+        let examined = Arc::new(AtomicU64::new(0));
+        Self {
+            examined: examined.clone(),
+            state: Arc::new(Mutex::new(ReaderState {
+                idle_interval: reader.idle_interval(),
+                more: false,
+                examined,
+                reader: Some(reader),
+                buffered: VecDeque::new(),
+            })),
+            returned: Arc::new(SyncMutex::new(VecDeque::new())),
+            returned_pages: Arc::new(SyncMutex::new(VecDeque::new())),
+        }
+    }
 }
 
 // A page shared by its record handles, with each record's message decoded once
@@ -1571,25 +922,7 @@ impl PyMatchedRecord {
     }
 }
 
-fn filter_ref(
-    filter: Option<PyConsumerFilter>,
-    filter_id: Option<u32>,
-    revision: Option<u32>,
-) -> PyResult<Option<FilterRef>> {
-    match (filter, filter_id, revision) {
-        (Some(filter), None, None) => Ok(Some(FilterRef::Inline(filter.inner))),
-        (None, Some(filter_id), Some(revision)) => Ok(Some(FilterRef::Revision {
-            filter_id,
-            revision,
-        })),
-        (None, None, None) => Ok(None),
-        _ => Err(InvalidError::new_err(
-            "pass either `filter`, or both `filter_id` and `revision`",
-        )),
-    }
-}
-
-fn filtered_start(
+pub(crate) fn filtered_start(
     start: &str,
     offset: Option<u64>,
     timestamp_micros: Option<u64>,
@@ -1668,7 +1001,7 @@ fn field_path(path: &str) -> PyResult<FieldPath> {
 
 // Typed sample headers: `bool`, `int`, `float`, `str`, or `bytes`. An `int`
 // above the signed range is unsigned, as the server reads a `uint64` header.
-fn filter_headers(headers: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<FilterHeader>> {
+pub(crate) fn filter_headers(headers: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<FilterHeader>> {
     let Some(headers) = headers else {
         return Ok(Vec::new());
     };

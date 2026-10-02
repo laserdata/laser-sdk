@@ -58,8 +58,9 @@ pub struct Capabilities {
     /// The authorization control surface (`Laser::whoami` and the role/binding
     /// verbs). Fork-native, advertised by the `AUTHZ` feature bit.
     pub authz: bool,
-    /// Server-side consumer filters (`Laser::filters`): native filtered reads
-    /// and, with a managed plane, the saved-filter catalog.
+    /// Server-side consumer filters, administered through a consumer group's
+    /// `filter()` handle: native filtered reads and, with a managed plane,
+    /// the group policy catalog.
     pub filters: FilterCaps,
     /// Platform-native session lifecycle (the infrastructure tracks a session).
     pub sessions: bool,
@@ -72,6 +73,24 @@ pub struct Capabilities {
     pub versions: Option<OpVersions>,
     /// Structured, versioned, secret-free backend observations advertised at connect.
     pub backends: Vec<BackendDescriptor>,
+    /// What the `AGDX_HELLO` probe established at connect. A group consumer
+    /// reads natively only when the managed surfaces are positively absent.
+    pub hello: HelloOutcome,
+}
+
+/// The outcome of the connect-time `AGDX_HELLO` probe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HelloOutcome {
+    /// No probe ran: a bring-your-own client or an explicit capability set.
+    #[default]
+    Unknown,
+    /// The server answered with a managed announcement.
+    Answered,
+    /// The server answered without one: Apache Iggy refusing the command or
+    /// an older server's empty body. The managed surfaces are absent.
+    Rejected,
+    /// The probe failed or timed out, so nothing is established.
+    Failed,
 }
 
 /// The managed query surface and the strongest read-consistency it serves.
@@ -113,6 +132,11 @@ pub struct FilterCaps {
     /// Saved filters, revisions, group bindings, and mutation outcomes. Needs a
     /// ready managed plane that advertises the `filter` op version.
     pub catalog: bool,
+    /// Group-aware reads: the server resolves a consumer group's own policy,
+    /// delivers an unbound group unfiltered, and fences acknowledgments by
+    /// policy generation. Advertised by the `GROUP_POLICY_READS` feature bit.
+    /// A normal group consumer needs it on a server that serves filters.
+    pub group_policy_reads: bool,
     /// The evaluator version and codecs the server announced. `None` from a
     /// server that predates the announcement, which then evaluates as this
     /// build does.
@@ -184,12 +208,14 @@ impl Capabilities {
         filters: FilterCaps {
             native: false,
             catalog: false,
+            group_policy_reads: false,
             evaluation: None,
         },
         sessions: false,
         durable_dedup: false,
         versions: None,
         backends: Vec::new(),
+        hello: HelloOutcome::Unknown,
     };
 
     /// True when the connected infrastructure advertised nothing beyond the open
@@ -353,6 +379,7 @@ impl Capabilities {
         self.filters = FilterCaps {
             native,
             catalog,
+            group_policy_reads: native,
             evaluation: None,
         };
         self
@@ -391,18 +418,7 @@ impl Capabilities {
     /// the served level to the strongest advertised). Additive, so a sub-feature
     /// already set by a BYO builder survives, and one the server does not
     /// advertise stays off.
-    #[cfg(any(
-        feature = "filters",
-        feature = "fork",
-        feature = "destinations",
-        feature = "graph",
-        feature = "kv",
-        feature = "projections",
-        feature = "query",
-        feature = "rbac",
-        feature = "runs",
-        test
-    ))]
+    #[cfg(any(feature = "streaming", test))]
     pub(crate) fn merge_features(&mut self, versions: &OpVersions) {
         use laser_wire::hello::feature;
         self.kv.cas |= versions.has_feature(feature::KV_CAS);
@@ -414,6 +430,7 @@ impl Capabilities {
         self.watch |= versions.has_feature(feature::WATCH);
         self.authz |= versions.has_feature(feature::AUTHZ);
         self.filters.native |= versions.has_feature(feature::CONSUMER_FILTERS);
+        self.filters.group_policy_reads |= versions.has_feature(feature::GROUP_POLICY_READS);
         self.destinations.available |=
             versions.checkpoint > 0 && versions.has_feature(feature::DESTINATIONS);
         if self.destinations.available {

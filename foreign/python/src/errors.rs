@@ -231,7 +231,8 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         SdkError::Authz(_) => AuthzError::new_err(message),
         SdkError::Filter(_)
         | SdkError::FilterFault { .. }
-        | SdkError::FilterOversizedRecord { .. } => FilterError::new_err(message),
+        | SdkError::FilterOversizedRecord { .. }
+        | SdkError::ConsumerGroupSetup { .. } => FilterError::new_err(message),
         SdkError::Signature(_) => SignatureError::new_err(message),
         SdkError::Timeout(_) => {
             Python::attach(|py| PyErr::from_type(timeout_error(py).clone(), message))
@@ -301,6 +302,20 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
                 let _ = value.setattr("fault_reason", py.None());
                 let _ = value.setattr("partition_id", partition_id);
                 let _ = value.setattr("offset", offset);
+            }
+            // The group exists, its filter was not configured. `reason` is
+            // the catalog's refusal when there is one.
+            SdkError::ConsumerGroupSetup {
+                group_id, source, ..
+            } => {
+                let reason = source
+                    .filter_reason()
+                    .map_or_else(|| "setup_failed".to_owned(), |reason| reason.to_string());
+                let _ = value.setattr("reason", reason);
+                let _ = value.setattr("fault_reason", py.None());
+                let _ = value.setattr("partition_id", py.None());
+                let _ = value.setattr("offset", py.None());
+                let _ = value.setattr("group_id", group_id);
             }
             _ => {}
         }

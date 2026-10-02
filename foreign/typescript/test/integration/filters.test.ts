@@ -6,16 +6,18 @@ import { ApacheIggyTransport } from "../../src/iggy/apache-iggy.js"
 import { TestIggyCluster } from "../support/test-iggy.js"
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
-import { test } from "node:test"
+import { test, type TestContext } from "node:test"
 import {
   ConfigError,
+  ConsumerGroupSetupError,
   FilterStopError,
   InvalidError,
   UnsupportedError
 } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
+import type { ConsumerGroup } from "../../src/stream/consumer-group.js"
 import { HeaderValue } from "../../src/stream/header-value.js"
-import type { FilteredReaderBuilder } from "../../src/managed/filters.js"
+import type { FilteredReader, FilteredReaderBuilder } from "../../src/managed/filters.js"
 import {
   ConsumerFilter,
   FilterExpr,
@@ -73,13 +75,22 @@ function safeModeFilter(): ConsumerFilter {
   )
 }
 
-async function withSource(run: (laser: Laser, stream: string) => Promise<void>): Promise<void> {
+// A consumer group filter needs the catalog, which only a managed plane serves.
+class NeedsCatalog extends Error {}
+
+async function withSource(
+  context: TestContext,
+  run: (laser: Laser, stream: string) => Promise<void>
+): Promise<void> {
   const laser = await Laser.connect(CONNECTION_STRING)
   const stream = `laser-ts-orbit-${randomUUID()}`
   try {
     await laser.stream(stream).ensure()
     await laser.stream(stream).topic(TOPIC).ensure(1)
     await run(laser, stream)
+  } catch (error) {
+    if (!(error instanceof NeedsCatalog)) throw error
+    context.skip("a consumer group filter needs a managed plane")
   } finally {
     await laser
       .stream(stream)
@@ -94,12 +105,31 @@ async function publish(laser: Laser, stream: string, payloads: readonly string[]
   for (const payload of payloads) await topic.send(new TextEncoder().encode(payload))
 }
 
-function reader(laser: Laser, stream: string, consumer: string): FilteredReaderBuilder {
-  return laser.filters().reader(stream, TOPIC).consumer(consumer).inline(safeModeFilter())
+// Create `name` with a filter as its policy.
+async function boundGroup(
+  laser: Laser,
+  stream: string,
+  name: string,
+  definition: ConsumerFilter = safeModeFilter()
+): Promise<ConsumerGroup> {
+  if (!(await laser.capabilities()).filters.catalog) throw new NeedsCatalog()
+  const group = laser.stream(stream).topic(TOPIC).consumerGroup(name)
+  await group.create({ filter: definition })
+  return group
 }
 
-void test("given_edge_records_when_read_inline_then_should_return_only_matches_at_their_offsets", async () => {
-  await withSource(async (laser, stream) => {
+async function reader(
+  laser: Laser,
+  stream: string,
+  name: string,
+  shape: (builder: FilteredReaderBuilder) => FilteredReaderBuilder = (builder) => builder,
+  definition: ConsumerFilter = safeModeFilter()
+): Promise<FilteredReader> {
+  return shape((await boundGroup(laser, stream, name, definition)).reader()).build()
+}
+
+void test("given_edge_records_when_read_through_the_group_filter_then_should_return_only_matches_at_their_offsets", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [
       SAFE_MODE,
       SAFE_MODE_VALUES,
@@ -107,9 +137,9 @@ void test("given_edge_records_when_read_inline_then_should_return_only_matches_a
       TELEMETRY,
       GROUND_STATION
     ])
-    const filtered = await reader(laser, stream, "safe-mode-backfill")
-      .start({ kind: "first" })
-      .build()
+    const filtered = await reader(laser, stream, "safe-mode-backfill", (builder) =>
+      builder.start({ kind: "first" })
+    )
 
     const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
 
@@ -124,15 +154,17 @@ void test("given_edge_records_when_read_inline_then_should_return_only_matches_a
   })
 })
 
-void test("given_stored_progress_when_reading_next_then_should_read_only_new_matches", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_stored_progress_when_reading_next_then_should_read_only_new_matches", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, GROUND_STATION])
-    const first = await reader(laser, stream, "safe-mode-resume").start({ kind: "first" }).build()
+    const first = await reader(laser, stream, "safe-mode-resume", (builder) =>
+      builder.start({ kind: "first" })
+    )
     await first.ackPage(await first.nextPage({ timeoutMs: READ_TIMEOUT_MS }))
     await first.close()
 
     await publish(laser, stream, [GROUND_STATION, DECOMMISSION])
-    const second = await reader(laser, stream, "safe-mode-resume").build()
+    const second = await reader(laser, stream, "safe-mode-resume")
     const page = await second.nextPage({ timeoutMs: READ_TIMEOUT_MS })
 
     assert.deepEqual(
@@ -143,15 +175,17 @@ void test("given_stored_progress_when_reading_next_then_should_read_only_new_mat
   })
 })
 
-void test("given_only_non_matches_when_reading_then_should_store_the_scanned_range", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_only_non_matches_when_reading_then_should_store_the_scanned_range", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [GROUND_STATION, GROUND_STATION, GROUND_STATION])
-    const first = await reader(laser, stream, "safe-mode-sparse").start({ kind: "first" }).build()
+    const first = await reader(laser, stream, "safe-mode-sparse", (builder) =>
+      builder.start({ kind: "first" })
+    )
     assert.equal(await first.tryNextPage(), undefined)
     await first.close()
 
     await publish(laser, stream, [DECOMMISSION])
-    const second = await reader(laser, stream, "safe-mode-sparse").build()
+    const second = await reader(laser, stream, "safe-mode-sparse")
     const page = await second.nextPage({ timeoutMs: READ_TIMEOUT_MS })
 
     assert.deepEqual(
@@ -163,19 +197,18 @@ void test("given_only_non_matches_when_reading_then_should_store_the_scanned_ran
   })
 })
 
-void test("given_out_of_order_acks_when_acked_then_should_store_only_the_completed_prefix", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_out_of_order_acks_when_acked_then_should_store_only_the_completed_prefix", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, DECOMMISSION])
-    const first = await reader(laser, stream, "safe-mode-ordered")
-      .start({ kind: "first" })
-      .count(1)
-      .build()
+    const first = await reader(laser, stream, "safe-mode-ordered", (builder) =>
+      builder.start({ kind: "first" }).count(1)
+    )
     const earlier = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
     const later = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
     await first.ack(later)
     await first.close()
 
-    const second = await reader(laser, stream, "safe-mode-ordered").build()
+    const second = await reader(laser, stream, "safe-mode-ordered")
     const record = await second.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
 
     assert.deepEqual([earlier.offset, later.offset], [0n, 1n])
@@ -184,10 +217,12 @@ void test("given_out_of_order_acks_when_acked_then_should_store_only_the_complet
   })
 })
 
-void test("given_a_malformed_record_when_reading_then_should_deliver_matches_then_the_fault", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_a_malformed_record_when_reading_then_should_deliver_matches_then_the_fault", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, "not json", DECOMMISSION])
-    const filtered = await reader(laser, stream, "safe-mode-fault").start({ kind: "first" }).build()
+    const filtered = await reader(laser, stream, "safe-mode-fault", (builder) =>
+      builder.start({ kind: "first" })
+    )
 
     const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     assert.deepEqual(
@@ -206,13 +241,12 @@ void test("given_a_malformed_record_when_reading_then_should_deliver_matches_the
   })
 })
 
-void test("given_a_local_guard_when_reading_then_should_agree_with_the_server", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_a_local_guard_when_reading_then_should_agree_with_the_server", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [GROUND_STATION, TELEMETRY])
-    const filtered = await reader(laser, stream, "safe-mode-guarded")
-      .start({ kind: "first" })
-      .localGuard(true)
-      .build()
+    const filtered = await reader(laser, stream, "safe-mode-guarded", (builder) =>
+      builder.start({ kind: "first" }).localGuard(true)
+    )
 
     const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
 
@@ -224,13 +258,12 @@ void test("given_a_local_guard_when_reading_then_should_agree_with_the_server", 
   })
 })
 
-void test("given_a_local_reader_when_acknowledging_then_should_refuse", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_a_local_reader_when_acknowledging_then_should_refuse", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [DECOMMISSION])
-    const filtered = await reader(laser, stream, "safe-mode-local")
-      .start({ kind: "first" })
-      .readMode("local")
-      .build()
+    const filtered = await reader(laser, stream, "safe-mode-local", (builder) =>
+      builder.start({ kind: "first" }).readMode("local")
+    )
     const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
 
     await assert.rejects(filtered.ackPage(page), InvalidError)
@@ -238,20 +271,12 @@ void test("given_a_local_reader_when_acknowledging_then_should_refuse", async ()
   })
 })
 
-void test("given_stored_records_when_previewed_then_should_judge_them_without_progress", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_stored_records_when_previewed_then_should_judge_them_without_progress", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "preview-desk")
     await publish(laser, stream, [SAFE_MODE, SAFE_MODE_VALUES, DECOMMISSION])
 
-    const preview = await laser.filters().preview(
-      stream,
-      TOPIC,
-      0,
-      { kind: "inline", filter: safeModeFilter() },
-      {
-        maxRecords: 10,
-        explain: true
-      }
-    )
+    const preview = await group.filter().preview(0, { maxRecords: 10, explain: true })
 
     assert.equal(preview.examined, 3)
     assert.equal(preview.matched, 2)
@@ -263,34 +288,123 @@ void test("given_stored_records_when_previewed_then_should_judge_them_without_pr
   })
 })
 
-void test("given_a_sample_when_tested_and_validated_then_should_explain_and_digest", async () => {
-  await withSource(async (laser) => {
-    const tested = await laser
-      .filters()
-      .test({ kind: "inline", filter: safeModeFilter() }, SAFE_MODE_VALUES)
-    const validation = await laser.filters().validate(safeModeFilter())
+void test("given_a_sample_when_tested_against_the_group_filter_then_should_explain", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "sample-desk")
+
+    const tested = await group.filter().test(SAFE_MODE_VALUES)
+    const revisions = await group.filter().revisions()
 
     assert.equal(tested.explanation.verdict, "rejected")
-    assert.deepEqual(validation.digest, consumerFilterDigest(safeModeFilter()))
-    assert.equal(validation.readsPayload, true)
+    assert.equal(revisions.total, 1)
+    assert.deepEqual(revisions.items[0]?.digest, consumerFilterDigest(safeModeFilter()))
   })
 })
 
-void test("given_no_catalog_when_listing_saved_filters_then_should_refuse_as_unsupported", async (context) => {
-  await withSource(async (laser) => {
-    if ((await laser.capabilities()).filters.catalog) {
-      context.skip("this deployment serves the saved-filter catalog")
+void test("given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refuse_as_unsupported", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const capabilities = await laser.capabilities()
+    if (capabilities.filters.catalog) {
+      context.skip("this deployment serves the group filter catalog")
       return
     }
-    await assert.rejects(laser.filters().list(), UnsupportedError)
+    assert.equal(capabilities.filters.groupPolicyReads, true)
+    const topic = laser.stream(stream).topic(TOPIC)
+    const group = topic.consumerGroup("anomaly-desk")
+    await assert.rejects(group.create({ filter: safeModeFilter() }), UnsupportedError)
+
+    const plain = await group.create()
+    await assert.rejects(group.filter().configure(safeModeFilter()), UnsupportedError)
+    assert.equal(plain.name, "anomaly-desk")
+    assert.equal(plain.filter, undefined)
+    assert.equal(plain.identity.groupId, BigInt(plain.id))
+    const byId = topic.consumerGroupId(plain.id)
+    assert.deepEqual([byId.name, byId.id], [undefined, BigInt(plain.id)])
+    assert.equal((await byId.info()).name, "anomaly-desk")
   })
 })
 
-void test("given_two_readers_when_acknowledging_another_readers_page_then_should_reject", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
+    const group = laser.stream(stream).topic(TOPIC).consumerGroup("plain-desk")
+    const consumer = await group.consumer({
+      startFrom: { kind: "first" },
+      autoCommit: false,
+      pollIntervalMs: 5
+    })
+    try {
+      const delivered: bigint[] = []
+      for (let index = 0; index < 3; index += 1) {
+        const message = await consumer.nextWithin(READ_TIMEOUT_MS)
+        assert.ok(message !== null)
+        delivered.push(message.offset)
+        await consumer.commit(message)
+      }
+      assert.deepEqual(delivered, [0n, 1n, 2n], "a group without a filter receives everything")
+      assert.equal(consumer.lastConsumedOffset(0), 2n)
+      assert.equal((await consumer.storedOffset(0))?.storedOffset, 2n)
+      await assert.rejects(
+        consumer.commit({
+          payload: new Uint8Array(),
+          partitionId: 0,
+          offset: 1n,
+          headers: new Map()
+        }),
+        InvalidError,
+        "only a delivered message commits"
+      )
+    } finally {
+      await consumer.shutdown()
+    }
+    assert.equal((await group.info()).filter, undefined)
+  })
+})
+
+void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_matches", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "anomaly-desk")
+    await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
+    const consumer = await group.consumer({
+      startFrom: { kind: "first" },
+      autoCommit: false,
+      pollIntervalMs: 5
+    })
+    try {
+      const delivered: bigint[] = []
+      for (let index = 0; index < 2; index += 1) {
+        const message = await consumer.nextWithin(READ_TIMEOUT_MS)
+        assert.ok(message !== null)
+        delivered.push(message.offset)
+        await consumer.commit(message)
+      }
+      assert.deepEqual(delivered, [0n, 2n], "the server ran the group's filter")
+    } finally {
+      await consumer.shutdown()
+    }
+    const binding = await group.filter().get()
+    assert.ok(binding !== undefined)
+    assert.deepEqual(binding.digest, consumerFilterDigest(safeModeFilter()))
+    assert.equal(binding.policyGeneration, 1n)
+    await assert.rejects(
+      group.filter().configure(ConsumerFilter.json(FilterExpr.present("kind"))),
+      (error: unknown) => error instanceof FilterExecutionError && error.reason === "conflict"
+    )
+    const released = await group.filter().release()
+    assert.deepEqual(released.digest, binding.digest)
+    assert.equal(await group.filter().get(), undefined)
+  })
+})
+
+void test("given_two_readers_when_acknowledging_another_readers_page_then_should_reject", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE])
-    const first = await reader(laser, stream, "owner-one").start({ kind: "first" }).build()
-    const second = await reader(laser, stream, "owner-two").start({ kind: "first" }).build()
+    const first = await reader(laser, stream, "owner-one", (builder) =>
+      builder.start({ kind: "first" })
+    )
+    const second = await reader(laser, stream, "owner-two", (builder) =>
+      builder.start({ kind: "first" })
+    )
     const firstPage = await first.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     const secondPage = await second.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     await assert.rejects(second.ackPage(firstPage), InvalidError)
@@ -302,18 +416,20 @@ void test("given_two_readers_when_acknowledging_another_readers_page_then_should
   })
 })
 
-void test("given_buffered_records_when_reader_is_closed_then_should_not_yield_more", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_buffered_records_when_reader_is_closed_then_should_not_yield_more", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, DECOMMISSION])
-    const filtered = await reader(laser, stream, "closed-reader").start({ kind: "first" }).build()
+    const filtered = await reader(laser, stream, "closed-reader", (builder) =>
+      builder.start({ kind: "first" })
+    )
     await filtered.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
     await filtered.close()
     await assert.rejects(filtered.nextRecord(), ConfigError)
   })
 })
 
-void test("given_typed_custom_headers_when_filtered_then_should_preserve_types_and_payload", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_typed_custom_headers_when_filtered_then_should_preserve_types_and_payload", async (context) => {
+  await withSource(context, async (laser, stream) => {
     const topic = laser.stream(stream).topic(TOPIC)
     for (const priority of [HeaderValue.uint8(1), HeaderValue.uint8(2), HeaderValue.string("2")]) {
       await topic.send(Uint8Array.of(0xff, 0x00), {
@@ -334,14 +450,13 @@ void test("given_typed_custom_headers_when_filtered_then_should_preserve_types_a
         FilterExpr.header("sequence", "gt", (1n << 63n) - 1n)
       ])
     )
-    const filtered = await laser
-      .filters()
-      .reader(stream, TOPIC)
-      .consumer("typed-headers")
-      .inline(filter)
-      .start({ kind: "first" })
-      .localGuard(true)
-      .build()
+    const filtered = await reader(
+      laser,
+      stream,
+      "typed-headers",
+      (builder) => builder.start({ kind: "first" }).localGuard(true),
+      filter
+    )
     try {
       const record = await filtered.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
       assert.equal(record.offset, 1n)
@@ -354,32 +469,30 @@ void test("given_typed_custom_headers_when_filtered_then_should_preserve_types_a
   })
 })
 
-void test("given_a_fresh_filtered_reader_when_reading_next_then_should_start_at_zero", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_a_fresh_filtered_reader_when_reading_next_then_should_start_at_zero", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, [SAFE_MODE, DECOMMISSION])
-    const first = await reader(laser, stream, "fresh-next").count(1).build()
+    const first = await reader(laser, stream, "fresh-next", (builder) => builder.count(1))
     const zero = await first.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
     assert.equal(zero.offset, 0n)
     await first.ack(zero)
     await first.close()
-    const resumed = await reader(laser, stream, "fresh-next").count(1).build()
+    const resumed = await reader(laser, stream, "fresh-next", (builder) => builder.count(1))
     assert.equal((await resumed.nextRecord({ timeoutMs: READ_TIMEOUT_MS })).offset, 1n)
     await resumed.close()
   })
 })
 
-void test("given_pass_through_decode_faults_when_guarded_then_should_verify_the_server_bounds", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_pass_through_decode_faults_when_guarded_then_should_verify_the_server_bounds", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(laser, stream, ["broken JSON", SAFE_MODE])
-    const filtered = await laser
-      .filters()
-      .reader(stream, TOPIC)
-      .consumer("guarded-pass")
-      .inline({ ...safeModeFilter(), faultPolicy: "pass" })
-      .start({ kind: "first" })
-      .localGuard(true)
-      .count(2)
-      .build()
+    const filtered = await reader(
+      laser,
+      stream,
+      "guarded-pass",
+      (builder) => builder.start({ kind: "first" }).localGuard(true).count(2),
+      { ...safeModeFilter(), faultPolicy: "pass" }
+    )
     const page = await filtered.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     assert.deepEqual(
       page.records.map((record) => [record.offset, record.evaluated]),
@@ -394,7 +507,7 @@ void test("given_pass_through_decode_faults_when_guarded_then_should_verify_the_
 })
 
 void test(
-  "given_cluster_partition_primaries_when_reading_filtered_then_should_read_and_ack_every_partition",
+  "given_cluster_partition_primaries_when_a_group_consumes_then_should_read_and_commit_every_partition",
   { timeout: 120_000 },
   async () => {
     const cluster = await TestIggyCluster.start()
@@ -406,28 +519,27 @@ void test(
       await topic.ensure(9)
       for (let partition = 0; partition < 9; partition += 1)
         await topic.send(new TextEncoder().encode(SAFE_MODE), { partition })
-      const reader = await laser
-        .filters()
-        .reader(stream, TOPIC)
-        .consumer("cluster-filter")
-        .inline(safeModeFilter())
-        .count(1)
-        .build()
+      const consumer = await topic.consumerGroup("cluster-desk").consumer({
+        startFrom: { kind: "first" },
+        autoCommit: false,
+        batchLength: 1,
+        pollIntervalMs: 5
+      })
       try {
         const seen = new Set<number>()
         for (let index = 0; index < 9; index += 1) {
-          const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS })
-          assert.equal(page.records.length, 1)
-          assert.equal(page.records[0]?.offset, 0n)
-          seen.add(page.partitionId)
-          await reader.ackPage(page)
+          const message = await consumer.nextWithin(READ_TIMEOUT_MS)
+          assert.ok(message !== null)
+          assert.equal(message.offset, 0n)
+          seen.add(message.partitionId)
+          await consumer.commit(message)
         }
         assert.deepEqual(
           [...seen].sort((a, b) => a - b),
           [0, 1, 2, 3, 4, 5, 6, 7, 8]
         )
       } finally {
-        await reader.close()
+        await consumer.shutdown()
       }
     } finally {
       await laser
@@ -477,17 +589,16 @@ void test(
   }
 )
 
-void test("given_more_than_64_outstanding_pages_when_configured_then_should_read_and_ack_the_prefix", async () => {
-  await withSource(async (laser, stream) => {
+void test("given_more_than_64_outstanding_pages_when_configured_then_should_read_and_ack_the_prefix", async (context) => {
+  await withSource(context, async (laser, stream) => {
     await publish(
       laser,
       stream,
       Array.from({ length: 80 }, () => SAFE_MODE)
     )
-    const filtered = await reader(laser, stream, "large-window")
-      .count(1)
-      .maxUnackedPages(80)
-      .build()
+    const filtered = await reader(laser, stream, "large-window", (builder) =>
+      builder.count(1).maxUnackedPages(80)
+    )
     try {
       let last: Awaited<ReturnType<typeof filtered.nextPage>> | undefined
       for (let offset = 0; offset < 80; offset += 1) {
@@ -505,19 +616,13 @@ void test("given_more_than_64_outstanding_pages_when_configured_then_should_read
   })
 })
 
-void test("given_a_saved_group_binding_when_members_rejoin_then_should_resume_and_refuse_a_conflicting_filter", async (context) => {
-  await withSource(async (laser, stream) => {
-    if (!(await laser.capabilities()).filters.catalog) {
-      context.skip("requires the managed filter catalog")
-      return
-    }
-    const filters = laser.filters()
-    const saved = await filters.register(`group-${randomUUID()}`, safeModeFilter())
-    const group = { stream, topic: TOPIC, group: "review-group" }
-    const binding = await filters.createConsumerGroup(group, saved.filterId, saved.revision)
+void test("given_a_group_filter_when_members_rejoin_then_should_resume_and_refuse_another_policy", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "review-group")
+    const created = await group.info()
     try {
       await publish(laser, stream, [SAFE_MODE, GROUND_STATION, SAFE_MODE])
-      const first = await filters.reader(stream, TOPIC).group(group.group).count(1).build()
+      const first = await group.reader().count(1).build()
       try {
         const page = await first.nextPage({ timeoutMs: READ_TIMEOUT_MS })
         assert.deepEqual(
@@ -528,9 +633,11 @@ void test("given_a_saved_group_binding_when_members_rejoin_then_should_resume_an
       } finally {
         await first.close()
       }
-      const resumed = await filters
-        .reader(stream, TOPIC)
-        .groupId(binding.identity.groupId)
+      const resumed = await laser
+        .stream(stream)
+        .topic(TOPIC)
+        .consumerGroupId(created.id)
+        .reader()
         .count(1)
         .build()
       try {
@@ -543,50 +650,43 @@ void test("given_a_saved_group_binding_when_members_rejoin_then_should_resume_an
       } finally {
         await resumed.close()
       }
-      const conflict = await filters
-        .reader(stream, TOPIC)
-        .group(group.group)
-        .inline(ConsumerFilter.json(FilterExpr.present("other")))
-        .build()
-      try {
-        await assert.rejects(
-          conflict.tryNextPage(),
-          (error: unknown) => error instanceof FilterExecutionError && error.reason === "conflict"
-        )
-      } finally {
-        await conflict.close()
-      }
+      await assert.rejects(
+        group.create({ filter: ConsumerFilter.json(FilterExpr.present("other")) }),
+        (error: unknown) => error instanceof ConsumerGroupSetupError && error.reason === "conflict"
+      )
+      assert.deepEqual((await group.filter().get())?.digest, created.filter?.digest)
     } finally {
-      await filters.unbindBinding(binding)
-      await filters.delete(saved.filterId)
+      await group.filter().release()
     }
   })
 })
 
 void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_leave_the_new_group_untouched", async (context) => {
-  await withSource(async (laser, stream) => {
-    if (!(await laser.capabilities()).filters.catalog) {
-      context.skip("requires the managed filter catalog")
-      return
-    }
-    const filters = laser.filters()
-    const saved = await filters.register(`recreated-${randomUUID()}`, safeModeFilter())
-    const group = { stream, topic: TOPIC, group: "incarnation-group" }
-    const old = await filters.createConsumerGroup(group, saved.filterId, saved.revision)
-    const stale = await filters
-      .reader(stream, TOPIC)
-      .groupId(old.identity.groupId)
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "incarnation-group")
+    const old = await group.info()
+    const stale = await laser
+      .stream(stream)
+      .topic(TOPIC)
+      .consumerGroupId(old.id)
+      .reader()
       .idleInterval(0)
       .build()
     const native = new SingleClient(
       CONNECTION_STRING.includes("://") ? CONNECTION_STRING : `iggy://${CONNECTION_STRING}`
     )
-    let current: typeof old | undefined
+    let recreated = false
     try {
       await native.topic.delete({ streamId: stream, topicId: TOPIC, partitionsCount: 1 })
       await laser.stream(stream).topic(TOPIC).ensure(1)
-      current = await filters.createConsumerGroup(group, saved.filterId, saved.revision)
-      assert.equal(current.identity.groupId, old.identity.groupId)
+      const current = await group.create({ filter: safeModeFilter() })
+      recreated = true
+      assert.equal(current.id, old.id)
+      assert.notDeepEqual(
+        current.identity,
+        old.identity,
+        "a recreated topic is another group incarnation"
+      )
       let refused = false
       for (let attempt = 0; attempt < 10 && !refused; attempt += 1) {
         try {
@@ -601,15 +701,13 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
       const fresh = await native.group.get({
         streamId: stream,
         topicId: TOPIC,
-        groupId: Number(current.identity.groupId)
+        groupId: current.id
       })
       assert.equal(fresh?.membersCount, 0)
     } finally {
       await stale.close()
       await native.destroy()
-      await filters.unbindBinding(old)
-      if (current !== undefined) await filters.unbindBinding(current)
-      await filters.delete(saved.filterId)
+      if (recreated) await group.filter().release()
     }
   })
 })

@@ -15,6 +15,7 @@ import {
   type Provenance
 } from "../provenance/provenance.js"
 import type { Codec, ValueDecoder } from "./codecs.js"
+import { ConsumerGroup, type GroupContext } from "./consumer-group.js"
 import { Consumer, type ConsumerOptions } from "./consumer.js"
 import { Cursor, type CursorOptions } from "./cursor.js"
 import { Producer, type ProducerOptions } from "./producer.js"
@@ -57,7 +58,8 @@ export class Topic {
     readonly name: string,
     private readonly govern?: GovernPublish,
     private readonly resolveSchema?: ResolveSchema,
-    private readonly observe?: ObserveEffect
+    private readonly observe?: ObserveEffect,
+    private readonly groups?: GroupContext
   ) {}
 
   /** Idempotently creates this topic with `partitions`, creating its stream
@@ -84,10 +86,14 @@ export class Topic {
     })
   }
 
-  /** Idempotently creates the consumer group `name` on this topic without joining it. */
+  /**
+   * Idempotently creates the consumer group `name` on this topic without
+   * joining it or giving it a filter policy. `consumerGroup(name).create()`
+   * configures a policy in the same step.
+   */
   async ensureConsumerGroup(name: string): Promise<void> {
     await this.observed("ensure", { group: name }, async () => {
-      await this.transport.ensureConsumerGroup(this.streamName, this.name, name)
+      await this.consumerGroup(name).create()
     })
   }
 
@@ -258,14 +264,37 @@ export class Topic {
     )
   }
 
-  async consumerGroup(name: string, options?: ConsumerOptions): Promise<Consumer> {
-    await this.transport.joinConsumerGroup(this.streamName, this.name, name)
-    return new Consumer(
+  /**
+   * The consumer group `name` of this topic: the handle that owns the group's
+   * filter policy and builds its consumers and readers. Free and synchronous,
+   * IO happens at the verbs.
+   */
+  consumerGroup(name: string): ConsumerGroup {
+    return new ConsumerGroup(
       this.transport,
       this.streamName,
       this.name,
-      { kind: "group", name },
-      options
+      { kind: "name", name },
+      this.groups
+    )
+  }
+
+  /**
+   * `consumerGroup` by the group's native numeric id. The id names a group
+   * inside this topic incarnation only.
+   */
+  consumerGroupId(id: bigint | number): ConsumerGroup {
+    if (typeof id === "number" && !Number.isSafeInteger(id))
+      throw new InvalidError("consumer group id must be an integer")
+    const value = BigInt(id)
+    if (value < 0n || value > 0xffff_ffffn)
+      throw new InvalidError("consumer group id exceeds 32 bits")
+    return new ConsumerGroup(
+      this.transport,
+      this.streamName,
+      this.name,
+      { kind: "id", id: value },
+      this.groups
     )
   }
 

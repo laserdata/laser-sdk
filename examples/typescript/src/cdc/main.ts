@@ -4,6 +4,7 @@ import {
   FilterExecutionError,
   FilterExpr,
   HeaderValue,
+  type ConsumerGroup,
   type FilterBinding,
   type FilteredReader,
   type Laser,
@@ -14,14 +15,14 @@ import { decodeUtf8, managedGate, phase, runExample, runToken, utf8 } from "../c
 // A satellite fleet streams the change feed of its mission-ops database: every
 // battery reading, orbit maneuver, and ground-station status flip. The anomaly
 // desk only wants satellites entering safe mode or leaving the fleet. The
-// server evaluates the filter next to the data, so the desk receives a handful
-// of records out of hundreds, and everything else never leaves the broker.
+// desk's consumer group owns that filter: the server evaluates it next to the
+// data, so the desk receives a handful of records out of hundreds, and
+// everything else never leaves the broker.
 export const EXAMPLE = "cdc"
 const TOPIC = "fleet_changes"
 const ALERTS = "fleet_alerts"
 const PARTITIONS = 3
 const GROUP = "anomaly-desk"
-const BACKFILL = "safe-mode-backfill"
 const SATELLITES = 8
 const FEED_SIZE = 240
 const ROUTINE = 1
@@ -78,7 +79,7 @@ interface Feed {
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const capabilities = await laser.capabilities()
-  if (!managedGate(capabilities, "filters", EXAMPLE, "consumer filters")) return
+  if (!managedGate(capabilities, "filterCatalog", EXAMPLE, "consumer group filters")) return
   const stream = laser.defaultStream ?? ""
   const topic = laser.stream(stream).topic(TOPIC)
 
@@ -98,46 +99,62 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     `  ${String(feed.records.length)} records, ${String(publishedBytes)} bytes: battery readings, maneuvers, station flips, and ${String(feed.strictMatches)} safe-mode or decommission events`
   )
 
-  phase("read only the safe-mode or decommission events, no catalog needed")
-  const backfill = await laser
-    .filters()
-    .reader(stream, TOPIC)
-    .consumer(BACKFILL)
-    .inline(safeModeFilter())
-    .start({ kind: "first" })
-    .build()
-  let delivered: readonly MatchedRecord[]
-  try {
-    delivered = await readMatches(backfill, feed.strictMatches)
-  } finally {
-    await backfill.close()
-  }
-  const deliveredBytes = delivered.reduce((sum, record) => sum + record.payload.byteLength, 0)
+  phase("create the anomaly desk group with its filter")
+  const desk = topic.consumerGroup(`${GROUP}-${runToken()}`)
+  const created = await desk.create({ filter: safeModeFilter() })
+  const binding = created.filter
+  if (binding === undefined) throw new Error("the group was created unbound")
   console.log(
-    `  delivered ${String(delivered.length)} of ${String(feed.records.length)} records, ${String(deliveredBytes)} of ${String(publishedBytes)} payload bytes: ${((100 * (publishedBytes - deliveredBytes)) / publishedBytes).toFixed(1)}% stayed on the broker`
+    `  group ${created.name} (${String(created.id)}) runs revision ${String(binding.revision)} of its own filter from now on`
   )
 
-  phase("test both filters against a battery update of a satellite already in safe mode")
-  const stillSafe = satelliteUpdate(2, "safe", 58, "battery_pct")
-  for (const [name, filter] of [
-    ["strict, transitions only", safeModeFilter()],
-    ["values only, current state", safeModeValuesFilter()]
-  ] as const) {
-    const tested = await laser.filters().test({ kind: "inline", filter }, JSON.stringify(stillSafe))
-    console.log(`  ${name}: ${tested.explanation.verdict}`)
+  phase("consume as the group: the application names the group, the server runs its filter")
+  const consumer = await desk.consumer({ startFrom: { kind: "first" }, autoCommit: false })
+  let deliveredBytes = 0
+  try {
+    for (let handled = 0; handled < feed.strictMatches; handled += 1) {
+      const message = await consumer.nextWithin(READ_TIMEOUT_MS)
+      if (message === null) throw new Error("the next matching record did not arrive")
+      const change = JSON.parse(decodeUtf8(message.payload)) as FleetChange
+      console.log(
+        `  partition ${String(message.partitionId)} offset ${message.offset.toString()}: ${describe(change)}`
+      )
+      deliveredBytes += message.payload.byteLength
+      await consumer.commit(message)
+    }
+  } finally {
+    await consumer.shutdown()
   }
+  console.log(
+    `  delivered ${String(feed.strictMatches)} of ${String(feed.records.length)} records, ${String(deliveredBytes)} of ${String(publishedBytes)} payload bytes: ${((100 * (publishedBytes - deliveredBytes)) / publishedBytes).toFixed(1)}% stayed on the broker`
+  )
+
+  phase("page the matches again with the group reader and its own scan budget")
+  const pager = await desk
+    .reader()
+    .start({ kind: "first" })
+    .count(10)
+    .maxExamined(100)
+    .localGuard(true)
+    .build()
+  let paged: readonly MatchedRecord[]
+  try {
+    paged = await readMatches(pager, feed.strictMatches)
+  } finally {
+    await pager.close()
+  }
+  console.log(
+    `  the reader handed out ${String(paged.length)} matches in pages, each acknowledged after handling`
+  )
+
+  phase("test the group's filter against a battery update of a satellite already in safe mode")
+  const stillSafe = satelliteUpdate(2, "safe", 58, "battery_pct")
+  const tested = await desk.filter().test(JSON.stringify(stillSafe))
+  console.log(`  strict, transitions only: ${tested.explanation.verdict}`)
 
   phase("preview every partition, nothing is stored")
   for (let partitionId = 0; partitionId < PARTITIONS; partitionId += 1) {
-    const preview = await laser
-      .filters()
-      .preview(
-        stream,
-        TOPIC,
-        partitionId,
-        { kind: "inline", filter: safeModeFilter() },
-        { maxRecords: 10 }
-      )
+    const preview = await desk.filter().preview(partitionId, { maxRecords: 10 })
     console.log(
       `  partition ${String(partitionId)}: examined ${String(preview.examined)}, matched ${String(preview.matched)}, stopped at ${preview.stop}`
     )
@@ -145,18 +162,14 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   phase("route binary alerts on a header, their payload is never decoded")
   await routeAlerts(laser, stream)
-  await runCodecs(laser, stream, capabilities.filters.catalog)
+  await runCodecs(laser, stream)
 
-  if (!capabilities.filters.catalog) {
-    console.log("  the saved-filter catalog needs a managed plane, skipping group bindings")
-    return
-  }
-  await manageGroup(laser, stream, feed.strictMatches)
+  await manageRevisions(laser, stream, desk, binding, feed.strictMatches)
 }
 
-// Binary alert frames carry their priority as a header. A headers-only filter
-// selects the critical ones without decoding a payload, so the alert topic can
-// hold any format.
+// Binary alert frames carry their priority as a header. A pager group with a
+// headers-only filter selects the critical ones without decoding a payload, so
+// the alert topic can hold any format.
 async function routeAlerts(laser: Laser, stream: string): Promise<void> {
   const alerts = laser.stream(stream).topic(ALERTS)
   await alerts.ensure(1)
@@ -172,13 +185,11 @@ async function routeAlerts(laser: Laser, stream: string): Promise<void> {
       headers: { priority: HeaderValue.uint8(priority) }
     })
   }
-  const pager = await laser
-    .filters()
-    .reader(stream, ALERTS)
-    .consumer(`${BACKFILL}-pager`)
-    .inline(ConsumerFilter.headersOnly(FilterExpr.header("priority", "eq", CRITICAL)))
-    .start({ kind: "first" })
-    .build()
+  const pagerGroup = alerts.consumerGroup(`${GROUP}-pager-${runToken()}`)
+  await pagerGroup.create({
+    filter: ConsumerFilter.headersOnly(FilterExpr.header("priority", "eq", CRITICAL))
+  })
+  const pager = await pagerGroup.reader().start({ kind: "first" }).build()
   try {
     for (let handled = 0; handled < 2; handled += 1) {
       const record = await pager.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
@@ -189,124 +200,81 @@ async function routeAlerts(laser: Laser, stream: string): Promise<void> {
     }
   } finally {
     await pager.close()
+    await pagerGroup.filter().release()
   }
 }
 
-// Save both filters, bind the anomaly desk to the strict one, consume as the
-// group, then release everything this run created, also when a step fails.
-async function manageGroup(laser: Laser, stream: string, expected: number): Promise<void> {
-  phase("save both filters in the catalog")
-  const filters = laser.filters()
-  const saved: number[] = []
-  const bindings: FilterBinding[] = []
-  let failure: unknown
+// Draft a stricter revision on the desk's own filter, run the variant in its
+// own group, pause and resume it, then release both policies.
+async function manageRevisions(
+  laser: Laser,
+  stream: string,
+  desk: ConsumerGroup,
+  binding: FilterBinding,
+  expected: number
+): Promise<void> {
+  phase("draft a stricter revision: readers keep running the active one")
+  const draft = await desk
+    .filter()
+    .revise(binding.revision, ConsumerFilter.json(safeModeTransition()))
+  const revisions = await desk.filter().revisions({ page: 0, pageSize: 10 })
+  console.log(
+    `  revision ${String(draft.revision)} drafted, the group lists ${String(revisions.total)} revisions and still runs revision ${String(binding.revision)}`
+  )
+
+  phase("A/B: the transitions-only variant runs in its own group")
+  const variantName = `${GROUP}-transitions-${runToken()}`
+  const variant = laser.stream(stream).topic(TOPIC).consumerGroup(variantName)
+  const variantBinding = (
+    await variant.create({ filter: ConsumerFilter.json(safeModeTransition()) })
+  ).filter
+  if (variantBinding === undefined) throw new Error("the variant was created unbound")
+  const reader = await variant
+    .reader()
+    .count(1)
+    .localGuard(true)
+    .start({ kind: "first" })
+    .build()
   try {
-    const strict = await filters.register(`sats-safe-mode-${runToken()}`, safeModeFilter(), {
-      description: "Satellites entering safe mode, reporting it, or leaving the fleet"
-    })
-    saved.push(strict.filterId)
-    const values = await filters.register(
-      `sats-safe-mode-values-${runToken()}`,
-      safeModeValuesFilter(),
-      { description: "Every update of a satellite whose current mode is safe" }
-    )
-    saved.push(values.filterId)
-    console.log(
-      `  strict is filter ${String(strict.filterId)} revision ${String(strict.revision)}, values only is filter ${String(values.filterId)} revision ${String(values.revision)}`
-    )
+    const first = await reader.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
+    const change = JSON.parse(decodeUtf8(first.payload)) as FleetChange
+    console.log(`  ${variantName}: ${describe(change)}`)
 
-    phase("bind the anomaly desk group to the strict filter")
-    const binding = await filters.createConsumerGroup(
-      { stream, topic: TOPIC, group: GROUP },
-      strict.filterId,
-      strict.revision
-    )
-    bindings.push(binding)
-    console.log(`  ${GROUP} runs revision ${String(binding.revision)} from now on`)
-
-    phase("consume as the group and acknowledge")
-    const desk = await filters
-      .reader(stream, TOPIC)
-      .groupId(binding.identity.groupId)
-      .localGuard(true)
-      .start({ kind: "first" })
-      .build()
+    phase("pause the variant: new reads stop, in-flight work still acknowledges")
+    await variant.filter().setRevisionEnabled(variantBinding.revision, false)
+    await reader.ack(first)
     try {
-      const handled = await readMatches(desk, expected)
-      console.log(`  the desk handled ${String(handled.length)} safe-mode or decommission events`)
-    } finally {
-      await desk.close()
-    }
-
-    phase("A/B: a second revision runs in its own group")
-    const second = await filters.revise(
-      strict.filterId,
-      strict.revision,
-      ConsumerFilter.json(safeModeTransition())
-    )
-    const variantBinding = await filters.createConsumerGroup(
-      { stream, topic: TOPIC, group: `${GROUP}-transitions` },
-      second.filterId,
-      second.revision
-    )
-    bindings.push(variantBinding)
-    const variant = await filters
-      .reader(stream, TOPIC)
-      .groupId(variantBinding.identity.groupId)
-      .count(1)
-      .localGuard(true)
-      .start({ kind: "first" })
-      .build()
-    try {
-      const first = await variant.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
-      const change = JSON.parse(decodeUtf8(first.payload)) as FleetChange
-      console.log(`  revision ${String(second.revision)}: ${describe(change)}`)
-      await filters.setRevisionEnabled(second.filterId, second.revision, false)
-      await variant.ack(first)
-      try {
-        await variant.tryNextPage()
-        throw new Error("a disabled revision kept reading")
-      } catch (error) {
-        if (!(error instanceof FilterExecutionError) || error.reason !== "revision_disabled")
-          throw error
-        console.log("  paused: new reads stop, in-flight work can still be acknowledged")
-      }
-      await filters.setRevisionEnabled(second.filterId, second.revision, true)
-      await readMatches(variant, 1)
-      console.log(
-        `  A/B groups handled ${String(expected)} broad events and 2 transitions independently`
-      )
-    } finally {
-      await variant.close()
-    }
-
-    phase("a bound filter cannot be deleted")
-    try {
-      await filters.delete(strict.filterId)
-      throw new Error("a bound filter was deleted")
+      await reader.tryNextPage()
+      throw new Error("a disabled revision kept reading")
     } catch (error) {
-      if (!(error instanceof FilterExecutionError) || error.reason !== "conflict") throw error
-      console.log(`  refused with conflict while ${GROUP} is bound`)
+      if (!(error instanceof FilterExecutionError) || error.reason !== "revision_disabled")
+        throw error
+      console.log("  paused: the server refuses new reads with revision_disabled")
     }
-  } catch (error) {
-    failure = error
+    await variant.filter().setRevisionEnabled(variantBinding.revision, true)
+    await readMatches(reader, 1)
+    console.log(
+      `  resumed: the desk handled ${String(expected)} broad events, the variant 2 transitions`
+    )
   } finally {
-    phase("unbind, archive, delete")
-    const release = async (action: () => Promise<unknown>): Promise<void> => {
-      try {
-        await action()
-      } catch (error) {
-        failure ??= error
-      }
-    }
-    for (const binding of bindings) await release(() => filters.unbindBinding(binding))
-    for (const filterId of saved) {
-      await release(() => filters.archive(filterId))
-      await release(() => filters.delete(filterId))
-    }
-    if (failure !== undefined) throw failure
-    console.log("  both filters are gone, their names are never reused")
+    await reader.close()
   }
+
+  phase("a group that runs a policy cannot be switched to another one")
+  try {
+    await desk.filter().configure(ConsumerFilter.json(safeModeTransition()))
+    throw new Error("a running policy was replaced")
+  } catch (error) {
+    if (!(error instanceof FilterExecutionError) || error.reason !== "conflict") throw error
+    console.log("  refused with conflict: create a new group for another policy")
+  }
+
+  phase("release both policies")
+  const released = await desk.filter().release()
+  await variant.filter().release()
+  console.log(
+    `  ${released.group.group} is unbound again and receives every record, its filter stays saved as revision ${String(released.revision)}`
+  )
 }
 
 // Read and acknowledge until `expected` safe-mode or decommission events arrived, decoding
@@ -369,17 +337,6 @@ function safeModeTransition(): FilterExpr {
     FilterExpr.pred("changed", "contains", "mode"),
     FilterExpr.pred("after.mode", "eq", "safe")
   ])
-}
-
-// Values only: any update of a satellite whose current mode is safe.
-function safeModeValuesFilter(): ConsumerFilter {
-  return ConsumerFilter.json(
-    FilterExpr.all([
-      FilterExpr.pred("table", "eq", "satellites"),
-      FilterExpr.pred("op", "eq", "u"),
-      FilterExpr.pred("after.mode", "eq", "safe")
-    ])
-  )
 }
 
 // A deterministic feed: mostly battery telemetry, battery updates, orbit

@@ -61,3 +61,36 @@ pub struct ClientMetadataList {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<u32>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerPresence {
+    pub producer_presence_version: u32,
+    pub observed_at_millis: u64,
+    pub expires_after_millis: u64,
+    pub producers: Vec<ProducerStatistics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerStatistics {
+    pub instance_id: String,
+    pub stream: String,
+    pub topic: String,
+    pub first_activity_millis: u64,
+    pub last_activity_millis: u64,
+    pub submitted_records: u64,
+    pub submitted_payload_bytes: u64,
+    pub confirmed_records: Option<u64>,
+    pub confirmed_payload_bytes: Option<u64>,
+    pub retries: Option<u64>,
+    pub failed_calls: u64,
+    pub last_success_millis: Option<u64>,
+    pub latency: ProducerLatency,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerLatency {
+    pub samples: u64,
+    pub p50_micros: Option<u64>,
+    pub p99_micros: Option<u64>,
+    pub p999_micros: Option<u64>,
+}

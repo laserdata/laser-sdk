@@ -44,10 +44,22 @@ export interface FilterCapabilities {
   /** Saved filters, revisions, group bindings, and mutation outcomes, served
    * with a ready managed plane. */
   readonly catalog: boolean
+  /** Group-aware reads: the server resolves a consumer group's own policy,
+   * delivers an unbound group unfiltered, and fences acknowledgments by policy
+   * generation. A group consumer needs it on a server that serves filters. */
+  readonly groupPolicyReads: boolean
   /** The evaluator version and codecs the server announced. Absent from a
    * server that predates the announcement, which evaluates as this build does. */
   readonly evaluation?: FilterAnnounce
 }
+
+/**
+ * What the connect-time `AGDX_HELLO` probe established. A group consumer reads
+ * natively only when the managed surfaces are positively absent: `rejected`
+ * is Apache Iggy refusing the command or an older server's empty body,
+ * `failed` a probe that established nothing, `unknown` no probe at all.
+ */
+export type HelloOutcome = "unknown" | "answered" | "rejected" | "failed"
 
 export interface Capabilities {
   readonly managed: boolean
@@ -66,6 +78,7 @@ export interface Capabilities {
   readonly versions?: OpVersions
   readonly backends: readonly BackendDescriptor[]
   readonly topology?: WireTopology
+  readonly hello: HelloOutcome
 }
 
 export type CapabilitySurface =
@@ -102,10 +115,11 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   agentWorkflow: false,
   watch: false,
   authz: false,
-  filters: Object.freeze({ native: false, catalog: false }),
+  filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false }),
   sessions: false,
   durableDedup: false,
-  backends: Object.freeze([])
+  backends: Object.freeze([]),
+  hello: "unknown"
 })
 
 function managedBase(): Capabilities {
@@ -167,15 +181,20 @@ export function managedCapabilitiesFrom(announce: BackendAnnounce): Capabilities
       native: opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS),
       catalog:
         ready &&
-        opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS) &&
+        (opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS) ||
+          opVersionsHasFeature(versions, Feature.GROUP_POLICY_READS)) &&
         (versions.filter ?? 0) > 0,
+      // Served by the streaming server itself, like the native reads: a server
+      // without a managed plane resolves every group as unbound.
+      groupPolicyReads: opVersionsHasFeature(versions, Feature.GROUP_POLICY_READS),
       ...(opVersionsHasFeature(versions, Feature.CONSUMER_FILTERS) && announce.filters !== undefined
         ? { evaluation: announce.filters }
         : {})
     },
     versions,
     backends: announce.backends,
-    ...(announce.topology !== undefined ? { topology: announce.topology } : {})
+    ...(announce.topology !== undefined ? { topology: announce.topology } : {}),
+    hello: "answered"
   }
 }
 
@@ -222,6 +241,7 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
     filters: {
       native: configured.filters.native || announced.filters.native,
       catalog: configured.filters.catalog || announced.filters.catalog,
+      groupPolicyReads: configured.filters.groupPolicyReads || announced.filters.groupPolicyReads,
       ...((announced.filters.evaluation ?? configured.filters.evaluation) !== undefined
         ? { evaluation: announced.filters.evaluation ?? configured.filters.evaluation }
         : {})
@@ -238,7 +258,8 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
       ? { topology: announced.topology }
       : configured.topology !== undefined
         ? { topology: configured.topology }
-        : {})
+        : {}),
+    hello: announced.hello === "unknown" ? configured.hello : announced.hello
   }
 }
 
