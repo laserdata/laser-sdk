@@ -5,6 +5,7 @@ import {
   FilterExecutionError,
   InvalidError,
   ProtocolError,
+  TransportError,
   UnsupportedError
 } from "../../src/client/errors.js"
 import type { CoordinatorConnection, NodeConnection } from "../../src/iggy/apache-iggy.js"
@@ -510,6 +511,128 @@ void test("given_a_lost_ack_reply_when_the_next_ack_runs_then_should_store_the_s
     "the unstored target is sent again, and a spread copy still acknowledges"
   )
   await filtered.close()
+})
+
+void test("given_a_single_node_when_a_primary_is_routed_then_should_dial_the_endpoint_the_caller_dialed", async () => {
+  const dialed: (readonly [string, number])[] = []
+  const read = async (nodes: number) => {
+    const coordinator: CoordinatorConnection = {
+      send: (code) =>
+        Promise.resolve(code === SYNC_CONSUMER_GROUP_CODE ? assignment(1n, [0]) : route()),
+      joinConsumerGroup: () => Promise.resolve(),
+      leaveConsumerGroup: () => Promise.resolve(),
+      close: () => Promise.resolve()
+    }
+    const data: NodeConnection = {
+      close: () => Promise.resolve(),
+      send: (code, payload) => {
+        if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
+        const request = pollOf(payload)
+        const {
+          safeAckOffset: _safe,
+          nextScanOffset: _next,
+          ...unscanned
+        } = page("primary", { partitionId: request.partitionId })
+        return Promise.resolve(
+          pageReply({
+            ...unscanned,
+            policy: {
+              digest: consumerFilterDigest(filter),
+              groupId: 3n,
+              mode: "filtered",
+              policyGeneration: 0n
+            },
+            examined: 0
+          })
+        )
+      }
+    }
+    const transport: FilterTransport = {
+      ...baseTransport(() => Promise.reject(new Error("the shared transport is not used"))),
+      openCoordinator: () => Promise.resolve(coordinator),
+      openNodeConnection: (ip, port) => {
+        dialed.push([ip, port])
+        return Promise.resolve(data)
+      },
+      clusterNodeCount: () => Promise.resolve(nodes)
+    }
+    const filtered = await FilteredReaderBuilder.create(
+      transport,
+      () => Promise.resolve(capabilities),
+      new Filters(transport, () => Promise.resolve(capabilities)),
+      { stream: "orbit", topic: "fleet_changes" },
+      { kind: "group", name: "anomaly-desk" },
+      { kind: "bound" }
+    )
+      .start({ kind: "first" })
+      .build()
+    // The dial is what this test is about, the page itself is not served.
+    await filtered.tryNextPage().catch(() => undefined)
+    await filtered.close().catch(() => undefined)
+  }
+  await read(1)
+  assert.deepEqual(dialed, [["", 0]], "one node: the caller's own endpoint, port zero")
+  dialed.length = 0
+  await read(3)
+  assert.equal(dialed.length, 1)
+  assert.notEqual(dialed[0]?.[1], 0, "a cluster: the primary's advertised endpoint")
+})
+
+void test("given_a_failed_topology_probe_when_reading_again_then_should_recover_the_mapped_endpoint_and_cache_success", async () => {
+  const failure = new TransportError("cluster metadata is temporarily unavailable", true)
+  let probes = 0
+  let loseRoute = false
+  const dialed: (readonly [string, number])[] = []
+  const transport: FilterTransport = {
+    ...baseTransport(() => Promise.resolve(route())),
+    clusterNodeCount: () => {
+      probes += 1
+      return probes === 1 ? Promise.reject(failure) : Promise.resolve(1)
+    },
+    openNodeConnection: (ip, port) => {
+      dialed.push([ip, port])
+      if (ip !== "" || port !== 0) {
+        return Promise.reject(new TransportError("the advertised port is unreachable", true))
+      }
+      return Promise.resolve({
+        close: () => Promise.resolve(),
+        send: (code, payload) => {
+          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
+          if (loseRoute) {
+            loseRoute = false
+            return Promise.resolve(staleReply("the data connection lost its route"))
+          }
+          const request = pollOf(payload)
+          const offset =
+            request.start.kind === "continue" ? request.start.continuation.nextScanOffset : 0n
+          return Promise.resolve(
+            pageReply(page("primary", { offsets: [offset], nextScanOffset: offset + 1n }))
+          )
+        }
+      })
+    }
+  }
+  const filtered = reader(transport, "primary", undefined, { idleIntervalMs: 0 })
+  try {
+    await assert.rejects(filtered.tryNextPage(), failure)
+    assert.deepEqual(dialed, [], "failed discovery must not dial an unverified endpoint")
+    const recovered = await filtered.tryNextPage()
+    assert.equal(recovered?.records[0]?.offset, 0n)
+    assert.deepEqual(dialed, [["", 0]])
+    assert.equal(probes, 2)
+
+    loseRoute = true
+    assert.equal(await filtered.tryNextPage(), undefined)
+    const rerouted = await filtered.tryNextPage()
+    assert.equal(rerouted?.records[0]?.offset, 1n)
+    assert.deepEqual(dialed, [
+      ["", 0],
+      ["", 0]
+    ])
+    assert.equal(probes, 2, "successful topology discovery stays cached after rerouting")
+  } finally {
+    await filtered.close()
+  }
 })
 
 void test("given_a_rebalance_when_a_partition_is_gained_then_should_start_it_at_the_stored_offset", async () => {

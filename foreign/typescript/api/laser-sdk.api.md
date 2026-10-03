@@ -2735,7 +2735,7 @@ export interface FilterTestResult {
 }
 
 // @public
-export type FilterTransport = Pick<LaserTransport, "sendManaged" | "joinConsumerGroup" | "leaveConsumerGroup" | "joinExistingConsumerGroup" | "openNodeConnection" | "openCoordinator" | "connectsNodes">;
+export type FilterTransport = Pick<LaserTransport, "sendManaged" | "joinConsumerGroup" | "leaveConsumerGroup" | "joinExistingConsumerGroup" | "openNodeConnection" | "clusterNodeCount" | "openCoordinator" | "connectsNodes">;
 
 // @public (undocumented)
 export interface FilterValidation {
@@ -5920,7 +5920,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.5.1";
+export const SDK_VERSION = "0.5.2";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;

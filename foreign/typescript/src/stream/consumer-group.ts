@@ -430,11 +430,27 @@ export class GroupFilter {
     await this.group.filters().requireCatalog()
     const native = await this.group.native()
     const name = groupFilterName(native.identity)
-    const page = await this.group.filters().list(name, { pageSize: GROUP_FILTER_LOOKUP_PAGE })
-    const own = page.items.find((summary) => summary.name === name)
-    if (own === undefined) return false
-    this.group.remember(await this.group.filters().dropFilter(own.id))
-    return true
+    const filters = this.group.filters()
+    let beforeId: number | undefined
+    for (;;) {
+      const page = await filters.list(name, { pageSize: GROUP_FILTER_LOOKUP_PAGE }, beforeId)
+      const own = page.items.find((summary) => summary.name === name)
+      if (own !== undefined) {
+        this.group.remember(await filters.dropFilter(own.id))
+        return true
+      }
+      const next = page.items.at(-1)?.id
+      if (next === undefined) return false
+      if (beforeId !== undefined && next >= beforeId) {
+        throw new FilterExecutionError("the catalog lookup cursor did not advance", {
+          code: { kind: "known", name: "Unavailable" },
+          reason: "catalog_unavailable",
+          message: "the catalog lookup cursor did not advance"
+        })
+      }
+      if (page.items.length >= page.total) return false
+      beforeId = next
+    }
   }
 
   /**

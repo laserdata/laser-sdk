@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.5.1" # typed streaming plus provenance
+laser-sdk = "0.5.2" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.5.1", features = ["agent", "managed"] }
+laser-sdk = { version = "0.5.2", features = ["agent", "managed"] }
 ```
 
 ## Quick example

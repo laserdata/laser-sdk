@@ -322,6 +322,42 @@ async def test_given_a_group_filter_when_deleted_then_should_release_the_group_a
     assert await group.filter().delete() is True
 
 
+async def test_given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_exact_filter(
+    laser,
+):
+    if not (await laser.capabilities()).filters_catalog:
+        pytest.skip("a consumer group filter needs a managed plane")
+    topic = laser.topic(TOPIC)
+    await topic.ensure(1)
+    group = None
+    before = None
+    collisions = []
+    for index in range(98):
+        candidate = topic.consumer_group(f"delete-worker-{index}")
+        info = await candidate.create()
+        if info["id"] == 9:
+            group = candidate
+            before = await group.filter().configure(safe_mode_filter())
+        elif 90 <= info["id"] <= 97:
+            binding = await candidate.filter().configure(safe_mode_filter())
+            collisions.append((candidate, binding))
+        if info["id"] == 97:
+            break
+    assert group is not None
+    assert before is not None
+    assert len(collisions) == 8
+    assert await group.filter().delete() is True
+    assert await group.filter().get() is None
+    assert await group.filter().delete() is False
+    again = await group.filter().configure(safe_mode_filter())
+    assert again["filter_id"] != before["filter_id"]
+    assert again["digest"] == before["digest"]
+    assert await group.filter().delete() is True
+    for candidate, binding in collisions:
+        assert await candidate.filter().get() == binding
+        assert await candidate.filter().delete() is True
+
+
 async def test_given_edge_records_when_read_inline_then_should_return_matches_at_their_offsets(
     laser,
 ):

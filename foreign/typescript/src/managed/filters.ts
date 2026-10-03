@@ -154,6 +154,7 @@ export type FilterTransport = Pick<
   | "leaveConsumerGroup"
   | "joinExistingConsumerGroup"
   | "openNodeConnection"
+  | "clusterNodeCount"
   | "openCoordinator"
   | "connectsNodes"
 >
@@ -293,10 +294,15 @@ export class Filters {
    *
    * @internal
    */
-  async list(nameContains: string, options: CatalogPageOptions = {}): Promise<FilterPage> {
+  async list(
+    nameContains: string,
+    options: CatalogPageOptions = {},
+    beforeId?: number
+  ): Promise<FilterPage> {
     const request: ListFilters = {
       v: FILTER_OP_VERSION,
       nameContains,
+      ...(beforeId !== undefined ? { beforeId } : {}),
       page: options.page ?? 0,
       pageSize: options.pageSize ?? DEFAULT_PAGE_SIZE
     }
@@ -1552,6 +1558,11 @@ class Routes {
   private readonly opening = new Map<string, Promise<NodeConnection>>()
   private readonly partitions = new Map<number, string>()
   private closed = false
+  // Whether the deployment is one node, learned on the first route. A single
+  // node is every partition's primary, and the address it advertises can be
+  // one the caller cannot reach (a port mapped by a container runtime, a slot
+  // behind a proxy), so its data connection dials what the caller dialed.
+  private singleNode: boolean | undefined
   /** Data connections these routes opened. */
   opened = 0
 
@@ -1584,7 +1595,12 @@ class Routes {
       )
     )
     this.requireOpen()
-    const endpoint = `${route.ip}:${String(route.tcpPort)}`
+    if (this.singleNode === undefined) {
+      const count = this.transport.clusterNodeCount
+      this.singleNode = count === undefined ? false : (await count.call(this.transport)) <= 1
+    }
+    const dial: PollRoute = this.singleNode ? { ...route, ip: "", tcpPort: 0 } : route
+    const endpoint = this.singleNode ? "caller" : `${route.ip}:${String(route.tcpPort)}`
     const existing = this.connections.get(endpoint)
     const reuse = existing === undefined ? undefined : sessionReuse(existing.session, route.session)
     if (existing !== undefined && reuse === "raise") {
@@ -1598,7 +1614,7 @@ class Routes {
       await this.dropEndpoint(endpoint)
     }
     if (!this.connections.has(endpoint)) {
-      if (route.tcpPort === 0) {
+      if (!this.singleNode && route.tcpPort === 0) {
         throw new UnsupportedError(`partition primary ${route.name} serves no TCP endpoint`)
       }
       let pending = this.opening.get(endpoint)
@@ -1612,7 +1628,7 @@ class Routes {
         }
         pending = this.opening.get(endpoint)
         if (pending === undefined && !this.connections.has(endpoint)) {
-          pending = attach(open.bind(this.transport), route).then((connection) => {
+          pending = attach(open.bind(this.transport), dial).then((connection) => {
             this.opened += 1
             return connection
           })

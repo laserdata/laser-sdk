@@ -72,7 +72,7 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- Python follows the shared workspace version, currently `0.5.1`. Its dependency must select the matching Rust `laser-sdk` crate.
+- Python follows the shared workspace version, currently `0.5.2`. Its dependency must select the matching Rust `laser-sdk` crate.
 
 ## Working on it
 

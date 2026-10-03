@@ -206,6 +206,8 @@ export interface LaserTransport {
    * unspecified address is reached through the host this transport connected to.
    */
   openNodeConnection?(ip: string, port: number): Promise<NodeConnection>
+  /** How many nodes the deployment has, when the transport can ask. */
+  clusterNodeCount?(): Promise<number>
   /**
    * A second authenticated connection to the node this transport reaches,
    * which holds its own consumer-group memberships and never rejoins them on
@@ -1593,11 +1595,12 @@ export class ApacheIggyTransport implements LaserTransport {
     }
     const unspecified = ip.length === 0 || ip === "0.0.0.0" || ip === "::" || ip === "[::]"
     const host = unspecified ? this.connection.host : ip
+    // Port zero means the endpoint this transport dialed itself.
     const connected = await connectSimpleClient(
       {
         ...this.connection,
         host,
-        port,
+        port: port === 0 ? this.connection.port : port,
         ...(isIP(this.connection.host) === 0 ? { servername: this.connection.host } : {})
       },
       Date.now() + connectOptions().timeoutMs,
@@ -1613,6 +1616,14 @@ export class ApacheIggyTransport implements LaserTransport {
         await client.destroy().catch(() => undefined)
       }
     }
+  }
+
+  async clusterNodeCount(): Promise<number> {
+    const metadata = await this.execute(
+      (client) => client.cluster.getClusterMetadata(),
+      "failed to read the cluster metadata"
+    )
+    return metadata.nodes.length
   }
 
   async openCoordinator(): Promise<CoordinatorConnection> {

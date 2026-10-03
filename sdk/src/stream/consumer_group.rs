@@ -502,21 +502,34 @@ impl GroupFilter {
         let details = self.group.native().await?;
         let identity = self.group.identity_of(details.id).await?;
         let name = group_filter_name(&identity);
-        let own = self
-            .group
-            .laser()
-            .filters()
-            .list(&name, 0, GROUP_FILTER_LOOKUP_PAGE)
-            .await?
-            .items
-            .into_iter()
-            .find(|summary| summary.name == name);
-        let Some(own) = own else {
-            return Ok(false);
-        };
-        let position = self.group.laser().filters().drop_filter(own.id).await?;
-        self.group.remember_position(position);
-        Ok(true)
+        let filters = self.group.laser().filters();
+        let mut before_id = None;
+        loop {
+            let page = filters
+                .list_before(&name, before_id, GROUP_FILTER_LOOKUP_PAGE)
+                .await?;
+            let next = page.items.last().map(|summary| summary.id);
+            let count = page.items.len();
+            if let Some(own) = page.items.into_iter().find(|summary| summary.name == name) {
+                let position = filters.drop_filter(own.id).await?;
+                self.group.remember_position(position);
+                return Ok(true);
+            }
+            let Some(next) = next else {
+                return Ok(false);
+            };
+            if before_id.is_some_and(|before| next >= before) {
+                return Err(FilterError::new(
+                    FilterErrorReason::CatalogUnavailable,
+                    "the catalog lookup cursor did not advance",
+                )
+                .into());
+            }
+            if count as u64 >= u64::from(page.total) {
+                return Ok(false);
+            }
+            before_id = Some(next);
+        }
     }
 
     /// Release the group's policy. Its readers then receive every record. A

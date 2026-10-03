@@ -129,18 +129,18 @@ impl<'a> Filters<'a> {
 
     /// One page of saved filters whose name contains `name_contains`, newest
     /// first.
-    pub(crate) async fn list(
+    pub(crate) async fn list_before(
         &self,
         name_contains: &str,
-        page: u32,
+        before_id: Option<u32>,
         page_size: u32,
     ) -> Result<FilterPage, LaserError> {
         let request = ListFilters {
             v: FILTER_OP_VERSION,
             name_contains: Some(name_contains.to_owned()),
             state: None,
-            before_id: None,
-            page,
+            before_id,
+            page: 0,
             page_size,
         };
         request.validate()?;

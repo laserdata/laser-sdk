@@ -8,11 +8,13 @@ import {
   TransportError
 } from "../../src/client/errors.js"
 import type { LaserTransport } from "../../src/iggy/apache-iggy.js"
-import { ConsumerGroup } from "../../src/stream/consumer-group.js"
-import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
+import { Filters } from "../../src/managed/filters.js"
+import { ConsumerGroup, GroupFilter } from "../../src/stream/consumer-group.js"
+import { decodeOne, encodeNamed, expectMap, field } from "../../src/wire/cbor.js"
 import {
   AGDX_FILTER_MUTATE_CODE,
   AGDX_GET_FILTER_BINDING_CODE,
+  AGDX_LIST_FILTERS_CODE,
   FILTER_OP_VERSION
 } from "../../src/wire/codes.js"
 import {
@@ -23,7 +25,8 @@ import {
   encodeFilterCatalogReply,
   type FilterBinding,
   type FilterGroupIdentity,
-  type FilterMutationRequest
+  type FilterMutationRequest,
+  type FilterSummary
 } from "../../src/wire/filter.js"
 
 const identity: FilterGroupIdentity = {
@@ -183,4 +186,198 @@ void test("given_a_group_without_capability_context_when_consuming_then_should_n
     name: "workers"
   })
   await assert.rejects(group.consumer(), TransportError)
+})
+
+function deletionSetup(collisionCount: number, present = true) {
+  const ownIdentity = { ...identity, groupId: 9n }
+  const summary = (id: number, groupId: bigint): FilterSummary => ({
+    id,
+    name: `group:1:1:2:2:${groupId.toString()}`,
+    description: "",
+    state: "active",
+    latestRevision: 1,
+    latestDigest: binding.digest,
+    codec: "json",
+    bindings: 1,
+    createdAtMicros: 1n,
+    updatedAtMicros: 1n
+  })
+  let items = Array.from({ length: collisionCount }, (_, index) =>
+    summary(index + 2, BigInt(index < 8 ? 90 + index : 900 + index - 8))
+  )
+  if (present) items.push(summary(1, 9n))
+  items.sort((left, right) => right.id - left.id)
+  const pages: number[] = []
+  const cursors: (number | undefined)[] = []
+  const dropped: number[] = []
+  const remembered: bigint[] = []
+  let failedPage: number | undefined
+  let changeBetweenPages = false
+  let repeatPage = false
+  const transport = {
+    sendManaged: (code: number, payload: Uint8Array): Promise<Uint8Array> => {
+      if (code === AGDX_LIST_FILTERS_CODE) {
+        const request = expectMap(decodeOne(payload, "list"), "list")
+        const page = field.requiredU32(request, "page", "list")
+        const pageSize = field.requiredU32(request, "page_size", "list")
+        const name = field.requiredString(request, "name_contains", "list")
+        const beforeId = field.optionalU32(request, "before_id", "list")
+        const lookup = pages.length
+        pages.push(page)
+        cursors.push(beforeId)
+        if (lookup === failedPage) {
+          failedPage = undefined
+          return Promise.reject(new TransportError("catalog page unavailable", true))
+        }
+        if (beforeId !== undefined && changeBetweenPages) {
+          items = items.filter((item) => item.id <= 4)
+          items.unshift(summary(1001, 999n))
+          changeBetweenPages = false
+        }
+        const matching = items.filter(
+          (item) =>
+            item.name.includes(name) && (beforeId === undefined || repeatPage || item.id < beforeId)
+        )
+        return Promise.resolve(
+          encodeNamed(
+            encodeFilterCatalogReply({
+              kind: "ok",
+              outcome: {
+                kind: "filters",
+                page: {
+                  items: matching.slice(page * pageSize, (page + 1) * pageSize),
+                  page,
+                  pageSize,
+                  total: matching.length
+                }
+              }
+            })
+          )
+        )
+      }
+      if (code === AGDX_FILTER_MUTATE_CODE) {
+        const request = decodeFilterMutationRequest(decodeOne(payload, "mutation"), "mutation")
+        assert.equal(request.mutation.kind, "drop")
+        const filterId = request.mutation.filterId
+        dropped.push(filterId)
+        items = items.filter((item) => item.id !== filterId)
+        return Promise.resolve(
+          encodeNamed(
+            encodeFilterCatalogReply({
+              kind: "ok",
+              outcome: {
+                kind: "mutation",
+                outcome: {
+                  v: FILTER_OP_VERSION,
+                  operationId: request.operationId,
+                  status: { kind: "applied", result: { kind: "dropped", filterId } },
+                  catalogPosition: {
+                    partitionId: 0,
+                    offset: 42n,
+                    operationId: request.operationId
+                  }
+                }
+              }
+            })
+          )
+        )
+      }
+      return Promise.reject(new Error(`unexpected command ${code.toString()}`))
+    }
+  } as unknown as LaserTransport
+  const filters = new Filters(transport, () => Promise.resolve(capabilities))
+  return {
+    filter: GroupFilter.create({
+      streamName: "orbit",
+      topicName: "fleet_changes",
+      filters: () => filters,
+      groupRef: () => Promise.resolve(binding.group),
+      native: () => Promise.resolve({ id: 9, name: "workers", identity: ownIdentity }),
+      remember: (position) => {
+        if (position !== undefined) remembered.push(position.offset)
+      }
+    }),
+    pages,
+    cursors,
+    dropped,
+    remembered,
+    remaining: () => items.map((item) => item.id),
+    failPageOnce: (page: number) => {
+      failedPage = page
+    },
+    changeAfterFirstPage: () => {
+      changeBetweenPages = true
+    },
+    repeatPage: () => {
+      repeatPage = true
+    }
+  }
+}
+
+void test("given_group_9_and_groups_90_through_97_when_deleted_then_should_find_the_exact_filter_on_the_next_page", async () => {
+  const fixture = deletionSetup(8)
+  assert.equal(await fixture.filter.delete(), true)
+  assert.deepEqual(fixture.pages, [0, 0])
+  assert.deepEqual(fixture.cursors, [undefined, 2])
+  assert.deepEqual(fixture.dropped, [1])
+  assert.deepEqual(fixture.remembered, [42n])
+  assert.equal(fixture.remaining().length, 8)
+  assert.equal(await fixture.filter.delete(), false)
+  assert.deepEqual(fixture.dropped, [1], "a repeated delete preserves the other groups")
+})
+
+void test("given_three_pages_of_prefix_collisions_when_deleted_then_should_find_the_exact_filter_on_the_fourth_page", async () => {
+  const fixture = deletionSetup(24)
+  assert.equal(await fixture.filter.delete(), true)
+  assert.deepEqual(fixture.pages, [0, 0, 0, 0])
+  assert.deepEqual(fixture.cursors, [undefined, 18, 10, 2])
+  assert.deepEqual(fixture.dropped, [1])
+  assert.equal(fixture.remaining().length, 24)
+})
+
+void test("given_only_prefix_collisions_when_deleted_then_should_scan_every_page_and_return_false", async () => {
+  const fixture = deletionSetup(17, false)
+  assert.equal(await fixture.filter.delete(), false)
+  assert.deepEqual(fixture.pages, [0, 0, 0])
+  assert.deepEqual(fixture.cursors, [undefined, 11, 3])
+  assert.deepEqual(fixture.dropped, [])
+  assert.deepEqual(fixture.remembered, [])
+})
+
+void test("given_a_failed_catalog_page_when_deletion_is_retried_then_should_report_the_error_and_converge", async () => {
+  for (const failedPage of [0, 1, 2, 3]) {
+    const fixture = deletionSetup(24)
+    fixture.failPageOnce(failedPage)
+    await assert.rejects(fixture.filter.delete(), TransportError)
+    assert.deepEqual(fixture.dropped, [])
+    assert.deepEqual(fixture.remembered, [])
+    assert.equal(fixture.remaining().length, 25)
+    assert.equal(await fixture.filter.delete(), true)
+    assert.equal(await fixture.filter.delete(), false)
+    assert.deepEqual(fixture.dropped, [1])
+    assert.equal(fixture.remaining().length, 24)
+  }
+})
+
+void test("given_deleted_and_new_prefix_collisions_between_pages_when_deleted_then_should_still_find_the_exact_filter", async () => {
+  const fixture = deletionSetup(8)
+  fixture.changeAfterFirstPage()
+  assert.equal(await fixture.filter.delete(), true)
+  assert.deepEqual(fixture.cursors, [undefined, 2])
+  assert.deepEqual(fixture.dropped, [1])
+  assert.deepEqual(fixture.remaining(), [1001, 4, 3, 2])
+  assert.equal(await fixture.filter.delete(), false)
+})
+
+void test("given_a_repeated_catalog_cursor_when_deleted_then_should_fail_without_deleting_another_filter", async () => {
+  const fixture = deletionSetup(8)
+  fixture.repeatPage()
+  await assert.rejects(
+    fixture.filter.delete(),
+    (error: unknown) =>
+      error instanceof FilterExecutionError && error.reason === "catalog_unavailable"
+  )
+  assert.deepEqual(fixture.cursors, [undefined, 2])
+  assert.deepEqual(fixture.dropped, [])
+  assert.equal(fixture.remaining().length, 9)
 })

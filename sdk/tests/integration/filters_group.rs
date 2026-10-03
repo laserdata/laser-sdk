@@ -54,7 +54,8 @@ const SAFE_MODE: &str = r#"{"op":"u","table":"satellites","changed":["mode"],"af
 const DECOMMISSION: &str = r#"{"op":"d","table":"satellites","before":{"id":"sat-042"}}"#;
 const GROUND_STATION: &str = r#"{"op":"u","table":"ground_stations","changed":["status"],"after":{"id":"svalbard","status":"online"}}"#;
 
-static CATALOG_SERVER: OnceCell<(TestIggy, tempfile::TempDir)> = OnceCell::const_new();
+static CATALOG_SERVER: OnceCell<(TestIggy, tempfile::TempDir, Arc<Mutex<CatalogState>>)> =
+    OnceCell::const_new();
 
 fn bound_filter() -> ConsumerFilter {
     ConsumerFilter::json(FilterExpr::any([
@@ -72,6 +73,10 @@ struct CatalogState {
     owners: HashMap<FilterGroupIdentity, u32>,
     bindings: HashMap<FilterGroupIdentity, FilterBinding>,
     generations: HashMap<FilterGroupIdentity, u64>,
+    list_failures: HashMap<String, u32>,
+    list_requests: HashMap<String, Vec<Option<u32>>>,
+    list_changes: HashMap<String, FilterGroupIdentity>,
+    list_repeats: BTreeSet<String>,
 }
 
 impl CatalogState {
@@ -388,9 +393,61 @@ impl CatalogState {
             }
             AGDX_LIST_FILTERS_CODE => {
                 let request: ListFilters = decode_named(&forwarded.payload).ok()?;
+                if let Some(name) = &request.name_contains {
+                    let requests = self.list_requests.entry(name.clone()).or_default();
+                    let lookup = requests.len() as u32;
+                    requests.push(request.before_id);
+                    if self.list_failures.get(name) == Some(&lookup) {
+                        self.list_failures.remove(name);
+                        return encode_named(&FilterCatalogReply::Err(FilterError::new(
+                            FilterErrorReason::CatalogUnavailable,
+                            "the catalog page is unavailable",
+                        )))
+                        .ok();
+                    }
+                    if request.before_id.is_some()
+                        && let Some(identity) = self.list_changes.remove(name)
+                    {
+                        let group = self.bindings.get(&identity)?.group.clone();
+                        for group_id in 90..95 {
+                            let collision = FilterGroupIdentity {
+                                group_id,
+                                ..identity
+                            };
+                            if let Some(filter_id) = self.owners.remove(&collision) {
+                                self.filters.remove(&filter_id);
+                                self.bindings.remove(&collision);
+                            }
+                        }
+                        self.mutate(FilterCatalogCommand {
+                            limits: None,
+                            operation_id: 999,
+                            actor_user_id: 0,
+                            mutation: FilterMutation::ConfigureGroup {
+                                group,
+                                policy: GroupFilterSpec::Definition(bound_filter()),
+                                expected_identity: None,
+                            },
+                            identity: Some(FilterGroupIdentity {
+                                group_id: 999,
+                                ..identity
+                            }),
+                            filter_id: None,
+                            grants: Vec::new(),
+                        })
+                        .ok()?;
+                    }
+                }
+                let repeated = request
+                    .name_contains
+                    .as_ref()
+                    .is_some_and(|name| self.list_repeats.contains(name));
                 let mut items: Vec<FilterSummary> = self
                     .owners
                     .iter()
+                    .filter(|(_, filter_id)| {
+                        repeated || request.before_id.is_none_or(|before| **filter_id < before)
+                    })
                     .filter_map(|(identity, filter_id)| {
                         let name = format!(
                             "group:{}:{}:{}:{}:{}",
@@ -428,6 +485,11 @@ impl CatalogState {
                     .collect();
                 items.sort_by_key(|summary| std::cmp::Reverse(summary.id));
                 let total = items.len() as u32;
+                let items = items
+                    .into_iter()
+                    .skip((request.page as usize).saturating_mul(request.page_size as usize))
+                    .take(request.page_size as usize)
+                    .collect();
                 FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Filters(FilterPage {
                     items,
                     page: request.page,
@@ -492,14 +554,15 @@ impl CatalogState {
 }
 
 async fn catalog_server() -> &'static TestIggy {
-    let (server, _socket_dir) = CATALOG_SERVER.get_or_init(start_catalog_server).await;
+    let (server, _socket_dir, _state) = CATALOG_SERVER.get_or_init(start_catalog_server).await;
     server
 }
 
-async fn start_catalog_server() -> (TestIggy, tempfile::TempDir) {
+async fn start_catalog_server() -> (TestIggy, tempfile::TempDir, Arc<Mutex<CatalogState>>) {
     let socket_dir = tempfile::tempdir().expect("socket directory");
     let socket = socket_dir.path().join("plane.sock");
-    spawn_catalog(socket.clone());
+    let state = Arc::new(Mutex::new(CatalogState::default()));
+    spawn_catalog(socket.clone(), Arc::clone(&state));
     let server = TestIggy::start_with(vec![
         ("IGGY_PLANE_ENABLED".to_owned(), "true".to_owned()),
         (
@@ -508,15 +571,14 @@ async fn start_catalog_server() -> (TestIggy, tempfile::TempDir) {
         ),
     ])
     .await;
-    (server, socket_dir)
+    (server, socket_dir, state)
 }
 
-fn spawn_catalog(socket: PathBuf) {
+fn spawn_catalog(socket: PathBuf, state: Arc<Mutex<CatalogState>>) {
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the catalog");
     listener
         .set_nonblocking(true)
         .expect("nonblocking catalog socket");
-    let state = Arc::new(Mutex::new(CatalogState::default()));
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -603,6 +665,66 @@ async fn bound_group(laser: &Laser) -> ConsumerGroup {
         Some(1)
     );
     group
+}
+
+async fn deletion_group(laser: &Laser, collisions: usize) -> (ConsumerGroup, FilterBinding) {
+    let topic = laser.topic(TOPIC);
+    topic.ensure(1).await.expect("the topic exists");
+    let stream_id = Identifier::named(laser.default_stream().expect("stream")).expect("stream id");
+    let topic_id = Identifier::named(TOPIC).expect("topic id");
+    for index in 0..10 {
+        let native = laser
+            .client()
+            .create_consumer_group(&stream_id, &topic_id, &format!("delete-worker-{index}"))
+            .await
+            .expect("the group is created");
+        if native.id == 9 {
+            break;
+        }
+    }
+    let group = topic.consumer_group_id(9);
+    let binding = group
+        .filter()
+        .configure(bound_filter())
+        .await
+        .expect("group 9 receives its own filter");
+    let (_, _, state) = CATALOG_SERVER.get().expect("the catalog runs");
+    let mut state = state.lock().expect("catalog state");
+    for group_id in (90..98).chain(900..1000).take(collisions) {
+        state
+            .mutate(FilterCatalogCommand {
+                limits: None,
+                operation_id: u128::from(group_id),
+                actor_user_id: 0,
+                mutation: FilterMutation::ConfigureGroup {
+                    group: FilterGroupRef {
+                        group: format!("collision-{group_id}"),
+                        ..binding.group.clone()
+                    },
+                    policy: GroupFilterSpec::Definition(bound_filter()),
+                    expected_identity: None,
+                },
+                identity: Some(FilterGroupIdentity {
+                    group_id,
+                    ..binding.identity
+                }),
+                filter_id: None,
+                grants: Vec::new(),
+            })
+            .expect("the catalog contains a prefix collision");
+    }
+    (group, binding)
+}
+
+fn deletion_filter_name(binding: &FilterBinding) -> String {
+    format!(
+        "group:{}:{}:{}:{}:{}",
+        binding.identity.stream_id,
+        binding.identity.stream_created_at_micros,
+        binding.identity.topic_id,
+        binding.identity.topic_created_at_micros,
+        binding.identity.group_id
+    )
 }
 
 async fn stored_group_offset(laser: &Laser, stream: &str, partition: u32) -> Option<u64> {
@@ -1080,7 +1202,7 @@ async fn given_lost_membership_when_reading_again_then_should_rejoin_from_commit
 #[tokio::test]
 async fn given_two_partitions_on_one_node_when_reading_many_pages_then_should_keep_one_data_connection()
  {
-    let (server, _socket_dir) = start_catalog_server().await;
+    let (server, _socket_dir, _state) = start_catalog_server().await;
     let laser = harness::connected_laser_on(&server).await;
     let stream = group_source(&laser).await;
     let stream_id = Identifier::named(&stream).expect("stream");
@@ -1401,7 +1523,8 @@ async fn given_out_of_order_acks_when_acknowledging_then_should_store_only_the_c
 #[tokio::test]
 async fn given_a_malformed_record_under_stop_when_reading_then_should_deliver_earlier_matches_then_the_fault()
  {
-    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let (server, _socket_dir, _state) = start_catalog_server().await;
+    let laser = harness::connected_laser_on(&server).await;
     publish(&laser, TOPIC, &[SAFE_MODE, "not json", DECOMMISSION], 0).await;
     let stream = laser.default_stream().expect("stream").to_owned();
     let group = bound_group(&laser).await;
@@ -1539,6 +1662,151 @@ async fn given_a_group_with_a_filter_when_deleted_then_should_release_it_and_rem
     assert_eq!(again.digest, before.digest);
     assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
     group.filter().delete().await.expect("cleanup");
+}
+
+#[tokio::test]
+async fn given_group_9_and_groups_90_through_97_when_deleted_then_should_find_its_filter_after_the_first_page()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let (group, before) = deletion_group(&laser, 8).await;
+    assert!(
+        group
+            .filter()
+            .delete()
+            .await
+            .expect("the exact filter deletes")
+    );
+    assert_eq!(group.filter().get().await.expect("readable"), None);
+    assert!(!group.filter().delete().await.expect("nothing left"));
+    let (_, _, state) = CATALOG_SERVER.get().expect("the catalog runs");
+    let state = state.lock().expect("catalog state");
+    assert!(!state.filters.contains_key(&before.filter_id));
+    for group_id in 90..98 {
+        assert!(state.owners.contains_key(&FilterGroupIdentity {
+            group_id,
+            ..before.identity
+        }));
+    }
+}
+
+#[tokio::test]
+async fn given_three_pages_of_prefix_collisions_when_deleted_then_should_find_the_exact_filter_on_the_fourth_page()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let (group, before) = deletion_group(&laser, 24).await;
+    assert!(
+        group
+            .filter()
+            .delete()
+            .await
+            .expect("the exact filter deletes")
+    );
+    assert!(
+        !group
+            .filter()
+            .delete()
+            .await
+            .expect("every page proves absence")
+    );
+    let again = group
+        .filter()
+        .configure(bound_filter())
+        .await
+        .expect("the same group configures again");
+    assert_ne!(again.filter_id, before.filter_id);
+    assert_eq!(again.digest, before.digest);
+    assert!(
+        group
+            .filter()
+            .delete()
+            .await
+            .expect("the replacement deletes")
+    );
+    assert!(!group.filter().delete().await.expect("nothing left"));
+}
+
+#[tokio::test]
+async fn given_a_failed_catalog_page_when_deletion_is_retried_then_should_report_the_error_and_converge()
+ {
+    for page in 0..4 {
+        let laser = harness::connected_laser_on(catalog_server().await).await;
+        let (group, before) = deletion_group(&laser, 24).await;
+        let name = deletion_filter_name(&before);
+        let (_, _, state) = CATALOG_SERVER.get().expect("the catalog runs");
+        state
+            .lock()
+            .expect("catalog state")
+            .list_failures
+            .insert(name, page);
+        let error = group.filter().delete().await.expect_err("the page fails");
+        assert_eq!(
+            error.filter_reason(),
+            Some(FilterErrorReason::CatalogUnavailable)
+        );
+        assert_eq!(group.filter().get().await.expect("readable"), Some(before));
+        assert!(group.filter().delete().await.expect("the retry deletes"));
+        assert!(!group.filter().delete().await.expect("nothing left"));
+    }
+}
+
+#[tokio::test]
+async fn given_deleted_and_new_prefix_collisions_between_pages_when_deleted_then_should_still_find_the_exact_filter()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let (group, before) = deletion_group(&laser, 8).await;
+    let name = deletion_filter_name(&before);
+    let (_, _, state) = CATALOG_SERVER.get().expect("the catalog runs");
+    let first_collision_id = {
+        let mut state = state.lock().expect("catalog state");
+        let filter_id = *state
+            .owners
+            .get(&FilterGroupIdentity {
+                group_id: 90,
+                ..before.identity
+            })
+            .expect("the first collision exists");
+        state.list_changes.insert(name.clone(), before.identity);
+        filter_id
+    };
+    assert!(
+        group
+            .filter()
+            .delete()
+            .await
+            .expect("the exact filter deletes")
+    );
+    assert!(!group.filter().delete().await.expect("nothing left"));
+    let state = state.lock().expect("catalog state");
+    assert!(!state.filters.contains_key(&before.filter_id));
+    assert!(state.owners.contains_key(&FilterGroupIdentity {
+        group_id: 999,
+        ..before.identity
+    }));
+    let requests = state.list_requests.get(&name).expect("catalog requests");
+    assert_eq!(&requests[..2], &[None, Some(first_collision_id)]);
+}
+
+#[tokio::test]
+async fn given_a_repeated_catalog_cursor_when_deleted_then_should_fail_without_deleting_another_filter()
+ {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let (group, before) = deletion_group(&laser, 8).await;
+    let (_, _, state) = CATALOG_SERVER.get().expect("the catalog runs");
+    state
+        .lock()
+        .expect("catalog state")
+        .list_repeats
+        .insert(deletion_filter_name(&before));
+    let error = group
+        .filter()
+        .delete()
+        .await
+        .expect_err("the cursor repeats");
+    assert_eq!(
+        error.filter_reason(),
+        Some(FilterErrorReason::CatalogUnavailable)
+    );
+    assert_eq!(group.filter().get().await.expect("readable"), Some(before));
 }
 
 #[tokio::test]

@@ -1,10 +1,10 @@
 use crate::error::LaserError;
 use crate::iggy::prelude::{
-    AutoLogin, Client, ClientWrapper, Credentials, IggyClient, PersonalAccessTokenClient,
-    QuicClient, QuicClientConfig, TcpClient, TcpClientConfig, UserClient, WebSocketClient,
-    WebSocketClientConfig,
+    AutoLogin, Client, ClientWrapper, ClusterClient, Credentials, IggyClient,
+    PersonalAccessTokenClient, QuicClient, QuicClientConfig, TcpClient, TcpClientConfig,
+    UserClient, WebSocketClient, WebSocketClientConfig,
 };
-use crate::laser::{host_of, with_endpoint};
+use crate::laser::{endpoint_of, host_of, with_endpoint};
 use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_POLL_ROUTING_CODE,
 };
@@ -41,6 +41,12 @@ pub(crate) struct Routes {
     connections: HashMap<String, PrimaryConnection>,
     partitions: HashMap<u32, String>,
     opened: u64,
+    // Whether the deployment is one node, learned on the first route. A single
+    // node is every partition's primary, and the address it advertises can be
+    // one the caller cannot reach (a port mapped by a container runtime, a
+    // slot behind a proxy), so its data connection dials what the caller
+    // dialed.
+    single_node: Option<bool>,
 }
 
 struct PrimaryConnection {
@@ -99,7 +105,9 @@ impl Routes {
             "primary filtered reads open data connections, so they need a Laser built from a connection string. Read in ReadMode::Local for a bring-your-own client",
         ))?;
         let route = resolve(coordinator, route_to, partition_id, acknowledgment).await?;
-        let endpoint = endpoint(connection_string, &route)?;
+        let endpoint = self
+            .endpoint(coordinator, connection_string, &route)
+            .await?;
         let session = route.consumer_session;
         let reuse = self
             .connections
@@ -154,6 +162,27 @@ impl Routes {
         }
         self.partitions.insert(partition_id, endpoint.clone());
         Ok(Arc::clone(&self.connections[&endpoint].client))
+    }
+
+    async fn endpoint(
+        &mut self,
+        coordinator: &(impl ClusterClient + Sync),
+        connection_string: &str,
+        route: &PollRoutingResponse,
+    ) -> Result<String, LaserError> {
+        let single_node = match self.single_node {
+            Some(single_node) => single_node,
+            None => {
+                let single_node = coordinator.get_cluster_metadata().await?.nodes.len() <= 1;
+                self.single_node = Some(single_node);
+                single_node
+            }
+        };
+        if single_node {
+            Ok(endpoint_of(connection_string).to_owned())
+        } else {
+            endpoint(connection_string, route)
+        }
     }
 
     /// Data connections these routes opened, which stays at one per node while every session lives.
@@ -373,6 +402,73 @@ async fn attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterNodeResponse;
+    use iggy_common::{ClusterMetadata, IggyError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecoveringCluster {
+        calls: AtomicUsize,
+        metadata: ClusterMetadata,
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterClient for RecoveringCluster {
+        async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            Ok(self.metadata.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_failed_topology_probe_when_routing_again_then_should_recover_and_cache_the_endpoint()
+     {
+        let route = PollRoutingResponse {
+            consumer_session: session(7, 3, 10),
+            primary: ClusterNodeResponse {
+                name: "node-1".to_owned(),
+                ip: "127.0.0.1".to_owned(),
+                tcp_port: 8090,
+                quic_port: 8091,
+                http_port: 0,
+                websocket_port: 3000,
+                role: 1,
+                status: 1,
+            },
+        };
+        let connection_string = "iggy+tcp://iggy:iggy@127.0.0.1:18090";
+        for (nodes, expected) in [(1, "127.0.0.1:18090"), (3, "127.0.0.1:8090")] {
+            let coordinator = RecoveringCluster {
+                calls: AtomicUsize::new(0),
+                metadata: ClusterMetadata {
+                    name: "cluster".to_owned(),
+                    nodes: vec![
+                        ClusterNode::try_from(route.primary.clone()).expect("valid node");
+                        nodes
+                    ],
+                },
+            };
+            let mut routes = Routes::default();
+            assert!(matches!(
+                routes
+                    .endpoint(&coordinator, connection_string, &route)
+                    .await,
+                Err(LaserError::Iggy(IggyError::TransientNotAccepted))
+            ));
+            assert_eq!(routes.single_node, None);
+            for _ in 0..2 {
+                assert_eq!(
+                    routes
+                        .endpoint(&coordinator, connection_string, &route)
+                        .await
+                        .expect("topology discovery recovers"),
+                    expected
+                );
+            }
+            assert_eq!(coordinator.calls.load(Ordering::Relaxed), 2);
+        }
+    }
 
     fn session(
         client_id: u128,

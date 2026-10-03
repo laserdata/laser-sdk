@@ -1746,6 +1746,17 @@ fn authority_start(after_scheme: &str) -> usize {
     before_query.rfind('@').map_or(0, |at| at + 1)
 }
 
+// The host and port a connection string dials, without scheme, userinfo,
+// path, or query.
+pub(crate) fn endpoint_of(connection_string: &str) -> &str {
+    let after_scheme = after_scheme(connection_string);
+    let host_and_port = &after_scheme[authority_start(after_scheme)..];
+    host_and_port
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(host_and_port)
+}
+
 // Strip scheme, userinfo, and port from a connection string's authority.
 pub(crate) fn host_of(connection_string: &str) -> &str {
     let after_scheme = after_scheme(connection_string);
@@ -2215,8 +2226,8 @@ mod builder_conflict_tests {
 #[cfg(test)]
 mod connection_string_tests {
     use super::{
-        PROD_CERT, flag_value_enabled, has_query_param, host_of, install_cert, is_laserdata_host,
-        normalize_connection_string, resolve_tls, resolve_tls_with,
+        PROD_CERT, endpoint_of, flag_value_enabled, has_query_param, host_of, install_cert,
+        is_laserdata_host, normalize_connection_string, resolve_tls, resolve_tls_with,
     };
 
     #[test]
@@ -2386,6 +2397,11 @@ mod connection_string_tests {
     #[test]
     fn given_a_bracketed_ipv6_authority_when_the_host_is_extracted_then_should_drop_the_brackets() {
         assert_eq!(host_of("iggy+tcp://u:p@[::1]:8090"), "::1");
+        assert_eq!(
+            endpoint_of("iggy+tcp://u:p@h.laserdata.cloud:8090?tls=true"),
+            "h.laserdata.cloud:8090"
+        );
+        assert_eq!(endpoint_of("iggy+tcp://u:p/q@[::1]:8090/x"), "[::1]:8090");
     }
 
     #[test]

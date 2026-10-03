@@ -21,6 +21,7 @@ import type { FilteredReader, FilteredReaderBuilder } from "../../src/managed/fi
 import {
   ConsumerFilter,
   FilterExpr,
+  type FilterBinding,
   consumerFilterDigest,
   decodeFilterReply,
   encodeConsumerFilter
@@ -627,6 +628,41 @@ void test("given_a_group_with_a_filter_when_deleted_then_should_release_it_and_r
     assert.notEqual(again.filterId, before?.filterId, "the id is not reused")
     assert.deepEqual(again.digest, before?.digest)
     assert.equal(await group.filter().delete(), true)
+  })
+})
+
+void test("given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_exact_filter", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    if (!(await laser.capabilities()).filters.catalog) throw new NeedsCatalog()
+    const topic = laser.stream(stream).topic(TOPIC)
+    let target: ConsumerGroup | undefined
+    let before: FilterBinding | undefined
+    const collisions: { group: ConsumerGroup; binding: FilterBinding }[] = []
+    for (let index = 0; index < 98; index += 1) {
+      const group = topic.consumerGroup(`delete-worker-${String(index)}`)
+      const info = await group.create()
+      if (info.id === 9) {
+        target = group
+        before = await group.filter().configure(safeModeFilter())
+      } else if (info.id >= 90 && info.id <= 97) {
+        collisions.push({ group, binding: await group.filter().configure(safeModeFilter()) })
+      }
+      if (info.id === 97) break
+    }
+    assert.ok(target)
+    assert.ok(before)
+    assert.equal(collisions.length, 8)
+    assert.equal(await target.filter().delete(), true)
+    assert.equal(await target.filter().get(), undefined)
+    assert.equal(await target.filter().delete(), false)
+    const again = await target.filter().configure(safeModeFilter())
+    assert.notEqual(again.filterId, before.filterId)
+    assert.deepEqual(again.digest, before.digest)
+    assert.equal(await target.filter().delete(), true)
+    for (const collision of collisions) {
+      assert.deepEqual(await collision.group.filter().get(), collision.binding)
+      assert.equal(await collision.group.filter().delete(), true)
+    }
   })
 })
 
