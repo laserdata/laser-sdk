@@ -1790,6 +1790,13 @@ class GroupFilter:
         revision refuses new reads, while records already delivered can still
         be acknowledged.
         """
+    def delete(self) -> typing.Any:
+        r"""
+        Delete the group's own filter with every revision. A bound group is
+        released first, so its consumers receive every record from their next
+        poll. Nothing of the filter stays in the catalog. Returns `False` when
+        the group has no filter of its own.
+        """
     def release(self) -> typing.Any:
         r"""
         Release the group's policy. Its readers then receive every record. A

@@ -3126,6 +3126,7 @@ export class GroupFilter {
     configure(filter: ConsumerFilter): Promise<FilterBinding>;
     configureAs(operationId: bigint | undefined, policy: GroupFilterSpec): Promise<FilterBinding>;
     configureWith(policy: GroupFilterSpec): Promise<FilterBinding>;
+    delete(): Promise<boolean>;
     get(): Promise<FilterBinding | undefined>;
     preview(partitionId: number, options?: FilterPreviewOptions): Promise<FilterPreview>;
     release(): Promise<FilterBinding>;

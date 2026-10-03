@@ -130,8 +130,8 @@ pub async fn run(laser: &Laser, stream: &str) -> Result<(), LaserError> {
             }
             .await;
             let closed = reader.close().await;
-            let released = group.filter().release().await.map(|_| ());
-            outcome.and(closed).and(released)?;
+            let deleted = group.filter().delete().await.map(|_| ());
+            outcome.and(closed).and(deleted)?;
         }
         Ok(())
     }

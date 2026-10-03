@@ -5,7 +5,13 @@ import type {
   LaserTransport,
   PolledMessage
 } from "../iggy/apache-iggy.js"
-import { CancelledError, InvalidError, TransportError, UnsupportedError } from "../client/errors.js"
+import {
+  CancelledError,
+  FilterExecutionError,
+  InvalidError,
+  TransportError,
+  UnsupportedError
+} from "../client/errors.js"
 import type { FilteredReader, MatchedRecord } from "../managed/filters.js"
 import type { PollingStrategy } from "./polling-strategy.js"
 
@@ -323,7 +329,15 @@ export class Consumer implements AsyncIterable<ConsumedMessage>, AsyncDisposable
   // redelivers the current batch instead of skipping it.
   private async fillFromGroup(reader: FilteredReader): Promise<void> {
     if (this.handledSincePoll) {
-      await reader.flushCompleted()
+      try {
+        await reader.flushCompleted()
+      } catch (error) {
+        // A policy change fences the prefix read under the old policy. Those
+        // records are delivered again from the stored offset, so nothing is
+        // lost and the consumer goes on without an error.
+        if (!(error instanceof FilterExecutionError) || error.reason !== "conflict") throw error
+        this.records.length = 0
+      }
       this.handledSincePoll = false
     }
     const [page, more] = await reader.readRound()

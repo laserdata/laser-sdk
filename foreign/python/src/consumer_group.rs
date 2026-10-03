@@ -342,6 +342,17 @@ impl PyGroupFilter {
         })
     }
 
+    /// Delete the group's own filter with every revision. A bound group is
+    /// released first, so its consumers receive every record from their next
+    /// poll. Nothing of the filter stays in the catalog. Returns `False` when
+    /// the group has no filter of its own.
+    fn delete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let group = self.group.clone();
+        future_into_py(py, async move {
+            group.filter().delete().await.map_err(to_pyerr)
+        })
+    }
+
     /// Release the group's policy. Its readers then receive every record. A
     /// released group may only be configured with the digest it ran. Returns
     /// the released binding dict.

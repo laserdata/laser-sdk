@@ -25,14 +25,14 @@ use laser_sdk::query::CmpOp;
 use laser_sdk::wire::codes::{
     AGDX_BACKEND_HELLO_CODE, AGDX_FILTER_MUTATE_CODE, AGDX_FILTER_OPERATION_CODE,
     AGDX_GET_FILTER_BINDING_CODE, AGDX_LIST_FILTER_BINDINGS_CODE, AGDX_LIST_FILTER_REVISIONS_CODE,
-    AGDX_RESOLVE_FILTER_POLICY_CODE, CONTROL_OP_VERSION, FILTER_OP_VERSION, FORK_OP_VERSION,
-    KV_OP_VERSION, QUERY_OP_VERSION,
+    AGDX_LIST_FILTERS_CODE, AGDX_RESOLVE_FILTER_POLICY_CODE, CONTROL_OP_VERSION, FILTER_OP_VERSION,
+    FORK_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
 };
 use laser_sdk::wire::filter::FilterMutationRequest;
 use laser_sdk::wire::filter::{
-    FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterPolicyRef,
-    GetFilterBinding, ListFilterBindings, ListFilterRevisions, ResolveFilterPolicy,
-    ResolvedFilterPolicy,
+    FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterPage, FilterPolicyRef,
+    FilterSummary, GetFilterBinding, ListFilterBindings, ListFilterRevisions, ListFilters,
+    ResolveFilterPolicy, ResolvedFilterPolicy,
 };
 use laser_sdk::wire::forward::ForwardedCommand;
 use laser_sdk::wire::framing::{decode_named, encode_named};
@@ -255,6 +255,26 @@ impl CatalogState {
                 self.bump(identity);
                 Ok(FilterMutationResult::Unbound(binding))
             }
+            FilterMutation::Drop { filter_id } => {
+                if self.filters.remove(&filter_id).is_none() {
+                    return Err(FilterError::new(
+                        FilterErrorReason::NotFound,
+                        "no such filter",
+                    ));
+                }
+                let released: Vec<FilterGroupIdentity> = self
+                    .bindings
+                    .iter()
+                    .filter(|(_, binding)| binding.filter_id == filter_id)
+                    .map(|(identity, _)| *identity)
+                    .collect();
+                for identity in released {
+                    self.bindings.remove(&identity);
+                    self.bump(identity);
+                }
+                self.owners.retain(|_, owned| *owned != filter_id);
+                Ok(FilterMutationResult::Dropped { filter_id })
+            }
             _ => Err(FilterError::new(
                 FilterErrorReason::Unsupported,
                 "the stand-in catalog serves group policies only",
@@ -365,6 +385,55 @@ impl CatalogState {
                         "the group is not bound",
                     )),
                 }
+            }
+            AGDX_LIST_FILTERS_CODE => {
+                let request: ListFilters = decode_named(&forwarded.payload).ok()?;
+                let mut items: Vec<FilterSummary> = self
+                    .owners
+                    .iter()
+                    .filter_map(|(identity, filter_id)| {
+                        let name = format!(
+                            "group:{}:{}:{}:{}:{}",
+                            identity.stream_id,
+                            identity.stream_created_at_micros,
+                            identity.topic_id,
+                            identity.topic_created_at_micros,
+                            identity.group_id
+                        );
+                        if request
+                            .name_contains
+                            .as_deref()
+                            .is_some_and(|fragment| !name.contains(fragment))
+                        {
+                            return None;
+                        }
+                        let latest = self.filters.get(filter_id)?.last()?;
+                        Some(FilterSummary {
+                            id: *filter_id,
+                            name,
+                            description: String::new(),
+                            state: FilterState::Active,
+                            latest_revision: latest.revision,
+                            latest_digest: latest.digest.clone(),
+                            codec: latest.filter.codec,
+                            bindings: self
+                                .bindings
+                                .values()
+                                .filter(|binding| binding.filter_id == *filter_id)
+                                .count() as u32,
+                            created_at_micros: latest.created_at_micros,
+                            updated_at_micros: latest.created_at_micros,
+                        })
+                    })
+                    .collect();
+                items.sort_by_key(|summary| std::cmp::Reverse(summary.id));
+                let total = items.len() as u32;
+                FilterCatalogReply::Ok(Box::new(FilterCatalogOutcome::Filters(FilterPage {
+                    items,
+                    page: request.page,
+                    page_size: request.page_size,
+                    total,
+                })))
             }
             AGDX_LIST_FILTER_REVISIONS_CODE => {
                 let request: ListFilterRevisions = decode_named(&forwarded.payload).ok()?;
@@ -711,7 +780,7 @@ async fn given_an_interval_policy_when_the_partition_is_idle_then_should_store_t
     let mut consumer = group
         .consumer()
         .start_at(ConsumerStart::First)
-        .commit_policy(CommitPolicy::Interval(Duration::from_millis(100)))
+        .commit_policy(CommitPolicy::Interval(Duration::from_millis(400)))
         .poll_interval(Duration::from_millis(10))
         .build()
         .await
@@ -719,14 +788,17 @@ async fn given_an_interval_policy_when_the_partition_is_idle_then_should_store_t
     consumer.next_within(READ_TIMEOUT).await.expect("first");
     let last = consumer.next_within(READ_TIMEOUT).await.expect("second");
     assert_eq!(last.position.offset, 2);
+    // Nothing new arrives. The interval elapses inside this wait, so the
+    // engine must store between its idle rounds instead of inside a blocked
+    // page read.
     assert!(matches!(
-        consumer.next_within(Duration::from_millis(600)).await,
+        consumer.next_within(Duration::from_millis(1500)).await,
         Err(LaserError::Timeout(_))
     ));
     assert_eq!(
         stored_group_offset(&laser, &stream, 0).await,
-        Some(3),
-        "the interval stores the handled prefix while the partition is idle"
+        Some(2),
+        "the interval stores the examined prefix while the partition is idle"
     );
     consumer.shutdown().await.expect("clean stop");
 }
@@ -829,10 +901,10 @@ async fn given_a_cancelled_binding_delivery_when_returned_then_should_redeliver_
 }
 
 #[tokio::test]
-async fn given_a_changed_policy_when_an_automatic_ack_is_refused_then_should_resume_without_the_stale_buffer()
+async fn given_a_policy_released_while_consuming_then_should_continue_unfiltered_and_redeliver_the_unstored_record()
  {
     let laser = harness::connected_laser_on(catalog_server().await).await;
-    let stream = group_source(&laser).await;
+    group_source(&laser).await;
     let group = bound_group(&laser).await;
     let mut consumer = group
         .consumer()
@@ -856,19 +928,13 @@ async fn given_a_changed_policy_when_an_automatic_ack_is_refused_then_should_res
         .release()
         .await
         .expect("release while reading");
-    let refused = consumer
-        .next_within(READ_TIMEOUT)
-        .await
-        .expect_err("old policy ack is fenced");
-    assert_eq!(refused.filter_reason(), Some(FilterErrorReason::Conflict));
-    assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
     let repeated = consumer
         .next_within(READ_TIMEOUT)
         .await
-        .expect("fresh unbound read");
+        .expect("the consumer goes on without an error");
     assert_eq!(
         repeated.position.offset, 0,
-        "the unacknowledged record is redelivered"
+        "the record read under the old policy was not stored, so it is delivered again"
     );
     assert_eq!(
         consumer
@@ -1445,6 +1511,34 @@ async fn given_a_paused_revision_when_reading_then_should_refuse_new_reads_until
         .expect("revisions list");
     assert_eq!(revisions.total, 1);
     reader.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn given_a_group_with_a_filter_when_deleted_then_should_release_it_and_remove_its_filter() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let before = group
+        .filter()
+        .get()
+        .await
+        .expect("readable")
+        .expect("bound");
+    assert!(group.filter().delete().await.expect("the filter deletes"));
+    assert_eq!(group.filter().get().await.expect("readable"), None);
+    assert!(
+        !group.filter().delete().await.expect("nothing left"),
+        "a second delete finds no filter"
+    );
+    let again = group
+        .filter()
+        .configure(bound_filter())
+        .await
+        .expect("the same group configures again");
+    assert_ne!(again.filter_id, before.filter_id, "the id is not reused");
+    assert_eq!(again.digest, before.digest);
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
+    group.filter().delete().await.expect("cleanup");
 }
 
 #[tokio::test]

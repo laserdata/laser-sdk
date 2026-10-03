@@ -23,7 +23,7 @@ What it shows:
   - filter typed CBOR, Avro, and Protobuf readings, using registered writer
     schemas for Avro and Protobuf
   - draft a stricter revision, run the variant in its own A/B group, pause
-    and resume it, see a running policy refuse another one, and release both
+    and resume it, see a running policy refuse another one, release and delete both
 
 Consumer group filters need laser-plane, as Laser Stack or LaserData Cloud
 runs it, and skip elsewhere.
@@ -302,12 +302,13 @@ async def route_alerts(laser: ls.Laser) -> None:
             await pager.ack(record)
     finally:
         await pager.close()
-        await pager_group.filter().release()
+        await pager_group.filter().delete()
 
 
 async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) -> None:
     """Draft a stricter revision on the desk's own filter, run the variant in
-    its own group, pause and resume it, then release both policies."""
+    its own group, pause and resume it, then release and delete both
+    policies."""
     _common.phase("draft a stricter revision: readers keep running the active one")
     draft = await desk.filter().revise(
         binding["revision"], ls.ConsumerFilter.json(safe_mode_transition())
@@ -363,6 +364,11 @@ async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) 
         f"  {released['group']['group']} is unbound again and receives every record, "
         f"its filter stays saved as revision {released['revision']}"
     )
+
+    _common.phase("delete both filters: nothing of them stays in the catalog")
+    await desk.filter().delete()
+    await variant.filter().delete()
+    print("  deleted with every revision, the groups keep reading everything")
 
 
 async def main() -> None:

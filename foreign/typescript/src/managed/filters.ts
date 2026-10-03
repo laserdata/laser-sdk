@@ -42,7 +42,8 @@ import {
   FilterTestCommand,
   GetFilterBindingCommand,
   ListFilterBindingsCommand,
-  ListFilterRevisionsCommand
+  ListFilterRevisionsCommand,
+  ListFiltersCommand
 } from "../wire/commands.js"
 import { CompiledFilter, usesRegex, type DecodeLimits } from "../wire/filter-eval.js"
 import {
@@ -88,7 +89,9 @@ import {
   validateFilterMutationRequest,
   validateFilterPreviewRequest,
   validateFilterTestRequest,
-  validateFilteredPollRequest
+  validateFilteredPollRequest,
+  type FilterPage,
+  type ListFilters
 } from "../wire/filter.js"
 import {
   MAX_FILTER_CATALOG_PAGE,
@@ -283,6 +286,35 @@ export class Filters {
     const outcome = await this.catalog(ListFilterRevisionsCommand, request)
     if (outcome.kind === "revisions") return outcome.page
     throw unexpected("revisions")
+  }
+
+  /**
+   * One page of saved filters whose name contains `nameContains`, newest first.
+   *
+   * @internal
+   */
+  async list(nameContains: string, options: CatalogPageOptions = {}): Promise<FilterPage> {
+    const request: ListFilters = {
+      v: FILTER_OP_VERSION,
+      nameContains,
+      page: options.page ?? 0,
+      pageSize: options.pageSize ?? DEFAULT_PAGE_SIZE
+    }
+    validateCatalogPage(request.page, request.pageSize)
+    const outcome = await this.catalog(ListFiltersCommand, request)
+    if (outcome.kind === "filters") return outcome.page
+    throw unexpected("filters")
+  }
+
+  /**
+   * Drop a saved filter. The catalog releases every group bound to it.
+   *
+   * @internal
+   */
+  async dropFilter(filterId: number): Promise<CatalogPosition | undefined> {
+    const applied = await this.apply({ kind: "drop", filterId })
+    if (applied.result.kind === "dropped") return applied.catalogPosition
+    throw unexpected("drop")
   }
 
   /** The binding of one consumer group. Throws with reason `not_found` when it is unbound. */
@@ -1025,6 +1057,13 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         return { kind: "empty", more: false }
       }
       this.restartAfter(partitionId, error)
+      // The group's policy changed under this read. The partition restarted
+      // from its stored offset and is read again at once under the policy the
+      // group holds now. Only an explicit acknowledgment of a record read
+      // under the old policy reports the change.
+      if (error instanceof FilterExecutionError && error.reason === "conflict") {
+        return { kind: "empty", more: true }
+      }
       throw error
     }
     this.requireOpen()

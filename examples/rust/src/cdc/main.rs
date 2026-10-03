@@ -207,13 +207,13 @@ async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
     }
     .await;
     pager.close().await?;
-    pager_group.filter().release().await?;
+    pager_group.filter().delete().await?;
     paged
 }
 
 // Draft a stricter revision on the desk's own filter, run the variant in its
-// own group, pause and resume it, then release both policies, also when a
-// step fails.
+// own group, pause and resume it, then release and delete both policies,
+// also when a step fails.
 async fn manage_revisions(
     laser: &Laser,
     desk: &ConsumerGroup,
@@ -312,6 +312,11 @@ async fn manage_revisions(
         "  {} is unbound again and receives every record, its filter stays saved as revision {}",
         released.group.group, released.revision
     );
+
+    phase("delete both filters: nothing of them stays in the catalog");
+    desk.filter().delete().await?;
+    variant.filter().delete().await?;
+    println!("  deleted with every revision, the groups keep reading everything");
     Ok(())
 }
 

@@ -310,6 +310,18 @@ async def test_given_a_group_with_a_filter_when_consumed_then_should_deliver_onl
     assert await group.filter().get() is None
 
 
+async def test_given_a_group_filter_when_deleted_then_should_release_the_group_and_remove_it(laser):
+    group = await bound_group(laser, "anomaly-desk-delete")
+    before = await group.filter().get()
+    assert await group.filter().delete() is True
+    assert await group.filter().get() is None
+    assert await group.filter().delete() is False, "nothing left to delete"
+    again = await group.filter().configure(safe_mode_filter())
+    assert again["filter_id"] != before["filter_id"], "the id is not reused"
+    assert again["digest"] == before["digest"]
+    assert await group.filter().delete() is True
+
+
 async def test_given_edge_records_when_read_inline_then_should_return_matches_at_their_offsets(
     laser,
 ):

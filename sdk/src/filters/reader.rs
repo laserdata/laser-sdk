@@ -780,7 +780,19 @@ impl FilteredReader {
                 }
                 return Ok(Read::Empty { more: false });
             }
-            Err(error) => return Err(self.restart_after(partition_id, error)),
+            Err(error) => {
+                let error = self.restart_after(partition_id, error);
+                // The group's policy changed under this read. The partition
+                // restarted from its stored offset and is read again at
+                // once, now under the policy the group holds. Delivery goes
+                // on, only an explicit acknowledgment of a record read under
+                // the old policy reports the change.
+                if error.filter_reason() == Some(FilterErrorReason::Conflict) {
+                    tracing::warn!(target: "laser", partition_id, %error, "the group's policy changed, the partition continues from its stored offset (partition: {partition_id})");
+                    return Ok(Read::Empty { more: true });
+                }
+                return Err(error);
+            }
         };
         if page.records.len() > self.request.max_reply_bytes as usize + 16 {
             return Err(LaserError::Protocol(

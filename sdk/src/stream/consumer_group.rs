@@ -13,6 +13,10 @@ use laser_wire::filter::{
 use laser_wire::validate::Validate;
 use std::sync::{Arc, Mutex};
 
+// Filters whose name contains a group's own filter name: the name is unique,
+// so the first page holds it when it exists.
+const GROUP_FILTER_LOOKUP_PAGE: u32 = 8;
+
 /// A consumer group by name or by its native numeric id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GroupTarget {
@@ -489,6 +493,32 @@ impl GroupFilter {
             .await
     }
 
+    /// Delete the group's own filter with every revision. A bound group is
+    /// released first, so its consumers receive every record from their next
+    /// poll. Nothing of the filter stays in the catalog. `Ok(false)` when the
+    /// group has no filter of its own.
+    pub async fn delete(&self) -> Result<bool, LaserError> {
+        self.group.laser().filters().catalog_capabilities().await?;
+        let details = self.group.native().await?;
+        let identity = self.group.identity_of(details.id).await?;
+        let name = group_filter_name(&identity);
+        let own = self
+            .group
+            .laser()
+            .filters()
+            .list(&name, 0, GROUP_FILTER_LOOKUP_PAGE)
+            .await?
+            .items
+            .into_iter()
+            .find(|summary| summary.name == name);
+        let Some(own) = own else {
+            return Ok(false);
+        };
+        let position = self.group.laser().filters().drop_filter(own.id).await?;
+        self.group.remember_position(position);
+        Ok(true)
+    }
+
     /// Release the group's policy. Its readers then receive every record. A
     /// released group may only be configured with the digest it ran.
     pub async fn release(&self) -> Result<FilterBinding, LaserError> {
@@ -546,4 +576,17 @@ impl GroupFilter {
             .into()
         })
     }
+}
+
+// The catalog names a group's own filter by the ids of the group incarnation
+// it was configured for.
+fn group_filter_name(identity: &FilterGroupIdentity) -> String {
+    format!(
+        "group:{}:{}:{}:{}:{}",
+        identity.stream_id,
+        identity.stream_created_at_micros,
+        identity.topic_id,
+        identity.topic_created_at_micros,
+        identity.group_id
+    )
 }

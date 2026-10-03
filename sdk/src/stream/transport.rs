@@ -1145,8 +1145,9 @@ impl GroupEngine {
             return Ok(());
         }
         if let Err(error) = self.reader.flush_completed().await {
+            let reason = error.filter_reason();
             if matches!(
-                error.filter_reason(),
+                reason,
                 Some(
                     laser_wire::filter::FilterErrorReason::Conflict
                         | laser_wire::filter::FilterErrorReason::SourceChanged
@@ -1158,6 +1159,14 @@ impl GroupEngine {
                 self.yielded_since_flush = 0;
             }
             self.sync_stored();
+            // A policy change fences the prefix read under the old policy.
+            // Those records are delivered again from the stored offset, so
+            // nothing is lost and the consumer goes on without an error.
+            if reason == Some(laser_wire::filter::FilterErrorReason::Conflict) {
+                tracing::warn!(target: "laser", %error, "the group's policy changed, progress read under the old policy is delivered again");
+                self.last_flush = Instant::now();
+                return Ok(());
+            }
             return Err(error);
         }
         self.yielded_since_flush = 0;

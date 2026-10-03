@@ -200,12 +200,12 @@ async function routeAlerts(laser: Laser, stream: string): Promise<void> {
     }
   } finally {
     await pager.close()
-    await pagerGroup.filter().release()
+    await pagerGroup.filter().delete()
   }
 }
 
 // Draft a stricter revision on the desk's own filter, run the variant in its
-// own group, pause and resume it, then release both policies.
+// own group, pause and resume it, then release and delete both policies.
 async function manageRevisions(
   laser: Laser,
   stream: string,
@@ -229,12 +229,7 @@ async function manageRevisions(
     await variant.create({ filter: ConsumerFilter.json(safeModeTransition()) })
   ).filter
   if (variantBinding === undefined) throw new Error("the variant was created unbound")
-  const reader = await variant
-    .reader()
-    .count(1)
-    .localGuard(true)
-    .start({ kind: "first" })
-    .build()
+  const reader = await variant.reader().count(1).localGuard(true).start({ kind: "first" }).build()
   try {
     const first = await reader.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
     const change = JSON.parse(decodeUtf8(first.payload)) as FleetChange
@@ -275,6 +270,11 @@ async function manageRevisions(
   console.log(
     `  ${released.group.group} is unbound again and receives every record, its filter stays saved as revision ${String(released.revision)}`
   )
+
+  phase("delete both filters: nothing of them stays in the catalog")
+  await desk.filter().delete()
+  await variant.filter().delete()
+  console.log("  deleted with every revision, the groups keep reading everything")
 }
 
 // Read and acknowledge until `expected` safe-mode or decommission events arrived, decoding

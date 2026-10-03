@@ -1,5 +1,11 @@
 import { readFile } from "node:fs/promises"
-import { ConsumerFilter, FilterExpr, CompiledSchema, cborCodec, type Laser } from "@laserdata/laser-sdk"
+import {
+  ConsumerFilter,
+  FilterExpr,
+  CompiledSchema,
+  cborCodec,
+  type Laser
+} from "@laserdata/laser-sdk"
 import type { SchemaSource } from "@laserdata/laser-sdk/full"
 import { phase } from "../common.js"
 
@@ -8,7 +14,11 @@ type Reading = { readonly satellite: string; readonly mode: string; readonly bat
 function reading(value: unknown): Reading {
   if (value === null || typeof value !== "object") throw new Error("expected a fleet reading")
   const item = value as Record<string, unknown>
-  if (typeof item["satellite"] !== "string" || typeof item["mode"] !== "string" || typeof item["battery"] !== "number") {
+  if (
+    typeof item["satellite"] !== "string" ||
+    typeof item["mode"] !== "string" ||
+    typeof item["battery"] !== "number"
+  ) {
     throw new Error("invalid fleet reading fields")
   }
   return { satellite: item["satellite"], mode: item["mode"], battery: item["battery"] }
@@ -21,8 +31,22 @@ export async function runCodecs(laser: Laser, stream: string): Promise<void> {
   try {
     for (const codec of ["cbor", "avro", "protobuf"] as const) {
       let source: SchemaSource | undefined
-      if (codec === "avro") source = { kind: "avro", schema: await readFile(new URL("../../../../shared/fleet-reading.avsc", import.meta.url), "utf8") }
-      if (codec === "protobuf") source = { kind: "protobuf", descriptorSet: await readFile(new URL("../../../../shared/fleet-reading.desc", import.meta.url)), messageType: "fleet.Reading" }
+      if (codec === "avro")
+        source = {
+          kind: "avro",
+          schema: await readFile(
+            new URL("../../../../shared/fleet-reading.avsc", import.meta.url),
+            "utf8"
+          )
+        }
+      if (codec === "protobuf")
+        source = {
+          kind: "protobuf",
+          descriptorSet: await readFile(
+            new URL("../../../../shared/fleet-reading.desc", import.meta.url)
+          ),
+          messageType: "fleet.Reading"
+        }
       let id: number | undefined
       let compiled: CompiledSchema | undefined
       if (source !== undefined) {
@@ -52,23 +76,38 @@ export async function runCodecs(laser: Laser, stream: string): Promise<void> {
       }
       const expr = FilterExpr.pred("mode", "eq", "safe")
       const schemaRefs = id === undefined ? [] : [id]
-      const filter = codec === "cbor" ? ConsumerFilter.cbor(expr)
-        : codec === "avro" ? ConsumerFilter.avro(expr, schemaRefs) : ConsumerFilter.protobuf(expr, schemaRefs)
+      const filter =
+        codec === "cbor"
+          ? ConsumerFilter.cbor(expr)
+          : codec === "avro"
+            ? ConsumerFilter.avro(expr, schemaRefs)
+            : ConsumerFilter.protobuf(expr, schemaRefs)
       const group = laser.stream(stream).topic(topicName).consumerGroup(`safe-${codec}`)
       await group.create({ filter })
       try {
         await using reader = await group.reader().start({ kind: "first" }).localGuard(true).build()
         const record = await reader.nextRecord({ timeoutMs: 15_000 })
-        const selected = compiled === undefined ? cbor.decode(record.payload) : reading(compiled.decode(record.payload))
-        console.log(`  ${codec}: ${selected.satellite} entered ${selected.mode} mode at ${String(selected.battery)}% battery, 1 of 3 records delivered`)
+        const selected =
+          compiled === undefined
+            ? cbor.decode(record.payload)
+            : reading(compiled.decode(record.payload))
+        console.log(
+          `  ${codec}: ${selected.satellite} entered ${selected.mode} mode at ${String(selected.battery)}% battery, 1 of 3 records delivered`
+        )
         await reader.ack(record)
       } finally {
-        await group.filter().release()
+        await group.filter().delete()
       }
     }
-  } catch (error) { failure = error }
+  } catch (error) {
+    failure = error
+  }
   for (const id of registered) {
-    try { await laser.schemas().drop(id) } catch (error) { failure ??= error }
+    try {
+      await laser.schemas().drop(id)
+    } catch (error) {
+      failure ??= error
+    }
   }
   if (failure !== undefined) throw failure instanceof Error ? failure : new Error(String(failure))
 }

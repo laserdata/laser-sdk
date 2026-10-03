@@ -377,6 +377,9 @@ export class GroupFilter {
 
   /** The active policy, `undefined` for an unbound group. */
   async get(): Promise<FilterBinding | undefined> {
+    // The catalog gate comes first, like Rust: without a plane the answer is
+    // `unsupported`, whatever the native group looks like.
+    await this.group.filters().requireCatalog()
     const native = await this.group.native()
     try {
       const binding = await this.group.filters().binding({
@@ -415,6 +418,23 @@ export class GroupFilter {
   async setRevisionEnabled(revision: number, enabled: boolean): Promise<void> {
     const active = await this.active()
     await this.group.filters().setRevisionEnabled(active.filterId, revision, enabled)
+  }
+
+  /**
+   * Delete the group's own filter with every revision. A bound group is
+   * released first, so its consumers receive every record from their next
+   * poll. Nothing of the filter stays in the catalog. `false` when the group
+   * has no filter of its own.
+   */
+  async delete(): Promise<boolean> {
+    await this.group.filters().requireCatalog()
+    const native = await this.group.native()
+    const name = groupFilterName(native.identity)
+    const page = await this.group.filters().list(name, { pageSize: GROUP_FILTER_LOOKUP_PAGE })
+    const own = page.items.find((summary) => summary.name === name)
+    if (own === undefined) return false
+    this.group.remember(await this.group.filters().dropFilter(own.id))
+    return true
   }
 
   /**
@@ -473,6 +493,14 @@ export class GroupFilter {
     }
     return binding
   }
+}
+
+// The catalog names a group's own filter by the ids of the group incarnation
+// it was configured for. The name is unique, so the first page holds it.
+const GROUP_FILTER_LOOKUP_PAGE = 8
+
+function groupFilterName(identity: FilterGroupIdentity): string {
+  return `group:${String(identity.streamId)}:${identity.streamCreatedAtMicros.toString()}:${String(identity.topicId)}:${identity.topicCreatedAtMicros.toString()}:${identity.groupId.toString()}`
 }
 
 function requireSameGroup(expected: FilterGroupIdentity, actual: FilterGroupIdentity): void {

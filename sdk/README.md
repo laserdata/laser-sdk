@@ -269,7 +269,7 @@ One connection can advertise one agent. A second advertisement receives `LaserEr
 | `laser.topic(name)` | a topic on the optional default stream | shorthand for the same verbs |
 | `laser.query(index)` | a materialized index | filters, aggregates, vector recall, the bounded `.max_rows(n).rows()` walk |
 | `laser.watch()` | the change feed | consume advancement records instead of re-querying blind |
-| `topic.consumer_group(name).filter()` | one group's server-side policy | configure, inspect and draft revisions, pause/resume, release, preview and sample-test |
+| `topic.consumer_group(name).filter()` | one group's server-side policy | configure, inspect and draft revisions, pause/resume, release, delete, preview and sample-test |
 | `laser.kv(namespace)` | managed point state | get/set/delete/scan, compare-and-swap, leases |
 | `laser.fork(id)` | a copy-on-write branch | speculative writes, overlay queries, promote or squash |
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |

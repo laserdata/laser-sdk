@@ -5,15 +5,15 @@ use laser_wire::codes::AGDX_LIST_FILTER_BINDINGS_CODE;
 use laser_wire::codes::{
     AGDX_FILTER_MUTATE_CODE, AGDX_FILTER_OPERATION_CODE, AGDX_FILTER_PREVIEW_CODE,
     AGDX_FILTER_TEST_CODE, AGDX_GET_FILTER_BINDING_CODE, AGDX_LIST_FILTER_REVISIONS_CODE,
-    FILTER_OP_VERSION,
+    AGDX_LIST_FILTERS_CODE, FILTER_OP_VERSION,
 };
 use laser_wire::filter::{
     CatalogPosition, ConsumerFilter, FilterBinding, FilterCatalogOutcome, FilterCatalogReply,
     FilterError, FilterErrorReason, FilterGroupRef, FilterHeader, FilterMutation,
     FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
-    FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply, FilterRevisionPage,
-    FilterRevisionRef, FilterSource, FilterTestRequest, FilterTestResult, GetFilterBinding,
-    GetFilterOperation, GroupFilterSpec, ListFilterRevisions,
+    FilterOutcome, FilterPage, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
+    FilterRevisionPage, FilterRevisionRef, FilterSource, FilterTestRequest, FilterTestResult,
+    GetFilterBinding, GetFilterOperation, GroupFilterSpec, ListFilterRevisions, ListFilters,
 };
 #[cfg(feature = "filters")]
 use laser_wire::filter::{FilterBindingPage, ListFilterBindings};
@@ -124,6 +124,42 @@ impl<'a> Filters<'a> {
         {
             FilterCatalogOutcome::Revisions(revisions) => Ok(revisions),
             _ => Err(unexpected("revisions")),
+        }
+    }
+
+    /// One page of saved filters whose name contains `name_contains`, newest
+    /// first.
+    pub(crate) async fn list(
+        &self,
+        name_contains: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<FilterPage, LaserError> {
+        let request = ListFilters {
+            v: FILTER_OP_VERSION,
+            name_contains: Some(name_contains.to_owned()),
+            state: None,
+            before_id: None,
+            page,
+            page_size,
+        };
+        request.validate()?;
+        match self.catalog(AGDX_LIST_FILTERS_CODE, &request).await? {
+            FilterCatalogOutcome::Filters(filters) => Ok(filters),
+            _ => Err(unexpected("filters")),
+        }
+    }
+
+    /// Drop a saved filter. The catalog releases every group bound to it and
+    /// returns the control-log position the drop was applied at.
+    pub(crate) async fn drop_filter(
+        &self,
+        filter_id: u32,
+    ) -> Result<Option<CatalogPosition>, LaserError> {
+        let applied = self.apply(FilterMutation::Drop { filter_id }).await?;
+        match applied.result {
+            FilterMutationResult::Dropped { .. } => Ok(applied.catalog_position),
+            _ => Err(unexpected("drop")),
         }
     }
 

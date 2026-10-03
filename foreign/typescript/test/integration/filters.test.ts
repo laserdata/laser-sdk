@@ -616,6 +616,20 @@ void test("given_more_than_64_outstanding_pages_when_configured_then_should_read
   })
 })
 
+void test("given_a_group_with_a_filter_when_deleted_then_should_release_it_and_remove_its_filter", async (context) => {
+  await withSource(context, async (laser, stream) => {
+    const group = await boundGroup(laser, stream, "delete-group")
+    const before = await group.filter().get()
+    assert.equal(await group.filter().delete(), true)
+    assert.equal(await group.filter().get(), undefined)
+    assert.equal(await group.filter().delete(), false, "a second delete finds no filter")
+    const again = await group.filter().configure(safeModeFilter())
+    assert.notEqual(again.filterId, before?.filterId, "the id is not reused")
+    assert.deepEqual(again.digest, before?.digest)
+    assert.equal(await group.filter().delete(), true)
+  })
+})
+
 void test("given_a_group_filter_when_members_rejoin_then_should_resume_and_refuse_another_policy", async (context) => {
   await withSource(context, async (laser, stream) => {
     const group = await boundGroup(laser, stream, "review-group")

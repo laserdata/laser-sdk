@@ -94,7 +94,7 @@ async def run_codecs(laser: ls.Laser) -> None:
                 await reader.ack(record)
             finally:
                 await reader.close()
-                await group.filter().release()
+                await group.filter().delete()
     except BaseException:
         for schema_id in registered:
             with suppress(Exception):
