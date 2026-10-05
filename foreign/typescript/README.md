@@ -4,7 +4,7 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> The current release is `0.5.2`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.3`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 

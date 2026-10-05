@@ -20,6 +20,8 @@ Rust, Python, and TypeScript bound the initial connect by one 30-second budget c
 
 ## Publish recovery
 
+Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
+
 Rust, Python, and TypeScript publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds. Explicit builder or connect configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.
 
 Preserve message identities and confirmed chunks across retries. Return permanent errors immediately. Return exhausted errors without panicking. Rust reconnects the shared client in place so consumers and reply readers stay attached. Recover only the connection that the attempt used. If another publish replaces that connection, skip recovery and use the replacement. See [publish recovery](docs/publish-recovery.md).

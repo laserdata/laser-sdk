@@ -135,7 +135,7 @@ pub(crate) async fn drain_partition(
                     polled = Some(batch);
                     break;
                 }
-                Err(error) if crate::laser::is_transient_iggy_io_error(&error) && attempt < 4 => {
+                Err(error) if crate::error::is_transient_iggy_io_error(&error) && attempt < 4 => {
                     last_error = Some(error);
                     sleep(Duration::from_millis(50 * (attempt + 1))).await;
                 }

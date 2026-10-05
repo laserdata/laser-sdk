@@ -4,7 +4,7 @@ This package provides the Python Laser SDK for Apache Iggy. [LaserData, Inc.](ht
 
 Rust and Python share the data contract and Rust implementation. The bindings expose Python forms of the SDK operations, configuration, and errors. Shared examples and behavior scenarios cover language-neutral behavior.
 
-> The current release is `0.5.2`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.3`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` separates agent identity from its consumer group. The default group uses the agent ID spelling. Set `consumer_group` when the deployment needs a different group.
 
@@ -695,6 +695,8 @@ Connecting gives up after 30 seconds. Set another budget with the Rust `connect_
 See [connect timeout and cleanup](../../docs/connect-timeout.md).
 
 ## Publish recovery
+
+Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
 
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
 

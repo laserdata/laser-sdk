@@ -782,8 +782,10 @@ impl Laser {
                 .map_err(|error| {
                     publish_failure(
                         error,
-                        &messages[index * PUBLISH_BATCH_LENGTH + chunk.len()..],
+                        &messages[index * PUBLISH_BATCH_LENGTH..],
                         std::mem::take(&mut confirmations),
+                        chunk.len(),
+                        (stream, topic),
                     )
                 })?;
             confirmations.extend(response.confirmations);
@@ -986,12 +988,19 @@ fn claim_presence_slot(
     }
 }
 
+// `pending` is the failed chunk followed by every record after it, and
+// `attempted` is that chunk's length. Apache Iggy reports which records of the
+// chunk it did not confirm, so only those join the unsent tail; a timeout
+// leaves the whole chunk unconfirmed.
 pub(crate) fn publish_failure(
     error: LaserError,
-    unsent: &[IggyMessage],
+    pending: &[IggyMessage],
     mut confirmations: Vec<SendMessagesConfirmationResponse>,
+    attempted: usize,
+    target: (&str, &str),
 ) -> LaserError {
-    match error {
+    let unsent = pending.get(attempted..).unwrap_or_default();
+    let (source, stream, topic, unconfirmed) = match error {
         LaserError::Iggy(IggyError::ProducerSendFailed {
             cause,
             failed,
@@ -1000,21 +1009,32 @@ pub(crate) fn publish_failure(
             topic_name,
         }) => {
             confirmations.extend(committed.iter().cloned());
-            let pending = failed
+            let unconfirmed = failed
                 .iter()
                 .chain(unsent)
                 .map(clone_iggy_message)
                 .collect();
-            LaserError::Iggy(IggyError::ProducerSendFailed {
-                cause,
-                failed: Arc::new(pending),
-                committed: Arc::new(confirmations),
+            (
+                LaserError::Iggy(*cause),
                 stream_name,
                 topic_name,
-            })
+                unconfirmed,
+            )
         }
-        error => error,
-    }
+        error => (
+            error,
+            target.0.to_owned(),
+            target.1.to_owned(),
+            pending.iter().map(clone_iggy_message).collect(),
+        ),
+    };
+    LaserError::PublishFailed(Box::new(crate::error::PublishFailure {
+        source,
+        stream,
+        topic,
+        committed: confirmations,
+        unconfirmed,
+    }))
 }
 
 pub(crate) fn prepare_publish_messages(messages: &mut [IggyMessage]) {
@@ -1039,39 +1059,6 @@ pub(crate) fn clone_iggy_message(message: &IggyMessage) -> IggyMessage {
         },
         payload: message.payload.clone(),
         user_headers: message.user_headers.clone(),
-    }
-}
-
-pub(crate) fn is_transient_iggy_io_error(error: &IggyError) -> bool {
-    match error {
-        IggyError::Disconnected
-        | IggyError::TcpError
-        | IggyError::QuicError
-        | IggyError::StaleClient
-        | IggyError::NotConnected
-        | IggyError::ConnectionClosed
-        | IggyError::CannotEstablishConnection
-        | IggyError::CannotSendMessagesDueToClientDisconnection
-        | IggyError::TransientNotAccepted
-        | IggyError::TransientNotCommitted
-        | IggyError::CannotReadFile
-        | IggyError::CannotReadPartitions
-        | IggyError::PartitionNotFound(..) => true,
-        IggyError::ProducerSendFailed { cause, .. } => is_transient_iggy_io_error(cause),
-        _ => false,
-    }
-}
-
-// A publish answered `Unauthenticated` on a connection that already
-// authenticated once means the client's socket was re-dialed underneath it,
-// by its own reconnect or by a leader move, and the new node holds no session
-// for it. Recovery re-dials through the connection string, which carries the
-// auto-login credentials, so the retry runs authenticated.
-pub(crate) fn needs_reauthentication(error: &IggyError) -> bool {
-    match error {
-        IggyError::Unauthenticated => true,
-        IggyError::ProducerSendFailed { cause, .. } => needs_reauthentication(cause),
-        _ => false,
     }
 }
 
@@ -2130,24 +2117,73 @@ mod builder_conflict_tests {
                 stream_name: "stream".to_owned(),
                 topic_name: "topic".to_owned(),
             }),
-            &[message(3)],
+            &[message(1), message(2), message(3)],
             vec![confirmed],
+            2,
+            ("other", "other"),
         );
-        let LaserError::Iggy(IggyError::ProducerSendFailed {
-            failed, committed, ..
-        }) = error
-        else {
+        assert!(error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "publish failed to stream/topic: Disconnected"
+        );
+        let LaserError::PublishFailed(failure) = error else {
             panic!("preserve the structured publish error");
         };
+        assert!(matches!(
+            failure.source,
+            LaserError::Iggy(IggyError::Disconnected)
+        ));
         assert_eq!(
-            failed
+            failure
+                .unconfirmed
                 .iter()
                 .map(|message| message.header.id)
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].base_offset, 9);
+        assert_eq!(failure.committed.len(), 1);
+        assert_eq!(failure.committed[0].base_offset, 9);
+    }
+
+    #[test]
+    fn given_a_partially_confirmed_batch_when_a_chunk_times_out_then_should_preserve_progress() {
+        let message = |id| {
+            IggyMessage::builder()
+                .id(id)
+                .payload(Bytes::from_static(b"body"))
+                .build()
+                .expect("message builds")
+        };
+        let error = super::publish_failure(
+            LaserError::Timeout("Iggy publish response"),
+            &[message(4), message(5), message(6)],
+            vec![iggy::prelude::SendMessagesConfirmationResponse {
+                stream_id: 1,
+                topic_id: 2,
+                partition_id: 0,
+                base_offset: 9,
+            }],
+            2,
+            ("stream", "topic"),
+        );
+        assert!(error.is_retryable());
+        assert!(matches!(error.publish_cause(), LaserError::Timeout(_)));
+        let LaserError::PublishFailed(failure) = error else {
+            panic!("a timeout must retain batch progress");
+        };
+        assert_eq!(failure.committed.len(), 1);
+        assert_eq!(failure.committed[0].base_offset, 9);
+        assert_eq!(
+            failure
+                .unconfirmed
+                .iter()
+                .map(|message| message.header.id)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        assert_eq!(failure.stream, "stream");
+        assert_eq!(failure.topic, "topic");
     }
 
     #[tokio::test]

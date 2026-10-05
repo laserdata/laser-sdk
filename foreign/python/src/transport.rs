@@ -2,11 +2,14 @@ use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning}
 use crate::convert::payload_bytes;
 use crate::errors::{InvalidError, to_pyerr};
 use iggy::prelude::{
-    HeaderKey, HeaderKind, HeaderValue, IggyDuration, IggyMessage, IggyProducer,
-    NonZeroIggyDuration, Partitioning, SendMessagesConfirmationResponse, SendMessagesResponse,
+    HeaderKey, HeaderKind, HeaderValue, IggyExpiry, NonZeroIggyDuration,
+    SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use laser_sdk::error::LaserError;
-use laser_sdk::stream::{CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart};
+use laser_sdk::stream::{
+    CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Producer,
+    ProducerMessage, Routing, Topic,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -18,14 +21,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, OnceCell, watch};
 
 pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
     to_pyerr(error.into())
-}
-
-pub(crate) fn duration_ms(value: u64) -> IggyDuration {
-    IggyDuration::from(Duration::from_millis(value))
 }
 
 pub(crate) fn positive_duration_ms(
@@ -279,19 +278,24 @@ pub(crate) fn configure_consumer(
     Ok(PyConsumer::new(name, builder))
 }
 
-pub(crate) fn partitioning(
-    key: Option<&Bound<'_, PyAny>>,
-    partition: Option<u32>,
-) -> PyResult<Partitioning> {
+pub(crate) fn routing(key: Option<&Bound<'_, PyAny>>, partition: Option<u32>) -> PyResult<Routing> {
     match (key, partition) {
         (Some(_), Some(_)) => Err(InvalidError::new_err(
             "key and partition are mutually exclusive",
         )),
-        (Some(key), None) => {
-            Partitioning::messages_key(&payload_bytes(key)?).map_err(transport_error)
-        }
-        (None, Some(partition)) => Ok(Partitioning::partition_id(partition)),
-        (None, None) => Ok(Partitioning::balanced()),
+        (Some(key), None) => Ok(Routing::key(payload_bytes(key)?)),
+        (None, Some(partition)) => Ok(Routing::Partition(partition)),
+        (None, None) => Ok(Routing::Balanced),
+    }
+}
+
+fn routing_override(
+    key: Option<&Bound<'_, PyAny>>,
+    partition: Option<u32>,
+) -> PyResult<Option<Routing>> {
+    match (key, partition) {
+        (None, None) => Ok(None),
+        _ => routing(key, partition).map(Some),
     }
 }
 
@@ -415,15 +419,11 @@ fn headers(values: Option<&Bound<'_, PyDict>>) -> PyResult<BTreeMap<HeaderKey, H
 fn message(
     payload: &Bound<'_, PyAny>,
     headers_value: Option<&Bound<'_, PyDict>>,
-) -> PyResult<IggyMessage> {
-    IggyMessage::builder()
-        .payload(payload_bytes(payload)?.into())
-        .user_headers(headers(headers_value)?)
-        .build()
-        .map_err(transport_error)
+) -> PyResult<ProducerMessage> {
+    Ok(ProducerMessage::new(payload_bytes(payload)?).with_headers(headers(headers_value)?))
 }
 
-fn messages(values: &Bound<'_, PyAny>) -> PyResult<Vec<IggyMessage>> {
+fn messages(values: &Bound<'_, PyAny>) -> PyResult<Vec<ProducerMessage>> {
     values
         .try_iter()?
         .map(|value| {
@@ -448,23 +448,81 @@ fn messages(values: &Bound<'_, PyAny>) -> PyResult<Vec<IggyMessage>> {
         .collect()
 }
 
+/// The settings a Python `Producer` builds its Laser producer from on first use.
+#[derive(Clone)]
+pub(crate) struct ProducerSettings {
+    pub batch_length: u32,
+    pub linger: Duration,
+    pub retries: Option<u32>,
+    pub retry_interval: Option<Duration>,
+    pub routing: Routing,
+    pub create_stream: bool,
+    pub create_topic: bool,
+    pub partitions: u32,
+    pub expiry: IggyExpiry,
+    pub max_topic_size: u64,
+}
+
+impl ProducerSettings {
+    async fn build(self, topic: Topic) -> Result<Producer, LaserError> {
+        let mut builder = topic
+            .producer()
+            .batch_length(self.batch_length)
+            .linger(self.linger)
+            .routing(self.routing)
+            .create_stream(self.create_stream)
+            .create_topic(self.create_topic)
+            .partitions(self.partitions)
+            .max_topic_bytes(self.max_topic_size);
+        if let Some(retries) = self.retries {
+            builder = builder.retries(Some(retries), self.retry_interval);
+        } else if let Some(interval) = self.retry_interval {
+            builder = builder.retry_backoff(interval);
+        }
+        let builder = match self.expiry {
+            IggyExpiry::ServerDefault => builder,
+            IggyExpiry::NeverExpire => builder.never_expire(),
+            IggyExpiry::ExpireDuration(expiry) => builder.expire_after(expiry.get_duration()),
+        };
+        builder.build().await
+    }
+}
+
 /// A configurable Laser streaming producer. Build it with `Topic.producer`.
-/// Sends use Apache Iggy's direct producer path and accept per-send key or
-/// partition overrides without passing through the typed publish layer.
+/// Every send runs the Laser publish recovery: each attempt is bounded by the
+/// connection's publish timeout, a failed attempt reconnects and retries
+/// `retries` times with the same message ids, and the final error names the
+/// cause. Sends accept per-send key or partition overrides.
 #[gen_stub_pyclass]
 #[pyclass(name = "Producer")]
 pub struct PyProducer {
-    inner: Arc<IggyProducer>,
-    statistics: Arc<std::sync::OnceLock<laser_sdk::stream::producer_statistics::ProducerRecorder>>,
-    laser: laser_sdk::laser::Laser,
+    topic: Topic,
+    settings: ProducerSettings,
+    producer: Arc<OnceCell<Producer>>,
+    stream: String,
+    name: String,
 }
 
 impl PyProducer {
-    pub(crate) fn new(inner: IggyProducer, laser: &laser_sdk::laser::Laser) -> Self {
+    pub(crate) fn new(topic: Topic, stream: String, settings: ProducerSettings) -> Self {
         Self {
-            statistics: Arc::new(std::sync::OnceLock::new()),
-            laser: laser.clone(),
-            inner: Arc::new(inner),
+            name: topic.name().to_owned(),
+            topic,
+            settings,
+            producer: Arc::new(OnceCell::new()),
+            stream,
+        }
+    }
+
+    fn producer(&self) -> impl Future<Output = PyResult<Producer>> + Send + 'static {
+        let cell = self.producer.clone();
+        let topic = self.topic.clone();
+        let settings = self.settings.clone();
+        async move {
+            cell.get_or_try_init(|| settings.build(topic))
+                .await
+                .cloned()
+                .map_err(to_pyerr)
         }
     }
 }
@@ -476,11 +534,11 @@ impl PyProducer {
     /// `send` and `send_batch` also initialize lazily, so calling this is useful
     /// when startup should fail before accepting work.
     fn init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let producer = self.inner.clone();
-        future_into_py(
-            py,
-            async move { producer.init().await.map_err(transport_error) },
-        )
+        let producer = self.producer();
+        future_into_py(py, async move {
+            producer.await?;
+            Ok(())
+        })
     }
 
     /// Send one raw message. `headers` preserves Python scalar types as Iggy
@@ -495,31 +553,15 @@ impl PyProducer {
         partition: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let message = message(payload, headers)?;
-        let partitioning = match (key, partition) {
-            (None, None) => None,
-            _ => Some(Arc::new(partitioning(key, partition)?)),
-        };
-        let producer = self.inner.clone();
-        let statistics = self.statistics.clone();
-        let laser = self.laser.clone();
+        let routing = routing_override(key, partition)?;
+        let producer = self.producer();
         future_into_py(py, async move {
-            producer.init().await.map_err(transport_error)?;
-            let statistics = statistics.get_or_init(|| {
-                laser_sdk::stream::producer_statistics::ProducerRecorder::new(
-                    &laser,
-                    producer.stream().to_string(),
-                    producer.topic().to_string(),
-                    true,
-                )
-            });
-            let observation = statistics.begin(1, message.payload.len() as u64);
-            let result = producer
-                .send_with_partitioning(vec![message], partitioning)
-                .await;
-            observation.finish(result.is_ok());
-            result
-                .map(PySendMessagesResponse::from)
-                .map_err(transport_error)
+            let producer = producer.await?;
+            let response = match routing {
+                Some(routing) => producer.send_with_routing(message, routing).await,
+                None => producer.send_message(message).await,
+            };
+            response.map(PySendMessagesResponse::from).map_err(to_pyerr)
         })
     }
 
@@ -535,46 +577,20 @@ impl PyProducer {
         partition: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = messages(values)?;
-        let partitioning = match (key, partition) {
-            (None, None) => None,
-            _ => Some(Arc::new(partitioning(key, partition)?)),
-        };
-        let producer = self.inner.clone();
-        let statistics = self.statistics.clone();
-        let laser = self.laser.clone();
+        let routing = routing_override(key, partition)?;
+        let producer = self.producer();
         future_into_py(py, async move {
-            producer.init().await.map_err(transport_error)?;
-            let statistics = statistics.get_or_init(|| {
-                laser_sdk::stream::producer_statistics::ProducerRecorder::new(
-                    &laser,
-                    producer.stream().to_string(),
-                    producer.topic().to_string(),
-                    true,
-                )
-            });
-            let observation = statistics.begin(
-                messages.len() as u64,
-                messages
-                    .iter()
-                    .map(|message| message.payload.len() as u64)
-                    .sum(),
-            );
-            let result = producer
-                .send_with_partitioning(messages, partitioning)
-                .await;
-            observation.finish(result.is_ok());
-            result
+            producer
+                .await?
+                .send_batch_with_routing(messages, routing)
+                .await
                 .map(PySendMessagesResponse::from)
-                .map_err(transport_error)
+                .map_err(to_pyerr)
         })
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "Producer(stream={}, topic={})",
-            self.inner.stream(),
-            self.inner.topic()
-        )
+        format!("Producer(stream={}, topic={})", self.stream, self.name)
     }
 }
 

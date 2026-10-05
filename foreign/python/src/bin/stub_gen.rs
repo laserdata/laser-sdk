@@ -32,6 +32,8 @@ class LaserError(Exception):
     budget_exceeded: builtins.bool
     quarantined: builtins.bool
     not_leader: builtins.bool
+    committed: builtins.list[SendMessagesConfirmation]
+    unconfirmed_count: builtins.int | None
 
 class ConfigError(LaserError): ...
 class TimeoutError(LaserError, builtins.TimeoutError): ...

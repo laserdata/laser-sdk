@@ -1,3 +1,5 @@
+use crate::transport::PySendMessagesConfirmation;
+use iggy::prelude::IggyError;
 use laser_sdk::LaserError as SdkError;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyTimeoutError};
@@ -204,7 +206,40 @@ fn cancelled_error(py: Python<'_>) -> &Bound<'_, PyType> {
 // attach the classifier results as instance attributes so Python callers branch
 // on `err.retryable` / `err.unsupported` without re-deriving them.
 pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
-    let message = err.to_string();
+    // A publish failure raises as its cause, with the target in the message
+    // and the batch outcome attached.
+    if let SdkError::PublishFailed(failure) = err {
+        let message = failure.to_string();
+        let laser_sdk::error::PublishFailure {
+            source,
+            committed,
+            unconfirmed,
+            ..
+        } = *failure;
+        let error = to_pyerr(source);
+        Python::attach(|py| {
+            let value = error.value(py);
+            let committed = committed
+                .into_iter()
+                .map(PySendMessagesConfirmation::from)
+                .collect::<Vec<_>>();
+            let _ = value.setattr("args", (message,));
+            let _ = value.setattr("committed", committed);
+            let _ = value.setattr("unconfirmed_count", unconfirmed.len());
+        });
+        return error;
+    }
+    // Apache Iggy prints a failed send as "Producer send failed" alone, so the
+    // message names its target and cause, and the cause classifies it.
+    let message = match &err {
+        SdkError::Iggy(IggyError::ProducerSendFailed {
+            cause,
+            stream_name,
+            topic_name,
+            ..
+        }) => format!("{err} to {stream_name}/{topic_name}: {cause}"),
+        _ => err.to_string(),
+    };
     let code = format!("{:?}", err.code());
     let retryable = err.is_retryable();
     let unavailable = err.is_unavailable();
@@ -277,7 +312,22 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         let _ = value.setattr("budget_exceeded", budget_exceeded);
         let _ = value.setattr("quarantined", quarantined);
         let _ = value.setattr("not_leader", not_leader);
+        let _ = value.setattr("committed", Vec::<PySendMessagesConfirmation>::new());
+        let _ = value.setattr("unconfirmed_count", py.None());
         match &err {
+            // A background producer's send fails with Apache Iggy's own report
+            // of what committed and what did not.
+            SdkError::Iggy(IggyError::ProducerSendFailed {
+                failed, committed, ..
+            }) => {
+                let committed = committed
+                    .iter()
+                    .cloned()
+                    .map(PySendMessagesConfirmation::from)
+                    .collect::<Vec<_>>();
+                let _ = value.setattr("committed", committed);
+                let _ = value.setattr("unconfirmed_count", failed.len());
+            }
             SdkError::Filter(error) => {
                 let _ = value.setattr("reason", error.reason.to_string());
                 let _ = value.setattr("fault_reason", py.None());

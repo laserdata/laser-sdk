@@ -6,7 +6,7 @@ This example publishes a satellite change feed and gives each consumer group its
 
 ## What it does
 
-- Publishes the complete typed feed to `fleet_changes`, keyed by satellite.
+- Publishes the complete typed feed to `fleet_changes` in one batch per satellite or station key and prints the time of each batch.
 - Creates the anomaly desk group with its policy, then reads through a normal group consumer and commits after processing.
 - Reads the same matches through the advanced group reader with separate match and scan limits.
 - Tests change evidence against a battery update and previews stored records without changing consumer progress.

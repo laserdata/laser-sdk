@@ -10,7 +10,8 @@ use laser_sdk::iggy::prelude::{HeaderKey, HeaderValue};
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::CmpOp;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 // A satellite fleet streams the change feed of its mission-ops database: every
 // battery reading, orbit maneuver, and ground-station status flip. The anomaly
@@ -45,16 +46,25 @@ async fn main() -> Result<(), LaserError> {
         let topic = laser.topic(TOPIC);
         topic.ensure(PARTITIONS).await?;
         let mut published_bytes = 0;
+        let mut by_key = BTreeMap::<&str, Vec<&FleetChange>>::new();
         for change in &feed.records {
             published_bytes += serde_json::to_vec(change)
                 .map_err(|error| LaserError::Codec(error.to_string()))?
                 .len();
-            topic
-                .publish()
-                .partition_key(change.key())
-                .json(change)?
-                .send()
-                .await?;
+            by_key.entry(change.key()).or_default().push(change);
+        }
+        for (key, changes) in by_key {
+            let started = Instant::now();
+            let mut batch = topic.publish_batch().partition_key(key);
+            for change in &changes {
+                batch = batch.add_json(change)?;
+            }
+            batch.send().await?;
+            println!(
+                "  {key}: {} records in {} ms",
+                changes.len(),
+                started.elapsed().as_millis()
+            );
         }
         println!(
             "  {} records, {published_bytes} bytes: battery readings, maneuvers, station flips, and {} safe-mode or decommission events",

@@ -359,7 +359,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.5.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.5.3` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as durable duplicate suppression, graphs, and an A2A gateway. Memory combines query and graph operations and has no separate managed command group.
 
@@ -419,6 +419,8 @@ See the AGDX spec for the wire contract.
 Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples reset their own stream at the start of a run and keep it afterwards. See [connect timeout and cleanup](docs/connect-timeout.md).
 
 ## Publish recovery
+
+Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
 
 Rust, Python, and TypeScript publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds. Explicit builder or connect configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.
 

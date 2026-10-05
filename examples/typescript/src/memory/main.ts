@@ -97,11 +97,25 @@ const RELATIONSHIPS = [
 ] as const
 const MITIGATION_SINCE_US = 1_900_000_000_000_000n
 
+// A linear scan, where the equivalent regex is quadratic on long runs of
+// punctuation.
+function trimToAlphanumeric(word: string): string {
+  const alphanumeric = (index: number): boolean => {
+    const code = word.charCodeAt(index)
+    return (code >= 48 && code <= 57) || (code >= 97 && code <= 122)
+  }
+  let start = 0
+  let end = word.length
+  while (start < end && !alphanumeric(start)) start += 1
+  while (end > start && !alphanumeric(end - 1)) end -= 1
+  return word.slice(start, end)
+}
+
 class DeterministicEmbedder implements Embedder {
   embed(text: string): Promise<readonly number[]> {
     const dimensions = Array.from({ length: 64 }, () => 0)
     for (const word of text.toLowerCase().split(/\s+/u)) {
-      const token = word.replace(/^[^a-z0-9]+|[^a-z0-9]+$/gu, "")
+      const token = trimToAlphanumeric(word)
       if (token.length === 0) continue
       let hash = 0
       for (const byte of new TextEncoder().encode(token)) {

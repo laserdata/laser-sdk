@@ -1393,6 +1393,9 @@ export class Laser implements AsyncDisposable {
         ...(transport.openNodeConnection !== undefined
           ? { openNodeConnection: transport.openNodeConnection.bind(transport) }
           : {}),
+        ...(transport.clusterNodeCount !== undefined
+          ? { clusterNodeCount: transport.clusterNodeCount.bind(transport) }
+          : {}),
         ...(transport.openCoordinator !== undefined
           ? { openCoordinator: transport.openCoordinator.bind(transport) }
           : {}),

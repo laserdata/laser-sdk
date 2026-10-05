@@ -10,7 +10,8 @@ of hundreds, and everything else never leaves the broker.
 
 What it shows:
   - publish a busy feed of typed change records, dataclasses keyed by
-    satellite (`topic.publish(record).partition_key(key)`)
+    satellite, one batch per key
+    (`topic.publish_batch().partition_key(key).extend_json(records)`)
   - create the anomaly desk group with its filter in one call
   - consume as the group with the normal consumer, decode every delivered
     record back into its dataclass, commit after handling, and see how much
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -383,10 +385,16 @@ async def main() -> None:
         topic = laser.topic(TOPIC)
         await topic.ensure(PARTITIONS)
         published_bytes = 0
+        by_key: dict[str, list[dict[str, Any]]] = {}
         for change in feed:
             record = change.to_dict()
             published_bytes += len(json.dumps(record, separators=(",", ":")).encode())
-            await topic.publish(record).partition_key(change.key).send()
+            by_key.setdefault(change.key, []).append(record)
+        for key, records in sorted(by_key.items()):
+            started = time.monotonic()
+            await topic.publish_batch().partition_key(key).extend_json(records).send()
+            elapsed = round((time.monotonic() - started) * 1000)
+            print(f"  {key}: {len(records)} records in {elapsed} ms")
         print(
             f"  {len(feed)} records, {published_bytes} bytes: battery readings, maneuvers, "
             f"station flips, and {strict_matches} safe-mode or decommission events"

@@ -4,7 +4,7 @@ use crate::kv::KvError;
 use crate::provenance::ProvenanceError;
 use crate::query::QueryError;
 use crate::types::IdError;
-use iggy::prelude::IggyError;
+use iggy::prelude::{IggyError, IggyMessage, SendMessagesConfirmationResponse};
 use laser_wire::error::{DecodeError, InvalidError};
 use laser_wire::filter::FilterErrorReason;
 use laser_wire::result::{CommandError, ResultCode};
@@ -23,6 +23,10 @@ use laser_wire::result::{CommandError, ResultCode};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LaserError {
+    /// A fluent or direct publish that gave up. Carries the cause, the
+    /// target, the ranges that committed, and the records left unconfirmed.
+    #[error(transparent)]
+    PublishFailed(Box<PublishFailure>),
     /// A transient handler-side failure a handler may return to request a retry
     /// (the reliable consumer retries it under the [`RetryPolicy`](crate::agent::RetryPolicy)).
     /// Deterministic wiring, startup, and configuration failures use
@@ -223,6 +227,59 @@ pub enum LaserError {
     Provenance(#[from] ProvenanceError),
 }
 
+/// What a failed publish left behind. [`LaserError::publish_cause`] reaches
+/// the original error, so every classifier answers for it.
+#[derive(Debug, thiserror::Error)]
+#[error("publish failed to {stream}/{topic}: {source}")]
+#[non_exhaustive]
+pub struct PublishFailure {
+    #[source]
+    pub source: LaserError,
+    pub stream: String,
+    pub topic: String,
+    /// The ranges confirmed before the failure. Never replay them.
+    pub committed: Vec<SendMessagesConfirmationResponse>,
+    /// Records without a confirmation: those whose acknowledgement was lost
+    /// and those never sent. They keep the ids the attempts used, so a resend
+    /// stays deduplicated on the server.
+    pub unconfirmed: Vec<IggyMessage>,
+}
+
+// Transport failures a reconnect can clear. A failed producer send is
+// classified by its cause.
+pub(crate) fn is_transient_iggy_io_error(error: &IggyError) -> bool {
+    match error {
+        IggyError::Disconnected
+        | IggyError::TcpError
+        | IggyError::QuicError
+        | IggyError::StaleClient
+        | IggyError::NotConnected
+        | IggyError::ConnectionClosed
+        | IggyError::CannotEstablishConnection
+        | IggyError::CannotSendMessagesDueToClientDisconnection
+        | IggyError::TransientNotAccepted
+        | IggyError::TransientNotCommitted
+        | IggyError::CannotReadFile
+        | IggyError::CannotReadPartitions
+        | IggyError::PartitionNotFound(..) => true,
+        IggyError::ProducerSendFailed { cause, .. } => is_transient_iggy_io_error(cause),
+        _ => false,
+    }
+}
+
+// A publish answered `Unauthenticated` on a connection that already
+// authenticated once means the client's socket was re-dialed underneath it,
+// by its own reconnect or by a leader move, and the new node holds no session
+// for it. Recovery re-dials through the connection string, which carries the
+// auto-login credentials, so the retry runs authenticated.
+pub(crate) fn needs_reauthentication(error: &IggyError) -> bool {
+    match error {
+        IggyError::Unauthenticated => true,
+        IggyError::ProducerSendFailed { cause, .. } => needs_reauthentication(cause),
+        _ => false,
+    }
+}
+
 // The wire crate's codec failures map onto the SDK's own variants so every
 // call site keeps its error shape after a `?`.
 impl From<DecodeError> for LaserError {
@@ -294,6 +351,12 @@ pub(crate) fn decode_managed_reply<R: serde::de::DeserializeOwned>(
 }
 
 impl LaserError {
+    pub fn publish_cause(&self) -> &Self {
+        match self {
+            Self::PublishFailed(failure) => failure.source.publish_cause(),
+            error => error,
+        }
+    }
     /// A handler returns this to reject a message permanently: the reliable
     /// consumer dead-letters it immediately instead of retrying.
     pub fn rejected(reason: impl Into<String>) -> Self {
@@ -328,7 +391,8 @@ impl LaserError {
     /// canonical [`ResultCode`] classifier, while transport, handler, routing,
     /// timeout, and deferred-policy failures retain their local semantics.
     pub fn is_retryable(&self) -> bool {
-        match self {
+        match self.publish_cause() {
+            Self::PublishFailed(failure) => failure.source.is_retryable(),
             Self::Rejected(_)
             | Self::Unsupported { .. }
             | Self::Invalid(_)
@@ -363,12 +427,12 @@ impl LaserError {
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()).is_retryable(),
             Self::Filter(error) => error.code.is_retryable(),
             Self::ConsumerGroupSetup { source, .. } => source.is_retryable(),
+            Self::Iggy(error) => is_transient_iggy_io_error(error) || needs_reauthentication(error),
             Self::Handler(_)
             | Self::Timeout(_)
             | Self::PolicyDeferred(_)
             | Self::NoCapableAgent { .. }
-            | Self::NoInbox { .. }
-            | Self::Iggy(_) => true,
+            | Self::NoInbox { .. } => true,
             Self::AmbiguousMutation(_) => false,
         }
     }
@@ -386,7 +450,7 @@ impl LaserError {
     /// does not own that operation's mutation partition.
     pub fn is_not_leader(&self) -> bool {
         matches!(
-            self,
+            self.publish_cause(),
             Self::Kv(KvError::NotLeader)
                 | Self::Fork(ForkError::NotLeader)
                 | Self::Agent(laser_wire::agent_workflow::AgentError::NotLeader)
@@ -398,7 +462,7 @@ impl LaserError {
     /// code path instead.
     pub fn is_unsupported(&self) -> bool {
         matches!(
-            self,
+            self.publish_cause(),
             Self::Unsupported { .. }
                 | Self::Query(QueryError::Unsupported(_))
                 | Self::Kv(KvError::Unsupported(_))
@@ -411,12 +475,14 @@ impl LaserError {
     /// from a backend being down: the call worked, the thing is not there.
     pub fn is_not_found(&self) -> bool {
         matches!(
-            self,
+            self.publish_cause(),
             Self::Query(QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_))
                 | Self::Fork(ForkError::NotFound(_))
-        ) || self.filter_reason() == Some(FilterErrorReason::NotFound)
+        ) || self.is_stream_or_topic_not_found()
+            || matches!(self.iggy_cause(), Some(IggyError::ResourceNotFound(_)))
+            || self.filter_reason() == Some(FilterErrorReason::NotFound)
             || matches!(
-                self,
+                self.publish_cause(),
                 Self::Checkpoint(error)
                     if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::NotFound)
             )
@@ -427,13 +493,13 @@ impl LaserError {
     /// this client build: upgrade or downshift instead of retrying.
     pub fn is_version_skew(&self) -> bool {
         matches!(
-            self,
+            self.publish_cause(),
             Self::Query(QueryError::Version { .. })
                 | Self::Kv(KvError::Version { .. })
                 | Self::Fork(ForkError::Version { .. })
         ) || self.filter_reason() == Some(FilterErrorReason::VersionSkew)
             || matches!(
-                self,
+                self.publish_cause(),
                 Self::Checkpoint(error)
                     if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Version { .. })
             )
@@ -443,7 +509,10 @@ impl LaserError {
     /// it, or an `expect_absent` create lost a race). Not a failure to retry
     /// blindly: re-read the current value and version, recompute, and CAS again.
     pub fn is_version_conflict(&self) -> bool {
-        matches!(self, Self::Kv(KvError::VersionConflict { .. }))
+        matches!(
+            self.publish_cause(),
+            Self::Kv(KvError::VersionConflict { .. })
+        )
     }
 
     /// Whether a managed mutation may already have reached the server. A
@@ -453,7 +522,7 @@ impl LaserError {
     /// otherwise conflict with itself and the reply carries no token to renew
     /// or release it.
     pub fn is_ambiguous_mutation(&self) -> bool {
-        matches!(self, Self::AmbiguousMutation(_))
+        matches!(self.publish_cause(), Self::AmbiguousMutation(_))
     }
 
     /// Whether a read-consistency barrier could not be met: a query projector
@@ -461,7 +530,7 @@ impl LaserError {
     /// Retryable: the read model is catching up.
     pub fn is_stale(&self) -> bool {
         matches!(
-            self,
+            self.publish_cause(),
             Self::Query(QueryError::Stale { .. }) | Self::Kv(KvError::Stale { .. })
         )
     }
@@ -473,18 +542,20 @@ impl LaserError {
     /// the stream or topic permission the failing verb needs (read, send,
     /// create), or point the client at a stream the principal can use.
     pub fn is_permission_denied(&self) -> bool {
-        matches!(
-            self,
-            Self::Iggy(IggyError::Unauthorized | IggyError::Unauthenticated)
-                | Self::RoutePrincipalMismatch { .. }
-        ) || matches!(
-            self.filter_reason(),
-            Some(FilterErrorReason::Forbidden | FilterErrorReason::Unauthenticated)
-        ) || matches!(
-            self,
-            Self::Checkpoint(error)
-                if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Unauthorized)
-        )
+        matches!(self.publish_cause(), Self::RoutePrincipalMismatch { .. })
+            || matches!(
+                self.iggy_cause(),
+                Some(IggyError::Unauthorized | IggyError::Unauthenticated)
+            )
+            || matches!(
+                self.filter_reason(),
+                Some(FilterErrorReason::Forbidden | FilterErrorReason::Unauthenticated)
+            )
+            || matches!(
+                self.publish_cause(),
+                Self::Checkpoint(error)
+                    if matches!(error.as_ref(), laser_wire::checkpoint::CheckpointError::Unauthorized)
+            )
     }
 
     /// Whether the target stream or topic does not exist FOR THIS PRINCIPAL.
@@ -496,8 +567,8 @@ impl LaserError {
     /// yet for this principal.
     pub fn is_stream_or_topic_not_found(&self) -> bool {
         matches!(
-            self,
-            Self::Iggy(
+            self.iggy_cause(),
+            Some(
                 IggyError::StreamIdNotFound(_)
                     | IggyError::StreamNameNotFound(_)
                     | IggyError::TopicIdNotFound(_, _)
@@ -506,36 +577,47 @@ impl LaserError {
         )
     }
 
+    fn iggy_cause(&self) -> Option<&IggyError> {
+        let Self::Iggy(error) = self.publish_cause() else {
+            return None;
+        };
+        let mut cause = error;
+        while let IggyError::ProducerSendFailed { cause: nested, .. } = cause {
+            cause = nested;
+        }
+        Some(cause)
+    }
+
     /// Whether capability routing found no live agent for the skill.
     pub fn is_no_capable_agent(&self) -> bool {
-        matches!(self, Self::NoCapableAgent { .. })
+        matches!(self.publish_cause(), Self::NoCapableAgent { .. })
     }
 
     /// Whether a revocable lease was lost (expired, released, or re-acquired by another
     /// holder). For a fenced write, see [`is_fence_violation`](Self::is_fence_violation).
     pub fn is_lease_lost(&self) -> bool {
-        matches!(self, Self::Kv(KvError::LeaseLost))
+        matches!(self.publish_cause(), Self::Kv(KvError::LeaseLost))
     }
 
     /// Whether a fenced write lost the fence (a stale holder stepped aside). Not
     /// alarming, never retryable by the loser.
     pub fn is_fence_violation(&self) -> bool {
-        matches!(self, Self::FenceViolation { .. })
+        matches!(self.publish_cause(), Self::FenceViolation { .. })
     }
 
     /// Whether a spend ceiling was reached.
     pub fn is_budget_exceeded(&self) -> bool {
-        matches!(self, Self::BudgetExceeded { .. })
+        matches!(self.publish_cause(), Self::BudgetExceeded { .. })
     }
 
     /// Whether the agent is quarantined.
     pub fn is_quarantined(&self) -> bool {
-        matches!(self, Self::Quarantined { .. })
+        matches!(self.publish_cause(), Self::Quarantined { .. })
     }
 
     /// The typed consumer-filter cause, when the failure is one.
     pub fn filter_reason(&self) -> Option<FilterErrorReason> {
-        match self {
+        match self.publish_cause() {
             Self::Filter(error) => Some(error.reason),
             _ => None,
         }
@@ -547,7 +629,19 @@ impl LaserError {
     /// matching every variant, and mirrors the HTTP status the same error gets
     /// on the management surface.
     pub fn code(&self) -> ResultCode {
-        match self {
+        match self.publish_cause() {
+            Self::PublishFailed(failure) => failure.source.code(),
+            Self::Iggy(_) if matches!(self.iggy_cause(), Some(IggyError::ResourceNotFound(_))) => {
+                ResultCode::NotFound
+            }
+            Self::Iggy(_) if self.is_stream_or_topic_not_found() => ResultCode::NotFound,
+            Self::Iggy(_) if matches!(self.iggy_cause(), Some(IggyError::Unauthorized)) => {
+                ResultCode::Forbidden
+            }
+            Self::Iggy(_) if matches!(self.iggy_cause(), Some(IggyError::Unauthenticated)) => {
+                ResultCode::Unauthenticated
+            }
+            Self::Iggy(error) if is_transient_iggy_io_error(error) => ResultCode::Unavailable,
             Self::Filter(error) => error.code,
             Self::FilterFault { .. } => ResultCode::InvalidArgument,
             Self::FilterOversizedRecord { .. } => ResultCode::TooLarge,
@@ -625,6 +719,60 @@ fn unsupported_message(surface: &str, feature: Option<&str>, message: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_failed_producer_send_when_classified_then_should_use_its_cause() {
+        for (cause, code, retryable, denied, missing) in [
+            (
+                IggyError::Unauthorized,
+                ResultCode::Forbidden,
+                false,
+                true,
+                false,
+            ),
+            (
+                IggyError::Unauthenticated,
+                ResultCode::Unauthenticated,
+                true,
+                true,
+                false,
+            ),
+            (
+                IggyError::StreamNameNotFound("deleted".into()),
+                ResultCode::NotFound,
+                false,
+                false,
+                true,
+            ),
+            (
+                IggyError::Disconnected,
+                ResultCode::Unavailable,
+                true,
+                false,
+                false,
+            ),
+            (
+                IggyError::InvalidFormat,
+                ResultCode::Backend,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let error = LaserError::Iggy(IggyError::ProducerSendFailed {
+                cause: Box::new(cause),
+                failed: std::sync::Arc::new(Vec::new()),
+                committed: std::sync::Arc::new(Vec::new()),
+                stream_name: "s".into(),
+                topic_name: "t".into(),
+            });
+            assert_eq!(error.code(), code);
+            assert_eq!(error.is_retryable(), retryable);
+            assert_eq!(error.is_permission_denied(), denied);
+            assert_eq!(error.is_not_found(), missing);
+            assert_eq!(error.is_stream_or_topic_not_found(), missing);
+        }
+    }
 
     #[test]
     fn given_a_deterministic_handler_config_error_when_classified_then_should_not_retry() {

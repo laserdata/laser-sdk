@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.5.2" # typed streaming plus provenance
+laser-sdk = "0.5.3" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.5.2", features = ["agent", "managed"] }
+laser-sdk = { version = "0.5.3", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -356,6 +356,8 @@ Connecting gives up after 30 seconds. Set another budget with the Rust `connect_
 See [connect timeout and cleanup](../docs/connect-timeout.md).
 
 ## Publish recovery
+
+Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
 
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
 

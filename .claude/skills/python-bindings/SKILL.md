@@ -72,7 +72,7 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 ## Versioning and naming
 
 - The Python package is `laser-sdk` on PyPI, imported as `laser_sdk`. The internal Rust crate is `laser-sdk-python` (`publish = false`) with cdylib lib `laser_sdk_py`, named to avoid clashing with the `laser_sdk` dependency crate. Maturin renames the built module to `laser_sdk` via `module-name`.
-- Python follows the shared workspace version, currently `0.5.2`. Its dependency must select the matching Rust `laser-sdk` crate.
+- Python follows the shared workspace version, currently `0.5.3`. Its dependency must select the matching Rust `laser-sdk` crate.
 
 ## Working on it
 
@@ -84,6 +84,8 @@ Pass `MutationPosition { topic_generation, partition, offset }` to `Kv.get_entry
 - After a Rust API or wire change, update Python bindings and regenerate stubs. Update the corresponding tests and documentation in the same authorized change.
 
 ## Publish recovery
+
+Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
 
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds.
 

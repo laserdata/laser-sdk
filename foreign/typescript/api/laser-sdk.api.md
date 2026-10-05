@@ -5920,7 +5920,7 @@ export class ScopedMemory {
 }
 
 // @public (undocumented)
-export const SDK_VERSION = "0.5.2";
+export const SDK_VERSION = "0.5.3";
 
 // @public (undocumented)
 export function selectRoute(skillId: string, candidates: readonly RegisteredCard[], policy: RoutePolicy): AgentId | undefined;

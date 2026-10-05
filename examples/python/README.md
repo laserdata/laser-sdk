@@ -21,7 +21,7 @@ uv run python log.py
 Local checkout:
 
 ```sh
-uv sync --project ../../foreign/python --locked --extra testing
+uv sync --project ../../foreign/python --locked --extra testing --extra examples
 uv run --project ../../foreign/python python log.py
 ```
 

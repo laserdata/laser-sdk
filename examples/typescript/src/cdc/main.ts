@@ -87,13 +87,20 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const feed = fleetFeed()
   await topic.ensure(PARTITIONS)
   let publishedBytes = 0
+  const byKey = new Map<string, FleetChange[]>()
   for (const change of feed.records) {
     publishedBytes += utf8(JSON.stringify(change)).byteLength
-    await topic
-      .publish()
-      .partitionKey(utf8(keyOf(change)))
-      .json(change)
-      .send()
+    const key = keyOf(change)
+    byKey.set(key, [...(byKey.get(key) ?? []), change])
+  }
+  for (const [key, changes] of [...byKey].sort(([left], [right]) => left.localeCompare(right))) {
+    const started = performance.now()
+    const batch = topic.publishBatch().partitionKey(utf8(key))
+    for (const change of changes) batch.addJson(change)
+    await batch.send()
+    console.log(
+      `  ${key}: ${String(changes.length)} records in ${String(Math.round(performance.now() - started))} ms`
+    )
   }
   console.log(
     `  ${String(feed.records.length)} records, ${String(publishedBytes)} bytes: battery readings, maneuvers, station flips, and ${String(feed.strictMatches)} safe-mode or decommission events`

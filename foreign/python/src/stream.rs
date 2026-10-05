@@ -5,15 +5,17 @@ use crate::errors::{InvalidError, to_pyerr};
 use crate::publish::{PyBatchPublish, PyPublish};
 use crate::reader::PyCursor;
 use crate::transport::{
-    ConsumerConfig, PyConsumer, PyProducer, configure_consumer, duration_ms, partitioning,
-    positive_duration_ms,
+    ConsumerConfig, ProducerSettings, PyConsumer, PyProducer, configure_consumer,
+    positive_duration_ms, routing,
 };
 use crate::typed::{PyTypedRecords, body_to_json};
-use iggy::prelude::{DirectConfig, IggyExpiry, MaxTopicSize};
+use iggy::prelude::IggyExpiry;
+use laser_sdk::error::LaserError;
 use laser_sdk::laser::Laser;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[gen_stub_pymethods]
 #[pymethods]
@@ -166,14 +168,14 @@ impl PyTopic {
     /// Build a Laser direct producer. This is the full streaming hot path
     /// below the typed publish API: tune batching/linger/retries,
     /// topology creation, and default key or partition, then `await send(...)`.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=Some(3), retry_interval_ms=1000, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0))]
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
         batch_length: u32,
         linger_ms: u64,
         retries: Option<u32>,
-        retry_interval_ms: u64,
+        retry_interval_ms: Option<u64>,
         key: Option<&Bound<'_, PyAny>>,
         partition: Option<u32>,
         create_stream: bool,
@@ -192,45 +194,33 @@ impl PyTopic {
                 "topic partitions must be greater than zero",
             ));
         }
-        let handle = match &self.stream {
-            Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
-            None => self.laser.topic(&*self.name),
-        };
-        let mut builder = handle
-            .iggy_producer()
-            .map_err(to_pyerr)?
-            .direct(
-                DirectConfig::builder()
-                    .batch_length(batch_length)
-                    .linger_time(duration_ms(linger_ms))
-                    .build(),
-            )
-            .partitioning(partitioning(key, partition)?)
-            .send_retries(
-                retries,
-                Some(positive_duration_ms(
-                    retry_interval_ms,
-                    "retry_interval_ms",
-                )?),
-            );
-        builder = if create_stream {
-            builder.create_stream_if_not_exists()
-        } else {
-            builder.do_not_create_stream_if_not_exists()
-        };
-        builder = if create_topic {
-            let expiry = message_expiry
+        if let Some(interval) = retry_interval_ms {
+            positive_duration_ms(interval, "retry_interval_ms")?;
+        }
+        let stream = self
+            .stream
+            .clone()
+            .or_else(|| self.laser.default_stream().map(str::to_owned))
+            .ok_or_else(|| to_pyerr(LaserError::NoStream))?;
+        let settings = ProducerSettings {
+            batch_length,
+            linger: Duration::from_millis(linger_ms),
+            retries,
+            retry_interval: retry_interval_ms.map(Duration::from_millis),
+            routing: routing(key, partition)?,
+            create_stream,
+            create_topic,
+            partitions,
+            expiry: message_expiry
                 .parse::<IggyExpiry>()
-                .map_err(InvalidError::new_err)?;
-            builder.create_topic_if_not_exists(
-                partitions,
-                expiry,
-                MaxTopicSize::from(max_topic_size),
-            )
-        } else {
-            builder.do_not_create_topic_if_not_exists()
+                .map_err(InvalidError::new_err)?,
+            max_topic_size,
         };
-        Ok(PyProducer::new(builder.build(), &self.laser))
+        Ok(PyProducer::new(
+            self.laser.stream(stream.clone()).topic(&*self.name),
+            stream,
+            settings,
+        ))
     }
 
     /// Build a Laser reader for one partition. It is an async iterator

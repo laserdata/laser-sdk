@@ -88,6 +88,8 @@ Refer to `Laser::send_agent`, `ReliableConsumer::consume`, `keys::CONVERSATION_I
 
 ## Publish recovery
 
+Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
+
 Publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds.
 
 Connect budgets use Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout`, overriding `LASER_CONNECT_TIMEOUT_MS` (default 30000, see [connect timeout and cleanup](../../../docs/connect-timeout.md)). Rust builder methods are `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff`. Python `Laser.connect` keywords are `publish_timeout_ms`, `publish_max_retries`, and `publish_retry_backoff_ms`. TypeScript builder methods are `publishTimeout`, `publishMaxRetries`, and `publishRetryBackoff`. Explicit configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.

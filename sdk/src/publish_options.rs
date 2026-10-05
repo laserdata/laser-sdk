@@ -100,8 +100,8 @@ impl PublishOptions {
                     let retryable = match &error {
                         LaserError::Timeout(_) => true,
                         LaserError::Iggy(cause) => {
-                            crate::laser::is_transient_iggy_io_error(cause)
-                                || crate::laser::needs_reauthentication(cause)
+                            crate::error::is_transient_iggy_io_error(cause)
+                                || crate::error::needs_reauthentication(cause)
                         }
                         _ => false,
                     };

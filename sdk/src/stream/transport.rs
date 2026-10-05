@@ -273,6 +273,12 @@ impl ProducerBuilder {
     }
 
     #[must_use]
+    pub fn retry_backoff(mut self, interval: Duration) -> Self {
+        self.retry_interval = Some(interval);
+        self
+    }
+
+    #[must_use]
     pub fn routing(mut self, routing: Routing) -> Self {
         self.routing = routing;
         self
@@ -386,7 +392,23 @@ impl ProducerBuilder {
             builder.do_not_create_topic_if_not_exists()
         };
         let producer = builder.build();
-        producer.init().await?;
+        let observed = std::sync::atomic::AtomicU64::new(0);
+        publish_options
+            .run(
+                || async {
+                    observed.store(
+                        self.topic.laser.publish_generation(),
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    Ok(producer.init().await?)
+                },
+                || {
+                    self.topic
+                        .laser
+                        .reconnect_for_publish(observed.load(std::sync::atomic::Ordering::Acquire))
+                },
+            )
+            .await?;
         let statistics = super::producer_statistics::ProducerRecorder::new(
             &self.topic.laser,
             producer.stream().to_string(),
@@ -553,8 +575,13 @@ impl Producer {
                 .map_err(|error| {
                     crate::laser::publish_failure(
                         error,
-                        &messages[index * self.batch_length + chunk.len()..],
+                        &messages[index * self.batch_length..],
                         std::mem::take(&mut confirmations),
+                        chunk.len(),
+                        (
+                            &self.inner.stream().to_string(),
+                            &self.inner.topic().to_string(),
+                        ),
                     )
                 })?;
             confirmations.extend(response.confirmations);

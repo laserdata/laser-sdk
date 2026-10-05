@@ -3121,8 +3121,10 @@ class PolicyEvidence:
 class Producer:
     r"""
     A configurable Laser streaming producer. Build it with `Topic.producer`.
-    Sends use Apache Iggy's direct producer path and accept per-send key or
-    partition overrides without passing through the typed publish layer.
+    Every send runs the Laser publish recovery: each attempt is bounded by the
+    connection's publish timeout, a failed attempt reconnects and retries
+    `retries` times with the same message ids, and the final error names the
+    cause. Sends accept per-send key or partition overrides.
     """
     def init(self) -> typing.Any:
         r"""
@@ -3955,7 +3957,7 @@ class Topic:
         r"""
         Start a batch publish that flushes 1..N records in a single Iggy send.
         """
-    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.int = 0, retries: typing.Optional[builtins.int] = 3, retry_interval_ms: builtins.int = 1000, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, message_expiry: builtins.str = 'server_default', max_topic_size: builtins.int = 0) -> Producer:
+    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.int = 0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, message_expiry: builtins.str = 'server_default', max_topic_size: builtins.int = 0) -> Producer:
         r"""
         Build a Laser direct producer. This is the full streaming hot path
         below the typed publish API: tune batching/linger/retries,
@@ -4302,6 +4304,8 @@ class LaserError(Exception):
     budget_exceeded: builtins.bool
     quarantined: builtins.bool
     not_leader: builtins.bool
+    committed: builtins.list[SendMessagesConfirmation]
+    unconfirmed_count: builtins.int | None
 
 class ConfigError(LaserError): ...
 class TimeoutError(LaserError, builtins.TimeoutError): ...

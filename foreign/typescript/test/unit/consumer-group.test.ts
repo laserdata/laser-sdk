@@ -7,9 +7,10 @@ import {
   ProtocolError,
   TransportError
 } from "../../src/client/errors.js"
-import type { LaserTransport } from "../../src/iggy/apache-iggy.js"
+import { Laser } from "../../src/client/laser.js"
+import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
 import { Filters } from "../../src/managed/filters.js"
-import { ConsumerGroup, GroupFilter } from "../../src/stream/consumer-group.js"
+import { ConsumerGroup, GroupFilter, type GroupContext } from "../../src/stream/consumer-group.js"
 import { decodeOne, encodeNamed, expectMap, field } from "../../src/wire/cbor.js"
 import {
   AGDX_FILTER_MUTATE_CODE,
@@ -380,4 +381,21 @@ void test("given_a_repeated_catalog_cursor_when_deleted_then_should_fail_without
   assert.deepEqual(fixture.cursors, [undefined, 2])
   assert.deepEqual(fixture.dropped, [])
   assert.equal(fixture.remaining().length, 9)
+})
+
+void test("given_a_single_node_deployment_when_a_laser_group_routes_reads_then_should_probe_the_node_count", async () => {
+  const client = {
+    clientProvider: () => Promise.resolve({ protocol: "vsr" }),
+    destroy: () => Promise.resolve(),
+    cluster: {
+      getClusterMetadata: () =>
+        Promise.resolve({
+          name: "single-node",
+          nodes: [{ name: "iggy-node", ip: "127.0.0.1", endpoints: { tcp: 20032 } }]
+        })
+    }
+  } as unknown as IggyClient
+  await using laser = await Laser.fromIggyClient(client)
+  const context = (laser as unknown as { groupContext(): GroupContext }).groupContext()
+  assert.equal(await context.transport.clusterNodeCount?.(), 1)
 })

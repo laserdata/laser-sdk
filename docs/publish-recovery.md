@@ -2,7 +2,7 @@
 
 Rust, Python, and TypeScript give each publish attempt a 60-second timeout and allow three additional attempts. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. A timeout limits how long an attempt can take. The transport can report a failure sooner.
 
-Producer setup and reconnection use time from the same attempt. TypeScript spends at most half of that time on reconnection, which leaves time to send. After an attempt times out, Rust can use one additional timeout period to close the old connection and reconnect.
+Each producer setup attempt and each send attempt uses the configured timeout. Reconnection before a retry uses time from that attempt. TypeScript spends at most half of that time on reconnection, which leaves time to send. After an attempt times out, Rust can use one additional timeout period to close the old connection and reconnect.
 
 | Configuration | Environment variable | Default |
 | --- | --- | --- |
@@ -48,7 +48,7 @@ const laser = await Laser.builder()
   .connect()
 ```
 
-This configuration covers fluent, typed, agent, and direct streaming publishes. Explicit retry configuration on a direct producer takes precedence. Rust background producers keep Iggy queue and worker behavior. Their send result acknowledges that the queue accepted the records. The publish response timeout does not cover that queue operation. Their retry count and delay use the connection defaults unless explicitly configured.
+This configuration covers fluent, typed, agent, and direct streaming publishes. Explicit retry configuration on a direct producer takes precedence. Python `retries=None` and `retry_interval_ms=None` inherit the connection configuration. Set `retries=0` to disable resends. Rust `ProducerBuilder::retry_backoff` changes the delay without changing the inherited retry count. Rust background producers keep Iggy queue and worker behavior. Their send result acknowledges that the queue accepted the records. The publish response timeout does not cover that queue operation. Their retry count and delay use the connection defaults unless explicitly configured.
 
 Timeouts and temporary connection failures trigger retries within the configured limits. An `Unauthenticated` reply also triggers recovery when the connection previously authenticated. Reconnection or a leader change can move the client to a node without its session. The SDK reconnects with the connection string credentials before retrying. Permission errors, rejected credentials, invalid requests, and malformed commit confirmations fail immediately.
 
@@ -71,3 +71,5 @@ An unhandled Python exception or JavaScript promise rejection can terminate an a
 Consumer and agent tasks can also finish with an error. Monitor their run or join result and restart them when appropriate. Publish retries do not replace application supervision.
 
 A long-running service must retain failed work in a durable application queue. During an outage, pause work or slow new requests. Retry later with the same business idempotency key, which identifies repeated attempts at one operation. Keep retry limits finite so one request cannot occupy resources forever. The SDK cannot guarantee progress while the cluster is unavailable. It does not provide a durable queue for offline publishes.
+
+Every fluent or direct publish that gives up returns Rust `LaserError::PublishFailed`. Its message names the stream, the topic, and the cause. It carries the confirmed ranges in `committed` and the records without a confirmation in `unconfirmed`, with the message ids the attempts used, so a resend stays deduplicated on the server. `publish_cause()` returns the original error, and every classifier answers for that cause. Python raises the exception class of the cause with the same message and exposes `committed` and `unconfirmed_count`. Every Python exception carries both attributes, empty and `None` outside a publish. Unconfirmed records can already exist on the server if their acknowledgement was lost. Do not replay the confirmed prefix. Permanent transport errors, including missing resources and denied permissions, set `retryable` to false. An expired session can still trigger reauthentication.
