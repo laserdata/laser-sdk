@@ -80,7 +80,7 @@ void test("given_a_cursor_stream_when_a_message_is_sent_later_then_should_yield_
     const topic = await freshTopic(laser)
     await topic.send(utf8("first"))
 
-    const cursor = await topic.replay({ batchSize: 10 })
+    const cursor = (await topic.replay()).batch(10)
     const iterator = cursor.stream({ pollIntervalMs: 50 })[Symbol.asyncIterator]()
 
     const first = await iterator.next()

@@ -1,8 +1,10 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, json_to_py, payload_bytes, py_to_json, ser_to_py};
+use crate::convert::{
+    codec_decode, codec_encode, duration_seconds, json_to_py, payload_bytes, py_to_json, ser_to_py,
+};
 use crate::errors::{InvalidError, to_pyerr};
-use laser_sdk::kv::{KvEntry, KvPage, Lease, MutationPosition};
+use laser_sdk::kv::{KvEntry, KvMetadata, KvPage, Lease, MutationPosition};
 use laser_sdk::laser::Laser;
 use laser_sdk::types::ConversationId;
 use pyo3::prelude::*;
@@ -173,6 +175,27 @@ impl PyKv {
         })
     }
 
+    /// Fetch the value at `key` decoded by a user `codec` (any object with
+    /// `decode(data) -> value`), or `None` if absent or expired. A codec
+    /// failure raises `CodecError` with the codec's exception as its cause.
+    fn get_as<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        codec: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        future_into_py(py, async move {
+            let value = laser.kv(namespace).get(key).await.map_err(to_pyerr)?;
+            Python::attach(|py| match value {
+                Some(payload) => codec_decode(codec.bind(py), &payload),
+                None => Ok(py.None()),
+            })
+        })
+    }
+
     /// Fetch the full entry (key, value, version, expiry) at `key`, or `None`.
     fn get_entry<'py>(
         &self,
@@ -246,7 +269,7 @@ impl PyKv {
         })
     }
 
-    /// Start a set. Supply a value (`json` / `msgpack` / `payload`), optional
+    /// Start a set. Supply a value (`bytes` / `json` / `msgpack`), optional
     /// `ttl` / `expires_at` / `expect_*`, then `await .send()` (or `.commit()`
     /// for a compare-and-swap).
     fn set(&self, key: &Bound<'_, PyAny>) -> PyResult<PyKvSet> {
@@ -323,15 +346,15 @@ impl PyKv {
         })
     }
 
-    /// Test presence and read metadata without the value. Returns
-    /// `(version, expires_at_micros, size_bytes)` or `None` when absent.
+    /// Test presence and read metadata without the value. Returns the
+    /// `KvMetadata`, or `None` when absent.
     fn exists<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
             let meta = laser.kv(namespace).exists(key).await.map_err(to_pyerr)?;
-            Ok(meta.map(|m| (m.version, m.expires_at_micros, m.size_bytes)))
+            Ok(meta.map(PyKvMetadata::from))
         })
     }
 
@@ -352,6 +375,28 @@ impl PyKv {
             .transpose()?;
         future_into_py(py, async move {
             laser.kv(namespace).expire(key, ttl).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Set the entry's absolute expiry (epoch microseconds) in place.
+    /// `expires_at_micros` of `None` clears it. Returns the entry's (unchanged)
+    /// version.
+    #[pyo3(signature = (key, expires_at_micros=None))]
+    fn expire_at<'py>(
+        &self,
+        py: Python<'py>,
+        key: &Bound<'_, PyAny>,
+        expires_at_micros: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = payload_bytes(key)?;
+        future_into_py(py, async move {
+            laser
+                .kv(namespace)
+                .expire_at(key, expires_at_micros)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -620,9 +665,9 @@ impl PyKvCasFenced {
     /// Store raw bytes (str, bytes, or bytearray).
     fn bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.body = Body::Bytes(payload_bytes(value)?);
+        slf.body = Body::Bytes(payload_bytes(payload)?);
         Ok(slf)
     }
 
@@ -641,6 +686,17 @@ impl PyKvCasFenced {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.body = Body::Msgpack(py_to_json(value)?);
+        Ok(slf)
+    }
+
+    /// Encode `value` with a user `codec` (any object with `encode(value) ->
+    /// bytes`) and store the bytes. A codec failure raises `CodecError`.
+    fn encode_with<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+        codec: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Bytes(codec_encode(codec, value)?);
         Ok(slf)
     }
 
@@ -729,6 +785,7 @@ pub struct PyKvEntry {
     pub version: u64,
     #[pyo3(get)]
     pub expires_at_micros: Option<u64>,
+    scope: Option<laser_sdk::wire::kv::MemoryRowScope>,
     source: Option<laser_sdk::wire::graph::SourceRef>,
 }
 
@@ -739,6 +796,7 @@ impl From<KvEntry> for PyKvEntry {
             value: entry.value,
             version: entry.version,
             expires_at_micros: entry.expires_at_micros,
+            scope: entry.scope.map(|scope| *scope),
             source: entry.source.map(|source| *source),
         }
     }
@@ -753,14 +811,32 @@ impl PyKvEntry {
     }
 
     /// Decode the value as JSON into a Python value.
-    fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value: serde_json::Value = serde_json::from_slice(&self.value)
-            .map_err(|e| crate::errors::CodecError::new_err(e.to_string()))?;
+    fn decode_value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value: serde_json::Value =
+            <laser_sdk::stream::Json as laser_sdk::stream::Decoder<_>>::decode(&self.value)
+                .map_err(|error| to_pyerr(laser_sdk::LaserError::from(error)))?;
         json_to_py(py, &value)
     }
 
+    /// Decode the value with a user `codec` (any object with
+    /// `decode(data) -> value`, such as `Json` or `Cbor`). A codec failure
+    /// raises `CodecError` with the codec's exception as its cause.
+    fn decode_value_with(&self, codec: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        codec_decode(codec, &self.value)
+    }
+
+    /// The memory scope of a memory read-view row as a dict (`kind`, `agent`,
+    /// `user`, `app`, `conversation`, `source`), or `None` for a generic entry.
+    #[getter]
+    fn scope(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.scope
+            .as_ref()
+            .map(|scope| ser_to_py(py, scope))
+            .transpose()
+    }
+
     /// The origin log record this entry was folded from, as a dict (the same
-    /// shape `graph_node`'s `source` uses), or `None` when the store did not
+    /// shape a graph node's `source` uses), or `None` when the store did not
     /// stamp one. Every managed write is log-first, so a stamped entry points
     /// back to the record that wrote it.
     fn source(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
@@ -768,6 +844,40 @@ impl PyKvEntry {
             .as_ref()
             .map(|source| crate::graph::source_to_py(py, source))
             .transpose()
+    }
+}
+
+/// One key's metadata without its value: version, expiry, and value size.
+#[gen_stub_pyclass]
+#[pyclass(name = "KvMetadata", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyKvMetadata {
+    #[pyo3(get)]
+    pub version: u64,
+    #[pyo3(get)]
+    pub expires_at_micros: Option<u64>,
+    #[pyo3(get)]
+    pub size_bytes: usize,
+}
+
+impl From<KvMetadata> for PyKvMetadata {
+    fn from(meta: KvMetadata) -> Self {
+        Self {
+            version: meta.version,
+            expires_at_micros: meta.expires_at_micros,
+            size_bytes: meta.size_bytes,
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyKvMetadata {
+    fn __repr__(&self) -> String {
+        format!(
+            "KvMetadata(version={}, expires_at_micros={:?}, size_bytes={})",
+            self.version, self.expires_at_micros, self.size_bytes
+        )
     }
 }
 
@@ -815,21 +925,11 @@ pub struct PyKvSet {
 #[pymethods]
 impl PyKvSet {
     /// Store raw bytes (str, bytes, or bytearray).
-    fn payload<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.body = Body::Bytes(payload_bytes(value)?);
-        Ok(slf)
-    }
-
-    /// Store raw bytes (str, bytes, or bytearray). The same as `payload`, under
-    /// the Rust and TypeScript name.
     fn bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.body = Body::Bytes(payload_bytes(value)?);
+        slf.body = Body::Bytes(payload_bytes(payload)?);
         Ok(slf)
     }
 
@@ -848,6 +948,17 @@ impl PyKvSet {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.body = Body::Msgpack(py_to_json(value)?);
+        Ok(slf)
+    }
+
+    /// Encode `value` with a user `codec` (any object with `encode(value) ->
+    /// bytes`) and store the bytes. A codec failure raises `CodecError`.
+    fn encode_with<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+        codec: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Bytes(codec_encode(codec, value)?);
         Ok(slf)
     }
 
@@ -953,8 +1064,7 @@ fn apply_body(
 ) -> Result<laser_sdk::kv::KvSetRequest, laser_sdk::LaserError> {
     match body {
         Body::Unset => Err(laser_sdk::LaserError::Invalid(
-            "no value set: call .payload(), .bytes(), .json(), or .msgpack() before sending"
-                .to_owned(),
+            "no value set: call .bytes(), .json(), or .msgpack() before sending".to_owned(),
         )),
         Body::Bytes(payload) => Ok(request.bytes(payload)),
         Body::Json(value) => request.json(&value),

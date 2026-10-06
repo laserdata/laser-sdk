@@ -80,7 +80,7 @@ def open_semantic_memory(world):
             vector[hash_value % dims] += 1.0
         return vector
 
-    world.semantic_memory = world.laser.vector_memory(embed)
+    world.semantic_memory = ls.VectorMemory.governed(world.laser, embed)
     world.semantic_conversation = str(ls.new_conversation_id())
 
 
@@ -101,7 +101,7 @@ def _assert_first(world, strategy, query, expected):
         )
     )
     assert items, "recall returned items"
-    assert items[0].text == expected
+    assert items[0].text() == expected
 
 
 @then(parsers.parse('keyword recall for "{query}" returns "{expected}" first'))

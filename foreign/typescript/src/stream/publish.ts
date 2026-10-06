@@ -7,7 +7,7 @@ import type { CompiledSchema } from "../schema-codecs.js"
 import type { SendMessagesResponse } from "../iggy/apache-iggy.js"
 import { type ArrowIpcMessageMetadata, validateArrowIpcMetadata } from "../wire/arrow.js"
 import { ContentType, type ContentType as ContentTypeValue } from "../wire/content.js"
-import { type Codec, jsonCodec, messagePackCodec } from "./codecs.js"
+import { type Codec, Json, Msgpack } from "./codecs.js"
 import { mergeRecord, Record, recordHeaders } from "./record.js"
 import type { Topic } from "./topic.js"
 
@@ -16,8 +16,8 @@ interface ClaimCheck {
   readonly thresholdBytes: number
 }
 
-const identityJson: Codec<unknown> = jsonCodec((decoded) => decoded)
-const identityMessagePack: Codec<unknown> = messagePackCodec((decoded) => decoded)
+const identityJson: Codec<unknown> = new Json()
+const identityMessagePack: Codec<unknown> = new Msgpack()
 
 export class PublishRequest {
   private body: Uint8Array | undefined
@@ -27,7 +27,12 @@ export class PublishRequest {
   private readonly record = new Record()
   private claimCheckValue: ClaimCheck | undefined
 
-  constructor(private readonly topic: Topic) {}
+  private constructor(private readonly topic: Topic) {}
+
+  /** @internal */
+  static create(topic: Topic): PublishRequest {
+    return new PublishRequest(topic)
+  }
 
   partitionKey(key: BytesLike): this {
     this.key = ownedBytes(key)
@@ -35,6 +40,7 @@ export class PublishRequest {
     return this
   }
 
+  /** @internal Explicit partition, used by typed publish options. */
   partition(id: number): this {
     this.partitionId = id
     this.key = undefined
@@ -67,12 +73,8 @@ export class PublishRequest {
   }
 
   header(key: string, value: string): this {
-    this.record.header(key, value)
+    this.record.metadata(key, value)
     return this
-  }
-
-  metadata(key: string, value: string): this {
-    return this.header(key, value)
   }
 
   inlinePayload(): this {
@@ -110,10 +112,6 @@ export class PublishRequest {
     return this
   }
 
-  encode<T>(value: T, codec: Codec<T>, contentType?: ContentTypeValue): this {
-    return this.encodeWith(value, codec, contentType)
-  }
-
   json(value: unknown): this
   json<T>(value: T, codec: Codec<T>): this
   json<T>(value: T, codec?: Codec<T>): this {
@@ -130,18 +128,11 @@ export class PublishRequest {
     return this.encodeWith(value, codec, ContentType.Msgpack)
   }
 
-  messagePack(value: unknown): this
-  messagePack<T>(value: T, codec: Codec<T>): this
-  messagePack<T>(value: T, codec?: Codec<T>): this {
-    if (codec === undefined) return this.msgpack(value)
-    return this.msgpack(value, codec)
-  }
-
   avro(schema: CompiledSchema, schemaId: number, value: unknown): this {
     if (schema.kind !== "avro") {
       throw new InvalidError("avro() requires a compiled Avro schema")
     }
-    this.body = schema.encode(value)
+    this.body = schema.encodeAvro(value)
     this.record.contentType(ContentType.Avro).schemaId(schemaId)
     return this
   }
@@ -189,7 +180,12 @@ export class BatchPublishRequest {
   private readonly entries: BatchEntry[] = []
   private key: Uint8Array | undefined
 
-  constructor(private readonly topic: Topic) {}
+  private constructor(private readonly topic: Topic) {}
+
+  /** @internal */
+  static create(topic: Topic): BatchPublishRequest {
+    return new BatchPublishRequest(topic)
+  }
 
   get length(): number {
     return this.entries.length
@@ -230,12 +226,8 @@ export class BatchPublishRequest {
   }
 
   header(key: string, value: string): this {
-    this.defaults.header(key, value)
+    this.defaults.metadata(key, value)
     return this
-  }
-
-  metadata(key: string, value: string): this {
-    return this.header(key, value)
   }
 
   addPayload(payload: BytesLike): this {
@@ -303,13 +295,6 @@ export class BatchPublishRequest {
     return this.addEncoded(value, codec, ContentType.Msgpack)
   }
 
-  addMessagePack(value: unknown): this
-  addMessagePack<T>(value: T, codec: Codec<T>): this
-  addMessagePack<T>(value: T, codec?: Codec<T>): this {
-    if (codec === undefined) return this.addMsgpack(value)
-    return this.addMsgpack(value, codec)
-  }
-
   addJsonWithProjection(projectionRef: string, value: unknown): this
   addJsonWithProjection<T>(projectionRef: string, value: T, codec: Codec<T>): this
   addJsonWithProjection<T>(projectionRef: string, value: T, codec?: Codec<T>): this {
@@ -324,9 +309,9 @@ export class BatchPublishRequest {
     return this.addEncodedWithProjection(projectionRef, value, codec, ContentType.Json)
   }
 
-  addMessagePackWithProjection(projectionRef: string, value: unknown): this
-  addMessagePackWithProjection<T>(projectionRef: string, value: T, codec: Codec<T>): this
-  addMessagePackWithProjection<T>(projectionRef: string, value: T, codec?: Codec<T>): this {
+  addMsgpackWithProjection(projectionRef: string, value: unknown): this
+  addMsgpackWithProjection<T>(projectionRef: string, value: T, codec: Codec<T>): this
+  addMsgpackWithProjection<T>(projectionRef: string, value: T, codec?: Codec<T>): this {
     if (codec === undefined) {
       return this.addEncodedWithProjection<unknown>(
         projectionRef,
@@ -343,7 +328,7 @@ export class BatchPublishRequest {
       throw new InvalidError("addAvro() requires a compiled Avro schema")
     }
     this.entries.push({
-      payload: schema.encode(value),
+      payload: schema.encodeAvro(value),
       record: new Record().contentType(ContentType.Avro).schemaId(schemaId)
     })
     return this
@@ -383,9 +368,9 @@ export class BatchPublishRequest {
     return this.extendEncoded(values, codec, ContentType.Json)
   }
 
-  extendMessagePack(values: Iterable<unknown>): this
-  extendMessagePack<T>(values: Iterable<T>, codec: Codec<T>): this
-  extendMessagePack<T>(values: Iterable<T>, codec?: Codec<T>): this {
+  extendMsgpack(values: Iterable<unknown>): this
+  extendMsgpack<T>(values: Iterable<T>, codec: Codec<T>): this
+  extendMsgpack<T>(values: Iterable<T>, codec?: Codec<T>): this {
     if (codec === undefined) {
       return this.extendEncoded<unknown>(values, identityMessagePack, ContentType.Msgpack)
     }

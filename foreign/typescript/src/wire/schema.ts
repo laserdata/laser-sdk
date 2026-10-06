@@ -1,6 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { CodecError, InvalidError } from "../client/errors.js"
-import { type CborMap, expectMap, field } from "./cbor.js"
+import { type CborMap, cborFloat, expectMap, field } from "./cbor.js"
 import { LogicalSchemaId } from "./ids.js"
 import { MAX_VALUE_BYTES } from "./limits.js"
 
@@ -67,6 +67,40 @@ export type LogicalType =
 
 export type LogicalTypeKind = LogicalType["kind"]
 
+export function logicalTypeKind(logicalType: LogicalType): LogicalTypeKind {
+  return logicalType.kind
+}
+
+export function logicalTypeAcceptsMapKey(logicalType: LogicalType): boolean {
+  return MAP_KEY_KINDS.has(logicalType.kind)
+}
+
+const MAP_KEY_KINDS: ReadonlySet<LogicalTypeKind> = new Set<LogicalTypeKind>([
+  "boolean",
+  "int",
+  "long",
+  "decimal",
+  "date",
+  "time_micros",
+  "timestamp_micros",
+  "timestamp_tz_micros",
+  "string",
+  "uuid",
+  "fixed",
+  "binary"
+])
+
+export const SchemaFingerprint = { BYTES: 32 } as const
+export type SchemaFingerprint = Uint8Array
+
+export const Digest32 = { BYTES: 32 } as const
+export type Digest32 = Uint8Array
+
+export const UuidValue = { BYTES: 16 } as const
+export type UuidValue = Uint8Array
+
+export type BinaryValue = Uint8Array
+
 export interface LogicalField {
   readonly id: number
   readonly name: string
@@ -78,7 +112,7 @@ export interface LogicalField {
 export interface LogicalSchemaRef {
   readonly id: LogicalSchemaId
   readonly version: number
-  readonly fingerprint: Uint8Array
+  readonly fingerprint: SchemaFingerprint
 }
 
 export interface LogicalSchema {
@@ -111,6 +145,10 @@ export interface DecimalValue {
   readonly scale: number
 }
 
+export function decimalValueValidateCanonical(value: DecimalValue): void {
+  validateDecimal(value)
+}
+
 export type TypedValue =
   | { readonly kind: "null" }
   | { readonly kind: "boolean"; readonly value: boolean }
@@ -123,7 +161,8 @@ export type TypedValue =
   | { readonly kind: "float" | "double"; readonly value: number }
   | { readonly kind: "decimal"; readonly value: DecimalValue }
   | { readonly kind: "string"; readonly value: string }
-  | { readonly kind: "uuid" | "fixed" | "binary"; readonly value: Uint8Array }
+  | { readonly kind: "uuid"; readonly value: UuidValue }
+  | { readonly kind: "fixed" | "binary"; readonly value: BinaryValue }
   | { readonly kind: "struct"; readonly value: readonly FieldValue[] }
   | { readonly kind: "list"; readonly value: readonly TypedValue[] }
   | { readonly kind: "map"; readonly value: readonly MapEntry[] }
@@ -135,6 +174,21 @@ export interface FieldValue {
 export interface MapEntry {
   readonly key: TypedValue
   readonly value: TypedValue
+}
+
+export function typedValueAsStr(value: TypedValue): string | undefined {
+  return value.kind === "string" ? value.value : undefined
+}
+
+export function typedValueAsU64(value: TypedValue): bigint | undefined {
+  const signed = typedValueAsI64(value)
+  return signed !== undefined && signed >= 0n ? signed : undefined
+}
+
+export function typedValueAsI64(value: TypedValue): bigint | undefined {
+  if (value.kind === "int") return BigInt(value.value)
+  if (value.kind === "long") return value.value
+  return undefined
 }
 
 function mapOf(entries: readonly (readonly [string, unknown])[]): Map<string, unknown> {
@@ -319,6 +373,8 @@ export function encodeTypedValue(value: TypedValue): Map<string, unknown> {
         ])
       )
     )
+  else if (value.kind === "float" || value.kind === "double")
+    map.set("value", cborFloat(value.value))
   else map.set("value", value.value)
   return map
 }
@@ -449,7 +505,11 @@ function diagnosticJsonValue(value: unknown): unknown {
   return value
 }
 
-export function validateTypedValue(value: TypedValue, depth = 1): void {
+export function typedValueValidateCanonical(value: TypedValue): void {
+  validateTypedValue(value, 1)
+}
+
+function validateTypedValue(value: TypedValue, depth: number): void {
   if (depth > MAX_LOGICAL_SCHEMA_DEPTH) throw new InvalidError("typed value depth exceeds cap")
   switch (value.kind) {
     case "int":
@@ -538,7 +598,7 @@ export function validateTypedValue(value: TypedValue, depth = 1): void {
   }
 }
 
-export function validateTypedValueAgainst(
+export function typedValueValidateAgainst(
   value: TypedValue,
   logicalType: LogicalType,
   required: boolean
@@ -547,7 +607,7 @@ export function validateTypedValueAgainst(
     if (required) throw new InvalidError("required value is null")
     return
   }
-  validateTypedValue(value)
+  validateTypedValue(value, 1)
   switch (logicalType.kind) {
     case "boolean":
     case "int":
@@ -584,19 +644,19 @@ export function validateTypedValueAgainst(
         const entry = value.value[index]
         if (field === undefined || entry?.fieldId !== field.id)
           throw new InvalidError("struct field ids do not match logical type")
-        validateTypedValueAgainst(entry.value, field.fieldType, field.required)
+        typedValueValidateAgainst(entry.value, field.fieldType, field.required)
       }
       return
     case "list":
       if (value.kind !== "list") throw new InvalidError("typed value does not match logical type")
       for (const item of value.value)
-        validateTypedValueAgainst(item, logicalType.element, logicalType.elementRequired)
+        typedValueValidateAgainst(item, logicalType.element, logicalType.elementRequired)
       return
     case "map":
       if (value.kind !== "map") throw new InvalidError("typed value does not match logical type")
       for (const entry of value.value) {
-        validateTypedValueAgainst(entry.key, logicalType.key, true)
-        validateTypedValueAgainst(entry.value, logicalType.value, logicalType.valueRequired)
+        typedValueValidateAgainst(entry.key, logicalType.key, true)
+        typedValueValidateAgainst(entry.value, logicalType.value, logicalType.valueRequired)
       }
   }
 }
@@ -613,13 +673,13 @@ export function createLogicalSchema(
   }
   return {
     ...withoutFingerprint,
-    schema: { id, version, fingerprint: sha256(canonicalSchemaBytes(withoutFingerprint)) }
+    schema: { id, version, fingerprint: logicalSchemaComputeFingerprint(withoutFingerprint) }
   }
 }
 
 export function validateLogicalSchema(schema: LogicalSchema): void {
   validateSchemaShape(schema.schema.id, schema.schema.version, schema.fields)
-  const expected = sha256(canonicalSchemaBytes(schema))
+  const expected = logicalSchemaComputeFingerprint(schema)
   if (!equalBytes(expected, schema.schema.fingerprint))
     throw new InvalidError("logical schema fingerprint does not match canonical bytes")
 }
@@ -629,7 +689,11 @@ export function validateResultFields(fields: readonly LogicalField[]): void {
   validateFieldShape(fields, true)
 }
 
-export function canonicalSchemaBytes(schema: LogicalSchema): Uint8Array {
+export function logicalSchemaComputeFingerprint(schema: LogicalSchema): SchemaFingerprint {
+  return sha256(logicalSchemaCanonicalFingerprintBytes(schema))
+}
+
+export function logicalSchemaCanonicalFingerprintBytes(schema: LogicalSchema): Uint8Array {
   validateSchemaShape(schema.schema.id, schema.schema.version, schema.fields)
   const encoder = new SchemaEncoder()
   encoder.bytes(new TextEncoder().encode("AGDX-SCHEMA-V1\0"))
@@ -724,22 +788,7 @@ function validateFieldShape(
     if (type.kind === "map") {
       nestedId(type.keyId)
       nestedId(type.valueId)
-      if (
-        ![
-          "boolean",
-          "int",
-          "long",
-          "decimal",
-          "date",
-          "time_micros",
-          "timestamp_micros",
-          "timestamp_tz_micros",
-          "string",
-          "uuid",
-          "fixed",
-          "binary"
-        ].includes(type.key.kind)
-      )
+      if (!logicalTypeAcceptsMapKey(type.key))
         throw new InvalidError("map key type is not supported")
       visitType(type.key, depth + 1)
       visitType(type.value, depth + 1)
@@ -875,7 +924,7 @@ function validateI64(value: bigint): void {
   }
 }
 function canonicalMapKey(value: TypedValue): Uint8Array {
-  validateTypedValue(value)
+  validateTypedValue(value, 1)
   switch (value.kind) {
     case "boolean":
       return Uint8Array.of(0, value.value ? 1 : 0)

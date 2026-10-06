@@ -24,9 +24,11 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const host = graphNodeEntity("host", "node-7")
   const services = await graph.neighbors(host.id, "out", RELATION, 1)
 
+  // The reply carries the start node beside the nodes it reaches.
   console.log(`  ${HOST} ${RELATION}:`)
   for (const node of services.nodes) {
-    console.log(`    ${node.labels[0] ?? "entity"}:${graphNodeValue(node)}`)
+    const entity = `${node.labels[0] ?? "entity"}:${graphNodeValue(node)}`
+    if (entity !== HOST) console.log(`    ${entity}`)
   }
 }
 

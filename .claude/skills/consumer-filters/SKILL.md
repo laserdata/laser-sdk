@@ -12,6 +12,7 @@ Load the SDK overview first. The public hierarchy is `Laser → stream → topic
 - `sdk/src/stream/consumer_group.rs` owns group handles, optional setup policies, creation outcomes and group-scoped administration.
 - `sdk/src/stream/transport.rs` owns normal streaming, group-aware delivery, commit policies, cancellation and shutdown.
 - `sdk/src/filters/` holds internal catalog clients, routing, membership, advanced readers, bounded outstanding pages, progress and optional local guards.
+- `sdk/src/filters/mod.rs` re-exports the policy and evaluator types. The saved-filter catalog frames (`FilterRef`, `FilterMutation`, `FilterPage`, `FilterSummary`, `FilteredPage`, `RecordFault`, and the rest) and `ExactDecimal` are reachable only as `laser_sdk::wire::filter`, and TypeScript keeps them under `wire` in `@laserdata/laser-sdk/full`. `FilterAnnounce` lives in `laser_sdk::capabilities`.
 - `wire/src/filter/` defines policies, codecs, requests, replies, revisions and durable operation results. `read.rs` includes automatic group execution, scan ceilings, source history and policy generations.
 - `foreign/python/src/consumer_group.rs`, `filters.rs` and `transport.rs` bind the same behavior through Rust. Regenerate the Python stubs.
 - `foreign/typescript/src/stream/consumer-group.ts`, `consumer.ts`, `managed/filters.ts` and the wire modules implement the native TypeScript peer. Regenerate both API reports.

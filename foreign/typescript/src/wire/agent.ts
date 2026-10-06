@@ -371,12 +371,40 @@ export function decodeContentRef(value: unknown, context: string): ContentRef {
 function cappedString(value: string | undefined, field_: string, cap: number): void {
   if (value !== undefined) {
     const bytes = utf8Length(value)
-    if (bytes > cap) {
-      throw new InvalidError(`${field_} is ${String(bytes)}B, exceeds cap ${String(cap)}B`, {
-        field: field_
-      })
-    }
+    if (bytes > cap) rejectValidation({ kind: "tooLarge", field: field_, size: bytes, cap })
   }
+}
+
+/**
+ * A validity-matrix or cap violation of an agent message, card, presence, body
+ * reference, or signature. The thrown `InvalidError` carries it as `context`.
+ */
+export type ValidateError =
+  | { readonly kind: "missing"; readonly agentKind: AgentKind; readonly field: string }
+  | { readonly kind: "forbidden"; readonly agentKind: AgentKind; readonly field: string }
+  | {
+      readonly kind: "tooLarge"
+      readonly field: string
+      readonly size: number
+      readonly cap: number
+    }
+  | { readonly kind: "invalid"; readonly field: string; readonly reason: string }
+
+function validateErrorMessage(error: ValidateError): string {
+  switch (error.kind) {
+    case "missing":
+      return `${error.agentKind} requires \`${error.field}\``
+    case "forbidden":
+      return `\`${error.field}\` is invalid on ${error.agentKind}`
+    case "tooLarge":
+      return `\`${error.field}\` is ${String(error.size)}B, exceeds cap ${String(error.cap)}B`
+    case "invalid":
+      return `\`${error.field}\`: ${error.reason}`
+  }
+}
+
+function rejectValidation(error: ValidateError): never {
+  throw new InvalidError(validateErrorMessage(error), error)
 }
 
 export interface CapabilityDescriptor {
@@ -435,10 +463,12 @@ export function validateAgentCard(card: AgentCard): void {
   cappedString(card.name, "name", MAX_AGENT_STRING_BYTES)
   cappedString(card.version, "version", MAX_AGENT_STRING_BYTES)
   if (card.capabilities.length > MAX_CARD_CAPABILITIES) {
-    throw new InvalidError(
-      `capabilities has ${String(card.capabilities.length)} entries, exceeds cap ${String(MAX_CARD_CAPABILITIES)}`,
-      { field: "capabilities" }
-    )
+    rejectValidation({
+      kind: "tooLarge",
+      field: "capabilities",
+      size: card.capabilities.length,
+      cap: MAX_CARD_CAPABILITIES
+    })
   }
   for (const capability of card.capabilities) {
     cappedString(capability.skillId, "capability skill_id", MAX_AGENT_STRING_BYTES)
@@ -516,20 +546,27 @@ export function newBodyRef(reference: string, sizeBytes: bigint, sha256: Uint8Ar
 
 export function validateBodyRef(ref: BodyRef): void {
   if (ref.reference.length === 0) {
-    throw new InvalidError("reference must not be empty", { field: "reference" })
+    rejectValidation({
+      kind: "invalid",
+      field: "reference",
+      reason: "reference must not be empty"
+    })
   }
   const referenceBytes = utf8Length(ref.reference)
   if (referenceBytes > MAX_BODY_REFERENCE_BYTES) {
-    throw new InvalidError(
-      `reference is ${String(referenceBytes)}B, exceeds cap ${String(MAX_BODY_REFERENCE_BYTES)}B`,
-      { field: "reference" }
-    )
+    rejectValidation({
+      kind: "tooLarge",
+      field: "reference",
+      size: referenceBytes,
+      cap: MAX_BODY_REFERENCE_BYTES
+    })
   }
   if (ref.sha256.length !== SHA256_BYTES) {
-    throw new InvalidError(
-      `digest must be ${String(SHA256_BYTES)} bytes, got ${String(ref.sha256.length)}`,
-      { field: "sha256" }
-    )
+    rejectValidation({
+      kind: "invalid",
+      field: "sha256",
+      reason: `digest must be ${String(SHA256_BYTES)} bytes, got ${String(ref.sha256.length)}`
+    })
   }
 }
 
@@ -589,16 +626,18 @@ export interface Signature {
 export function validateSignature(signature: Signature): void {
   if (signature.scheme !== SIGNATURE_SCHEME_ED25519) return
   if (signature.keyId.length !== ED25519_KEY_ID_BYTES) {
-    throw new InvalidError(
-      `Ed25519 key id must be ${String(ED25519_KEY_ID_BYTES)} bytes, got ${String(signature.keyId.length)}`,
-      { field: "key_id" }
-    )
+    rejectValidation({
+      kind: "invalid",
+      field: "key_id",
+      reason: `Ed25519 key id must be ${String(ED25519_KEY_ID_BYTES)} bytes, got ${String(signature.keyId.length)}`
+    })
   }
   if (signature.bytes.length !== ED25519_SIGNATURE_BYTES) {
-    throw new InvalidError(
-      `Ed25519 signature must be ${String(ED25519_SIGNATURE_BYTES)} bytes, got ${String(signature.bytes.length)}`,
-      { field: "bytes" }
-    )
+    rejectValidation({
+      kind: "invalid",
+      field: "bytes",
+      reason: `Ed25519 signature must be ${String(ED25519_SIGNATURE_BYTES)} bytes, got ${String(signature.bytes.length)}`
+    })
   }
 }
 
@@ -903,17 +942,13 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
   const kind = envelope.kind
 
   const require = (present: boolean, fieldName: string): void => {
-    if (!present)
-      throw new InvalidError(`${kind} requires \`${fieldName}\``, { kind, field: fieldName })
+    if (!present) rejectValidation({ kind: "missing", agentKind: kind, field: fieldName })
   }
   const forbid = (absent: boolean, fieldName: string): void => {
-    if (!absent) {
-      throw new InvalidError(`\`${fieldName}\` is invalid on ${kind}`, { kind, field: fieldName })
-    }
+    if (!absent) rejectValidation({ kind: "forbidden", agentKind: kind, field: fieldName })
   }
-  const invalid = (fieldName: string, reason: string): never => {
-    throw new InvalidError(`\`${fieldName}\`: ${reason}`, { field: fieldName })
-  }
+  const invalid = (fieldName: string, reason: string): never =>
+    rejectValidation({ kind: "invalid", field: fieldName, reason })
 
   if (kind !== AgentKind.Chunk) {
     require(envelope.record !== undefined, "record")
@@ -948,7 +983,7 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
   }
 
   if (envelope.last && kind !== AgentKind.Chunk && kind !== AgentKind.Status) {
-    throw new InvalidError(`\`last\` is invalid on ${kind}`, { kind, field: "last" })
+    rejectValidation({ kind: "forbidden", agentKind: kind, field: "last" })
   }
 
   if (kind === AgentKind.Chunk) {
@@ -1024,7 +1059,7 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
 
   if (kind === AgentKind.Chunk) {
     if (envelope.body.length === 0 && !envelope.last) {
-      throw new InvalidError(`${kind} requires \`body\``, { kind, field: "body" })
+      rejectValidation({ kind: "missing", agentKind: kind, field: "body" })
     }
   } else if (kind !== AgentKind.Status) {
     require(envelope.body.length > 0, "body")
@@ -1036,34 +1071,42 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
 
   if (envelope.metadata !== undefined) {
     if (envelope.metadata.size > MAX_METADATA_ENTRIES) {
-      throw new InvalidError(
-        `\`metadata\` is ${String(envelope.metadata.size)} entries, exceeds cap ${String(MAX_METADATA_ENTRIES)}`,
-        { field: "metadata" }
-      )
+      rejectValidation({
+        kind: "tooLarge",
+        field: "metadata",
+        size: envelope.metadata.size,
+        cap: MAX_METADATA_ENTRIES
+      })
     }
     let total = 0
     for (const [key, value] of envelope.metadata) {
       const keySize = utf8Length(key)
       if (keySize > MAX_METADATA_KEY_BYTES) {
-        throw new InvalidError(
-          `\`metadata key\` is ${String(keySize)}B, exceeds cap ${String(MAX_METADATA_KEY_BYTES)}B`,
-          { field: "metadata key" }
-        )
+        rejectValidation({
+          kind: "tooLarge",
+          field: "metadata key",
+          size: keySize,
+          cap: MAX_METADATA_KEY_BYTES
+        })
       }
       const size = valueSize(value)
       if (size > MAX_METADATA_VALUE_BYTES) {
-        throw new InvalidError(
-          `\`metadata value\` is ${String(size)}B, exceeds cap ${String(MAX_METADATA_VALUE_BYTES)}B`,
-          { field: "metadata value" }
-        )
+        rejectValidation({
+          kind: "tooLarge",
+          field: "metadata value",
+          size,
+          cap: MAX_METADATA_VALUE_BYTES
+        })
       }
       total += keySize + size
     }
     if (total > MAX_METADATA_TOTAL_BYTES) {
-      throw new InvalidError(
-        `\`metadata\` is ${String(total)}B, exceeds cap ${String(MAX_METADATA_TOTAL_BYTES)}B`,
-        { field: "metadata" }
-      )
+      rejectValidation({
+        kind: "tooLarge",
+        field: "metadata",
+        size: total,
+        cap: MAX_METADATA_TOTAL_BYTES
+      })
     }
   }
 
@@ -1073,7 +1116,7 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
 }
 
 function valueSize(value: Value): number {
-  if (value.kind === "string") return utf8Length(value.value)
+  if (value.kind === "str") return utf8Length(value.value)
   if (value.kind === "list") return value.value.reduce((sum, item) => sum + 1 + valueSize(item), 0)
   return 9
 }

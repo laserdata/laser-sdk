@@ -8,7 +8,12 @@ export const AgentTopic = {
   Audit: "agent.audit",
   Registry: "agent.registry",
   WorkflowJournal: "agent.workflow_journal",
-  Dlq: "agent.dlq"
+  Dlq: "agent.dlq",
+  /** Any other topic, by name. */
+  Custom: (name: string): string => name
 } as const
 
-export type AgentTopic = (typeof AgentTopic)[keyof typeof AgentTopic]
+export type AgentTopic = Exclude<
+  (typeof AgentTopic)[keyof typeof AgentTopic],
+  typeof AgentTopic.Custom
+>

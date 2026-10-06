@@ -1,82 +1,23 @@
+use pyo3::Python;
 use pyo3_stub_gen::Result;
 use std::fs;
 use std::path::Path;
 
-// The exception hierarchy is declared with `create_exception!`, and the
-// `CONTEXT_READ_WINDOW` constant with `module.add`, which the stub gatherer
-// does not see, so append them to the generated stub. Keeping it here (not
-// hand-edited into the .pyi) means the file regenerates reproducibly.
-// `TimeoutError` and `CancelledError` carry a second base each (the runtime
-// synthesizes them with `type(...)`): `builtins.TimeoutError` and
-// `asyncio.CancelledError`, so `except TimeoutError` / `except
-// asyncio.CancelledError` catch them while `except LaserError` still does too.
-// `InvalidError` also grafts `builtins.ValueError` on as a second base at
-// registration, so `except ValueError` catches it too.
-const EXCEPTIONS: &str = "
-import asyncio
-
-CONTEXT_READ_WINDOW: builtins.int
-
-class LaserError(Exception):
-    code: builtins.str
-    retryable: builtins.bool
-    unavailable: builtins.bool
-    unsupported: builtins.bool
-    not_found: builtins.bool
-    version_skew: builtins.bool
-    version_conflict: builtins.bool
-    ambiguous_mutation: builtins.bool
-    stale: builtins.bool
-    permission_denied: builtins.bool
-    stream_or_topic_not_found: builtins.bool
-    no_capable_agent: builtins.bool
-    lease_lost: builtins.bool
-    fence_violation: builtins.bool
-    budget_exceeded: builtins.bool
-    quarantined: builtins.bool
-    not_leader: builtins.bool
-    committed: builtins.list[SendMessagesConfirmation]
-    unconfirmed_count: builtins.int | None
-
-class ConfigError(LaserError): ...
-class NoStreamError(ConfigError): ...
-class NoRespondTopicError(ConfigError): ...
-class TimeoutError(LaserError, builtins.TimeoutError): ...
-class QueryError(LaserError): ...
-class KvError(LaserError): ...
-class ForkError(LaserError): ...
-class GraphError(LaserError): ...
-class AuthzError(LaserError): ...
-class FilterError(LaserError):
-    reason: builtins.str
-    fault_reason: builtins.str | None
-    partition_id: builtins.int | None
-    offset: builtins.int | None
-    group_id: builtins.int | None
-    group_name: builtins.str | None
-    identity: builtins.dict[builtins.str, builtins.int] | None
-class SignatureError(LaserError): ...
-class UnsupportedError(LaserError): ...
-class InvalidError(LaserError, builtins.ValueError): ...
-class CodecError(LaserError): ...
-class TypedDecodeError(CodecError): ...
-class ProtocolError(LaserError): ...
-class TransportError(LaserError): ...
-class BudgetExceededError(LaserError): ...
-class PolicyBlockedError(LaserError): ...
-class StepUpRequiredError(LaserError): ...
-class PolicyDeferredError(LaserError): ...
-class CancelledError(LaserError, asyncio.CancelledError): ...
-";
-
+// `create_exception!` classes are invisible to the stub gatherer, so their
+// block is rendered from the registered classes themselves and appended.
 fn main() -> Result<()> {
     let stub = laser_sdk_py::stub_info()?;
     stub.generate()?;
+    Python::initialize();
+    let exceptions = Python::attach(laser_sdk_py::exception_stub)?;
     let path = Path::new("laser_sdk.pyi");
     let mut content = fs::read_to_string(path)?;
-    if !content.contains("class LaserError(Exception):") {
-        content.push_str(EXCEPTIONS);
-        fs::write(path, content)?;
+    content.push_str(&exceptions);
+    let mut normalized = String::with_capacity(content.len());
+    for line in content.lines() {
+        normalized.push_str(line.trim_end());
+        normalized.push('\n');
     }
+    fs::write(path, normalized)?;
     Ok(())
 }

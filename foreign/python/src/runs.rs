@@ -6,7 +6,7 @@ use laser_sdk::laser::Laser;
 use laser_sdk::wire::agent_workflow::{AgentRunInfo, AgentRunState, RunBudget, RunPage};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -52,7 +52,7 @@ impl PyRuns {
                 .submit(agent_id, input)
                 .await
                 .map_err(to_pyerr)?;
-            Ok(PyRunInfo::from(info))
+            Ok(PyAgentRunInfo::from(info))
         })
     }
 
@@ -76,7 +76,7 @@ impl PyRuns {
                 .submit_with(agent_id, run_id, input, params.unwrap_or_default())
                 .await
                 .map_err(to_pyerr)?;
-            Ok(PyRunInfo::from(info))
+            Ok(PyAgentRunInfo::from(info))
         })
     }
 
@@ -100,7 +100,7 @@ impl PyRuns {
                 .submit_budgeted(agent_id, input, budget)
                 .await
                 .map_err(to_pyerr)?;
-            Ok(PyRunInfo::from(info))
+            Ok(PyAgentRunInfo::from(info))
         })
     }
 
@@ -111,7 +111,7 @@ impl PyRuns {
         let laser = self.laser.clone();
         future_into_py(py, async move {
             let info = laser.runs().cancel(run_id).await.map_err(to_pyerr)?;
-            Ok(PyRunInfo::from(info))
+            Ok(PyAgentRunInfo::from(info))
         })
     }
 
@@ -120,7 +120,7 @@ impl PyRuns {
         let laser = self.laser.clone();
         future_into_py(py, async move {
             let info = laser.runs().status(run_id).await.map_err(to_pyerr)?;
-            Ok(PyRunInfo::from(info))
+            Ok(PyAgentRunInfo::from(info))
         })
     }
 
@@ -161,14 +161,15 @@ impl PyRuns {
     }
 
     /// List runs, newest first, one page per call. Optional filters narrow the
-    /// page: `agent_id`, `state` (a pinned snake-case word, an unknown word
-    /// raises `ValueError`), `limit` (clamped server-side to the wire page
-    /// cap), and `cursor` (the opaque continuation from the previous page).
-    #[pyo3(signature = (*, agent_id=None, state=None, limit=None, cursor=None))]
+    /// page: `agent` (the agent id), `state` (a pinned snake-case word, an
+    /// unknown word raises `ValueError`), `limit` (clamped server-side to the
+    /// wire page cap), and `cursor` (the opaque continuation from the previous
+    /// page).
+    #[pyo3(signature = (*, agent=None, state=None, limit=None, cursor=None))]
     fn list<'py>(
         &self,
         py: Python<'py>,
-        agent_id: Option<String>,
+        agent: Option<String>,
         state: Option<String>,
         limit: Option<u32>,
         cursor: Option<&Bound<'_, PyAny>>,
@@ -179,8 +180,8 @@ impl PyRuns {
         future_into_py(py, async move {
             let runs = laser.runs();
             let mut request = runs.list();
-            if let Some(agent_id) = agent_id {
-                request = request.agent(agent_id);
+            if let Some(agent) = agent {
+                request = request.agent(agent);
             }
             if let Some(state) = state {
                 request = request.state(state);
@@ -202,9 +203,9 @@ impl PyRuns {
 /// intent (`cancel_requested` is the intent, not a state: the state moves only
 /// when the engine reports it).
 #[gen_stub_pyclass]
-#[pyclass(name = "RunInfo", frozen, skip_from_py_object)]
+#[pyclass(name = "AgentRunInfo", frozen, skip_from_py_object)]
 #[derive(Clone)]
-pub struct PyRunInfo {
+pub struct PyAgentRunInfo {
     #[pyo3(get)]
     pub run_id: String,
     #[pyo3(get)]
@@ -223,7 +224,7 @@ pub struct PyRunInfo {
     pub cancel_requested: bool,
 }
 
-impl From<AgentRunInfo> for PyRunInfo {
+impl From<AgentRunInfo> for PyAgentRunInfo {
     fn from(info: AgentRunInfo) -> Self {
         Self {
             run_id: info.run_id,
@@ -243,7 +244,7 @@ impl From<AgentRunInfo> for PyRunInfo {
 #[pyclass(name = "RunPage", frozen)]
 pub struct PyRunPage {
     #[pyo3(get)]
-    pub runs: Vec<PyRunInfo>,
+    pub runs: Vec<PyAgentRunInfo>,
     #[pyo3(get)]
     pub cursor: Option<Vec<u8>>,
 }
@@ -251,7 +252,7 @@ pub struct PyRunPage {
 impl From<RunPage> for PyRunPage {
     fn from(page: RunPage) -> Self {
         Self {
-            runs: page.runs.into_iter().map(PyRunInfo::from).collect(),
+            runs: page.runs.into_iter().map(PyAgentRunInfo::from).collect(),
             cursor: page.cursor,
         }
     }
@@ -327,6 +328,14 @@ impl From<PyRunBudget> for RunBudget {
             max_cost_usd: budget.max_cost_usd,
         }
     }
+}
+
+/// Whether a run in `state` (a pinned snake-case word) can never leave it. An
+/// unknown word raises `ValueError`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn agent_run_state_is_terminal(state: &str) -> PyResult<bool> {
+    Ok(parse_state(state)?.is_terminal())
 }
 
 fn parse_state(word: &str) -> PyResult<AgentRunState> {

@@ -1,9 +1,10 @@
-import { InvalidError, ProtocolError } from "../client/errors.js"
+import { ConfigError, InvalidError, ProtocolError } from "../client/errors.js"
 import { saturatingAdd } from "../runtime/clock.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import type { Codec } from "../stream/codecs.js"
 import { CONVERSATION_FIELD, VECTOR_FIELD } from "../wire/headers.js"
 import { QueryExecutionId } from "../wire/ids.js"
+import { DEFAULT_STREAM_PAGE_SIZE } from "../wire/limits.js"
 import {
   type AggCall,
   type AggFunc,
@@ -21,10 +22,11 @@ import {
   filterAll,
   filterPred,
   newQuery,
-  operationalTarget,
-  queryResultValue
+  operationalTarget
 } from "../wire/query.js"
 import type { TypedValue } from "../wire/schema.js"
+
+const ORIGINAL_PAYLOAD_FIELD = "__laser_original_payload"
 
 export type QueryExecutor = (query: Query) => Promise<QueryResult>
 export type QueryStatusExecutor = (executionId: QueryExecutionId) => Promise<QueryExecutionStatus>
@@ -44,7 +46,7 @@ export class QueryRequest {
   private readonly readStatus: QueryStatusExecutor | undefined
   private readonly cancelExecution: QueryStatusExecutor | undefined
 
-  constructor(
+  private constructor(
     indexOrTarget: string | QueryTarget,
     execute: QueryExecutor,
     readStatus?: QueryStatusExecutor,
@@ -58,9 +60,19 @@ export class QueryRequest {
     )
   }
 
-  executionId(value: QueryExecutionId): this {
-    this.queryValue = { ...this.queryValue, executionId: value }
-    return this
+  /** @internal */
+  static create(
+    indexOrTarget: string | QueryTarget,
+    execute: QueryExecutor,
+    readStatus?: QueryStatusExecutor,
+    cancelExecution?: QueryStatusExecutor
+  ): QueryRequest {
+    return new QueryRequest(indexOrTarget, execute, readStatus, cancelExecution)
+  }
+
+  /** The identity shared by execution, cursor pages, status, and cancellation. */
+  executionId(): QueryExecutionId {
+    return this.queryValue.executionId
   }
 
   /** The absolute deadline, in epoch microseconds. Defaults to 30 seconds
@@ -107,10 +119,6 @@ export class QueryRequest {
       ]
     }
     return this
-  }
-
-  byKey(field: string, value: string | TypedValue): this {
-    return this.whereEq(field, value)
   }
 
   conversation(conversationId: string): this {
@@ -249,7 +257,7 @@ export class QueryRequest {
     return this
   }
 
-  aggregateAs(
+  aggAs(
     func: AggFunc,
     alias: string,
     options: { readonly field?: string; readonly fraction?: number } = {}
@@ -263,28 +271,28 @@ export class QueryRequest {
   }
 
   count(alias = "count"): this {
-    return this.aggregateAs("count", alias)
+    return this.aggAs("count", alias)
   }
   sum(field: string, alias = "sum"): this {
-    return this.aggregateAs("sum", alias, { field })
+    return this.aggAs("sum", alias, { field })
   }
   avg(field: string, alias = "avg"): this {
-    return this.aggregateAs("avg", alias, { field })
+    return this.aggAs("avg", alias, { field })
   }
   min(field: string, alias = "min"): this {
-    return this.aggregateAs("min", alias, { field })
+    return this.aggAs("min", alias, { field })
   }
   max(field: string, alias = "max"): this {
-    return this.aggregateAs("max", alias, { field })
+    return this.aggAs("max", alias, { field })
   }
   countDistinct(field: string, alias = "count_distinct"): this {
-    return this.aggregateAs("count_distinct", alias, { field })
+    return this.aggAs("count_distinct", alias, { field })
   }
-  stdDev(field: string, alias = "stddev"): this {
-    return this.aggregateAs("std_dev", alias, { field })
+  stddev(field: string, alias = "stddev"): this {
+    return this.aggAs("std_dev", alias, { field })
   }
   percentile(field: string, fraction: number, alias = "percentile"): this {
-    return this.aggregateAs("percentile", alias, { field, fraction })
+    return this.aggAs("percentile", alias, { field, fraction })
   }
 
   groupBy(fields: readonly string[]): this {
@@ -406,11 +414,22 @@ export class QueryRequest {
 
   private async *pages(): AsyncGenerator<QueryResult> {
     let query = this.queryValue
+    if (query.page.limit === 0)
+      query = { ...query, page: { ...query.page, limit: DEFAULT_STREAM_PAGE_SIZE } }
     const singlePage = query.aggregate !== undefined || query.vector !== undefined
     let result = requireResultExecution(await this.execute(query), query.executionId)
     for (;;) {
       yield result
-      if (singlePage || !result.page.hasMore || result.page.nextCursor === undefined) return
+      // An empty page, or more rows without a new cursor, ends the walk even
+      // when the server reports more. Following it would repeat pages forever.
+      if (
+        singlePage ||
+        result.rows.length === 0 ||
+        !result.page.hasMore ||
+        result.page.nextCursor === undefined ||
+        result.page.nextCursor === query.page.cursor
+      )
+        return
       query = { ...query, page: cursorPage(query.page, result.page.nextCursor) }
       result = requireResultExecution(await this.execute(query), query.executionId)
     }
@@ -439,8 +458,14 @@ function cursorPage(page: Query["page"], cursor: string): Query["page"] {
 }
 
 function decodePayload<T>(result: QueryResult, row: Row, codec: Codec<T>): T {
-  const payload = queryResultValue(result, row, "__laser_original_payload")
-  if (payload?.kind !== "binary") throw new InvalidError("query row has no original payload bytes")
+  const index = result.fields.findIndex((field) => field.name === ORIGINAL_PAYLOAD_FIELD)
+  if (index < 0) throw new ConfigError("query result does not contain the original payload field")
+  const payload = row.values[index]
+  if (payload === undefined)
+    throw new ProtocolError("query row is shorter than its declared result schema")
+  if (payload.kind === "null") throw new ConfigError("query row has no original payload")
+  if (payload.kind !== "binary")
+    throw new ProtocolError("query original payload field is not binary")
   return codec.decode(payload.value)
 }
 

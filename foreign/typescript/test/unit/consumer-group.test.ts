@@ -4,13 +4,16 @@ import { OPEN_CAPABILITIES, type Capabilities } from "../../src/client/capabilit
 import {
   ConsumerGroupSetupError,
   FilterExecutionError,
+  InvalidError,
   ProtocolError,
-  TransportError
+  TransportError,
+  UnsupportedError
 } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
 import { Filters } from "../../src/managed/filters.js"
 import { ConsumerGroup, GroupFilter, type GroupContext } from "../../src/stream/consumer-group.js"
+import { Topic } from "../../src/stream/topic.js"
 import { decodeOne, encodeNamed, expectMap, field } from "../../src/wire/cbor.js"
 import {
   AGDX_FILTER_MUTATE_CODE,
@@ -114,10 +117,9 @@ function setup(replies: {
     }
   } as unknown as LaserTransport
   return {
-    group: new ConsumerGroup(
+    group: ConsumerGroup.create(
       transport,
-      "orbit",
-      "fleet_changes",
+      Topic.create(transport, "orbit", "fleet_changes"),
       { kind: "name", name: "workers" },
       {
         transport,
@@ -182,11 +184,72 @@ void test("given_a_recreated_group_when_its_old_binding_is_returned_then_should_
 })
 
 void test("given_a_group_without_capability_context_when_consuming_then_should_not_poll_natively", async () => {
-  const group = new ConsumerGroup({} as LaserTransport, "orbit", "fleet_changes", {
-    kind: "name",
-    name: "workers"
-  })
-  await assert.rejects(group.consumer(), TransportError)
+  const group = ConsumerGroup.create(
+    {} as LaserTransport,
+    Topic.create({} as LaserTransport, "orbit", "fleet_changes"),
+    {
+      kind: "name",
+      name: "workers"
+    }
+  )
+  await assert.rejects(group.consumer(), UnsupportedError)
+})
+
+void test("given_an_unanswered_probe_when_building_a_group_consumer_then_should_probe_again", async () => {
+  let refreshed = 0
+  let joined = 0
+  const transport = {
+    joinConsumerGroup: () => {
+      joined += 1
+      return Promise.resolve()
+    }
+  } as unknown as LaserTransport
+  const group = ConsumerGroup.create(
+    transport,
+    Topic.create(transport, "orbit", "fleet_changes"),
+    { kind: "name", name: "workers" },
+    {
+      transport,
+      capabilities: () => Promise.resolve(OPEN_CAPABILITIES),
+      refreshCapabilities: () => {
+        refreshed += 1
+        return Promise.resolve({ ...OPEN_CAPABILITIES, hello: "rejected" as const })
+      }
+    }
+  )
+  const consumer = await group.consumer()
+  assert.equal(refreshed, 1)
+  assert.equal(joined, 1)
+  await consumer.shutdown().catch(() => undefined)
+})
+
+void test("given_a_policy_aware_group_when_built_without_joining_then_should_refuse", async () => {
+  const { group } = setup({})
+  await assert.rejects(group.consumer({ autoJoinGroup: false }), InvalidError)
+})
+
+void test("given_a_permanent_join_failure_when_init_retries_are_set_then_should_not_retry", async () => {
+  let joins = 0
+  const transport = {
+    joinConsumerGroup: () => {
+      joins += 1
+      return Promise.reject(new TransportError("forbidden", false))
+    }
+  } as unknown as LaserTransport
+  const group = ConsumerGroup.create(
+    transport,
+    Topic.create(transport, "orbit", "fleet_changes"),
+    { kind: "name", name: "workers" },
+    {
+      transport,
+      capabilities: () => Promise.resolve({ ...OPEN_CAPABILITIES, hello: "rejected" as const })
+    }
+  )
+  await assert.rejects(
+    group.consumer({ initRetries: { retries: 3, intervalMs: 1 } }),
+    TransportError
+  )
+  assert.equal(joins, 1)
 })
 
 function deletionSetup(collisionCount: number, present = true) {
@@ -376,7 +439,7 @@ void test("given_a_repeated_catalog_cursor_when_deleted_then_should_fail_without
   await assert.rejects(
     fixture.filter.delete(),
     (error: unknown) =>
-      error instanceof FilterExecutionError && error.reason === "catalog_unavailable"
+      error instanceof FilterExecutionError && error.detail.reason === "catalog_unavailable"
   )
   assert.deepEqual(fixture.cursors, [undefined, 2])
   assert.deepEqual(fixture.dropped, [])
@@ -395,7 +458,14 @@ void test("given_a_single_node_deployment_when_a_laser_group_routes_reads_then_s
         })
     }
   } as unknown as IggyClient
-  await using laser = await Laser.fromIggyClient(client)
+  await using laser = await Laser.fromClient(client)
   const context = (laser as unknown as { groupContext(): GroupContext }).groupContext()
   assert.equal(await context.transport.clusterNodeCount?.(), 1)
+})
+
+void test("given_a_topic_when_addressing_its_group_then_should_hand_back_the_same_topic", () => {
+  const topic = Topic.create({} as LaserTransport, "orbit", "fleet_changes")
+  const group = topic.consumerGroup("workers")
+  assert.equal(group.topic, topic)
+  assert.equal(topic.consumerGroupId(7n).topic, topic)
 })

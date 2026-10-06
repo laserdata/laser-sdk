@@ -13,7 +13,7 @@ void test("given_a_record_when_lowered_then_should_stamp_compact_typed_headers",
       .schemaId(7)
       .inlinePayload()
       .index("host_id", "123")
-      .header("trace", "abc")
+      .metadata("trace", "abc")
   )
   assert.deepEqual(headers.get("agdx.ct"), { kind: "uint8", value: 1 })
   assert.deepEqual(headers.get("agdx.sid"), { kind: "uint32", value: 7 })
@@ -24,12 +24,12 @@ void test("given_a_record_when_lowered_then_should_stamp_compact_typed_headers",
 })
 
 void test("given_reserved_or_oversized_record_headers_when_lowered_then_should_reject", () => {
-  assert.throws(() => recordHeaders(new Record().header("agdx.ct", "json")), InvalidError)
+  assert.throws(() => recordHeaders(new Record().metadata("agdx.ct", "json")), InvalidError)
   assert.throws(() => recordHeaders(new Record().index("agdx.idx.bad", "value")), InvalidError)
   const tooMany = new Record()
   for (let index = 0; index <= MAX_INDEX_ENTRIES_PER_RECORD; index += 1) {
     tooMany.index(`field_${String(index)}`, "value")
   }
   assert.throws(() => recordHeaders(tooMany), InvalidError)
-  assert.throws(() => recordHeaders(new Record().header("large", "x".repeat(256))), InvalidError)
+  assert.throws(() => recordHeaders(new Record().metadata("large", "x".repeat(256))), InvalidError)
 })

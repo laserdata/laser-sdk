@@ -6,12 +6,11 @@ import {
   CorrelationId,
   RecordId,
   UnsupportedError,
-  WireConversationId,
   eventEnvelope,
-  parseWireAgentId,
   requiring,
   unmetRequirements
 } from "@laserdata/laser-sdk"
+import { wire } from "@laserdata/laser-sdk/full"
 import { eventual } from "../support/eventual.js"
 import type { LaserWorld } from "../world.js"
 
@@ -65,8 +64,7 @@ When("I start another conversation", function (this: LaserWorld) {
 
 When("I assemble the conversation", async function (this: LaserWorld) {
   this.assembled = await eventual(async () => {
-    const messages = await this
-      .requireLaser()
+    const messages = await this.requireLaser()
       .context(this.requireConversation())
       .fetch([AgentTopic.Commands, AgentTopic.Responses], 100)
     return messages.length > 0 ? messages : undefined
@@ -76,8 +74,7 @@ When("I assemble the conversation", async function (this: LaserWorld) {
 When(
   /^I publish an AGDX command "([^"]+)" via the typed producer$/,
   async function (this: LaserWorld, body: string) {
-    await this
-      .requireLaser()
+    await this.requireLaser()
       .agdx(AgentTopic.Commands, AgentId.new("producer"), this.requireConversation())
       .command(CorrelationId.fromU128(1n), encoder.encode(body))
       .send()
@@ -87,16 +84,18 @@ When(
 Then(
   /^the assembled payloads are "([^"]+)", "([^"]+)", "([^"]+)" in order$/,
   function (this: LaserWorld, first: string, second: string, third: string) {
-    assert.deepEqual(this.assembled.map((message) => decoder.decode(message.payload)), [
-      first,
-      second,
-      third
-    ])
+    assert.deepEqual(
+      this.assembled.map((message) => decoder.decode(message.payload)),
+      [first, second, third]
+    )
   }
 )
 
 Then(/^the assembled message payload is "([^"]+)"$/, function (this: LaserWorld, body: string) {
-  assert.deepEqual(this.assembled.map((message) => decoder.decode(message.payload)), [body])
+  assert.deepEqual(
+    this.assembled.map((message) => decoder.decode(message.payload)),
+    [body]
+  )
 })
 
 Then(/^the AGDX command body is "([^"]+)"$/, function (this: LaserWorld, body: string) {
@@ -104,7 +103,7 @@ Then(/^the AGDX command body is "([^"]+)"$/, function (this: LaserWorld, body: s
 })
 
 Then(/^the assembled message agent is "([^"]+)"$/, function (this: LaserWorld, agent: string) {
-  assert.equal(this.assembled[0]?.provenance.agent?.asString(), agent)
+  assert.equal(this.assembled[0]?.provenance.agent?.asStr(), agent)
 })
 
 Then(
@@ -125,21 +124,24 @@ Then("the assembled message belongs to the conversation", function (this: LaserW
   assert.ok(this.assembled[0]?.provenance.conversationId.equals(this.requireConversation()))
 })
 
-When("I build an agent event requiring feature bits the receiver lacks", function (this: LaserWorld) {
-  const envelope = eventEnvelope(
-    RecordId.fromU128(1n),
-    WireConversationId.fromU128(2n),
-    parseWireAgentId("sender"),
-    encoder.encode("event")
-  )
-  this.understood = unmetRequirements(requiring(envelope, 1n << 8n), 0n) === 0n
-})
+When(
+  "I build an agent event requiring feature bits the receiver lacks",
+  function (this: LaserWorld) {
+    const envelope = eventEnvelope(
+      RecordId.fromU128(1n),
+      wire.ConversationId.fromU128(2n),
+      AgentId.new("sender").wireId(),
+      encoder.encode("event")
+    )
+    this.understood = unmetRequirements(requiring(envelope, 1n << 8n), 0n) === 0n
+  }
+)
 
 When("I build a plain agent event", function (this: LaserWorld) {
   const envelope = eventEnvelope(
     RecordId.fromU128(1n),
-    WireConversationId.fromU128(2n),
-    parseWireAgentId("sender"),
+    wire.ConversationId.fromU128(2n),
+    AgentId.new("sender").wireId(),
     encoder.encode("event")
   )
   this.understood = unmetRequirements(envelope, 0n) === 0n
@@ -165,7 +167,10 @@ async function sendCommand(
   world: LaserWorld,
   body: string,
   agent = "agent",
-  extra: { readonly idempotencyKey?: string; readonly correlationId?: string } = {}
+  extra: {
+    readonly idempotencyKey?: string
+    readonly correlationId?: string
+  } = {}
 ): Promise<void> {
   await world.requireLaser().sendAgent(AgentTopic.Commands, encoder.encode(body), {
     conversationId: world.requireConversation(),

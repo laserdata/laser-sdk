@@ -1265,4 +1265,4 @@ The Rust SDK API and wire contract are separate. Both can change before 1.0 with
 - Add related operations to their existing feature handles rather than expanding the root client with unrelated methods.
 - Accessors select scopes through `stream(name)`, `topic(name)`, `query(index)`, `kv(namespace)`, `fork(id)`, `graph(name)`, `memory(name)`, `context(conversation)`, `agent(id)`, and `runs()`. Methods act on those objects. Accessors perform no I/O. Required arguments are positional, and optional configuration uses fluent methods. Boolean opt-ins use `.thing()` rather than `.thing(true)`.
 
-The [client behavior guide](client-behavior.md) records the 0.5.4 lifecycle refinements. Rust, Python, and TypeScript share prepared coordination, cause positions, claim checks, and validation. These client changes retain operation versions at 1.
+The [client behavior guide](client-behavior.md) lists the 0.6.0 client changes, including the breaking ones. Rust, Python, and TypeScript share prepared coordination, cause positions, claim checks, and validation. None of these changes touch the wire contract, and operation versions stay at 1.

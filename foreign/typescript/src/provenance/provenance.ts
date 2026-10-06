@@ -1,5 +1,5 @@
-import { CodecError, InvalidError } from "../client/errors.js"
-import type { IggyHeaderValue } from "../iggy/apache-iggy.js"
+import { IdError, ProvenanceError } from "../client/errors.js"
+import type { HeaderValue } from "../stream/header-value.js"
 import {
   AgentId,
   ConversationId,
@@ -50,35 +50,31 @@ export function provenancePartitionKey(provenance: Provenance): string {
   return provenance.conversationId.toString()
 }
 
-function putHeader(map: Map<string, IggyHeaderValue>, key: string, value: string): void {
+function putHeader(map: Map<string, HeaderValue>, key: string, value: string): void {
   if (value.length === 0) {
-    throw new InvalidError(`header \`${key}\` value must not be empty`)
+    throw ProvenanceError.emptyValue(key)
   }
   const bytes = new TextEncoder().encode(value)
   if (bytes.length > HEADER_VALUE_MAX) {
-    throw new InvalidError(
-      `header \`${key}\` value is ${String(bytes.length)}B, exceeds max ${String(HEADER_VALUE_MAX)}B`
-    )
+    throw ProvenanceError.valueTooLong(key, bytes.length, HEADER_VALUE_MAX)
   }
   for (const byte of bytes) {
     if (byte < 0x20 || byte === 0x7f) {
-      throw new InvalidError(`header \`${key}\` value must not contain control characters or NUL`)
+      throw ProvenanceError.invalidValueBytes(key)
     }
   }
   map.set(key, { kind: "string", value })
 }
 
-function putFinite(map: Map<string, IggyHeaderValue>, key: string, value: number): void {
+function putFinite(map: Map<string, HeaderValue>, key: string, value: number): void {
   if (!Number.isFinite(value)) {
-    throw new InvalidError(`non-finite floating-point value for header \`${key}\``)
+    throw ProvenanceError.nonFinite(key)
   }
   putHeader(map, key, String(value))
 }
 
-export function encodeProvenanceHeaders(
-  provenance: Provenance
-): ReadonlyMap<string, IggyHeaderValue> {
-  const map = new Map<string, IggyHeaderValue>()
+export function encodeProvenanceHeaders(provenance: Provenance): ReadonlyMap<string, HeaderValue> {
+  const map = new Map<string, HeaderValue>()
   putHeader(map, CONVERSATION_ID, provenance.conversationId.toString())
   if (provenance.parentConversationId !== undefined) {
     putHeader(map, PARENT_CONVERSATION_ID, provenance.parentConversationId.toString())
@@ -90,10 +86,10 @@ export function encodeProvenanceHeaders(
     putHeader(map, CAUSAL_PARENT, messageIdToString(provenance.causalParent))
   }
   if (provenance.agent !== undefined) {
-    putHeader(map, AGENT_ID, provenance.agent.asString())
+    putHeader(map, AGENT_ID, provenance.agent.asStr())
   }
   if (provenance.targetAgentId !== undefined) {
-    putHeader(map, TARGET_AGENT_ID, provenance.targetAgentId.asString())
+    putHeader(map, TARGET_AGENT_ID, provenance.targetAgentId.asStr())
   }
   if (provenance.idempotencyKey !== undefined) {
     putHeader(map, IDEMPOTENCY_KEY, provenance.idempotencyKey)
@@ -125,16 +121,25 @@ export function encodeProvenanceHeaders(
     size += new TextEncoder().encode(key).length + valueBytes + HEADER_FRAMING_BYTES
   }
   if (size > HEADER_SOFT_CAP) {
-    throw new InvalidError(
-      `provenance headers ${String(size)}B exceed soft cap ${String(HEADER_SOFT_CAP)}B`
-    )
+    throw ProvenanceError.tooLarge(size, HEADER_SOFT_CAP)
   }
   return map
 }
 
-function strValue(value: IggyHeaderValue, key: string): string {
+// An id header that does not parse fails provenance decode with the id
+// error as its cause, like the Rust `ProvenanceError::Id` conversion.
+function parseId<T>(parse: () => T): T {
+  try {
+    return parse()
+  } catch (cause) {
+    if (cause instanceof IdError) throw ProvenanceError.id(cause)
+    throw cause
+  }
+}
+
+function strValue(value: HeaderValue, key: string): string {
   if (value.kind !== "string") {
-    throw new CodecError(`invalid value for header \`${key}\``, "provenance", "decode")
+    throw ProvenanceError.invalidValue(key)
   }
   return value.value
 }
@@ -144,7 +149,7 @@ function parseUnsignedBigInt(text: string, key: string): bigint {
   // megabyte of digits on a peer-supplied header would burn CPU per message.
   // Encode enforces the same cap, so anything longer was never produced here.
   if (text.length > HEADER_VALUE_MAX || !/^[0-9]+$/.test(text)) {
-    throw new CodecError(`invalid value for header \`${key}\``, "provenance", "decode")
+    throw ProvenanceError.invalidValue(key)
   }
   return BigInt(text)
 }
@@ -152,12 +157,12 @@ function parseUnsignedBigInt(text: string, key: string): bigint {
 function parseFloatValue(text: string, key: string): number {
   const parsed = Number(text)
   if (Number.isNaN(parsed) && text.trim().toLowerCase() !== "nan") {
-    throw new CodecError(`invalid value for header \`${key}\``, "provenance", "decode")
+    throw ProvenanceError.invalidValue(key)
   }
   return parsed
 }
 
-export function decodeProvenanceHeaders(headers: ReadonlyMap<string, IggyHeaderValue>): Provenance {
+export function decodeProvenanceHeaders(headers: ReadonlyMap<string, HeaderValue>): Provenance {
   let conversationId: ConversationId | undefined
   let causalParent: MessageId | undefined
   let parentConversationId: ConversationId | undefined
@@ -176,22 +181,22 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, IggyHeaderV
   for (const [key, value] of headers) {
     switch (key) {
       case CONVERSATION_ID:
-        conversationId = ConversationId.parse(strValue(value, key))
+        conversationId = parseId(() => ConversationId.parse(strValue(value, key)))
         break
       case CAUSAL_PARENT:
-        causalParent = parseMessageId(strValue(value, key))
+        causalParent = parseId(() => parseMessageId(strValue(value, key)))
         break
       case PARENT_CONVERSATION_ID:
-        parentConversationId = ConversationId.parse(strValue(value, key))
+        parentConversationId = parseId(() => ConversationId.parse(strValue(value, key)))
         break
       case ROOT_CONVERSATION_ID:
-        rootConversationId = ConversationId.parse(strValue(value, key))
+        rootConversationId = parseId(() => ConversationId.parse(strValue(value, key)))
         break
       case AGENT_ID:
-        agent = AgentId.new(strValue(value, key))
+        agent = parseId(() => AgentId.new(strValue(value, key)))
         break
       case TARGET_AGENT_ID:
-        targetAgentId = AgentId.new(strValue(value, key))
+        targetAgentId = parseId(() => AgentId.new(strValue(value, key)))
         break
       case IDEMPOTENCY_KEY:
         idempotencyKey = strValue(value, key)
@@ -223,7 +228,7 @@ export function decodeProvenanceHeaders(headers: ReadonlyMap<string, IggyHeaderV
   }
 
   if (conversationId === undefined) {
-    throw new CodecError(`missing required header \`${CONVERSATION_ID}\``, "provenance", "decode")
+    throw ProvenanceError.missingRequired(CONVERSATION_ID)
   }
 
   return {

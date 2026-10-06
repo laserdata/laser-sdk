@@ -34,7 +34,9 @@ def bridge_route_rejected(world):
 
 @when("I submit and cancel an A2A task")
 def submit_and_cancel_a2a(world):
-    bridge = world.laser.a2a_bridge("a2a-gateway", ls.Topics.COMMANDS, ls.Topics.RESPONSES)
+    bridge = ls.A2aBridge(
+        world.laser, "a2a-gateway", ls.AgentTopic.Commands, ls.AgentTopic.Responses
+    )
     task = world.run(lambda: bridge.submit({"message": {"role": "user", "text": "cancel me"}}))
     canceled = world.run(lambda: bridge.cancel(task["id"]))
     replayed = canceled
@@ -56,12 +58,12 @@ def replayed_a2a_state(world, state):
 def publish_state(world):
     world.run(
         lambda: world.laser.publish_state_snapshot(
-            ls.Topics.AUDIT, "agui-gateway", world.conversation, {"count": 1}
+            ls.AgentTopic.Audit, "agui-gateway", world.conversation, {"count": 1}
         )
     )
     world.run(
         lambda: world.laser.publish_state_delta(
-            ls.Topics.AUDIT,
+            ls.AgentTopic.Audit,
             "agui-gateway",
             world.conversation,
             [{"op": "replace", "path": "/count", "value": 2}],
@@ -69,7 +71,7 @@ def publish_state(world):
     )
     for _ in range(80):
         state = world.run(
-            lambda: world.laser.reconstruct_state(world.conversation, ls.Topics.AUDIT)
+            lambda: world.laser.reconstruct_state(world.conversation, ls.AgentTopic.Audit)
         )
         if state == {"count": 2}:
             world.reconstructed_state = state
@@ -85,14 +87,14 @@ def reconstructed_count(world, count):
 
 @when(parsers.parse('I stream chat chunks "{first}" and "{second}"'))
 def stream_chat(world, first, second):
-    stream = world.laser.agdx(ls.Topics.LLM_IO, "assistant", world.conversation).stream(
-        ls.new_correlation_id(), "chat"
+    stream = world.laser.agdx(ls.AgentTopic.LlmIo, "assistant", world.conversation).stream(
+        ls.mint_ulid(), "chat"
     )
     world.run(lambda: stream.write(first.encode()))
     world.run(lambda: stream.write(second.encode()))
     world.run(lambda: stream.finish(finish_reason="stop"))
     for _ in range(80):
-        events = world.run(lambda: world.laser.agui_events(world.conversation, ls.Topics.LLM_IO))
+        events = world.run(lambda: world.laser.agui_events(world.conversation, ls.AgentTopic.LlmIo))
         if len(events) >= 4:
             world.agui_event_types = [event["type"] for event in events]
             return

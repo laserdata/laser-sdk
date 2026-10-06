@@ -1,8 +1,6 @@
-use crate::agent::PyAgentMessage;
+use crate::context::PyContextMessage;
 use crate::convert::{py_to_de, ser_to_py};
 use crate::govern::PyPolicyEvidence;
-use laser_sdk::agent::AgentMessage;
-use laser_sdk::context::ContextMessage;
 use laser_sdk::crash_context::CrashContext;
 use laser_sdk::wire::agent::AgentDeadLetter;
 use pyo3::prelude::*;
@@ -24,7 +22,7 @@ pub struct PyCrashContext {
 #[pymethods]
 impl PyCrashContext {
     /// Combine already-read pieces into one bundle. `journal` is a list of
-    /// `AgentMessage` (from `ContextScope.fetch` or `Laser.assemble_context`),
+    /// `ContextMessage` (from `ContextScope.fetch` or `Laser.assemble_context`),
     /// `dead_letter` is a capsule dict (the same shape `Laser.redrive_dead_letter`
     /// takes: `source` the 20 big-endian packed locator bytes, `reason` the
     /// dead-letter reason code, `attempts` an int, `detail` an optional string,
@@ -33,19 +31,13 @@ impl PyCrashContext {
     #[new]
     #[pyo3(signature = (journal, dead_letter=None, last_decision=None))]
     fn new(
-        journal: Vec<PyRef<'_, PyAgentMessage>>,
+        journal: Vec<PyRef<'_, PyContextMessage>>,
         dead_letter: Option<&Bound<'_, PyAny>>,
         last_decision: Option<&PyPolicyEvidence>,
     ) -> PyResult<Self> {
         let journal = journal
             .iter()
-            .map(|message| ContextMessage {
-                id: message.inner.id,
-                provenance: message.inner.provenance.clone(),
-                payload: message.inner.payload.clone(),
-                envelope: message.inner.envelope.clone(),
-                topic: message.topic.clone().unwrap_or_default(),
-            })
+            .map(|message| message.inner.clone())
             .collect();
         let dead_letter = dead_letter.map(py_to_de::<AgentDeadLetter>).transpose()?;
         let last_decision = last_decision.map(|evidence| evidence.inner.clone());
@@ -65,20 +57,12 @@ impl PyCrashContext {
 
     /// The recent conversation history, oldest first.
     #[getter]
-    fn journal(&self) -> Vec<PyAgentMessage> {
+    fn journal(&self) -> Vec<PyContextMessage> {
         self.inner
             .journal
             .iter()
-            .map(|message| {
-                PyAgentMessage::from_inner(AgentMessage {
-                    provenance: message.provenance.clone(),
-                    payload: message.payload.clone(),
-                    id: message.id,
-                    envelope: message.envelope.clone(),
-                    content_type: None,
-                    verified_principal: None,
-                })
-            })
+            .cloned()
+            .map(PyContextMessage::new)
             .collect()
     }
 

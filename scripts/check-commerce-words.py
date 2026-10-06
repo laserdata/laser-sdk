@@ -32,6 +32,7 @@ WORDS = [
     r"orders\.v\d",
     r"orders\.publish",
     r"order #",
+    r"order (?:fields?|records?|totals?|lines?|amounts?|status|history)",
     r"shops?",
     r"checkouts?",
     r"carts?",

@@ -48,11 +48,10 @@ mod tests {
 
     #[test]
     fn given_the_pinned_memory_segments_when_hashed_then_should_match_the_golden_id() {
-        // The cross-SDK golden vector: an empty stream segment, agent "agent", a
-        // separator, the Fact kind byte (1), and body "x". The SDK and the Python
-        // reference both render this u128 as the ULID below, so the dedup id agrees
-        // across languages. Rendered with the crate's Crockford encoder, the same
-        // one every wire id displays through.
+        // The cross-SDK hash vector: a zero separator, "agent", a separator, the
+        // kind byte 1, and body "x". Every port of `content_id` renders this u128
+        // as the ULID below. Rendered with the crate's Crockford encoder, the
+        // same one every wire id displays through.
         let id = content_id(&[&[0], b"agent", &[0], &[1], b"x"]);
         let rendered = crate::agent::RecordId::from_u128(id).to_string();
         assert_eq!(rendered, "1A9GVS6SJ6SNS4KY0H19130WCW");

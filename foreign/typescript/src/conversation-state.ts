@@ -1,5 +1,12 @@
+import { CodecError } from "./client/errors.js"
 import type { Laser } from "./client/laser.js"
-import { ContextAssembler, LastN, type Checkpoint, type ContextMessage } from "./context.js"
+import {
+  ContextAssembler,
+  LastN,
+  replayContext,
+  type Checkpoint,
+  type ContextMessage
+} from "./context.js"
 import type { SnapshotStore } from "./snapshot.js"
 import type { ConversationId } from "./types/ids.js"
 import { foldSnapshotResumeOffset, type FoldSnapshot } from "./wire/snapshot.js"
@@ -22,6 +29,9 @@ export function resumeOffsets(snapshot: FoldSnapshot): ReadonlyMap<number, bigin
   )
 }
 
+// `last` reads the newest context window like a context read. Every other
+// bound folds its whole range, read in chunks up to the tail seen when the
+// replay starts or up to the checkpoint.
 async function load<State>(
   laser: Laser,
   conversation: ConversationId,
@@ -30,30 +40,40 @@ async function load<State>(
   initial: State,
   fold: (state: State, message: ContextMessage) => State
 ): Promise<State> {
-  const builder = ContextAssembler.builder(conversation).topics(topics)
-  if (bound.kind === "last") builder.policy(new LastN(bound.count))
-  if (bound.kind === "full") builder.policy(new LastN(Number.MAX_SAFE_INTEGER))
-  if (bound.kind === "from-offsets") {
-    builder.policy(new LastN(Number.MAX_SAFE_INTEGER)).fromOffsets(bound.offsets)
+  if (bound.kind === "last") {
+    const history = await ContextAssembler.builder()
+      .conversationId(conversation)
+      .topics(topics)
+      .policy(new LastN(bound.count))
+      .build()
+      .assemble(laser)
+    return history.reduce(fold, initial)
   }
-  if (bound.kind === "from-checkpoint") {
-    builder.policy(new LastN(Number.MAX_SAFE_INTEGER)).fromCheckpoint(bound.checkpoint)
-  }
-  if (bound.kind === "at") {
-    builder.policy(new LastN(Number.MAX_SAFE_INTEGER)).toCheckpoint(bound.checkpoint)
-  }
-  const history = await builder.build().assemble(laser)
+  const history = await replayContext(
+    {
+      conversation,
+      acrossSubconversations: false,
+      topics,
+      policy: new LastN(Number.MAX_SAFE_INTEGER),
+      fromOffsets: bound.kind === "from-offsets" ? bound.offsets : new Map(),
+      ...(bound.kind === "from-checkpoint" ? { fromCheckpoint: bound.checkpoint } : {}),
+      ...(bound.kind === "at" ? { toCheckpoint: bound.checkpoint } : {})
+    },
+    laser
+  )
   return history.reduce(fold, initial)
 }
 
+// The newest snapshot's state (JSON by default, like the Rust SDK) plus a
+// replay of only the tail past it.
 async function loadWith<State>(
   laser: Laser,
   store: SnapshotStore,
   conversation: ConversationId,
   topics: readonly string[],
   initial: State,
-  decodeState: (bytes: Uint8Array) => State,
-  fold: (state: State, message: ContextMessage) => State
+  fold: (state: State, message: ContextMessage) => State,
+  decodeState: (bytes: Uint8Array) => State = (bytes) => decodeJsonState(bytes) as State
 ): Promise<State> {
   const snapshot = await store.latest(conversation)
   return load(
@@ -66,6 +86,16 @@ async function loadWith<State>(
     snapshot === undefined ? initial : decodeState(snapshot.state),
     fold
   )
+}
+
+function decodeJsonState(bytes: Uint8Array): unknown {
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown
+  } catch (error) {
+    throw new CodecError(`decode snapshot state: ${String(error)}`, "json", "decode", {
+      cause: error
+    })
+  }
 }
 
 export const ConversationState = { load, loadWith } as const

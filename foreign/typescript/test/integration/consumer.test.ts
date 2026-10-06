@@ -27,7 +27,7 @@ void test("given_several_sent_messages_when_consumed_with_next_within_then_shoul
     await topic.send(utf8("second"))
     await topic.send(utf8("third"))
 
-    const consumer = topic.consumer(0, { startFrom: { kind: "first" } })
+    const consumer = topic.consumer(0, { startAt: { kind: "first" } })
     const first = await consumer.nextWithin(2_000)
     const second = await consumer.nextWithin(2_000)
     const third = await consumer.nextWithin(2_000)
@@ -35,8 +35,8 @@ void test("given_several_sent_messages_when_consumed_with_next_within_then_shoul
     assert.equal(decodeUtf8(first.payload), "first")
     assert.equal(decodeUtf8(second.payload), "second")
     assert.equal(decodeUtf8(third.payload), "third")
-    assert.ok(second.offset > first.offset)
-    assert.ok(third.offset > second.offset)
+    assert.ok(second.position.offset > first.position.offset)
+    assert.ok(third.position.offset > second.position.offset)
   } finally {
     await laser.close()
   }
@@ -46,7 +46,7 @@ void test("given_no_messages_when_polling_with_next_within_then_should_fail_with
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const consumer = topic.consumer(0, { startFrom: { kind: "first" }, pollIntervalMs: 50 })
+    const consumer = topic.consumer(0, { startAt: { kind: "first" }, pollIntervalMs: 50 })
     await assert.rejects(consumer.nextWithin(200), TimeoutError)
   } finally {
     await laser.close()
@@ -61,8 +61,8 @@ void test("given_manual_commit_when_the_consumer_is_recreated_then_should_resume
     await topic.send(utf8("two"))
 
     const first = topic.consumer("resume-reader", 0, {
-      startFrom: { kind: "first" },
-      autoCommit: false
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
     })
     const one = await first.nextWithin(2_000)
     assert.equal(decodeUtf8(one.payload), "one")
@@ -70,8 +70,8 @@ void test("given_manual_commit_when_the_consumer_is_recreated_then_should_resume
     await first.shutdown()
 
     const resumed = topic.consumer("resume-reader", 0, {
-      startFrom: { kind: "next" },
-      autoCommit: false
+      startAt: { kind: "next" },
+      commitPolicy: { kind: "disabled" }
     })
     const two = await resumed.nextWithin(2_000)
     assert.equal(decodeUtf8(two.payload), "two")
@@ -87,7 +87,7 @@ void test("given_a_live_consumer_when_iterated_with_for_await_then_should_yield_
     await topic.send(utf8("alpha"))
     await topic.send(utf8("beta"))
 
-    const consumer = topic.consumer(0, { startFrom: { kind: "first" }, pollIntervalMs: 50 })
+    const consumer = topic.consumer(0, { startAt: { kind: "first" }, pollIntervalMs: 50 })
     const seen: string[] = []
     for await (const message of consumer) {
       seen.push(decodeUtf8(message.payload))
@@ -107,14 +107,14 @@ void test("given_a_named_consumer_when_committed_then_should_report_local_and_se
     const topic = await freshTopic(laser)
     await topic.send(utf8("tracked"))
     const consumer = topic.consumer("tracked-reader", 0, {
-      startFrom: { kind: "first" },
-      autoCommit: false
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
     })
     const message = await consumer.nextWithin(1_000)
-    assert.equal(consumer.lastConsumedOffset(0), message.offset)
+    assert.equal(consumer.lastConsumedOffset(0), message.position.offset)
     await consumer.commit(message)
     const offset = await consumer.storedOffset(0)
-    assert.equal(offset?.storedOffset, message.offset)
+    assert.equal(offset?.storedOffset, message.position.offset)
   } finally {
     await laser.close()
   }
@@ -142,7 +142,7 @@ void test("given_invalid_consumer_controls_when_created_then_should_reject_befor
     assert.throws(() => topic.consumer(0, { batchLength: 0 }), /batchLength/)
     assert.throws(() => topic.consumer(0, { pollIntervalMs: -1 }), /pollIntervalMs/)
     assert.throws(
-      () => topic.consumer(0, { startFrom: { kind: "timestamp", value: -1n } }),
+      () => topic.consumer(0, { startAt: { kind: "timestampMicros", value: -1n } }),
       /start/
     )
     const consumer = topic.consumer(0)
@@ -158,17 +158,17 @@ void test("given_a_fresh_consumer_when_reading_next_then_should_start_at_zero", 
     const topic = await freshTopic(laser)
     await topic.send(utf8("zero"))
     await topic.send(utf8("one"))
-    const options = { autoCommit: false, batchLength: 1 }
+    const options = { commitPolicy: { kind: "disabled" as const }, batchLength: 1 }
     const first = topic.consumer("fresh", 0, options)
-    assert.equal((await first.nextWithin(2_000)).offset, 0n)
+    assert.equal((await first.nextWithin(2_000)).position.offset, 0n)
     await first.shutdown()
     const retried = topic.consumer("fresh", 0, options)
     const zero = await retried.nextWithin(2_000)
-    assert.equal(zero.offset, 0n)
+    assert.equal(zero.position.offset, 0n)
     await retried.commit(zero)
     await retried.shutdown()
     const resumed = topic.consumer("fresh", 0, options)
-    assert.equal((await resumed.nextWithin(2_000)).offset, 1n)
+    assert.equal((await resumed.nextWithin(2_000)).position.offset, 1n)
     await resumed.shutdown()
   } finally {
     await laser.close()
@@ -181,11 +181,11 @@ void test("given_default_polling_when_shutdown_after_offset_zero_then_should_res
     const topic = await freshTopic(laser)
     for (const value of ["zero", "one", "two", "three"]) await topic.send(utf8(value))
     const first = topic.consumer("partial", 0, { batchLength: 4 })
-    assert.equal((await first.nextWithin(2_000)).offset, 0n)
+    assert.equal((await first.nextWithin(2_000)).position.offset, 0n)
     assert.equal(first.lastConsumedOffset(0), 0n)
     await first.shutdown()
     const resumed = topic.consumer("partial", 0, { batchLength: 4 })
-    assert.equal((await resumed.nextWithin(2_000)).offset, 1n)
+    assert.equal((await resumed.nextWithin(2_000)).position.offset, 1n)
     await resumed.shutdown()
   } finally {
     await laser.close()
@@ -200,10 +200,10 @@ void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_a
   try {
     const variants = [
       { group: false, options: {} },
-      { group: false, options: { autoCommit: false } },
-      { group: false, options: { startFrom: { kind: "first" as const } } },
+      { group: false, options: { commitPolicy: { kind: "disabled" as const } } },
+      { group: false, options: { startAt: { kind: "first" as const } } },
       { group: true, options: {} },
-      { group: true, options: { autoCommit: false } }
+      { group: true, options: { commitPolicy: { kind: "disabled" as const } } }
     ]
     for (const { group, options } of variants) {
       const streamName = `laser-ts-test-${randomUUID()}`
@@ -219,16 +219,16 @@ void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_a
       const before = await open()
       for (let expected = 0n; expected < 3n; expected++) {
         const record = await before.nextWithin(2_000)
-        assert.equal(record.offset, expected)
-        if (options.autoCommit === false) await before.commit(record)
+        assert.equal(record.position.offset, expected)
+        if ("commitPolicy" in options) await before.commit(record)
       }
       await before.shutdown()
 
-      await laser.iggyClient.topic.purge({ streamId: streamName, topicId: "telemetry" })
+      await laser.client.topic.purge({ streamId: streamName, topicId: "telemetry" })
       // Metadata commits before the owner applies the purge. Wait for the empty source before publishing its replacement.
       const deadline = performance.now() + 5_000
       for (;;) {
-        const polled = await laser.iggyClient.message.poll({
+        const polled = await laser.client.message.poll({
           streamId: streamName,
           topicId: "telemetry",
           partitionId: 0,
@@ -246,7 +246,7 @@ void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_a
       const after = await open()
       try {
         const record = await after.nextWithin(2_000)
-        assert.equal(record.offset, 0n)
+        assert.equal(record.position.offset, 0n)
         assert.equal(decodeUtf8(record.payload), "safe-mode-0")
       } finally {
         await after.shutdown()

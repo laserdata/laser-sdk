@@ -1,8 +1,9 @@
-use crate::error::LaserError;
+use crate::error::{LaserError, PublishFailure};
 use crate::laser::Laser;
 use iggy::prelude::{HeaderKey, HeaderValue, IggyMessage};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
@@ -88,6 +89,7 @@ impl BatchingProducerBuilder {
             max_bytes: self.max_bytes,
             queue: Mutex::new(Queue::default()),
             kept: Mutex::new(None),
+            failed: AtomicBool::new(false),
         });
         let shutdown = Arc::new(Notify::new());
         let timer = {
@@ -131,9 +133,11 @@ impl BatchingProducerBuilder {
 /// before dropping.
 ///
 /// A failed linger flush never stops the timer. Its failure is kept and
-/// returned by the next `flush` or `close`, after that call has drained the
-/// queue. When several batches fail before the caller asks, the report is
-/// one [`LaserError::PublishFailed`] that lists the records of all of them.
+/// returned by the next `send`, `flush`, or `close`, whichever comes first.
+/// A `send` that finds it refuses its own record, so nothing queues behind a
+/// failed batch. `flush` and `close` drain the queue first. When several
+/// batches fail before the caller asks, the report is one
+/// [`LaserError::PublishFailed`] that lists the records of all of them.
 pub struct BatchingProducer {
     inner: Arc<Inner>,
     timer: Option<tokio::task::JoinHandle<()>>,
@@ -164,14 +168,18 @@ struct Inner {
     // Held across the append, so batches reach the log in queue order. It
     // guards the failure a timer flush left for the caller.
     kept: Mutex<Option<LaserError>>,
+    // Mirrors whether a failure is kept, so a sender checks without waiting
+    // on a flush in flight.
+    failed: AtomicBool,
 }
 
 impl BatchingProducer {
     /// Enqueue one payload with optional headers. Flushes inline when a size
     /// bound trips, so backpressure lands on the sender, not the timer. An
     /// error is the failure of that inline flush and lists this record as
-    /// unconfirmed. A failed linger flush is reported by [`flush`](Self::flush)
-    /// or [`close`](Self::close), never here.
+    /// unconfirmed. When a linger flush failed before this call, the record is
+    /// not queued: the error is that kept failure with this record added to
+    /// its unconfirmed records, reported once.
     pub async fn send(
         &self,
         payload: impl Into<Vec<u8>>,
@@ -182,6 +190,9 @@ impl BatchingProducer {
             .payload(payload.into())
             .user_headers(headers)
             .build()?;
+        if let Some(kept) = self.inner.take_kept().await {
+            return Err(refuse(kept, message, &self.inner.stream, &self.inner.topic));
+        }
         let flush_now = {
             let mut queue = self.inner.queue.lock().await;
             queue.payload += message.payload.len();
@@ -235,12 +246,24 @@ impl Inner {
                 .await
                 .map(|_| ())
         };
-        settle(trigger, &mut kept, sent)
+        let settled = settle(trigger, &mut kept, sent);
+        self.failed.store(kept.is_some(), Ordering::Release);
+        settled
     }
 
     async fn flush_on_timer(&self) {
         // A timer flush keeps its failure for the caller, so it has nothing to return.
         let _ = self.flush(Trigger::Timer).await;
+    }
+
+    // The failure a linger flush kept, taken so it is reported once.
+    async fn take_kept(&self) -> Option<LaserError> {
+        if !self.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut kept = self.kept.lock().await;
+        self.failed.store(false, Ordering::Release);
+        kept.take()
     }
 }
 
@@ -269,6 +292,25 @@ fn settle(
             (Some(earlier), Ok(())) => Err(earlier),
             (Some(earlier), Err(error)) => Err(merge(earlier, error)),
         },
+    }
+}
+
+// A kept failure reported to a sender, with the sender's record added to the
+// unconfirmed records because it was never queued. A kept failure that lists
+// no records becomes the cause of a publish failure for this one record.
+fn refuse(kept: LaserError, record: IggyMessage, stream: &str, topic: &str) -> LaserError {
+    match kept {
+        LaserError::PublishFailed(mut failure) => {
+            failure.unconfirmed.push(record);
+            LaserError::PublishFailed(failure)
+        }
+        source => LaserError::PublishFailed(Box::new(PublishFailure {
+            source,
+            stream: stream.to_owned(),
+            topic: topic.to_owned(),
+            committed: Vec::new(),
+            unconfirmed: vec![record],
+        })),
     }
 }
 
@@ -304,7 +346,6 @@ impl Drop for BatchingProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::PublishFailure;
 
     fn producer() -> BatchingProducer {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
@@ -353,6 +394,48 @@ mod tests {
             .close()
             .await
             .expect("the reported failure is not repeated");
+    }
+
+    #[tokio::test]
+    async fn given_a_kept_timer_failure_when_sending_then_should_refuse_the_record_and_report_both()
+    {
+        let producer = producer();
+        *producer.inner.kept.lock().await = Some(publish_failure(&["a"]));
+        producer.inner.flush_on_timer().await;
+        let error = producer
+            .send("b", BTreeMap::new())
+            .await
+            .expect_err("the sender hears the kept failure");
+        assert_eq!(unconfirmed(&error), [b"a".as_slice(), b"b"]);
+        assert!(
+            producer.inner.queue.lock().await.messages.is_empty(),
+            "the refused record is not queued"
+        );
+        producer
+            .close()
+            .await
+            .expect("the reported failure is not repeated");
+    }
+
+    #[tokio::test]
+    async fn given_a_kept_failure_without_records_when_sending_then_should_list_the_refused_record()
+    {
+        let producer = producer();
+        *producer.inner.kept.lock().await = Some(LaserError::Invalid("failed batch".into()));
+        producer.inner.flush_on_timer().await;
+        let error = producer
+            .send("b", BTreeMap::new())
+            .await
+            .expect_err("the sender hears the kept failure");
+        assert_eq!(unconfirmed(&error), [b"b".as_slice()]);
+        let LaserError::PublishFailed(failure) = error else {
+            panic!("a publish failure")
+        };
+        assert!(matches!(failure.source, LaserError::Invalid(_)));
+        assert_eq!(
+            (failure.stream.as_str(), failure.topic.as_str()),
+            ("fleet", "readings")
+        );
     }
 
     #[tokio::test]

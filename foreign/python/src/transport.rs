@@ -1,14 +1,19 @@
-use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning};
+use crate::async_bridge::{
+    PyHook, Undelivered, future_into_py, future_into_py_returning, hook_callable,
+};
 use crate::convert::payload_bytes;
 use crate::errors::{InvalidError, to_pyerr};
+use iggy::clients::producer_config::BackpressureMode;
+use iggy::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
 use iggy::prelude::{
-    BackgroundConfig, HeaderKey, HeaderKind, HeaderValue, IggyDuration, IggyExpiry,
-    NonZeroIggyDuration, SendMessagesConfirmationResponse, SendMessagesResponse,
+    BackgroundConfig, BalancedSharding, HeaderKey, HeaderKind, HeaderValue, IggyByteSize,
+    IggyDuration, IggyError, IggyExpiry, NonZeroIggyDuration, OrderedSharding,
+    SendMessagesConfirmationResponse, SendMessagesResponse, Sharding,
 };
 use laser_sdk::error::LaserError;
 use laser_sdk::stream::{
     CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Producer,
-    ProducerMessage, Routing, Topic,
+    ProducerMessage, Routing, StoredOffset, Topic,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
@@ -21,7 +26,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, watch};
 
 pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
     to_pyerr(error.into())
@@ -38,7 +43,7 @@ pub(crate) fn positive_duration_ms(
 /// One committed partition range reported by Apache Iggy after a send.
 #[gen_stub_pyclass]
 #[pyclass(
-    name = "SendMessagesConfirmation",
+    name = "SendMessagesConfirmationResponse",
     frozen,
     get_all,
     skip_from_py_object
@@ -463,7 +468,7 @@ pub(crate) struct ProducerSettings {
     pub partitions: u32,
     pub expiry: IggyExpiry,
     pub max_topic_size: u64,
-    pub background: Option<usize>,
+    pub background: Option<BackgroundSettings>,
 }
 
 impl ProducerSettings {
@@ -488,16 +493,264 @@ impl ProducerSettings {
             IggyExpiry::ExpireDuration(expiry) => builder.expire_after(expiry.get_duration()),
         };
         let builder = match self.background {
-            Some(shards) => builder.background(
-                BackgroundConfig::builder()
-                    .num_shards(shards)
-                    .batch_length(self.batch_length as usize)
-                    .linger_time(IggyDuration::from(self.linger))
-                    .build(),
-            ),
+            Some(background) => builder.background(background.config()),
             None => builder,
         };
         builder.build().await
+    }
+}
+
+/// Apache Iggy's buffered background send mode, passed as
+/// `Topic.producer(background=BackgroundConfig(...))`. A send returns once the
+/// records are queued. Unset fields take Apache Iggy's defaults: one ordered
+/// shard, a flush at `batch_length` sends, `batch_size` bytes, or `linger_ms`,
+/// a `max_buffer_size` byte budget, and `max_in_flight` writes at once.
+/// `sharding="balanced"` spreads one topic over every shard and gives up
+/// ordering. `failure_mode` is what a send does when the budget is full:
+/// `"block"` waits, `"block_with_timeout"` waits up to `block_timeout_ms`, and
+/// `"fail_immediately"` raises. `error_callback(error)`, a callable or an
+/// object with `call(error)`, sync or async, receives each write that failed
+/// after its retries as a `PublishFailedError` with `stream`, `topic`,
+/// `committed`, `unconfirmed`, and the cause as `__cause__`. Without one, the
+/// failure is logged on the `laser_sdk`
+/// logger and its records are dropped.
+#[gen_stub_pyclass]
+#[pyclass(name = "BackgroundConfig", frozen)]
+pub struct PyBackgroundConfig {
+    settings: BackgroundSettings,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyBackgroundConfig {
+    #[new]
+    #[pyo3(signature = (*, num_shards=None, sharding="ordered", batch_length=None, batch_size=None, linger_ms=None, max_buffer_size=None, max_in_flight=None, failure_mode="block", block_timeout_ms=None, error_callback=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        num_shards: Option<usize>,
+        sharding: &str,
+        batch_length: Option<usize>,
+        batch_size: Option<usize>,
+        linger_ms: Option<u64>,
+        max_buffer_size: Option<u64>,
+        max_in_flight: Option<usize>,
+        failure_mode: &str,
+        block_timeout_ms: Option<u64>,
+        error_callback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let defaults = BackgroundSettings::default();
+        let balanced = match sharding {
+            "ordered" => false,
+            "balanced" => true,
+            _ => {
+                return Err(InvalidError::new_err(
+                    "sharding must be ordered or balanced",
+                ));
+            }
+        };
+        let failure_mode = match (failure_mode, block_timeout_ms) {
+            ("block", None) => BackpressureMode::Block,
+            ("block_with_timeout", Some(timeout)) => BackpressureMode::BlockWithTimeout(
+                IggyDuration::from(Duration::from_millis(timeout)),
+            ),
+            ("fail_immediately", None) => BackpressureMode::FailImmediately,
+            ("block_with_timeout", None) => {
+                return Err(InvalidError::new_err(
+                    "failure_mode='block_with_timeout' requires block_timeout_ms",
+                ));
+            }
+            ("block" | "fail_immediately", Some(_)) => {
+                return Err(InvalidError::new_err(
+                    "block_timeout_ms applies to failure_mode='block_with_timeout' only",
+                ));
+            }
+            _ => {
+                return Err(InvalidError::new_err(
+                    "failure_mode must be block, block_with_timeout, or fail_immediately",
+                ));
+            }
+        };
+        let error_callback = error_callback
+            .map(|callback| {
+                hook_callable(callback, "call", "an error callback")?;
+                Ok::<_, PyErr>(Arc::new(callback.clone().unbind()))
+            })
+            .transpose()?;
+        Ok(Self {
+            settings: BackgroundSettings {
+                num_shards: num_shards.unwrap_or(defaults.num_shards),
+                balanced,
+                batch_length: batch_length.unwrap_or(defaults.batch_length),
+                batch_size: batch_size.unwrap_or(defaults.batch_size),
+                linger: linger_ms
+                    .map(|linger| IggyDuration::from(Duration::from_millis(linger)))
+                    .unwrap_or(defaults.linger),
+                max_buffer_size: max_buffer_size.unwrap_or(defaults.max_buffer_size),
+                max_in_flight: max_in_flight.unwrap_or(defaults.max_in_flight),
+                failure_mode,
+                error_callback,
+            },
+        })
+    }
+
+    #[getter]
+    fn num_shards(&self) -> usize {
+        self.settings.num_shards
+    }
+
+    /// `ordered` or `balanced`.
+    #[getter]
+    fn sharding(&self) -> &'static str {
+        if self.settings.balanced {
+            "balanced"
+        } else {
+            "ordered"
+        }
+    }
+
+    #[getter]
+    fn batch_length(&self) -> usize {
+        self.settings.batch_length
+    }
+
+    #[getter]
+    fn batch_size(&self) -> usize {
+        self.settings.batch_size
+    }
+
+    /// The flush delay in milliseconds, fractional below one.
+    #[getter]
+    fn linger_ms(&self) -> f64 {
+        self.settings.linger.get_duration().as_secs_f64() * 1000.0
+    }
+
+    #[getter]
+    fn max_buffer_size(&self) -> u64 {
+        self.settings.max_buffer_size
+    }
+
+    #[getter]
+    fn max_in_flight(&self) -> usize {
+        self.settings.max_in_flight
+    }
+
+    /// `block`, `block_with_timeout`, or `fail_immediately`.
+    #[getter]
+    fn failure_mode(&self) -> &'static str {
+        match self.settings.failure_mode {
+            BackpressureMode::Block => "block",
+            BackpressureMode::BlockWithTimeout(_) => "block_with_timeout",
+            BackpressureMode::FailImmediately => "fail_immediately",
+        }
+    }
+
+    #[getter]
+    fn block_timeout_ms(&self) -> Option<u128> {
+        match &self.settings.failure_mode {
+            BackpressureMode::BlockWithTimeout(timeout) => Some(timeout.get_duration().as_millis()),
+            _ => None,
+        }
+    }
+}
+
+/// The background mode a producer builds from: Apache Iggy's defaults, or a
+/// `BackgroundConfig`.
+#[derive(Clone)]
+pub(crate) struct BackgroundSettings {
+    num_shards: usize,
+    balanced: bool,
+    batch_length: usize,
+    batch_size: usize,
+    linger: IggyDuration,
+    max_buffer_size: u64,
+    max_in_flight: usize,
+    failure_mode: BackpressureMode,
+    error_callback: Option<Arc<Py<PyAny>>>,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        let defaults = BackgroundConfig::builder().build();
+        Self {
+            num_shards: defaults.num_shards,
+            balanced: false,
+            batch_length: defaults.batch_length,
+            batch_size: defaults.batch_size,
+            linger: defaults.linger_time,
+            max_buffer_size: defaults.max_buffer_size.as_bytes_u64(),
+            max_in_flight: defaults.max_in_flight,
+            failure_mode: defaults.failure_mode,
+            error_callback: None,
+        }
+    }
+}
+
+impl From<&PyBackgroundConfig> for BackgroundSettings {
+    fn from(config: &PyBackgroundConfig) -> Self {
+        config.settings.clone()
+    }
+}
+
+impl BackgroundSettings {
+    // Runs inside the awaited call that builds the producer, so the callback
+    // falls back to that caller's loop on Iggy's error task.
+    fn config(self) -> BackgroundConfig {
+        let sharding: Box<dyn Sharding + Send + Sync> = if self.balanced {
+            Box::new(BalancedSharding::default())
+        } else {
+            Box::new(OrderedSharding)
+        };
+        let callback = self.error_callback.and_then(|callback| {
+            Python::attach(|py| PyHook::new(callback.bind(py), "call", "an error callback"))
+                .inspect_err(|error| log::warn!("background error callback unusable: {error}"))
+                .ok()
+        });
+        BackgroundConfig::builder()
+            .num_shards(self.num_shards)
+            .sharding(sharding)
+            .batch_length(self.batch_length)
+            .batch_size(self.batch_size)
+            .linger_time(self.linger)
+            .max_buffer_size(IggyByteSize::from(self.max_buffer_size))
+            .max_in_flight(self.max_in_flight)
+            .failure_mode(self.failure_mode)
+            .error_callback(Arc::new(Box::new(PyErrorCallback(callback))))
+            .build()
+    }
+}
+
+// Hands a failed background write to the Python callback as the same typed
+// exception a direct send raises, or logs it when there is no callback.
+struct PyErrorCallback(Option<PyHook>);
+
+impl std::fmt::Debug for PyErrorCallback {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PyErrorCallback")
+    }
+}
+
+impl ErrorCallback for PyErrorCallback {
+    fn call(&self, ctx: ErrorCtx) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let hook = self.0.clone();
+        Box::pin(async move {
+            let error = LaserError::Iggy(IggyError::ProducerSendFailed {
+                cause: ctx.cause,
+                failed: ctx.messages,
+                committed: ctx.committed,
+                stream_name: ctx.stream_name,
+                topic_name: ctx.topic_name,
+            });
+            let Some(hook) = hook else {
+                log::error!("background send failed, its records are dropped: {error}");
+                return;
+            };
+            let raised = hook
+                .call(|py| (to_pyerr(error).value(py).clone(),).into_pyobject(py))
+                .await;
+            if let Err(error) = raised {
+                log::warn!("background error callback raised: {error}");
+            }
+        })
     }
 }
 
@@ -511,7 +764,7 @@ impl ProducerSettings {
 pub struct PyProducer {
     topic: Topic,
     settings: ProducerSettings,
-    producer: Arc<Mutex<ProducerState>>,
+    producer: Arc<RwLock<ProducerState>>,
     stream: String,
     name: String,
 }
@@ -528,30 +781,65 @@ impl PyProducer {
             name: topic.name().to_owned(),
             topic,
             settings,
-            producer: Arc::new(Mutex::new(ProducerState::Pending)),
+            producer: Arc::new(RwLock::new(ProducerState::Pending)),
             stream,
         }
     }
 
-    fn producer(&self) -> impl Future<Output = PyResult<Producer>> + Send + 'static {
+    // A send holds this read guard for its whole call, so `shutdown`, which
+    // takes the write side, waits for every in-flight send and then owns the
+    // only handle to the producer.
+    fn producer(
+        &self,
+    ) -> impl Future<Output = PyResult<OwnedRwLockReadGuard<ProducerState, Producer>>> + Send + 'static
+    {
         let cell = self.producer.clone();
         let topic = self.topic.clone();
         let settings = self.settings.clone();
         async move {
-            let mut state = cell.lock().await;
-            match &*state {
-                ProducerState::Ready(producer) => Ok((**producer).clone()),
-                ProducerState::Closed => Err(InvalidError::new_err(
-                    "the producer is shut down, build a new one with Topic.producer",
-                )),
-                ProducerState::Pending => {
-                    let producer = settings.build(topic).await.map_err(to_pyerr)?;
-                    *state = ProducerState::Ready(Box::new(producer.clone()));
-                    Ok(producer)
+            loop {
+                let state = cell.clone().read_owned().await;
+                let state = match OwnedRwLockReadGuard::try_map(state, |state| match state {
+                    ProducerState::Ready(producer) => Some(producer.as_ref()),
+                    ProducerState::Pending | ProducerState::Closed => None,
+                }) {
+                    Ok(producer) => return Ok(producer),
+                    Err(state) => state,
+                };
+                if matches!(*state, ProducerState::Closed) {
+                    return Err(InvalidError::new_err(
+                        "the producer is shut down, build a new one with Topic.producer",
+                    ));
+                }
+                drop(state);
+                let mut state = cell.write().await;
+                if matches!(*state, ProducerState::Pending) {
+                    let producer = settings
+                        .clone()
+                        .build(topic.clone())
+                        .await
+                        .map_err(to_pyerr)?;
+                    *state = ProducerState::Ready(Box::new(producer));
                 }
             }
         }
     }
+}
+
+// Waits for in-flight sends, then flushes and stops the producer on a task of
+// its own, so cancelling the caller never drops buffered records. Later calls
+// find it closed and return at once.
+async fn close_producer(cell: Arc<RwLock<ProducerState>>) -> Result<(), LaserError> {
+    let flush = tokio::spawn(async move {
+        let mut state = cell.write_owned().await;
+        match std::mem::replace(&mut *state, ProducerState::Closed) {
+            ProducerState::Ready(producer) => producer.shutdown().await,
+            ProducerState::Pending | ProducerState::Closed => Ok(()),
+        }
+    });
+    flush
+        .await
+        .map_err(|error| LaserError::HandlerConfig(format!("producer shutdown: {error}")))?
 }
 
 #[gen_stub_pymethods]
@@ -595,15 +883,15 @@ impl PyProducer {
     /// Send one Iggy batch. Each item is either a raw payload or
     /// `(payload, headers)`. All records share the optional key or partition,
     /// matching Iggy's `send_with_partitioning` contract.
-    #[pyo3(signature = (values, *, key=None, partition=None))]
+    #[pyo3(signature = (messages, *, key=None, partition=None))]
     fn send_batch<'py>(
         &self,
         py: Python<'py>,
-        values: &Bound<'_, PyAny>,
+        messages: &Bound<'_, PyAny>,
         key: Option<&Bound<'_, PyAny>>,
         partition: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let messages = messages(values)?;
+        let messages = self::messages(messages)?;
         let routing = routing_override(key, partition)?;
         let producer = self.producer();
         future_into_py(py, async move {
@@ -616,20 +904,17 @@ impl PyProducer {
         })
     }
 
-    /// Flush buffered `background`-mode messages and stop the worker. A direct
-    /// producer has nothing to flush, so this only closes it. Await every
-    /// in-flight `send` first: shutdown needs the last live handle, and a send
-    /// still running makes it raise `InvalidError`. Later sends raise
-    /// `InvalidError`.
+    /// Flush buffered `background`-mode messages and stop the worker. It waits
+    /// for sends already in flight, so every record a send accepted is
+    /// flushed, and cancelling the call does not stop the flush. A direct
+    /// producer has nothing to flush, so this only closes it. Later sends
+    /// raise `InvalidError`, and a second shutdown returns at once.
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let cell = self.producer.clone();
-        future_into_py(py, async move {
-            let mut state = cell.lock().await;
-            match std::mem::replace(&mut *state, ProducerState::Closed) {
-                ProducerState::Ready(producer) => producer.shutdown().await.map_err(to_pyerr),
-                ProducerState::Pending | ProducerState::Closed => Ok(()),
-            }
-        })
+        future_into_py(
+            py,
+            async move { close_producer(cell).await.map_err(to_pyerr) },
+        )
     }
 
     fn __repr__(&self) -> String {
@@ -755,10 +1040,10 @@ pub struct PyConsumerMessage {
     payload: bytes::Bytes,
     message_id: String,
     headers: BTreeMap<String, PyHeader>,
+    user_headers: Option<bytes::Bytes>,
     #[pyo3(get)]
     pub checksum: u64,
-    #[pyo3(get)]
-    pub offset: u64,
+    offset: u64,
     #[pyo3(get)]
     pub current_offset: u64,
     #[pyo3(get)]
@@ -792,6 +1077,7 @@ impl PyConsumerMessage {
             payload: message.payload.clone(),
             message_id: message.header.id.to_string(),
             headers,
+            user_headers: message.user_headers.clone(),
             headers_malformed,
             checksum: message.header.checksum,
             offset: message.header.offset,
@@ -812,6 +1098,7 @@ impl PyConsumerMessage {
             payload: message.payload.clone(),
             message_id: message.message_id.to_string(),
             headers,
+            user_headers: message.user_headers.clone(),
             headers_malformed,
             checksum: message.checksum,
             offset: message.position.offset,
@@ -833,10 +1120,25 @@ impl PyConsumerMessage {
         PyBytes::new(py, &self.payload)
     }
 
-    /// Iggy's message identifier.
+    /// Iggy's 128-bit message identifier as decimal text.
     #[getter]
     fn message_id(&self) -> String {
         self.message_id.clone()
+    }
+
+    /// The record's log position (partition and offset).
+    #[getter]
+    fn position(&self) -> crate::ids::PyMessageId {
+        laser_sdk::types::MessageId::new(self.partition_id, self.offset).into()
+    }
+
+    /// The user header block exactly as stored, for a caller that decodes
+    /// its entries itself, or `None` when the record has none.
+    #[getter]
+    fn user_headers<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.user_headers
+            .as_ref()
+            .map(|block| PyBytes::new(py, block))
     }
 
     /// Typed Iggy user headers as Python `bytes`, `str`, `bool`, `int`, or
@@ -993,12 +1295,6 @@ impl PyConsumer {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyConsumer {
-    /// Consumer or group name.
-    #[getter]
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
     /// Initialize and join/create the configured group. Reads initialize lazily
     /// too, so call this when startup should fail before accepting work.
     fn init<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1145,6 +1441,25 @@ impl PyConsumer {
         })
     }
 
+    /// Read the offset the server stores for this consumer, or for its group,
+    /// on `partition`, with the partition's current head. `None` when the
+    /// server stores nothing for it yet. A server read, unlike the local
+    /// bookkeeping of `last_stored_offset`.
+    fn stored_offset<'py>(&self, py: Python<'py>, partition: u32) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            let stored = state
+                .lock()
+                .await
+                .built()
+                .await?
+                .stored_offset(partition)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(stored.map(PyStoredOffset::from))
+        })
+    }
+
     /// Local offset bookkeeping: the native SDK's stored offset, whose initial
     /// zero does not prove a durable checkpoint exists, or the last offset a
     /// policy-aware group consumer acknowledged. Use `next` polling for
@@ -1214,6 +1529,38 @@ impl PyConsumer {
     }
 }
 
+/// A consumer's offset as the server stores it, read by
+/// `Consumer.stored_offset`.
+#[gen_stub_pyclass]
+#[pyclass(name = "StoredOffset", frozen, get_all, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyStoredOffset {
+    /// The offset the server stored for the consumer.
+    pub stored_offset: u64,
+    /// The partition's current head offset.
+    pub current_offset: u64,
+}
+
+impl From<StoredOffset> for PyStoredOffset {
+    fn from(offset: StoredOffset) -> Self {
+        Self {
+            stored_offset: offset.stored_offset,
+            current_offset: offset.current_offset,
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyStoredOffset {
+    fn __repr__(&self) -> String {
+        format!(
+            "StoredOffset(stored_offset={}, current_offset={})",
+            self.stored_offset, self.current_offset
+        )
+    }
+}
+
 fn give_back_delivery(returned: Arc<std::sync::Mutex<VecDeque<ConsumerMessage>>>) -> Undelivered {
     Box::new(move |py, value| {
         let Ok(message) = value.extract::<PyRef<'_, PyConsumerMessage>>(py) else {
@@ -1246,12 +1593,34 @@ async fn return_deliveries(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsumerState, PyConsumer, PyConsumerMessage, PyHeaderValue, positive_duration_ms,
+        ConsumerState, ProducerState, PyConsumer, PyConsumerMessage, PyHeaderValue, close_producer,
+        positive_duration_ms,
     };
     use iggy::prelude::IggyMessage;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::{Mutex, watch};
+    use tokio::sync::{Mutex, RwLock, watch};
+
+    #[tokio::test]
+    async fn given_an_in_flight_send_when_shutting_down_then_should_wait_for_it_and_close_once() {
+        let state = Arc::new(RwLock::new(ProducerState::Pending));
+        let in_flight = Arc::clone(&state).read_owned().await;
+        let closing = tokio::spawn(close_producer(Arc::clone(&state)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !closing.is_finished(),
+            "shutdown ran past an in-flight send"
+        );
+        drop(in_flight);
+        closing
+            .await
+            .expect("shutdown task")
+            .expect("shutdown succeeds");
+        assert!(matches!(*state.read().await, ProducerState::Closed));
+        close_producer(state)
+            .await
+            .expect("a second shutdown returns at once");
+    }
 
     #[tokio::test]
     async fn given_shutdown_while_waiting_for_consumer_state_when_signalled_then_should_cancel_the_wait()
@@ -1289,9 +1658,10 @@ mod tests {
             .payload(bytes::Bytes::from_static(b"payload"))
             .build()
             .expect("message");
-        message.user_headers = Some(bytes.into());
+        message.user_headers = Some(bytes.clone().into());
         let decoded = PyConsumerMessage::of(&message, 0, 0).expect("readable message");
         assert!(!decoded.headers_malformed);
+        assert_eq!(decoded.user_headers.as_deref(), Some(bytes.as_slice()));
         assert!(
             matches!(&decoded.headers["future"].value, PyHeaderValue::Raw(value) if value == b"opaque")
         );

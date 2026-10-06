@@ -1,12 +1,12 @@
 use crate::error::LaserError;
-use crate::fork::{
-    ForkCreate, ForkDelete, ForkError, ForkInfo, ForkKind, ForkList, ForkOutcome, ForkPromote,
-    ForkPut, ForkReply,
-};
+use crate::fork::{ForkError, ForkInfo, ForkKind};
 use crate::laser::Laser;
 use crate::query::{
     AGDX_FORK_CREATE_CODE, AGDX_FORK_DELETE_CODE, AGDX_FORK_LIST_CODE, AGDX_FORK_PROMOTE_CODE,
     AGDX_FORK_PUT_CODE, FORK_OP_VERSION,
+};
+use laser_wire::fork::{
+    ForkCreate, ForkDelete, ForkList, ForkOutcome, ForkPromote, ForkPut, ForkReply,
 };
 use laser_wire::framing::encode_named;
 #[cfg(test)]

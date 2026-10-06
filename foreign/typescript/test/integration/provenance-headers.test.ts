@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
-import type { IggyHeaderValue } from "../../src/iggy/apache-iggy.js"
+import type { HeaderValue } from "../../src/stream/header-value.js"
 import { ApacheIggyTransport } from "../../src/iggy/apache-iggy.js"
 import {
   decodeProvenanceHeaders,
@@ -19,7 +19,7 @@ void test("given_a_message_sent_with_headers_when_polled_back_then_should_carry_
     await transport.ensureStream(streamName)
     await transport.ensureTopic(streamName, "events", 1)
 
-    const headers = new Map<string, IggyHeaderValue>([
+    const headers = new Map<string, HeaderValue>([
       ["agdx.string", { kind: "string", value: "hello" }],
       ["agdx.bool", { kind: "bool", value: true }],
       ["agdx.uint32", { kind: "uint32", value: 42 }],
@@ -91,7 +91,7 @@ void test("given_a_provenance_when_sent_and_polled_back_then_should_decode_to_th
     assert.ok(message !== undefined)
     const decoded = decodeProvenanceHeaders(message.headers)
     assert.ok(decoded.conversationId.equals(conversationId))
-    assert.equal(decoded.agent?.asString(), "planner")
+    assert.equal(decoded.agent?.asStr(), "planner")
     assert.equal(decoded.idempotencyKey, "key-1")
     assert.equal(decoded.fenceToken, 3n)
   } finally {

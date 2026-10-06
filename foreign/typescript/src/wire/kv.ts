@@ -102,7 +102,7 @@ export function decodeKvEntry(map: CborMap, context: string): KvEntry {
   }
 }
 
-export function kvEntryKeyString(entry: KvEntry): string | undefined {
+export function kvEntryKeyStr(entry: KvEntry): string | undefined {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(entry.key)
   } catch {
@@ -139,6 +139,8 @@ export function decodeKvPage(map: CborMap, context: string): KvPage {
 }
 
 export interface KvGet {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly ifNoneMatch?: bigint
@@ -150,7 +152,7 @@ export interface KvGet {
 
 export function encodeKvGet(get: KvGet): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", get.v ?? KV_OP_VERSION)
   map.set("namespace", get.namespace)
   map.set("key", get.key)
   if (get.ifNoneMatch !== undefined) map.set("if_none_match", get.ifNoneMatch)
@@ -163,6 +165,7 @@ export function decodeKvGet(map: CborMap, context: string): KvGet {
   const ifNoneMatch = field.optionalU64(map, "if_none_match", context)
   const minPositionMap = field.optionalMap(map, "min_position", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     ...(ifNoneMatch !== undefined ? { ifNoneMatch } : {}),
@@ -173,6 +176,8 @@ export function decodeKvGet(map: CborMap, context: string): KvGet {
 }
 
 export interface KvSet {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly value: Uint8Array
@@ -181,7 +186,7 @@ export interface KvSet {
 
 export function encodeKvSet(set: KvSet): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", set.v ?? KV_OP_VERSION)
   map.set("namespace", set.namespace)
   map.set("key", set.key)
   map.set("value", set.value)
@@ -192,6 +197,7 @@ export function encodeKvSet(set: KvSet): Map<string, unknown> {
 export function decodeKvSet(map: CborMap, context: string): KvSet {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     value: field.requiredBytes(map, "value", context),
@@ -219,6 +225,8 @@ export function decodeCasExpect(value: unknown, context: string): CasExpect {
 }
 
 export interface KvCas {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly value: Uint8Array
@@ -228,7 +236,7 @@ export interface KvCas {
 
 export function encodeKvCas(cas: KvCas): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", cas.v ?? KV_OP_VERSION)
   map.set("namespace", cas.namespace)
   map.set("key", cas.key)
   map.set("value", cas.value)
@@ -240,6 +248,7 @@ export function encodeKvCas(cas: KvCas): Map<string, unknown> {
 export function decodeKvCas(map: CborMap, context: string): KvCas {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     value: field.requiredBytes(map, "value", context),
@@ -249,6 +258,8 @@ export function decodeKvCas(map: CborMap, context: string): KvCas {
 }
 
 export interface KvCasFenced {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly value: Uint8Array
@@ -319,7 +330,7 @@ function decodeValidated<T>(value: T, validate: (value: T) => void, context: str
 export function encodeKvCasFenced(cas: KvCasFenced): Map<string, unknown> {
   validateKvCasFenced(cas)
   const map = new Map<string, unknown>()
-  map.set("v", KV_LEASE_OP_VERSION)
+  map.set("v", cas.v ?? KV_LEASE_OP_VERSION)
   map.set("namespace", cas.namespace)
   map.set("key", cas.key)
   map.set("value", cas.value)
@@ -336,6 +347,7 @@ export function decodeKvCasFenced(map: CborMap, context: string): KvCasFenced {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
   return decodeValidated(
     {
+      v: field.requiredU32(map, "v", context),
       namespace: field.requiredString(map, "namespace", context),
       key: field.requiredBytes(map, "key", context),
       value: field.requiredBytes(map, "value", context),
@@ -351,6 +363,8 @@ export function decodeKvCasFenced(map: CborMap, context: string): KvCasFenced {
 }
 
 export interface KvDelete {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly ifMatch?: bigint
@@ -358,7 +372,7 @@ export interface KvDelete {
 
 export function encodeKvDelete(del: KvDelete): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", del.v ?? KV_OP_VERSION)
   map.set("namespace", del.namespace)
   map.set("key", del.key)
   if (del.ifMatch !== undefined) map.set("if_match", del.ifMatch)
@@ -368,6 +382,7 @@ export function encodeKvDelete(del: KvDelete): Map<string, unknown> {
 export function decodeKvDelete(map: CborMap, context: string): KvDelete {
   const ifMatch = field.optionalU64(map, "if_match", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     ...(ifMatch !== undefined ? { ifMatch } : {})
@@ -375,13 +390,15 @@ export function decodeKvDelete(map: CborMap, context: string): KvDelete {
 }
 
 export interface KvExists {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
 }
 
 export function encodeKvExists(exists: KvExists): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", KV_OP_VERSION],
+    ["v", exists.v ?? KV_OP_VERSION],
     ["namespace", exists.namespace],
     ["key", exists.key]
   ])
@@ -389,12 +406,15 @@ export function encodeKvExists(exists: KvExists): Map<string, unknown> {
 
 export function decodeKvExists(map: CborMap, context: string): KvExists {
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context)
   }
 }
 
 export interface KvExpire {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly expiresAtMicros?: bigint
@@ -402,7 +422,7 @@ export interface KvExpire {
 
 export function encodeKvExpire(expire: KvExpire): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", expire.v ?? KV_OP_VERSION)
   map.set("namespace", expire.namespace)
   map.set("key", expire.key)
   if (expire.expiresAtMicros !== undefined) map.set("expires_at_micros", expire.expiresAtMicros)
@@ -412,6 +432,7 @@ export function encodeKvExpire(expire: KvExpire): Map<string, unknown> {
 export function decodeKvExpire(map: CborMap, context: string): KvExpire {
   const expiresAtMicros = field.optionalU64(map, "expires_at_micros", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     ...(expiresAtMicros !== undefined ? { expiresAtMicros } : {})
@@ -419,6 +440,8 @@ export function decodeKvExpire(map: CborMap, context: string): KvExpire {
 }
 
 export interface KvPatch {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly patch: Uint8Array
@@ -427,7 +450,7 @@ export interface KvPatch {
 
 export function encodeKvPatch(patch: KvPatch): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", patch.v ?? KV_OP_VERSION)
   map.set("namespace", patch.namespace)
   map.set("key", patch.key)
   map.set("patch", patch.patch)
@@ -438,6 +461,7 @@ export function encodeKvPatch(patch: KvPatch): Map<string, unknown> {
 export function decodeKvPatch(map: CborMap, context: string): KvPatch {
   const ifMatch = field.optionalU64(map, "if_match", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     patch: field.requiredBytes(map, "patch", context),
@@ -446,6 +470,8 @@ export function decodeKvPatch(map: CborMap, context: string): KvPatch {
 }
 
 export interface KvCopy {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly toNamespace?: string
@@ -454,7 +480,7 @@ export interface KvCopy {
 
 export function encodeKvCopy(copy: KvCopy): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", copy.v ?? KV_OP_VERSION)
   map.set("namespace", copy.namespace)
   map.set("key", copy.key)
   if (copy.toNamespace !== undefined) map.set("to_namespace", copy.toNamespace)
@@ -465,6 +491,7 @@ export function encodeKvCopy(copy: KvCopy): Map<string, unknown> {
 export function decodeKvCopy(map: CborMap, context: string): KvCopy {
   const toNamespace = field.optionalString(map, "to_namespace", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     ...(toNamespace !== undefined ? { toNamespace } : {}),
@@ -473,6 +500,8 @@ export function decodeKvCopy(map: CborMap, context: string): KvCopy {
 }
 
 export interface KvMove {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly toNamespace?: string
@@ -481,7 +510,7 @@ export interface KvMove {
 
 export function encodeKvMove(move: KvMove): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", move.v ?? KV_OP_VERSION)
   map.set("namespace", move.namespace)
   map.set("key", move.key)
   if (move.toNamespace !== undefined) map.set("to_namespace", move.toNamespace)
@@ -492,6 +521,7 @@ export function encodeKvMove(move: KvMove): Map<string, unknown> {
 export function decodeKvMove(map: CborMap, context: string): KvMove {
   const toNamespace = field.optionalString(map, "to_namespace", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     key: field.requiredBytes(map, "key", context),
     ...(toNamespace !== undefined ? { toNamespace } : {}),
@@ -500,6 +530,8 @@ export function decodeKvMove(map: CborMap, context: string): KvMove {
 }
 
 export interface KvLease {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly leaseTtlMicros: bigint
@@ -541,7 +573,7 @@ function validateKvLease(lease: KvLease): void {
 export function encodeKvLease(lease: KvLease): Map<string, unknown> {
   validateKvLease(lease)
   const map = new Map<string, unknown>([
-    ["v", KV_LEASE_OP_VERSION],
+    ["v", lease.v ?? KV_LEASE_OP_VERSION],
     ["namespace", lease.namespace],
     ["key", lease.key],
     ["lease_ttl_micros", lease.leaseTtlMicros],
@@ -556,6 +588,7 @@ export function decodeKvLease(map: CborMap, context: string): KvLease {
   const subjectUserId = field.optionalU32(map, "subject_user_id", context)
   return decodeValidated(
     {
+      v: field.requiredU32(map, "v", context),
       namespace: field.requiredString(map, "namespace", context),
       key: field.requiredBytes(map, "key", context),
       leaseTtlMicros: field.requiredU64(map, "lease_ttl_micros", context),
@@ -568,6 +601,8 @@ export function decodeKvLease(map: CborMap, context: string): KvLease {
 }
 
 export interface KvLeaseRenew {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly holderId: string
@@ -585,7 +620,7 @@ function validateKvLeaseRenew(renew: KvLeaseRenew): void {
 export function encodeKvLeaseRenew(renew: KvLeaseRenew): Map<string, unknown> {
   validateKvLeaseRenew(renew)
   const map = new Map<string, unknown>([
-    ["v", KV_LEASE_OP_VERSION],
+    ["v", renew.v ?? KV_LEASE_OP_VERSION],
     ["namespace", renew.namespace],
     ["key", renew.key],
     ["holder_id", renew.holderId]
@@ -601,6 +636,7 @@ export function decodeKvLeaseRenew(map: CborMap, context: string): KvLeaseRenew 
   const subjectUserId = field.optionalU32(map, "subject_user_id", context)
   return decodeValidated(
     {
+      v: field.requiredU32(map, "v", context),
       namespace: field.requiredString(map, "namespace", context),
       key: field.requiredBytes(map, "key", context),
       holderId: field.requiredString(map, "holder_id", context),
@@ -614,6 +650,8 @@ export function decodeKvLeaseRenew(map: CborMap, context: string): KvLeaseRenew 
 }
 
 export interface KvRelease {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly key: Uint8Array
   readonly leaseToken: bigint
@@ -629,7 +667,7 @@ function validateKvRelease(release: KvRelease): void {
 export function encodeKvRelease(release: KvRelease): Map<string, unknown> {
   validateKvRelease(release)
   return new Map<string, unknown>([
-    ["v", KV_LEASE_OP_VERSION],
+    ["v", release.v ?? KV_LEASE_OP_VERSION],
     ["namespace", release.namespace],
     ["key", release.key],
     ["lease_token", release.leaseToken],
@@ -641,6 +679,7 @@ export function decodeKvRelease(map: CborMap, context: string): KvRelease {
   requireLeaseVersion(map, context)
   return decodeValidated(
     {
+      v: field.requiredU32(map, "v", context),
       namespace: field.requiredString(map, "namespace", context),
       key: field.requiredBytes(map, "key", context),
       leaseToken: field.requiredU64(map, "lease_token", context),
@@ -674,8 +713,17 @@ export function decodeKvMetadata(map: CborMap, context: string): KvMetadata {
   }
 }
 
-export function encodeKvNamespaces(): Map<string, unknown> {
-  return new Map<string, unknown>([["v", KV_OP_VERSION]])
+export interface KvNamespaces {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
+}
+
+export function encodeKvNamespaces(request: KvNamespaces = {}): Map<string, unknown> {
+  return new Map<string, unknown>([["v", request.v ?? KV_OP_VERSION]])
+}
+
+export function decodeKvNamespaces(map: CborMap, context: string): KvNamespaces {
+  return { v: field.requiredU32(map, "v", context) }
 }
 
 export interface KvNamespaceInfo {
@@ -698,6 +746,8 @@ export function decodeKvNamespaceInfo(map: CborMap, context: string): KvNamespac
 }
 
 export interface KvScan {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly prefix?: Uint8Array
   readonly start?: Uint8Array
@@ -710,7 +760,7 @@ export interface KvScan {
 
 export function encodeKvScan(scan: KvScan): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", scan.v ?? KV_OP_VERSION)
   map.set("namespace", scan.namespace)
   if (scan.prefix !== undefined) map.set("prefix", scan.prefix)
   if (scan.start !== undefined) map.set("start", scan.start)
@@ -730,6 +780,7 @@ export function decodeKvScan(map: CborMap, context: string): KvScan {
   const conversation = field.optionalString(map, "conversation", context)
   const cursor = field.optionalBytes(map, "cursor", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     ...(prefix !== undefined ? { prefix } : {}),
     ...(start !== undefined ? { start } : {}),
@@ -742,6 +793,8 @@ export function decodeKvScan(map: CborMap, context: string): KvScan {
 }
 
 export interface KvDeleteMany {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namespace: string
   readonly prefix?: Uint8Array
   readonly start?: Uint8Array
@@ -752,7 +805,7 @@ export interface KvDeleteMany {
 
 export function encodeKvDeleteMany(deleteMany: KvDeleteMany): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", KV_OP_VERSION)
+  map.set("v", deleteMany.v ?? KV_OP_VERSION)
   map.set("namespace", deleteMany.namespace)
   if (deleteMany.prefix !== undefined) map.set("prefix", deleteMany.prefix)
   if (deleteMany.start !== undefined) map.set("start", deleteMany.start)
@@ -769,6 +822,7 @@ export function decodeKvDeleteMany(map: CborMap, context: string): KvDeleteMany 
   const keyContains = field.optionalString(map, "key_contains", context)
   const conversation = field.optionalString(map, "conversation", context)
   return {
+    v: field.requiredU32(map, "v", context),
     namespace: field.requiredString(map, "namespace", context),
     ...(prefix !== undefined ? { prefix } : {}),
     ...(start !== undefined ? { start } : {}),

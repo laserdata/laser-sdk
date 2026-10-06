@@ -19,7 +19,7 @@ const GROUP_FILTER_LOOKUP_PAGE: u32 = 8;
 
 /// A consumer group by name or by its native numeric id.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GroupTarget {
+pub(crate) enum GroupTarget {
     Name(String),
     Id(u64),
 }

@@ -325,7 +325,7 @@ async def manage_revisions(laser: ls.Laser, desk, binding: dict, expected: int) 
     variant_name = f"{GROUP}-transitions-{_common.run_token()}"
     variant = laser.topic(TOPIC).consumer_group(variant_name)
     created = await variant.create(filter=ls.ConsumerFilter.json(safe_mode_transition()))
-    variant_binding = created["filter"]
+    variant_binding = created.filter
     reader = await variant.reader(count=1, local_guard=True, start="first")
     try:
         first = await asyncio.wait_for(reader.next_record(), READ_TIMEOUT)
@@ -377,7 +377,7 @@ async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
         caps = await laser.capabilities()
-        if not _common.managed_gate(caps.filters_catalog, "consumer group filters", EXAMPLE):
+        if not _common.managed_gate(caps.filters.catalog, "consumer group filters", EXAMPLE):
             return
 
         _common.phase("publish a busy fleet change feed, keyed by satellite")
@@ -403,9 +403,9 @@ async def main() -> None:
         _common.phase("create the anomaly desk group with its filter")
         desk = topic.consumer_group(f"{GROUP}-{_common.run_token()}")
         created = await desk.create(filter=safe_mode_filter())
-        binding = created["filter"]
+        binding = created.filter
         print(
-            f"  group {created['name']} ({created['id']}) runs revision "
+            f"  group {created.name} ({created.id}) runs revision "
             f"{binding['revision']} of its own filter from now on"
         )
 
@@ -419,7 +419,7 @@ async def main() -> None:
                 message = await consumer.next_within(READ_TIMEOUT)
                 change = fleet_change(message.json())
                 print(
-                    f"  partition {message.partition_id} offset {message.offset}: "
+                    f"  partition {message.partition_id} offset {message.position.offset}: "
                     f"{change.describe()}"
                 )
                 delivered_bytes += len(message.payload)

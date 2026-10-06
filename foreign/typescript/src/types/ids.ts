@@ -1,8 +1,11 @@
-import { InvalidError } from "../client/errors.js"
+import { IdError, InvalidError } from "../client/errors.js"
 import { mintUlidValue, type UlidSource } from "../runtime/ulid.js"
+import { type AgentId as WireAgentId, parseAgentId } from "../wire/agent.js"
 import { crockfordDecode, crockfordEncode } from "../wire/ids.js"
 
 const MAX_ID_LEN = 255
+const MAX_PARTITION_ID = 0xffff_ffffn
+const MAX_OFFSET = 0xffff_ffff_ffff_ffffn
 
 const DERIVE_VERSION = 1
 const FNV_OFFSET = 0xcbf2_9ce4_8422_2325n
@@ -34,8 +37,8 @@ export class ConversationId {
   static parse(text: string): ConversationId {
     try {
       return new ConversationId(crockfordDecode(text))
-    } catch (cause) {
-      throw new InvalidError(`invalid ULID \`${text}\``, { text }, { cause })
+    } catch {
+      throw IdError.invalidUlid(text)
     }
   }
 
@@ -63,8 +66,8 @@ export class IntentId {
   static parse(text: string): IntentId {
     try {
       return new IntentId(crockfordDecode(text))
-    } catch (cause) {
-      throw new InvalidError(`invalid ULID \`${text}\``, { text }, { cause })
+    } catch {
+      throw IdError.invalidUlid(text)
     }
   }
 
@@ -79,18 +82,16 @@ export class IntentId {
 
 function validateId(name: string): void {
   if (name.length === 0) {
-    throw new InvalidError("identifier must not be empty")
+    throw IdError.empty()
   }
   const bytes = new TextEncoder().encode(name)
   if (bytes.length > MAX_ID_LEN) {
-    throw new InvalidError(
-      `identifier length ${String(bytes.length)}B exceeds max ${String(MAX_ID_LEN)}B`
-    )
+    throw IdError.tooLong(bytes.length, MAX_ID_LEN)
   }
   for (const char of name) {
     const codePoint = char.codePointAt(0) ?? 0
     if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) {
-      throw new InvalidError(`identifier contains invalid character \`${char}\``)
+      throw IdError.invalidChar(char)
     }
   }
 }
@@ -103,8 +104,14 @@ export class AgentId {
     return new AgentId(name)
   }
 
-  asString(): string {
+  asStr(): string {
     return this.value
+  }
+
+  /** This agent's identity on the wire: the same name string. A valid SDK
+   * agent id always fits the wire cap. */
+  wireId(): WireAgentId {
+    return parseAgentId(this.value)
   }
 
   toString(): string {
@@ -125,10 +132,10 @@ export class ConsumerGroupName {
   }
 
   static forAgent(agent: AgentId): ConsumerGroupName {
-    return new ConsumerGroupName(agent.asString())
+    return new ConsumerGroupName(agent.asStr())
   }
 
-  asString(): string {
+  asStr(): string {
     return this.value
   }
 
@@ -174,12 +181,30 @@ function isCanonicalDigits(s: string): boolean {
 export function parseMessageId(text: string): MessageId {
   const separator = text.indexOf(":")
   if (separator === -1) {
-    throw new InvalidError(`invalid message id \`${text}\`, expected \`<partition_id>:<offset>\``)
+    throw IdError.invalidMessageId(text)
   }
   const partition = text.slice(0, separator)
   const offset = text.slice(separator + 1)
   if (!isCanonicalDigits(partition) || !isCanonicalDigits(offset)) {
-    throw new InvalidError(`invalid message id \`${text}\`, expected \`<partition_id>:<offset>\``)
+    throw IdError.invalidMessageId(text)
   }
-  return { partitionId: Number(partition), offset: BigInt(offset) }
+  const partitionId = BigInt(partition)
+  const position = BigInt(offset)
+  if (partitionId > MAX_PARTITION_ID || position > MAX_OFFSET) {
+    throw IdError.invalidMessageId(text)
+  }
+  return { partitionId: Number(partitionId), offset: position }
+}
+
+/** An id type a fresh ULID can mint: any wire id built from a raw 128-bit
+ * value. */
+export interface MintUlid<T> {
+  fromU128(value: bigint): T
+}
+
+export const MintUlid: {
+  /** A fresh ULID (time-ordered, human-readable) as this id type. */
+  readonly mint: <T>(id: MintUlid<T>, source?: UlidSource) => T
+} = {
+  mint: (id, source) => id.fromU128(mintUlidValue(source))
 }

@@ -39,7 +39,7 @@ void test("given_the_agent_command_fixture_when_decoded_then_should_validate_and
   assert.equal(envelope.idempotencyKey, "job-123-attempt-2")
   assert.equal(envelope.deadlineMicros, 1_717_171_777_000_000n)
   assert.equal(envelope.operation, "chat")
-  assert.deepEqual(envelope.metadata?.get("priority"), { kind: "string", value: "high" })
+  assert.deepEqual(envelope.metadata?.get("priority"), { kind: "str", value: "high" })
 })
 
 void test("given_the_agent_command_signed_fixture_when_decoded_then_should_preserve_the_signature", async () => {
@@ -121,7 +121,7 @@ void test("given_the_agent_error_fixture_when_decoded_then_should_carry_the_enco
 
 void test("given_the_agent_status_run_metadata_fixture_when_decoded_then_should_preserve_metadata", async () => {
   const envelope = await assertRoundTrips("agent_status_run_metadata.bin")
-  assert.deepEqual(envelope.metadata?.get("run"), { kind: "string", value: "run-7" })
+  assert.deepEqual(envelope.metadata?.get("run"), { kind: "str", value: "run-7" })
 })
 
 const invalidFixtures: readonly [string, RegExp][] = [

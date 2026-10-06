@@ -2,8 +2,13 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import type { Capabilities } from "../../src/client/capabilities.js"
 import { managedCapabilitiesFrom, OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
-import { ForkExecutionError, InvalidError, UnsupportedError } from "../../src/client/errors.js"
-import { Fork } from "../../src/managed/forks.js"
+import {
+  ForkExecutionError,
+  InvalidError,
+  ProtocolError,
+  UnsupportedError
+} from "../../src/client/errors.js"
+import { ForkHandle } from "../../src/managed/forks.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import {
   ForkCreateCommand,
@@ -54,7 +59,10 @@ function fakeTransport(scriptedReplies: readonly Uint8Array[]): {
 
 function fork(forkId: string, replies: readonly Uint8Array[], capabilities: Capabilities = CAPS) {
   const transport = fakeTransport(replies)
-  return { fork: new Fork(transport, () => Promise.resolve(capabilities), forkId), transport }
+  return {
+    fork: ForkHandle.create(transport, () => Promise.resolve(capabilities), forkId),
+    transport
+  }
 }
 
 const INFO: ForkInfo = {
@@ -114,7 +122,7 @@ void test("given_a_written_outcome_when_put_row_is_sent_then_should_use_the_put_
 
 void test("given_a_list_outcome_when_forks_is_listed_then_should_return_every_fork", async () => {
   const { transport } = fork("experiment", [okFrame({ kind: "list", forks: [INFO] })])
-  const forks = await Fork.forks(transport, () => Promise.resolve(CAPS))
+  const forks = await ForkHandle.forks(transport, () => Promise.resolve(CAPS))
   assert.deepEqual(forks, [INFO])
   assert.equal(transport.calls[0]?.code, ForkListCommand.code)
 })
@@ -124,4 +132,9 @@ void test("given_an_err_reply_when_promote_fails_then_should_wrap_it_as_a_fork_e
     replyFrame({ kind: "err", error: { kind: "notFound", message: "no such fork" } })
   ])
   await assert.rejects(() => handle.promote(), ForkExecutionError)
+})
+
+void test("given_an_unexpected_fork_outcome_when_promoted_then_should_raise_a_protocol_error", async () => {
+  const { fork: handle } = fork("f-1", [okFrame({ kind: "written" })])
+  await assert.rejects(handle.promote(), ProtocolError)
 })

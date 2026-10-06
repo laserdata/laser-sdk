@@ -1,7 +1,9 @@
 use crate::cursor::Cursor;
 use crate::error::LaserError;
 use crate::message::Message;
-use crate::stream::{Cbor, Codec, ContentType, Decoder, Json, PublishRequest, Topic};
+use crate::stream::{
+    BatchPublishRequest, Cbor, Codec, ContentType, Decoder, Json, PublishRequest, Topic,
+};
 use crate::types::MessageId;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -77,6 +79,29 @@ impl<T> TypedTopic<T> {
         let mut request = self.topic.publish().raw_bytes(payload, content_type);
         if let Some(id) = schema_id {
             request = request.schema_id(id);
+        }
+        Ok(request)
+    }
+
+    /// Encode every body in `bodies` under the handle's form and open the
+    /// batch publish builder with the payloads, `agdx.ct`, and (for the
+    /// schema-bound form) `agdx.sid` already stamped. Chain batch options,
+    /// then `.send()`. A body that does not encode fails here, so a partly
+    /// valid batch never reaches the wire.
+    pub fn publish_batch<'b>(
+        &self,
+        bodies: impl IntoIterator<Item = &'b T>,
+    ) -> Result<BatchPublishRequest<'_>, LaserError>
+    where
+        T: Serialize + 'b,
+    {
+        let mut request = self.topic.publish_batch();
+        for body in bodies {
+            let (payload, content_type, schema_id) = self.form.encode(body)?;
+            request = request.add_raw_bytes(payload, content_type);
+            if let Some(id) = schema_id {
+                request = request.schema_id(id);
+            }
         }
         Ok(request)
     }
@@ -366,6 +391,17 @@ mod tests {
             host: "node-7".to_owned(),
             cpu: 42,
         }
+    }
+
+    #[test]
+    fn given_typed_bodies_when_batched_then_should_add_one_record_per_body() {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let readings = laser.topic("readings").json::<Reading>();
+        let batch = readings
+            .publish_batch(&[reading(), reading()])
+            .expect("bodies encode");
+        assert_eq!(batch.len(), 2);
+        assert!(readings.publish_batch(&[]).expect("empty").is_empty());
     }
 
     #[test]

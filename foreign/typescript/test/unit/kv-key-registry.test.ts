@@ -46,7 +46,7 @@ function stubLaser(replies: readonly Uint8Array[]): {
     }
   }
   const laser = {
-    kv: (namespace: string) => new Kv(transport, () => Promise.resolve(CAPS), namespace)
+    kv: (namespace: string) => Kv.create(transport, () => Promise.resolve(CAPS), namespace)
   } as unknown as Laser
   return { laser, calls }
 }
@@ -80,6 +80,18 @@ void test("given_no_prior_enrollment_when_enrolled_then_should_write_with_an_abs
   const version = await new KvKeyRegistry(laser).enrollRecord(record)
   assert.equal(version, 1n)
   assert.equal(calls[1]?.code, KvCasCommand.code)
+})
+
+void test("given_a_principal_and_key_when_enrolled_then_should_store_an_agent_record", async () => {
+  const { laser, calls } = stubLaser([
+    okFrame({ kind: "value" }),
+    okFrame({ kind: "committed", version: 1n })
+  ])
+  await new KvKeyRegistry(laser).enroll("enrollee", signer.verifyingKey())
+  const write = calls[1]
+  assert.equal(write?.code, KvCasCommand.code)
+  const stored = Buffer.from(storedBytes())
+  assert.ok(Buffer.from(write.payload).includes(stored), "the agent record bytes are written")
 })
 
 void test("given_a_prior_enrollment_when_re_enrolled_then_should_swap_against_its_version", async () => {

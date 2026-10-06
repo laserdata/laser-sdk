@@ -24,7 +24,7 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host cargo run --example f
 
 ## Where to look (LaserData Cloud)
 
-- Query: the reading-tape index, queried for per-host samples and mean CPU.
+- Query: the reading-tape index `readings_<token>` (the run token keeps a rerun, or another language's example on the same deployment, out of this run's rows), queried for per-host samples and mean CPU.
 - Writer schemas: the `fleet_reading` Avro schema the run registered, with its LaserData-Cloud-allocated id.
 
 ## Highlights

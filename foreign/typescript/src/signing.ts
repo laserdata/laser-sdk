@@ -1,7 +1,7 @@
 import * as ed25519 from "@noble/ed25519"
 import { sha256, sha512 } from "@noble/hashes/sha2.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
-import { SignatureError } from "./client/errors.js"
+import { InvalidError, SignatureError } from "./client/errors.js"
 import type { Laser } from "./client/laser.js"
 import {
   METADATA_DELEGATED_BY,
@@ -68,6 +68,7 @@ export class SigningKey {
     return this.signInner(envelope, context)
   }
 
+  /** @internal */
   signBytes(payload: Uint8Array): Uint8Array {
     return ed25519.sign(payload, this.secret)
   }
@@ -85,14 +86,14 @@ export class SigningKey {
 export class KeyRecord {
   constructor(
     readonly principal: string,
-    readonly verifyingKey: Uint8Array,
+    readonly verifying: Uint8Array,
     readonly kind: KeyKind = KeyKind.Agent,
     readonly validFromMicros = 0n,
     readonly validToMicros?: bigint,
     readonly revoked = false
   ) {
     if (principal.length === 0) throw new SignatureError("key principal must not be empty")
-    if (verifyingKey.byteLength !== PUBLIC_KEY_BYTES) {
+    if (verifying.byteLength !== PUBLIC_KEY_BYTES) {
       throw new SignatureError(`Ed25519 public key must be ${String(PUBLIC_KEY_BYTES)} bytes`)
     }
     if (validToMicros !== undefined && validToMicros <= validFromMicros) {
@@ -108,10 +109,24 @@ export class KeyRecord {
     return new KeyRecord(principal, verifyingKey.slice(), KeyKind.Operator)
   }
 
+  /** Build a record from a 32-byte Ed25519 public verifying key, rejecting
+   * bytes that are not a point on the curve. */
+  static fromVerifyingBytes(principal: string, verifying: Uint8Array, kind: KeyKind): KeyRecord {
+    if (verifying.byteLength !== PUBLIC_KEY_BYTES) {
+      throw new InvalidError("an Ed25519 public key requires exactly 32 bytes")
+    }
+    try {
+      ed25519.Point.fromBytes(verifying)
+    } catch (cause) {
+      throw new InvalidError("invalid Ed25519 public key", undefined, { cause })
+    }
+    return new KeyRecord(principal, verifying.slice(), kind)
+  }
+
   validWindow(fromMicros: bigint, toMicros?: bigint): KeyRecord {
     return new KeyRecord(
       this.principal,
-      this.verifyingKey.slice(),
+      this.verifying.slice(),
       this.kind,
       fromMicros,
       toMicros,
@@ -121,13 +136,13 @@ export class KeyRecord {
 
   /** The 8-byte identifier derived from this record's public key. */
   keyId(): Uint8Array {
-    return sha256(this.verifyingKey).slice(0, KEY_ID_BYTES)
+    return sha256(this.verifying).slice(0, KEY_ID_BYTES)
   }
 
   revoke(): KeyRecord {
     return new KeyRecord(
       this.principal,
-      this.verifyingKey.slice(),
+      this.verifying.slice(),
       this.kind,
       this.validFromMicros,
       this.validToMicros,
@@ -148,7 +163,7 @@ export class KeyRegistry {
   }
 
   enrollRecord(record: KeyRecord): void {
-    this.keys.set(keyIdHex(record.verifyingKey), record)
+    this.keys.set(keyIdHex(record.verifying), record)
   }
 
   verify(envelope: AgentEnvelope): string {
@@ -198,11 +213,7 @@ export class KeyRegistry {
       }
     }
     if (
-      !ed25519.verify(
-        signature.bytes,
-        signingInput(envelope, signature.context),
-        record.verifyingKey
-      )
+      !ed25519.verify(signature.bytes, signingInput(envelope, signature.context), record.verifying)
     ) {
       throw new SignatureError("signature verification failed")
     }
@@ -213,16 +224,18 @@ export class KeyRegistry {
 export class KvKeyRegistry {
   constructor(
     private readonly laser: Laser,
-    readonly namespace = DEFAULT_KEY_NAMESPACE
+    private readonly namespace = DEFAULT_KEY_NAMESPACE
   ) {}
 
-  async enroll(record: KeyRecord): Promise<void> {
-    await this.enrollRecord(record)
+  /** Enrolls `verifyingKey` as `principal`'s agent key. */
+  async enroll(principal: string, verifyingKey: Uint8Array): Promise<void> {
+    await this.enrollRecord(KeyRecord.agent(principal, verifyingKey))
   }
 
+  /** Enrolls or replaces a lifecycle-aware key record with compare-and-swap protection. */
   async enrollRecord(record: KeyRecord): Promise<bigint> {
     const kv = this.laser.kv(this.namespace)
-    const key = new TextEncoder().encode(keyIdHex(record.verifyingKey))
+    const key = new TextEncoder().encode(keyIdHex(record.verifying))
     const current = await kv.getEntry(key)
     const write = kv.set(key).bytes(encodeKeyRecord(record))
     return current === undefined
@@ -239,7 +252,7 @@ export class KvKeyRegistry {
     const current = await kv.getEntry(key)
     if (current === undefined) throw new SignatureError("signing key is not enrolled")
     const record = decodeKeyRecord(current.value)
-    if (keyIdHex(record.verifyingKey) !== bytesToHex(keyId)) {
+    if (keyIdHex(record.verifying) !== bytesToHex(keyId)) {
       throw new SignatureError("key record identifier differs from its storage key")
     }
     if (record.revoked) return current.version
@@ -256,7 +269,7 @@ export class KvKeyRegistry {
     for (const entry of entries) {
       try {
         const record = decodeKeyRecord(entry.value)
-        const expectedKey = new TextEncoder().encode(keyIdHex(record.verifyingKey))
+        const expectedKey = new TextEncoder().encode(keyIdHex(record.verifying))
         if (!equalBytes(entry.key, expectedKey)) continue
         registry.enrollRecord(record)
       } catch {
@@ -277,7 +290,7 @@ export function verifyDelegation(
 ): readonly [string, string] | undefined {
   const signer = registry.verify(envelope)
   const delegated = envelope.metadata?.get(METADATA_DELEGATED_BY)
-  return delegated?.kind === "string" ? [signer, delegated.value] : undefined
+  return delegated?.kind === "str" ? [signer, delegated.value] : undefined
 }
 
 export function signCardValue(key: SigningKey, card: unknown): AgentCardSignature {
@@ -330,8 +343,8 @@ function encodeKeyRecord(record: KeyRecord): Uint8Array {
     encodeStoredKeyRecord({
       v: 1,
       principal: record.principal,
-      keyId: sha256(record.verifyingKey).slice(0, KEY_ID_BYTES),
-      verifyingKey: record.verifyingKey,
+      keyId: sha256(record.verifying).slice(0, KEY_ID_BYTES),
+      verifyingKey: record.verifying,
       kind: record.kind,
       validFromMicros: record.validFromMicros,
       ...(record.validToMicros !== undefined ? { validToMicros: record.validToMicros } : {}),
@@ -366,10 +379,11 @@ function withoutSignatures(card: unknown): unknown {
   return clone
 }
 
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
 function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return JSON.stringify(value)
-  }
+  if (value === null || typeof value === "boolean") return JSON.stringify(value)
+  if (typeof value === "string") return canonicalString(value)
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value)) {
       throw new SignatureError("card canonicalization only accepts safe integers")
@@ -379,11 +393,32 @@ function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
   if (typeof value === "object") {
     const entries = Object.entries(value as Readonly<Record<string, unknown>>).toSorted(
-      ([a], [b]) => a.localeCompare(b)
+      ([a], [b]) => compareUtf8(a, b)
     )
-    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`
+    return `{${entries.map(([key, item]) => `${canonicalString(key)}:${canonicalJson(item)}`).join(",")}}`
   }
   throw new SignatureError("card contains an unsupported JSON value")
+}
+
+function canonicalString(value: string): string {
+  if (LONE_SURROGATE.test(value)) {
+    throw new SignatureError("card canonicalization does not accept lone surrogates")
+  }
+  return JSON.stringify(value)
+}
+
+// Code point order is UTF-8 byte order, the order Rust sorts object keys in.
+function compareUtf8(left: string, right: string): number {
+  let leftIndex = 0
+  let rightIndex = 0
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const leftPoint = left.codePointAt(leftIndex) ?? 0
+    const rightPoint = right.codePointAt(rightIndex) ?? 0
+    if (leftPoint !== rightPoint) return leftPoint - rightPoint
+    leftIndex += leftPoint > 0xffff ? 2 : 1
+    rightIndex += rightPoint > 0xffff ? 2 : 1
+  }
+  return left.length - leftIndex - (right.length - rightIndex)
 }
 
 function base64url(payload: Uint8Array): string {

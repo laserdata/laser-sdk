@@ -2,9 +2,9 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { CodecError } from "../../src/client/errors.js"
-import { messagePackCodec } from "../../src/stream/codecs.js"
+import { Msgpack } from "../../src/stream/codecs.js"
 
-const codec = messagePackCodec((value) => value)
+const codec = new Msgpack()
 
 void test("given_numbers_and_bigints_when_messagepack_encoded_then_should_use_the_rust_integer_bytes", () => {
   const values: readonly [number | bigint, readonly number[]][] = [

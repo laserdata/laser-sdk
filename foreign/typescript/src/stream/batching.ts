@@ -1,6 +1,7 @@
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
 import { InvalidError, PublishFailedError } from "../client/errors.js"
-import type { IggyHeaderValue, MessageWithHeaders } from "../iggy/apache-iggy.js"
+import type { MessageWithHeaders } from "../iggy/apache-iggy.js"
+import type { HeaderValue } from "./header-value.js"
 
 /** Flush at this many queued records unless overridden. */
 export const DEFAULT_MAX_RECORDS = 512
@@ -27,7 +28,16 @@ export class BatchingProducerBuilder {
   private lingerValue = DEFAULT_LINGER_MS
   private partitionKeyValue: Uint8Array | undefined
 
-  constructor(private readonly sink: BatchSink) {}
+  private constructor(
+    private readonly sink: BatchSink,
+    private readonly stream: string,
+    private readonly topic: string
+  ) {}
+
+  /** @internal */
+  static create(sink: BatchSink, stream: string, topic: string): BatchingProducerBuilder {
+    return new BatchingProducerBuilder(sink, stream, topic)
+  }
 
   /** Flush once this many records are queued. */
   maxRecords(count: number): this {
@@ -62,8 +72,9 @@ export class BatchingProducerBuilder {
 
   /** Builds the handle and starts its linger timer. */
   build(): BatchingProducer {
-    return new BatchingProducer(
+    return BatchingProducer.create(
       this.sink,
+      { stream: this.stream, topic: this.topic },
       this.partitionKeyValue,
       this.maxRecordsValue,
       this.maxBytesValue,
@@ -79,9 +90,9 @@ export class BatchingProducerBuilder {
  * timer.
  *
  * A failed linger flush never stops the timer. Its failure is kept and thrown
- * by the next `flush()` or `close()`, after that call has drained the queue.
- * When several batches fail before the caller asks, the report is one
- * `PublishFailedError` that lists the records of all of them.
+ * by the next `send()`, `flush()`, or `close()`. When several batches fail
+ * before the caller asks, the report is one `PublishFailedError` that lists
+ * the records of all of them.
  */
 export class BatchingProducer implements AsyncDisposable {
   private queue: MessageWithHeaders[] = []
@@ -91,8 +102,9 @@ export class BatchingProducer implements AsyncDisposable {
   private closed = false
   private failure: { readonly error: unknown } | undefined
 
-  constructor(
+  private constructor(
     private readonly sink: BatchSink,
+    private readonly target: { readonly stream: string; readonly topic: string },
     private readonly partitionKey: Uint8Array | undefined,
     private readonly maxRecords: number,
     private readonly maxBytes: number,
@@ -104,17 +116,39 @@ export class BatchingProducer implements AsyncDisposable {
     this.timer.unref()
   }
 
+  /** @internal */
+  static create(
+    sink: BatchSink,
+    target: { readonly stream: string; readonly topic: string },
+    partitionKey: Uint8Array | undefined,
+    maxRecords: number,
+    maxBytes: number,
+    lingerMs: number
+  ): BatchingProducer {
+    return new BatchingProducer(sink, target, partitionKey, maxRecords, maxBytes, lingerMs)
+  }
+
   /** Enqueues one payload with optional headers. Flushes inline when a size
    * bound trips, so backpressure lands on the sender. An error is the failure
-   * of that inline flush and lists this record as unconfirmed. A failed linger
-   * flush is reported by `flush()` or `close()`, never here. */
+   * of that inline flush and lists this record as unconfirmed. A failure an
+   * earlier linger flush left is thrown here instead of queueing the record,
+   * with this record added to its unconfirmed list, so a failing topic never
+   * grows the queue. */
   async send(
     payload: BytesLike,
-    headers: ReadonlyMap<string, IggyHeaderValue> = new Map()
+    headers: ReadonlyMap<string, HeaderValue> = new Map()
   ): Promise<void> {
     if (this.closed) throw new InvalidError("send() called after close()")
     const bytes = ownedBytes(payload)
-    this.queue.push({ payload: bytes, headers: new Map(headers) })
+    const record = { payload: bytes, headers: new Map(headers) }
+    // A flush in flight may still keep a failure, so the check waits for it.
+    await this.flushing
+    const kept = this.failure
+    if (kept !== undefined) {
+      this.failure = undefined
+      throw refuse(kept.error, record, this.target)
+    }
+    this.queue.push(record)
     this.payloadBytes += bytes.byteLength
     if (this.queue.length >= this.maxRecords || this.payloadBytes >= this.maxBytes) {
       await this.drain("send")
@@ -194,6 +228,26 @@ function mergeFailures(earlier: unknown, later: unknown): unknown {
     [...earlier.committed, ...later.committed],
     [...earlier.unconfirmed, ...later.unconfirmed],
     earlier.cause
+  )
+}
+
+// A kept failure reported to a sender, with the sender's record added to the
+// unconfirmed records because it was never queued. A kept failure that lists
+// no records becomes the cause of a publish failure for this one record.
+function refuse(
+  failure: unknown,
+  record: MessageWithHeaders,
+  target: { readonly stream: string; readonly topic: string }
+): PublishFailedError {
+  if (!(failure instanceof PublishFailedError)) {
+    return new PublishFailedError(target.stream, target.topic, [], [record], failure)
+  }
+  return new PublishFailedError(
+    failure.stream,
+    failure.topic,
+    failure.committed,
+    [...failure.unconfirmed, record],
+    failure.cause
   )
 }
 

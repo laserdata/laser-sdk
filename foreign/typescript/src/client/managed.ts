@@ -1,13 +1,18 @@
 import type { LaserTransport } from "../iggy/apache-iggy.js"
+import { decodeOne } from "../wire/cbor.js"
 import type { ManagedCommand } from "../wire/commands.js"
+import { ResultCodeName } from "../wire/result.js"
 import {
   CheckpointExecutionError,
   FilterExecutionError,
   ForkExecutionError,
   GraphExecutionError,
+  InvalidError,
   KvExecutionError,
+  type LaserError,
   ProtocolError,
-  QueryExecutionError
+  QueryExecutionError,
+  UnsupportedError
 } from "./errors.js"
 import { type Capabilities, requireCapability } from "./capabilities.js"
 
@@ -69,5 +74,57 @@ export async function executeManaged<Request, Reply>(
   command.validate?.(request)
   const payload = command.encode(request)
   const reply = await transport.sendManaged(command.code, payload, options)
-  return command.decode(reply)
+  return decodeManagedReply((bytes) => command.decode(bytes), reply)
+}
+
+const RESULT_CODE_BY_WIRE_NAME: ReadonlyMap<string, keyof typeof ResultCodeName> = new Map(
+  (Object.keys(ResultCodeName) as (keyof typeof ResultCodeName)[]).map((name) => [
+    name.replace(/(?<!^)([A-Z])/g, "_$1").toLowerCase(),
+    name
+  ])
+)
+
+/** Decodes a typed managed reply, or the surface-agnostic command error a
+ * server answers for a code it does not handle. */
+export function decodeManagedReply<Reply>(
+  decode: (reply: Uint8Array) => Reply,
+  reply: Uint8Array
+): Reply {
+  try {
+    return decode(reply)
+  } catch (error) {
+    throw commandErrorOf(reply) ?? error
+  }
+}
+
+function commandErrorOf(reply: Uint8Array): LaserError | undefined {
+  let value: unknown
+  try {
+    value = decodeOne(reply, "CommandError")
+  } catch {
+    return undefined
+  }
+  if (!(value instanceof Map)) return undefined
+  const wireCode: unknown = value.get("code")
+  const message: unknown = value.get("message")
+  if (typeof message !== "string") return undefined
+  // A code from a newer peer arrives as `{ unrecognized: n }`.
+  const unrecognized: unknown =
+    wireCode instanceof Map && wireCode.size === 1 ? wireCode.get("unrecognized") : undefined
+  if (
+    typeof unrecognized === "number" &&
+    Number.isInteger(unrecognized) &&
+    unrecognized >= 0 &&
+    unrecognized <= 0xffff
+  ) {
+    return new ProtocolError(`Unrecognized(${String(unrecognized)}): ${message}`, {
+      resultCode: unrecognized
+    })
+  }
+  if (typeof wireCode !== "string") return undefined
+  const name = RESULT_CODE_BY_WIRE_NAME.get(wireCode)
+  if (name === undefined) return undefined
+  if (name === "Unsupported") return new UnsupportedError(message, { surface: "managed" })
+  if (name === "InvalidArgument" || name === "VersionSkew") return new InvalidError(message)
+  return new ProtocolError(`${name}: ${message}`, { resultCode: ResultCodeName[name] })
 }

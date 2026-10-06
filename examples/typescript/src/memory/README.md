@@ -40,7 +40,7 @@ Run `npm run setup` once, then run from `examples/typescript`:
 npm run example:memory
 ```
 
-The vector phase needs no server. Durable memory and graph traversal require Laser Stack or LaserData Cloud.
+The vector phase needs no server. Durable memory and graph traversal require Laser Stack or LaserData Cloud. Without `LASER_CONNECTION_STRING` or `LASER_SERVER` set, the example runs only the vector phase and never connects.
 
 Run every phase against Laser Stack.
 

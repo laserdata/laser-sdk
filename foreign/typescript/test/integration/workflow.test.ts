@@ -36,6 +36,7 @@ void test("given_a_completed_workflow_when_resumed_then_should_replay_without_re
           )
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -88,6 +89,7 @@ void test("given_a_later_verifier_failure_when_running_then_should_compensate_co
           return context.respond(textEncoder.encode(`ok:${body}`))
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 

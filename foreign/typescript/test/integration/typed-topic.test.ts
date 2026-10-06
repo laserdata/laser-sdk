@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
 import { Laser } from "../../src/client/laser.js"
-import { jsonCodec } from "../../src/stream/codecs.js"
+import { Json } from "../../src/stream/codecs.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -37,7 +37,7 @@ void test("given_a_typed_topic_when_publishing_and_reading_records_then_should_d
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const readings = topic.json(jsonCodec(decodeReading))
+    const readings = topic.json(new Json(decodeReading))
     await readings.publish({ host: "node-1", cpu: 42 })
 
     const records = await readings.records("readings-one")
@@ -46,7 +46,7 @@ void test("given_a_typed_topic_when_publishing_and_reading_records_then_should_d
     const [result] = results
     assert.ok(result?.kind === "record")
     assert.deepEqual(result.record.value, { host: "node-1", cpu: 42 })
-    assert.equal(result.record.partitionId, 0)
+    assert.equal(result.record.position.partitionId, 0)
     assert.deepEqual(result.record.position, { partitionId: 0, offset: 0n })
     assert.deepEqual(result.record.headers.get("agdx.ct"), { kind: "uint8", value: 1 })
   } finally {
@@ -58,7 +58,7 @@ void test("given_a_typed_topic_when_publishing_a_batch_then_should_decode_every_
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const readings = topic.json(jsonCodec(decodeReading))
+    const readings = topic.json(new Json(decodeReading))
     const committed = await readings.publishBatch([
       { host: "node-1", cpu: 1 },
       { host: "node-2", cpu: 2 }
@@ -86,7 +86,7 @@ void test("given_a_poison_record_among_good_ones_when_polled_then_should_report_
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const readings = topic.json(jsonCodec(decodeReading))
+    const readings = topic.json(new Json(decodeReading))
 
     await topic.send(new TextEncoder().encode(JSON.stringify({ host: "node-1", cpu: 1 })))
     await topic.send(new TextEncoder().encode("not valid json"))

@@ -49,11 +49,20 @@ export interface SubmitOptions {
 }
 
 export class Runs {
-  constructor(
+  private constructor(
     private readonly backend: RunsBackend,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly publishControl: PublishControl
   ) {}
+
+  /** @internal */
+  static create(
+    backend: RunsBackend,
+    getCapabilities: () => Promise<Capabilities>,
+    publishControl: PublishControl
+  ): Runs {
+    return new Runs(backend, getCapabilities, publishControl)
+  }
 
   async submit(agentId: string, input?: Uint8Array): Promise<AgentRunInfo> {
     return this.submitWith(agentId, { ...(input !== undefined ? { input } : {}) })
@@ -95,7 +104,7 @@ export class Runs {
   }
 
   list(): RunListRequest {
-    return new RunListRequest(this.backend, this.getCapabilities)
+    return RunListRequest.create(this.backend, this.getCapabilities)
   }
 
   async registerSource(stream: string, topic: string): Promise<void> {
@@ -113,10 +122,18 @@ export class RunListRequest {
   private limitValue: number | undefined
   private cursorValue: Uint8Array | undefined
 
-  constructor(
+  private constructor(
     private readonly backend: RunsBackend,
     private readonly getCapabilities: () => Promise<Capabilities>
   ) {}
+
+  /** @internal */
+  static create(
+    backend: RunsBackend,
+    getCapabilities: () => Promise<Capabilities>
+  ): RunListRequest {
+    return new RunListRequest(backend, getCapabilities)
+  }
 
   agent(agentId: string): this {
     this.agentIdFilter = agentId

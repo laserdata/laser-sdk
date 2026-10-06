@@ -33,8 +33,8 @@ def enable_destination(bench, name, global_revision, definition_revision):
     )
 )
 def record_gap(bench, required, retained):
-    assert retained >= required
-    bench.data_stack.record_gap("readings-lakehouse")
+    bench.data_stack.record_gap("readings-lakehouse", required, retained)
+    assert bench.data_stack.error is None
 
 
 @when(
@@ -45,6 +45,7 @@ def record_gap(bench, required, retained):
 )
 def accept_gap(bench, next_offset, checkpoint_revision):
     bench.data_stack.accept_gap("readings-lakehouse", next_offset, checkpoint_revision)
+    assert bench.data_stack.error is None
 
 
 @then("the operation is accepted with a stable identity")

@@ -1,6 +1,6 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, json_to_py, payload_bytes, py_to_de, ser_to_py};
+use crate::convert::{duration_seconds, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use iggy::prelude::{Identifier, IggyTimestamp};
 use laser_sdk::agent::AgentMessage;
@@ -22,33 +22,6 @@ fn parse_conversation_id(value: Option<String>) -> PyResult<ConversationId> {
         Some(value) => ConversationId::from_str(&value).map_err(|e| to_pyerr(e.into())),
         None => Ok(ConversationId::new()),
     }
-}
-
-/// Round-trip an AGDX event with the required feature bits and report whether
-/// a receiver's understood bitset satisfies it.
-#[gen_stub_pyfunction]
-#[pyfunction]
-pub fn agent_event_is_understood(required: u64, understood: u64) -> PyResult<bool> {
-    use laser_sdk::wire::agent::{
-        AgentEnvelope, AgentId as WireAgentId, ConversationId as WireConversationId, RecordId,
-    };
-    use laser_sdk::wire::framing::{decode_named, encode_named};
-
-    let source = "sender"
-        .parse::<WireAgentId>()
-        .map_err(|error| InvalidError::new_err(error.to_string()))?;
-    let envelope = AgentEnvelope::event(
-        RecordId::from_u128(1),
-        WireConversationId::from_u128(2),
-        source,
-        b"event".to_vec(),
-    )
-    .requiring(required);
-    let payload =
-        encode_named(&envelope).map_err(|error| InvalidError::new_err(error.to_string()))?;
-    let decoded: AgentEnvelope =
-        decode_named(&payload).map_err(|error| InvalidError::new_err(error.to_string()))?;
-    Ok(decoded.unmet_requirements(understood) == 0)
 }
 
 // One argument per optional provenance field, mirroring the Python constructor's
@@ -185,6 +158,12 @@ impl PyProvenance {
         self.inner.conversation_id.to_string()
     }
 
+    /// The Iggy partition key (the conversation id), so one conversation
+    /// stays ordered.
+    fn partition_key(&self) -> String {
+        self.inner.partition_key()
+    }
+
     #[getter]
     fn parent_conversation_id(&self) -> Option<String> {
         self.inner.parent_conversation_id.map(|id| id.to_string())
@@ -228,19 +207,17 @@ impl PyProvenance {
         self.inner.fence_token
     }
 
+    /// The drop-dead time in microseconds since the Unix epoch. A consumer past
+    /// it dead-letters the message.
     #[getter]
-    fn input_tokens(&self) -> Option<u64> {
-        self.inner.usage.as_ref().and_then(|u| u.input_tokens)
+    fn deadline(&self) -> Option<u64> {
+        self.inner.deadline.map(|deadline| deadline.as_micros())
     }
 
+    /// The token and cost usage of the LLM call this message records, if any.
     #[getter]
-    fn output_tokens(&self) -> Option<u64> {
-        self.inner.usage.as_ref().and_then(|u| u.output_tokens)
-    }
-
-    #[getter]
-    fn cost_usd(&self) -> Option<f64> {
-        self.inner.usage.as_ref().and_then(|u| u.cost_usd)
+    fn usage(&self) -> Option<PyLlmUsage> {
+        self.inner.usage.clone().map(|inner| PyLlmUsage { inner })
     }
 
     fn __repr__(&self) -> String {
@@ -253,38 +230,53 @@ impl PyProvenance {
     }
 }
 
+/// Token and cost usage for an LLM call, carried on provenance for rollup.
+#[gen_stub_pyclass]
+#[pyclass(name = "LlmUsage", frozen)]
+pub struct PyLlmUsage {
+    inner: LlmUsage,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyLlmUsage {
+    /// Prompt tokens, if known.
+    #[getter]
+    fn input_tokens(&self) -> Option<u64> {
+        self.inner.input_tokens
+    }
+
+    /// Completion tokens, if known.
+    #[getter]
+    fn output_tokens(&self) -> Option<u64> {
+        self.inner.output_tokens
+    }
+
+    /// Call cost in USD, if known.
+    #[getter]
+    fn cost_usd(&self) -> Option<f64> {
+        self.inner.cost_usd
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LlmUsage(input_tokens={:?}, output_tokens={:?}, cost_usd={:?})",
+            self.inner.input_tokens, self.inner.output_tokens, self.inner.cost_usd
+        )
+    }
+}
+
 /// A message delivered to / received by an agent: decoded provenance, raw
 /// payload, log position, and the AGDX envelope when present.
 #[gen_stub_pyclass]
 #[pyclass(name = "AgentMessage", frozen)]
 pub struct PyAgentMessage {
     pub(crate) inner: AgentMessage,
-    pub(crate) topic: Option<String>,
 }
 
 impl PyAgentMessage {
     pub(crate) fn from_inner(inner: AgentMessage) -> Self {
-        Self { inner, topic: None }
-    }
-
-    pub(crate) fn from_context(message: laser_sdk::context::ContextMessage) -> Self {
-        Self {
-            inner: AgentMessage {
-                provenance: message.provenance,
-                payload: message.payload,
-                id: message.id,
-                envelope: message.envelope,
-                content_type: None,
-                verified_principal: None,
-            },
-            topic: Some(message.topic),
-        }
-    }
-
-    // The decoded AGDX envelope, for the chunk reassembler to feed the stream
-    // state machine. `None` for a plain (non-AGDX) message.
-    pub(crate) fn agdx_envelope(&self) -> Option<&laser_sdk::wire::agent::AgentEnvelope> {
-        self.inner.envelope.as_ref()
+        Self { inner }
     }
 }
 
@@ -296,18 +288,20 @@ impl PyAgentMessage {
         self.inner.payload.clone()
     }
 
-    /// The topic this message was read from, when it came off a context
-    /// read (`ContextScope.fetch`, `Session.context`). `None` for a consumed
-    /// message, whose consumer knows its topic.
-    #[getter]
-    fn topic(&self) -> Option<String> {
-        self.topic.clone()
-    }
-
     /// The enrolled principal that signed this verified contract reply.
     #[getter]
     fn verified_principal(&self) -> Option<String> {
         self.inner.verified_principal.clone()
+    }
+
+    /// The stamped content type of `body()` (`json`, `cbor`, `ref`, ...), or
+    /// `None` when the producer stamped none. `ref` marks a claim-checked body
+    /// that `resolve_body` fetches.
+    #[getter]
+    fn content_type(&self) -> Option<String> {
+        self.inner
+            .content_type
+            .map(|content_type| content_type.to_string())
     }
 
     /// The task body regardless of message shape: the AGDX envelope body for a
@@ -340,9 +334,10 @@ impl PyAgentMessage {
         )
     }
 
+    /// Where the message sits on the log (partition and offset).
     #[getter]
-    fn message_id(&self) -> String {
-        self.inner.id.to_string()
+    fn id(&self) -> crate::ids::PyMessageId {
+        self.inner.id.into()
     }
 
     #[getter]
@@ -352,30 +347,6 @@ impl PyAgentMessage {
         }
     }
 
-    #[getter]
-    fn conversation_id(&self) -> String {
-        self.inner.provenance.conversation_id.to_string()
-    }
-
-    #[getter]
-    fn agent(&self) -> Option<String> {
-        self.inner
-            .provenance
-            .agent
-            .as_ref()
-            .map(|a| a.as_str().to_owned())
-    }
-
-    #[getter]
-    fn idempotency_key(&self) -> Option<String> {
-        self.inner.provenance.idempotency_key.clone()
-    }
-
-    #[getter]
-    fn correlation_id(&self) -> Option<String> {
-        self.inner.provenance.correlation_id.clone()
-    }
-
     /// The decoded AGDX envelope as a dict, or `None` for a plain message.
     #[getter]
     fn envelope(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -383,24 +354,6 @@ impl PyAgentMessage {
             Some(envelope) => ser_to_py(py, envelope),
             None => Ok(py.None()),
         }
-    }
-
-    /// The decoded AGDX envelope's body bytes, or `None` for a plain message.
-    /// Unlike `payload` (the raw CBOR envelope for an AGDX message), this is the
-    /// inner body the producer sent.
-    #[getter]
-    fn agdx_body(&self) -> Option<Vec<u8>> {
-        self.inner
-            .envelope
-            .as_ref()
-            .map(|envelope| envelope.body.clone())
-    }
-
-    /// Decode the payload as JSON into a Python value.
-    fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value: serde_json::Value = serde_json::from_slice(&self.inner.payload)
-            .map_err(|e| crate::errors::CodecError::new_err(e.to_string()))?;
-        json_to_py(py, &value)
     }
 
     fn __repr__(&self) -> String {
@@ -510,32 +463,46 @@ impl PyLaser {
     }
 }
 
-/// The well-known agent topic names, so callers reference `Topics.COMMANDS`
-/// instead of retyping the string. Any other name works too: the agent methods
-/// take a plain topic string.
+/// The well-known agent topic names, so callers reference
+/// `AgentTopic.Commands` instead of retyping the string. Each variant is the
+/// topic name string. Any other name works too: the agent methods take a
+/// plain topic string.
 #[gen_stub_pyclass]
-#[pyclass(name = "Topics", frozen)]
-pub struct PyTopics;
+#[pyclass(name = "AgentTopic", frozen)]
+pub struct PyAgentTopic;
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl PyTopics {
+#[allow(non_upper_case_globals)]
+impl PyAgentTopic {
     #[classattr]
-    const COMMANDS: &'static str = "agent.commands";
+    const Commands: &'static str = topic_name(AgentTopic::Commands);
     #[classattr]
-    const RESPONSES: &'static str = "agent.responses";
+    const Responses: &'static str = topic_name(AgentTopic::Responses);
     #[classattr]
-    const TOOL_CALLS: &'static str = "agent.tool_calls";
+    const ToolCalls: &'static str = topic_name(AgentTopic::ToolCalls);
     #[classattr]
-    const TOOL_RESULTS: &'static str = "agent.tool_results";
+    const ToolResults: &'static str = topic_name(AgentTopic::ToolResults);
     #[classattr]
-    const LLM_IO: &'static str = "agent.llm_io";
+    const LlmIo: &'static str = topic_name(AgentTopic::LlmIo);
     #[classattr]
-    const HUMAN_INPUT: &'static str = "agent.human_input";
+    const HumanInput: &'static str = topic_name(AgentTopic::HumanInput);
     #[classattr]
-    const AUDIT: &'static str = "agent.audit";
+    const Audit: &'static str = topic_name(AgentTopic::Audit);
     #[classattr]
-    const DLQ: &'static str = "agent.dlq";
+    const Registry: &'static str = topic_name(AgentTopic::Registry);
+    #[classattr]
+    const WorkflowJournal: &'static str = topic_name(AgentTopic::WorkflowJournal);
+    #[classattr]
+    const Dlq: &'static str = topic_name(AgentTopic::Dlq);
+}
+
+// A well-known topic's static name. Every variant bound above has one.
+const fn topic_name(topic: AgentTopic<'static>) -> &'static str {
+    match topic.name() {
+        Some(name) => name,
+        None => "",
+    }
 }
 
 // A fresh, random conversation id (a time-ordered ULID).
@@ -543,14 +510,6 @@ impl PyTopics {
 #[pyfunction]
 pub fn new_conversation_id() -> String {
     ConversationId::new().to_string()
-}
-
-// A fresh request/reply correlation id, for the typed AGDX `command` / `respond`.
-#[gen_stub_pyfunction]
-#[pyfunction]
-pub fn new_correlation_id() -> String {
-    use laser_sdk::types::MintUlid;
-    laser_sdk::wire::agent::CorrelationId::mint().to_string()
 }
 
 /// A stable conversation id derived from `seed` (the same seed always yields the

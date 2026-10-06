@@ -9,14 +9,18 @@ use std::collections::BTreeMap;
 /// How much of a conversation's log a state fold replays. Explicit at every
 /// call (the bounded-reads law): a long-lived conversation is a long
 /// partition, and a full-partition walk must be the caller writing the word,
-/// never a silent default.
+/// never a silent default. Every bound except [`Last`](Self::Last) folds its
+/// whole range, read in bounded chunks.
 pub enum ReplayBound {
     /// Fold only messages at or after these per-partition offsets, the
     /// incremental form (a persisted cursor, a snapshot's resume offsets).
     /// One map shared across every topic in `topics`.
     /// [`FromCheckpoint`](Self::FromCheckpoint) bounds each topic on its own.
     FromOffsets(BTreeMap<u32, u64>),
-    /// Fold only the last `n` messages.
+    /// Fold only the last `n` messages found in the newest
+    /// [`CONTEXT_READ_WINDOW`](crate::context::CONTEXT_READ_WINDOW) records of
+    /// each partition, the window a context read covers. On a busy shared
+    /// partition a quiet conversation can have fewer than `n` there.
     Last(usize),
     /// Fold the whole partition from offset zero. Correct for a short
     /// conversation and for a first snapshot build, expensive everywhere else.
@@ -55,7 +59,7 @@ impl ConversationState {
                     .policy(Box::new(crate::context::LastN(usize::MAX)))
                     .from_offsets(offsets)
                     .build()
-                    .assemble(laser)
+                    .replay(laser)
                     .await?
             }
             ReplayBound::Last(n) => {
@@ -69,7 +73,7 @@ impl ConversationState {
                 assembler
                     .policy(Box::new(crate::context::LastN(usize::MAX)))
                     .build()
-                    .assemble(laser)
+                    .replay(laser)
                     .await?
             }
             ReplayBound::FromCheckpoint(checkpoint) => {
@@ -77,7 +81,7 @@ impl ConversationState {
                     .policy(Box::new(crate::context::LastN(usize::MAX)))
                     .from_checkpoint(checkpoint)
                     .build()
-                    .assemble(laser)
+                    .replay(laser)
                     .await?
             }
             ReplayBound::At(checkpoint) => {
@@ -85,7 +89,7 @@ impl ConversationState {
                     .policy(Box::new(crate::context::LastN(usize::MAX)))
                     .to_checkpoint(checkpoint)
                     .build()
-                    .assemble(laser)
+                    .replay(laser)
                     .await?
             }
         };

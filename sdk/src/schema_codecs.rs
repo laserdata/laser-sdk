@@ -138,9 +138,11 @@ impl CompiledSchema {
                     .map_err(|error| {
                         LaserError::Codec(format!("payload does not decode as Avro: {error}"))
                     })?;
-                apache_avro::from_value::<serde_json::Value>(&value).map_err(|error| {
-                    LaserError::Codec(format!("Avro value does not lower to JSON: {error}"))
-                })
+                apache_avro::from_value::<serde_json::Value>(&bytes_as_arrays(value)).map_err(
+                    |error| {
+                        LaserError::Codec(format!("Avro value does not lower to JSON: {error}"))
+                    },
+                )
             }
             Self::Protobuf(descriptor) => {
                 let message =
@@ -184,7 +186,7 @@ impl CompiledSchema {
         let json = serde_json::to_value(body)
             .map_err(|error| LaserError::Codec(format!("body does not lower to JSON: {error}")))?;
         let resolved = apache_avro::types::Value::try_from(json)
-            .and_then(|value| value.resolve(schema))
+            .and_then(|value| arrays_as_bytes(value, schema).resolve(schema))
             .map_err(|error| {
                 LaserError::Codec(format!("body does not match the Avro schema: {error}"))
             })?;
@@ -195,9 +197,131 @@ impl CompiledSchema {
     }
 }
 
+// The inverse of `bytes_as_arrays`, guided by the schema: a JSON array of byte
+// values in a `bytes` or `fixed` position becomes Avro bytes, which also
+// resolves into `fixed`. Arrays anywhere else stay arrays.
+fn arrays_as_bytes(
+    value: apache_avro::types::Value,
+    schema: &apache_avro::Schema,
+) -> apache_avro::types::Value {
+    use apache_avro::Schema;
+    use apache_avro::types::Value;
+    match (schema, value) {
+        (Schema::Bytes | Schema::Fixed(_), Value::Array(items)) => {
+            let bytes: Option<Vec<u8>> = items
+                .iter()
+                .map(|item| match item {
+                    Value::Int(byte) => u8::try_from(*byte).ok(),
+                    Value::Long(byte) => u8::try_from(*byte).ok(),
+                    _ => None,
+                })
+                .collect();
+            bytes.map_or(Value::Array(items), Value::Bytes)
+        }
+        (Schema::Array(array), Value::Array(items)) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| arrays_as_bytes(item, &array.items))
+                .collect(),
+        ),
+        (Schema::Map(map), Value::Map(entries)) => Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, item)| (key, arrays_as_bytes(item, &map.types)))
+                .collect(),
+        ),
+        (Schema::Record(record), Value::Map(entries)) => Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, item)| {
+                    let item = match record.fields.iter().find(|field| field.name == key) {
+                        Some(field) => arrays_as_bytes(item, &field.schema),
+                        None => item,
+                    };
+                    (key, item)
+                })
+                .collect(),
+        ),
+        (Schema::Union(union), value) => {
+            let variant = union.variants().iter().find(|variant| {
+                matches!(
+                    (variant, &value),
+                    (Schema::Bytes | Schema::Fixed(_), Value::Array(_))
+                        | (Schema::Record(_) | Schema::Map(_), Value::Map(_))
+                )
+            });
+            let has_array = union
+                .variants()
+                .iter()
+                .any(|variant| matches!(variant, Schema::Array(_)));
+            match variant {
+                Some(variant) if !(has_array && matches!(value, Value::Array(_))) => {
+                    arrays_as_bytes(value, variant)
+                }
+                _ => value,
+            }
+        }
+        (_, value) => value,
+    }
+}
+
+// JSON has no byte type, so an Avro `bytes` or `fixed` value lowers to an
+// array of byte values, the same shape `encode_avro` accepts for that field.
+fn bytes_as_arrays(value: apache_avro::types::Value) -> apache_avro::types::Value {
+    use apache_avro::types::Value;
+    match value {
+        Value::Bytes(bytes) | Value::Fixed(_, bytes) => Value::Array(
+            bytes
+                .into_iter()
+                .map(|byte| Value::Int(i32::from(byte)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(bytes_as_arrays).collect()),
+        Value::Map(entries) => Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, item)| (key, bytes_as_arrays(item)))
+                .collect(),
+        ),
+        Value::Record(fields) => Value::Record(
+            fields
+                .into_iter()
+                .map(|(name, item)| (name, bytes_as_arrays(item)))
+                .collect(),
+        ),
+        Value::Union(index, item) => Value::Union(index, Box::new(bytes_as_arrays(*item))),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_bytes_and_fixed_fields_when_encoded_then_should_decode_back() {
+        let def = SchemaDef {
+            id: 8,
+            source: SchemaSource::Avro {
+                schema: r#"{
+                    "type":"record","name":"Frame",
+                    "fields":[
+                        {"name":"body","type":"bytes"},
+                        {"name":"digest","type":{"type":"fixed","name":"Digest","size":2}},
+                        {"name":"tag","type":["null","bytes"]}
+                    ]
+                }"#
+                .to_owned(),
+            },
+            name: None,
+            version: None,
+        };
+        let compiled = CompiledSchema::compile(&def).expect("schema compiles");
+        let body = serde_json::json!({"body": [1, 2, 255], "digest": [7, 9], "tag": [4]});
+        let datum = compiled.encode_avro(&body).expect("body encodes");
+        assert!(compiled.validate(&datum), "own encoding validates");
+        assert_eq!(compiled.decode(&datum).expect("datum decodes"), body);
+    }
 
     const READING_AVRO_SCHEMA: &str = r#"{
         "type":"record","name":"Reading",

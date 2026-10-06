@@ -10,9 +10,8 @@ pub use laser_wire::codes::{
     AGDX_KV_SET_CODE, KV_LEASE_OP_VERSION, KV_OP_VERSION,
 };
 pub use laser_wire::kv::{
-    CasExpect, KvCas, KvCasFenced, KvCopy, KvDelete, KvDeleteMany, KvEntry, KvError, KvExists,
-    KvExpire, KvGet, KvLease, KvLeaseRenew, KvMetadata, KvMove, KvNamespaceInfo, KvNamespaces,
-    KvOutcome, KvPage, KvPatch, KvRelease, KvReply, KvScan, KvSet,
+    CasExpect, KvCasFenced, KvEntry, KvError, KvGet, KvLease, KvLeaseRenew, KvMetadata,
+    KvNamespaceInfo, KvPage, KvRelease,
 };
 pub use laser_wire::limits::{
     DEFAULT_NAMESPACE, DEFAULT_SCAN_LIMIT, MAX_HOLDER_ID_BYTES, MAX_KEY_BYTES,

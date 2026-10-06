@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{PyHook, future_into_py};
 use crate::client::PyLaser;
 use crate::errors::{InvalidError, to_pyerr};
 use async_trait::async_trait;
@@ -6,12 +6,12 @@ use laser_sdk::LaserError;
 use laser_sdk::govern::{
     ActionCounters, ActionDecision, ActionGovernor, ActionKind, GovernedAction, GovernorMode,
     GovernorRetention, PolicyEvidence, PolicyRef, QuorumGovernor, QuorumPolicy, SwappableGovernor,
+    Verdict,
 };
 use laser_sdk::types::ConversationId;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3_async_runtimes::tokio::into_future;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::sync::{Arc, RwLock};
 
 #[gen_stub_pymethods]
@@ -26,60 +26,106 @@ impl PyLaser {
     /// evidence chain are fresh. Agents spawned from the governed handle
     /// inherit it.
     #[pyo3(signature = (governor, mode="enforce"))]
-    fn with_governor(&self, governor: Py<PyAny>, mode: &str) -> PyResult<PyLaser> {
+    fn with_governor(&self, governor: &Bound<'_, PyAny>, mode: &str) -> PyResult<PyLaser> {
         let mode = parse_mode(mode)?;
         Ok(PyLaser::from_inner(self.inner.with_governor(
-            Arc::new(PyActionGovernor { hooks: governor }),
+            Arc::new(PyActionGovernor::new(governor)?),
             mode,
         )))
     }
 
-    /// `with_governor` with an explicit retention policy for the process-local
-    /// evidence-chain heads: at most `capacity` conversations (default 4096),
-    /// and a head idle for `idle_ttl_secs` (default 3600) may be evicted.
-    /// Eviction or a process restart starts a new local chain for that
-    /// conversation.
-    #[pyo3(signature = (governor, mode="enforce", *, capacity=4096, idle_ttl_secs=3600.0))]
+    /// `with_governor` with an explicit `GovernorRetention` for the
+    /// process-local evidence-chain heads. Eviction or a process restart
+    /// starts a new local chain for that conversation.
     fn with_governor_retention(
         &self,
-        governor: Py<PyAny>,
+        governor: &Bound<'_, PyAny>,
         mode: &str,
-        capacity: usize,
-        idle_ttl_secs: f64,
+        retention: PyGovernorRetention,
     ) -> PyResult<PyLaser> {
         let mode = parse_mode(mode)?;
-        let retention = GovernorRetention {
-            capacity,
-            idle_ttl: crate::convert::duration_seconds(idle_ttl_secs, "idle_ttl_secs")?,
-        };
         Ok(PyLaser::from_inner(self.inner.with_governor_retention(
-            Arc::new(PyActionGovernor { hooks: governor }),
+            Arc::new(PyActionGovernor::new(governor)?),
             mode,
-            retention,
+            retention.inner,
         )))
     }
 }
 
-// An `ActionGovernor` backed by a Python object exposing `async def
-// decide(action: GovernedAction) -> ActionDecision`. A raise or a non-decision
-// return fails the governed action (fail closed), mirroring the Rust trait's
-// `Err` contract, so a broken governor never fails open.
+/// Process-local retention for governance digest-chain heads: at most
+/// `capacity` conversations, and a head idle for `idle_ttl_secs` may be
+/// evicted. An omitted argument keeps the SDK default. Eviction or a process
+/// restart starts a new local chain for that conversation.
+#[gen_stub_pyclass]
+#[pyclass(name = "GovernorRetention", frozen, from_py_object)]
+#[derive(Clone, Copy)]
+pub struct PyGovernorRetention {
+    pub(crate) inner: GovernorRetention,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyGovernorRetention {
+    #[new]
+    #[pyo3(signature = (*, capacity=None, idle_ttl_secs=None))]
+    fn new(capacity: Option<usize>, idle_ttl_secs: Option<f64>) -> PyResult<Self> {
+        let mut inner = GovernorRetention::default();
+        if let Some(capacity) = capacity {
+            inner.capacity = capacity;
+        }
+        if let Some(idle_ttl_secs) = idle_ttl_secs {
+            inner.idle_ttl = crate::convert::duration_seconds(idle_ttl_secs, "idle_ttl_secs")?;
+        }
+        Ok(Self { inner })
+    }
+
+    /// Maximum retained conversation heads.
+    #[getter]
+    fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
+
+    /// Inactivity, in seconds, after which an unlocked head may be evicted.
+    #[getter]
+    fn idle_ttl_secs(&self) -> f64 {
+        self.inner.idle_ttl.as_secs_f64()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GovernorRetention(capacity={}, idle_ttl_secs={})",
+            self.inner.capacity,
+            self.inner.idle_ttl.as_secs_f64()
+        )
+    }
+}
+
+// An `ActionGovernor` backed by a Python object exposing `decide(action:
+// GovernedAction) -> ActionDecision`, or a plain callable, sync or async. A
+// raise or a non-decision return fails the governed action (fail closed),
+// mirroring the Rust trait's `Err` contract, so a broken governor never fails
+// open.
 pub(crate) struct PyActionGovernor {
-    pub(crate) hooks: Py<PyAny>,
+    hook: PyHook,
+}
+
+impl PyActionGovernor {
+    pub(crate) fn new(governor: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            hook: PyHook::new(governor, "decide", "a governor")?,
+        })
+    }
 }
 
 #[async_trait]
 impl ActionGovernor for PyActionGovernor {
     async fn decide(&self, action: &GovernedAction<'_>) -> Result<ActionDecision, LaserError> {
         let snapshot = PyGovernedAction::snapshot(action);
-        let future = Python::attach(|py| -> PyResult<_> {
-            let coroutine = self.hooks.bind(py).call_method1("decide", (snapshot,))?;
-            into_future(coroutine)
-        })
-        .map_err(|error| LaserError::HandlerConfig(format!("governor decide: {error}")))?;
-        let value = future.await.map_err(|error| {
-            LaserError::HandlerConfig(format!("governor decide raised: {error}"))
-        })?;
+        let value = self
+            .hook
+            .call(|py| (snapshot,).into_pyobject(py))
+            .await
+            .map_err(crate::errors::from_callback_error)?;
         Python::attach(|py| -> PyResult<ActionDecision> {
             let decision = value.bind(py).extract::<PyActionDecision>()?;
             Ok(decision.inner)
@@ -113,9 +159,7 @@ pub struct PyGovernedAction {
     data_classification: Option<String>,
     payload: Vec<u8>,
     signed: bool,
-    sends: u64,
-    requests: u64,
-    bytes_sent: u64,
+    counters: ActionCounters,
 }
 
 impl PyGovernedAction {
@@ -135,9 +179,7 @@ impl PyGovernedAction {
             data_classification: action.data_classification.map(str::to_owned),
             payload: action.payload.to_vec(),
             signed: action.signed,
-            sends: action.counters.sends,
-            requests: action.counters.requests,
-            bytes_sent: action.counters.bytes_sent,
+            counters: action.counters,
         }
     }
 
@@ -172,11 +214,7 @@ impl PyGovernedAction {
             data_classification: self.data_classification.as_deref(),
             payload: &self.payload,
             signed: self.signed,
-            counters: ActionCounters {
-                sends: self.sends,
-                requests: self.requests,
-                bytes_sent: self.bytes_sent,
-            },
+            counters: self.counters,
         })
     }
 }
@@ -269,22 +307,50 @@ impl PyGovernedAction {
         self.signed
     }
 
-    /// Governed non-request effects so far this session.
+    /// Session counters at decision time, for rate and budget policies.
+    #[getter]
+    fn counters(&self) -> PyActionCounters {
+        PyActionCounters {
+            inner: self.counters,
+        }
+    }
+}
+
+/// Session counters at decision time. Shared by every clone of the governed
+/// `Laser`, so a policy can bound a whole session, not one handle.
+#[gen_stub_pyclass]
+#[pyclass(name = "ActionCounters", frozen, eq, skip_from_py_object)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct PyActionCounters {
+    inner: ActionCounters,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyActionCounters {
+    /// Governed non-request effects so far.
     #[getter]
     fn sends(&self) -> u64 {
-        self.sends
+        self.inner.sends
     }
 
-    /// Governed requests so far this session.
+    /// Governed requests so far.
     #[getter]
     fn requests(&self) -> u64 {
-        self.requests
+        self.inner.requests
     }
 
-    /// Payload bytes published through governed effects so far this session.
+    /// Payload bytes published through governed effects so far.
     #[getter]
     fn bytes_sent(&self) -> u64 {
-        self.bytes_sent
+        self.inner.bytes_sent
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ActionCounters(sends={}, requests={}, bytes_sent={})",
+            self.inner.sends, self.inner.requests, self.inner.bytes_sent
+        )
     }
 }
 
@@ -359,13 +425,9 @@ impl PyActionDecision {
     }
 
     /// A copy of this decision naming the deciding policy pack and rules.
-    fn with_policy(&self, pack_id: String, pack_version: String, rule_ids: Vec<String>) -> Self {
+    fn with_policy(&self, policy: PyPolicyRef) -> Self {
         Self {
-            inner: self.inner.clone().with_policy(PolicyRef {
-                pack_id,
-                pack_version,
-                rule_ids,
-            }),
+            inner: self.inner.clone().with_policy(policy.inner),
         }
     }
 
@@ -374,6 +436,180 @@ impl PyActionDecision {
         Self {
             inner: self.inner.clone().with_risk_score(risk_score),
         }
+    }
+
+    /// The verdict to apply.
+    #[getter]
+    fn verdict(&self) -> PyVerdict {
+        PyVerdict {
+            inner: self.inner.verdict.clone(),
+        }
+    }
+
+    /// Why, recorded in evidence.
+    #[getter]
+    fn reason(&self) -> Option<&str> {
+        self.inner.reason.as_deref()
+    }
+
+    /// The policy pack and rules that decided, when named.
+    #[getter]
+    fn policy(&self) -> Option<PyPolicyRef> {
+        self.inner.policy.clone().map(|inner| PyPolicyRef { inner })
+    }
+
+    /// The governor's risk estimate, recorded in evidence.
+    #[getter]
+    fn risk_score(&self) -> Option<f64> {
+        self.inner.risk_score
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ActionDecision(verdict={})", self.inner.verdict)
+    }
+}
+
+/// The decision vocabulary, broader than allow and deny. Build one with the
+/// static constructors. `as_str()` is its evidence name (`allow` | `observe`
+/// | `block` | `step_up` | `modify` | `defer`), and `scope` and `body` carry
+/// the `step_up` and `modify` payloads.
+#[gen_stub_pyclass]
+#[pyclass(name = "Verdict", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq)]
+pub struct PyVerdict {
+    inner: Verdict,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyVerdict {
+    /// Run the effect.
+    #[staticmethod]
+    fn allow() -> Self {
+        Self {
+            inner: Verdict::Allow,
+        }
+    }
+
+    /// Run the effect and emit evidence.
+    #[staticmethod]
+    fn observe() -> Self {
+        Self {
+            inner: Verdict::Observe,
+        }
+    }
+
+    /// Reject before the effect.
+    #[staticmethod]
+    fn block() -> Self {
+        Self {
+            inner: Verdict::Block,
+        }
+    }
+
+    /// Pause on an approval granting `scope`.
+    #[staticmethod]
+    fn step_up(scope: String) -> Self {
+        Self {
+            inner: Verdict::StepUp { scope },
+        }
+    }
+
+    /// Replace the body, then run the effect.
+    #[staticmethod]
+    fn modify(body: Vec<u8>) -> Self {
+        Self {
+            inner: Verdict::Modify { body },
+        }
+    }
+
+    /// Record that the work is held for later.
+    #[staticmethod]
+    fn defer() -> Self {
+        Self {
+            inner: Verdict::Defer,
+        }
+    }
+
+    /// The pinned evidence name of this verdict.
+    fn as_str(&self) -> &'static str {
+        self.inner.as_str()
+    }
+
+    /// The scope a `step_up` verdict asks an approval to grant.
+    #[getter]
+    fn scope(&self) -> Option<&str> {
+        match &self.inner {
+            Verdict::StepUp { scope } => Some(scope),
+            _ => None,
+        }
+    }
+
+    /// The replacement body of a `modify` verdict.
+    #[getter]
+    fn body<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        match &self.inner {
+            Verdict::Modify { body } => Some(PyBytes::new(py, body)),
+            _ => None,
+        }
+    }
+
+    fn __str__(&self) -> &'static str {
+        self.inner.as_str()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Verdict({})", self.inner)
+    }
+}
+
+/// The versioned policy artifact a decision came from, recorded verbatim in
+/// evidence. The SDK parses no policy language: a governor maps whatever
+/// engine it fronts onto this.
+#[gen_stub_pyclass]
+#[pyclass(name = "PolicyRef", frozen, eq, from_py_object)]
+#[derive(Clone, PartialEq)]
+pub struct PyPolicyRef {
+    inner: PolicyRef,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyPolicyRef {
+    #[new]
+    fn new(pack_id: String, pack_version: String, rule_ids: Vec<String>) -> Self {
+        Self {
+            inner: PolicyRef {
+                pack_id,
+                pack_version,
+                rule_ids,
+            },
+        }
+    }
+
+    /// The policy pack id.
+    #[getter]
+    fn pack_id(&self) -> &str {
+        &self.inner.pack_id
+    }
+
+    /// The policy pack version.
+    #[getter]
+    fn pack_version(&self) -> &str {
+        &self.inner.pack_version
+    }
+
+    /// The rule ids that matched.
+    #[getter]
+    fn rule_ids(&self) -> Vec<String> {
+        self.inner.rule_ids.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PolicyRef(pack_id={:?}, pack_version={:?}, rule_ids={:?})",
+            self.inner.pack_id, self.inner.pack_version, self.inner.rule_ids
+        )
     }
 }
 
@@ -493,16 +729,10 @@ impl PyPolicyEvidence {
         self.inner.approved_scope.as_deref()
     }
 
-    /// The deciding policy as `(pack_id, pack_version, rule_ids)`, when named.
+    /// The policy pack and rules that decided, when named.
     #[getter]
-    fn policy(&self) -> Option<(String, String, Vec<String>)> {
-        self.inner.policy.as_ref().map(|policy| {
-            (
-                policy.pack_id.clone(),
-                policy.pack_version.clone(),
-                policy.rule_ids.clone(),
-            )
-        })
+    fn policy(&self) -> Option<PyPolicyRef> {
+        self.inner.policy.clone().map(|inner| PyPolicyRef { inner })
     }
 
     /// The governor's risk estimate.
@@ -534,6 +764,16 @@ impl PyPolicyEvidence {
     fn at_micros(&self) -> u64 {
         self.inner.at_micros
     }
+}
+
+/// Whether `evidence`, in log order for one conversation, is an unbroken
+/// chain: every record reproduces its own `receipt_digest` and names the
+/// previous record's digest as its `previous_digest`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn verify_evidence_chain(evidence: Vec<PyPolicyEvidence>) -> bool {
+    let evidence: Vec<PolicyEvidence> = evidence.into_iter().map(|item| item.inner).collect();
+    laser_sdk::govern::verify_evidence_chain(&evidence)
 }
 
 /// How a `QuorumGovernor` combines its voters' verdicts into one decision.
@@ -611,18 +851,20 @@ impl PyQuorumGovernor {
     /// Enroll one named voter (an object with `async def decide(action) ->
     /// ActionDecision`, the same contract `Laser.with_governor` takes). A
     /// `mandatory` voter must be affirmative, regardless of policy.
-    fn voter(&mut self, name: String, governor: Py<PyAny>, mandatory: bool) -> PyResult<()> {
+    fn voter(
+        &mut self,
+        name: String,
+        governor: &Bound<'_, PyAny>,
+        mandatory: bool,
+    ) -> PyResult<()> {
+        let governor = Arc::new(PyActionGovernor::new(governor)?);
         // The builder is consumed and put back. If a previous call unwound
         // between the two, the slot stays empty, so report that as a typed
         // error rather than panicking on every later call.
         let current = self.inner.take().ok_or_else(|| {
             InvalidError::new_err("this QuorumGovernor is unusable: a previous voter() call failed")
         })?;
-        self.inner = Some(current.voter(
-            name,
-            Arc::new(PyActionGovernor { hooks: governor }),
-            mandatory,
-        ));
+        self.inner = Some(current.voter(name, governor, mandatory));
         Ok(())
     }
 
@@ -668,29 +910,27 @@ pub struct PySwappableGovernor {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PySwappableGovernor {
-    /// A swappable governor starting from `governor` (an object with
+    /// A swappable governor starting from `initial` (an object with
     /// `async def decide(action) -> ActionDecision`).
     #[new]
-    fn new(py: Python<'_>, governor: Py<PyAny>) -> Self {
-        Self {
-            inner: Arc::new(SwappableGovernor::new(Arc::new(PyActionGovernor {
-                hooks: governor.clone_ref(py),
-            }))),
-            active: RwLock::new(governor),
-        }
+    fn new(initial: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: Arc::new(SwappableGovernor::new(Arc::new(PyActionGovernor::new(
+                initial,
+            )?))),
+            active: RwLock::new(initial.clone().unbind()),
+        })
     }
 
-    /// Replace the active policy with `governor` and return the previous one.
+    /// Replace the active policy with `next` and return the previous one.
     /// A `decide` already in flight finishes under whichever policy it read.
-    fn swap(&self, py: Python<'_>, governor: Py<PyAny>) -> Py<PyAny> {
-        self.inner.swap(Arc::new(PyActionGovernor {
-            hooks: governor.clone_ref(py),
-        }));
+    fn swap(&self, next: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.inner.swap(Arc::new(PyActionGovernor::new(next)?));
         let mut active = self
             .active
             .write()
             .expect("Python governor lock is never poisoned");
-        std::mem::replace(&mut *active, governor)
+        Ok(std::mem::replace(&mut *active, next.clone().unbind()))
     }
 
     /// The currently active Python policy object.

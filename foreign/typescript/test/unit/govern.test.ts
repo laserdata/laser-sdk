@@ -6,16 +6,17 @@ import {
   ConversationId,
   CodecError,
   GovernorMode,
-  GovernorState,
   PolicyBlockedError,
   QuorumGovernor,
   SwappableGovernor,
   decodePolicyEvidence,
   encodePolicyEvidence,
+  verdictAsStr,
   verifyEvidenceChain,
   type ActionGovernor,
   type PolicyEvidence
 } from "../../src/index.js"
+import { GovernorState } from "../../src/govern.js"
 import { decodeOne, encodeNamed } from "../../src/wire/cbor.js"
 
 const encoder = new TextEncoder()
@@ -148,7 +149,9 @@ void test("given_an_unknown_evidence_vocabulary_when_decoded_then_should_reject_
 })
 
 void test("given_quorum_voters_when_combined_then_should_require_the_configured_threshold", async () => {
-  const quorum = new QuorumGovernor(2).voter("allow", allow).voter("block", block)
+  const quorum = new QuorumGovernor({ kind: "at-least", required: 2 })
+    .voter("allow", allow)
+    .voter("block", block)
   assert.equal(
     (await quorum.decide({ ...action(), counters: { sends: 0n, requests: 0n, bytesSent: 0n } }))
       .verdict.kind,
@@ -162,10 +165,118 @@ void test("given_quorum_voters_when_combined_then_should_require_the_configured_
   )
 })
 
+function governedProbe() {
+  return { ...action(), counters: { sends: 0n, requests: 0n, bytesSent: 0n } }
+}
+
+function fixed(decision: ActionDecision): ActionGovernor {
+  return { decide: () => Promise.resolve(decision) }
+}
+
+const failing: ActionGovernor = { decide: () => Promise.reject(new Error("voter offline")) }
+
+void test("given_duplicate_voter_names_when_decided_then_should_block", async () => {
+  const quorum = new QuorumGovernor({ kind: "any" }).voter("same", allow).voter("same", allow)
+  const decision = await quorum.decide(governedProbe())
+  assert.equal(decision.verdict.kind, "block")
+  assert.match(decision.reason ?? "", /configured more than once/)
+})
+
+void test("given_a_non_mandatory_voter_error_when_another_allows_then_should_abstain_and_allow", async () => {
+  const quorum = new QuorumGovernor({ kind: "any" }).voter("flaky", failing).voter("llm", allow)
+  const decision = await quorum.decide(governedProbe())
+  assert.equal(decision.verdict.kind, "allow")
+  assert.equal(decision.reason, "quorum(Any): flaky=error(voter offline), llm=allow")
+})
+
+void test("given_a_voter_that_throws_synchronously_when_another_allows_then_should_abstain_and_allow", async () => {
+  const throwing: ActionGovernor = {
+    decide: () => {
+      throw new Error("voter crashed")
+    }
+  }
+  const quorum = new QuorumGovernor({ kind: "any" }).voter("broken", throwing).voter("llm", allow)
+  const decision = await quorum.decide(governedProbe())
+  assert.equal(decision.verdict.kind, "allow")
+  assert.equal(decision.reason, "quorum(Any): broken=error(voter crashed), llm=allow")
+})
+
+void test("given_a_mandatory_voter_error_when_another_allows_then_should_block", async () => {
+  const quorum = new QuorumGovernor({ kind: "any" })
+    .voter("safety", failing, true)
+    .voter("llm", allow)
+  const decision = await quorum.decide(governedProbe())
+  assert.equal(decision.verdict.kind, "block")
+  assert.match(decision.reason ?? "", /^mandatory voter 'safety' failed; quorum\(Any\)/)
+})
+
+void test("given_conflicting_modifications_when_quorum_met_then_should_block", async () => {
+  const quorum = new QuorumGovernor({ kind: "all" })
+    .voter("one", fixed(ActionDecision.modify(encoder.encode("one"))))
+    .voter("two", fixed(ActionDecision.modify(encoder.encode("two"))))
+  assert.equal((await quorum.decide(governedProbe())).verdict.kind, "block")
+})
+
+void test("given_matching_modifications_when_quorum_met_then_should_apply_the_body", async () => {
+  const quorum = new QuorumGovernor({ kind: "all" })
+    .voter("one", fixed(ActionDecision.modify(encoder.encode("same"))))
+    .voter("two", fixed(ActionDecision.modify(encoder.encode("same"))))
+    .voter("three", allow)
+  const decision = await quorum.decide(governedProbe())
+  assert.deepEqual(decision.verdict, { kind: "modify", body: encoder.encode("same") })
+})
+
+void test("given_an_unmet_quorum_without_denials_when_decided_then_should_block", async () => {
+  const quorum = new QuorumGovernor({ kind: "at-least", required: 2 })
+    .voter("flaky", failing)
+    .voter("llm", allow)
+  const decision = await quorum.decide(governedProbe())
+  assert.equal(decision.verdict.kind, "block")
+  assert.match(
+    decision.reason ?? "",
+    /^no voter reached the required quorum; quorum\(AtLeast\(2\)\)/
+  )
+})
+
+void test("given_a_voter_reason_when_annotated_then_should_keep_it_before_the_ballot", async () => {
+  const quorum = new QuorumGovernor({ kind: "all" }).voter("a", allow).voter("b", block)
+  const decision = await quorum.decide(governedProbe())
+  assert.equal(decision.verdict.kind, "block")
+  assert.equal(decision.reason, "refused; quorum(All): a=allow, b=block")
+})
+
+void test("given_a_step_up_and_a_defer_without_quorum_when_decided_then_should_prefer_step_up", async () => {
+  const quorum = new QuorumGovernor({ kind: "all" })
+    .voter("reviewer", fixed(ActionDecision.stepUp("storage:rotate")))
+    .voter("scheduler", fixed(ActionDecision.defer("later")))
+  assert.equal((await quorum.decide(governedProbe())).verdict.kind, "step_up")
+})
+
+void test("given_a_fractional_threshold_when_decided_then_should_block", async () => {
+  const quorum = new QuorumGovernor({ kind: "at-least", required: 1.5 })
+    .voter("a", allow)
+    .voter("b", allow)
+  assert.equal((await quorum.decide(governedProbe())).verdict.kind, "block")
+})
+
 void test("given_a_swappable_governor_when_replaced_then_should_use_the_new_policy", async () => {
   const swappable = new SwappableGovernor(allow)
   const governed = { ...action(), counters: { sends: 0n, requests: 0n, bytesSent: 0n } }
   assert.equal((await swappable.decide(governed)).verdict.kind, "allow")
   swappable.swap(block)
   assert.equal((await swappable.decide(governed)).verdict.kind, "block")
+})
+
+void test("given_each_verdict_when_named_then_should_use_the_pinned_evidence_name", () => {
+  assert.deepEqual(
+    [
+      ActionDecision.allow(),
+      ActionDecision.observe(),
+      ActionDecision.block("no"),
+      ActionDecision.stepUp("deploys"),
+      ActionDecision.modify(new Uint8Array([1])),
+      ActionDecision.defer("later")
+    ].map((decision) => verdictAsStr(decision.verdict)),
+    ["allow", "observe", "block", "step_up", "modify", "defer"]
+  )
 })

@@ -1,6 +1,7 @@
 import { CodecError, InvalidError } from "../client/errors.js"
 import {
   type CborMap,
+  cborFloat,
   decodeOne,
   encodeNamed,
   expectMap,
@@ -16,9 +17,12 @@ import {
   decodeTypedValue,
   encodeLogicalField,
   encodeTypedValue,
+  typedValueAsI64,
+  typedValueAsU64,
+  typedValueDiagnosticText,
   validateResultFields,
-  validateTypedValueAgainst,
-  validateTypedValue
+  typedValueValidateAgainst,
+  typedValueValidateCanonical
 } from "./schema.js"
 import {
   MAX_PAGE_SIZE,
@@ -34,6 +38,10 @@ import {
 import { QUERY_OP_VERSION } from "./codes.js"
 
 export type Consistency = "eventual" | "read_your_writes" | "strong"
+
+export function consistencyIsEventual(consistency: Consistency): boolean {
+  return consistency === "eventual"
+}
 export type SqlDialect = "data_fusion" | "postgres" | "my_sql" | "sqlite"
 export type QueryTarget =
   | { readonly kind: "operational"; readonly index: string }
@@ -257,6 +265,14 @@ export function newQuery(
   }
 }
 
+export function operationalQuery(
+  executionId: QueryExecutionId,
+  index: string,
+  deadlineMicros: bigint
+): Query {
+  return newQuery(operationalTarget(index), executionId, deadlineMicros)
+}
+
 function optional<T>(
   map: Map<string, unknown>,
   name: string,
@@ -406,7 +422,7 @@ function decodeText(map: CborMap, context: string): TextQuery {
 function encodeVector(value: VectorQuery): Map<string, unknown> {
   return mapOf([
     ["field", value.field],
-    ["embedding", [...value.embedding]],
+    ["embedding", value.embedding.map(cborFloat)],
     ["top_k", value.topK]
   ])
 }
@@ -424,7 +440,7 @@ function decodeVector(map: CborMap, context: string): VectorQuery {
 function encodeAggCall(value: AggCall): Map<string, unknown> {
   const map = mapOf([["func", value.func]])
   optional(map, "field", value.field)
-  optional(map, "arg", value.arg)
+  optional(map, "arg", value.arg, cborFloat)
   map.set("alias", value.alias)
   return map
 }
@@ -633,7 +649,7 @@ export function validateQuery(query: Query): void {
   }
   for (const match of query.byKey) {
     validateName(match.field)
-    validateTypedValue(match.value)
+    typedValueValidateCanonical(match.value)
   }
   if (query.messageType !== undefined) validateName(query.messageType)
   if (query.timeRange !== undefined && query.timeRange[0] >= query.timeRange[1])
@@ -678,7 +694,7 @@ export function validateQuery(query: Query): void {
     } else if (filter.kind === "not") visit(filter.filter, depth + 1, count)
     else {
       validateName(filter.predicate.field)
-      validateTypedValue(filter.predicate.value)
+      typedValueValidateCanonical(filter.predicate.value)
       if (
         filter.predicate.op === "in" &&
         (filter.predicate.value.kind !== "list" || filter.predicate.value.value.length === 0)
@@ -738,7 +754,7 @@ export function validateQuery(query: Query): void {
       query.rawSql.params.length > MAX_QUERY_PARAMETERS
     )
       throw new InvalidError("raw SQL is invalid")
-    for (const param of query.rawSql.params) validateTypedValue(param)
+    for (const param of query.rawSql.params) typedValueValidateCanonical(param)
     if (
       query.byKey.length > 0 ||
       query.messageType !== undefined ||
@@ -804,7 +820,7 @@ export function decodeQueryEnvelope(map: CborMap, context: string): QueryEnvelop
   }
 }
 export function encodeQueryEnvelopeFrame(envelope: QueryEnvelope): Uint8Array {
-  return encodeNamed(encodeQueryEnvelope(envelope), { forceFloatNumbers: true })
+  return encodeNamed(encodeQueryEnvelope(envelope))
 }
 export function decodeQueryEnvelopeFrame(bytes: Uint8Array): QueryEnvelope {
   return decodeQueryEnvelope(
@@ -1084,7 +1100,7 @@ export function validateQueryResult(result: QueryResult): void {
       const value = row.values[index]
       if (field === undefined || value === undefined)
         throw new InvalidError("query row value count does not match the result schema")
-      validateTypedValueAgainst(value, field.fieldType, field.required)
+      typedValueValidateAgainst(value, field.fieldType, field.required)
     }
     if (row.score !== undefined && !Number.isFinite(row.score))
       throw new InvalidError("query row score must be finite")
@@ -1151,13 +1167,45 @@ function validateQueryContext(context: QueryContext): void {
   if (context.boundary !== undefined && context.boundary.digest.length !== 32)
     throw new InvalidError("query materialization boundary digest must contain 32 bytes")
 }
+export function queryResultFieldIndex(result: QueryResult, name: string): number | undefined {
+  const index = result.fields.findIndex((item) => item.name === name)
+  return index < 0 ? undefined : index
+}
+
 export function queryResultValue(
   result: QueryResult,
   row: Row,
   name: string
 ): TypedValue | undefined {
-  const index = result.fields.findIndex((item) => item.name === name)
-  return index < 0 ? undefined : row.values[index]
+  const index = queryResultFieldIndex(result, name)
+  return index === undefined ? undefined : row.values[index]
+}
+
+export function queryResultValueText(
+  result: QueryResult,
+  row: Row,
+  name: string
+): string | undefined {
+  const value = queryResultValue(result, row, name)
+  return value === undefined ? undefined : typedValueDiagnosticText(value)
+}
+
+export function queryResultValueU64(
+  result: QueryResult,
+  row: Row,
+  name: string
+): bigint | undefined {
+  const value = queryResultValue(result, row, name)
+  return value === undefined ? undefined : typedValueAsU64(value)
+}
+
+export function queryResultValueI64(
+  result: QueryResult,
+  row: Row,
+  name: string
+): bigint | undefined {
+  const value = queryResultValue(result, row, name)
+  return value === undefined ? undefined : typedValueAsI64(value)
 }
 
 export type QueryError =
@@ -1470,8 +1518,12 @@ export function parseConsistency(value: string, context: string): Consistency {
 export function consistencyToWord(value: Consistency): string {
   return value
 }
+const U64_MAX = (1n << 64n) - 1n
+
 export function pageAtLeast(page: Page, rowsOnPage: number): bigint | undefined {
-  return page.offset === undefined ? undefined : page.offset + BigInt(rowsOnPage)
+  if (page.offset === undefined) return undefined
+  const rows = page.offset + BigInt(rowsOnPage)
+  return rows > U64_MAX ? undefined : rows
 }
 export function pageTotalPages(page: Page): bigint | undefined {
   return page.total === undefined || page.limit === 0

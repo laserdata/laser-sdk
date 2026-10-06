@@ -144,6 +144,8 @@ impl PyWatchReader {
 #[gen_stub_pyclass]
 #[pyclass(name = "ChangeRecord", frozen, get_all)]
 pub struct PyChangeRecord {
+    /// The change-feed record version.
+    pub v: u32,
     /// The materialized index that advanced.
     pub index: String,
     /// The source partition the batch came from.
@@ -159,6 +161,7 @@ pub struct PyChangeRecord {
 impl From<laser_sdk::wire::change::ChangeRecord> for PyChangeRecord {
     fn from(record: laser_sdk::wire::change::ChangeRecord) -> Self {
         Self {
+            v: record.v,
             index: record.index,
             partition_id: record.partition_id,
             from_offset: record.from_offset,

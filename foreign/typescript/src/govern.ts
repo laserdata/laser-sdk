@@ -61,6 +61,12 @@ export type Verdict =
   | { readonly kind: "modify"; readonly body: Uint8Array }
   | { readonly kind: "defer" }
 
+/** The pinned evidence name of `verdict`: `allow`, `observe`, `block`,
+ * `step_up`, `modify`, or `defer`. */
+export function verdictAsStr(verdict: Verdict): string {
+  return verdict.kind
+}
+
 export interface PolicyRef {
   readonly packId: string
   readonly packVersion: string
@@ -334,6 +340,13 @@ export function verifyEvidenceChain(evidence: readonly PolicyEvidence[]): boolea
   return true
 }
 
+/** How a `QuorumGovernor` combines its voters' verdicts. Only `allow`,
+ * `observe`, and `modify` count as affirmative. */
+export type QuorumPolicy =
+  | { readonly kind: "all" }
+  | { readonly kind: "any" }
+  | { readonly kind: "at-least"; readonly required: number }
+
 export class QuorumGovernor implements ActionGovernor {
   private readonly voters: {
     readonly name: string
@@ -341,7 +354,9 @@ export class QuorumGovernor implements ActionGovernor {
     readonly mandatory: boolean
   }[] = []
 
-  constructor(private readonly required: "all" | "any" | number) {}
+  /** A quorum under `policy`. Add voters with `voter`. An empty or otherwise
+   * invalid configuration blocks when evaluated. */
+  constructor(private readonly policy: QuorumPolicy) {}
 
   voter(name: string, governor: ActionGovernor, mandatory = false): this {
     this.voters.push({ name, governor, mandatory })
@@ -352,45 +367,112 @@ export class QuorumGovernor implements ActionGovernor {
     if (this.voters.length === 0)
       return ActionDecision.block("quorum governor has no configured voters")
     if (
-      typeof this.required === "number" &&
-      (this.required < 1 || this.required > this.voters.length)
+      this.policy.kind === "at-least" &&
+      (!Number.isSafeInteger(this.policy.required) ||
+        this.policy.required < 1 ||
+        this.policy.required > this.voters.length)
     ) {
       return ActionDecision.block(
-        `quorum threshold ${String(this.required)} is invalid for ${String(this.voters.length)} voters`
+        `quorum threshold ${String(this.policy.required)} is invalid for ${String(this.voters.length)} voters`
       )
     }
-    const decisions = await Promise.all(
-      this.voters.map(async (voter) => ({ voter, decision: await voter.governor.decide(action) }))
-    )
-    const affirmative = decisions.filter(({ decision }) =>
-      ["allow", "observe", "modify"].includes(decision.verdict.kind)
-    )
-    const required =
-      this.required === "all" ? decisions.length : this.required === "any" ? 1 : this.required
-    const mandatoryPassed = decisions.every(
-      ({ voter, decision }) =>
-        !voter.mandatory || ["allow", "observe", "modify"].includes(decision.verdict.kind)
-    )
-    const reason = decisions
-      .map(({ voter, decision }) => `${voter.name}:${decision.verdict.kind}`)
-      .join(",")
-    if (mandatoryPassed && affirmative.length >= required) {
-      const modify = affirmative.find(
-        ({ decision }) => decision.verdict.kind === "modify"
-      )?.decision
-      return (
-        modify ??
-        (affirmative.some(({ decision }) => decision.verdict.kind === "observe")
-          ? ActionDecision.observe()
-          : ActionDecision.allow())
-      ).withReason(reason)
+    const names = new Set<string>()
+    const duplicate = this.voters.find(({ name }) => names.size === names.add(name).size)
+    if (duplicate !== undefined) {
+      return ActionDecision.block(`quorum voter '${duplicate.name}' is configured more than once`)
     }
-    const denied =
-      decisions.find(({ decision }) => decision.verdict.kind === "block")?.decision ??
-      decisions.find(({ decision }) => decision.verdict.kind === "step_up")?.decision ??
-      ActionDecision.defer("quorum not met")
-    return denied.withReason(reason)
+    // A voter that throws before returning its promise abstains like one that rejects.
+    const votes = await Promise.allSettled(
+      this.voters.map(async (voter) => voter.governor.decide(action))
+    )
+    const ballot: string[] = []
+    let affirmative = 0
+    let mandatoryDenial: ActionDecision | undefined
+    let mandatoryError: string | undefined
+    let bestAffirmative: ActionDecision | undefined
+    let bestDenial: ActionDecision | undefined
+    let replacement: Uint8Array | undefined
+    let conflictingReplacements = false
+    for (const [index, voter] of this.voters.entries()) {
+      const vote = votes[index]
+      if (vote?.status !== "fulfilled") {
+        const failure: unknown = vote?.reason
+        ballot.push(
+          `${voter.name}=error(${failure instanceof Error ? failure.message : String(failure)})`
+        )
+        if (voter.mandatory) mandatoryError ??= voter.name
+        continue
+      }
+      const decision = vote.value
+      ballot.push(`${voter.name}=${decision.verdict.kind}`)
+      const rank = affirmativeRank(decision.verdict)
+      if (voter.mandatory && rank < 0) mandatoryDenial ??= decision
+      if (rank >= 0) {
+        affirmative += 1
+        if (decision.verdict.kind === "modify") {
+          if (replacement === undefined) replacement = decision.verdict.body
+          else if (!sameBytes(replacement, decision.verdict.body)) conflictingReplacements = true
+        }
+        if (rank > (bestAffirmative === undefined ? -1 : affirmativeRank(bestAffirmative.verdict)))
+          bestAffirmative = decision
+      } else if (
+        denialRank(decision.verdict) >
+        (bestDenial === undefined ? -1 : denialRank(bestDenial.verdict))
+      ) {
+        bestDenial = decision
+      }
+    }
+    const reason = `quorum(${quorumLabel(this.policy)}): ${ballot.join(", ")}`
+    if (mandatoryError !== undefined) {
+      return annotate(ActionDecision.block(`mandatory voter '${mandatoryError}' failed`), reason)
+    }
+    if (mandatoryDenial !== undefined) return annotate(mandatoryDenial, reason)
+    if (conflictingReplacements) {
+      return annotate(
+        ActionDecision.block("quorum voters proposed conflicting body replacements"),
+        reason
+      )
+    }
+    const met =
+      this.policy.kind === "all"
+        ? affirmative === this.voters.length
+        : affirmative >= (this.policy.kind === "any" ? 1 : this.policy.required)
+    if (met) return annotate(bestAffirmative ?? ActionDecision.allow(), reason)
+    return annotate(
+      bestDenial ?? ActionDecision.block("no voter reached the required quorum"),
+      reason
+    )
   }
+}
+
+function quorumLabel(policy: QuorumPolicy): string {
+  if (policy.kind === "all") return "All"
+  if (policy.kind === "any") return "Any"
+  return `AtLeast(${String(policy.required)})`
+}
+
+function annotate(decision: ActionDecision, ballot: string): ActionDecision {
+  return decision.withReason(
+    decision.reason === undefined ? ballot : `${decision.reason}; ${ballot}`
+  )
+}
+
+// Modify outranks Observe outranks Allow, so a body replacement survives.
+function affirmativeRank(verdict: Verdict): number {
+  if (verdict.kind === "modify") return 2
+  if (verdict.kind === "observe") return 1
+  return verdict.kind === "allow" ? 0 : -1
+}
+
+// Block outranks StepUp outranks Defer, the most actionable denial first.
+function denialRank(verdict: Verdict): number {
+  if (verdict.kind === "block") return 2
+  if (verdict.kind === "step_up") return 1
+  return verdict.kind === "defer" ? 0 : -1
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength && left.every((byte, index) => byte === right[index])
 }
 
 export class SwappableGovernor implements ActionGovernor {

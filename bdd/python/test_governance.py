@@ -31,7 +31,7 @@ def govern_the_laser(world, needle, mode):
 def send_governed(world, payload):
     provenance = ls.Provenance(conversation_id=world.conversation)
     world.capture(
-        lambda: world.governed.send_agent(ls.Topics.COMMANDS, payload.encode(), provenance)
+        lambda: world.governed.send_agent(ls.AgentTopic.Commands, payload.encode(), provenance)
     )
 
 
@@ -62,13 +62,13 @@ def audit_records(world, decision, outcome):
     deadline = time.monotonic() + 10
     while True:
         messages = world.run(
-            lambda: world.laser.assemble_context(world.conversation, topics=[ls.Topics.AUDIT])
+            lambda: world.laser.assemble_context(world.conversation, topics=[ls.AgentTopic.Audit])
         )
         for message in messages:
             envelope = message.envelope
             if not envelope or envelope.get("operation") != "policy_decision":
                 continue
-            evidence = ls.PolicyEvidence.decode(bytes(message.agdx_body))
+            evidence = ls.PolicyEvidence.decode(bytes(envelope["body"]))
             if evidence.decision == decision and evidence.outcome == outcome:
                 assert len(evidence.receipt_digest) == 64
                 return

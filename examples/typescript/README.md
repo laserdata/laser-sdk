@@ -1,4 +1,4 @@
-# LaserData -Laser SDK examples - TypeScript
+# LaserData - Laser SDK examples - TypeScript
 
 The TypeScript examples cover the Rust and Python catalog: nine tiny primitive examples plus the nine non-benchmark deep-dive scenarios. The deep-dive scenarios are shorter than their Rust counterparts and exercise the same primitives. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
 
@@ -24,7 +24,7 @@ Start Apache Iggy, then run any example. The SDK uses Iggy's native VSR transpor
 npm run example:native-streaming
 ```
 
-With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each example uses its own `laser-<example>-typescript` stream so the agent topics, consumer offsets, and managed views of different examples never collide. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. Managed index names carry a per-run token. A stream supplied through `LASER_STREAM` is never deleted.
+With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`. Each example uses its own `laser-<example>-typescript` stream so the agent topics, consumer offsets, and managed views of different examples never collide. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. Managed index names carry a per-run token. A stream supplied through `LASER_STREAM` is never deleted. The `log` example keeps its readings on the `fleet` stream, so a rerun finds the earlier records.
 
 For the complete managed surface, start Laser Stack with `./scripts/up` from its checkout and use the `LASER_CONNECTION_STRING` it prints.
 
@@ -62,6 +62,7 @@ Set `LASER_STREAM` to the stream provisioned for the deployment. The helper uses
 | `LASER_NON_INTERACTIVE=1` | Runs orchestra without waiting for Enter between phases |
 | `LASER_GOVERNANCE_USER_ID` | User whose role bindings the governance example manages |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Select a real LLM for incident-desk or interop instead of the deterministic mock |
+| `ANTHROPIC_MODEL`, `OPENAI_MODEL` | Override the default model of the selected provider |
 
 The firehose also accepts `LASER_FIREHOSE_MESSAGES`, `LASER_FIREHOSE_ORGS`, `LASER_FIREHOSE_CONCURRENCY`, `LASER_FIREHOSE_PAYLOAD_BYTES`, `LASER_FIREHOSE_BATCH`, `LASER_FIREHOSE_PARTITIONS`, `LASER_FIREHOSE_REGISTER`, and `LASER_FIREHOSE_QUERY`.
 
@@ -75,7 +76,7 @@ One tiny, single-primitive example each, most under 100 lines including imports.
 | [`query`](src/query/README.md) | Views | Declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch`](src/watch/README.md) | Change feed | React to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
 | [`kv`](src/kv/README.md) | State | Set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
-| [`cdc`](src/cdc/README.md) | Consumer filters | Read four safe-mode events out of a 240-record feed of typed records, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (bindings need plane) | no | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
+| [`cdc`](src/cdc/README.md) | Consumer filters | Read four safe-mode events out of a 240-record feed of typed records, sample-test and preview filters, route binary alerts on a header, then bind groups to saved filters and manage their revisions | yes | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
 | [`graph`](src/graph/README.md) | Graph | Link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall`](src/recall/README.md) | Memory | All four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
 | [`context`](src/context/README.md) | Context | Assemble one conversation under a `LastN` + `TokenBudget` policy chain | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
@@ -95,7 +96,7 @@ One tiny, single-primitive example each, most under 100 lines including imports.
 | [`orchestra`](src/orchestra/README.md) | Agentic | Discovery, directed contracts, capability fan-out, journalled workflows, quarantine, recovery, and deadline rerouting |
 | [`governance`](src/governance/README.md) | Agentic | Deny-wins grants, delegated permission intersection, edge step-up, managed RBAC, role bindings, and budgeted run submission |
 
-Every example runs its open phase against Apache Iggy. Managed phases print one precise skip reason when the server does not advertise their capability. Point the same command at Laser Stack or LaserData Cloud to run the full scenario without changing code.
+Examples with an open phase run it against Apache Iggy. Managed phases print one precise skip reason when the server does not advertise their capability. Point the same command at Laser Stack or LaserData Cloud to run the full scenario without changing code.
 
 ## Verification
 
@@ -107,4 +108,4 @@ npm run build
 node --test dist/test/common.test.js
 ```
 
-The smoke suite additionally runs native streaming and interop against a live Apache Iggy instance.
+`npm run smoke` additionally runs native streaming, interop, and the `log`, `recall`, `context`, and `agent` primitives against a live Apache Iggy instance. It also starts `cdc`, which skips on a server without the filter catalog.

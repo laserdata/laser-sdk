@@ -9,7 +9,6 @@ import {
   decodeAgentCard,
   decodeAgentPresence,
   encodeAgentPresence,
-  parseAgentId,
   validateAgentPresence,
   type AgentCard,
   type AgentEnvelope,
@@ -118,22 +117,22 @@ export function applyCard(
   } catch {
     return false
   }
-  cards.set(agent.asString(), { agent, card, observedAtMicros })
+  cards.set(agent.asStr(), { agent, card, observedAtMicros })
   return true
 }
 
 export function applyQuarantine(quarantined: Set<string>, envelope: AgentEnvelope): boolean {
   const text = tryUtf8(envelope.body)
   const agent = text !== undefined ? tryAgentId(text) : undefined
-  if (agent === undefined || quarantined.has(agent.asString())) return false
-  quarantined.add(agent.asString())
+  if (agent === undefined || quarantined.has(agent.asStr())) return false
+  quarantined.add(agent.asStr())
   return true
 }
 
 export function liftQuarantine(quarantined: Set<string>, envelope: AgentEnvelope): boolean {
   const text = tryUtf8(envelope.body)
   const agent = text !== undefined ? tryAgentId(text) : undefined
-  return agent !== undefined && quarantined.delete(agent.asString())
+  return agent !== undefined && quarantined.delete(agent.asStr())
 }
 
 export function applyPresence(
@@ -152,24 +151,14 @@ export function applyPresence(
   }
   const agent = tryAgentId(body.agent)
   if (agent === undefined) return false
-  presence.set(agent.asString(), {
+  presence.set(agent.asStr(), {
     presence: body,
     ...(userId !== undefined ? { principal: PrincipalId.new(userId) } : {})
   })
   return true
 }
 
-export interface AgentPresenceInput {
-  readonly agent: AgentId
-  readonly inbox?: string
-}
-
-export function encodePresenceInput(input: AgentPresenceInput): Uint8Array {
-  const presence: AgentPresence = {
-    v: 1,
-    agent: parseAgentId(input.agent.asString()),
-    ...(input.inbox !== undefined ? { inbox: input.inbox } : {})
-  }
+export function encodePresence(presence: AgentPresence): Uint8Array {
   validateAgentPresence(presence)
   return encodeNamed(encodeAgentPresence(presence))
 }
@@ -186,7 +175,12 @@ export class ClientMetadataRequest {
     limit: MAX_PAGE_SIZE
   }
 
-  constructor(private readonly transport: Pick<LaserTransport, "sendManaged">) {}
+  private constructor(private readonly transport: Pick<LaserTransport, "sendManaged">) {}
+
+  /** @internal */
+  static create(transport: Pick<LaserTransport, "sendManaged">): ClientMetadataRequest {
+    return new ClientMetadataRequest(transport)
+  }
 
   withMetadataOnly(value: boolean): this {
     this.query = { ...this.query, withMetadataOnly: value }
@@ -239,7 +233,7 @@ export class AgentRegistry {
   private appliedFacts: Map<string, bigint>
   private presenceReadAtMicros: bigint | undefined
 
-  constructor(
+  private constructor(
     private readonly cursor: Cursor,
     private readonly cache: RegistryCache,
     private readonly clientMetadata: () => ClientMetadataRequest,
@@ -254,8 +248,19 @@ export class AgentRegistry {
     this.cursor.fromOffsets(cache.offsets)
   }
 
+  /** @internal */
+  static create(
+    cursor: Cursor,
+    cache: RegistryCache,
+    clientMetadata: () => ClientMetadataRequest,
+    nowMicros?: () => bigint,
+    verifier?: KeyRegistry
+  ): AgentRegistry {
+    return new AgentRegistry(cursor, cache, clientMetadata, nowMicros, verifier)
+  }
+
   async refresh(nowMicros: bigint = this.nowMicros()): Promise<number> {
-    const messages = await this.cursor.poll()
+    const messages = await this.cursor.pollRecords()
     let folded = 0
     for (const message of messages) {
       const decoded = decodeAgentMessage(message)
@@ -318,7 +323,7 @@ export class AgentRegistry {
   }
 
   lookup(agent: AgentId): RegisteredCard | undefined {
-    return this.cards.get(agent.asString())
+    return this.cards.get(agent.asStr())
   }
 
   resolve(skillId: string, nowMicros: bigint = this.nowMicros()): readonly RegisteredCard[] {
@@ -326,25 +331,25 @@ export class AgentRegistry {
       (card) =>
         cardAvailableFor(card, skillId) &&
         cardIsFresh(card, nowMicros) &&
-        !this.quarantined.has(card.agent.asString())
+        !this.quarantined.has(card.agent.asStr())
     )
   }
 
   isQuarantined(agent: AgentId): boolean {
-    return this.quarantined.has(agent.asString())
+    return this.quarantined.has(agent.asStr())
   }
 
   inboxFor(agent: AgentId): string | undefined {
-    return this.presence.get(agent.asString())?.presence.inbox
+    return this.presence.get(agent.asStr())?.presence.inbox
   }
 
   inboxForPrincipal(agent: AgentId, principal: PrincipalId): string | undefined {
-    const entry = this.presence.get(agent.asString())
+    const entry = this.presence.get(agent.asStr())
     return entry?.principal?.get() === principal.get() ? entry.presence.inbox : undefined
   }
 
   principalFor(agent: AgentId): PrincipalId | undefined {
-    return this.presence.get(agent.asString())?.principal
+    return this.presence.get(agent.asStr())?.principal
   }
 
   async refreshPresence(): Promise<number> {

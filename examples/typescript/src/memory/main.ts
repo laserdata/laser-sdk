@@ -135,11 +135,7 @@ async function vectorPhase(conversation: ConversationId): Promise<void> {
   let replicaNote: MemoryId | undefined
   let staleNote: MemoryId | undefined
   for (const fact of KNOWLEDGE) {
-    const id = await memory
-      .remember(utf8(fact))
-      .conversation(conversation)
-      .kind(MemoryKind.Fact)
-      .send()
+    const id = await memory.remember(utf8(fact)).scope(conversation).kind(MemoryKind.Fact).send()
     if (fact.includes("read replica")) replicaNote = id
     if (fact.includes("index rebuild")) staleNote = id
   }
@@ -147,12 +143,7 @@ async function vectorPhase(conversation: ConversationId): Promise<void> {
 
   phase("Recall")
   const question = "gateway is slow during the rollout"
-  const initial = await memory
-    .recall()
-    .conversation(conversation)
-    .semantic(question)
-    .limit(3)
-    .fetch()
+  const initial = await memory.recall(conversation).semantic(question).limit(3).fetch()
   printHits(`recall for "${question}"`, initial)
 
   if (replicaNote === undefined) throw new Error("the read-replica note was not remembered")
@@ -161,12 +152,7 @@ async function vectorPhase(conversation: ConversationId): Promise<void> {
     { conversation },
     { target: replicaNote, weight: 1, note: "resolved the incident" }
   )
-  const improved = await memory
-    .recall()
-    .conversation(conversation)
-    .semantic(question)
-    .limit(3)
-    .fetch()
+  const improved = await memory.recall(conversation).semantic(question).limit(3).fetch()
   printHits(`recall after feedback for "${question}"`, improved)
   if (!improved[0]?.id.equals(replicaNote)) {
     throw new Error("feedback did not rank the read-replica note first")
@@ -177,8 +163,7 @@ async function vectorPhase(conversation: ConversationId): Promise<void> {
   phase("Forget")
   await memory.forget({ conversation }, staleNote)
   const remaining = await memory
-    .recall()
-    .conversation(conversation)
+    .recall(conversation)
     .semantic("search results are stale")
     .limit(3)
     .fetch()
@@ -196,9 +181,9 @@ async function durablePhase(laser: Laser, conversation: ConversationId): Promise
     .ttl(86_400_000)
     .build()
   for (const fact of KNOWLEDGE) {
-    await durable.remember(utf8(fact)).conversation(conversation).durable().send()
+    await durable.remember(utf8(fact)).scope(conversation).durable().send()
   }
-  const durableHits = await durable.recall().conversation(conversation).limit(3).fetch()
+  const durableHits = await durable.recall(conversation).limit(3).fetch()
   console.log(
     `stored ${String(KNOWLEDGE.length)} durable facts, recalled ` +
       `${String(durableHits.length)} most-recent`
@@ -307,7 +292,7 @@ async function graphPhase(laser: Laser): Promise<void> {
     .filter((node) => !node.id.equals(incident.id))
     .map((node) => {
       const value = node.attrs.find(([key]) => key === "value")?.[1]
-      return value?.kind === "string" ? value.value : "?"
+      return value?.kind === "str" ? value.value : "?"
     })
     .sort()
   console.log(`what INC-101 affected: ${touched.join(", ")}`)

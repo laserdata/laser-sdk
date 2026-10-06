@@ -1,5 +1,5 @@
 use crate::agent_runtime::{route_policy, static_topic, take_route_failure};
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{HookLoop, call_hook, future_into_py, hook_callable};
 use crate::errors::to_pyerr;
 use laser_sdk::agent::{
     Budget, InboxRoute, OnTimeout, Router, StepContext, StepFn, Verifier, Workflow,
@@ -9,30 +9,27 @@ use laser_sdk::types::{AgentId, ConversationId, PrincipalId};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-// Workflow callbacks can return directly or through an awaitable. Dropping a
-// running workflow cancels any active Python callback task.
+// Workflow callbacks are callables or objects with the named method, and can
+// return directly or through an awaitable. Dropping a running workflow cancels
+// any active Python callback task.
 struct PyStepFn(Arc<Py<PyAny>>);
 
 #[async_trait::async_trait]
 impl StepFn for PyStepFn {
     async fn build(&self, ctx: &StepContext<'_>) -> Result<Vec<u8>, laser_sdk::LaserError> {
-        let value = crate::memory::call_hook_cancellable(|py| {
+        let value = call_hook(&HookLoop::default(), |call| {
+            let py = call.py();
+            let build = hook_callable(self.0.bind(py), "build", "a workflow step builder")?;
             let outputs = PyDict::new(py);
             for (label, output) in ctx.outputs {
                 outputs.set_item(label, PyBytes::new(py, output))?;
             }
-            let callback = self.0.bind(py);
-            if callback.is_callable() {
-                callback.call1((outputs,)).map(Bound::unbind)
-            } else {
-                callback
-                    .call_method1("build", (outputs,))
-                    .map(Bound::unbind)
-            }
+            call.call(&build, (outputs,))
         })
         .await
         .map_err(crate::errors::from_callback_error)?;
@@ -49,16 +46,10 @@ struct PyVerifier(Arc<Py<PyAny>>);
 #[async_trait::async_trait]
 impl Verifier for PyVerifier {
     async fn verify(&self, output: &[u8]) -> Result<bool, laser_sdk::LaserError> {
-        let value = crate::memory::call_hook_cancellable(|py| {
-            let callback = self.0.bind(py);
-            let output = PyBytes::new(py, output);
-            if callback.is_callable() {
-                callback.call1((output,)).map(Bound::unbind)
-            } else {
-                callback
-                    .call_method1("verify", (output,))
-                    .map(Bound::unbind)
-            }
+        let value = call_hook(&HookLoop::default(), |call| {
+            let py = call.py();
+            let verify = hook_callable(self.0.bind(py), "verify", "a workflow verifier")?;
+            call.call(&verify, (PyBytes::new(py, output),))
         })
         .await
         .map_err(crate::errors::from_callback_error)?;
@@ -271,7 +262,8 @@ impl PyWorkflow {
         Ok(())
     }
 
-    /// Run the workflow, returning the completed steps' outputs keyed by label.
+    /// Run the workflow, returning a `WorkflowOutcome` with the completed steps'
+    /// outputs keyed by label and the run id.
     /// The workflow name is the orchestrator identity it dispatches as, so it must
     /// be a valid agent id. A failed step runs the compensations in reverse and
     /// raises.
@@ -353,14 +345,48 @@ impl PyWorkflow {
                 return Err(error);
             }
             let outcome = outcome.map_err(to_pyerr)?;
-            Python::attach(|py| {
-                let outputs = PyDict::new(py);
-                for (label, output) in outcome.outputs {
-                    outputs.set_item(label, PyBytes::new(py, &output))?;
-                }
-                Ok(outputs.into_any().unbind())
+            Ok(PyWorkflowOutcome {
+                outputs: outcome.outputs,
+                run_id: outcome.run_id.to_string(),
             })
         })
+    }
+}
+
+/// The result of a completed `Workflow.run`: each step's output by label, plus
+/// the run id. Pass the run id to `Workflow.run_id` to resume the same run.
+#[gen_stub_pyclass]
+#[pyclass(name = "WorkflowOutcome", frozen)]
+pub struct PyWorkflowOutcome {
+    outputs: BTreeMap<String, Vec<u8>>,
+    run_id: String,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyWorkflowOutcome {
+    /// Each completed step's output, keyed by step label.
+    #[getter]
+    fn outputs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let outputs = PyDict::new(py);
+        for (label, output) in &self.outputs {
+            outputs.set_item(label, PyBytes::new(py, output))?;
+        }
+        Ok(outputs)
+    }
+
+    /// The run id, which resumes the same run when passed to `Workflow.run_id`.
+    #[getter]
+    fn run_id(&self) -> String {
+        self.run_id.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "WorkflowOutcome(run_id={}, steps={})",
+            self.run_id,
+            self.outputs.len()
+        )
     }
 }
 
@@ -536,5 +562,22 @@ async def pending_build(outputs):
             })
         })
         .expect("dropping a callback retires its Python task");
+    }
+
+    #[test]
+    fn given_a_workflow_outcome_when_read_then_should_expose_outputs_and_run_id() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let outcome = super::PyWorkflowOutcome {
+                outputs: BTreeMap::from([("triage".to_owned(), b"sev2".to_vec())]),
+                run_id: "run-7".to_owned(),
+            };
+            let outputs = outcome.outputs(py)?;
+            let triage = outputs.get_item("triage")?.expect("triage output");
+            assert_eq!(triage.extract::<Vec<u8>>()?, b"sev2");
+            assert_eq!(outcome.run_id(), "run-7");
+            Ok(())
+        })
+        .expect("workflow outcome reads");
     }
 }

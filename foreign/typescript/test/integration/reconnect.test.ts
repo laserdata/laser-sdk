@@ -16,7 +16,6 @@ void test(
     let laser: Laser | undefined
     const running = { value: true }
     let sent = 0
-    let observed = 0
     let worker: Promise<void> | undefined
     try {
       const [leader, follower] = await cluster.leaderAndFollower()
@@ -34,7 +33,7 @@ void test(
             )
             sent += 1
             const cursor = await topic.replay()
-            observed += (await within(cursor.poll(), 10_000)).length
+            await within(cursor.poll(), 10_000)
           } catch (error) {
             console.error("rolling TypeScript publish failed", error)
           }
@@ -53,7 +52,28 @@ void test(
       cluster.routeEndpointTo(newLeader)
       await cluster.startNode(leader)
       await waitForProgress(() => sent, sent + 1)
-      assert.ok(observed > 0)
+      running.value = false
+      await worker
+      // Every confirmed publish, before, during, and after the restarts, is
+      // readable on the same handle. A lost acknowledgement may duplicate a
+      // record, never drop one.
+      const values = new Set<bigint>()
+      const cursor = await topic.replay()
+      for (;;) {
+        const batch = await within(cursor.poll(), 10_000)
+        if (batch.length === 0) break
+        for (const record of batch) {
+          values.add(
+            new DataView(record.payload.buffer, record.payload.byteOffset, 8).getBigUint64(0, true)
+          )
+        }
+      }
+      for (let value = 1n; value <= BigInt(sent); value += 1n) {
+        assert.ok(
+          values.has(value),
+          `record ${value.toString()} is not readable after the restarts`
+        )
+      }
     } finally {
       running.value = false
       await worker
@@ -87,7 +107,7 @@ void test(
       await within(topic.ensure(1), 3_000)
       consumer = await topic.consumerGroup("restart-workers").consumer({
         batchLength: 10,
-        startFrom: { kind: "first" },
+        startAt: { kind: "first" },
         pollIntervalMs: 10
       })
       await within(topic.send(new TextEncoder().encode("before-restart")), 3_000)
@@ -114,7 +134,7 @@ void test(
       )
       consumer = await topic.consumerGroup("restart-workers").consumer({
         batchLength: 10,
-        startFrom: { kind: "next" },
+        startAt: { kind: "next" },
         pollIntervalMs: 10
       })
       const after = await within(consumer.nextWithin(5_000), 6_000)

@@ -1,3 +1,5 @@
+import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.command.js"
+import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
 import { connectOptions } from "../client/connect-options.js"
 import { publishOptions, publishWithin, type PublishOptions } from "../client/publish-options.js"
 import {
@@ -22,13 +24,16 @@ import { isIP } from "node:net"
 import {
   AmbiguousMutationError,
   ConfigError,
+  InvalidError,
   ProtocolError,
+  PublishFailedError,
   TimeoutError,
   TransportError,
   UnsupportedError
 } from "../client/errors.js"
 import { LASERDATA_ROOT_CA } from "../client/laserdata-ca.js"
-import type { PollingStrategy } from "../stream/polling-strategy.js"
+import type { ConsumerStart } from "../stream/consumer-start.js"
+import type { HeaderValue } from "../stream/header-value.js"
 import type { Routing } from "../stream/routing.js"
 import { Mutex } from "../runtime/mutex.js"
 import { mintUlidValue } from "../runtime/ulid.js"
@@ -41,12 +46,22 @@ export interface PolledMessage {
   readonly partitionId: number
   readonly offset: bigint
   readonly timestampMicros?: bigint
-  readonly headers: ReadonlyMap<string, IggyHeaderValue>
+  readonly headers: ReadonlyMap<string, HeaderValue>
   /**
    * Why the header block did not decode, when it did not: its structure, the
    * `agdx.ct` entry, or another entry. A valid content type can remain available.
    */
   readonly headersMalformed?: HeaderFault
+  /** The id the record was sent with. */
+  readonly messageId?: bigint
+  /** The record checksum as stored. */
+  readonly checksum?: bigint
+  /** The producer timestamp in microseconds. */
+  readonly originTimestampMicros?: bigint
+  /** The partition head when the record was read. */
+  readonly currentOffset?: bigint
+  /** The user-header block exactly as stored, absent when the record has none. */
+  readonly userHeaders?: Uint8Array
 }
 
 /** The part of a user-header block that did not decode. */
@@ -66,14 +81,22 @@ export interface TopicCreateSettings {
 
 /** The `maxTopicSize` value that lifts the topic size limit (u64 max). */
 export const UNLIMITED_TOPIC_SIZE = 18_446_744_073_709_551_615n
+/** The message expiry that keeps records until retention removes them (u64 max). */
+export const NEVER_EXPIRE = 18_446_744_073_709_551_615n
 
 const TOPIC_NAME_ALREADY_EXISTS = 2013
+const UNAUTHENTICATED = 40
+const POLL_MESSAGES_CODE = 100
+const PUBLISH_BATCH_LENGTH = 1_000
+const NUMERIC_IDENTIFIER = 1
+const STRING_IDENTIFIER = 2
+// Server replies a later attempt can clear: a write the cluster did not
+// commit or admit, and a partition the node could not read or find yet.
+const TRANSIENT_PUBLISH_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 3007, 10002])
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
 const ACCEPT_STAGE = "Iggy server to accept the connection"
 const LOGIN_STAGE = "Iggy login reply"
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
-const TRANSIENT_NOT_COMMITTED = 57
-const TRANSIENT_NOT_ACCEPTED = 58
 const POLLED_HEAD_BYTES = 16
 const BATCH_HEADER_BYTES = 256
 const FRAME_HEADER_BYTES = 48
@@ -87,28 +110,39 @@ export function toNodeBuffer(bytes: Uint8Array): Buffer {
 
 export interface MessageWithHeaders {
   readonly payload: Uint8Array
-  readonly headers: ReadonlyMap<string, IggyHeaderValue>
+  readonly headers: ReadonlyMap<string, HeaderValue>
+  /** The message id. A record without one, or with `0n`, gets a fresh id
+   * before its first attempt, and every retry and a resend from a failure
+   * report keep it, so the server deduplicates them. */
+  readonly id?: bigint
 }
 
-/** Represents every Apache Iggy user-header kind. */
-export type IggyHeaderValue =
-  | { readonly kind: "raw"; readonly value: Uint8Array }
-  | { readonly kind: "string"; readonly value: string }
-  | { readonly kind: "bool"; readonly value: boolean }
-  | { readonly kind: "int8"; readonly value: number }
-  | { readonly kind: "int16"; readonly value: number }
-  | { readonly kind: "int32"; readonly value: number }
-  | { readonly kind: "int64"; readonly value: bigint }
-  | { readonly kind: "int128"; readonly value: Uint8Array }
-  | { readonly kind: "uint8"; readonly value: number }
-  | { readonly kind: "uint16"; readonly value: number }
-  | { readonly kind: "uint32"; readonly value: number }
-  | { readonly kind: "uint64"; readonly value: bigint }
-  | { readonly kind: "uint128"; readonly value: Uint8Array }
-  | { readonly kind: "float"; readonly value: number }
-  | { readonly kind: "double"; readonly value: number }
+/** The records with an id each: a record without one gets a fresh id. */
+export function withMessageIds(records: readonly MessageWithHeaders[]): MessageWithHeaders[] {
+  return records.map((record) =>
+    record.id === undefined || record.id === 0n ? { ...record, id: mintUlidValue() } : record
+  )
+}
 
 const SYNC_CONSUMER_GROUP_CODE = 606
+const GROUP_MEMBER_NOT_FOUND = 5006
+const GROUP_PARTITION_NOT_OWNED = 5009
+const RESYNC_REQUIRED_PARTITION = 0xffff_ffff
+const GROUP_ASSIGNMENT_REFRESH_MS = 5_000
+const GROUP_POLL_MAX_ATTEMPTS = 2
+const TRANSIENT_NOT_COMMITTED = 57
+
+interface GroupCursor {
+  generation: bigint
+  partitions: readonly number[]
+  position: number
+  synchronizedAt: number
+}
+interface GroupPollState {
+  readonly cursors: Map<string, GroupCursor>
+  sessionGeneration: number
+}
+const GROUP_POLL_STATES = new WeakMap<RawClient, GroupPollState>()
 
 export type ConsumerTarget =
   | { readonly kind: "single"; readonly partitionId: number; readonly name?: string }
@@ -166,23 +200,26 @@ export interface LaserTransport {
     streamId: string,
     topicId: string,
     payload: Uint8Array,
-    headers: ReadonlyMap<string, IggyHeaderValue>,
+    headers: ReadonlyMap<string, HeaderValue>,
     partitionKey?: string | Uint8Array,
     partitionId?: number
   ): Promise<SendMessagesResponse>
+  /** Sends the records in requests of at most `batchLength` (1000 unless
+   * set). A failure throws `PublishFailedError` with the confirmed requests
+   * and the records from the failed request on. */
   sendMessagesWithHeaders(
     streamId: string,
     topicId: string,
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number,
-    options?: Partial<PublishOptions>
+    options?: Partial<PublishOptions> & { readonly batchLength?: number }
   ): Promise<SendMessagesResponse>
   pollMessages(
     streamId: string,
     topicId: string,
     target: ConsumerTarget,
-    strategy: PollingStrategy,
+    strategy: ConsumerStart,
     count: number,
     autoCommit: boolean
   ): Promise<readonly PolledMessage[]>
@@ -266,6 +303,63 @@ function toIggyConsumer(target: ConsumerTarget) {
     : Consumer.Group(target.name)
 }
 
+// The poll command body: consumer, stream, topic, partition, strategy,
+// count, and the auto-commit flag, laid out as the Apache Iggy client lays it.
+function encodePollRequest(
+  streamId: string,
+  topicId: string,
+  target: ConsumerTarget,
+  partitionId: number,
+  strategy: ConsumerStart,
+  count: number,
+  autoCommit: boolean
+): Uint8Array {
+  const consumer =
+    target.kind === "group" ? encodeIdentifier(target.name) : encodeIdentifier(target.name ?? 0)
+  const parts = [
+    Uint8Array.of(target.kind === "group" ? 2 : 1),
+    consumer,
+    encodeIdentifier(streamId),
+    encodeIdentifier(topicId)
+  ]
+  const tail = new Uint8Array(19)
+  const view = new DataView(tail.buffer)
+  view.setUint8(0, 1)
+  view.setUint32(1, partitionId, true)
+  const polling = toIggyPollingStrategy(strategy)
+  view.setUint8(5, polling.kind)
+  view.setBigUint64(6, polling.value, true)
+  view.setUint32(14, count, true)
+  view.setUint8(18, autoCommit ? 1 : 0)
+  parts.push(tail)
+  const request = new Uint8Array(parts.reduce((size, part) => size + part.byteLength, 0))
+  let offset = 0
+  for (const part of parts) {
+    request.set(part, offset)
+    offset += part.byteLength
+  }
+  return request
+}
+
+function encodeIdentifier(value: string | number): Uint8Array {
+  if (typeof value === "number") {
+    const numeric = new Uint8Array(6)
+    const view = new DataView(numeric.buffer)
+    view.setUint8(0, NUMERIC_IDENTIFIER)
+    view.setUint8(1, 4)
+    view.setUint32(2, value, true)
+    return numeric
+  }
+  const name = new TextEncoder().encode(value)
+  if (name.byteLength === 0 || name.byteLength > 255)
+    throw new ConfigError("an Iggy identifier must contain 1 to 255 UTF-8 bytes")
+  const encoded = new Uint8Array(2 + name.byteLength)
+  encoded[0] = STRING_IDENTIFIER
+  encoded[1] = name.byteLength
+  encoded.set(name, 2)
+  return encoded
+}
+
 function toIggyOffsetConsumer(target: ConsumerOffsetTarget) {
   return target.kind === "group"
     ? Consumer.Group(target.name)
@@ -326,7 +420,7 @@ export function xxHash32(bytes: Uint8Array): number {
   return hash >>> 0
 }
 
-function toIggyPollingStrategy(strategy: PollingStrategy) {
+function toIggyPollingStrategy(strategy: ConsumerStart) {
   switch (strategy.kind) {
     case "first":
       return IggyPollingStrategy.First
@@ -336,12 +430,12 @@ function toIggyPollingStrategy(strategy: PollingStrategy) {
       return IggyPollingStrategy.Next
     case "offset":
       return IggyPollingStrategy.Offset(strategy.value)
-    case "timestamp":
+    case "timestampMicros":
       return IggyPollingStrategy.Timestamp(strategy.value)
   }
 }
 
-function toIggyHeaderValue(value: IggyHeaderValue) {
+function toIggyHeaderValue(value: HeaderValue) {
   switch (value.kind) {
     case "raw":
       return IggyHeaderValueFactory.Raw(toNodeBuffer(value.value))
@@ -376,68 +470,6 @@ function toIggyHeaderValue(value: IggyHeaderValue) {
   }
 }
 
-const HEADER_KIND_BY_NUMBER: Readonly<Record<number, IggyHeaderValue["kind"]>> = {
-  1: "raw",
-  2: "string",
-  3: "bool",
-  4: "int8",
-  5: "int16",
-  6: "int32",
-  7: "int64",
-  8: "int128",
-  9: "uint8",
-  10: "uint16",
-  11: "uint32",
-  12: "uint64",
-  13: "uint128",
-  14: "float",
-  15: "double"
-}
-
-function fromParsedHeaderValue(kind: number, value: unknown): IggyHeaderValue | undefined {
-  const tag = HEADER_KIND_BY_NUMBER[kind]
-  if (tag === undefined) return undefined
-  switch (tag) {
-    case "raw":
-    case "int128":
-    case "uint128": {
-      if (!(value instanceof Buffer)) return undefined
-      return { kind: tag, value: new Uint8Array(value) }
-    }
-    case "string":
-      return typeof value === "string" ? { kind: tag, value } : undefined
-    case "bool":
-      return typeof value === "boolean" ? { kind: tag, value } : undefined
-    case "int64":
-    case "uint64":
-      return typeof value === "bigint" ? { kind: tag, value } : undefined
-    case "int8":
-    case "int16":
-    case "int32":
-    case "uint8":
-    case "uint16":
-    case "uint32":
-    case "float":
-    case "double":
-      return typeof value === "number" ? { kind: tag, value } : undefined
-  }
-}
-
-function parsedHeadersToMap(
-  entries: readonly {
-    readonly key: { readonly value: unknown }
-    readonly value: { readonly kind: number; readonly value: unknown }
-  }[]
-): ReadonlyMap<string, IggyHeaderValue> {
-  const map = new Map<string, IggyHeaderValue>()
-  for (const entry of entries) {
-    if (typeof entry.key.value !== "string") continue
-    const value = fromParsedHeaderValue(entry.value.kind, entry.value.value)
-    if (value !== undefined) map.set(entry.key.value, value)
-  }
-  return map
-}
-
 /** The Iggy error code a server reply carried, through any transport wrapping. */
 export function serverErrorCode(error: unknown): number | undefined {
   let current = error
@@ -461,12 +493,14 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
   if (body.byteLength < POLLED_HEAD_BYTES) throw malformed("head")
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
   const partitionId = view.getUint32(0, true)
+  const currentOffset = view.getBigUint64(4, true)
   const messages: PolledMessage[] = []
   let position = POLLED_HEAD_BYTES
   while (position < body.byteLength) {
     if (position + BATCH_HEADER_BYTES > body.byteLength) throw malformed("batch header")
     const baseOffset = view.getBigUint64(position + 8, true)
     const baseTimestamp = view.getBigUint64(position + 16, true)
+    const originTimestamp = view.getBigUint64(position + 24, true)
     const batchLength = view.getBigUint64(position + 32, true)
     if (
       batchLength < BigInt(BATCH_HEADER_BYTES) ||
@@ -492,6 +526,12 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
         partitionId,
         offset: baseOffset + BigInt(offsetDelta),
         timestampMicros: baseTimestamp,
+        messageId:
+          view.getBigUint64(position + 8, true) | (view.getBigUint64(position + 16, true) << 64n),
+        checksum: view.getBigUint64(position, true),
+        originTimestampMicros: originTimestamp + BigInt(view.getUint32(position + 28, true)),
+        currentOffset,
+        ...(block.byteLength > 0 ? { userHeaders: block } : {}),
         ...(typeof headers === "string"
           ? {
               headers: typeof contentType === "string" ? new Map() : contentType,
@@ -513,8 +553,8 @@ export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
 function decodeUserHeaders(
   block: Uint8Array,
   contentTypeOnly = false
-): ReadonlyMap<string, IggyHeaderValue> | HeaderFault {
-  const headers = new Map<string, IggyHeaderValue>()
+): ReadonlyMap<string, HeaderValue> | HeaderFault {
+  const headers = new Map<string, HeaderValue>()
   const view = new DataView(block.buffer, block.byteOffset, block.byteLength)
   let position = 0
   while (position < block.byteLength) {
@@ -562,7 +602,7 @@ function decodeUserHeaders(
   return headers
 }
 
-function headerValueOf(kind: number, bytes: Uint8Array): IggyHeaderValue | undefined {
+function headerValueOf(kind: number, bytes: Uint8Array): HeaderValue | undefined {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const sized = (size: number): boolean => bytes.byteLength === size
   switch (kind) {
@@ -873,7 +913,8 @@ function pinnedClient(raw: RawClient, loginDeadline: number | undefined): Simple
   const queue = data._queueCommand
   if (typeof queue !== "function")
     throw new UnsupportedError(
-      "this Apache Iggy SDK does not expose the partition data request queue required by filtered Primary reads"
+      "this Apache Iggy SDK does not expose the partition data request queue required by filtered Primary reads",
+      { surface: "filters" }
     )
   const facade: RawClient = {
     sendCommand(code, payload, options) {
@@ -1226,32 +1267,23 @@ export class ApacheIggyTransport implements LaserTransport {
     )
   }
 
+  /** Creates the topic when it is absent, keeping records until retention
+   * removes them like Rust `ensure_topic`. An existing topic is left as it is. */
   async ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void> {
-    const topic = await this.execute(
-      (client) => client.topic.ensure(streamId, topicId, partitions),
-      `failed to ensure topic \`${topicId}\` on stream \`${streamId}\``
-    )
-    this.partitionCounts.set(this.topicKey(streamId, topicId), topic.partitionsCount)
+    await this.createTopicIfAbsent(streamId, topicId, partitions, {
+      messageExpiryMicros: NEVER_EXPIRE
+    })
   }
 
+  /** `ensureTopic` with a message expiry for a topic it creates. An existing
+   * topic keeps its own expiry. */
   async ensureTopicWithExpiry(
     streamId: string,
     topicId: string,
     partitions: number,
     messageExpiryMicros: bigint
   ): Promise<void> {
-    const partitionCount = await this.execute(async (client) => {
-      const topic = await client.topic.ensure(streamId, topicId, partitions)
-      if (topic.messageExpiry === messageExpiryMicros) return topic.partitionsCount
-      await client.topic.update({
-        streamId,
-        topicId,
-        name: topic.name,
-        messageExpiry: messageExpiryMicros
-      })
-      return topic.partitionsCount
-    }, `failed to ensure topic \`${topicId}\` on stream \`${streamId}\` with message expiry`)
-    this.partitionCounts.set(this.topicKey(streamId, topicId), partitionCount)
+    await this.createTopicIfAbsent(streamId, topicId, partitions, { messageExpiryMicros })
   }
 
   async createTopicIfAbsent(
@@ -1374,9 +1406,13 @@ export class ApacheIggyTransport implements LaserTransport {
       } catch (cause) {
         const response = serverResponseError(cause)
         const code = serverErrorCode(cause)
-        const transient = code === TRANSIENT_NOT_COMMITTED || code === TRANSIENT_NOT_ACCEPTED
+        const transient = code !== undefined && TRANSIENT_PUBLISH_CODES.has(code)
+        // An expired session on a connection that logged in once means the
+        // socket was re-dialed underneath it. A reconnect logs in again.
+        const reauthenticate = code === UNAUTHENTICATED && this.connection !== undefined
         const retryable =
           transient ||
+          reauthenticate ||
           (response === undefined &&
             !(cause instanceof DeserializeError) &&
             !(cause instanceof ConfigError) &&
@@ -1385,7 +1421,7 @@ export class ApacheIggyTransport implements LaserTransport {
         // the current one. A concurrent publish may already have replaced it,
         // and destroying that fresh connection would starve every publisher for
         // as long as failures keep arriving.
-        if (response === undefined && retryable && this.client === used) {
+        if ((response === undefined || reauthenticate) && retryable && this.client === used) {
           this.disconnected.add(used)
           // Destroy before retry so a timed-out queued write cannot run on the old socket.
           await used.destroy().catch(() => undefined)
@@ -1412,29 +1448,19 @@ export class ApacheIggyTransport implements LaserTransport {
     payloads: readonly Uint8Array[],
     routing: Routing
   ): Promise<SendMessagesResponse> {
-    let partitionId: number | undefined
-    const messages = payloads.map((payload) => ({
-      id: mintUlidValue(),
-      payload: toNodeBuffer(payload)
-    }))
-    return this.publish(async (client) => {
-      partitionId ??= await this.resolvePartition(streamId, topicId, routing, client)
-      if (this.disconnected.has(client))
-        throw new TransportError("publish connection was retired", true)
-      return client.message.send({
-        streamId,
-        topicId,
-        messages,
-        partition: Partitioning.PartitionId(partitionId)
-      })
-    })
+    return this.sendRecords(
+      streamId,
+      topicId,
+      payloads.map((payload) => ({ payload, headers: new Map() })),
+      routing
+    )
   }
 
   async sendMessageWithHeaders(
     streamId: string,
     topicId: string,
     payload: Uint8Array,
-    headers: ReadonlyMap<string, IggyHeaderValue>,
+    headers: ReadonlyMap<string, HeaderValue>,
     partitionKey?: string | Uint8Array,
     partitionId?: number
   ): Promise<SendMessagesResponse> {
@@ -1453,9 +1479,8 @@ export class ApacheIggyTransport implements LaserTransport {
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number,
-    options?: Partial<PublishOptions>
+    options?: Partial<PublishOptions> & { readonly batchLength?: number }
   ): Promise<SendMessagesResponse> {
-    let resolvedPartition: number | undefined
     const routing: Routing =
       partitionId !== undefined
         ? { kind: "partition", partition: partitionId }
@@ -1468,59 +1493,110 @@ export class ApacheIggyTransport implements LaserTransport {
                   : partitionKey
             }
           : { kind: "balanced" }
-    const prepared = messages.map(({ payload, headers }) => ({
-      id: mintUlidValue(),
-      payload: toNodeBuffer(payload),
-      headers: [...headers].map(([key, value]) => ({
-        key: HeaderKeyFactory.String(key),
-        value: toIggyHeaderValue(value)
+    return this.sendRecords(streamId, topicId, messages, routing, options)
+  }
+
+  // Sends the records in consecutive requests of at most `batchLength`, each
+  // with bounded retries, like the Rust `send_batch_on`. A failure reports the
+  // confirmed requests and every record from the failed request on, with the
+  // ids its attempts used. An empty batch sends nothing.
+  private async sendRecords(
+    streamId: string,
+    topicId: string,
+    messages: readonly MessageWithHeaders[],
+    routing: Routing,
+    options?: Partial<PublishOptions> & { readonly batchLength?: number }
+  ): Promise<SendMessagesResponse> {
+    if (messages.length === 0) return { confirmations: [] }
+    if (routing.kind === "key" && (routing.key.byteLength === 0 || routing.key.byteLength > 255))
+      throw new InvalidError("a partition key must hold 1 to 255 bytes")
+    const records = withMessageIds(messages)
+    const batchLength = options?.batchLength ?? PUBLISH_BATCH_LENGTH
+    const confirmations: SendMessagesConfirmation[] = []
+    let resolvedPartition: number | undefined
+    for (let start = 0; start < records.length; start += batchLength) {
+      const prepared = records.slice(start, start + batchLength).map((record) => ({
+        id: record.id ?? mintUlidValue(),
+        payload: toNodeBuffer(record.payload),
+        headers: [...record.headers].map(([key, value]) => ({
+          key: HeaderKeyFactory.String(key),
+          value: toIggyHeaderValue(value)
+        }))
       }))
-    }))
-    return this.publish(async (client) => {
-      resolvedPartition ??= await this.resolvePartition(streamId, topicId, routing, client)
-      if (this.disconnected.has(client))
-        throw new TransportError("publish connection was retired", true)
-      return client.message.send({
-        streamId,
-        topicId,
-        messages: prepared,
-        partition: Partitioning.PartitionId(resolvedPartition)
-      })
-    }, options)
+      try {
+        const response = await this.publish(async (client) => {
+          resolvedPartition ??= await this.resolvePartition(streamId, topicId, routing, client)
+          if (this.disconnected.has(client))
+            throw new TransportError("publish connection was retired", true)
+          return client.message.send({
+            streamId,
+            topicId,
+            messages: prepared,
+            partition: Partitioning.PartitionId(resolvedPartition)
+          })
+        }, options)
+        confirmations.push(...response.confirmations)
+      } catch (cause) {
+        throw new PublishFailedError(streamId, topicId, confirmations, records.slice(start), cause)
+      }
+    }
+    return { confirmations }
   }
 
   async pollMessages(
     streamId: string,
     topicId: string,
     target: ConsumerTarget,
-    strategy: PollingStrategy,
+    strategy: ConsumerStart,
     count: number,
     autoCommit: boolean
   ): Promise<readonly PolledMessage[]> {
-    const reply = await this.execute(
-      (client) =>
-        client.message.poll({
-          streamId,
-          topicId,
-          partitionId: target.partitionId ?? null,
-          consumer: toIggyConsumer(target),
-          pollingStrategy: toIggyPollingStrategy(strategy),
-          count,
-          autocommit: autoCommit
-        }),
+    const partitionId = target.partitionId
+    if (partitionId === undefined) {
+      if (target.kind !== "group") throw new InvalidError("a single consumer needs a partition")
+      return this.execute(async (client) => {
+        const raw = await client.clientProvider()
+        const release = raw.hold?.()
+        try {
+          const state = groupPollState(raw)
+          for (;;) {
+            const generation = state.sessionGeneration
+            try {
+              return await pollGroupRecords(
+                raw,
+                state,
+                streamId,
+                topicId,
+                target,
+                strategy,
+                count,
+                autoCommit
+              )
+            } catch (error) {
+              if (
+                state.sessionGeneration === generation ||
+                serverErrorCode(error) === TRANSIENT_NOT_COMMITTED
+              )
+                throw error
+            }
+          }
+        } finally {
+          release?.()
+        }
+      }, `failed to poll topic \`${topicId}\``)
+    }
+    const request = toNodeBuffer(
+      encodePollRequest(streamId, topicId, target, partitionId, strategy, count, autoCommit)
+    )
+    const body = await this.execute(
+      (client) => client.sendBinaryRequest(POLL_MESSAGES_CODE, request),
       `failed to poll topic \`${topicId}\``
     )
-    return reply.messages.map((message) => ({
-      payload: new Uint8Array(
-        message.payload.buffer,
-        message.payload.byteOffset,
-        message.payload.byteLength
-      ),
-      partitionId: reply.partitionId,
-      offset: message.headers.offset,
-      timestampMicros: BigInt(message.headers.timestamp.getTime()) * 1_000n,
-      headers: parsedHeadersToMap(message.userHeaders)
-    }))
+    // The stored records exactly: microsecond times, message ids, and a
+    // header block that does not decode marked rather than failing the poll.
+    return body.byteLength === 0
+      ? []
+      : decodePolledBody(new Uint8Array(body.buffer, body.byteOffset, body.byteLength))
   }
 
   async storeOffset(
@@ -1796,4 +1872,100 @@ export class ApacheIggyTransport implements LaserTransport {
     this.balancedCursors.set(key, (cursor + 1) >>> 0)
     return cursor % partitionCount
   }
+}
+
+function groupPollState(client: RawClient): GroupPollState {
+  const current = GROUP_POLL_STATES.get(client)
+  if (current !== undefined) return current
+  const state: GroupPollState = { cursors: new Map(), sessionGeneration: 0 }
+  GROUP_POLL_STATES.set(client, state)
+  client.on("sessionReset", () => {
+    state.cursors.clear()
+    state.sessionGeneration += 1
+  })
+  client.on("heartbeat", () => {
+    for (const cursor of state.cursors.values()) cursor.synchronizedAt = 0
+  })
+  return state
+}
+
+async function pollGroupRecords(
+  client: RawClient,
+  state: GroupPollState,
+  streamId: string,
+  topicId: string,
+  target: Extract<ConsumerTarget, { readonly kind: "group" }>,
+  strategy: ConsumerStart,
+  count: number,
+  autoCommit: boolean
+): Promise<readonly PolledMessage[]> {
+  const key = `${streamId}\0${topicId}\0${target.name}`
+  for (let attempt = 0; attempt < GROUP_POLL_MAX_ATTEMPTS; attempt += 1) {
+    let cursor = state.cursors.get(key)
+    const age = cursor === undefined ? -1 : Date.now() - cursor.synchronizedAt
+    if (cursor === undefined || age < 0 || age >= GROUP_ASSIGNMENT_REFRESH_MS) {
+      const group = { streamId, topicId, groupId: target.name }
+      let assignment
+      try {
+        assignment = SYNC_GROUP.deserialize(
+          await client.sendCommand(SYNC_GROUP.code, SYNC_GROUP.serialize(group))
+        )
+      } catch (error) {
+        if (serverErrorCode(error) !== GROUP_MEMBER_NOT_FOUND) throw error
+        assignment = null
+      }
+      if (assignment === null) {
+        await client.sendCommand(JOIN_GROUP.code, JOIN_GROUP.serialize(group))
+        assignment = SYNC_GROUP.deserialize(
+          await client.sendCommand(SYNC_GROUP.code, SYNC_GROUP.serialize(group))
+        )
+      }
+      if (assignment === null) throw new ProtocolError("the consumer group assignment is absent")
+      cursor = {
+        generation: assignment.generation,
+        partitions: assignment.partitions,
+        position:
+          cursor?.generation === assignment.generation &&
+          cursor.position < assignment.partitions.length
+            ? cursor.position
+            : 0,
+        synchronizedAt: Date.now()
+      }
+      state.cursors.set(key, cursor)
+    }
+    const partition = cursor.partitions[cursor.position]
+    if (partition === undefined) return []
+    cursor.position = (cursor.position + 1) % cursor.partitions.length
+    let body: Uint8Array
+    try {
+      const response = await client.sendCommand(
+        POLL_MESSAGES_CODE,
+        toNodeBuffer(
+          encodePollRequest(streamId, topicId, target, partition, strategy, count, autoCommit)
+        )
+      )
+      body = new Uint8Array(
+        response.data.buffer,
+        response.data.byteOffset,
+        response.data.byteLength
+      )
+    } catch (error) {
+      const code = serverErrorCode(error)
+      if (code !== GROUP_MEMBER_NOT_FOUND && code !== GROUP_PARTITION_NOT_OWNED) throw error
+      state.cursors.delete(key)
+      continue
+    }
+    if (body.byteLength === 0) return []
+    const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
+    if (
+      body.byteLength >= POLLED_HEAD_BYTES &&
+      view.getUint32(0, true) === RESYNC_REQUIRED_PARTITION &&
+      view.getUint32(12, true) === 0
+    ) {
+      state.cursors.delete(key)
+      continue
+    }
+    return decodePolledBody(body)
+  }
+  return []
 }

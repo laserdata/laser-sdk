@@ -38,14 +38,14 @@ async def main() -> None:
 
         _common.phase("append a conversation, then assemble it under a budget")
         ctx = laser.context(conversation)
-        await ctx.append(ls.Topics.COMMANDS, b"drain node-7")
-        await ctx.append(ls.Topics.RESPONSES, b"drained, 0 connections left")
+        await ctx.append(ls.AgentTopic.Commands, b"drain node-7")
+        await ctx.append(ls.AgentTopic.Responses, b"drained, 0 connections left")
 
         # The shape of a prompt's context is a declared bound, not slicing logic
         # spread through the application: cap the turns, then fit the budget.
         turns = await ctx.fetch(
-            topics=[ls.Topics.COMMANDS, ls.Topics.RESPONSES],
-            last_n=LAST_N,
+            topics=[ls.AgentTopic.Commands, ls.AgentTopic.Responses],
+            n=LAST_N,
             token_budget=TOKEN_BUDGET,
         )
 

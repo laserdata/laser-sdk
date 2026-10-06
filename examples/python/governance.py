@@ -64,15 +64,12 @@ async def install_roles(laser, target_user: int) -> None:
 
 def roles() -> dict[str, list[ls.Grant]]:
     return {
-        "support-reader": [
-            ls.Grant("kv", "read", resource_kind="prefix", resource_value="support/")
-        ],
+        "support-reader": [ls.Grant("kv", "read", resource=ls.ResourcePattern.prefix("support/"))],
         "projection-operator": [
             ls.Grant(
                 "projection",
                 "admin",
-                resource_kind="prefix",
-                resource_value="support_",
+                resource=ls.ResourcePattern.prefix("support_"),
             )
         ],
         "agent-runner": [
@@ -87,13 +84,13 @@ def roles() -> dict[str, list[ls.Grant]]:
 
 def demonstrate_intersection() -> None:
     user = [
-        ls.Grant("kv", "read", resource_kind="prefix", resource_value="support/"),
+        ls.Grant("kv", "read", resource=ls.ResourcePattern.prefix("support/")),
         ls.Grant("kv", "delete", effect="deny"),
     ]
     agent = [
-        ls.Grant("kv", "read", resource_kind="prefix", resource_value="support/tickets/"),
-        ls.Grant("kv", "write", resource_kind="prefix", resource_value="support/tickets/"),
-        ls.Grant("kv", "delete", resource_kind="prefix", resource_value="support/tickets/"),
+        ls.Grant("kv", "read", resource=ls.ResourcePattern.prefix("support/tickets/")),
+        ls.Grant("kv", "write", resource=ls.ResourcePattern.prefix("support/tickets/")),
+        ls.Grant("kv", "delete", resource=ls.ResourcePattern.prefix("support/tickets/")),
     ]
 
     for action in ("read", "write", "delete"):
@@ -104,20 +101,14 @@ def demonstrate_intersection() -> None:
 
 
 def demonstrate_edge_auth() -> None:
-    authorized, challenge = ls.authorize_edge(
-        ["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:read"
-    )
-    print(f"edge read authorized: {authorized}, challenge={challenge}")
+    denial = ls.authorize_edge(["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:read")
+    print(f"edge read authorized: {denial is None}")
 
-    authorized, challenge = ls.authorize_edge(
-        ["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:write"
-    )
-    print(f"edge write step-up challenge: {challenge}")
+    denial = ls.authorize_edge(["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:write")
+    print(f"edge write step-up challenge: {denial.challenge}")
 
-    authorized, challenge = ls.authorize_edge(
-        ["other.server"], ["tool:write"], "mcp.laserdata", "tool:write"
-    )
-    print(f"foreign audience rejected: {not authorized}")
+    denial = ls.authorize_edge(["other.server"], ["tool:write"], "mcp.laserdata", "tool:write")
+    print(f"foreign audience rejected: {denial.kind == 'wrong_audience'}")
 
 
 async def submit_budgeted_run(laser) -> None:

@@ -1,7 +1,13 @@
 export { LogMemory } from "./memory/log-memory.js"
-export { MemoryBackend, MemoryHandle, RecallBuilder, RememberBuilder } from "./memory/handle.js"
+export {
+  MemoryBackend,
+  MemoryHandle,
+  RecallBuilder,
+  RememberBuilder,
+  RerankedMemory
+} from "./memory/handle.js"
 export type { MemoryBackendKind } from "./memory/handle.js"
-export { MemoryTopicBuilder } from "./memory/topic.js"
+export { DEFAULT_MEMORY_TOPIC_TTL_MS, MemoryTopicBuilder } from "./memory/topic.js"
 export {
   Lifetime,
   MemoryClass,
@@ -10,6 +16,9 @@ export {
   RecallStrategy,
   fuseReciprocalRank,
   memoryClass,
+  memoryItemJson,
+  memoryItemText,
+  memoryKindCode,
   toContextBlock
 } from "./memory/types.js"
 export type {
@@ -26,4 +35,4 @@ export type {
   Reranker,
   Summarizer
 } from "./memory/types.js"
-export { VectorMemory, ZeroEmbedder } from "./memory/vector-memory.js"
+export { VectorMemory } from "./memory/vector-memory.js"

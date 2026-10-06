@@ -15,6 +15,7 @@ import {
   type RetryPolicy
 } from "./reliable-consumer.js"
 import type { InboxRoute } from "./router.js"
+import { longTimeout } from "./timer.js"
 
 export interface AgentDefinition {
   readonly id: AgentId
@@ -31,7 +32,7 @@ export interface AgentDefinition {
   readonly understoodFeatures: bigint
   readonly warmDedup: boolean
   readonly middleware: readonly AgentMiddleware[]
-  readonly deadLetterSink?: DeadLetterSink
+  readonly onDeadLetter?: DeadLetterSink
   readonly dedupWindow?: number
   readonly retry?: RetryPolicy
   readonly deduplicator?: Deduplicator
@@ -43,10 +44,29 @@ export interface AgentDefinition {
   readonly governorMode?: GovernorMode
   readonly governorRetention?: Partial<GovernorRetention>
   readonly consolidateEveryMs?: number
-  readonly consolidator?: AgentConsolidator
+  readonly consolidator?: Consolidator
 }
 
-export type AgentConsolidator = Consolidator
+/**
+ * One configured agent. `spawn` runs it as its own consumer group, named after
+ * its id unless `consumerGroup` is set. Never put two agent ids in one group:
+ * each member skips work addressed to another id, so the intended agent would
+ * never see it.
+ */
+export class Agent {
+  constructor(private readonly definition: AgentDefinition) {
+    validateDefinition(definition)
+  }
+
+  static builder(): AgentBuilder {
+    return new AgentBuilder()
+  }
+
+  /** Starts the agent on `laser` and returns the handle that stops it. */
+  spawn(laser: Laser): AgentHandle {
+    return AgentHandle.create(this.definition, laser)
+  }
+}
 
 type RunOutcome = { readonly kind: "ok" } | { readonly kind: "error"; readonly error: unknown }
 
@@ -64,7 +84,7 @@ export class AgentHandle implements AsyncDisposable {
   private readonly consolidationController = new AbortController()
   private readonly consolidationTask: Promise<void> | undefined
 
-  constructor(definition: AgentDefinition, laser: Laser) {
+  private constructor(definition: AgentDefinition, laser: Laser) {
     this.shutdownGraceMs = definition.shutdownGraceMs
     let resolveReady: (() => void) | undefined
     let rejectReady: ((error: unknown) => void) | undefined
@@ -81,11 +101,17 @@ export class AgentHandle implements AsyncDisposable {
     this.consolidationTask =
       definition.consolidateEveryMs !== undefined && definition.consolidator !== undefined
         ? this.runConsolidation(
+            definition.id,
             definition.consolidateEveryMs,
             definition.consolidator,
             this.consolidationController.signal
           )
         : undefined
+  }
+
+  /** @internal */
+  static create(definition: AgentDefinition, laser: Laser): AgentHandle {
+    return new AgentHandle(definition, laser)
   }
 
   ready(): Promise<void> {
@@ -96,14 +122,14 @@ export class AgentHandle implements AsyncDisposable {
   async shutdown(): Promise<void> {
     this.shutdownController.abort("agent shutdown")
     this.consolidationController.abort("agent shutdown")
-    let timer: ReturnType<typeof setTimeout> | undefined
+    let timer: { cancel(): void } | undefined
     const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => {
+      timer = longTimeout(() => {
         resolve("timeout")
       }, this.shutdownGraceMs)
     })
     const outcome = await Promise.race([this.task, timeout])
-    if (timer !== undefined) clearTimeout(timer)
+    timer?.cancel()
     if (outcome === "timeout") {
       this.hardStopped = true
       this.hardStopController.abort("agent shutdown drain")
@@ -132,9 +158,11 @@ export class AgentHandle implements AsyncDisposable {
     this.consolidationController.abort("agent abort")
   }
 
+  // Each pass covers the agent's own memory, never the whole namespace.
   private async runConsolidation(
+    agent: AgentId,
     everyMs: number,
-    consolidator: AgentConsolidator,
+    consolidator: Consolidator,
     signal: AbortSignal
   ): Promise<void> {
     while (!signal.aborted) {
@@ -146,7 +174,7 @@ export class AgentHandle implements AsyncDisposable {
         signal.addEventListener("abort", onAbort, { once: true })
       })
       try {
-        await Promise.race([consolidator.consolidate({}, signal), stopped])
+        await Promise.race([consolidator.consolidate({ agent }, signal), stopped])
       } catch {
         // Consolidation failures do not stop message handling.
       } finally {
@@ -160,10 +188,10 @@ export class AgentHandle implements AsyncDisposable {
     if (signal.aborted) return Promise.resolve()
     return new Promise<void>((resolve) => {
       const onAbort = (): void => {
-        clearTimeout(timer)
+        timer.cancel()
         resolve()
       }
-      const timer = setTimeout(() => {
+      const timer = longTimeout(() => {
         signal.removeEventListener("abort", onAbort)
         resolve()
       }, everyMs)
@@ -202,9 +230,7 @@ export class AgentHandle implements AsyncDisposable {
           ? { maxQueuedBytes: definition.maxQueuedBytes }
           : {}),
         understoodFeatures: definition.understoodFeatures,
-        ...(definition.deadLetterSink !== undefined
-          ? { deadLetterSink: definition.deadLetterSink }
-          : {}),
+        ...(definition.onDeadLetter !== undefined ? { onDeadLetter: definition.onDeadLetter } : {}),
         ...(definition.dedupWindow !== undefined ? { dedupWindow: definition.dedupWindow } : {}),
         ...(definition.retry !== undefined ? { retry: definition.retry } : {}),
         ...(definition.deduplicator !== undefined ? { deduplicator: definition.deduplicator } : {}),
@@ -262,7 +288,7 @@ export class AgentBuilder {
   private mode: GovernorMode | undefined
   private retention: Partial<GovernorRetention> | undefined
   private consolidationIntervalMs: number | undefined
-  private memoryConsolidator: AgentConsolidator | undefined
+  private memoryConsolidator: Consolidator | undefined
 
   id(id: AgentId): this {
     this.agentId = id
@@ -334,7 +360,7 @@ export class AgentBuilder {
     return this
   }
 
-  deadLetterSink(sink: DeadLetterSink): this {
+  onDeadLetter(sink: DeadLetterSink): this {
     this.sink = sink
     return this
   }
@@ -374,13 +400,15 @@ export class AgentBuilder {
     return this
   }
 
-  governor(
-    governor: ActionGovernor,
-    mode: GovernorMode,
-    retention?: Partial<GovernorRetention>
-  ): this {
-    this.actionGovernor = governor
-    this.mode = mode
+  /** The policy and mode applied to everything this agent's handler publishes. */
+  governor(governor: readonly [ActionGovernor, GovernorMode]): this {
+    this.actionGovernor = governor[0]
+    this.mode = governor[1]
+    return this
+  }
+
+  /** Process-local evidence-chain retention for this agent's governor. */
+  governorRetention(retention: Partial<GovernorRetention>): this {
     this.retention = retention
     return this
   }
@@ -390,12 +418,13 @@ export class AgentBuilder {
     return this
   }
 
-  consolidator(consolidator: AgentConsolidator): this {
+  consolidator(consolidator: Consolidator): this {
     this.memoryConsolidator = consolidator
     return this
   }
 
-  spawn(laser: Laser): AgentHandle {
+  /** The configured agent. Throws `HandlerConfigError` when the identity, input topic, or handler is missing. */
+  build(): Agent {
     if (this.agentId === undefined) throw new HandlerConfigError("Agent.builder().id() is required")
     if (this.listenTopic === undefined) {
       throw new HandlerConfigError("Agent.builder().listenOn() is required")
@@ -403,87 +432,87 @@ export class AgentBuilder {
     if (this.agentHandler === undefined) {
       throw new HandlerConfigError("Agent.builder().handler() is required")
     }
-    if (!Number.isFinite(this.graceMs) || this.graceMs < 0) {
-      throw new HandlerConfigError("shutdownGrace must be a non-negative finite number")
-    }
-    if (this.pollMs !== undefined && (!Number.isFinite(this.pollMs) || this.pollMs < 0)) {
-      throw new HandlerConfigError("pollInterval must be a non-negative finite number")
-    }
-    if (this.window !== undefined && (!Number.isSafeInteger(this.window) || this.window < 1)) {
-      throw new HandlerConfigError("dedupWindow must be a positive safe integer")
-    }
-    if (
-      this.retryPolicy !== undefined &&
-      (!Number.isSafeInteger(this.retryPolicy.maxAttempts) || this.retryPolicy.maxAttempts < 1)
-    ) {
-      throw new HandlerConfigError("retry maxAttempts must be a positive safe integer")
-    }
-    if (
-      this.consolidationIntervalMs !== undefined &&
-      (!Number.isFinite(this.consolidationIntervalMs) || this.consolidationIntervalMs <= 0)
-    ) {
-      throw new HandlerConfigError("consolidateEvery must be a positive finite number")
-    }
-    if (
-      this.retryPolicy !== undefined &&
-      (!Number.isFinite(this.retryPolicy.baseDelayMs) || this.retryPolicy.baseDelayMs < 0)
-    ) {
-      throw new HandlerConfigError("retry baseDelayMs must be a non-negative finite number")
-    }
-    if (
-      this.concurrencyPolicy?.kind === "serial-per-partition" &&
-      (!Number.isSafeInteger(this.concurrencyPolicy.maxPartitions) ||
-        this.concurrencyPolicy.maxPartitions < 1)
-    ) {
-      throw new HandlerConfigError("maxPartitions must be a positive safe integer")
-    }
-    for (const [name, value] of [
-      ["maxQueuedRecords", this.queuedRecords],
-      ["maxQueuedBytes", this.queuedBytes]
-    ] as const) {
-      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
-        throw new HandlerConfigError(`${name} must be a positive safe integer`)
-      }
-    }
-    return new AgentHandle(
-      {
-        id: this.agentId,
-        ...(this.group !== undefined ? { consumerGroup: this.group } : {}),
-        listenOn: this.listenTopic,
-        handler: this.agentHandler,
-        ...(this.replyTopic !== undefined ? { respondOn: this.replyTopic } : {}),
-        ...(this.route !== undefined ? { inboxRoute: this.route } : {}),
-        ...(this.pollMs !== undefined ? { pollIntervalMs: this.pollMs } : {}),
-        shutdownGraceMs: this.graceMs,
-        ...(this.concurrencyPolicy !== undefined ? { concurrency: this.concurrencyPolicy } : {}),
-        ...(this.queuedRecords !== undefined ? { maxQueuedRecords: this.queuedRecords } : {}),
-        ...(this.queuedBytes !== undefined ? { maxQueuedBytes: this.queuedBytes } : {}),
-        understoodFeatures: this.understood,
-        warmDedup: this.shouldWarmDedup,
-        middleware: [...this.middlewareList],
-        ...(this.sink !== undefined ? { deadLetterSink: this.sink } : {}),
-        ...(this.window !== undefined ? { dedupWindow: this.window } : {}),
-        ...(this.retryPolicy !== undefined ? { retry: this.retryPolicy } : {}),
-        ...(this.dedup !== undefined ? { deduplicator: this.dedup } : {}),
-        capabilities: this.advertisedCapabilities,
-        ackOnPickup: this.pickupAck,
-        ...(this.signatureVerifier !== undefined ? { verifier: this.signatureVerifier } : {}),
-        ...(this.signer !== undefined ? { signingKey: this.signer } : {}),
-        ...(this.actionGovernor !== undefined ? { governor: this.actionGovernor } : {}),
-        ...(this.mode !== undefined ? { governorMode: this.mode } : {}),
-        ...(this.retention !== undefined ? { governorRetention: this.retention } : {}),
-        ...(this.consolidationIntervalMs !== undefined
-          ? { consolidateEveryMs: this.consolidationIntervalMs }
-          : {}),
-        ...(this.memoryConsolidator !== undefined ? { consolidator: this.memoryConsolidator } : {})
-      },
-      laser
-    )
+    return new Agent({
+      id: this.agentId,
+      ...(this.group !== undefined ? { consumerGroup: this.group } : {}),
+      listenOn: this.listenTopic,
+      handler: this.agentHandler,
+      ...(this.replyTopic !== undefined ? { respondOn: this.replyTopic } : {}),
+      ...(this.route !== undefined ? { inboxRoute: this.route } : {}),
+      ...(this.pollMs !== undefined ? { pollIntervalMs: this.pollMs } : {}),
+      shutdownGraceMs: this.graceMs,
+      ...(this.concurrencyPolicy !== undefined ? { concurrency: this.concurrencyPolicy } : {}),
+      ...(this.queuedRecords !== undefined ? { maxQueuedRecords: this.queuedRecords } : {}),
+      ...(this.queuedBytes !== undefined ? { maxQueuedBytes: this.queuedBytes } : {}),
+      understoodFeatures: this.understood,
+      warmDedup: this.shouldWarmDedup,
+      middleware: [...this.middlewareList],
+      ...(this.sink !== undefined ? { onDeadLetter: this.sink } : {}),
+      ...(this.window !== undefined ? { dedupWindow: this.window } : {}),
+      ...(this.retryPolicy !== undefined ? { retry: this.retryPolicy } : {}),
+      ...(this.dedup !== undefined ? { deduplicator: this.dedup } : {}),
+      capabilities: this.advertisedCapabilities,
+      ackOnPickup: this.pickupAck,
+      ...(this.signatureVerifier !== undefined ? { verifier: this.signatureVerifier } : {}),
+      ...(this.signer !== undefined ? { signingKey: this.signer } : {}),
+      ...(this.actionGovernor !== undefined ? { governor: this.actionGovernor } : {}),
+      ...(this.mode !== undefined ? { governorMode: this.mode } : {}),
+      ...(this.retention !== undefined ? { governorRetention: this.retention } : {}),
+      ...(this.consolidationIntervalMs !== undefined
+        ? { consolidateEveryMs: this.consolidationIntervalMs }
+        : {}),
+      ...(this.memoryConsolidator !== undefined ? { consolidator: this.memoryConsolidator } : {})
+    })
   }
 }
 
-export const Agent = {
-  builder(): AgentBuilder {
-    return new AgentBuilder()
+function validateDefinition(definition: AgentDefinition): void {
+  if (!Number.isFinite(definition.shutdownGraceMs) || definition.shutdownGraceMs < 0) {
+    throw new HandlerConfigError("shutdownGrace must be a non-negative finite number")
   }
-} as const
+  if (
+    definition.pollIntervalMs !== undefined &&
+    (!Number.isFinite(definition.pollIntervalMs) || definition.pollIntervalMs < 0)
+  ) {
+    throw new HandlerConfigError("pollInterval must be a non-negative finite number")
+  }
+  if (
+    definition.dedupWindow !== undefined &&
+    (!Number.isSafeInteger(definition.dedupWindow) || definition.dedupWindow < 1)
+  ) {
+    throw new HandlerConfigError("dedupWindow must be a positive safe integer")
+  }
+  if (
+    definition.retry !== undefined &&
+    (!Number.isSafeInteger(definition.retry.maxAttempts) || definition.retry.maxAttempts < 1)
+  ) {
+    throw new HandlerConfigError("retry maxAttempts must be a positive safe integer")
+  }
+  if (
+    definition.consolidateEveryMs !== undefined &&
+    (!Number.isFinite(definition.consolidateEveryMs) || definition.consolidateEveryMs <= 0)
+  ) {
+    throw new HandlerConfigError("consolidateEvery must be a positive finite number")
+  }
+  if (
+    definition.retry !== undefined &&
+    (!Number.isFinite(definition.retry.baseDelayMs) || definition.retry.baseDelayMs < 0)
+  ) {
+    throw new HandlerConfigError("retry baseDelayMs must be a non-negative finite number")
+  }
+  if (
+    definition.concurrency?.kind === "serial-per-partition" &&
+    (!Number.isSafeInteger(definition.concurrency.maxPartitions) ||
+      definition.concurrency.maxPartitions < 1)
+  ) {
+    throw new HandlerConfigError("maxPartitions must be a positive safe integer")
+  }
+  for (const [name, value] of [
+    ["maxQueuedRecords", definition.maxQueuedRecords],
+    ["maxQueuedBytes", definition.maxQueuedBytes]
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+      throw new HandlerConfigError(`${name} must be a positive safe integer`)
+    }
+  }
+}

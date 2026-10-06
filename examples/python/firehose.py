@@ -33,7 +33,8 @@ import laser_sdk as ls
 
 EXAMPLE = "firehose"
 
-# One index per org, named org_00, org_01, and so on. Query index names accept
+# One topic per org, named org_00, org_01, and so on, each feeding an index of the
+# same name plus the run token. Query index names accept
 # [A-Za-z0-9_] only, so the separator is `_` rather than `.`.
 TOPIC_PREFIX = "org_"
 
@@ -109,19 +110,22 @@ async def main() -> None:
         )
 
         topics = [f"{TOPIC_PREFIX}{org:02}" for org in range(config.orgs)]
+        # Index names carry this run's token, so another run or another
+        # language's firehose never shares an index (or its rows) with this one.
+        indexes = [_common.index_for(topic) for topic in topics]
         for topic in topics:
             await laser.topic(topic).ensure(partitions=config.partitions)
 
-        register = config.register and caps.query
+        register = config.register and caps.query.available
         if register:
             _common.phase("provisioning topics and indexes")
-            for topic in topics:
-                await register_index(laser, topic)
+            for topic, index in zip(topics, indexes, strict=True):
+                await register_index(laser, topic, index)
             print(f"registered {len(topics)} projections, waiting for the plane to create indexes")
             # Best effort. Give the managed plane a moment to create the first index.
             # With no managed plane attached this short wait simply elapses and we
             # publish anyway.
-            await wait_for_index(laser, topics[0], 15.0)
+            await wait_for_index(laser, indexes[0], 15.0)
         elif not config.register:
             print("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)")
         else:
@@ -153,10 +157,10 @@ async def main() -> None:
             f"({total / elapsed:.0f} msg/s, {(total_bytes / 1e6) / elapsed:.1f} MB/s)"
         )
 
-        if config.query and _common.managed_gate(caps.query, "query", EXAMPLE):
-            await _common.wait_for_projection(laser, topics[0], per_org + (1 if remainder else 0))
+        if config.query and _common.managed_gate(caps.query.available, "query", EXAMPLE):
+            await _common.wait_for_projection(laser, indexes[0], per_org + (1 if remainder else 0))
             _common.phase("sample analytics over the firehose")
-            await run_sample_queries(laser, topics)
+            await run_sample_queries(laser, indexes)
     finally:
         await laser.close()
 
@@ -177,24 +181,24 @@ class Config:
         self.progress_every = max(1, _common.env_int("LASER_FIREHOSE_PROGRESS_EVERY", 5_000))
 
 
-async def register_index(laser: ls.Laser, topic: str) -> None:
-    """Register one projection and binding so `topic` materializes into an index
-    of the same name with our indexed columns."""
-    await _common.start_projector(laser, topic, FIELDS, content_type="any")
+async def register_index(laser: ls.Laser, topic: str, index: str) -> None:
+    """Register one projection and binding so `topic` materializes into `index`
+    with our indexed columns."""
+    await _common.start_projector(laser, topic, FIELDS, index=index, content_type="any")
 
 
-async def wait_for_index(laser: ls.Laser, topic: str, timeout: float) -> None:
-    """Poll until `topic`'s index exists (the query stops erroring), or the
+async def wait_for_index(laser: ls.Laser, index: str, timeout: float) -> None:
+    """Poll until `index` exists (the query stops erroring), or the
     timeout elapses. A short, non-fatal nudge after registration."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            await laser.query(topic).fetch()
-            print(f"index '{topic}' is live")
+            await laser.query(index).fetch()
+            print(f"index '{index}' is live")
             return
         except ls.LaserError:
             await asyncio.sleep(0.25)
-    print(f"index '{topic}' is not live yet (no managed plane attached?), publishing anyway")
+    print(f"index '{index}' is not live yet (no managed plane attached?), publishing anyway")
 
 
 async def produce_shard(
@@ -279,35 +283,35 @@ def build_filler(length: int, rng: _common.Rng) -> str:
     return "".join(FILLER_ALPHABET[rng.below(len(FILLER_ALPHABET))] for _ in range(max(0, length)))
 
 
-async def run_sample_queries(laser: ls.Laser, topics: list[str]) -> None:
+async def run_sample_queries(laser: ls.Laser, indexes: list[str]) -> None:
     """A few representative analytics the firehose makes possible. Best effort: if
     the indexes are not materialized the queries error and we note it."""
-    topic = topics[0]
+    index = indexes[0]
     try:
-        total = (await laser.query(topic).with_total().fetch()).total
+        total = (await laser.query(index).with_total().fetch()).page.total
     except ls.LaserError as error:
         print(f"query unavailable ({error}). Is the plane materializing the indexes? Skipping")
         return
-    print(f"index '{topic}' holds {total} rows")
+    print(f"index '{index}' holds {total} rows")
 
-    by_severity = await laser.query(topic).count().group_by(["severity"]).fetch()
-    print(f"'{topic}' events by severity:")
+    by_severity = await laser.query(index).count().group_by(["severity"]).fetch()
+    print(f"'{index}' events by severity:")
     for row in by_severity.rows:
         severity = by_severity.value_text(row, "severity") or "?"
         count = by_severity.value_text(row, "count") or "0"
         print(f"  {severity:<6} {count}")
 
-    slowest = await laser.query(topic).order_desc("latency_ms").limit(5).fetch()
-    print(f"'{topic}' slowest 5 requests:")
+    slowest = await laser.query(index).order_desc("latency_ms").limit(5).fetch()
+    print(f"'{index}' slowest 5 requests:")
     for row in slowest.rows:
         latency = slowest.value_text(row, "latency_ms") or "?"
         route = slowest.value_text(row, "route") or "?"
         print(f"  {latency:>5}ms  {route}")
 
     grand_total = 0
-    for index_topic in topics:
-        grand_total += (await laser.query(index_topic).with_total().fetch()).total
-    print(f"grand total across {len(topics)} indexes: {grand_total} rows")
+    for each in indexes:
+        grand_total += (await laser.query(each).with_total().fetch()).page.total
+    print(f"grand total across {len(indexes)} indexes: {grand_total} rows")
 
 
 if __name__ == "__main__":

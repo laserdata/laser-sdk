@@ -1,4 +1,4 @@
-import { jsonCodec, type Laser, type TypedRecord, type TypedRecords } from "@laserdata/laser-sdk"
+import { Json, type Laser, type TypedRecord, type TypedRecords } from "@laserdata/laser-sdk"
 import { phase, runExample } from "../common.js"
 
 export const EXAMPLE = "log"
@@ -19,7 +19,7 @@ const READINGS: readonly Reading[] = [
 
 // Types vanish at runtime, so a typed topic takes a codec that validates what
 // came back off the log rather than asserting it.
-const READING_CODEC = jsonCodec<Reading>((value) => {
+const READING_CODEC = new Json<Reading>((value) => {
   if (typeof value !== "object" || value === null) throw new TypeError("reading must be an object")
   const { host, cpu } = value as Record<string, unknown>
   if (typeof host !== "string" || typeof cpu !== "number") {
@@ -28,7 +28,7 @@ const READING_CODEC = jsonCodec<Reading>((value) => {
   return { host, cpu }
 })
 
-export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
+export async function run(laser: Laser, _signal: AbortSignal): Promise<readonly Reading[]> {
   phase("write two messages, then read them back")
   const topic = laser.stream(STREAM).topic(TOPIC)
   await topic.ensure(PARTITIONS)
@@ -40,9 +40,11 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   // One typed handle pins the contract: `Reading` in on publish, `Reading` out on
   // replay, read from offset 0 with the offsets staying caller-owned.
   const replay = await topic.json(READING_CODEC).records("log-example")
-  for (const { value } of await drain(replay, READINGS.length)) {
+  const readings = (await drain(replay, READINGS.length)).map(({ value }) => value)
+  for (const value of readings) {
     console.log(`  reading ${value.host} cpu ${String(value.cpu)}`)
   }
+  return readings
 }
 
 /** Collects through the current tail. A poll reads at most one configured batch

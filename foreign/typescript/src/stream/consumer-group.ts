@@ -1,9 +1,10 @@
 import type { Capabilities } from "../client/capabilities.js"
+import { isStreamOrTopicNotFound, isUnavailable } from "../client/error-classify.js"
 import {
   ConsumerGroupSetupError,
   FilterExecutionError,
   InvalidError,
-  TransportError,
+  TimeoutError,
   UnsupportedError
 } from "../client/errors.js"
 import { INTERNAL_NATIVE_CONSUMER } from "../client/internals.js"
@@ -12,7 +13,6 @@ import {
   FilteredReaderBuilder,
   Filters,
   nativeGroup,
-  type CatalogPageOptions,
   type FilterPreviewOptions,
   type FilterTransport,
   type NativeGroup
@@ -39,12 +39,15 @@ import {
   type ConsumerOptions,
   type PollFailures
 } from "./consumer.js"
-import type { PollingStrategy } from "./polling-strategy.js"
+import type { ConsumerStart } from "./consumer-start.js"
+import type { Topic } from "./topic.js"
 
 /** What a consumer group needs beyond the stream transport to reach its filter policy. */
 export interface GroupContext {
   readonly transport: FilterTransport
   readonly capabilities: () => Promise<Capabilities>
+  /** Probes the server again, for a consumer built before any probe answered. */
+  readonly refreshCapabilities?: () => Promise<Capabilities>
 }
 
 /** A consumer group by name or by its native numeric id. */
@@ -89,16 +92,36 @@ export class ConsumerGroup {
   // observes its own configuration as absent through another node.
   private configuredAt: CatalogPosition | undefined
 
-  constructor(
+  private constructor(
     private readonly transport: LaserTransport,
-    readonly streamName: string,
-    readonly topicName: string,
+    /** The topic this group consumes. */
+    readonly topic: Topic,
     private readonly target: GroupTarget,
     private readonly context?: GroupContext
   ) {
     if (target.kind === "id" && (target.id < 0n || target.id > 0xffff_ffffn)) {
       throw new InvalidError("consumer group id exceeds 32 bits")
     }
+  }
+
+  /** @internal */
+  static create(
+    transport: LaserTransport,
+    topic: Topic,
+    target: GroupTarget,
+    context?: GroupContext
+  ): ConsumerGroup {
+    return new ConsumerGroup(transport, topic, target, context)
+  }
+
+  /** @internal */
+  get streamName(): string {
+    return this.topic.streamName
+  }
+
+  /** @internal */
+  get topicName(): string {
+    return this.topic.name
   }
 
   /** The group name, `undefined` for a handle addressed by numeric id. */
@@ -116,8 +139,8 @@ export class ConsumerGroup {
    * call. Idempotent: an existing group is kept, and the same policy keeps its
    * binding. A policy is preflighted against the server's capabilities before
    * the native group is created. A group that runs another policy throws
-   * `ConsumerGroupSetupError` with reason `conflict`, and the group is left as
-   * it is.
+   * `ConsumerGroupSetupError` whose cause has filter reason `conflict`, and
+   * the group is left as it is.
    */
   async create(options: CreateConsumerGroupOptions = {}): Promise<ConsumerGroupInfo> {
     if (this.target.kind !== "name") {
@@ -182,35 +205,47 @@ export class ConsumerGroup {
    * resolves group policies the consumer runs the group's filter, or none, and
    * commits through the group's fenced acknowledgments. On Apache Iggy it is
    * the native group consumer. A server that serves filters without group
-   * reads is refused with `UnsupportedError`, and a capability probe that
-   * established nothing is a retryable `TransportError`, never a native read.
+   * reads is refused with `UnsupportedError`. When no probe answered yet, the
+   * server is probed again, and a probe that still established nothing is a
+   * retryable `TimeoutError`, never a native read.
    */
   async consumer(options: ConsumerOptions = {}): Promise<Consumer> {
-    const capabilities = await this.context?.capabilities()
-    if (capabilities === undefined) {
-      throw new TransportError(
+    const context = this.context
+    if (context === undefined) {
+      throw new UnsupportedError(
         "consumer group policies require capability negotiation, build the topic from a Laser client",
-        true
+        { surface: "filters" }
       )
+    }
+    let capabilities = await context.capabilities()
+    if (capabilities.hello === "unknown" && context.refreshCapabilities !== undefined) {
+      capabilities = await context.refreshCapabilities()
     }
     if (!policyAware(capabilities)) {
       return this[INTERNAL_NATIVE_CONSUMER](options)
     }
     const resolved = resolveConsumerOptions(options, false)
-    if (this.target.kind === "name" && resolved.createGroup) {
-      const groupName = this.target.name
-      await withInitRetries(resolved.initRetries, () =>
-        this.transport.ensureConsumerGroup(this.streamName, this.topicName, groupName)
+    if (!resolved.autoJoinGroup) {
+      throw new InvalidError(
+        "a policy-aware group consumer always joins its group, remove autoJoinGroup: false"
       )
     }
+    if (this.target.kind === "name" && resolved.createGroup) {
+      await this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name)
+    }
     const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
-    const reader = await this.readerWith({ kind: "group" })
-      .start(filteredStart(resolved.startFrom))
+    let builder = this.readerWith({ kind: "group" })
+      .start(filteredStart(resolved.startAt))
       .count(resolved.batchLength)
       .maxExamined(resolved.batchLength)
-      .idleInterval(resolved.pollIntervalMs)
-      .build()
-    return new Consumer(
+    if (options.pollIntervalMs !== undefined)
+      builder = builder.idleInterval(resolved.pollIntervalMs)
+    const reader = await withInitRetries(
+      resolved.initRetries,
+      (error) => isUnavailable(error) || error instanceof TimeoutError,
+      () => builder.build()
+    )
+    return Consumer.create(
       this.transport,
       this.streamName,
       this.topicName,
@@ -242,22 +277,24 @@ export class ConsumerGroup {
     const resolved = resolveConsumerOptions(options, false)
     const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
     if (resolved.autoJoinGroup) {
-      await withInitRetries(resolved.initRetries, async () => {
+      await withInitRetries(resolved.initRetries, isStreamOrTopicNotFound, async () => {
         if (resolved.createGroup) {
           await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
           return
         }
         if (this.transport.joinExistingConsumerGroup === undefined) {
-          throw new UnsupportedError("this transport cannot join a group without creating it")
+          throw new UnsupportedError("this transport cannot join a group without creating it", {
+            surface: "stream"
+          })
         }
         await this.transport.joinExistingConsumerGroup(this.streamName, this.topicName, name)
       })
     } else if (resolved.createGroup) {
-      await withInitRetries(resolved.initRetries, () =>
+      await withInitRetries(resolved.initRetries, isStreamOrTopicNotFound, () =>
         this.transport.ensureConsumerGroup(this.streamName, this.topicName, name)
       )
     }
-    return new Consumer(
+    return Consumer.create(
       this.transport,
       this.streamName,
       this.topicName,
@@ -272,7 +309,9 @@ export class ConsumerGroup {
   private filters(): Filters {
     const context = this.context
     if (context === undefined) {
-      throw new UnsupportedError("consumer group filters need a topic built from a Laser client")
+      throw new UnsupportedError("consumer group filters need a topic built from a Laser client", {
+        surface: "filters"
+      })
     }
     return new Filters(context.transport, context.capabilities)
   }
@@ -304,7 +343,9 @@ export class ConsumerGroup {
   private readerWith(filter: Extract<FilterRef, { readonly kind: "bound" | "group" }>) {
     const context = this.context
     if (context === undefined) {
-      throw new UnsupportedError("a group reader needs a topic built from a Laser client")
+      throw new UnsupportedError("a group reader needs a topic built from a Laser client", {
+        surface: "filters"
+      })
     }
     return FilteredReaderBuilder.create(
       context.transport,
@@ -419,15 +460,19 @@ export class GroupFilter {
       requireSameGroup(native.identity, binding.identity)
       return binding
     } catch (error) {
-      if (error instanceof FilterExecutionError && error.reason === "not_found") return undefined
+      if (error instanceof FilterExecutionError && error.detail.reason === "not_found")
+        return undefined
       throw error
     }
   }
 
   /** One page of the group's own filter revisions, newest first. */
-  async revisions(options: CatalogPageOptions = {}): Promise<FilterRevisionPage> {
+  async revisions(page?: number, pageSize?: number): Promise<FilterRevisionPage> {
     const active = await this.active()
-    return this.group.filters().revisions(active.filterId, options)
+    return this.group.filters().revisions(active.filterId, {
+      ...(page !== undefined ? { page } : {}),
+      ...(pageSize !== undefined ? { pageSize } : {})
+    })
   }
 
   /**
@@ -576,19 +621,19 @@ export function policyAware(capabilities: Capabilities): boolean {
   if (capabilities.filters.groupPolicyReads) return true
   if (capabilities.filters.native) {
     throw new UnsupportedError(
-      "this server serves consumer filters but not group-aware reads, upgrade it before consuming groups through the Laser SDK"
+      "this server serves consumer filters but not group-aware reads, upgrade it before consuming groups through the Laser SDK",
+      { surface: "filters", feature: "group_policy_reads" }
     )
   }
   if (capabilities.hello === "failed" || capabilities.hello === "unknown") {
-    throw new TransportError(
-      "the managed probe that decides whether this server resolves consumer group policies did not answer, reconnect and build the consumer again",
-      true
+    throw new TimeoutError(
+      "the managed probe that decides whether this server resolves consumer group policies, reconnect and build the consumer again"
     )
   }
   return false
 }
 
-function filteredStart(start: PollingStrategy): FilteredStart {
+function filteredStart(start: ConsumerStart): FilteredStart {
   switch (start.kind) {
     case "first":
     case "last":
@@ -596,23 +641,23 @@ function filteredStart(start: PollingStrategy): FilteredStart {
       return { kind: start.kind }
     case "offset":
       return { kind: "offset", offset: start.value }
-    case "timestamp":
+    case "timestampMicros":
       return { kind: "timestamp", micros: start.value }
   }
 }
 
-// Builds a consumer's group membership with the configured init retries: the
-// first attempt plus `retries` more, `intervalMs` apart.
-async function withInitRetries(
+// Builds a consumer with the configured init retries: the first attempt plus
+// up to `retries` more, `intervalMs` apart, for a failure `retryable` admits.
+async function withInitRetries<T>(
   initRetries: { readonly retries: number; readonly intervalMs: number },
-  attempt: () => Promise<void>
-): Promise<void> {
+  retryable: (error: unknown) => boolean,
+  attempt: () => Promise<T>
+): Promise<T> {
   for (let tried = 0; ; tried += 1) {
     try {
-      await attempt()
-      return
+      return await attempt()
     } catch (error) {
-      if (tried >= initRetries.retries) throw error
+      if (tried >= initRetries.retries || !retryable(error)) throw error
       await new Promise((resolve) => setTimeout(resolve, initRetries.intervalMs))
     }
   }

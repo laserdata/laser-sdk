@@ -45,7 +45,7 @@ function canonicalCommand() {
   envelope = withIdempotencyKey(envelope, parseIdempotencyKey("job-123-attempt-2"))
   envelope = withDeadlineMicros(envelope, 1_717_171_777_000_000n)
   envelope = withOperation(envelope, "chat")
-  return withMetadata(envelope, "priority", { kind: "string", value: "high" })
+  return withMetadata(envelope, "priority", { kind: "str", value: "high" })
 }
 
 void test("given_the_canonical_agent_record_fixture_when_decoded_then_should_re_encode_byte_identically", async () => {

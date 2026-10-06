@@ -34,6 +34,7 @@ void test("given_a_directed_contract_when_the_agent_replies_then_should_complete
           return context.respond(new TextEncoder().encode("completed"))
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -87,6 +88,7 @@ void test("given_a_picked_up_contract_without_a_reply_when_deadline_elapses_then
       .ackOnPickup()
       .pollInterval(5)
       .handler({ handle: () => Promise.resolve() })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -114,7 +116,7 @@ void test("given_a_verified_contract_when_the_target_signs_then_should_bind_the_
     const worker = AgentId.new("signed-contract-worker")
     const key = SigningKey.fromBytes(new Uint8Array(32).fill(17))
     const registry = new KeyRegistry()
-    registry.enroll(worker.asString(), key.verifyingKey())
+    registry.enroll(worker.asStr(), key.verifyingKey())
     handle = Agent.builder()
       .id(worker)
       .listenOn(AgentTopic.Commands)
@@ -126,19 +128,28 @@ void test("given_a_verified_contract_when_the_target_signs_then_should_bind_the_
           return context.respond(new TextEncoder().encode("authenticated"))
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 
-    const outcome = await laser
-      .withVerifier(registry)
-      .contract(routeTo(worker))
-      .from(AgentId.new("orchestrator"))
-      .payload(new TextEncoder().encode("work"))
-      .inboxRoute(fixed(AgentTopic.Commands))
-      .deadline(2_000)
-      .send()
-    assert.equal(outcome.kind, "completed")
-    assert.equal(outcome.reply.verifiedPrincipal, worker.asString())
+    const verifying = await Laser.builder()
+      .connectionString(CONNECTION_STRING)
+      .stream(stream)
+      .verifier(registry)
+      .connect()
+    try {
+      const outcome = await verifying
+        .contract(routeTo(worker))
+        .from(AgentId.new("orchestrator"))
+        .payload(new TextEncoder().encode("work"))
+        .inboxRoute(fixed(AgentTopic.Commands))
+        .deadline(2_000)
+        .send()
+      assert.equal(outcome.kind, "completed")
+      assert.equal(outcome.reply.verifiedPrincipal, worker.asStr())
+    } finally {
+      await verifying.close()
+    }
   } finally {
     if (handle !== undefined) await handle.shutdown()
     await laser.close()

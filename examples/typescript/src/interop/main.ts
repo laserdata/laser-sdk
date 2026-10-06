@@ -6,10 +6,10 @@ import {
   ConversationId,
   CorrelationId,
   McpBridge,
-  OPERATION_CHAT,
   type AgentHandle,
   type Laser
 } from "@laserdata/laser-sdk"
+import { wire } from "@laserdata/laser-sdk/full"
 
 import { AsyncResourceGroup, phase, runExample, utf8 } from "../common.js"
 import { defaultLlm } from "../llm.js"
@@ -51,10 +51,19 @@ function worker(laser: Laser, id: string, input: string, output: string): AgentH
           .send()
       }
     })
+    .build()
     .spawn(laser)
 }
 
-export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
+/** What each bridge flow returned. */
+export interface InteropSummary {
+  readonly a2a: string
+  readonly mcp: string
+  readonly aguiEvents: number
+  readonly decision: string
+}
+
+export async function run(laser: Laser, _signal: AbortSignal): Promise<InteropSummary> {
   phase("connecting")
   await laser.bootstrap(1)
   await using agents = new AsyncResourceGroup()
@@ -71,6 +80,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
             return context.respondInput(AgentTopic.Responses, utf8("approved"))
           }
         })
+        .build()
         .spawn(laser)
     )
   ]
@@ -86,7 +96,8 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const submitted = await a2a.submit({
     message: { role: "user", text: "summarize incident" }
   })
-  console.log(`A2A completed: ${await completedTask(a2a, submitted.id)}`)
+  const a2aText = await completedTask(a2a, submitted.id)
+  console.log(`A2A completed: ${a2aText}`)
 
   phase("MCP: initialize / tools/list / tools/call")
   const mcp = new McpBridge(
@@ -107,13 +118,14 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     ])
     .withTimeout(15_000)
   const tool = await mcp.callTool("ask", { q: "what is AGDX?" })
-  console.log(`MCP result: ${tool.content[0]?.text ?? ""}`)
+  const mcpText = tool.content[0]?.text ?? ""
+  console.log(`MCP result: ${mcpText}`)
 
   phase("AG-UI: render a chat stream as events")
   const conversation = ConversationId.new()
   const stream = laser
     .agdx(AgentTopic.LlmIo, AgentId.new("assistant"), conversation)
-    .stream(CorrelationId.parse(conversation.toString()), OPERATION_CHAT)
+    .stream(CorrelationId.parse(conversation.toString()), wire.OPERATION_CHAT)
   await stream.write(utf8("incident "))
   await stream.write(utf8("stable"))
   await stream.finish("stop")
@@ -125,6 +137,12 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     .agdx(AgentTopic.HumanInput, AgentId.new("orchestrator"), ConversationId.new())
     .requestInput(AgentTopic.Responses, utf8("approve draining node-7?"), 15_000)
   console.log(`human decision: ${decoder.decode(decision)}`)
+  return {
+    a2a: a2aText,
+    mcp: mcpText,
+    aguiEvents: events.length,
+    decision: decoder.decode(decision)
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await runExample(EXAMPLE, run)

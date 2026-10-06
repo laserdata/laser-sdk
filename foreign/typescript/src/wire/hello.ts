@@ -3,10 +3,10 @@ import { type CborMap, decodeOne, encodeNamed, expectMap, expectString, field } 
 import { BackendResourceId } from "./ids.js"
 import type { Consistency, SqlDialect } from "./query.js"
 import type { LogicalTypeKind } from "./schema.js"
-import { type FilterCodec, decodeFilterCodec } from "./filter.js"
+import { FILTER_EVALUATOR_VERSION, type FilterCodec, decodeFilterCodec } from "./filter.js"
 import { type WireTopology, decodeWireTopology, encodeWireTopology } from "./topology.js"
 
-export const Feature = {
+export const feature = {
   KV_CAS: 1n << 0n,
   READ_YOUR_WRITES: 1n << 1n,
   STRONG_CONSISTENCY: 1n << 2n,
@@ -176,6 +176,14 @@ export interface FilterAnnounce {
   readonly codecs: readonly FilterCodec[]
 }
 
+/** What this build of the evaluator serves. */
+export function filterAnnounceServed(): FilterAnnounce {
+  return {
+    evaluatorVersion: FILTER_EVALUATOR_VERSION,
+    codecs: ["json", "headers_only", "avro", "protobuf", "cbor"]
+  }
+}
+
 /** Whether a filter of `evaluatorVersion` and `codec` evaluates on the announcing server as it does here. */
 export function filterAnnounceEvaluates(
   announce: FilterAnnounce,
@@ -203,7 +211,7 @@ export function newBackendDescriptor(
     runtimeConfigurationRevision,
     desiredState: "disabled",
     observedState: "disabled",
-    readiness: { ready: false, reasons: [{ code: "disabled" }], observedAtMicros: 0n },
+    readiness: backendReadinessNotReady("disabled"),
     materialization: [],
     schema: { logicalSchema: false, arrowIpcStream: false, schemaEvolution: false },
     maintenance: { expireSnapshots: false, removeOrphanFiles: false, compactDataFiles: false },
@@ -218,6 +226,10 @@ export function newBackendDescriptor(
     }
   }
 }
+export function backendReadinessNotReady(code: BackendReadinessCode): BackendReadiness {
+  return { ready: false, reasons: [{ code }], observedAtMicros: 0n }
+}
+
 export function backendDescriptorHasCapability(backend: BackendDescriptor, tag: string): boolean {
   return (
     backend.materialization.some((item) => item.fileFormat === tag || item.tableFormat === tag) ||

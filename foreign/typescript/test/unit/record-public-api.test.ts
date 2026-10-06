@@ -1,9 +1,10 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { ContentType, Record, recordHeaders } from "../../src/index.js"
+import { ContentType, Record } from "../../src/index.js"
 import { Record as FullRecord } from "../../src/full.js"
 import type { LaserTransport, MessageWithHeaders } from "../../src/iggy/apache-iggy.js"
+import { recordHeaders } from "../../src/stream/record.js"
 import { Topic } from "../../src/stream/topic.js"
 import { LOGICAL_SCHEMA_FINGERPRINT } from "../../src/wire/headers.js"
 
@@ -28,7 +29,10 @@ void test("given_root_and_full_record_metadata_when_a_fingerprint_is_set_then_sh
     }
   } as unknown as LaserTransport
   const payload = new Uint8Array([1, 2, 3])
-  await new Topic(transport, "readings", "ipc").publishBatch().addRecord(payload, metadata).send()
+  await Topic.create(transport, "readings", "ipc")
+    .publishBatch()
+    .addRecord(payload, metadata)
+    .send()
   const first = sent[0]
   assert.ok(first !== undefined)
   assert.deepEqual(first.payload, payload)

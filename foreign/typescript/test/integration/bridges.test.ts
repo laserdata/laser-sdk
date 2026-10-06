@@ -61,6 +61,7 @@ void test("given_an_mcp_tool_call_when_bridged_then_should_return_the_correlated
             .send()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
     const bridge = new McpBridge(
@@ -75,7 +76,7 @@ void test("given_an_mcp_tool_call_when_bridged_then_should_return_the_correlated
       arguments: { query: "laser" },
       _meta: { trace: "abc" }
     })
-    assert.deepEqual(result, { content: [{ type: "text", text: "called:search" }] })
+    assert.deepEqual(result, { content: [{ kind: "text", text: "called:search" }] })
   } finally {
     if (handle !== undefined) await handle.shutdown()
     await laser.close()

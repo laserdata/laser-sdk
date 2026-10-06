@@ -1,6 +1,6 @@
 use laser_examples::{
-    PARTITIONS, fresh_run, init_tracing, laser, managed_feature_ready, phase, start_projector,
-    stream_for,
+    PARTITIONS, ensure_view, fresh_run, index_for, init_tracing, laser, managed_feature_ready,
+    phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::WINDOW_START;
@@ -34,7 +34,6 @@ const CHECKPOINT_KEY: &str = "clickstream-export-cursor";
 // The validated ingest (managed deployment): events on this topic stamp a
 // registered JSON Schema's id, so a malformed payload never materializes.
 const GUARDED_TOPIC: &str = "clickstream_guarded";
-const GUARDED_PROJECTION: &str = "clickstream_guarded.v1";
 const EVENT_JSON_SCHEMA: &str = r#"{
     "type":"object",
     "required":["user_id","message_type","route","latency_ms","ts"],
@@ -122,12 +121,13 @@ async fn main() -> Result<(), LaserError> {
 
         // On LaserData Cloud, register before publishing so no event is missed.
         phase("hot path: a live reader tails the stream while the producer runs");
-        let projector = if query_available {
-            Some(start_projector(&laser, TOPIC, ContentType::Json, COLUMNS).await?)
+        // The index carries this run's token, so a rerun or another language's
+        // example on the same deployment never shares its rows.
+        if query_available {
+            ensure_view(&laser, TOPIC, &index_for(TOPIC), ContentType::Json, COLUMNS).await?;
         } else {
             managed_feature_ready(false, "projection-backed analytics", "event-analytics");
-            None
-        };
+        }
         let publisher = {
             let laser = laser.clone();
             let events = events.clone();
@@ -159,9 +159,6 @@ async fn main() -> Result<(), LaserError> {
             info!("writer schemas need Laser Stack or LaserData Cloud, skipping validated ingest");
         }
 
-        if let Some(projector) = projector {
-            projector.shutdown().await;
-        }
         Ok(())
     })
     .await
@@ -310,6 +307,7 @@ async fn live_monitor(laser: &Laser, expected: usize) -> Result<(), LaserError> 
 // Poll until the projector has indexed every event, tolerant of a not-yet-created
 // index while a remote LaserData Cloud applies the projection.
 async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), LaserError> {
+    let index = index_for(TOPIC);
     let deadline = Instant::now() + PROJECTOR_TIMEOUT;
     // Await-then-query where the deployment publishes the change feed (LaserData
     // Cloud with a notifying binding): each tick drains the feed and re-runs the
@@ -319,7 +317,7 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
         .capabilities()
         .await
         .watch
-        .then(|| laser.watch().index(TOPIC).records())
+        .then(|| laser.watch().index(&index).records())
         .transpose()?;
     let mut last = usize::MAX;
     loop {
@@ -329,7 +327,7 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
         };
         if advanced || last == usize::MAX {
             let total = laser
-                .query(TOPIC)
+                .query(&index)
                 .with_total()
                 .fetch()
                 .await
@@ -355,9 +353,10 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
 
 // The analytics read model: the aggregates a dashboard asks of a clickstream.
 async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
+    let index = index_for(TOPIC);
     // Mix: how many events of each kind, grouped.
     let by_kind = laser
-        .query(TOPIC)
+        .query(&index)
         .count()
         .group_by([MESSAGE_TYPE])
         .fetch()
@@ -375,7 +374,7 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
 
     // Slowest routes: order by latency, top 3.
     let slowest = laser
-        .query(TOPIC)
+        .query(&index)
         .order_desc(LATENCY_MS)
         .limit(3)
         .fetch()
@@ -393,7 +392,7 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
 
     // Errors only, via the reserved `message_type` field.
     let errors = laser
-        .query(TOPIC)
+        .query(&index)
         .message_type(EventType::Error.to_string())
         .count()
         .fetch()
@@ -402,7 +401,7 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
 
     // First 5 minutes of the session, via the reserved `ts` field and a time range.
     let first_window = laser
-        .query(TOPIC)
+        .query(&index)
         .time_range(BASE_US, BASE_US + 5 * ONE_MINUTE_US)
         .count()
         .fetch()
@@ -412,7 +411,7 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
     // Per-minute event counts in ONE query via a tumbling window. Each result
     // row carries the bucket's lower edge under `window_start` plus the count.
     let per_minute = laser
-        .query(TOPIC)
+        .query(&index)
         .count()
         .window(TS, ONE_MINUTE_US)
         .fetch()
@@ -431,7 +430,7 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
     // Two metrics in one pass: mean latency and distinct routes per event kind.
     // `avg`/`count_distinct` are universal across backends (no capability gate).
     let by_kind_metrics = laser
-        .query(TOPIC)
+        .query(&index)
         .avg(LATENCY_MS)
         .count_distinct(ROUTE)
         .group_by([MESSAGE_TYPE])
@@ -527,11 +526,13 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
     info!("LaserData Cloud allocated writer-schema id {schema_id} for the Event guard");
 
     laser.topic(GUARDED_TOPIC).ensure(PARTITIONS).await?;
+    let index = index_for(GUARDED_TOPIC);
+    let projection = format!("{index}.v1");
     laser
         .projections()
         .register(
-            Projection::builder(GUARDED_PROJECTION)
-                .name("clickstream_guarded")
+            Projection::builder(projection.clone())
+                .name(index.clone())
                 .version(1)
                 .content_type(ContentType::Json)
                 .fields(COLUMNS.iter().copied())
@@ -544,9 +545,9 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
         .apply(
             ProjectionBinding::builder()
                 .source(stream_for("event-analytics"), GUARDED_TOPIC)
-                .allow(GUARDED_PROJECTION)
-                .default_projection(GUARDED_PROJECTION)
-                .index(GUARDED_TOPIC)
+                .allow(projection.clone())
+                .default_projection(projection)
+                .index(index.clone())
                 .build(),
         )
         .await?;
@@ -582,7 +583,7 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
     let deadline = Instant::now() + PROJECTOR_TIMEOUT;
     loop {
         let total = laser
-            .query(GUARDED_TOPIC)
+            .query(&index)
             .with_total()
             .fetch()
             .await
@@ -593,7 +594,7 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
             // malformed event before pinning the count.
             tokio::time::sleep(Duration::from_secs(1)).await;
             let settled = laser
-                .query(GUARDED_TOPIC)
+                .query(&index)
                 .with_total()
                 .fetch()
                 .await

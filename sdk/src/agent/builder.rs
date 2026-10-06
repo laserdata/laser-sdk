@@ -114,8 +114,9 @@ pub struct Agent<H> {
     pub ack_on_pickup: bool,
     /// Run `consolidator` every `consolidate_every` off the handler loop (its
     /// own task, stopped with the agent). Both must be set for the tick to
-    /// exist. Absent means no background consolidation, ever. The scope is the
-    /// consolidator's own concern (a `DefaultConsolidator` holds its memory).
+    /// exist. Absent means no background consolidation, ever. Each pass runs
+    /// over this agent's own memory: the scope carries the agent id and
+    /// nothing else.
     pub consolidate_every: Option<Duration>,
     /// The consolidation pass the periodic tick runs (see
     /// [`consolidate_every`](Self::consolidate_every)).
@@ -178,22 +179,11 @@ where
         let signing_key = self.signing_key;
         let (shutdown, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
-        // The consolidation tick, off the handler loop: best-effort, logged,
-        // aborted with the agent. No background magic unless both knobs are set.
+        // No background magic unless both knobs are set.
         let consolidation = match (self.consolidate_every, self.consolidator) {
-            (Some(every), Some(consolidator)) => Some(tokio::spawn(async move {
-                let mut tick = tokio::time::interval(every);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tick.tick().await;
-                    let scope = crate::memory::MemoryScope::default();
-                    if let Err(error) =
-                        crate::memory::Consolidator::consolidate(&consolidator, &scope).await
-                    {
-                        warn!(%error, "background consolidation pass failed");
-                    }
-                }
-            })),
+            (Some(every), Some(consolidator)) => {
+                Some(spawn_consolidation(&id, every, consolidator))
+            }
             _ => None,
         };
         let task = tokio::spawn(async move {
@@ -347,6 +337,31 @@ impl Drop for AgentHandle {
     }
 }
 
+// The consolidation tick, off the handler loop: best-effort, logged, aborted
+// with the agent. A pass covers the agent's own memory, never every
+// conversation in the namespace.
+fn spawn_consolidation(
+    agent: &AgentId,
+    every: Duration,
+    consolidator: crate::memory::SharedConsolidator,
+) -> JoinHandle<()> {
+    let scope = crate::memory::MemoryScope::builder()
+        .agent(agent.clone())
+        .build();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(error) =
+                crate::memory::Consolidator::consolidate(&consolidator, &scope).await
+            {
+                warn!(%error, "background consolidation pass failed");
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +374,40 @@ mod tests {
                 let _ = signal.send(());
             }
         }
+    }
+
+    struct RecordingConsolidator(tokio::sync::mpsc::UnboundedSender<crate::memory::MemoryScope>);
+
+    impl crate::memory::Consolidator for RecordingConsolidator {
+        async fn consolidate(
+            &self,
+            scope: &crate::memory::MemoryScope,
+        ) -> Result<crate::memory::ConsolidationReport, LaserError> {
+            let _ = self.0.send(scope.clone());
+            Ok(crate::memory::ConsolidationReport::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn given_an_agent_consolidation_tick_when_it_fires_then_should_scope_the_pass_to_the_agent()
+     {
+        let (passes, mut scopes) = tokio::sync::mpsc::unbounded_channel();
+        let agent: AgentId = "planner".parse().expect("valid agent id");
+        let tick = spawn_consolidation(
+            &agent,
+            Duration::from_millis(5),
+            crate::memory::SharedConsolidator::new(RecordingConsolidator(passes)),
+        );
+        let scope = tokio::time::timeout(Duration::from_secs(2), scopes.recv())
+            .await
+            .expect("a pass ran")
+            .expect("the tick is alive");
+        tick.abort();
+        assert_eq!(scope.agent, Some(agent));
+        assert!(scope.conversation.is_none());
+        assert!(scope.user.is_none());
+        assert!(scope.app.is_none());
+        assert!(scope.stream.is_none());
     }
 
     #[tokio::test]

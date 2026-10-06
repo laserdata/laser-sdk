@@ -15,12 +15,14 @@ This workspace publishes `laser-wire` and `laser-sdk`. `laser-wire` defines shar
 - [Conventions](#conventions)
 - [Testing](#testing)
 - [What is shipped vs planned](#what-is-shipped-vs-planned)
+- [Client behavior docs](#client-behavior-docs)
+- [Consumer-group ownership](#consumer-group-ownership)
 
 ## STOP and ask the user before
 
 These changes require explicit user authorization unless the current session already grants it:
 
-- Changes to encoded data in `wire/src/` require coordinated updates. This includes codes, versions, header keys in `wire/src/headers.rs`, topics, fields, serde attributes, dictionaries, and limits. During the current pre-1.0 stage, authorized breaking changes do not require backward compatibility. Update `wire/fixtures/`, all clients, consumers, examples, and specifications together.
+- Changes to encoded data in `wire/src/` require coordinated updates. This includes codes, versions, header keys in `wire/src/headers.rs`, topics, fields, serde attributes, dictionaries, and limits. During the current pre-1.0 stage, authorized breaking changes do not require backward compatibility, and operation versions stay at 1. Update `wire/fixtures/`, all clients, consumers, examples, and specifications together.
 - Changing `ConversationId::derive` in `sdk/src/types/ids.rs` changes derived `SessionPolicy::PerUser` identities. Keep its version policy explicit through `DERIVE_VERSION`. `AgentId::wire_id` uses the agent name directly.
 - Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`) - repoints live topics.
 - Changing `Provenance::partition_key` (currently `conversation_id`) - breaks the per-conversation ordering guarantee.
@@ -60,7 +62,7 @@ just commerce-check        # 14. neutral vocabulary in examples, docs, tests, fi
 just parity-check          # 15. Rust, Python, TypeScript surfaces match docs/parity.md
 ```
 
-`just parity-check` runs `scripts/check-parity.py`. It reads the public Rust methods, the Python stub, and the TypeScript API report, and fails when `docs/parity.md` is stale, when a public Rust type is neither covered nor excluded with a reason, or when a row says MISSING. After a public change in any SDK, regenerate the matrix with `python3 scripts/check-parity.py --write`. The Rust, Python, and TypeScript CI workflows run it.
+`just parity-check` runs `scripts/check-parity.py`. It reads public Rust types, re-exports, fields, enum variants, error payloads, constants, methods, trait methods, `bon` builder controls, and standalone functions, then checks the Python stub and TypeScript API reports. It also checks parameters and APIs present only in a peer. It fails when `docs/parity.md` is stale, when a public Rust type is neither covered nor excluded with a reason, or when a row says MISSING. After a public change in any SDK, regenerate the matrix with `python3 scripts/check-parity.py --write`. The Rust, Python, and TypeScript CI workflows run it. A listed row proves the API exists, not that it behaves the same, so behavior still needs tests.
 
 `just commerce-check` runs `scripts/check-commerce-words.py`. Examples, docs, tests, and fixtures use neutral systems vocabulary (hosts, readings, services, incidents). The check fails on commerce vocabulary such as orders, payments, carts, invoices, customers, or refunds. CI runs it in the `lint` job.
 
@@ -95,8 +97,9 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
                         revisions, group bindings, mutations and outcomes), headers (the
                         typed header dictionary), codecs (JSON/CBOR/Avro/Protobuf decode),
                         eval (the compiled evaluator, feature filter-eval)
-    agent.rs            the Agent Data Exchange Protocol: AgentEnvelope, machine ids (16-byte u128 + Crockford), agent ids (bounded name strings)
-                        base32), AgentKind, TaskState/AgentErrorCode/DeadLetterReason u8
+    agent.rs            the Agent Data Exchange Protocol: AgentEnvelope, machine ids (16-byte u128 +
+                        Crockford base32), agent ids (bounded name strings), AgentKind,
+                        TaskState/AgentErrorCode/DeadLetterReason u8
                         dictionaries, TokenUsage, AgentDeadLetter, dormant Signature,
                         BodyRef (the agdx.ct=ref claim-check capsule), the pinned
                         operation vocabularies (task/card/progress, chunk-stream
@@ -345,8 +348,10 @@ examples/typescript/    nine non-benchmark mirrors, one entry point + README per
                         step-for-step identical across the languages
 docs/                   tutorial.md (progressive guide), building-agents.md (scenario
                         -> SDK recipe guide), agdx.md (the AGDX spec),
-                        interop.md (A2A / MCP / AG-UI bridges), parity.md (the cross-SDK
-                        parity matrix)
+                        interop.md (A2A / MCP / AG-UI bridges), parity.md (the generated
+                        cross-SDK parity matrix), client-behavior.md (0.6.0 behavior and
+                        migration), connect-timeout.md, publish-recovery.md,
+                        producer-statistics.md
 ```
 
 ## Repo-wide principles
@@ -383,11 +388,11 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.5.4` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.6.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
-Rust, Python, and TypeScript expose the same public surface. The [cross-SDK parity matrix](docs/parity.md) lists each Rust symbol with its Python and TypeScript spelling, and records every deliberate difference. The remaining differences are naming idioms and argument shapes: Python takes cards and presence as dicts, names the query predicate class `QueryFilter` and the graph start argument `start_match=`, and TypeScript uses `deadLetterTopic`, `fromIggyClient`, `aggregateAs`, microsecond `ttl(ttlMicros)` units, and `Map` offsets. Defaults agree across the three: a 30-second contract deadline, a typed `Timeout` from `next_within`, `Polling` as the default commit policy, TTL semantics for `expire` (TypeScript adds `expireAt` for an absolute time), a structured publish failure with committed and unconfirmed records, the same error classifiers, and the same context read window. The 0.5.4 parity pass also added: Python `memory_custom`, `Memory.reranker`, `Topic.cbor`, `Topic.schema`, `PublishRequest.claim_check`, producer `background` mode and `shutdown`, fork `continuous`, `Workflow.run_id`, `Capabilities.is_open_only` and `serves_consistency`, `AgdxStream` `channel`, `with_target`, `with_deadline_micros`, `content_type`, `buffered`, `flush`, `Intent.validate`, `SigningKey.sign` and the `KeyRegistry` verify family, `Session.context_with` and `Session.graph`. TypeScript producer `batchLength`, `lingerMs`, `maxTopicBytes`, `unlimitedTopicSize`, `background` with `flush` and `shutdown`, `QueryRequest.atSnapshot`, `atTimestampMicros`, `rowsTyped`, `MemoryHandle.backend`, `AgentScope.contract`, the exported capability helpers, `SwappableGovernor.current`. Rust `ScopedMemory::forget` and `improve`. `python3 scripts/check-parity.py` reports zero missing rows.
+Rust, Python, and TypeScript expose streaming, managed, and agent surfaces. The generated [cross-SDK parity matrix](docs/parity.md) lists each Rust symbol with its Python and TypeScript spelling and records every deliberate difference, and `python3 scripts/check-parity.py` reports unresolved mappings as failures. The matrix checks naming idioms and argument shapes: Python takes cards, presence, and graph results as dicts, and TypeScript uses microsecond `ttl(ttlMicros)` units and `Map` offsets. Names otherwise follow Rust, for example `Filter`, `agg_as` (TypeScript `aggAs`), `dlq_topic` (TypeScript `dlqTopic`), and `from_client` (TypeScript `fromClient`). Defaults agree across the three: a 30-second contract deadline, a typed timeout from `next_within`, `Polling` as the default commit policy, TTL semantics for `expire` (TypeScript adds `expireAt` for an absolute time), a structured publish failure with committed and unconfirmed records, the same error classifiers, and the same context read window. [Client behavior](docs/client-behavior.md) lists what 0.6.0 added and changed.
 
 The open SDK supports provenance, causality, context, memory, routing, sessions, and state. Reliable consumption supports graceful drain, `ConcurrencyPolicy::SerialPerPartition`, `AgentMiddleware`, `DeadLetterSink`, and `Agent::builder` retry, verifier, and duplicate-suppression controls. `laser_sdk::testing`, `respond_on`, and `AgentCtx` support handlers.
 
@@ -440,20 +445,15 @@ Still planned, not present:
 
 See the AGDX spec for the wire contract.
 
-## Connect timeout
+## Client behavior docs
 
-Rust, Python, and TypeScript bound the initial connect by one 30-second budget covering dial, TLS, login, and the capability probe. Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout` override `LASER_CONNECT_TIMEOUT_MS`. An expired budget returns a timeout that names the stalled stage, accept or login. Runtime reconnection stays unlimited so consumers survive a server restart. `Stream::delete` and `Laser::close` exist in all three SDKs, and the examples reset their own stream at the start of a run and keep it afterwards. See [connect timeout and cleanup](docs/connect-timeout.md).
+Each client-facing default has one owning page. Link to it rather than restating it.
 
-## Publish recovery
-
-Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
-
-Rust, Python, and TypeScript publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds. Explicit builder or connect configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.
-
-Preserve message identities and confirmed chunks across retries. Return permanent errors immediately. Return exhausted errors without panicking. Rust reconnects the shared client in place so consumers and reply readers stay attached. Recover only the connection that the attempt used. If another publish replaces that connection, skip recovery and use the replacement. See [publish recovery](docs/publish-recovery.md).
+- [Connect timeout and cleanup](docs/connect-timeout.md) covers the 30-second connect budget, `close`, and `Stream::delete`.
+- [Publish recovery](docs/publish-recovery.md) covers publish timeouts, retries, failure reports, and outage handling.
+- [Client behavior](docs/client-behavior.md) lists the 0.6.0 changes and the upgrade steps.
+- [Producer statistics](docs/producer-statistics.md) covers optional producer telemetry.
 
 ## Consumer-group ownership
 
 The public resource paths are Laser → stream → topic → producer and Laser → stream → topic → consumer group → filter. Group setup can include an optional policy. Normal consumers and advanced group readers use its configured policy, or return all records when it is unbound. Applications need no filter definition in consumer code. Normal batch length limits examined source records. Advanced match and scan limits remain separate. Never fall back to an unfiltered read after a catalog or capability failure. Keep Rust, Python and TypeScript behavior and documentation in parity.
-
-The [client behavior guide](docs/client-behavior.md) covers final 0.5.4 changes. The parity gate includes multiline inherent implementations and bon-generated builder controls. Its regressions run through just parity-check. Keep operation versions at 1 during this pre-1.0 work.

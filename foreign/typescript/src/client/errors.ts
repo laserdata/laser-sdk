@@ -1,11 +1,6 @@
 import type { MessageWithHeaders, SendMessagesConfirmation } from "../iggy/apache-iggy.js"
 import type { CheckpointError } from "../wire/checkpoint.js"
-import type {
-  FaultReason,
-  FilterError,
-  FilterErrorReason,
-  FilterGroupIdentity
-} from "../wire/filter.js"
+import type { FaultReason, FilterError, FilterGroupIdentity } from "../wire/filter.js"
 
 export type LaserErrorKind =
   | "config"
@@ -15,6 +10,8 @@ export type LaserErrorKind =
   | "cancelled"
   | "unsupported"
   | "invalid"
+  | "id"
+  | "provenance"
   | "codec"
   | "typed-decode"
   | "protocol"
@@ -47,7 +44,7 @@ export type LaserErrorKind =
 export class LaserError extends Error {
   readonly kind: LaserErrorKind
 
-  constructor(message: string, kind: LaserErrorKind, options?: { cause?: unknown }) {
+  protected constructor(message: string, kind: LaserErrorKind, options?: { cause?: unknown }) {
     super(message, options)
     this.kind = kind
     this.name = new.target.name
@@ -78,15 +75,29 @@ export class AmbiguousMutationError extends LaserError {
   }
 }
 
+/** An aborted wait, or a registered run whose cancel intent was observed at
+ * a step boundary. `run` names that run. Not retryable on the same run. */
 export class CancelledError extends LaserError {
-  constructor(message: string, options?: { cause?: unknown }) {
+  readonly run: string | undefined
+
+  constructor(message: string, options?: { cause?: unknown; run?: string }) {
     super(message, "cancelled", options)
+    this.run = options?.run
   }
 }
 
+/** The connected infrastructure does not provide the requested feature.
+ * Permanent: gate the code path instead of retrying. `surface` names the
+ * accessor the call came through and `feature` the sub-capability when one
+ * exists. */
 export class UnsupportedError extends LaserError {
-  constructor(message: string, options?: { cause?: unknown }) {
+  readonly surface: string | undefined
+  readonly feature: string | undefined
+
+  constructor(message: string, options?: { cause?: unknown; surface?: string; feature?: string }) {
     super(message, "unsupported", options)
+    this.surface = options?.surface
+    this.feature = options?.feature
   }
 }
 
@@ -103,8 +114,91 @@ export class InvalidError extends LaserError {
   }
 }
 
+/** Why parsing or validating an id failed: a conversation, agent, group, or
+ * message id. Each static constructor is one Rust `IdError` variant with the
+ * same message. */
+export class IdError extends LaserError {
+  private constructor(message: string) {
+    super(message, "id")
+  }
+
+  static empty(): IdError {
+    return new IdError("identifier must not be empty")
+  }
+
+  static tooLong(got: number, max: number): IdError {
+    return new IdError(`identifier length ${String(got)}B exceeds max ${String(max)}B`)
+  }
+
+  static invalidChar(char: string): IdError {
+    return new IdError(`identifier contains invalid character \`${char}\``)
+  }
+
+  static invalidUlid(text: string): IdError {
+    return new IdError(`invalid ULID \`${text}\``)
+  }
+
+  static invalidMessageId(text: string): IdError {
+    return new IdError(`invalid message id \`${text}\`, expected \`<partition_id>:<offset>\``)
+  }
+}
+
+/** Why encoding or decoding provenance headers failed. Each static
+ * constructor is one Rust `ProvenanceError` variant with the same message. */
+export class ProvenanceError extends LaserError {
+  private constructor(message: string, options?: { cause?: unknown }) {
+    super(message, "provenance", options)
+  }
+
+  static missingRequired(key: string): ProvenanceError {
+    return new ProvenanceError(`missing required header \`${key}\``)
+  }
+
+  static tooLarge(got: number, cap: number): ProvenanceError {
+    return new ProvenanceError(`provenance headers ${String(got)}B exceed soft cap ${String(cap)}B`)
+  }
+
+  static invalidValue(key: string): ProvenanceError {
+    return new ProvenanceError(`invalid value for header \`${key}\``)
+  }
+
+  static invalidValueBytes(key: string): ProvenanceError {
+    return new ProvenanceError(`header \`${key}\` value must not contain control characters or NUL`)
+  }
+
+  static nonFinite(key: string): ProvenanceError {
+    return new ProvenanceError(`non-finite floating-point value for header \`${key}\``)
+  }
+
+  static emptyValue(key: string): ProvenanceError {
+    return new ProvenanceError(`header \`${key}\` value must not be empty`)
+  }
+
+  static valueTooLong(key: string, got: number, max: number): ProvenanceError {
+    return new ProvenanceError(
+      `header \`${key}\` value is ${String(got)}B, exceeds max ${String(max)}B`
+    )
+  }
+
+  static malformedHeaders(detail: string): ProvenanceError {
+    return new ProvenanceError(`malformed Iggy headers on this message: ${detail}`)
+  }
+
+  /** A header block the Apache Iggy client could not read, with its error as the cause. */
+  static header(cause: unknown): ProvenanceError {
+    return new ProvenanceError(cause instanceof Error ? cause.message : String(cause), { cause })
+  }
+
+  /** An id header that does not parse, with the `IdError` as the cause. */
+  static id(cause: IdError): ProvenanceError {
+    return new ProvenanceError(cause.message, { cause })
+  }
+}
+
 export class CodecError extends LaserError {
+  /** @internal */
   readonly surface: string
+  /** @internal */
   readonly operation: string
 
   constructor(message: string, surface: string, operation: string, options?: { cause?: unknown }) {
@@ -116,19 +210,24 @@ export class CodecError extends LaserError {
 
 export class TypedDecodeError extends LaserError {
   readonly position: { readonly partitionId: number; readonly offset: bigint } | undefined
+  /** What went wrong: a codec failure for a positioned record, the transport error for a failed poll. */
+  readonly source: LaserError
 
   constructor(
     message: string,
     position: { readonly partitionId: number; readonly offset: bigint } | undefined,
-    options?: { cause?: unknown }
+    source: LaserError
   ) {
-    super(message, "typed-decode", options)
+    super(message, "typed-decode", { cause: source })
     this.position = position
+    this.source = source
   }
 }
 
 export class ProtocolError extends LaserError {
+  /** @internal */
   readonly resultCode: number | undefined
+  /** @internal */
   readonly commandCode: number | undefined
 
   constructor(
@@ -143,6 +242,8 @@ export class ProtocolError extends LaserError {
 }
 
 export class TransportError extends LaserError {
+  /** Read through `isRetryable`, like the Rust `is_retryable`.
+   * @internal */
   readonly retryable: boolean
 
   constructor(message: string, retryable: boolean, options?: { cause?: unknown }) {
@@ -216,42 +317,43 @@ export class FilterExecutionError extends LaserError {
   ) {
     super(message, "filter", options)
   }
-
-  get reason(): FilterErrorReason {
-    return this.detail.reason
-  }
 }
 
-/**
- * A partition stopped at a record it cannot deliver. `reason` names the stop
- * as the Python and Rust SDKs do (`fault` or `oversized_record`), and
- * `faultReason` the decode fault.
- */
-export class FilterStopError extends LaserError {
+/** A filtered read stopped in front of a record the filter could not
+ * evaluate under the `stop` fault policy. The record and everything after it
+ * stay unacknowledged. */
+export class FilterFaultError extends LaserError {
   constructor(
-    readonly stop: "fault" | "oversized_record",
     readonly partitionId: number,
     readonly offset: bigint,
-    readonly faultReason?: FaultReason
+    readonly reason?: FaultReason
   ) {
     super(
-      stop === "fault"
-        ? `filter fault on partition ${String(partitionId)} at offset ${offset.toString()}: ${faultReason ?? "malformed"}`
-        : `the record at offset ${offset.toString()} on partition ${String(partitionId)} exceeds the filtered reply cap`,
+      `filter fault on partition ${String(partitionId)} at offset ${offset.toString()}: ${reason ?? "malformed"}`,
       "filter"
     )
   }
+}
 
-  get reason(): "fault" | "oversized_record" {
-    return this.stop
+/** A matching record alone exceeds the filtered reply cap, so no page can
+ * carry it. The record and everything after it stay unacknowledged. */
+export class FilterOversizedRecordError extends LaserError {
+  constructor(
+    readonly partitionId: number,
+    readonly offset: bigint
+  ) {
+    super(
+      `the record at offset ${offset.toString()} on partition ${String(partitionId)} exceeds the filtered reply cap`,
+      "filter"
+    )
   }
 }
 
 /**
  * The consumer group exists, but its filter was not configured. The group
  * stays as it is, unbound unless it ran a policy before, and no reader joined
- * it. `cause` is the catalog refusal or the transport failure, and `reason`
- * the catalog's reason when there is one.
+ * it. `cause` is the catalog refusal or the transport failure, and
+ * `filterReason(error.cause)` the catalog's reason when there is one.
  */
 export class ConsumerGroupSetupError extends LaserError {
   constructor(
@@ -266,10 +368,6 @@ export class ConsumerGroupSetupError extends LaserError {
       { cause }
     )
   }
-
-  get reason(): FilterErrorReason | undefined {
-    return this.cause instanceof FilterExecutionError ? this.cause.reason : undefined
-  }
 }
 
 export class AgentWorkflowExecutionError extends LaserError {
@@ -282,23 +380,25 @@ export class AgentWorkflowExecutionError extends LaserError {
   }
 }
 
-export type RoutingErrorReason =
-  | { readonly kind: "noInbox"; readonly agent: string }
-  | { readonly kind: "noCapableAgent"; readonly skill: string }
-  | {
-      readonly kind: "principalMismatch"
-      readonly agent: string
-      readonly expected: number
-      readonly actual?: number
-    }
+export class NoCapableAgentError extends LaserError {
+  constructor(readonly skill: string) {
+    super(`no live agent advertises capability \`${skill}\``, "routing")
+  }
+}
 
-export class RoutingError extends LaserError {
+export class NoInboxError extends LaserError {
+  constructor(readonly agent: string) {
+    super(`no inbox advertised for agent \`${agent}\``, "routing")
+  }
+}
+
+export class RoutePrincipalMismatchError extends LaserError {
   constructor(
-    message: string,
-    readonly reason: RoutingErrorReason,
-    options?: { cause?: unknown }
+    readonly agent: string,
+    readonly expected: number,
+    readonly actual?: number
   ) {
-    super(message, "routing", options)
+    super(`agent \`${agent}\` is not authenticated as principal ${expected.toString()}`, "routing")
   }
 }
 
@@ -455,28 +555,4 @@ export class CheckpointExecutionError extends LaserError {
 
 export function assertNever(value: never): never {
   throw new InvalidError("unreachable variant", { value })
-}
-
-// A remote-safe rendering of a failure, for the bridge JSON-RPC responses. A
-// `TransportError` message names hosts, streams, and topics, and a
-// `ConfigError` can carry connection detail, none of which an unauthenticated
-// caller should see. The classification goes on the wire, the detail stays in
-// the local log.
-export function publicErrorMessage(error: unknown): string {
-  if (!(error instanceof LaserError)) return "internal error"
-  const publicByKind: Partial<Record<LaserErrorKind, string>> = {
-    invalid: "invalid request",
-    codec: "invalid request",
-    unsupported: "unsupported operation",
-    routing: "not found",
-    timeout: "request timed out",
-    cancelled: "request cancelled",
-    rejected: "forbidden",
-    "policy-blocked": "forbidden",
-    signature: "unauthenticated",
-    quarantined: "forbidden",
-    "fence-violation": "conflict",
-    "step-up-required": "step-up authorization required"
-  }
-  return publicByKind[error.kind] ?? "internal error"
 }

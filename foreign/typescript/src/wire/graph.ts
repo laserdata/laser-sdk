@@ -76,6 +76,10 @@ function checkedU128(name: string, value: bigint): bigint {
 
 export type EdgeDir = "out" | "in" | "both"
 
+export function edgeDirIsOut(dir: EdgeDir): boolean {
+  return dir === "out"
+}
+
 function parseEdgeDir(word: string, context: string): EdgeDir {
   if (word !== "out" && word !== "in" && word !== "both") {
     throw new CodecError(`\`${word}\` is not a recognized edge direction`, context, "dir")
@@ -84,6 +88,10 @@ function parseEdgeDir(word: string, context: string): EdgeDir {
 }
 
 export type GraphReturn = "nodes" | "edges" | "paths" | "triplets"
+
+export function graphReturnIsNodes(value: GraphReturn): boolean {
+  return value === "nodes"
+}
 
 function parseGraphReturn(word: string, context: string): GraphReturn {
   if (word !== "nodes" && word !== "edges" && word !== "paths" && word !== "triplets") {
@@ -101,7 +109,7 @@ export interface Hop {
 export function encodeHop(hop: Hop): Map<string, unknown> {
   const map = new Map<string, unknown>()
   if (hop.edgeType !== undefined) map.set("edge_type", hop.edgeType)
-  if (hop.dir !== "out") map.set("dir", hop.dir)
+  if (!edgeDirIsOut(hop.dir)) map.set("dir", hop.dir)
   map.set("max", BigInt(hop.max))
   return map
 }
@@ -197,7 +205,7 @@ export function encodeGraphQuery(query: GraphQuery): Map<string, unknown> {
     )
   if (query.nodeFilter !== undefined) map.set("node_filter", encodeFilter(query.nodeFilter))
   if (query.edgeFilter !== undefined) map.set("edge_filter", encodeFilter(query.edgeFilter))
-  if (query.return !== "nodes") map.set("return_", query.return)
+  if (!graphReturnIsNodes(query.return)) map.set("return_", query.return)
   map.set("limit", BigInt(query.limit))
   if (query.fork !== undefined) map.set("fork", query.fork)
   if (query.consistency !== "eventual") map.set("consistency", consistencyToWord(query.consistency))
@@ -259,7 +267,7 @@ export function encodeGraphNeighbors(neighbors: GraphNeighbors): Map<string, unk
   map.set("v", GRAPH_OP_VERSION)
   map.set("graph", neighbors.graph)
   map.set("node", neighbors.node.toBytes())
-  if (neighbors.dir !== "out") map.set("dir", neighbors.dir)
+  if (!edgeDirIsOut(neighbors.dir)) map.set("dir", neighbors.dir)
   if (neighbors.edgeType !== undefined) map.set("edge_type", neighbors.edgeType)
   map.set("depth", neighbors.depth)
   map.set("limit", neighbors.limit)
@@ -396,7 +404,7 @@ export interface GraphNode {
 
 export function graphNodeEntity(label: string, value: string): GraphNode {
   const id = NodeId.content(label, new TextEncoder().encode(value))
-  return { id, labels: [label], attrs: [["value", { kind: "string", value }]] }
+  return { id, labels: [label], attrs: [["value", { kind: "str", value }]] }
 }
 
 export function encodeGraphNode(node: GraphNode): Map<string, unknown> {
@@ -465,6 +473,15 @@ export function graphEdgeRelate(from: GraphNode, edgeType: string, to: GraphNode
     edgeType,
     weight: 1,
     attrs: []
+  }
+}
+
+export function graphEdgeValid(edge: GraphEdge, from?: bigint, to?: bigint): GraphEdge {
+  const { validFrom: _from, validTo: _to, ...rest } = edge
+  return {
+    ...rest,
+    ...(from === undefined ? {} : { validFrom: from }),
+    ...(to === undefined ? {} : { validTo: to })
   }
 }
 

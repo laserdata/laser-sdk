@@ -8,10 +8,10 @@ import { Watch } from "../../src/managed/watch.js"
 import { Cursor } from "../../src/stream/cursor.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import { encodeChangeRecord } from "../../src/wire/change.js"
-import { Feature } from "../../src/wire/hello.js"
+import { feature } from "../../src/wire/hello.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
-  versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: Feature.WATCH },
+  versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: feature.WATCH },
   backends: []
 })
 
@@ -56,7 +56,7 @@ function polled(payload: Uint8Array, offset: bigint): PolledMessage {
 
 void test("given_open_capabilities_when_records_is_called_then_should_reject_before_opening_a_cursor", async () => {
   let opened = false
-  const watch = new Watch(
+  const watch = Watch.create(
     () => Promise.resolve(OPEN_CAPABILITIES),
     () => {
       opened = true
@@ -69,8 +69,8 @@ void test("given_open_capabilities_when_records_is_called_then_should_reject_bef
 
 void test("given_watch_capability_when_records_is_called_then_should_open_the_injected_cursor", async () => {
   const transport = fakeTransport([[polled(changeRecordPayload("readings_v1", 0n, 1n), 0n)]])
-  const cursor = new Cursor(transport, "ops", "changes", [0])
-  const watch = new Watch(
+  const cursor = Cursor.create(transport, "ops", "changes", [0])
+  const watch = Watch.create(
     () => Promise.resolve(CAPS),
     () => Promise.resolve(cursor)
   )
@@ -87,8 +87,8 @@ void test("given_an_index_filter_when_polled_then_should_keep_only_matching_reco
       polled(changeRecordPayload("hosts_v1", 0n, 1n), 1n)
     ]
   ])
-  const cursor = new Cursor(transport, "ops", "changes", [0])
-  const watch = new Watch(
+  const cursor = Cursor.create(transport, "ops", "changes", [0])
+  const watch = Watch.create(
     () => Promise.resolve(CAPS),
     () => Promise.resolve(cursor)
   ).index("readings_v1")
@@ -102,8 +102,8 @@ void test("given_an_index_filter_when_polled_then_should_keep_only_matching_reco
 
 void test("given_an_undecodable_payload_when_polled_then_should_skip_it", async () => {
   const transport = fakeTransport([[polled(Uint8Array.of(0xff, 0x00), 0n)]])
-  const cursor = new Cursor(transport, "ops", "changes", [0])
-  const watch = new Watch(
+  const cursor = Cursor.create(transport, "ops", "changes", [0])
+  const watch = Watch.create(
     () => Promise.resolve(CAPS),
     () => Promise.resolve(cursor)
   )
@@ -117,8 +117,8 @@ void test("given_multiple_pages_when_streamed_then_should_yield_records_and_stop
     [polled(changeRecordPayload("readings_v1", 1n, 2n), 1n)],
     []
   ])
-  const cursor = new Cursor(transport, "ops", "changes", [0])
-  const watch = new Watch(
+  const cursor = Cursor.create(transport, "ops", "changes", [0])
+  const watch = Watch.create(
     () => Promise.resolve(CAPS),
     () => Promise.resolve(cursor)
   )
@@ -130,8 +130,8 @@ void test("given_multiple_pages_when_streamed_then_should_yield_records_and_stop
 
 void test("given_offsets_when_from_offsets_is_called_then_should_resume_and_expose_them", async () => {
   const transport = fakeTransport([[]])
-  const cursor = new Cursor(transport, "ops", "changes", [0])
-  const watch = new Watch(
+  const cursor = Cursor.create(transport, "ops", "changes", [0])
+  const watch = Watch.create(
     () => Promise.resolve(CAPS),
     () => Promise.resolve(cursor)
   )

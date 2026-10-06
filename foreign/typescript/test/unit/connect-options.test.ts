@@ -40,10 +40,10 @@ void test("given_connect_defaults_when_resolved_then_should_allow_thirty_seconds
   })
 })
 
-void test("given_invalid_connect_settings_when_connected_then_should_reject_before_io", () => {
+void test("given_invalid_connect_settings_when_connected_then_should_reject_before_io", async () => {
   assert.throws(() => connectOptions({}, { LASER_CONNECT_TIMEOUT_MS: "soon" }), ConfigError)
   for (const value of [0, -1, NaN, Infinity, 0x8000_0000]) {
-    assert.throws(() => Laser.builder().connectTimeout(value).connect(), ConfigError)
+    await assert.rejects(Laser.builder().connectTimeout(value).connect(), ConfigError)
   }
 })
 
@@ -106,7 +106,7 @@ void test(
         }
       } as unknown as IggyClient
       await assert.rejects(
-        Laser.builder().iggyClient(client, { ownership }).connectTimeout(30).connect(),
+        Laser.builder().client(client, { ownership }).connectTimeout(30).connect(),
         (error: unknown) => error instanceof TimeoutError && error.message.includes("readiness")
       )
       assert.equal(destroys, ownership === "owned" ? 1 : 0)
@@ -142,7 +142,7 @@ void test(
         return probes === 1 ? delayed : Promise.resolve(reply)
       }
     } as unknown as IggyClient
-    const laser = await Laser.builder().iggyClient(client).connectTimeout(30).connect()
+    const laser = await Laser.builder().client(client).connectTimeout(30).connect()
     const originalOpsStream = laser.opsStream
     assert.deepEqual(await laser.capabilities(), { ...OPEN_CAPABILITIES, hello: "failed" })
     assert.equal(probes, 1)

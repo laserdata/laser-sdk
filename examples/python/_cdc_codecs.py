@@ -21,7 +21,7 @@ class Reading:
 
 
 async def wait_for_schema(laser: ls.Laser, schema_id: int) -> None:
-    while await laser.get_schema(schema_id) is None:
+    while await laser.schemas().get(schema_id) is None:
         await asyncio.sleep(0.05)
 
 
@@ -51,7 +51,7 @@ async def run_codecs(laser: ls.Laser) -> None:
             schema_id = None
             compiled = None
             if source is not None:
-                schema_id = await laser.register_schema(source, name=f"fleet-{codec}")
+                schema_id = await laser.schemas().register(source, name=f"fleet-{codec}")
                 registered.append(schema_id)
                 await asyncio.wait_for(wait_for_schema(laser, schema_id), 15)
                 compiled = ls.CompiledSchema.compile(source, id=schema_id)
@@ -98,12 +98,12 @@ async def run_codecs(laser: ls.Laser) -> None:
     except BaseException:
         for schema_id in registered:
             with suppress(Exception):
-                await laser.drop_schema(schema_id)
+                await laser.schemas().drop(schema_id)
         raise
     first_error: Exception | None = None
     for schema_id in registered:
         try:
-            await laser.drop_schema(schema_id)
+            await laser.schemas().drop(schema_id)
         except Exception as error:
             first_error = first_error or error
     if first_error is not None:

@@ -1,8 +1,9 @@
 import type { Laser } from "./client/laser.js"
 import type { GraphHandle } from "./managed/graph.js"
 import {
-  Checkpoint,
+  type Checkpoint,
   ContextAssembler,
+  contextCheckpoint,
   LastN,
   type ContextMessage,
   type ContextPolicy
@@ -21,10 +22,16 @@ import type {
 } from "./memory/types.js"
 
 export class ContextScope {
-  constructor(
-    private readonly laser: Laser,
+  /** `laser` is the client this scope reads and writes through. */
+  private constructor(
+    readonly laser: Laser,
     readonly conversation: ConversationId
   ) {}
+
+  /** @internal */
+  static create(laser: Laser, conversation: ConversationId): ContextScope {
+    return new ContextScope(laser, conversation)
+  }
 
   append(topic: string, payload: BytesLike): Promise<void> {
     return this.laser.sendAgent(topic, payload, { conversationId: this.conversation })
@@ -35,7 +42,8 @@ export class ContextScope {
   }
 
   fetchWith(topics: readonly string[], policy: ContextPolicy): Promise<readonly ContextMessage[]> {
-    return ContextAssembler.builder(this.conversation)
+    return ContextAssembler.builder()
+      .conversationId(this.conversation)
       .topics(topics)
       .policy(policy)
       .build()
@@ -50,7 +58,7 @@ export class ContextScope {
   /** The current tail of `topics` as a `Checkpoint`: fold up to it with the
    * `at` replay bound or resume after it with `from-checkpoint`. */
   checkpoint(topics: readonly string[]): Promise<Checkpoint> {
-    return Checkpoint.capture(this.laser, topics)
+    return contextCheckpoint(this.laser, topics)
   }
 
   /** Binds a memory namespace or existing handle to this conversation. */
@@ -59,7 +67,7 @@ export class ContextScope {
       typeof namespaceOrHandle === "string"
         ? this.laser.memory(namespaceOrHandle)
         : namespaceOrHandle
-    return new ScopedMemory(handle, this.conversation)
+    return ScopedMemory.create(handle, this.conversation)
   }
 
   /** The knowledge graph `name`, reached from this scope so one conversation's
@@ -81,21 +89,24 @@ export class ContextScope {
     return ConversationState.load(this.laser, this.conversation, topics, bound, initial, fold)
   }
 
+  /** Like `state` but seeded through a `SnapshotStore`: the newest snapshot's
+   * state, JSON-decoded unless `decodeState` is given, plus a replay of only
+   * the tail past it. */
   stateWith<State>(
     store: SnapshotStore,
     topics: readonly string[],
-    initial: State,
-    decodeState: (bytes: Uint8Array) => State,
-    fold: (state: State, message: ContextMessage) => State
+    init: State,
+    fold: (state: State, message: ContextMessage) => State,
+    decodeState?: (bytes: Uint8Array) => State
   ): Promise<State> {
     return ConversationState.loadWith(
       this.laser,
       store,
       this.conversation,
       topics,
-      initial,
-      decodeState,
-      fold
+      init,
+      fold,
+      decodeState
     )
   }
 }
@@ -103,17 +114,22 @@ export class ContextScope {
 export class ScopedMemory {
   /** `handle` is the underlying memory, for the cross-conversation verbs this
    * scoped face does not narrow. */
-  constructor(
+  private constructor(
     readonly handle: MemoryHandle,
     readonly conversation: ConversationId
   ) {}
 
+  /** @internal */
+  static create(handle: MemoryHandle, conversation: ConversationId): ScopedMemory {
+    return new ScopedMemory(handle, conversation)
+  }
+
   remember(payload: Uint8Array) {
-    return this.handle.remember(payload).conversation(this.conversation)
+    return this.handle.remember(payload).scope(this.conversation)
   }
 
   recall() {
-    return this.handle.recall().conversation(this.conversation)
+    return this.handle.recall(this.conversation)
   }
 
   /** Keyword recall for `query` within this conversation. Needs no embedder,
@@ -125,16 +141,11 @@ export class ScopedMemory {
 
   /** This conversation's recalled items as one prompt-ready block, trimmed to
    * `tokenBudget` estimated tokens when given. */
-  context(tokenBudget?: number): Promise<string> {
+  block(tokenBudget?: number): Promise<string> {
     return this.handle.context(
       { conversation: this.conversation },
       tokenBudget === undefined ? {} : { tokenBudget }
     )
-  }
-
-  /** The same block as `context`, under the name the Rust and Python SDKs use. */
-  block(tokenBudget?: number): Promise<string> {
-    return this.context(tokenBudget)
   }
 
   /** One consolidation pass over this conversation, keeping the newest
@@ -143,10 +154,15 @@ export class ScopedMemory {
     return this.handle.consolidate({ conversation: this.conversation }, maxItems, options)
   }
 
+  /** Forgets the item `id`. The item is addressed by id alone, so an item
+   * remembered in another conversation is forgotten too. The conversation
+   * only stamps the tombstone's provenance. */
   forget(id: MemoryId): Promise<void> {
     return this.handle.forget({ conversation: this.conversation }, id)
   }
 
+  /** Records `feedback` on the item it targets, addressed by id alone like
+   * `forget`. The conversation only stamps the feedback record's provenance. */
   improve(feedback: Feedback): Promise<MemoryId> {
     return this.handle.improve({ conversation: this.conversation }, feedback)
   }

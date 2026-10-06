@@ -5,7 +5,7 @@ This example publishes clickstream events and reads them through a live consumer
 ## What it does
 
 1. Read the log through a consumer group while the producer sends batches. `CommitPolicy::Polling` enables automatic commits during polling. A lost response can require recovery from explicit offsets. A timeout reports a stalled read.
-2. On a managed deployment, query the projected `clickstream` table. The queries use `message_type`, `ts`, and `time_range` for counts and time windows.
+2. On a managed deployment, query the projected `clickstream_<token>` table. The queries use `message_type`, `ts`, and `time_range` for counts and time windows.
 3. Export records through a separate `Cursor` and save offsets in a `StateStore`. Recreate the reader from the saved offsets.
 4. Register a JSON Schema through `laser.schemas().register(source).send()`. Attach its ID with `.schema_id(id)`. A matching record enters the index. A mismatched record increments `schema_decode_failures.mismatch` and follows the configured dead-letter policy.
 
@@ -29,7 +29,7 @@ LASER_MESSAGES=2000000 LASER_BATCH=1000 cargo run --release --example event-anal
 
 ## Where to look (LaserData Cloud)
 
-- Query: indexes `clickstream` (the main tape) and `clickstream_guarded` (the schema-guarded one, exactly one row).
+- Query: indexes `clickstream_<token>` (the main tape) and `clickstream_guarded_<token>` (the schema-guarded one, exactly one row). The run token keeps a rerun, or another language's example on the same deployment, out of this run's rows.
 - Writer schemas: the JSON Schema guard the run registered, with the LaserData-Cloud-allocated id.
 - Messages: the raw events with their compact `agdx.*` headers.
 

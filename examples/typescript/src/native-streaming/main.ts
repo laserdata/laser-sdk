@@ -16,8 +16,8 @@ async function receive(
     .consumerGroup(group)
     .consumer({
       batchLength: Math.min(100, expected),
-      autoCommit: !manualCommit,
-      startFrom: { kind: "first" },
+      commitPolicy: { kind: manualCommit ? "disabled" : "polling" },
+      startAt: { kind: "first" },
       pollIntervalMs: 5
     })
   let seen = 0
@@ -28,21 +28,28 @@ async function receive(
     if (seen === 1 || seen === expected || seen % 100 === 0) {
       console.log(
         `${group}: ${String(seen)}/${String(expected)} partition=${String(message.partitionId)} ` +
-          `offset=${message.offset.toString()} payload=${decodeUtf8(message.payload)}`
+          `offset=${message.position.offset.toString()} payload=${decodeUtf8(message.payload)}`
       )
     }
   }
   return seen
 }
 
-export async function run(laser: Laser, signal: AbortSignal): Promise<void> {
+/** How many records were published and how many each commit strategy read back. */
+export interface NativeStreamingSummary {
+  readonly published: number
+  readonly automatic: number
+  readonly manual: number
+}
+
+export async function run(laser: Laser, signal: AbortSignal): Promise<NativeStreamingSummary> {
   const count = messages(1_000)
   const batch = Math.min(batchSize(100), count)
   const topic = laser.topic(TOPIC)
   await topic.ensure(PARTITIONS)
   await using producer = topic.producer({
     retries: 3,
-    retryIntervalMs: 1_000
+    retryBackoffMs: 1_000
   })
   phase("producer: exact-width header, keyed routing, and batched messages")
   await producer.send(utf8("message-0"), {
@@ -59,7 +66,6 @@ export async function run(laser: Laser, signal: AbortSignal): Promise<void> {
     sent += size
     console.log(`published ${String(sent)}/${String(count)}`)
   }
-  await producer.flush()
 
   phase("consumer: production automatic offset commits")
   const automatic = await receive(laser, "auto-workers", count, false, signal)
@@ -67,6 +73,7 @@ export async function run(laser: Laser, signal: AbortSignal): Promise<void> {
   const manual = await receive(laser, "manual-workers", count, true, signal)
   if (automatic !== count || manual !== count) throw new Error("consumer count mismatch")
   console.log(`\nverified ${String(count)} records through both commit strategies`)
+  return { published: sent, automatic, manual }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

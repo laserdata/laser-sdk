@@ -17,24 +17,19 @@ function fakeClient(onDestroy: () => void): IggyClient {
   } as unknown as IggyClient
 }
 
-void test("given_conflicting_builder_modes_when_connected_then_should_reject_before_io", () => {
+void test("given_conflicting_builder_modes_when_connected_then_should_reject_before_io", async () => {
   const client = fakeClient(() => undefined)
-  assert.throws(
-    () => Laser.builder().connectionString("local").iggyClient(client).connect(),
+  await assert.rejects(
+    Laser.builder().connectionString("local").client(client).connect(),
     ConfigError
   )
-  assert.throws(() => Laser.builder().credentials("user", "password").connect(), ConfigError)
-  assert.throws(() => Laser.builder().opsStream("").connect(), ConfigError)
+  await assert.rejects(Laser.builder().credentials("user", "password").connect(), ConfigError)
+  await assert.rejects(Laser.builder().opsStream("").connect(), ConfigError)
 })
 
 void test("given_a_borrowed_injected_client_when_closed_then_should_leave_the_client_open", async () => {
   let destroys = 0
-  const laser = await Laser.fromIggyClient(
-    fakeClient(() => destroys++),
-    {
-      defaultStream: "events"
-    }
-  )
+  const laser = (await Laser.fromClient(fakeClient(() => destroys++))).withDefaultStream("events")
   assert.equal(laser.defaultStream, "events")
   await laser.close()
   await laser.close()
@@ -44,7 +39,7 @@ void test("given_a_borrowed_injected_client_when_closed_then_should_leave_the_cl
 void test("given_an_owned_client_when_asynchronously_disposed_then_should_close_once", async () => {
   let destroys = 0
   const laser = await Laser.builder()
-    .iggyClient(
+    .client(
       fakeClient(() => destroys++),
       { ownership: "owned" }
     )
@@ -59,22 +54,22 @@ void test("given_an_owned_client_when_asynchronously_disposed_then_should_close_
 void test("given_an_owned_client_and_scoped_handle_when_disposed_then_should_only_close_from_the_root", async () => {
   let destroys = 0
   const laser = await Laser.builder()
-    .iggyClient(
+    .client(
       fakeClient(() => destroys++),
       { ownership: "owned" }
     )
-    .defaultStream("events")
+    .stream("events")
     .capabilities(OPEN_CAPABILITIES)
     .opsStream("ops-custom")
     .controlTopic("control-custom")
-    .deadLetterTopic("dlq-custom")
+    .dlqTopic("dlq-custom")
     .changesTopic("changes-custom")
     .connect()
   const scoped = laser.withDefaultStream("other")
 
   assert.equal(laser.opsStream, "ops-custom")
   assert.equal(scoped.controlTopic, "control-custom")
-  assert.equal(scoped.deadLetterTopic, "dlq-custom")
+  assert.equal(scoped.dlqTopic, "dlq-custom")
   assert.equal(scoped.changesTopic, "changes-custom")
   await scoped[Symbol.asyncDispose]()
   assert.equal(destroys, 0)
@@ -85,7 +80,7 @@ void test("given_an_owned_client_and_scoped_handle_when_disposed_then_should_onl
 
 void test("given_a_scoped_handle_when_explicitly_closed_then_should_close_the_shared_connection_once", async () => {
   let destroys = 0
-  const laser = await Laser.fromIggyClient(
+  const laser = await Laser.fromClient(
     fakeClient(() => destroys++),
     { ownership: "owned" }
   )
@@ -96,7 +91,7 @@ void test("given_a_scoped_handle_when_explicitly_closed_then_should_close_the_sh
 })
 
 void test("given_a_capability_override_when_refreshed_then_should_remain_authoritative", async () => {
-  const laser = await Laser.fromIggyClient(fakeClient(() => undefined))
+  const laser = await Laser.fromClient(fakeClient(() => undefined))
   const configured = {
     ...OPEN_CAPABILITIES,
     query: { ...OPEN_CAPABILITIES.query, available: true }
@@ -122,7 +117,7 @@ void test("given_an_injected_observer_when_the_client_closes_then_should_record_
     event: () => undefined
   }
   const laser = await Laser.builder()
-    .iggyClient(
+    .client(
       fakeClient(() => undefined),
       { ownership: "owned" }
     )

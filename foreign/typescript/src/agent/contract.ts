@@ -104,7 +104,7 @@ async function resolveContract(
   return {
     target,
     inbox,
-    expectedSigner: requiredPrincipal(router)?.toString() ?? target.asString()
+    expectedSigner: requiredPrincipal(router)?.toString() ?? target.asStr()
   }
 }
 
@@ -140,9 +140,9 @@ export async function markRun(
     .status(OPERATION_TASK)
     .withCorrelation(correlation)
     .withTaskState(state)
-    .withMetadata(METADATA_RUN, { kind: "string", value: run })
+    .withMetadata(METADATA_RUN, { kind: "str", value: run })
   if (detail !== undefined) {
-    status = status.withMetadata("detail", { kind: "string", value: detail })
+    status = status.withMetadata("detail", { kind: "str", value: detail })
   }
   await status.send()
 }
@@ -158,11 +158,16 @@ export class ContractBuilder {
   private conversationId: ConversationId | undefined
   private registerRun = false
 
-  constructor(
+  private constructor(
     private readonly laser: Laser,
     private readonly router: Router,
     private readonly nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n
   ) {}
+
+  /** @internal */
+  static create(laser: Laser, router: Router, nowMicros?: () => bigint): ContractBuilder {
+    return new ContractBuilder(laser, router, nowMicros)
+  }
 
   from(source: AgentId): this {
     this.source = source
@@ -230,7 +235,7 @@ export class ContractBuilder {
     let run: string | undefined
     try {
       if (this.registerRun) {
-        run = (await this.laser.runs().submitWith(resolved.target.asString(), { input: this.body }))
+        run = (await this.laser.runs().submitWith(resolved.target.asStr(), { input: this.body }))
           .runId
       }
       let command = this.laser
@@ -238,10 +243,10 @@ export class ContractBuilder {
         .command(actualCorrelation, this.body)
         .withTarget(resolved.target)
       if (this.fenceToken !== undefined) {
-        command = command.withMetadata(FENCE, { kind: "int", value: this.fenceToken })
+        command = command.withMetadata(FENCE, { kind: "uint", value: this.fenceToken })
       }
       if (run !== undefined)
-        command = command.withMetadata(METADATA_RUN, { kind: "string", value: run })
+        command = command.withMetadata(METADATA_RUN, { kind: "str", value: run })
       if (this.expiryMicros !== undefined) {
         command = command.withDeadlineMicros(this.nowMicros() + this.expiryMicros)
       }

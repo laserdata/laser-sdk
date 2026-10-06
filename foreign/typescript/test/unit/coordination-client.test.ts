@@ -3,13 +3,19 @@ import { test } from "node:test"
 
 import {
   AmbiguousMutationError,
+  ConfigError,
   InvalidError,
   ProtocolError,
   TimeoutError,
+  TransportError,
   UnsupportedError
 } from "../../src/client/errors.js"
 import { isRetryable } from "../../src/agent/reliable-consumer.js"
-import { FencedLeaseClient, type ManagedKvTransport } from "../../src/managed/coordination.js"
+import {
+  FencedLeaseClient,
+  LeaseCoordinator,
+  type ManagedKvTransport
+} from "../../src/managed/coordination.js"
 import { utf8 } from "../../src/client/bytes.js"
 import { decodeManagedRequestEnvelope } from "../../src/wire/mutation.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
@@ -136,4 +142,74 @@ void test("given_an_unexpected_reply_or_invalid_request_when_executed_then_shoul
   })
   await assert.rejects(client.release(client.prepareRelease(release)), ProtocolError)
   assert.throws(() => client.prepareAcquire({ ...acquire, leaseTtlMicros: 0n }), InvalidError)
+})
+
+const leased = (token: bigint): Uint8Array =>
+  reply({
+    kind: "leased",
+    leaseToken: token,
+    grantedTtlMicros: 1_000_000n,
+    position: { topicGeneration: 1n, partition: 0, offset: token }
+  })
+
+void test("given_concurrent_acquisitions_when_coordinated_then_should_send_one_at_a_time", async () => {
+  let inFlight = 0
+  let peak = 0
+  let token = 0n
+  const coordinator = new LeaseCoordinator(
+    new FencedLeaseClient({
+      send: async () => {
+        inFlight += 1
+        peak = Math.max(peak, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        inFlight -= 1
+        token += 1n
+        return leased(token)
+      },
+      reset: () => Promise.resolve()
+    })
+  )
+  const leases = await Promise.all([
+    coordinator.acquire(acquire),
+    coordinator.acquire({ ...acquire, key: utf8("other") }),
+    coordinator.acquire({ ...acquire, key: utf8("third") })
+  ])
+  assert.equal(peak, 1)
+  assert.deepEqual(
+    leases.map((lease) => lease.token),
+    [1n, 2n, 3n]
+  )
+})
+
+void test("given_an_ambiguous_coordinated_acquisition_when_it_fails_then_should_wait_the_requested_ttl_and_free_the_gate", async () => {
+  let calls = 0
+  const coordinator = new LeaseCoordinator(
+    new FencedLeaseClient({
+      send: () => {
+        calls += 1
+        return calls === 1
+          ? Promise.reject(new TransportError("connection lost", true))
+          : Promise.resolve(leased(9n))
+      },
+      reset: () => Promise.resolve()
+    })
+  )
+  const started = performance.now()
+  await assert.rejects(coordinator.acquire(acquire), AmbiguousMutationError)
+  assert.ok(performance.now() - started >= 990, "the whole requested TTL elapses")
+  assert.equal((await coordinator.acquire(acquire)).token, 9n)
+})
+
+void test("given_no_dedicated_client_when_coordinated_then_should_reject_as_config", async () => {
+  await assert.rejects(new LeaseCoordinator().acquire(acquire), ConfigError)
+})
+
+void test("given_a_definite_rejection_when_coordinated_then_should_preserve_it_without_ttl_recovery", async () => {
+  const denied = new TransportError("server rejected acquisition", false)
+  const coordinator = new LeaseCoordinator(
+    new FencedLeaseClient({ send: () => Promise.reject(denied), reset: () => Promise.resolve() })
+  )
+  const started = performance.now()
+  await assert.rejects(coordinator.acquire(acquire), (error: unknown) => error === denied)
+  assert.ok(performance.now() - started < 500, "no TTL wait for a definite answer")
 })

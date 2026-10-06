@@ -47,7 +47,10 @@ function fakeTransport(scriptedReplies: readonly Uint8Array[]): {
 
 function graph(name: string, replies: readonly Uint8Array[], capabilities: Capabilities = CAPS) {
   const transport = fakeTransport(replies)
-  return { graph: new GraphHandle(transport, () => Promise.resolve(capabilities), name), transport }
+  return {
+    graph: GraphHandle.create(transport, () => Promise.resolve(capabilities), name),
+    transport
+  }
 }
 
 void test("given_a_fetch_when_run_then_should_use_the_query_command_and_return_the_result", async () => {

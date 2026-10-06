@@ -293,7 +293,7 @@ void test("given_paged_client_metadata_when_all_is_called_then_should_follow_the
       )
     )
 
-  const clients = await new ClientMetadataRequest(transport)
+  const clients = await ClientMetadataRequest.create(transport)
     .withMetadataOnly(true)
     .principal(PrincipalId.new(7))
     .limit(1)
@@ -313,7 +313,7 @@ void test("given_paged_client_metadata_when_all_is_called_then_should_follow_the
 })
 
 void test("given_invalid_client_metadata_page_numbers_when_set_then_should_reject_locally", () => {
-  const request = new ClientMetadataRequest(new RegistryTransport())
+  const request = ClientMetadataRequest.create(new RegistryTransport())
   assert.throws(() => request.limit(-1), InvalidError)
   assert.throws(() => request.limit(1.5), InvalidError)
   assert.throws(() => request.after(0x1_0000_0000), InvalidError)
@@ -332,27 +332,27 @@ void test("given_registry_records_when_refreshed_then_should_cache_offsets_and_e
   }
   transport.pollPages.push([polled(cardEnvelope("planner", ["plan"]), 0n), polled(quarantine, 1n)])
   const cache = newRegistryCache()
-  const registry = new AgentRegistry(
-    new Cursor(transport, "stream", "agent.registry", [0]),
+  const registry = AgentRegistry.create(
+    Cursor.create(transport, "stream", "agent.registry", [0]),
     cache,
-    () => new ClientMetadataRequest(transport),
+    () => ClientMetadataRequest.create(transport),
     () => 100n
   )
 
   assert.equal(await registry.refresh(), 2)
-  assert.equal(registry.lookup(SdkAgentId.new("planner"))?.agent.asString(), "planner")
+  assert.equal(registry.lookup(SdkAgentId.new("planner"))?.agent.asStr(), "planner")
   assert.equal(registry.resolve("plan").length, 0)
   assert.equal(registry.isQuarantined(SdkAgentId.new("planner")), true)
   assert.equal(cache.offsets.get(0), 2n)
 
-  const resumed = new AgentRegistry(
-    new Cursor(new RegistryTransport(), "stream", "agent.registry", [0]),
+  const resumed = AgentRegistry.create(
+    Cursor.create(new RegistryTransport(), "stream", "agent.registry", [0]),
     cache,
-    () => new ClientMetadataRequest(transport),
+    () => ClientMetadataRequest.create(transport),
     () => 100n
   )
   assert.equal(resumed.isQuarantined(SdkAgentId.new("planner")), true)
-  assert.equal(resumed.lookup(SdkAgentId.new("planner"))?.agent.asString(), "planner")
+  assert.equal(resumed.lookup(SdkAgentId.new("planner"))?.agent.asStr(), "planner")
 })
 
 void test("given_live_presence_when_refreshed_within_ttl_then_should_reuse_the_cached_page", async () => {
@@ -376,10 +376,10 @@ void test("given_live_presence_when_refreshed_within_ttl_then_should_reuse_the_c
       })
     )
   let now = 10_000_000n
-  const registry = new AgentRegistry(
-    new Cursor(transport, "stream", "agent.registry", [0]),
+  const registry = AgentRegistry.create(
+    Cursor.create(transport, "stream", "agent.registry", [0]),
     newRegistryCache(),
-    () => new ClientMetadataRequest(transport),
+    () => ClientMetadataRequest.create(transport),
     () => now
   )
 

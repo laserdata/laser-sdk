@@ -14,7 +14,7 @@ import {
   AgentSubmitCommand
 } from "../../src/wire/commands.js"
 import type { ControlCommand } from "../../src/wire/control.js"
-import { Feature } from "../../src/wire/hello.js"
+import { feature } from "../../src/wire/hello.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
   versions: {
@@ -24,7 +24,7 @@ const CAPS: Capabilities = managedCapabilitiesFrom({
     fork: 1,
     agent: 1,
     graph: 1,
-    features: Feature.AGENT_WORKFLOW
+    features: feature.AGENT_WORKFLOW
   },
   backends: []
 })
@@ -78,7 +78,7 @@ void test("given_a_submitted_outcome_when_submit_is_called_then_should_return_th
     replyFrame({ kind: "ok", outcome: { kind: "submitted", run: RUN } })
   ])
   const control = fakePublishControl()
-  const runs = new Runs(transport, () => Promise.resolve(CAPS), control.publish)
+  const runs = Runs.create(transport, () => Promise.resolve(CAPS), control.publish)
   const run = await runs.submit("planner", Uint8Array.of(1))
   assert.deepEqual(run, RUN)
   assert.equal(transport.calls[0]?.code, AgentSubmitCommand.code)
@@ -88,7 +88,7 @@ void test("given_submit_with_options_when_submitted_then_should_carry_run_id_par
   const transport = fakeTransport([
     replyFrame({ kind: "ok", outcome: { kind: "submitted", run: RUN } })
   ])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(CAPS),
     () => Promise.resolve()
@@ -113,7 +113,7 @@ void test("given_a_budget_when_submit_budgeted_is_called_then_should_delegate_to
   const transport = fakeTransport([
     replyFrame({ kind: "ok", outcome: { kind: "submitted", run: RUN } })
   ])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(CAPS),
     () => Promise.resolve()
@@ -126,7 +126,7 @@ void test("given_a_cancelled_outcome_when_cancel_is_called_then_should_use_the_c
   const transport = fakeTransport([
     replyFrame({ kind: "ok", outcome: { kind: "cancelled", run: RUN } })
   ])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(CAPS),
     () => Promise.resolve()
@@ -140,7 +140,7 @@ void test("given_a_status_outcome_when_status_is_called_then_should_use_the_stat
   const transport = fakeTransport([
     replyFrame({ kind: "ok", outcome: { kind: "status", run: RUN } })
   ])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(CAPS),
     () => Promise.resolve()
@@ -154,7 +154,7 @@ void test("given_a_list_outcome_when_list_is_fetched_with_filters_then_should_re
   const transport = fakeTransport([
     replyFrame({ kind: "ok", outcome: { kind: "list", page: { runs: [RUN] } } })
   ])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(CAPS),
     () => Promise.resolve()
@@ -166,7 +166,7 @@ void test("given_a_list_outcome_when_list_is_fetched_with_filters_then_should_re
 
 void test("given_a_stream_and_topic_when_register_and_remove_source_are_called_then_should_publish_the_right_commands", async () => {
   const control = fakePublishControl()
-  const runs = new Runs(
+  const runs = Runs.create(
     { sendManaged: () => Promise.reject(new Error("unused")) },
     () => Promise.resolve(CAPS),
     control.publish
@@ -181,7 +181,7 @@ void test("given_a_stream_and_topic_when_register_and_remove_source_are_called_t
 
 void test("given_open_capabilities_when_submit_is_called_then_should_reject_before_the_transport", async () => {
   const transport = fakeTransport([])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(OPEN_CAPABILITIES),
     () => Promise.resolve()
@@ -194,7 +194,7 @@ void test("given_an_err_reply_when_cancel_fails_then_should_wrap_it_as_an_agent_
   const transport = fakeTransport([
     replyFrame({ kind: "err", error: { kind: "notFound", message: "no such run" } })
   ])
-  const runs = new Runs(
+  const runs = Runs.create(
     transport,
     () => Promise.resolve(CAPS),
     () => Promise.resolve()

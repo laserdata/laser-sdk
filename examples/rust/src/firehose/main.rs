@@ -1,5 +1,5 @@
 use laser_examples::{
-    env_bool, env_u64, env_usize, fresh_run, init_tracing, laser, phase, stream_for,
+    env_bool, env_u64, env_usize, fresh_run, index_for, init_tracing, laser, phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::{Projection, ProjectionBinding};
@@ -34,7 +34,8 @@ use tracing::{info, warn};
 // still runs at full speed (it exercises the log, not the read model) and the
 // trailing analytics are skipped.
 
-// One index per org, named `org_00`, `org_01`, and so on. This is the
+// One topic per org, named `org_00`, `org_01`, and so on, each feeding an
+// index of the same name plus the run token. This is the
 // realistic multi-org shape: each org gets its own materialized index, so
 // a modest org count already exercises LaserData Cloud maintaining many indexes
 // at once. Query index names accept `[A-Za-z0-9_]` only (each name is used
@@ -182,6 +183,9 @@ async fn main() -> Result<(), LaserError> {
         let topics: Vec<String> = (0..config.orgs)
             .map(|org| format!("{TOPIC_PREFIX}{org:02}"))
             .collect();
+        // Index names carry this run's token, so another run or another
+        // language's firehose never shares an index (or its rows) with this one.
+        let indexes: Vec<String> = topics.iter().map(|topic| index_for(topic)).collect();
 
         // Create every topic. LaserData Cloud runs the optional projection and
         // query phases, while the raw streaming load works against Apache Iggy.
@@ -190,8 +194,8 @@ async fn main() -> Result<(), LaserError> {
             laser.topic(topic).ensure(config.partitions).await?;
         }
         if config.register && query_available {
-            for topic in &topics {
-                register_index(&laser, &stream_name, topic).await?;
+            for (topic, index) in topics.iter().zip(&indexes) {
+                register_index(&laser, &stream_name, topic, index).await?;
             }
             info!(
                 "registered {} projections, waiting for LaserData Cloud to create indexes",
@@ -199,7 +203,7 @@ async fn main() -> Result<(), LaserError> {
             );
             // Best effort. Give LaserData Cloud a moment to create the first index. With no
             // LaserData Cloud attached this short wait simply elapses and we publish anyway.
-            wait_for_index(&laser, &topics[0], Duration::from_secs(15)).await;
+            wait_for_index(&laser, &indexes[0], Duration::from_secs(15)).await;
         } else if !config.register {
             info!("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)");
         } else {
@@ -268,7 +272,7 @@ async fn main() -> Result<(), LaserError> {
         // Analytics, best effort.
         if config.query && query_available {
             phase("sample analytics over the firehose");
-            run_sample_queries(&laser, &topics).await;
+            run_sample_queries(&laser, &indexes).await;
         } else if config.query {
             info!(
                 "sample analytics needs Laser Stack or LaserData Cloud, streaming run completed without it"
@@ -314,10 +318,15 @@ impl Config {
 // the same name with our indexed columns. This mirrors the shared cloud
 // projector path, inlined so we can register many indexes with a rich field set
 // directly.
-async fn register_index(laser: &Laser, stream_name: &str, topic: &str) -> Result<(), LaserError> {
-    let projection_id = format!("{topic}.v1");
+async fn register_index(
+    laser: &Laser,
+    stream_name: &str,
+    topic: &str,
+    index: &str,
+) -> Result<(), LaserError> {
+    let projection_id = format!("{index}.v1");
     let mut projection = Projection::builder(projection_id.clone())
-        .name(topic)
+        .name(index)
         .version(1)
         .content_type(ContentType::Any)
         .index_only();
@@ -330,24 +339,24 @@ async fn register_index(laser: &Laser, stream_name: &str, topic: &str) -> Result
         .source(stream_name, topic)
         .allow(projection_id.clone())
         .default_projection(projection_id)
-        .index(topic)
+        .index(index)
         .build();
     laser.bindings().apply(binding).await?;
     Ok(())
 }
 
-// Poll until `topic`'s index exists (the query stops erroring), or the deadline
+// Poll until `index` exists (the query stops erroring), or the deadline
 // elapses. Used as a short, non fatal nudge after registration.
-async fn wait_for_index(laser: &Laser, topic: &str, timeout: Duration) {
+async fn wait_for_index(laser: &Laser, index: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if laser.query(topic).fetch().await.is_ok() {
-            info!("index `{topic}` is live");
+        if laser.query(index).fetch().await.is_ok() {
+            info!("index `{index}` is live");
             return;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    info!("index `{topic}` is not live yet (no managed backend attached?), publishing anyway");
+    info!("index `{index}` is not live yet (no managed backend attached?), publishing anyway");
 }
 
 // A small xorshift64* pseudo random generator, one per producer task, seeded by
@@ -502,12 +511,12 @@ fn build_filler(length: usize, rng: &mut Rng) -> String {
 
 // A few representative analytics the firehose makes possible. Best effort: if no
 // LaserData Cloud materialized the indexes the queries error and we simply note it.
-async fn run_sample_queries(laser: &Laser, topics: &[String]) {
-    let topic = &topics[0];
+async fn run_sample_queries(laser: &Laser, indexes: &[String]) {
+    let index = &indexes[0];
 
-    match laser.query(topic).with_total().fetch().await {
+    match laser.query(index).with_total().fetch().await {
         Ok(result) => info!(
-            "index `{topic}` holds {} rows",
+            "index `{index}` holds {} rows",
             result.page.total.unwrap_or(0)
         ),
         Err(error) => {
@@ -519,13 +528,13 @@ async fn run_sample_queries(laser: &Laser, topics: &[String]) {
     }
 
     if let Ok(by_severity) = laser
-        .query(topic)
+        .query(index)
         .count()
         .group_by(["severity"])
         .fetch()
         .await
     {
-        info!("`{topic}` events by severity:");
+        info!("`{index}` events by severity:");
         for row in &by_severity.rows {
             let severity = by_severity
                 .value_text(row, "severity")
@@ -538,13 +547,13 @@ async fn run_sample_queries(laser: &Laser, topics: &[String]) {
     }
 
     if let Ok(slowest) = laser
-        .query(topic)
+        .query(index)
         .order_desc("latency_ms")
         .limit(5)
         .fetch()
         .await
     {
-        info!("`{topic}` slowest 5 requests:");
+        info!("`{index}` slowest 5 requests:");
         for row in &slowest.rows {
             let route = slowest
                 .value_text(row, "route")
@@ -558,13 +567,13 @@ async fn run_sample_queries(laser: &Laser, topics: &[String]) {
 
     // A cheap fan out. Total rows across every index, the headline scale number.
     let mut grand_total = 0u64;
-    for index_topic in topics {
-        if let Ok(result) = laser.query(index_topic).with_total().fetch().await {
+    for index in indexes {
+        if let Ok(result) = laser.query(index).with_total().fetch().await {
             grand_total += result.page.total.unwrap_or(0);
         }
     }
     info!(
         "grand total across {} indexes: {grand_total} rows",
-        topics.len()
+        indexes.len()
     );
 }

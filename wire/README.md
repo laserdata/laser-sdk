@@ -44,7 +44,7 @@ Modules group related types and operations. Features select optional dependencie
 | `browse` | registry browse requests + `BrowseReply`, including `DecodeRecord` |
 | `control` | `Projection` (including `ProjectionKind::Graph` + the `EntitySchema` node/edge extraction plan), `ProjectionBinding`, `SchemaDef`, `ControlEnvelope` |
 | `kv` | the key-value requests (including `KvCas`/`CasExpect` and the single-transaction `KvCopy`/`KvMove`), `KvReply` (including `Committed`), `KvError` (including `VersionConflict`), the entry `version` token, and an optional `conversation` on `KvScan`/`KvDeleteMany` that narrows a memory-view scan to one conversation (additive, omitted on the wire when unset) |
-| `fork` | the Iggy server requests, `ForkReply`, `ForkError`, and `validate_fork_id` (the shared id charset safelist) |
+| `fork` | the fork requests, `ForkReply`, `ForkError`, and `validate_fork_id` (the shared id charset safelist) |
 | `graph` | the knowledge-graph ops (`GraphQuery`/`GraphNeighbors`/`GraphUpsert`), `GraphResult`, `GraphError`, `NodeId`/`EdgeId`, and the content-addressed constructors `NodeId::content`/`EdgeId::content` + `GraphNode::entity`/`GraphEdge::relate`. A node and an edge carry an optional `source` (`SourceRef`: a message position, key-value entry, or memory id) so a graph element links back to its origin, skip-none and excluded from the content-addressed id (`GraphEdge::with_source`). `SourceRef::Message` carries an optional `conversation`, and `GraphQuery`/`GraphNeighbors` an optional `conversation`, so a read narrows a traversal to one conversation (additive, omitted on the wire when unset) |
 | `hashing` | the one canonical `content_id` (a dependency-free FNV over byte segments) every content-addressed id shares, pinned by a golden vector |
 | `agent` | the Agent Data Exchange Protocol: `AgentEnvelope`, ids, dictionaries, `validate`, `BodyRef`, the pinned operation/metadata vocabularies |
@@ -77,12 +77,16 @@ Byte fields use the shared `encoding::bin_bytes` and `opt_bin_bytes` helpers. Th
 
 Reference files define the expected encoded bytes. If a wire change is intentional, regenerate them with `AGDX_WIRE_FIXTURES_REGEN=1`. The decode tests in `wire/tests/robustness.rs` reject malformed input without a panic. The `cargo-fuzz` project under `fuzz/` also tests malformed input.
 
+## Consumer-group reads
+
+Consumer-group reads use `FilterRef::Group`. A bound group runs its saved revision, while an explicitly unbound group returns original records without evaluating payloads. Pages, continuations and acknowledgments carry execution mode, policy generation and source identity. `count` limits delivered records and `max_examined` independently limits source records scanned. `CatalogPosition` carries an optional `operation_id` as durable proof of configuration across control-log recreation. JSON encodes this 128-bit ID as decimal text, while CBOR retains the integer. `GROUP_POLICIES_PATH` and `group_policy_path` address the confirmed HTTP group-policy endpoint.
+
+## Changes in 0.6.0
+
+The 0.6.0 release regenerated the reference files with neutral payload vocabulary and left every operation version at 1. The encoding did not change. Client lifecycle and upgrade steps are in [client behavior](../docs/client-behavior.md).
+
 ## License
 
 Apache-2.0. Copyright LaserData, Inc.
 
 Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of these marks does not imply endorsement by the Apache Software Foundation.
-
-Consumer-group reads use `FilterRef::Group`. A bound group runs its saved revision, while an explicitly unbound group returns original records without evaluating payloads. Pages, continuations and acknowledgments carry execution mode, policy generation and source identity. `count` limits delivered records and `max_examined` independently limits source records scanned. `CatalogPosition` carries an optional `operation_id` as durable proof of configuration across control-log recreation. JSON encodes this 128-bit ID as decimal text, while CBOR retains the integer. `GROUP_POLICIES_PATH` and `group_policy_path` address the confirmed HTTP group-policy endpoint.
-
-SDK 0.5.4 keeps operation versions at 1. The three clients use the same corpus. Lifecycle and migration behavior is documented in [client behavior](../docs/client-behavior.md).

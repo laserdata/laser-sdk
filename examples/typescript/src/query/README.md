@@ -4,7 +4,7 @@ A projector turns topic records into a queryable view. This example waits for pr
 
 ## What it shows
 
-- Declares this run's `readings_v1_<token>` view over the `readings` topic (`ensureView` with `indexFor`), so repeat and concurrent runs never count each other's rows, bound to an embedded managed table. Naming the index apart from its source topic is what lets a view be versioned without renaming the topic.
+- Declares this run's `readings_v1_<token>` view over the `readings` topic (`ensureView` with `indexFor`), so repeat and concurrent runs never count each other's rows. Naming the index apart from its source topic is what lets a view be versioned without renaming the topic.
 - Publishes three host readings with a `status` field and waits for the projector to materialize them.
 - Queries the maintained view with `laser.query(INDEX).whereEq("status", "degraded").limit(10).fetch()` and reads the matching rows. `whereEq` matches an indexed key, the cheap path a projection's key columns answer directly, and `filterEq` and its siblings cover the rest.
 

@@ -6,7 +6,7 @@ import pytest
 
 
 async def test_given_a_handled_message_when_remembered_then_should_retain_its_scope():
-    memory = ls.Memory.vector(lambda _: [1.0])
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
     conversation = ls.new_conversation_id()
     message = ls.agent_message(
         b"auth restarted", ls.Provenance(conversation_id=conversation, agent="planner")
@@ -20,12 +20,12 @@ async def test_given_a_handled_message_when_remembered_then_should_retain_its_sc
     await wrapped(None, message)
     assert handled == [b"auth restarted"]
     items = await memory.recall(conversation=conversation, agent="planner")
-    assert [item.text for item in items] == ["auth restarted"]
+    assert [item.text() for item in items] == ["auth restarted"]
     assert items[0].kind == "message"
 
 
 async def test_given_a_handler_failure_when_remembering_then_should_skip_memory():
-    memory = ls.Memory.vector(lambda _: [1.0])
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
     conversation = ls.new_conversation_id()
     message = ls.agent_message(b"auth restarted", ls.Provenance(conversation_id=conversation))
 
@@ -42,7 +42,7 @@ async def test_given_failed_memory_when_the_handler_succeeds_then_should_not_ret
     def fail_embed(_):
         raise ValueError("embedding failed")
 
-    memory = ls.Memory.vector(fail_embed)
+    memory = ls.MemoryHandle.vector(fail_embed)
     message = ls.agent_message(b"auth restarted", ls.Provenance())
     handled = []
 
@@ -54,10 +54,17 @@ async def test_given_failed_memory_when_the_handler_succeeds_then_should_not_ret
 
 
 def test_given_content_and_kind_when_reading_memory_helpers_then_should_match_the_reference():
-    assert ls.Memory.content_id(
+    assert ls.memory_id_content(
         "fact", b"auth", stream="fleet", agent="planner"
-    ) == ls.Memory.content_id("fact", b"auth", stream="fleet", agent="planner")
-    assert ls.Memory.kind_class("fact") == "semantic"
+    ) == ls.memory_id_content("fact", b"auth", stream="fleet", agent="planner")
+    assert (
+        ls.memory_id_content(
+            "fact", b"x", stream="laser", agent="agent", user="alice", application="console"
+        )
+        == "28429K3B8MPSM8WHDQR474827P"
+    )
+    assert ls.memory_id_content("procedure", b"x", user="alice") == "3E6HJGHKFDBMQ91TCJEHV28X40"
+    assert ls.memory_kind_class("fact") == "semantic"
     assert ls.Sessions.turn_kind(ls.Sessions.turn_topic("instruction")) == "instruction"
 
 
@@ -75,23 +82,23 @@ async def test_given_a_schema_handle_when_publishing_then_should_share_its_cache
             }
         ),
     }
-    schema_id = await laser.register_schema(source, name=f"python-{laser.default_stream}")
+    schema_id = await laser.schemas().register(source, name=f"python-{laser.default_stream}")
     try:
         deadline = asyncio.get_running_loop().time() + 5
-        while await laser.get_schema(schema_id) is None:
+        while await laser.schemas().get(schema_id) is None:
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.05)
         topic = await laser.topic("schema-readings").schema(schema_id)
-        with pytest.raises(ls.InvalidError, match="requires a body"):
+        with pytest.raises(TypeError):
             topic.publish()
         with pytest.raises(ls.CodecError):
             topic.publish({"host": "node-7", "cpu": "bad"})
-        await laser.drop_schema(schema_id)
+        await laser.schemas().drop(schema_id)
         await topic.publish({"host": "node-7", "cpu": 82}).send()
         record = await topic.records("schema-reader").next()
         assert record.value == {"host": "node-7", "cpu": 82}
     finally:
-        await laser.drop_schema(schema_id)
+        await laser.schemas().drop(schema_id)
 
 
 def test_given_provenance_when_a_fence_is_set_then_should_expose_the_token():
@@ -276,16 +283,16 @@ async def test_given_an_unscoped_consumer_when_records_arrive_then_should_handle
 
 
 async def test_given_recalled_items_when_rendered_then_should_preserve_order_and_omissions():
-    memory = ls.Memory.vector(lambda _: [1.0])
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
     for body in ("alpha", "beta", "gamma"):
         await memory.remember(body)
     items = await memory.recall()
-    assert ls.Memory.to_context_block(items) == "\n\n".join(item.text for item in items)
+    assert ls.to_context_block(items) == "\n\n".join(item.text() for item in items)
     assert (
-        ls.Memory.to_context_block(items, token_budget=0)
-        == items[0].text + "\n\n[... 2 more recalled item(s) omitted ...]"
+        ls.to_context_block(items, token_budget=0)
+        == items[0].text() + "\n\n[... 2 more recalled item(s) omitted ...]"
     )
-    assert ls.Memory.to_context_block([], token_budget=0) == ""
+    assert ls.to_context_block([], token_budget=0) == ""
 
 
 @pytest.mark.integration
@@ -336,7 +343,7 @@ async def test_given_an_active_embedder_when_the_call_is_cancelled_then_should_s
         finally:
             stopped.set()
 
-    memory = ls.Memory.vector(embed)
+    memory = ls.MemoryHandle.vector(embed)
     pending = asyncio.ensure_future(memory.remember("record"))
     await asyncio.wait_for(active.wait(), 2)
     pending.cancel()
@@ -408,7 +415,7 @@ async def test_given_a_typed_custom_backend_when_remembered_then_should_keep_kin
     options = {"kind": "message", "stream": "fleet", "agent": "planner", "dedup": True}
     first = await memory.remember(b"source", **options)
     second = await memory.remember(b"source", **options)
-    expected = ls.Memory.content_id("message", b"source", stream="fleet", agent="planner")
+    expected = ls.memory_id_content("message", b"source", stream="fleet", agent="planner")
     assert first == second == expected
     assert len(entries) == 1
     assert [call[2] for call in calls] == ["message", "message"]
@@ -423,7 +430,7 @@ async def test_given_a_typed_custom_backend_when_remembered_then_should_keep_kin
 
 
 async def test_given_an_explicit_memory_id_when_appended_then_should_keep_the_id_kind_and_scope():
-    memory = ls.Memory.vector(lambda _: [1.0])
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
     memory_id = ls.new_conversation_id()
     scope = {
         "conversation": ls.new_conversation_id(),
@@ -438,5 +445,5 @@ async def test_given_an_explicit_memory_id_when_appended_then_should_keep_the_id
     assert len(items) == 1
     assert items[0].id == memory_id
     assert items[0].kind == "entity"
-    assert items[0].text == "typed"
+    assert items[0].text() == "typed"
     assert await memory.recall(strategy="recent", **{**scope, "stream": "another-fleet"}) == []

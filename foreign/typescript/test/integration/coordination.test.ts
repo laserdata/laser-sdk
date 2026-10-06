@@ -24,8 +24,8 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
     assert.ok(published !== undefined)
     const groupName = `probe-${randomUUID()}`
     const consumer = await topic.consumerGroup(groupName).consumer({
-      autoCommit: false,
-      startFrom: { kind: "first" }
+      commitPolicy: { kind: "disabled" },
+      startAt: { kind: "first" }
     })
     try {
       const received = await consumer.nextWithin(2_000)
@@ -40,13 +40,13 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
         {
           streamId: ids.streamId,
           topicId: ids.topicId,
-          partitionId: published.partitionId,
-          offset: published.offset
+          partitionId: published.id.partitionId,
+          offset: published.id.offset
         }
       )
       assert.equal(status.kind, "consumed")
-      assert.ok(status.committed >= published.offset)
-      assert.ok(status.head >= published.offset)
+      assert.ok(status.committed >= published.id.offset)
+      assert.ok(status.head >= published.id.offset)
     } finally {
       await consumer.shutdown()
     }
@@ -78,8 +78,8 @@ void test("given_a_dead_letter_source_when_redriven_then_should_preserve_the_rec
       source: {
         streamId: ids.streamId,
         topicId: ids.topicId,
-        partitionId: original.partitionId,
-        offset: original.offset
+        partitionId: original.id.partitionId,
+        offset: original.id.offset
       },
       reason: { kind: "known", name: "Rejected" },
       attempts: 1,
@@ -94,7 +94,7 @@ void test("given_a_dead_letter_source_when_redriven_then_should_preserve_the_rec
     assert.equal(provenance.conversationId.toString(), conversationId.toString())
     assert.deepEqual(redriven.headers.get(IDEMPOTENCY_KEY), {
       kind: "string",
-      value: `original-key/redrive/${String(original.partitionId)}-${original.offset.toString()}`
+      value: `original-key/redrive/${String(original.id.partitionId)}-${original.id.offset.toString()}`
     })
   } finally {
     await laser.close()

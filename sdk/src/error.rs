@@ -166,12 +166,12 @@ pub enum LaserError {
     /// transport, said no.
     #[error("policy blocked: {0}")]
     PolicyBlocked(String),
-    /// The enrolled governor paused the action on a stronger approval. The
-    /// message names the scope the approval must grant, so a handler can run an
+    /// The enrolled governor paused the action on a stronger approval.
+    /// `scope` names the scope the approval must grant, so a handler can run an
     /// [`approval_gate`](crate::agent::AgentCtx::approval_gate) and re-send.
     /// Never retryable as-is.
-    #[error("step-up required: {0}")]
-    StepUpRequired(String),
+    #[error("step-up required: {scope}")]
+    StepUpRequired { scope: String },
     /// The enrolled governor held the action for later execution. Retryable by
     /// definition: later is the point.
     #[error("policy deferred: {0}")]
@@ -404,7 +404,7 @@ impl LaserError {
             | Self::Integrity { .. }
             | Self::NoStream
             | Self::PolicyBlocked(_)
-            | Self::StepUpRequired(_)
+            | Self::StepUpRequired { .. }
             | Self::NoRespondTopic
             | Self::PresenceConflict { .. }
             | Self::RoutePrincipalMismatch { .. }
@@ -615,6 +615,13 @@ impl LaserError {
         matches!(self.publish_cause(), Self::Quarantined { .. })
     }
 
+    /// The Apache Iggy error code of the failure, when an Iggy error caused it.
+    /// Reads through publish wrapping and a failed producer send, like the
+    /// classifiers. Another SDK variant keeps its own classification.
+    pub fn iggy_error_code(&self) -> Option<u32> {
+        self.iggy_cause().map(IggyError::as_code)
+    }
+
     /// The typed consumer-filter cause, when the failure is one.
     pub fn filter_reason(&self) -> Option<FilterErrorReason> {
         match self.publish_cause() {
@@ -668,7 +675,7 @@ impl LaserError {
             Self::Quarantined { .. }
             | Self::PolicyBlocked(_)
             | Self::RoutePrincipalMismatch { .. } => ResultCode::Forbidden,
-            Self::StepUpRequired(_) => ResultCode::StepUpRequired,
+            Self::StepUpRequired { .. } => ResultCode::StepUpRequired,
             // A digest mismatch is served-data corruption, a backend fault.
             Self::Integrity { .. } => ResultCode::Backend,
             Self::NoCapableAgent { .. } | Self::NoInbox { .. } => ResultCode::NotFound,
@@ -684,7 +691,7 @@ impl LaserError {
 // `Display` text names streams, topics, hosts, and transport detail, which an
 // unauthenticated JSON-RPC caller has no business seeing, so the wire carries
 // only the classification and the detail stays in the local log.
-#[cfg(any(feature = "a2a-http", feature = "mcp-http"))]
+#[cfg(any(feature = "a2a-bridge", feature = "mcp-bridge"))]
 pub(crate) fn public_error_message(error: &LaserError) -> &'static str {
     match error.code() {
         ResultCode::InvalidArgument => "invalid request",
@@ -772,6 +779,29 @@ mod tests {
             assert_eq!(error.is_not_found(), missing);
             assert_eq!(error.is_stream_or_topic_not_found(), missing);
         }
+    }
+
+    #[test]
+    fn given_an_iggy_failure_when_reading_its_code_then_should_unwrap_the_send_cause() {
+        let send = LaserError::Iggy(IggyError::ProducerSendFailed {
+            cause: Box::new(IggyError::Unauthorized),
+            failed: std::sync::Arc::new(Vec::new()),
+            committed: std::sync::Arc::new(Vec::new()),
+            stream_name: "s".into(),
+            topic_name: "t".into(),
+        });
+        assert_eq!(
+            send.iggy_error_code(),
+            Some(IggyError::Unauthorized.as_code())
+        );
+        assert_eq!(
+            LaserError::Iggy(IggyError::Disconnected).iggy_error_code(),
+            Some(IggyError::Disconnected.as_code())
+        );
+        assert_eq!(
+            LaserError::Handler("not an Iggy failure".to_owned()).iggy_error_code(),
+            None
+        );
     }
 
     #[test]

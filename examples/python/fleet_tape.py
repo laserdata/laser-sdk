@@ -27,7 +27,11 @@ EXAMPLE = "fleet-tape"
 FEED_TOPIC = "metrics_feed"  # raw hot path
 TAPE_TOPIC = "readings"  # queryable analytics tape
 AVRO_TAPE_TOPIC = "readings_avro"  # schema-first tape (managed deployment)
-AVRO_PROJECTION = f"{AVRO_TAPE_TOPIC}.v1"
+# Index names carry this run's token, so a rerun or another language's example on
+# the same deployment never shares their rows.
+TAPE_INDEX = _common.index_for(TAPE_TOPIC)
+AVRO_TAPE_INDEX = _common.index_for(AVRO_TAPE_TOPIC)
+AVRO_PROJECTION = f"{AVRO_TAPE_INDEX}.v1"
 
 # The schema-first tape replays the identical readings as raw Avro datums,
 # decoded by a writer schema the managed plane allocated an id for.
@@ -208,8 +212,7 @@ async def audit_tape(laser: ls.Laser, readings: list[dict]) -> None:
     drain, a record that stopped decoding would raise with its exact log
     position) and the weighted CPU totals recomputed off the log must equal the
     session's own."""
-    tape = laser.topic(TAPE_TOPIC, cls=Reading)
-    records = tape.records("fleet-tape-audit-py")
+    records = laser.topic(TAPE_TOPIC).json(Reading).records("fleet-tape-audit-py")
     cpu_total_by_host: dict[str, int] = {}
     audited = 0
     while (record := await records.next()) is not None:
@@ -239,8 +242,8 @@ def group_totals(result: ls.QueryResult) -> dict[str, int]:
 async def report_samples_and_mean(laser: ls.Laser) -> None:
     """Query the materialized tape: per-host samples, and the sample-weighted mean
     CPU derived from two grouped sums (mean = cpu_total / samples)."""
-    samples = await laser.query(TAPE_TOPIC).sum(SAMPLES).group_by([HOST]).fetch()
-    cpu_total = await laser.query(TAPE_TOPIC).sum(CPU_TOTAL).group_by([HOST]).fetch()
+    samples = await laser.query(TAPE_INDEX).sum(SAMPLES).group_by([HOST]).fetch()
+    cpu_total = await laser.query(TAPE_INDEX).sum(CPU_TOTAL).group_by([HOST]).fetch()
     samples_by_host = group_totals(samples)
     cpu_total_by_host = group_totals(cpu_total)
     print(f"tape analytics over {sum(samples_by_host.values())} samples (Laser query layer):")
@@ -259,11 +262,13 @@ async def avro_tape(laser: ls.Laser, readings: list[dict]) -> None:
     matching fails before publishing, not as a managed-side warning the producer
     cannot see."""
     schema_source = {"kind": "avro", "schema": READING_AVRO_SCHEMA}
-    schema_id = await laser.register_schema(schema_source, name="fleet_reading")
+    schema_id = await laser.schemas().register(schema_source, name="fleet_reading")
     print(f"the managed plane allocated writer-schema id {schema_id} for the HostReading schema")
 
     await laser.topic(AVRO_TAPE_TOPIC).ensure(partitions=_common.PARTITIONS)
-    await _common.start_projector(laser, AVRO_TAPE_TOPIC, COLUMNS, content_type="avro")
+    await _common.start_projector(
+        laser, AVRO_TAPE_TOPIC, COLUMNS, index=AVRO_TAPE_INDEX, content_type="avro"
+    )
 
     compiled = ls.CompiledSchema.compile(schema_source, id=schema_id)
     subset = readings[:AVRO_READINGS_CAP]
@@ -273,8 +278,8 @@ async def avro_tape(laser: ls.Laser, readings: list[dict]) -> None:
     await batch.send()
     print(f"published {len(subset)} readings as raw Avro datums")
 
-    await _common.wait_for_projection(laser, AVRO_TAPE_TOPIC, len(subset))
-    per_host = await laser.query(AVRO_TAPE_TOPIC).sum(CPU_TOTAL).group_by([HOST]).fetch()
+    await _common.wait_for_projection(laser, AVRO_TAPE_INDEX, len(subset))
+    per_host = await laser.query(AVRO_TAPE_INDEX).sum(CPU_TOTAL).group_by([HOST]).fetch()
     print("weighted CPU total per host, aggregated over columns decoded out of Avro bodies:")
     for host, total in sorted(group_totals(per_host).items()):
         print(f"  {host:<7} {total:>14}")
@@ -294,8 +299,8 @@ async def main() -> None:
 
         # Register the analytics projector before the tape is written so no reading
         # is missed by a projector that starts afterwards (managed-only).
-        if caps.query:
-            await _common.start_projector(laser, TAPE_TOPIC, COLUMNS)
+        if caps.query.available:
+            await _common.start_projector(laser, TAPE_TOPIC, COLUMNS, index=TAPE_INDEX)
 
         _common.phase("warming up")
         print(f"{count} readings across {len(OPENING)} hosts")
@@ -306,8 +311,8 @@ async def main() -> None:
         _common.phase("publishing the readings to the durable reading tape")
         await index_tape(laser, readings)
 
-        if _common.managed_gate(caps.query, "query", EXAMPLE):
-            await _common.wait_for_projection(laser, TAPE_TOPIC, count)
+        if _common.managed_gate(caps.query.available, "query", EXAMPLE):
+            await _common.wait_for_projection(laser, TAPE_INDEX, count)
             _common.phase("reading-tape analytics")
             await report_samples_and_mean(laser)
 
@@ -318,7 +323,7 @@ async def main() -> None:
         if caps.managed:
             _common.phase("schema-first tape: Avro readings decoded by a registered writer schema")
             await avro_tape(laser, readings)
-        elif caps.query:
+        elif caps.query.available:
             print("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape")
     finally:
         await laser.close()

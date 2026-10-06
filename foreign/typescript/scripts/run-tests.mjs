@@ -50,7 +50,10 @@ for (const suite of requestedSuites) {
   files.push(...suiteFiles)
 }
 
-const child = spawn(process.execPath, ["--test", ...files], {
+const concurrency = requestedSuites.some((suite) => suite === "integration" || suite === "e2e")
+  ? ["--test-concurrency=1"]
+  : []
+const child = spawn(process.execPath, ["--test", ...concurrency, ...files], {
   stdio: "inherit",
   shell: false
 })

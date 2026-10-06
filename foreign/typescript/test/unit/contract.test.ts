@@ -7,7 +7,7 @@ import type { Laser } from "../../src/client/laser.js"
 import { AgentId } from "../../src/types/ids.js"
 
 function builder(): ContractBuilder {
-  return new ContractBuilder({} as Laser, routeTo(AgentId.new("worker")))
+  return ContractBuilder.create({} as Laser, routeTo(AgentId.new("worker")))
 }
 
 void test("given_fractional_expiry_when_configured_then_should_preserve_microseconds", () => {

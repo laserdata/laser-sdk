@@ -14,6 +14,7 @@ import {
 } from "@laserdata/laser-sdk"
 import {
   batchSize,
+  indexFor,
   managedGate,
   messages,
   PARTITIONS,
@@ -29,6 +30,10 @@ export const EXAMPLE = "event-analytics"
 export const TOPIC = "clickstream"
 const CHECKPOINT = "clickstream-export-cursor"
 const GUARDED_TOPIC = "clickstream_guarded"
+// Index names carry this run's token, so a rerun or another language's example on
+// the same deployment never shares their rows.
+const INDEX = indexFor(TOPIC)
+const GUARDED_INDEX = indexFor(GUARDED_TOPIC)
 const USER_ID = "user_id"
 const MESSAGE_TYPE = "message_type"
 const ROUTE = "route"
@@ -109,6 +114,7 @@ const CLICK_EVENT_SCHEMA = JSON.stringify({
 })
 
 export const CLICK_EVENT_CODEC: Codec<ClickEvent> = {
+  contentType: ContentType.Json,
   encode: (event) => new TextEncoder().encode(JSON.stringify(event)),
   decode: decodeEvent
 }
@@ -134,12 +140,13 @@ export function clickstream(count: number): readonly ClickEvent[] {
 async function registerProjection(
   laser: Laser,
   topic: string,
+  index: string,
   inlinePayloadDefault = false
 ): Promise<void> {
-  const id = parseProjectionId(`${topic}.v1`)
+  const id = parseProjectionId(`${index}.v1`)
   const projection: Projection = {
     id,
-    name: topic,
+    name: index,
     version: 1,
     kind: { kind: "row" },
     contentType: ContentType.Json,
@@ -156,7 +163,7 @@ async function registerProjection(
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    index: topic,
+    index,
     notify: true
   }
   await laser.projections().register(projection)
@@ -188,7 +195,7 @@ async function guardedIngest(laser: Laser, sample: ClickEvent): Promise<void> {
     .send()
   console.log(`allocated writer-schema id ${String(schemaId)} for the ClickEvent guard`)
   await laser.topic(GUARDED_TOPIC).ensure(PARTITIONS)
-  await registerProjection(laser, GUARDED_TOPIC, true)
+  await registerProjection(laser, GUARDED_TOPIC, GUARDED_INDEX, true)
   await waitForSchema(laser, schemaId)
   const guarded = await laser.topic(GUARDED_TOPIC).schema(schemaId, decodeEventValue)
   await guarded.publish(sample)
@@ -213,9 +220,9 @@ async function guardedIngest(laser: Laser, sample: ClickEvent): Promise<void> {
     )
     .schemaId(schemaId)
     .send()
-  await waitForProjection(laser, GUARDED_TOPIC, 1)
+  await waitForProjection(laser, GUARDED_INDEX, 1)
   await new Promise((resolve) => setTimeout(resolve, 1_000))
-  const result = await laser.query(GUARDED_TOPIC).withTotal().fetch()
+  const result = await laser.query(GUARDED_INDEX).withTotal().fetch()
   if (result.page.total !== 1n) throw new Error("the malformed event must not materialize")
   console.log(`guarded JSON rows: ${result.page.total.toString()}`)
 }
@@ -231,7 +238,7 @@ function valueText(result: QueryResult, row: Row, field: string): string | undef
 }
 
 async function runAnalytics(laser: Laser): Promise<void> {
-  const byKind = await laser.query(TOPIC).count().groupBy([MESSAGE_TYPE]).fetch()
+  const byKind = await laser.query(INDEX).count().groupBy([MESSAGE_TYPE]).fetch()
   printTable([
     ["event", "count"],
     ...byKind.rows.map((row) => [
@@ -240,7 +247,7 @@ async function runAnalytics(laser: Laser): Promise<void> {
     ])
   ])
 
-  const slowest = await laser.query(TOPIC).orderDesc(LATENCY_MS).limit(3).fetch()
+  const slowest = await laser.query(INDEX).orderDesc(LATENCY_MS).limit(3).fetch()
   console.log("slowest 3 routes")
   printTable([
     ["route", "latency"],
@@ -250,18 +257,18 @@ async function runAnalytics(laser: Laser): Promise<void> {
     ])
   ])
 
-  const errors = await laser.query(TOPIC).messageType("error").count().fetch()
+  const errors = await laser.query(INDEX).messageType("error").count().fetch()
   console.log(`errors: ${scalar(errors)}`)
 
   const start = BigInt(BASE_MICROS)
   const firstWindow = await laser
-    .query(TOPIC)
+    .query(INDEX)
     .timeRange(start, start + 5n * ONE_MINUTE_MICROS)
     .count()
     .fetch()
   console.log(`events in the first 5 minutes: ${scalar(firstWindow)}`)
 
-  const perMinute = await laser.query(TOPIC).count().window(TS, ONE_MINUTE_MICROS).fetch()
+  const perMinute = await laser.query(INDEX).count().window(TS, ONE_MINUTE_MICROS).fetch()
   console.log("events per minute")
   printTable([
     ["window start", "count"],
@@ -272,7 +279,7 @@ async function runAnalytics(laser: Laser): Promise<void> {
   ])
 
   const metrics = await laser
-    .query(TOPIC)
+    .query(INDEX)
     .avg(LATENCY_MS)
     .countDistinct(ROUTE)
     .groupBy([MESSAGE_TYPE])
@@ -287,7 +294,7 @@ async function runAnalytics(laser: Laser): Promise<void> {
     ])
   ])
 
-  const payload = await laser.query(TOPIC).fetchOne(CLICK_EVENT_CODEC)
+  const payload = await laser.query(INDEX).fetchOne(CLICK_EVENT_CODEC)
   if (payload === undefined) throw new Error("materialized clickstream returned no payload")
   console.log(`payload round trip: ${payload.message_type} on ${payload.route}`)
 }
@@ -308,10 +315,9 @@ async function checkpointedExport(laser: Laser): Promise<void> {
     await laser.topic(TOPIC).json(CLICK_EVENT_CODEC).records("event-analytics-count")
   )
   const state = new InMemoryStore()
-  const records = await laser
-    .topic(TOPIC)
-    .json(CLICK_EVENT_CODEC)
-    .records("event-analytics-export", { batchSize: 1 })
+  const records = (
+    await laser.topic(TOPIC).json(CLICK_EVENT_CODEC).records("event-analytics-export")
+  ).batch(1)
   const first = await drain(records, 1)
   const offsets = [...records.offsets].map(([partition, offset]) => [partition, offset.toString()])
   await state.set(CHECKPOINT, new TextEncoder().encode(JSON.stringify(offsets)))
@@ -337,7 +343,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const capabilities = await laser.capabilities()
   phase("warming up")
   await laser.topic(TOPIC).ensure(PARTITIONS)
-  if (capabilities.query.available) await registerProjection(laser, TOPIC)
+  if (capabilities.query.available) await registerProjection(laser, TOPIC, INDEX)
 
   await using live = await laser.topic(TOPIC).consumerGroup(LIVE_GROUP).consumer({
     batchLength: 100,
@@ -360,7 +366,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   if (managedGate(capabilities, "query", EXAMPLE)) {
     phase("read model: ad-hoc analytics over the managed query layer")
-    await waitForProjection(laser, TOPIC, count)
+    await waitForProjection(laser, INDEX, count)
     await runAnalytics(laser)
     const sample = events[0]
     if (sample === undefined) throw new Error("the deterministic clickstream is empty")

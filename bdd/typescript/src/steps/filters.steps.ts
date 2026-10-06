@@ -7,11 +7,9 @@ import {
   ConsumerFilter,
   FilterExpr,
   UnsupportedError,
-  consumerFilterDigest,
-  consumerFilterJson,
-  decodeConsumerFilterJson,
   type FilterHeader
 } from "@laserdata/laser-sdk"
+import { wire } from "@laserdata/laser-sdk/full"
 import type { LaserWorld } from "../world.js"
 
 const TOPIC = "fleet_changes"
@@ -116,14 +114,14 @@ Then(/^the record is (selected|rejected|a fault)$/, function (this: LaserWorld, 
 
 Then("its digest survives a round trip through its wire form", function (this: LaserWorld) {
   if (this.filter === undefined) throw new Error("scenario has no filter")
-  const back = decodeConsumerFilterJson(consumerFilterJson(this.filter))
-  assert.deepEqual(consumerFilterDigest(back), consumerFilterDigest(this.filter))
+  const back = wire.decodeConsumerFilterJson(wire.consumerFilterJson(this.filter))
+  assert.deepEqual(ConsumerFilter.digest(back), ConsumerFilter.digest(this.filter))
 })
 
 Then("a different fault policy gives a different digest", function (this: LaserWorld) {
   if (this.filter === undefined) throw new Error("scenario has no filter")
   const dropping = ConsumerFilter.json(this.filter.expr, "drop")
-  assert.notDeepEqual(consumerFilterDigest(dropping), consumerFilterDigest(this.filter))
+  assert.notDeepEqual(ConsumerFilter.digest(dropping), ConsumerFilter.digest(this.filter))
 })
 
 Given("a fresh fleet change feed", async function (this: LaserWorld) {
@@ -142,7 +140,7 @@ When(
     const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS })
     await reader.ackPage(page)
     await reader.close()
-    this.filtered = page.records.map((record) => record.payload)
+    this.filtered = page.records.map((record) => record.message.payload)
   }
 )
 
@@ -181,7 +179,9 @@ When(
     const binding = first.filter
     assert.ok(binding !== undefined)
     const byId = topic.consumerGroupId(first.id)
-    const consumer = await byId.consumer({ autoCommit: false })
+    const consumer = await byId.consumer({
+      commitPolicy: { kind: "disabled" }
+    })
     const delivered: Uint8Array[] = []
     try {
       for (let index = 0; index < 3; index += 1) {
@@ -200,7 +200,7 @@ When(
     await assert.rejects(reader.tryNextPage(), /revision_disabled/)
     await group.filter().setRevisionEnabled(binding.revision, true)
     assert.deepEqual(
-      page.records.map((record) => record.payload),
+      page.records.map((record) => record.message.payload),
       delivered
     )
     await reader.close()
@@ -216,7 +216,7 @@ When(
     const consumer = await this.requireLaser()
       .topic(TOPIC)
       .consumerGroupId(info.id)
-      .consumer({ autoCommit: false, batchLength: 2 })
+      .consumer({ commitPolicy: { kind: "disabled" }, batchLength: 2 })
     const delivered: Uint8Array[] = []
     try {
       for (const _ of FEED) {
@@ -244,7 +244,7 @@ When(
       assert.equal(page.examined, page.records.length)
       assert.ok(page.records.length <= 2)
       assert.ok(page.records.every((record) => !record.evaluated))
-      delivered.push(...page.records.map((record) => record.payload))
+      delivered.push(...page.records.map((record) => record.message.payload))
       await reader.ackPage(page)
     }
     this.filtered = delivered
@@ -286,7 +286,7 @@ When(
       [100n]
     )
     await reader.ackPage(matched)
-    this.filtered = matched.records.map((record) => record.payload)
+    this.filtered = matched.records.map((record) => record.message.payload)
   }
 )
 
@@ -311,12 +311,12 @@ When(
     await group.create({ filter: safeMode() })
     const consumer = await group.consumer({
       batchLength: 100,
-      autoCommit: false,
-      startFrom: { kind: "first" }
+      commitPolicy: { kind: "disabled" },
+      startAt: { kind: "first" }
     })
     try {
       const record = await consumer.nextWithin(READ_TIMEOUT_MS)
-      assert.equal(record.offset, 100n)
+      assert.equal(record.position.offset, 100n)
       assert.equal((await consumer.storedOffset(0))?.storedOffset, 99n)
       await consumer.commit(record)
       this.filtered = [record.payload]

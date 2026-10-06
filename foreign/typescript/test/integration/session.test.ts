@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto"
 import { test } from "node:test"
 import { Laser } from "../../src/client/laser.js"
 import { Checkpoint } from "../../src/context.js"
-import { sessionTurnText, type SessionTurnKind } from "../../src/session.js"
+import { SessionConfig, sessionTurnText, type SessionTurnKind } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -58,7 +58,7 @@ void test("given_a_checkpoint_when_more_turns_are_appended_then_turns_at_and_sin
   const laser = await Laser.connectWithStream(CONNECTION_STRING, `laser-ts-test-${randomUUID()}`)
   try {
     await laser.bootstrap(2)
-    const session = laser.sessions({ contextTurns: 10 }).start()
+    const session = laser.sessions(new SessionConfig().contextTurns(10)).start()
     await session.append("instruction", encode("first"))
     await session.append("model.response", encode("second"))
     const checkpoint = await eventually(async () => {
@@ -94,11 +94,13 @@ void test("given_a_custom_layout_when_turns_ride_their_own_stream_and_topic_then
     await laser.stream(support).topic("support.turns").ensure(2)
     await laser.stream(support).topic("support.replies").ensure(2)
     const session = laser
-      .sessions({
-        stream: support,
-        topics: { instruction: "support.turns", response: "support.replies" },
-        memoryNamespace: "support.sessions"
-      })
+      .sessions(
+        new SessionConfig()
+          .stream(support)
+          .topic("instruction", "support.turns")
+          .topic("response", "support.replies")
+          .memoryNamespace("support.sessions")
+      )
       .create("ticket-7")
     await session.append("instruction", encode("where is my order"))
     const turns = await eventually(async () => {

@@ -39,7 +39,9 @@ READINGS = [
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
-        if not _common.managed_gate((await laser.capabilities()).query, "views (query)", EXAMPLE):
+        if not _common.managed_gate(
+            (await laser.capabilities()).query.available, "views (query)", EXAMPLE
+        ):
             return
 
         _common.phase("keep a queryable view of a topic, then query it")

@@ -11,13 +11,18 @@ import type {
   HandlerResult
 } from "../../src/agent/reliable-consumer.js"
 import { INTERNAL_TRANSPORT, Laser } from "../../src/client/laser.js"
-import { RejectedError, TimeoutError, TransportError } from "../../src/client/errors.js"
-import type { IggyHeaderValue } from "../../src/iggy/apache-iggy.js"
+import {
+  PublishFailedError,
+  RejectedError,
+  TimeoutError,
+  TransportError
+} from "../../src/client/errors.js"
+import type { HeaderValue } from "../../src/stream/header-value.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import { KeyRecord, KeyRegistry, SigningKey } from "../../src/signing.js"
-import type { ConsumedMessage } from "../../src/stream/consumer.js"
+import type { Message } from "../../src/stream/message.js"
 import {
   AgentKind,
   TaskStateName,
@@ -52,7 +57,7 @@ async function readFixture(name: string): Promise<Uint8Array> {
 }
 
 async function sendAgentFixture(laser: Laser, payload: Uint8Array): Promise<void> {
-  const headers = new Map<string, IggyHeaderValue>([
+  const headers = new Map<string, HeaderValue>([
     [AGENT_VERSION, { kind: "uint32", value: AGENT_OP_VERSION }],
     [CONTENT_TYPE, { kind: "uint8", value: contentTypeCode(ContentType.Cbor) }]
   ])
@@ -90,6 +95,7 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
       })
       .retry({ maxAttempts: 2, baseDelayMs: 1 })
       .middleware(middleware)
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -115,8 +121,8 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
       .topic(AgentTopic.Commands)
       .consumerGroup("retry-worker")
       .consumer({
-        autoCommit: false,
-        startFrom: { kind: "next" }
+        commitPolicy: { kind: "disabled" },
+        startAt: { kind: "next" }
       })
     try {
       await assert.rejects(rejoined.nextWithin(100), TimeoutError)
@@ -172,7 +178,8 @@ void test("given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject
       .listenOn(AgentTopic.Commands)
       .handler(handler)
       .middleware(middleware)
-      .deadLetterSink(sink)
+      .onDeadLetter(sink)
+      .build()
       .spawn(laser)
     await first.ready()
 
@@ -200,6 +207,7 @@ void test("given_invalid_and_unmet_agdx_records_when_consumed_then_should_reject
       .listenOn(AgentTopic.Commands)
       .handler(handler)
       .understoodFeatures(required.mustUnderstand)
+      .build()
       .spawn(laser)
     await second.ready()
     await sendAgentFixture(laser, requiredBytes)
@@ -225,11 +233,13 @@ void test("given_periodic_memory_consolidation_when_an_agent_runs_then_should_ti
       .consolidateEvery(10)
       .consolidator({
         consolidate(scope) {
-          assert.deepEqual(scope, {})
+          assert.deepEqual(Object.keys(scope), ["agent"])
+          assert.equal(scope.agent?.asStr(), "consolidating-worker")
           consolidations += 1
           return Promise.resolve({ summarized: 0, reweighted: 0, pruned: 0, derived: 0 })
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
     for (let attempt = 0; attempt < 50 && consolidations < 2; attempt += 1) await delay(10)
@@ -270,7 +280,8 @@ void test("given_a_permanent_handler_rejection_when_consumed_then_should_publish
           return Promise.reject(new RejectedError("policy refused"))
         }
       })
-      .deadLetterSink(sink)
+      .onDeadLetter(sink)
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -297,8 +308,8 @@ void test("given_a_permanent_handler_rejection_when_consumed_then_should_publish
     assert.equal(capsule.detail, "policy refused")
     assert.deepEqual(capsule.payload, payload)
     const [streamDetails, topicDetails] = await Promise.all([
-      laser.iggyClient.stream.get({ streamId: stream }),
-      laser.iggyClient.topic.get({ streamId: stream, topicId: AgentTopic.Commands })
+      laser.client.stream.get({ streamId: stream }),
+      laser.client.topic.get({ streamId: stream, topicId: AgentTopic.Commands })
     ])
     assert.ok(streamDetails !== null)
     assert.ok(topicDetails !== null)
@@ -335,6 +346,7 @@ void test("given_partition_lanes_when_one_blocks_then_should_run_other_partition
         }
       })
       .concurrency({ kind: "serial-per-partition", maxPartitions: 2 })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -411,6 +423,7 @@ void test("given_sustained_partition_churn_when_consumed_then_should_bound_concu
         }
       })
       .concurrency({ kind: "serial-per-partition", maxPartitions: concurrency })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -472,6 +485,7 @@ void test("given_ack_on_pickup_when_an_agdx_command_arrives_then_should_emit_wor
           return handlerGate
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -519,13 +533,14 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
           return Promise.reject(new RejectedError("reject"))
         }
       })
-      .deadLetterSink({
+      .onDeadLetter({
         onDeadLetter(_message, _capsule, publishError): Promise<void> {
           sinkCalls += 1
           published = publishError
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
     await laser.sendAgent(AgentTopic.Commands, new TextEncoder().encode("poison"), {
@@ -533,8 +548,13 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
     })
     for (let attempt = 0; attempt < 80 && sinkCalls === 0; attempt += 1) await delay(10)
     assert.equal(sinkCalls, 1)
-    assert.ok(published instanceof TransportError)
-    await assert.rejects(handle.join(), TransportError)
+    assert.ok(published instanceof PublishFailedError)
+    assert.ok(published.publishCause() instanceof TransportError)
+    await assert.rejects(
+      handle.join(),
+      (error: unknown) =>
+        error instanceof PublishFailedError && error.publishCause() instanceof TransportError
+    )
 
     await laser.topic(AgentTopic.Dlq).ensure()
     const dlq = await laser.topic(AgentTopic.Dlq).replay()
@@ -547,13 +567,14 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
           return Promise.reject(new RejectedError("reject"))
         }
       })
-      .deadLetterSink({
+      .onDeadLetter({
         onDeadLetter(_message, _capsule, publishError): Promise<void> {
           assert.equal(publishError, undefined)
           durableSinkCalls += 1
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await replacement.ready()
     let record
@@ -569,8 +590,8 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
       .topic(AgentTopic.Commands)
       .consumerGroup("dlq-failure-worker")
       .consumer({
-        autoCommit: false,
-        startFrom: { kind: "next" }
+        commitPolicy: { kind: "disabled" },
+        startAt: { kind: "next" }
       })
     try {
       await assert.rejects(rejoined.nextWithin(100), TimeoutError)
@@ -599,6 +620,7 @@ void test("given_a_retryable_handler_that_never_succeeds_when_consumed_then_shou
         }
       })
       .retry({ maxAttempts: 3, baseDelayMs: 1 })
+      .build()
       .spawn(laser)
     await handle.ready()
     await laser.sendAgent(AgentTopic.Commands, new TextEncoder().encode("retry-me"), {
@@ -625,7 +647,7 @@ void test("given_a_retryable_handler_that_never_succeeds_when_consumed_then_shou
       .topic(AgentTopic.Commands)
       .consumerGroup("exhausted-worker")
       .consumer({
-        autoCommit: false
+        commitPolicy: { kind: "disabled" }
       })
     try {
       await assert.rejects(rejoined.nextWithin(100), TimeoutError)
@@ -656,6 +678,7 @@ void test("given_an_inflight_message_when_hard_aborted_then_should_redeliver_to_
           return firstGate
         }
       })
+      .build()
       .spawn(laser)
     await first.ready()
     await laser.sendAgent(AgentTopic.Commands, new TextEncoder().encode("uncommitted"), {
@@ -678,6 +701,7 @@ void test("given_an_inflight_message_when_hard_aborted_then_should_redeliver_to_
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await replacement.ready()
     for (let attempt = 0; attempt < 80 && replacementBody === undefined; attempt += 1) {
@@ -706,6 +730,7 @@ void test("given_committed_history_when_a_warmed_agent_restarts_then_should_supp
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await first.ready()
     const conversationId = ConversationId.new()
@@ -736,6 +761,7 @@ void test("given_committed_history_when_a_warmed_agent_restarts_then_should_supp
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await restarted.ready()
     for (let attempt = 0; attempt < 80 && restartedBodies.length === 0; attempt += 1) {
@@ -764,9 +790,10 @@ void test("given_lost_group_membership_when_polling_then_should_rejoin_and_conti
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
-    await laser.iggyClient.group.leave({
+    await laser.client.group.leave({
       streamId: stream,
       topicId: AgentTopic.Commands,
       groupId: "rejoin-worker"
@@ -798,6 +825,7 @@ void test("given_deadline_fence_and_dedup_records_when_consumed_then_should_appl
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
     const fencedConversation = ConversationId.new()
@@ -822,7 +850,7 @@ void test("given_deadline_fence_and_dedup_records_when_consumed_then_should_appl
       conversationId: duplicateConversation,
       idempotencyKey: "same"
     })
-    let deadlineRecord: ConsumedMessage | undefined
+    let deadlineRecord: Message | undefined
     const deadlinePending = () => handled.length < 2 || deadlineRecord === undefined
     for (let attempt = 0; attempt < 160 && deadlinePending(); attempt += 1) {
       deadlineRecord ??= (await dlq.poll())[0]
@@ -867,6 +895,7 @@ void test("given_a_verified_agent_when_signed_and_unsigned_commands_arrive_then_
           await context.respond(new TextEncoder().encode("signed-response"))
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
     const responses = await laser.topic(AgentTopic.Responses).replay()
@@ -943,7 +972,7 @@ async function publishWithHeaders(
   contentType: number | undefined,
   agentVersion: number
 ): Promise<void> {
-  const headers = new Map<string, IggyHeaderValue>([
+  const headers = new Map<string, HeaderValue>([
     [AGENT_VERSION, { kind: "uint32", value: agentVersion }],
     ...(contentType !== undefined
       ? ([[CONTENT_TYPE, { kind: "uint8", value: contentType }]] as const)
@@ -980,12 +1009,13 @@ void test("given_a_verified_agent_when_broker_headers_are_mutated_then_should_de
         }
       })
       .middleware(middleware)
-      .deadLetterSink({
+      .onDeadLetter({
         onDeadLetter(_message, capsule): Promise<void> {
           deadLetters.push(capsule)
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -1073,12 +1103,13 @@ void test("given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then
           return Promise.resolve()
         }
       })
-      .deadLetterSink({
+      .onDeadLetter({
         onDeadLetter(_message, capsule): Promise<void> {
           deadLetters.push(capsule)
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -1118,12 +1149,18 @@ void test("given_lifecycle_bound_keys_when_verified_at_the_broker_timestamp_then
 void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_only_on_the_signed_response", async () => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  const callers: Laser[] = []
   try {
     await laser.bootstrap(1)
     const approverKey = SigningKey.fromBytes(new Uint8Array(32).fill(51))
     const registry = new KeyRegistry()
     registry.enroll("approver", approverKey.verifyingKey())
-    const caller = laser.withVerifier(registry)
+    const caller = await Laser.builder()
+      .connectionString(CONNECTION_STRING)
+      .stream(stream)
+      .verifier(registry)
+      .connect()
+    callers.push(caller)
 
     // An unsigned approver answers every interrupt, but its response cannot
     // verify, so the paused caller must keep waiting and time out.
@@ -1134,6 +1171,7 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
         handle: (_message, context) =>
           context.respondInput(AgentTopic.Responses, new TextEncoder().encode("forged"))
       })
+      .build()
       .spawn(laser)
     await faker.ready()
 
@@ -1157,6 +1195,7 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
         handle: (_message, context) =>
           context.respondInput(AgentTopic.Responses, new TextEncoder().encode("approved-signed"))
       })
+      .build()
       .spawn(laser)
     await approver.ready()
 
@@ -1169,6 +1208,7 @@ void test("given_a_verifier_when_input_replies_are_forged_then_should_resume_onl
     await faker.shutdown()
     await approver.shutdown()
   } finally {
+    for (const caller of callers) await caller.close()
     await laser.close()
   }
 })
@@ -1209,6 +1249,7 @@ void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_sta
       .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
       .maxQueuedRecords(3)
       .handler(gatedHandler(handled, gate, announceEntered))
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -1294,6 +1335,7 @@ void test("given_a_blocked_partition_when_the_byte_bound_fills_then_should_stall
       .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
       .maxQueuedBytes(64 * 1024)
       .handler(gatedHandler(handled, gate, announceEntered))
+      .build()
       .spawn(laser)
     await handle.ready()
 
@@ -1362,6 +1404,7 @@ void test("given_a_failed_lane_when_successors_are_queued_then_should_not_commit
         }
       })
       .handler(recorder)
+      .build()
       .spawn(laser)
     await handle.ready()
     await laser.sendAgent(AgentTopic.Commands, new TextEncoder().encode("a"), {
@@ -1395,6 +1438,7 @@ void test("given_a_permanent_transport_rejection_when_polling_then_should_stop_w
           return Promise.resolve()
         }
       })
+      .build()
       .spawn(laser)
     await handle.ready()
     await laser.sendAgent(AgentTopic.Commands, new TextEncoder().encode("live"), {
@@ -1406,7 +1450,7 @@ void test("given_a_permanent_transport_rejection_when_polling_then_should_stop_w
     // Deleting the topic turns every poll into a definitive server rejection.
     // That is permanent, so the consumer must stop with a typed non-retryable
     // error instead of spinning through shutdown-and-reopen forever.
-    await laser.iggyClient.topic.delete({
+    await laser.client.topic.delete({
       streamId: stream,
       topicId: AgentTopic.Commands,
       partitionsCount: 1

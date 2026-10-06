@@ -57,7 +57,7 @@ async def main() -> None:
         )
         print("  newest recalled fact(s):")
         for hit in hits:
-            print(f"    {hit.text}")
+            print(f"    {hit.text()}")
 
         # Reinforce what was useful, then retire it. Both are records on the memory
         # topic, so the store stays an auditable history, not a mutable cell.

@@ -164,20 +164,32 @@ impl MemoryId {
 
     /// A deterministic, content-addressed id: the same `owner`, `kind`, and
     /// `body` always produce the same id, so a deduped remember stores one item.
-    /// The owner is the durable scope (stream and agent, never the conversation),
-    /// so the same fact in two conversations is one durable memory. The hash is
-    /// the wire crate's one canonical [`content_id`](laser_wire::hashing::content_id),
+    /// The owner is the durable scope (stream, agent, user, and application,
+    /// never the conversation), so the same fact in two conversations is one
+    /// durable memory and two users never share an id. The hash is the wire
+    /// crate's one canonical [`content_id`](laser_wire::hashing::content_id),
     /// so every SDK reproduces it from the same byte segments.
     pub fn content(owner: &MemoryScope, kind: MemoryKind, body: &[u8]) -> Self {
         let stream = owner.stream.as_deref().unwrap_or("").as_bytes();
         let agent = owner.agent.as_ref().map(AgentId::as_str).unwrap_or("");
+        let user = owner.user.as_deref().unwrap_or("").as_bytes();
+        let application = owner.app.as_deref().unwrap_or("").as_bytes();
         let kind = [kind.code()];
-        let segments: [&[u8]; 5] = [stream, &[0], agent.as_bytes(), &[0], &kind];
-        // The body is the last segment, appended so the segment order matches the
-        // pinned cross-SDK vector (owner, separators, kind byte, body).
-        let mut all = segments.to_vec();
-        all.push(body);
-        Self::from_u128(laser_wire::hashing::content_id(&all))
+        // Owner segments each end in a zero separator, then the kind byte and
+        // the body, the order every SDK hashes.
+        let segments: [&[u8]; 10] = [
+            stream,
+            &[0],
+            agent.as_bytes(),
+            &[0],
+            user,
+            &[0],
+            application,
+            &[0],
+            &kind,
+            body,
+        ];
+        Self::from_u128(laser_wire::hashing::content_id(&segments))
     }
 }
 
@@ -267,6 +279,18 @@ pub struct MemoryItem {
     /// back to the source message while it is still on the log. `None` for an
     /// in-process recall or a read view without provenance.
     pub source: Option<SourceRef>,
+}
+
+impl MemoryItem {
+    /// The payload as UTF-8, lossy.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.payload).into_owned()
+    }
+
+    /// Decode the payload as JSON.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, LaserError> {
+        serde_json::from_slice(&self.payload).map_err(|error| LaserError::Codec(error.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -713,7 +737,8 @@ fn folded_memory_items(
         .cloned()
         .collect();
     items.reverse();
-    if !projection.feedback.is_empty() {
+    // Recent recall is recency alone, so feedback never reorders it.
+    if query.strategy != RecallStrategy::Recent && !projection.feedback.is_empty() {
         for item in &mut items {
             if let Some(weight) = projection.feedback.get(&item.id) {
                 item.score = Some(*weight);
@@ -727,8 +752,10 @@ fn folded_memory_items(
         });
         for (rank, item) in items.iter_mut().enumerate() {
             if let Some(score) = item.score {
+                // Feedback is not a strategy the caller picked, so its signal
+                // reads `Auto` in every backend.
                 item.signals.push(RecallSignal {
-                    strategy: query.strategy,
+                    strategy: RecallStrategy::Auto,
                     rank,
                     score: Some(score),
                 });
@@ -821,13 +848,9 @@ impl LogMemory {
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, LaserError> {
         let topic = self.topic.to_string();
-        let stream = match &self.stream {
-            Some(stream) => stream.as_str(),
-            None => self.laser.stream_required()?,
-        };
         let action = crate::govern::GovernedAction {
             kind: crate::govern::ActionKind::MemoryWrite,
-            stream,
+            stream: self.stream_name()?,
             topic: &topic,
             source: provenance.agent.as_ref().map(|agent| agent.as_str()),
             target: None,
@@ -1026,10 +1049,7 @@ impl LogMemory {
     // partition past our snapshot in the meantime. Otherwise the other caller
     // already folded those messages and re-applying would duplicate items.
     async fn catch_up(&self) -> Result<(), LaserError> {
-        let stream = match &self.stream {
-            Some(stream) => Identifier::named(stream)?,
-            None => Identifier::named(self.laser.stream_required()?)?,
-        };
+        let stream = Identifier::named(self.stream_name()?)?;
         let topic = self.topic.clone();
         let Some(details) = self.laser.client().get_topic(&stream, &topic).await? else {
             return Ok(());
@@ -1073,10 +1093,14 @@ impl LogMemory {
                 continue; // a concurrent catch_up already folded this partition
             }
             for message in messages {
-                let Ok(provenance) = Provenance::try_from(&message) else {
+                // One header decode serves provenance and the memory scope. A
+                // record whose headers do not decode is not a memory record.
+                let Ok(Some(headers)) = message.user_headers_map() else {
                     continue;
                 };
-                let headers = message.user_headers_map()?.unwrap_or_default();
+                let Ok(provenance) = crate::provenance::provenance_from_headers(&headers) else {
+                    continue;
+                };
                 let text = |name: &str| -> Option<String> {
                     let key = HeaderKey::from_str(name).ok()?;
                     headers.get(&key)?.as_str().ok().map(str::to_owned)
@@ -1413,8 +1437,10 @@ impl<M> DefaultConsolidator<M> {
 }
 
 impl<M, S> DefaultConsolidator<M, S> {
-    /// Add the summarize pass. `Message` items in the scope are folded through `summarizer` into one `Summary` per pass under a durable scope.
-    /// The SDK ships no model client, the seam is yours.
+    /// Add the summarize pass. `Message` items in the scope are folded through
+    /// `summarizer` into one durable `Summary` per conversation, stored under
+    /// the consolidation scope narrowed to that conversation. The SDK ships no
+    /// model client, the seam is yours.
     pub fn with_summarizer<S2>(self, summarizer: S2) -> DefaultConsolidator<M, S2> {
         DefaultConsolidator {
             memory: self.memory,
@@ -1439,25 +1465,30 @@ impl<M: Memory + Sync, S: Summarizer + Sync> Consolidator for DefaultConsolidato
         let mut items = self.memory.recall(scope, &query).await?;
         let mut report = ConsolidationReport::default();
 
-        // Fold Message items into a Summary under a durable scope. Custom backends can keep their remember fallback.
+        // Fold Message items into one durable Summary per conversation, so each
+        // summary stays recallable in the conversation it distills. Custom
+        // backends can keep their remember fallback.
         if let Some(summarizer) = &self.summarizer {
             let sessions: Vec<&MemoryItem> = items
                 .iter()
                 .filter(|item| item.kind == MemoryKind::Message)
                 .collect();
             if !sessions.is_empty() {
-                let bodies = sessions.iter().map(|item| item.payload.clone()).collect();
-                let summary = summarizer.summarize(bodies).await?;
-                let mut summary_scope = scope.clone();
-                summary_scope.lifetime = Lifetime::Durable;
-                self.memory
-                    .append(
-                        &summary_scope,
-                        MemoryId::new(),
-                        MemoryKind::Summary,
-                        summary,
-                    )
-                    .await?;
+                for (conversation, turns) in by_conversation(&sessions) {
+                    let bodies = turns.iter().map(|item| item.payload.clone()).collect();
+                    let summary = summarizer.summarize(bodies).await?;
+                    let mut summary_scope = scope.clone();
+                    summary_scope.conversation = Some(conversation);
+                    summary_scope.lifetime = Lifetime::Durable;
+                    self.memory
+                        .append(
+                            &summary_scope,
+                            MemoryId::new(),
+                            MemoryKind::Summary,
+                            summary,
+                        )
+                        .await?;
+                }
                 report.summarized = sessions.len();
                 if self.prune_summarized {
                     let ids: Vec<MemoryId> = sessions.iter().map(|item| item.id).collect();
@@ -1484,6 +1515,20 @@ impl<M: Memory + Sync, S: Summarizer + Sync> Consolidator for DefaultConsolidato
         }
         Ok(report)
     }
+}
+
+// Group summarized turns by conversation, in the order each conversation
+// first appears in the recall, keeping each group's recall order.
+fn by_conversation<'a>(items: &[&'a MemoryItem]) -> Vec<(ConversationId, Vec<&'a MemoryItem>)> {
+    let mut groups: Vec<(ConversationId, Vec<&'a MemoryItem>)> = Vec::new();
+    for &item in items {
+        let conversation = item.provenance.conversation_id;
+        match groups.iter_mut().find(|(known, _)| *known == conversation) {
+            Some((_, turns)) => turns.push(item),
+            None => groups.push((conversation, vec![item])),
+        }
+    }
+    groups
 }
 
 /// Wraps any [`Memory`] with a [`Reranker`] second stage: `recall` runs the inner
@@ -1764,7 +1809,9 @@ impl<E: Embedder + Sync> Memory for VectorMemory<E> {
             })
             .collect();
 
-        let any_feedback = matched.iter().any(|entry| entry.feedback != 0.0);
+        // Recent recall is recency alone, so feedback never reorders it.
+        let feedback_ranks = query.strategy != RecallStrategy::Recent;
+        let any_feedback = feedback_ranks && matched.iter().any(|entry| entry.feedback != 0.0);
 
         let mut scored: Vec<(f32, &VectorEntry, Vec<RecallSignal>)> = matched
             .iter()
@@ -1784,7 +1831,7 @@ impl<E: Embedder + Sync> Memory for VectorMemory<E> {
                         score: Some(keyword_score(tokens, &entry.item.payload)),
                     });
                 }
-                if entry.feedback != 0.0 {
+                if feedback_ranks && entry.feedback != 0.0 {
                     signals.push(RecallSignal {
                         strategy: RecallStrategy::Auto,
                         rank: 0,
@@ -2400,7 +2447,13 @@ impl MemoryHandle {
         match self {
             MemoryHandle::Log(memory) => memory.recall_folded(scope, query).await,
             MemoryHandle::Vector(memory) => Memory::recall(memory.as_ref(), scope, query).await,
-            MemoryHandle::Reranked { inner, .. } => recall_folded_boxed(inner, scope, query).await,
+            MemoryHandle::Reranked { inner, reranker } => {
+                let items = recall_folded_boxed(inner, scope, query).await?;
+                match &query.semantic {
+                    Some(text) => Reranker::rerank(reranker, text, items).await,
+                    None => Ok(items),
+                }
+            }
             // A custom backend has no separate in-process fold: its own recall is
             // the closest, so folded recall delegates to it.
             MemoryHandle::Custom(memory) => memory.recall(scope, query).await,
@@ -2872,6 +2925,13 @@ impl RecallBuilder<'_> {
         self
     }
 
+    /// Narrow to items remembered on this stream.
+    #[must_use]
+    pub fn stream(mut self, stream: impl Into<String>) -> Self {
+        self.scope.stream = Some(stream.into());
+        self
+    }
+
     /// Cap the number of items returned.
     #[must_use]
     pub fn limit(mut self, limit: usize) -> Self {
@@ -3009,6 +3069,7 @@ mod tests {
             .remember(b"fact".to_vec())
             .user("operator-1")
             .application("fleet")
+            .stream("fleet-memory")
             .send()
             .await
             .expect("the scoped remember should succeed");
@@ -3016,6 +3077,7 @@ mod tests {
             .recall(ConversationId::new())
             .user("operator-1")
             .application("fleet")
+            .stream("fleet-memory")
             .block(Some(100))
             .await
             .expect("the block should render");
@@ -3025,6 +3087,7 @@ mod tests {
         for scope in seen.iter() {
             assert_eq!(scope.user.as_deref(), Some("operator-1"));
             assert_eq!(scope.app.as_deref(), Some("fleet"));
+            assert_eq!(scope.stream.as_deref(), Some("fleet-memory"));
         }
     }
 
@@ -3168,8 +3231,9 @@ mod tests {
     async fn given_session_messages_when_consolidated_then_should_store_one_summary() {
         let memory = LogMemoryStub::default();
         let scope = MemoryScope::default();
+        let conversation = ConversationId::new();
         for body in [b"turn one".to_vec(), b"turn two".to_vec()] {
-            memory.push(MemoryKind::Message, body);
+            memory.push_in(MemoryKind::Message, body, conversation);
         }
         memory.push(MemoryKind::Fact, b"a durable fact".to_vec());
         let consolidator =
@@ -3183,6 +3247,60 @@ mod tests {
             memory.bodies().iter().any(|body| body == b"summary of 2"),
             "the summary landed"
         );
+    }
+
+    #[tokio::test]
+    async fn given_turns_in_two_conversations_when_consolidated_then_should_store_one_summary_each()
+    {
+        let memory = LogMemoryStub::default();
+        let first = ConversationId::new();
+        let second = ConversationId::new();
+        memory.push_in(MemoryKind::Message, b"first a".to_vec(), first);
+        memory.push_in(MemoryKind::Message, b"second a".to_vec(), second);
+        memory.push_in(MemoryKind::Message, b"first b".to_vec(), first);
+        let scope = MemoryScope::builder()
+            .agent("planner".parse().expect("valid agent"))
+            .build();
+        let consolidator =
+            DefaultConsolidator::new(memory.clone(), 100).with_summarizer(StubSummarizer);
+        let report = Consolidator::consolidate(&consolidator, &scope)
+            .await
+            .expect("consolidates");
+        assert_eq!(report.summarized, 3);
+        let summaries: Vec<_> = memory
+            .appended()
+            .into_iter()
+            .map(|(scope, kind, body)| {
+                (scope.conversation, scope.agent, scope.lifetime, kind, body)
+            })
+            .collect();
+        let planner = Some("planner".parse().expect("valid agent"));
+        assert_eq!(
+            summaries,
+            [
+                (
+                    Some(first),
+                    planner.clone(),
+                    Lifetime::Durable,
+                    MemoryKind::Summary,
+                    b"summary of 2".to_vec()
+                ),
+                (
+                    Some(second),
+                    planner,
+                    Lifetime::Durable,
+                    MemoryKind::Summary,
+                    b"summary of 1".to_vec()
+                ),
+            ]
+        );
+        let stored = memory.items.lock().expect("stub lock").clone();
+        let summary_conversations: Vec<_> = stored
+            .iter()
+            .filter(|item| item.kind == MemoryKind::Summary)
+            .map(|item| item.provenance.conversation_id)
+            .collect();
+        assert_eq!(summary_conversations, [first, second]);
     }
 
     #[tokio::test]
@@ -3200,22 +3318,32 @@ mod tests {
         assert_eq!(report.pruned, 1, "the folded turn is forgotten");
     }
 
+    // One typed append the stub saw: its scope, kind, and body.
+    type Appended = (MemoryScope, MemoryKind, Vec<u8>);
+
     /// A minimal in-memory `Memory` for consolidator tests: pushes are visible
     /// to recall, forget removes, nothing ranks. Clones share the store so a
     /// test can hand one clone to the consolidator and assert on the other.
     #[derive(Clone, Default)]
     struct LogMemoryStub {
         items: std::sync::Arc<std::sync::Mutex<Vec<MemoryItem>>>,
+        appended: std::sync::Arc<std::sync::Mutex<Vec<Appended>>>,
     }
 
     impl LogMemoryStub {
         fn push(&self, kind: MemoryKind, payload: Vec<u8>) {
-            let provenance = Provenance::builder()
-                .conversation_id(crate::types::ConversationId::new())
-                .build();
+            self.push_in(kind, payload, crate::types::ConversationId::new());
+        }
+
+        fn push_in(&self, kind: MemoryKind, payload: Vec<u8>, conversation: ConversationId) {
+            let provenance = Provenance::builder().conversation_id(conversation).build();
             let mut item = MemoryItem::plain(MemoryId::new(), payload, provenance);
             item.kind = kind;
             self.items.lock().expect("stub lock").push(item);
+        }
+
+        fn appended(&self) -> Vec<Appended> {
+            self.appended.lock().expect("stub lock").clone()
         }
 
         fn bodies(&self) -> Vec<Vec<u8>> {
@@ -3242,6 +3370,21 @@ mod tests {
                 .lock()
                 .expect("stub lock")
                 .push(MemoryItem::plain(id, payload, provenance));
+            Ok(id)
+        }
+
+        async fn append(
+            &self,
+            scope: &MemoryScope,
+            id: MemoryId,
+            kind: MemoryKind,
+            payload: Vec<u8>,
+        ) -> Result<MemoryId, LaserError> {
+            self.appended
+                .lock()
+                .expect("stub lock")
+                .push((scope.clone(), kind, payload.clone()));
+            self.push_in(kind, payload, scope.conversation.unwrap_or_default());
             Ok(id)
         }
 
@@ -3317,6 +3460,23 @@ mod tests {
             .conversation_id(crate::types::ConversationId::new())
             .build();
         MemoryItem::plain(MemoryId::new(), body.as_bytes().to_vec(), provenance)
+    }
+
+    #[test]
+    fn given_a_text_payload_when_read_then_should_return_the_text_and_json() {
+        let item = context_item(r#"{"city":"Oslo"}"#);
+        assert_eq!(item.text(), r#"{"city":"Oslo"}"#);
+        let value: serde_json::Value = item.json().expect("json");
+        assert_eq!(value["city"], "Oslo");
+    }
+
+    #[test]
+    fn given_a_non_json_payload_when_decoded_then_should_fail_with_a_codec_error() {
+        let item = context_item("plain words");
+        assert!(matches!(
+            item.json::<serde_json::Value>(),
+            Err(LaserError::Codec(_))
+        ));
     }
 
     #[test]
@@ -3583,6 +3743,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn given_a_reranked_handle_when_recalling_folded_then_should_apply_the_reranker() {
+        let handle = MemoryHandle::vector(WordEmbedder).reranker(ReverseReranker);
+        let conversation = ConversationId::new();
+        for body in ["the cat sat", "the dog ran"] {
+            handle
+                .remember(body)
+                .scope(conversation)
+                .send()
+                .await
+                .expect("remember");
+        }
+        let scope = MemoryScope::builder().conversation(conversation).build();
+        let query = MemoryQuery::builder().semantic("cat".to_owned()).build();
+        let hits = handle
+            .recall_folded(&scope, &query)
+            .await
+            .expect("folded recall");
+        assert_eq!(
+            hits.iter()
+                .map(|item| item.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"the dog ran".as_slice(), b"the cat sat"],
+            "the reranker reversed the similarity order"
+        );
+    }
+
     #[test]
     fn given_the_same_content_when_addressed_then_should_produce_the_same_id() {
         let owner = MemoryScope::builder()
@@ -3598,14 +3785,67 @@ mod tests {
 
     #[test]
     fn given_a_known_content_when_addressed_then_should_match_the_cross_sdk_id() {
-        // Pins the content-addressed id to a golden value shared with the Python
-        // reference engine, so a fact deduped in one SDK has the same id in the
-        // other. Owner: agent "agent", no stream, kind Fact, body "x".
-        let owner = MemoryScope::builder()
+        // Pins the content-addressed id to golden values every SDK reproduces, so
+        // a fact deduped in one SDK has the same id in the others.
+        let agent_only = MemoryScope::builder()
             .agent("agent".parse().expect("valid agent"))
             .build();
-        let id = MemoryId::content(&owner, MemoryKind::Fact, b"x");
-        assert_eq!(id.to_string(), "1A9GVS6SJ6SNS4KY0H19130WCW");
+        let full_owner = MemoryScope::builder()
+            .stream("laser".to_owned())
+            .agent("agent".parse().expect("valid agent"))
+            .user("alice".to_owned())
+            .app("console".to_owned())
+            .build();
+        let user_only = MemoryScope::builder().user("alice".to_owned()).build();
+        let cases = [
+            (
+                &agent_only,
+                MemoryKind::Fact,
+                "63FZWE3WTSCVXAY845QK4TMVWM",
+                0xc37f_f8e1_f359_66fa_af20_85bc_c9aa_6f94_u128,
+            ),
+            (
+                &full_owner,
+                MemoryKind::Fact,
+                "28429K3B8MPSM8WHDQR474827P",
+                0x4820_9331_ad14_b668_8e45_b7c1_0e44_08f6,
+            ),
+            (
+                &user_only,
+                MemoryKind::Procedure,
+                "3E6HJGHKFDBMQ91TCJEHV28X40",
+                0x6e34_6508_cded_5d2e_90e9_9274_7624_7480,
+            ),
+        ];
+        for (owner, kind, rendered, value) in cases {
+            let id = MemoryId::content(owner, kind, b"x");
+            assert_eq!(id.as_u128(), value);
+            assert_eq!(id.to_string(), rendered);
+        }
+    }
+
+    #[test]
+    fn given_two_users_when_the_same_body_is_addressed_then_should_produce_distinct_ids() {
+        let owner = |user: &str, application: &str| {
+            MemoryScope::builder()
+                .agent("agent".parse().expect("valid agent"))
+                .user(user.to_owned())
+                .app(application.to_owned())
+                .build()
+        };
+        let alice = MemoryId::content(&owner("alice", "console"), MemoryKind::Fact, b"x");
+        let bob = MemoryId::content(&owner("bob", "console"), MemoryKind::Fact, b"x");
+        let support = MemoryId::content(&owner("alice", "support"), MemoryKind::Fact, b"x");
+        assert_ne!(alice, bob, "the user is part of the owner");
+        assert_ne!(alice, support, "the application is part of the owner");
+        // The separators keep segment boundaries: moving bytes between the user
+        // and the application must not collide.
+        let shifted = MemoryId::content(&owner("alicecon", "sole"), MemoryKind::Fact, b"x");
+        assert_ne!(
+            owner("alicecon", "sole").user,
+            owner("alice", "console").user
+        );
+        assert_ne!(alice, shifted);
     }
 
     #[tokio::test]
@@ -3831,6 +4071,92 @@ mod tests {
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].payload, b"item-4");
+    }
+
+    fn projection_with_feedback_on_the_older_item() -> (Projection, MemoryId, MemoryId) {
+        let conversation = ConversationId::new();
+        let prov = || Provenance::builder().conversation_id(conversation).build();
+        let mut projection = Projection::default();
+        let older = MemoryId::new();
+        let newer = MemoryId::new();
+        projection.absorb(&item_entry(older, b"older"), prov());
+        projection.absorb(&item_entry(newer, b"newer"), prov());
+        let feedback = MemoryLogEntry::Feedback {
+            target: older,
+            weight: 3.0,
+        }
+        .encode()
+        .expect("a feedback entry encodes");
+        projection.absorb(&feedback, prov());
+        (projection, older, newer)
+    }
+
+    #[test]
+    fn given_feedback_when_folded_recall_is_recent_then_should_keep_recency_order() {
+        let (projection, older, newer) = projection_with_feedback_on_the_older_item();
+        let items = folded_memory_items(
+            &projection,
+            &MemoryScope::default(),
+            &MemoryQuery::builder()
+                .strategy(RecallStrategy::Recent)
+                .build(),
+        );
+        assert_eq!(
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [newer, older]
+        );
+        assert!(items.iter().all(|item| item.score.is_none()));
+        assert!(items.iter().all(|item| item.signals.is_empty()));
+    }
+
+    #[test]
+    fn given_feedback_when_folded_recall_ranks_then_should_label_the_signal_auto() {
+        let (projection, older, _) = projection_with_feedback_on_the_older_item();
+        let items = folded_memory_items(
+            &projection,
+            &MemoryScope::default(),
+            &MemoryQuery::builder()
+                .strategy(RecallStrategy::Semantic)
+                .build(),
+        );
+        assert_eq!(items[0].id, older, "feedback promotes outside Recent");
+        assert_eq!(
+            items[0].signals,
+            [RecallSignal {
+                strategy: RecallStrategy::Auto,
+                rank: 0,
+                score: Some(3.0),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_feedback_when_vector_recall_is_recent_then_should_keep_recency_order() {
+        let memory = VectorMemory::new(WordEmbedder);
+        let scope = MemoryScope::default();
+        let older = Memory::remember(&memory, &scope, b"cat".to_vec())
+            .await
+            .expect("remember older");
+        let newer = Memory::remember(&memory, &scope, b"dog".to_vec())
+            .await
+            .expect("remember newer");
+        Memory::improve(&memory, &scope, Feedback::new(older, 5.0))
+            .await
+            .expect("improve");
+        let items = Memory::recall(
+            &memory,
+            &scope,
+            &MemoryQuery::builder()
+                .strategy(RecallStrategy::Recent)
+                .build(),
+        )
+        .await
+        .expect("recent recall");
+        assert_eq!(
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [newer, older]
+        );
+        assert!(items.iter().all(|item| item.signals.is_empty()));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ export class AgentActivity {
   decisions = 0n
   lastDecision: PolicyEvidence | undefined
 
+  /** @internal */
   observe(evidence: PolicyEvidence): void {
     this.decisions += 1n
     this.byVerdict.set(evidence.decision, this.count(evidence.decision) + 1n)

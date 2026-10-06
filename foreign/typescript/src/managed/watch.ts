@@ -2,7 +2,7 @@ import type { Capabilities } from "../client/capabilities.js"
 import { UnsupportedError } from "../client/errors.js"
 import { decodeOne, expectMap } from "../wire/cbor.js"
 import { type ChangeRecord, decodeChangeRecord } from "../wire/change.js"
-import type { Cursor, CursorOptions } from "../stream/cursor.js"
+import type { Cursor } from "../stream/cursor.js"
 
 function tryDecodeChangeRecord(payload: Uint8Array): ChangeRecord | undefined {
   try {
@@ -16,10 +16,18 @@ function tryDecodeChangeRecord(payload: Uint8Array): ChangeRecord | undefined {
 export class Watch {
   private filterIndex: string | undefined
 
-  constructor(
+  private constructor(
     private readonly getCapabilities: () => Promise<Capabilities>,
-    private readonly openCursor: (options?: CursorOptions) => Promise<Cursor>
+    private readonly openCursor: () => Promise<Cursor>
   ) {}
+
+  /** @internal */
+  static create(
+    getCapabilities: () => Promise<Capabilities>,
+    openCursor: () => Promise<Cursor>
+  ): Watch {
+    return new Watch(getCapabilities, openCursor)
+  }
 
   index(index: string): this {
     this.filterIndex = index
@@ -34,15 +42,20 @@ export class Watch {
       })
     }
     const cursor = await this.openCursor()
-    return new WatchReader(cursor, this.filterIndex)
+    return WatchReader.create(cursor, this.filterIndex)
   }
 }
 
 export class WatchReader {
-  constructor(
+  private constructor(
     private cursor: Cursor,
     private readonly filterIndex: string | undefined
   ) {}
+
+  /** @internal */
+  static create(cursor: Cursor, filterIndex: string | undefined): WatchReader {
+    return new WatchReader(cursor, filterIndex)
+  }
 
   fromOffsets(offsets: ReadonlyMap<number, bigint>): this {
     this.cursor = this.cursor.fromOffsets(offsets)

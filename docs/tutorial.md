@@ -1,8 +1,8 @@
 # LaserData - Laser SDK tutorial
 
-This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, and similarity reads. Chapter 9 adds agent coordination, and Chapter 11 reads only matching records with a server-side filter.
+This tutorial builds an observability application for model calls. It records calls and queries them by latency, result, model, and user. Chapters 1 through 8 cover publication, projections, queries, batches, codecs, and similarity reads. Chapter 9 adds agent coordination, Chapter 10 adds multi-agent orchestration, and Chapter 11 reads only matching records with a server-side filter. The snippets use Rust, the reference SDK. The [three-language guides](https://docs.laserdata.cloud/laser-sdk) show each feature in TypeScript, Rust, and Python, and the [parity matrix](parity.md) maps every Rust call to its Python and TypeScript spelling.
 
-Prerequisites: the install snippet from the [README](../README.md) and Apache Iggy, either from the configured R2 release or a local Iggy binary.
+Prerequisites: the install snippet from the [README](../README.md) and a running Apache Iggy server. `just up` starts one on `127.0.0.1:8090` through Docker.
 
 ---
 
@@ -13,7 +13,7 @@ Laser SDK is a streaming substrate, a managed query layer over it, and an agenti
 | layer | what it is | when you need it |
 | --- | --- | --- |
 | streaming (`streaming` feature, default) | typed publish, direct producers, live async consumer groups with server offsets, and the resumable `Cursor`. No agent concepts, no managed backend. | anywhere you stream messages against Apache Iggy. |
-| managed (`managed` feature, or the granular `query` / `projections` / `kv` / `fork` / `graph` / `watch` / `runs` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
+| managed (`managed` feature, or the granular `query` / `projections` / `destinations` / `filters` / `kv` / `fork` / `graph` / `watch` / `runs` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
 | agentic (`agent` feature) | reliable consumer + DLQ, conversation/causality, `Router`, `Memory`, `Agent::builder` handlers. Builds on the streaming layer. | When you are orchestrating LLM agents, not just observing traffic. |
 
 Chapters 1-8 use streaming and managed data operations. Chapter 9 adds the agent runtime.
@@ -104,7 +104,14 @@ let binding = ProjectionBinding::builder()
     .build();
 ```
 
-Store the declaration with the deployment configuration and apply it through the control API. `laser-plane` uses it to materialize records from `inferences`.
+Register the projection, then apply the binding that routes `inferences` into it:
+
+```rust
+laser.projections().register(inference_v1).await?;
+laser.bindings().apply(binding).await?;
+```
+
+The binding is rejected when it names a projection that is not registered. Both calls publish control commands that `laser-plane` applies asynchronously, so poll `laser.projections().get(id)` to observe the result. `laser-plane` then materializes records from `inferences`.
 
 ### Three storage tiers
 
@@ -132,7 +139,7 @@ for call in slow {
 }
 ```
 
-`laser.query("inferences")` runs across the same Iggy connection. Query is a managed feature served by Laser Stack or LaserData Cloud. Against Apache Iggy without `laser-plane`, `laser.query(...)` returns `LaserError::Unsupported`. KV, forks, and registry browse behave the same way.
+`laser.query("inferences")` runs across the same Iggy connection. Query is a managed feature served by Laser Stack or LaserData Cloud. Against Apache Iggy without `laser-plane`, a query terminal such as `.fetch()` returns `LaserError::Unsupported`. KV, forks, and registry browse behave the same way.
 
 What runs on Apache Iggy is the open SDK's streaming, agent, provenance, dedup, cursor, and log-backed memory surfaces. The query, KV, fork, and projection surfaces require Laser Stack or LaserData Cloud. The typed result decodes straight back into your struct.
 
@@ -146,6 +153,8 @@ Laser Stack and LaserData Cloud serve two more read surfaces, both answering `La
 The topic `message_expiry` controls raw-record retention. A projection normally follows the log and removes rows whose source expires. Set binding retention to select a different lifetime for the read model:
 
 ```rust
+use laser_sdk::query::RetentionPolicy;
+
 let binding = ProjectionBinding::builder()
     .source("agent-telemetry", "inferences")
     .allow("inference.v1")
@@ -174,7 +183,7 @@ A projection defines the indexed fields. Stamping `.index("user_id", "alice")` o
 
 The producer supplies data, and the projection defines extraction. An explicit `.index(..)` header wins over a value the projection schema extracts for the same field. A record with no indexed fields from headers or the schema produces no row.
 
-> _Niche scenario, the producer needs to surface a queryable field on a payload the projector cannot decode (opaque binary, custom framing). For those, the projection can declare a header-source field and the producer stamps it via `.header("trace_id", id)` as ride-along metadata. Same "schema lives on the projector side" principle, header instead of JSON pointer. Not used in the rest of the tutorial._
+> _Niche scenario: the producer needs to surface a queryable field on a payload the projector cannot decode (opaque binary, custom framing, or a schema-first body with no registered schema). For those, the producer stamps the field with `.index("trace_id", id)` and the projector indexes the `agdx.idx.*` header. `.header(..)` is different. It attaches metadata that stays on the log record and is not queryable. Not used in the rest of the tutorial._
 
 ---
 
@@ -191,7 +200,7 @@ inferences.publish_batch()
     .send().await?;                  // ONE send_messages, N records
 ```
 
-Iggy limits the bytes in a `send_messages` request. Split larger producer queues into batches that fit that limit.
+Iggy limits the bytes in a `send_messages` request. Split a larger backlog of records into batches that fit that limit.
 
 Partitioning composes with the batch:
 
@@ -199,7 +208,7 @@ Partitioning composes with the batch:
 - `.partition_key("alice")`, the entire batch is hashed to one partition, preserving per-user ordering across records.
 - One-partition topic, global order across the whole topic, useful for the heterogeneous-message pattern in Chapter 4.
 
-A query above `MAX_PAGE_SIZE` (1000 rows) returns `QueryError::TooLarge`. Replies also have a 64 MiB size limit. Use `.max_rows(n).rows()` or `.fetch_all()` to read larger results through bounded pages (Chapter 5).
+A query above `MAX_PAGE_SIZE` (1000 rows) fails with `LaserError::Invalid` before any round trip. Replies also have a 64 MiB size limit. Use `.max_rows(n).rows()` or `.fetch_all()` to read larger results through bounded pages (Chapter 5).
 
 The projection from Chapter 2 covers every record in this batch. No new declaration needed.
 
@@ -253,6 +262,7 @@ A record arriving without a `projection_ref` uses the binding's `default_project
 The query DSL exists so you do not write SQL.
 
 ```rust
+use laser_sdk::query::{CmpOp, Filter};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 let now_us = SystemTime::now().duration_since(UNIX_EPOCH)
@@ -273,7 +283,8 @@ let errors_by_model = laser.query("inferences")
     .count()
     .group_by(["model"])
     .fetch().await?;
-// Each group row carries the count under headers["count"].
+// The result schema carries the count as the field "count". Read it with
+// result.value(row, "count") or result.value_u64(row, "count").
 
 // Several metrics in one pass, plus a HAVING on the count alias. Each metric
 // lands under its alias (count -> "count", avg -> "avg", p95 -> "percentile"):
@@ -397,7 +408,7 @@ laser.stream("agent-telemetry").topic("inferences").publish()
 let traces: Vec<Inference> = laser.query("inferences").fetch_typed_with::<Msgpack, _>().await?;
 ```
 
-Payload bytes come back out of the public API as `Vec<u8>` for streaming messages and memory items. Queries return positional tagged values. When payload selection is enabled, `fetch_typed` and `fetch_typed_with` read the reserved original-payload field from the result schema. Raw byte inputs on the hot chain accept `Vec<u8>`, `String`, and `&'static [u8]`.
+Payload bytes come back out of the public API as `Vec<u8>` for cursor messages, agent messages, and memory items. A live consumer record holds its payload as `Bytes`. Queries return positional tagged values. When payload selection is enabled, `fetch_typed` and `fetch_typed_with` read the reserved original-payload field from the result schema. Raw byte inputs on the hot chain accept `Vec<u8>`, `String`, and `&'static [u8]`.
 
 ### One typed handle instead of per-call codecs
 
@@ -490,18 +501,18 @@ The `agent` feature adds coordination to streaming. It supplies correlation, ret
 
 | concern | open-SDK primitive | what it solves |
 | --- | --- | --- |
-| reliable consumption | `Agent::builder().handler(H).spawn(..)`, `ReliableConsumer` | at-least-once + idempotent. Dedup window on `agdx.idem`, retries with backoff for transient errors, dead-letter for permanent + undecodable + deadline-exceeded. `AgentId` is logical identity, `ConsumerGroupName` is replica topology and defaults from the agent id unless explicitly overridden. |
+| reliable consumption | `Agent::builder().handler(H).build().spawn(..)`, `ReliableConsumer` | at-least-once + idempotent. Dedup window on `agdx.idem`, retries with backoff for transient errors, dead-letter for permanent + undecodable + deadline-exceeded. `AgentId` is logical identity, `ConsumerGroupName` is replica topology and defaults from the agent id unless explicitly overridden. |
 | reply correlation | `Laser::request(...).await`, `AgentCtx::respond(payload)` | request stamps a fresh `correlation_id` (Ulid) on `agdx.corr`, distinct from the business `idempotency_key` on `agdx.idem`. Responder echoes it back via `respond`. Reader filters on `agdx.corr`, so a forged reply that guesses the conversation id cannot hijack. |
 | conversation + causality | `ConversationId`, `MessageId`, `Provenance.causal_parent`, `spawn_subconversation(&parent)` | a conversation is one partition (total order). Sub-conversations carry `agdx.parent_conv` + `agdx.root_conv`. Replies carry `agdx.cause`. Walk one partition for a chat. Walk the causality tree for a multi-agent flow. |
-| routing | `Router::to(agent_id)` / `Router::broadcast()` | stamps / clears `agdx.to`. Defensive filter at the consumer side, see the consumer-group note above. |
+| routing | `Router::to(agent_id)` / `Router::broadcast()` | stamps / clears `agdx.to`. The reliable consumer skips messages addressed to another agent. |
 | session | `laser.sessions().create(id)` -> `Session`: `append(SessionTurnKind, data)`, `context()`, `memory().search(q)`, `checkpoint()`, `turns_at` / `turns_since`, `state_at` / `replay` | Each turn kind uses one conversation-level agent topic. `SessionConfig` selects the stream and topics. A `Checkpoint` stores offsets for reads before or from that point. |
-| sessions | `SessionPolicy::PerCall` / `SessionPolicy::PerUser` | per-user mode derives a stable `ConversationId` from the user key (versioned FNV-1a) so the SAME user keeps the SAME conversation across processes. |
-| context assembly | `ContextAssembler::builder().conversation_id(c).policy(LastN(20)).assemble()` | read one partition (or walk the causality tree with `across_subconversations`) and apply a `ContextPolicy` (`LastN`, `RoleFilter`, or your own) to feed an LLM call. |
-| log replay -> state | `ConversationState::load(laser, conv, topics, bound, init, fold)` | deterministic fold of the conversation back to current state, under an explicit `ReplayBound` (`FromOffsets` incremental, `Last(n)`, or `Full` written out). `load_with(store, ..)` seeds from a `SnapshotStore` and folds only the tail past the snapshot. Same idea as event sourcing on the conversation partition. |
+| session policy | `SessionPolicy::PerCall` / `SessionPolicy::PerUser` | per-user mode derives a stable `ConversationId` from the user key (versioned FNV-1a) so the same user keeps the same conversation across processes. |
+| context assembly | `ContextAssembler::builder().conversation_id(c).policy(Box::new(LastN(20))).build().assemble(&laser)` | read one partition (or walk the causality tree with `across_subconversations`) and apply a `ContextPolicy` (`LastN`, `RoleFilter`, or your own) to feed an LLM call. Each partition read examines at most its newest 10,000 raw records before the conversation filter runs, see [client behavior](client-behavior.md). |
+| log replay -> state | `ConversationState::load(laser, conv, topics, bound, init, fold)` | deterministic fold of the conversation back to current state, under an explicit `ReplayBound` (`FromOffsets` incremental, `Last(n)`, `Full` written out, or a `Checkpoint` bound through `FromCheckpoint` and `At`). `load_with(store, ..)` seeds from a `SnapshotStore` and folds only the tail past the snapshot. Same idea as event sourcing on the conversation partition. The same 10,000-record window applies, so `Full` covers a partition only when it holds no more than that. |
 | memory | `Laser::memory(ns)` -> `MemoryHandle`, the one model: every `remember` / `recall` / `improve` / `forget` rides a memory topic (the versioned audit) that materializes to a versioned key-value read view. `memory_topic(name).stream(..).partitions(n).ttl(d)` configures the topic. `memory_with(ns, MemoryBackend::Vector)` is the in-process similarity index for tests and offline recall. | one API, scope by agent / conversation. User isolation lives at the stream boundary. |
 | state | `StateStore` trait (`get`/`set`/`delete`) + `InMemoryStore` / `FileStore`, and managed `Kv` (which implements `StateStore`) | one point-store seam for dedup persistence, checkpoints, per-agent state. `FileStore` does atomic `<file>.<ulid>.tmp` + rename. Swap in `laser.kv(ns)` for the managed durable backend, same trait. |
 | stream cursor | `laser.stream(stream).topic(topic).replay()` -> `Cursor` (`poll` / `offsets` / `from_offsets` / `stream`) | resumable, offset-addressable read over the log. Checkpoint `offsets()` into any `StateStore` to resume after a restart. `stream()` drives it as a `futures::Stream` (draining then ending when caught up, the shape the Python binding exposes as `async for`). The open primitive the `Agent` runtime sits above. |
-| A2A interop | `A2aBridge` (feature `a2a-bridge`) | speaks Google's A2A JSON-RPC over the agent runtime. One axum route, the agent topology underneath. |
+| A2A interop | `A2aBridge` (feature `a2a-bridge`, plus `a2a-http` for the axum router) | speaks Google's A2A JSON-RPC over the agent runtime. One axum route, the agent topology underneath. |
 
 ### A handler that responds
 
@@ -516,14 +527,17 @@ impl AgentHandler for Echo {
     }
 }
 
-Agent::builder()
+let mut handle = Agent::builder()
     .id("echo".parse()?)
     .listen_on(AgentTopic::Commands)
     .respond_on(AgentTopic::Responses)
     .handler(Echo)
     .build()
     .spawn(laser.clone());
+handle.ready().await?;  // joined its group, so a publish now is delivered
 ```
+
+`spawn` returns an `AgentHandle` that owns the running agent. Keep it for as long as the agent should run. Dropping the handle signals a graceful shutdown, so an agent spawned without binding the handle stops at once. Call `handle.shutdown().await?` to stop the agent and read its consumer result, or `handle.join().await?` to wait for it to finish.
 
 ### Request a reply, await the correlated response
 
@@ -561,7 +575,7 @@ impl AgentHandler for Coordinator {
 }
 ```
 
-Each sub-conversation gets its own partition (= total order within that branch) and carries `parent_conversation_id` + `root_conversation_id` so a downstream context assembler can walk the whole tree. The `incident-desk` example's triage fan-out shows the full loop, including aggregating the replies at the root.
+Each sub-conversation gets its own partition (= total order within that branch) and carries `parent_conversation_id` + `root_conversation_id` so a downstream context assembler can walk the whole tree. The `incident-desk` example's triage shows the fan-out half of this loop. It sends one deadline-bounded request per diagnostic angle and gathers the replies in the caller.
 
 ### Memory, semantic recall
 
@@ -588,7 +602,7 @@ Managed models can retain the source conversation from `gen_ai.conversation.id`.
 
 Streaming, agents, provenance, duplicate suppression, `Cursor`, `StateStore`, and locally folded memory run on Apache Iggy. Queries, projections, KV, and forks require a managed backend. Without it, calls return `LaserError::Unsupported`.
 
-Capabilities group support under `managed`, `query`, `kv`, `graph`, `forks`, `filters`, and `a2a_gateway`. Query includes `available`, `consistency`, `keyword`, `cursor_paging`, `cancellation`, and `execution_status`. KV includes `available` and `cas`. Memory combines query and graph capabilities rather than defining another group:
+Capabilities group support under `managed`, `query`, `destinations`, `kv`, `graph`, `forks`, `a2a_gateway`, `agent_workflow`, `watch`, `authz`, and `filters`. Query includes `available`, `consistency`, `keyword`, `cursor_paging`, `cancellation`, and `execution_status`. KV includes `available`, `cas`, `cas_fenced`, and `fenced_leases`. Memory combines query and graph capabilities rather than defining another group:
 
 | concern | open SDK (this crate, Apache Iggy) | managed runtime (LaserData Cloud or Laser Stack) |
 | --- | --- | --- |
@@ -618,7 +632,7 @@ The general-purpose counterpart (`event-analytics`) lives, with per-example READ
 
 ## Chapter 10 - multi-agent orchestration
 
-Chapter 9 selects sub-conversations directly. The orchestration API adds discovery and capability-based routing through the same log.
+Chapter 9 selects sub-conversations directly. The orchestration API adds discovery and capability-based routing through the same log. The snippets in this chapter assume a glob import of `laser_sdk::prelude::full`.
 
 ### Agents advertise, the orchestrator resolves
 
@@ -642,9 +656,11 @@ let worker = Agent::builder()
     .spawn(laser.clone());
 ```
 
+Keep `worker` alive while the agent should serve work, because dropping the handle stops the agent.
+
 ### A contract: one directed task with a deadline
 
-`Laser::contract` hands a task to one capable agent and tells you whether it was consumed, completed, or timed out, with no hand-rolled correlation ids or timers.
+`Laser::contract` hands a task to one capable agent and tells you whether it was consumed, completed, or timed out, with no hand-rolled correlation ids or timers. The deadline defaults to 30 seconds. `Contract::NotConsumed` is reported only when the contract sets `expire_if_not_consumed` and the target emits pickup acknowledgments through `ack_on_pickup`. `Contract::Failed` carries the target's terminal error reply.
 
 ```rust
 let outcome = laser
@@ -758,12 +774,12 @@ Queries, projections, KV, and forks require Laser Stack or LaserData Cloud. A ma
 | the `laser-wire` contract crate (codes, envelopes, dictionaries, caps, the agent envelope, the golden fixture corpus) | the same crate, consumed as the one typed source of truth |
 | publish / batch / query API | one Iggy connection, public |
 | `Projection` + `ProjectionBinding` types | resolved from the cloud's deployment snapshots |
-| query DSL + request/reply envelope | served from the `_agdx` internal stream |
+| query DSL + request/reply envelope | served over the managed command band on the same connection |
 | managed KV client (`kv` feature, `Laser::kv`) + registry browse (projections via `projections().get` / `projections().list`, writer schemas via `schemas().get` / `schemas().list`) | the `AGDX_KV_*` / `AGDX_*_PROJECTION` / `AGDX_*_SCHEMA` managed commands, served by Laser Stack or LaserData Cloud |
 | group-owned consumer policies: normal and advanced readers with fenced acknowledgments, preview/test and revision management, with optional local evaluation under `filters` | the `AGDX_FILTER*` commands evaluated by the LaserData Iggy fork next to the data, and the saved-filter catalog with group bindings kept by `laser-plane` |
 | `Codec<T>` trait + `Json` + `Msgpack` + `Cbor` + `Bson` | identical wire. Codecs run on the producer side. Schema-first codecs resolve their writer schema from the managed registry |
 | reliable agent runtime | same agent runtime can run inside cloud services |
-| example projector (header path) + test projector (registry path) | the long-running managed projector under Operator |
+| projection, binding, and schema registry control (`laser.projections()`, `laser.bindings()`, `laser.schemas()`) | the long-running managed projector applies the control commands and materializes the read models |
 
 ## Handling cluster outages
 

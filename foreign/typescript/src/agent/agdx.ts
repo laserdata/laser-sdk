@@ -1,13 +1,15 @@
 import { type BlobStore, checkIn } from "../blob.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
 import { CancelledError, InvalidError, RejectedError, TimeoutError } from "../client/errors.js"
-import type { IggyHeaderValue, LaserTransport, MessageWithHeaders } from "../iggy/apache-iggy.js"
-import { mintUlidValue, type UlidSource } from "../runtime/ulid.js"
+import type { LaserTransport, MessageWithHeaders } from "../iggy/apache-iggy.js"
+import type { HeaderValue } from "../stream/header-value.js"
+import type { UlidSource } from "../runtime/ulid.js"
 import { type KeyRegistry, type SigningKey } from "../signing.js"
 import { decodeAgentMessage } from "./reliable-consumer.js"
 import {
   type AgentId as SdkAgentId,
-  type ConversationId as SdkConversationId
+  type ConversationId as SdkConversationId,
+  MintUlid
 } from "../types/ids.js"
 import {
   AgentKind,
@@ -24,7 +26,6 @@ import {
   errorEnvelope,
   eventEnvelope,
   responseEnvelope,
-  parseAgentId,
   statusEnvelope,
   validateAgentEnvelope,
   withCause,
@@ -59,8 +60,6 @@ const REPLY_BATCH = 200
 const REPLY_POLL_INTERVAL_MS = 50
 const textDecoder = new TextDecoder("utf-8", { fatal: true })
 
-export type AgdxLogPosition = LogPosition
-
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted === true) {
@@ -79,10 +78,6 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-function wireAgentId(agent: SdkAgentId): WireAgentId {
-  return parseAgentId(agent.asString())
-}
-
 function u32FromLittleEndian(header: CanonicalHeader): number {
   if (header.bytes.byteLength !== 4) throw new InvalidError("AGDX u32 header must be 4 bytes")
   return new DataView(
@@ -92,7 +87,7 @@ function u32FromLittleEndian(header: CanonicalHeader): number {
   ).getUint32(0, true)
 }
 
-function iggyHeader(header: CanonicalHeader): IggyHeaderValue {
+function iggyHeader(header: CanonicalHeader): HeaderValue {
   switch (header.kind) {
     case "u32":
       return { kind: "uint32", value: u32FromLittleEndian(header) }
@@ -125,15 +120,15 @@ function assemble(envelope: AgentEnvelope, contentType: ContentType): MessageWit
 }
 
 function mintRecordId(source?: UlidSource): RecordId {
-  return RecordId.fromU128(mintUlidValue(source))
+  return MintUlid.mint(RecordId, source)
 }
 
 function mintCorrelationId(source?: UlidSource): CorrelationId {
-  return CorrelationId.fromU128(mintUlidValue(source))
+  return MintUlid.mint(CorrelationId, source)
 }
 
 function mintChannelId(source?: UlidSource): ChannelId {
-  return ChannelId.fromU128(mintUlidValue(source))
+  return MintUlid.mint(ChannelId, source)
 }
 
 class AgdxReplyReader {
@@ -224,7 +219,6 @@ class AgdxReplyReader {
 }
 
 export interface Agdx {
-  readonly topicName: string
   command(correlation: CorrelationId, body: BytesLike): AgdxSend
   respond(correlation: CorrelationId, body: BytesLike): AgdxSend
   emit(body: BytesLike): AgdxSend
@@ -459,7 +453,7 @@ export function createAgdx(
     transport,
     streamName,
     topicName,
-    parseAgentId(source.asString()),
+    source.wireId(),
     ConversationId.parse(conversation.toString()),
     ulidSource,
     govern,
@@ -503,7 +497,7 @@ class AgdxSendBuilder implements AgdxSend {
   ) {}
 
   withTarget(target: SdkAgentId): this {
-    this.envelope = withTarget(this.envelope, wireAgentId(target))
+    this.envelope = withTarget(this.envelope, target.wireId())
     return this
   }
 
@@ -636,7 +630,7 @@ class AgdxStreamWriter implements AgdxStream {
   }
 
   withTarget(target: SdkAgentId): this {
-    this.target = wireAgentId(target)
+    this.target = target.wireId()
     return this
   }
 

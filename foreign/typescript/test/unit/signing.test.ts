@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import { test } from "node:test"
 import {
+  InvalidError,
   KeyKind,
   KeyRecord,
   KeyRegistry,
@@ -85,13 +86,13 @@ void test("given_a_signed_delegation_when_verified_then_should_bind_signer_and_u
   const registry = new KeyRegistry()
   registry.enroll("agent-a", key.verifyingKey())
   const delegated = withMetadata(envelope(), METADATA_DELEGATED_BY, {
-    kind: "string",
+    kind: "str",
     value: "user-7"
   })
   const signed = withSignature(delegated, key.sign(delegated))
   assert.deepEqual(verifyDelegation(registry, signed), ["agent-a", "user-7"])
   const forged = withMetadata(signed, METADATA_DELEGATED_BY, {
-    kind: "string",
+    kind: "str",
     value: "user-999"
   })
   assert.throws(() => verifyDelegation(registry, forged), SignatureError)
@@ -111,6 +112,29 @@ void test("given_a_signed_card_when_verified_then_should_reject_tampering_and_ig
   assert.throws(() => {
     verifyCard({ ...card, name: "impostor" }, signature, key.verifyingKey())
   })
+})
+
+void test("given_mixed_case_and_astral_keys_when_a_card_is_signed_then_should_sign_utf8_byte_ordered_json", () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(7))
+  const card = {
+    b: 1,
+    "\u{1F600}": { z: "\u0001\n", Z: [true, null] },
+    a: 3,
+    "": 4,
+    B: 2,
+    signatures: []
+  }
+  const canonical = '{"B":2,"a":3,"b":1,"":4,"\u{1F600}":{"Z":[true,null],"z":"\\u0001\\n"}}'
+  const protectedValue = Buffer.from('{"alg":"EdDSA"}').toString("base64url")
+  const input = `${protectedValue}.${Buffer.from(canonical).toString("base64url")}`
+  const expected = Buffer.from(key.signBytes(new TextEncoder().encode(input))).toString("base64url")
+  assert.deepEqual(signCardValue(key, card), { protected: protectedValue, signature: expected })
+})
+
+void test("given_a_lone_surrogate_when_a_card_is_signed_then_should_reject_it", () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(7))
+  assert.throws(() => signCardValue(key, { name: "\uD800" }), SignatureError)
+  assert.throws(() => signCardValue(key, { ["\uDC00"]: 1 }), SignatureError)
 })
 
 void test("given_the_rust_signature_vector_when_checked_then_should_cross_verify_both_directions", async () => {
@@ -152,3 +176,19 @@ function hex(value: Uint8Array): string {
 function fromHex(value: string): Uint8Array {
   return Uint8Array.from(value.match(/.{2}/g)?.map((byte) => Number.parseInt(byte, 16)) ?? [])
 }
+
+void test("given_public_key_bytes_when_building_a_key_record_then_should_accept_only_a_curve_point", () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(9))
+  const record = KeyRecord.fromVerifyingBytes("planner", key.verifyingKey(), KeyKind.Operator)
+  assert.equal(record.kind, KeyKind.Operator)
+  assert.deepEqual(record.verifying, key.verifyingKey())
+  assert.deepEqual(record.keyId(), key.keyId())
+  assert.throws(() => KeyRecord.fromVerifyingBytes("planner", new Uint8Array(31), KeyKind.Agent), {
+    message: "an Ed25519 public key requires exactly 32 bytes"
+  })
+  assert.throws(
+    () => KeyRecord.fromVerifyingBytes("planner", new Uint8Array(32).fill(255), KeyKind.Agent),
+    (error: unknown) =>
+      error instanceof InvalidError && error.message === "invalid Ed25519 public key"
+  )
+})

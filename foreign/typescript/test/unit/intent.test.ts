@@ -86,3 +86,65 @@ void test("given_a_mutated_body_or_foreign_voter_when_used_then_should_reject", 
   const valid = build({ kind: "any" })
   assert.throws(() => Vote.cast(valid, AgentId.new("outsider"), VoteChoice.Allow, 20n), IntentError)
 })
+
+void test("given_each_invalid_configuration_when_constructed_then_should_raise_its_rust_variant", () => {
+  const a = AgentId.new("a")
+  const options = {
+    conversation: ConversationId.new(),
+    proposer: AgentId.new("proposer"),
+    body: new Uint8Array(),
+    eligibleVoters: [a],
+    policy: { kind: "any" } as const,
+    policyVersion: 1n,
+    atMicros: 10n,
+    deadlineMicros: 20n
+  }
+  const cases: readonly [() => unknown, IntentError][] = [
+    [() => new Intent({ ...options, eligibleVoters: [] }), IntentError.noEligibleVoters()],
+    [
+      () => new Intent({ ...options, eligibleVoters: [a, a] }),
+      IntentError.duplicateEligibleVoter("a")
+    ],
+    [
+      () => new Intent({ ...options, mandatoryVoters: [a, a] }),
+      IntentError.duplicateMandatoryVoter("a")
+    ],
+    [
+      () => new Intent({ ...options, mandatoryVoters: [AgentId.new("b")] }),
+      IntentError.mandatoryVoterNotEligible("b")
+    ],
+    [
+      () => new Intent({ ...options, policy: { kind: "at-least", required: 2 } }),
+      IntentError.invalidThreshold(2, 1)
+    ],
+    [() => new Intent({ ...options, deadlineMicros: 10n }), IntentError.invalidDeadline(10n, 10n)],
+    [() => new Intent({ ...options, digest: "00" }), IntentError.digestMismatch()]
+  ]
+  for (const [construct, expected] of cases) {
+    assert.throws(construct, (error: unknown) => {
+      assert.ok(error instanceof IntentError)
+      assert.equal(error.message, expected.message)
+      assert.deepEqual(error.context, expected.context)
+      return true
+    })
+  }
+  assert.equal(
+    IntentError.invalidThreshold(2, 1).message,
+    "threshold 2 is invalid for 1 eligible voters"
+  )
+  assert.deepEqual(IntentError.invalidDeadline(10n, 5n).context, { proposed: 10n, deadline: 5n })
+  const intent = new Intent(options)
+  assert.throws(
+    () => Vote.cast(intent, AgentId.new("outsider"), VoteChoice.Allow, 15n),
+    (error: unknown) =>
+      error instanceof IntentError &&
+      error.message === IntentError.ineligibleVoter("outsider").message
+  )
+  const other = new Intent(options)
+  const decision = decide(other, [Vote.cast(other, a, VoteChoice.Allow, 15n)], 15n)
+  assert.throws(
+    () => decision?.authorizes(intent),
+    (error: unknown) =>
+      error instanceof IntentError && error.message === IntentError.decisionIntentMismatch().message
+  )
+})

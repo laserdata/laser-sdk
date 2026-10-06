@@ -24,11 +24,54 @@ export interface IntentOptions {
   readonly policy: IntentPolicy
   readonly policyVersion: bigint
   readonly deadlineMicros: bigint
-  readonly intentId?: IntentId
-  readonly atMicros?: bigint
 }
 
-export class IntentError extends InvalidError {}
+/** An invalid durable-intent configuration or operation. Each static
+ * constructor is one Rust `IntentError` variant, with the same message and its
+ * payload in `context`. */
+export class IntentError extends InvalidError {
+  static noEligibleVoters(): IntentError {
+    return new IntentError("an intent requires at least one eligible voter")
+  }
+
+  static duplicateEligibleVoter(voter: string): IntentError {
+    return new IntentError(`eligible voter '${voter}' appears more than once`, { voter })
+  }
+
+  static duplicateMandatoryVoter(voter: string): IntentError {
+    return new IntentError(`mandatory voter '${voter}' appears more than once`, { voter })
+  }
+
+  static mandatoryVoterNotEligible(voter: string): IntentError {
+    return new IntentError(`mandatory voter '${voter}' is not eligible`, { voter })
+  }
+
+  static invalidThreshold(required: number, eligible: number): IntentError {
+    return new IntentError(
+      `threshold ${String(required)} is invalid for ${String(eligible)} eligible voters`,
+      { required, eligible }
+    )
+  }
+
+  static invalidDeadline(proposed: bigint, deadline: bigint): IntentError {
+    return new IntentError(
+      `deadline ${String(deadline)} must be after proposal time ${String(proposed)}`,
+      { proposed, deadline }
+    )
+  }
+
+  static digestMismatch(): IntentError {
+    return new IntentError("intent digest does not match its body")
+  }
+
+  static ineligibleVoter(voter: string): IntentError {
+    return new IntentError(`voter '${voter}' is not eligible for this intent`, { voter })
+  }
+
+  static decisionIntentMismatch(): IntentError {
+    return new IntentError("decision is not bound to this intent body and policy version")
+  }
+}
 
 export class Intent {
   readonly intentId: IntentId
@@ -43,7 +86,15 @@ export class Intent {
   readonly deadlineMicros: bigint
   readonly atMicros: bigint
 
-  constructor(options: IntentOptions & { readonly digest?: string }) {
+  /** `intentId`, `digest` and `atMicros` restore a decoded intent. A new
+   * intent mints its id, hashes its body and stamps the current time. */
+  constructor(
+    options: IntentOptions & {
+      readonly intentId?: IntentId
+      readonly digest?: string
+      readonly atMicros?: bigint
+    }
+  ) {
     this.intentId = options.intentId ?? IntentId.new()
     this.conversation = options.conversation
     this.proposer = options.proposer
@@ -59,12 +110,15 @@ export class Intent {
   }
 
   validate(): void {
-    if (this.eligibleVoters.length === 0)
-      throw new IntentError("an intent requires eligible voters")
-    const eligible = uniqueAgents(this.eligibleVoters, "eligible")
-    const mandatory = uniqueAgents(this.mandatoryVoters, "mandatory")
+    if (this.eligibleVoters.length === 0) throw IntentError.noEligibleVoters()
+    const eligible = uniqueAgents(this.eligibleVoters, (voter) =>
+      IntentError.duplicateEligibleVoter(voter)
+    )
+    const mandatory = uniqueAgents(this.mandatoryVoters, (voter) =>
+      IntentError.duplicateMandatoryVoter(voter)
+    )
     for (const voter of mandatory) {
-      if (!eligible.has(voter)) throw new IntentError(`mandatory voter '${voter}' is not eligible`)
+      if (!eligible.has(voter)) throw IntentError.mandatoryVoterNotEligible(voter)
     }
     if (this.policy.kind === "at-least") {
       if (
@@ -72,16 +126,13 @@ export class Intent {
         this.policy.required < 1 ||
         this.policy.required > this.eligibleVoters.length
       ) {
-        throw new IntentError(
-          `threshold ${String(this.policy.required)} is invalid for ${String(this.eligibleVoters.length)} eligible voters`
-        )
+        throw IntentError.invalidThreshold(this.policy.required, this.eligibleVoters.length)
       }
     }
     if (this.deadlineMicros <= this.atMicros) {
-      throw new IntentError("intent deadline must be after proposal time")
+      throw IntentError.invalidDeadline(this.atMicros, this.deadlineMicros)
     }
-    if (this.digest !== digestOf(this.body))
-      throw new IntentError("intent digest does not match its body")
+    if (this.digest !== digestOf(this.body)) throw IntentError.digestMismatch()
   }
 }
 
@@ -98,7 +149,7 @@ export class Vote {
   static cast(intent: Intent, voter: AgentId, choice: VoteChoice, atMicros?: bigint): Vote {
     intent.validate()
     if (!intent.eligibleVoters.some((eligible) => eligible.equals(voter))) {
-      throw new IntentError(`voter '${voter.toString()}' is not eligible for this intent`)
+      throw IntentError.ineligibleVoter(voter.toString())
     }
     return new Vote(intent.intentId, intent.digest, intent.policyVersion, voter, choice, atMicros)
   }
@@ -122,7 +173,7 @@ export class Decision {
       this.intentDigest !== intent.digest ||
       this.policyVersion !== intent.policyVersion
     ) {
-      throw new IntentError("decision is not bound to this intent body and policy version")
+      throw IntentError.decisionIntentMismatch()
     }
     return this.outcome === IntentOutcome.Committed
   }
@@ -134,21 +185,21 @@ export function decide(
   nowMicros: bigint
 ): Decision | undefined {
   intent.validate()
-  const eligible = new Set(intent.eligibleVoters.map((voter) => voter.asString()))
+  const eligible = new Set(intent.eligibleVoters.map((voter) => voter.asStr()))
   const valid = votes
     .filter(
       (vote) =>
         vote.intentId.equals(intent.intentId) &&
         vote.intentDigest === intent.digest &&
         vote.policyVersion === intent.policyVersion &&
-        eligible.has(vote.voter.asString()) &&
+        eligible.has(vote.voter.asStr()) &&
         vote.atMicros >= intent.atMicros &&
         vote.atMicros <= intent.deadlineMicros &&
         vote.atMicros <= nowMicros
     )
     .toSorted(
       (left, right) =>
-        left.voter.asString().localeCompare(right.voter.asString()) ||
+        left.voter.asStr().localeCompare(right.voter.asStr()) ||
         compareBigInt(left.atMicros, right.atMicros) ||
         choiceRank(left.choice) - choiceRank(right.choice)
     )
@@ -157,7 +208,7 @@ export function decide(
   let terminalAt = intent.atMicros
   for (const vote of valid) {
     if (vote.atMicros > terminalAt) terminalAt = vote.atMicros
-    const voter = vote.voter.asString()
+    const voter = vote.voter.asStr()
     const previous = ballots.get(voter)
     if (previous === undefined) {
       ballots.set(voter, vote.choice)
@@ -174,7 +225,7 @@ export function decide(
     }
   }
   for (const voter of intent.mandatoryVoters) {
-    const choice = ballots.get(voter.asString())
+    const choice = ballots.get(voter.asStr())
     if (choice !== undefined && choice !== VoteChoice.Allow) {
       return sealed(
         intent,
@@ -189,7 +240,7 @@ export function decide(
   const responded = ballots.size
   const total = intent.eligibleVoters.length
   const mandatoryMet = intent.mandatoryVoters.every(
-    (voter) => ballots.get(voter.asString()) === VoteChoice.Allow
+    (voter) => ballots.get(voter.asStr()) === VoteChoice.Allow
   )
   const quorumMet =
     intent.policy.kind === "all"
@@ -227,11 +278,14 @@ function digestOf(body: Uint8Array): string {
   return bytesToHex(blake3(encodeNamed(new Map<string, unknown>([["body", body]]))))
 }
 
-function uniqueAgents(agents: readonly AgentId[], label: string): Set<string> {
+function uniqueAgents(
+  agents: readonly AgentId[],
+  duplicate: (voter: string) => IntentError
+): Set<string> {
   const unique = new Set<string>()
   for (const agent of agents) {
-    const value = agent.asString()
-    if (unique.has(value)) throw new IntentError(`${label} voter '${value}' appears more than once`)
+    const value = agent.asStr()
+    if (unique.has(value)) throw duplicate(value)
     unique.add(value)
   }
   return unique

@@ -36,30 +36,32 @@ async def main() -> None:
         # reads the decoded AGDX command body and answers with a correlated AGDX
         # response, which is what a bridge's tasks/get and tool result read.
         async def a2a_worker(ctx, message):
-            prompt = bytes(message.agdx_body or message.payload).decode(errors="replace")
-            await ctx.respond_input(ls.Topics.RESPONSES, complete(prompt).encode())
+            prompt = bytes(message.body()).decode(errors="replace")
+            await ctx.respond_input(ls.AgentTopic.Responses, complete(prompt).encode())
 
         async def mcp_worker(ctx, message):
-            prompt = bytes(message.agdx_body or message.payload).decode(errors="replace")
-            await ctx.respond_input(ls.Topics.TOOL_RESULTS, complete(prompt).encode())
+            prompt = bytes(message.body()).decode(errors="replace")
+            await ctx.respond_input(ls.AgentTopic.ToolResults, complete(prompt).encode())
 
         # The human behind the interrupt gate: it resolves every request_input it is
         # handed with a correlated AGDX response. A real deployment routes this to a
         # UI or a person.
         async def approver(ctx, message):
-            await ctx.respond_input(ls.Topics.RESPONSES, b"approved")
+            await ctx.respond_input(ls.AgentTopic.Responses, b"approved")
 
         def spawn(agent_id, topic, handler):
             return laser.spawn_agent(agent_id, topic, handler, poll_interval_ms=10)
 
-        a2a_agent = spawn("assistant", ls.Topics.COMMANDS, a2a_worker)
-        mcp_agent = spawn("tool-runner", ls.Topics.TOOL_CALLS, mcp_worker)
-        approver_agent = spawn("approver", ls.Topics.HUMAN_INPUT, approver)
+        a2a_agent = spawn("assistant", ls.AgentTopic.Commands, a2a_worker)
+        mcp_agent = spawn("tool-runner", ls.AgentTopic.ToolCalls, mcp_worker)
+        approver_agent = spawn("approver", ls.AgentTopic.HumanInput, approver)
 
         async with a2a_agent, mcp_agent, approver_agent:
             # A2A: SendMessage publishes the task, the worker answers, GetTask completes.
             _common.phase("A2A: SendMessage -> GetTask")
-            a2a = laser.a2a_bridge("a2a-gateway", ls.Topics.COMMANDS, ls.Topics.RESPONSES)
+            a2a = ls.A2aBridge(
+                laser, "a2a-gateway", ls.AgentTopic.Commands, ls.AgentTopic.Responses
+            )
             params = {"message": {"role": "user", "parts": [{"kind": "text", "text": "summarize"}]}}
             task = await a2a.submit(params)
             completed = None
@@ -76,10 +78,11 @@ async def main() -> None:
 
             # MCP: tools/call reaches the same worker and renders the answer as a tool result.
             _common.phase("MCP: initialize / tools/list / tools/call")
-            mcp = laser.mcp_bridge(
+            mcp = ls.McpBridge(
+                laser,
                 "mcp-gateway",
-                ls.Topics.TOOL_CALLS,
-                ls.Topics.TOOL_RESULTS,
+                ls.AgentTopic.ToolCalls,
+                ls.AgentTopic.ToolResults,
                 "laser-mcp",
                 tools=[
                     {
@@ -100,14 +103,14 @@ async def main() -> None:
             # conversation as AG-UI events straight off the log.
             _common.phase("AG-UI: render a chat stream as events")
             conversation = ls.new_conversation_id()
-            correlation = ls.new_correlation_id()
-            stream = laser.agdx(ls.Topics.LLM_IO, "assistant", conversation).stream(
+            correlation = ls.mint_ulid()
+            stream = laser.agdx(ls.AgentTopic.LlmIo, "assistant", conversation).stream(
                 correlation, "chat"
             )
             for token in complete("give a one-line status update").split(" "):
                 await stream.write((token + " ").encode())
             await stream.finish(finish_reason="stop")
-            events = await laser.agui_events(conversation, ls.Topics.LLM_IO)
+            events = await laser.agui_events(conversation, ls.AgentTopic.LlmIo)
             print(f"AG-UI rendered {len(events)} event(s) from the chat stream")
 
             # HITL: the orchestrator pauses for a human decision with the typed AGDX
@@ -115,9 +118,9 @@ async def main() -> None:
             # a correlated response. Built on AGDX command/response, riding the same log.
             _common.phase("Human-in-the-loop: request_input -> respond_input")
             conversation = ls.new_conversation_id()
-            gate = laser.agdx(ls.Topics.HUMAN_INPUT, "orchestrator", conversation)
+            gate = laser.agdx(ls.AgentTopic.HumanInput, "orchestrator", conversation)
             decision = await gate.request_input(
-                ls.Topics.RESPONSES, b"approve draining node-7?", timeout_secs=15.0
+                ls.AgentTopic.Responses, b"approve draining node-7?", timeout_secs=15.0
             )
             print(f"HITL decision: {bytes(decision).decode(errors='replace')}")
     finally:

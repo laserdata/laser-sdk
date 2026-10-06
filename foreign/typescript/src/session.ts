@@ -3,7 +3,7 @@ import type { BytesLike } from "./client/bytes.js"
 import type { GraphHandle } from "./managed/graph.js"
 import {
   type Checkpoint,
-  ContextChain,
+  Chain,
   LastN,
   TokenBudget,
   type ContextMessage,
@@ -61,60 +61,96 @@ export function sessionTurnText(turn: SessionTurn): string {
   return new TextDecoder().decode(turn.message.payload)
 }
 
-/** How a `Sessions` factory lays its sessions out on the log. The defaults
- * are the conversation-level agent topics on the connection's default stream.
- * A fleet of agents that must not share a topic's partitions with another
- * fleet points its kinds at its own topics, or the whole factory at its own
- * stream. Every kind needs a topic of its own: a turn's kind is its topic. */
-export interface SessionOptions {
+// How a `Sessions` factory lays its sessions out on the log.
+interface SessionLayout {
   readonly stream?: string
-  readonly topics?: Partial<Readonly<Record<SessionTurnKind, string>>>
-  readonly memoryNamespace?: string
-  readonly contextTurns?: number
-  readonly contextTokens?: number
-}
-
-export class SessionConfig {
-  readonly stream: string | undefined
   readonly topics: Readonly<Record<SessionTurnKind, string>>
   readonly memoryNamespace: string
   readonly contextTurns: number
   readonly contextTokens: number
+}
 
-  constructor(options: SessionOptions = {}) {
-    this.stream = options.stream
-    this.topics = { ...TURN_TOPICS, ...options.topics }
-    this.memoryNamespace = options.memoryNamespace ?? DEFAULT_SESSION_MEMORY_NAMESPACE
-    this.contextTurns = options.contextTurns ?? DEFAULT_SESSION_CONTEXT_TURNS
-    this.contextTokens = options.contextTokens ?? DEFAULT_SESSION_CONTEXT_TOKENS
-    const owners = new Map<string, SessionTurnKind>()
-    for (const kind of Object.keys(this.topics) as SessionTurnKind[]) {
-      const topic = this.topics[kind]
-      const other = owners.get(topic)
-      if (other !== undefined) {
-        throw new InvalidError(
-          `session turn kinds ${other} and ${kind} share topic ${topic}, each kind needs its own topic`
-        )
-      }
-      owners.set(topic, kind)
-    }
+/** How a `Sessions` factory lays its sessions out on the log. The defaults
+ * are the conversation-level agent topics on the connection's default stream.
+ * A fleet of agents that must not share a topic's partitions with another
+ * fleet points its kinds at its own topics, or the whole factory at its own
+ * stream. Every kind needs a topic of its own: a turn's kind is its topic.
+ * The config is a value: each setter returns a new config, so a config shared
+ * by a `Sessions` factory never changes under it. */
+export class SessionConfig {
+  private layout: SessionLayout = {
+    topics: TURN_TOPICS,
+    memoryNamespace: DEFAULT_SESSION_MEMORY_NAMESPACE,
+    contextTurns: DEFAULT_SESSION_CONTEXT_TURNS,
+    contextTokens: DEFAULT_SESSION_CONTEXT_TOKENS
+  }
+
+  /** Lay sessions out on `stream` instead of the connection's default stream. */
+  stream(stream: string): SessionConfig {
+    return this.with({ stream })
+  }
+
+  /** Ride `kind` on `topic`. A turn's kind is its topic, so every kind needs a
+   * topic of its own: `laser.sessions` rejects a layout where two kinds share one. */
+  topic(kind: SessionTurnKind, topic: string): SessionConfig {
+    return this.with({ topics: { ...this.layout.topics, [kind]: topic } })
+  }
+
+  /** The memory namespace `Session.memory` opens. */
+  memoryNamespace(namespace: string): SessionConfig {
+    return this.with({ memoryNamespace: namespace })
+  }
+
+  /** The turn bound of `Session.context`. */
+  contextTurns(turns: number): SessionConfig {
+    return this.with({ contextTurns: turns })
+  }
+
+  /** The estimated token bound of `Session.context`. */
+  contextTokens(tokens: number): SessionConfig {
+    return this.with({ contextTokens: tokens })
+  }
+
+  /** The stream sessions ride, or `undefined` for the connection's default stream. */
+  get streamName(): string | undefined {
+    return this.layout.stream
+  }
+
+  /** The memory namespace `Session.memory` opens. */
+  get memoryNamespaceName(): string {
+    return this.layout.memoryNamespace
+  }
+
+  /** The turn bound of `Session.context`. */
+  get contextTurnBound(): number {
+    return this.layout.contextTurns
+  }
+
+  /** The estimated token bound of `Session.context`. */
+  get contextTokenBound(): number {
+    return this.layout.contextTokens
   }
 
   /** The topic `kind` rides. */
   topicFor(kind: SessionTurnKind): string {
-    return this.topics[kind]
+    return this.layout.topics[kind]
   }
 
   /** The kind that rides `topic`, or `undefined` outside this layout. */
   kindFor(topic: string): SessionTurnKind | undefined {
-    return (Object.keys(this.topics) as SessionTurnKind[]).find(
-      (kind) => this.topics[kind] === topic
-    )
+    const topics = this.layout.topics
+    return (Object.keys(topics) as SessionTurnKind[]).find((kind) => topics[kind] === topic)
   }
 
   /** Every topic this layout reads, in kind order. */
-  get topicList(): readonly string[] {
-    return Object.values(this.topics)
+  topics(): readonly string[] {
+    return Object.values(this.layout.topics)
+  }
+
+  private with(change: Partial<SessionLayout>): SessionConfig {
+    const next = new SessionConfig()
+    next.layout = { ...this.layout, ...change }
+    return next
   }
 }
 
@@ -122,13 +158,19 @@ export class SessionConfig {
 export class Sessions {
   readonly config: SessionConfig
 
-  constructor(
+  private constructor(
     private readonly laser: Laser,
-    options: SessionOptions = {}
+    config: SessionConfig = new SessionConfig()
   ) {
-    this.config = new SessionConfig(options)
-    this.laser =
-      this.config.stream === undefined ? laser : laser.withDefaultStream(this.config.stream)
+    this.config = config
+    validateLayout(this.config)
+    const stream = this.config.streamName
+    this.laser = stream === undefined ? laser : laser.withDefaultStream(stream)
+  }
+
+  /** @internal */
+  static create(laser: Laser, config?: SessionConfig): Sessions {
+    return new Sessions(laser, config)
   }
 
   /** The durable session named `id`. The conversation derives from `id`, so
@@ -146,7 +188,7 @@ export class Sessions {
   /** The session over an existing conversation: one minted by `start`, carried
    * by an inbound message's provenance, or a sub-conversation. */
   open(conversation: ConversationId): Session {
-    return new Session(new ContextScope(this.laser, conversation), this.config)
+    return Session.create(ContextScope.create(this.laser, conversation), this.config)
   }
 }
 
@@ -155,10 +197,15 @@ export class Sessions {
  * is the conversation's scoped memory, and a `Checkpoint` bounds point-in-time
  * and incremental replay. Build it with `laser.sessions()`. */
 export class Session {
-  constructor(
+  private constructor(
     readonly scope: ContextScope,
     readonly config: SessionConfig = new SessionConfig()
   ) {}
+
+  /** @internal */
+  static create(scope: ContextScope, config: SessionConfig = new SessionConfig()): Session {
+    return new Session(scope, config)
+  }
 
   get conversation(): ConversationId {
     return this.scope.conversation
@@ -172,19 +219,19 @@ export class Session {
    * topics, trimmed to the configured estimated token bound. */
   context(): Promise<readonly SessionTurn[]> {
     return this.contextWith(
-      new ContextChain([
-        new LastN(this.config.contextTurns),
-        new TokenBudget(this.config.contextTokens)
+      new Chain([
+        new LastN(this.config.contextTurnBound),
+        new TokenBudget(this.config.contextTokenBound)
       ])
     )
   }
 
   async contextWith(policy: ContextPolicy): Promise<readonly SessionTurn[]> {
-    return this.turnsOf(await this.scope.fetchWith(this.config.topicList, policy))
+    return this.turnsOf(await this.scope.fetchWith(this.config.topics(), policy))
   }
 
   /** This session's memory in the configured namespace, scoped to the conversation. */
-  memory(namespace: string = this.config.memoryNamespace): ScopedMemory {
+  memory(namespace: string = this.config.memoryNamespaceName): ScopedMemory {
     return this.scope.memory(namespace)
   }
 
@@ -196,7 +243,7 @@ export class Session {
   /** Where this session's topics end right now. Persist it and hand it to
    * `turnsAt`, `turnsSince`, `stateAt`, or `replay`. */
   checkpoint(): Promise<Checkpoint> {
-    return this.scope.checkpoint(this.config.topicList)
+    return this.scope.checkpoint(this.config.topics())
   }
 
   /** The turns up to `checkpoint`. */
@@ -230,10 +277,13 @@ export class Session {
   private async turns(bound: ReplayBound): Promise<readonly SessionTurn[]> {
     return this.turnsOf(
       await this.scope.state(
-        this.config.topicList,
+        this.config.topics(),
         bound,
         [] as ContextMessage[],
-        (acc, message) => [...acc, message]
+        (acc, message) => {
+          acc.push(message)
+          return acc
+        }
       )
     )
   }
@@ -243,5 +293,19 @@ export class Session {
       const kind = this.config.kindFor(message.topic)
       return kind === undefined ? [] : [{ kind, message }]
     })
+  }
+}
+
+function validateLayout(config: SessionConfig): void {
+  const owners = new Map<string, SessionTurnKind>()
+  for (const kind of Object.keys(TURN_TOPICS) as SessionTurnKind[]) {
+    const topic = config.topicFor(kind)
+    const other = owners.get(topic)
+    if (other !== undefined) {
+      throw new InvalidError(
+        `session turn kinds ${other} and ${kind} share topic ${topic}, each kind needs its own topic`
+      )
+    }
+    owners.set(topic, kind)
   }
 }

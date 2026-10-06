@@ -16,7 +16,7 @@ void test("given_a_sent_message_when_polled_back_through_the_raw_client_then_sho
 
     await topic.send(new TextEncoder().encode("hello from laser-sdk"))
 
-    const reply = await laser.iggyClient.message.poll({
+    const reply = await laser.client.message.poll({
       streamId: streamName,
       topicId: "events",
       consumer: Consumer.Single,
@@ -49,7 +49,7 @@ void test("given_a_topic_batch_call_when_sent_then_should_deliver_every_message_
     assert.equal(committed.confirmations.length, 1)
     assert.equal(committed.confirmations[0]?.partitionId, 0)
 
-    const reply = await laser.iggyClient.message.poll({
+    const reply = await laser.client.message.poll({
       streamId: streamName,
       topicId: "events",
       consumer: Consumer.Single,

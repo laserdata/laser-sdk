@@ -3,17 +3,19 @@ import { test } from "node:test"
 import type { Capabilities } from "../../src/client/capabilities.js"
 import { managedCapabilitiesFrom } from "../../src/client/capabilities.js"
 import {
-  AmbiguousMutationError,
+  ConfigError,
   InvalidError,
-  TransportError,
+  KvExecutionError,
   UnsupportedError
 } from "../../src/client/errors.js"
+import { isUnsupported } from "../../src/client/error-classify.js"
 import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Laser } from "../../src/client/laser.js"
 import type { IggyClient } from "../../src/iggy/apache-iggy.js"
+import { FencedLeaseClient, LeaseCoordinator } from "../../src/managed/coordination.js"
 import { Kv } from "../../src/managed/kv.js"
 import { encodeBatchReply } from "../../src/wire/batch.js"
-import { encodeNamed } from "../../src/wire/cbor.js"
+import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   KvCasCommand,
   KvCasFencedCommand,
@@ -22,8 +24,8 @@ import {
   KvMoveCommand,
   KvSetCommand
 } from "../../src/wire/commands.js"
-import { type KvOutcome, type KvReply, encodeKvReply } from "../../src/wire/kv.js"
-import { MIN_LEASE_TTL_MICROS } from "../../src/wire/limits.js"
+import { type KvOutcome, type KvReply, decodeKvScan, encodeKvReply } from "../../src/wire/kv.js"
+import { MAX_SCAN_LIMIT, MIN_LEASE_TTL_MICROS } from "../../src/wire/limits.js"
 import { encode as encodeMessagePack } from "@msgpack/msgpack"
 
 // The shortest lifetime the contract will accept, and twice it for a request the
@@ -82,7 +84,7 @@ function fakeTransport(scriptedReplies: readonly Uint8Array[]): {
 
 function kv(namespace: string, replies: readonly Uint8Array[], capabilities: Capabilities = CAPS) {
   const transport = fakeTransport(replies)
-  return { kv: new Kv(transport, () => Promise.resolve(capabilities), namespace), transport }
+  return { kv: Kv.create(transport, () => Promise.resolve(capabilities), namespace), transport }
 }
 
 void test("given_a_value_outcome_when_get_entry_is_called_then_should_decode_the_entry", async () => {
@@ -222,76 +224,54 @@ void test("given_a_versioned_outcome_when_patch_is_called_then_should_return_the
   assert.equal(await store.patch(Uint8Array.of(1), Uint8Array.of(9)), 7n)
 })
 
-void test("given_a_leased_outcome_when_lease_is_called_then_should_return_the_token_ttl_and_position", async () => {
-  const position = { topicGeneration: 1n, partition: 0, offset: 512n }
-  const { kv: store, transport } = kv(
-    "sessions",
-    [okFrame({ kind: "leased", leaseToken: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })],
-    CAS_CAPS
-  )
-  const lease = await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS)
-  assert.deepEqual(lease, { token: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })
-  assert.equal(transport.calls[0]?.options?.retryAfterReconnect, false)
-})
-
-void test("given_a_laser_kv_acquire_when_sent_then_should_preserve_the_no_replay_option", async () => {
+void test("given_an_injected_client_when_a_laser_kv_lease_is_acquired_then_should_refuse_without_a_connection_string", async () => {
   const client = {
     clientProvider: () => Promise.resolve({}),
     destroy: () => Promise.resolve()
   } as unknown as IggyClient
-  await using laser = await Laser.fromIggyClient(client, { capabilities: CAS_CAPS })
-  let retryAfterReconnect: boolean | undefined
-  laser[INTERNAL_TRANSPORT]().sendManaged = (_code, _payload, options) => {
-    retryAfterReconnect = options?.retryAfterReconnect
-    return Promise.resolve(
-      okFrame({
-        kind: "leased",
-        leaseToken: 42n,
-        grantedTtlMicros: MIN_TTL_MICROS,
-        position: { topicGeneration: 1n, partition: 0, offset: 512n }
-      })
-    )
+  await using laser = await Laser.builder().client(client).capabilities(CAS_CAPS).connect()
+  let sent = 0
+  laser[INTERNAL_TRANSPORT]().sendManaged = () => {
+    sent += 1
+    return Promise.reject(new Error("the shared connection must not acquire leases"))
   }
-
-  await laser.kv("sessions").lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS)
-
-  assert.equal(retryAfterReconnect, false)
+  await assert.rejects(
+    laser.kv("sessions").lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS),
+    ConfigError
+  )
+  assert.equal(sent, 0)
 })
 
-void test("given_an_ambiguous_acquire_when_lease_is_called_then_should_wait_before_returning_a_terminal_error", async () => {
-  let calls = 0
-  const transport = {
-    sendManaged() {
-      calls += 1
-      return Promise.reject(new TransportError("connection lost", true))
-    }
-  }
-  const store = new Kv(transport, () => Promise.resolve(CAS_CAPS), "sessions")
-  const started = performance.now()
+void test("given_a_lease_coordinator_when_lease_is_called_then_should_validate_and_acquire_through_it", async () => {
+  const position = { topicGeneration: 1n, partition: 0, offset: 7n }
+  const frames: Uint8Array[] = []
+  const coordinator = new LeaseCoordinator(
+    new FencedLeaseClient({
+      send: (_code, frame) => {
+        frames.push(frame)
+        return Promise.resolve(
+          okFrame({ kind: "leased", leaseToken: 5n, grantedTtlMicros: MIN_TTL_MICROS, position })
+        )
+      },
+      reset: () => Promise.resolve()
+    })
+  )
+  const shared = fakeTransport([])
+  const store = Kv.create(shared, () => Promise.resolve(CAS_CAPS), "sessions", coordinator)
+  const lease = await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS)
+  assert.deepEqual(lease, { token: 5n, grantedTtlMicros: MIN_TTL_MICROS, position })
+  assert.equal(frames.length, 1)
+  assert.equal(shared.calls.length, 0, "acquisition never rides the shared connection")
   await assert.rejects(
-    () => store.lease(Uint8Array.of(1), "worker-1", MIN_TTL_MICROS),
-    AmbiguousMutationError
+    store.lease(new Uint8Array(), "worker-1", REQUESTED_TTL_MICROS),
+    InvalidError
   )
-  assert.equal(calls, 1)
-  // The recovery wait is the whole requested TTL, not a token gesture.
-  assert.ok(performance.now() - started >= Number(MIN_TTL_MICROS) / 1_000)
-})
-
-void test("given_a_definite_transport_rejection_when_lease_is_called_then_should_preserve_it_without_ttl_recovery", async () => {
-  const denied = new TransportError("server rejected acquisition", false)
-  const store = new Kv(
-    { sendManaged: () => Promise.reject(denied) },
-    () => Promise.resolve(CAS_CAPS),
-    "sessions"
-  )
-
+  const unadvertised = Kv.create(shared, () => Promise.resolve(CAPS), "sessions", coordinator)
   await assert.rejects(
-    () => store.lease(Uint8Array.of(1), "worker-1", 60_000_000n),
-    (error) => {
-      assert.equal(error, denied)
-      return true
-    }
+    unadvertised.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS),
+    UnsupportedError
   )
+  assert.equal(frames.length, 1)
 })
 
 void test("given_a_renewed_outcome_when_renew_lease_is_called_then_should_return_the_same_token", async () => {
@@ -354,6 +334,35 @@ void test("given_scan_fetch_when_called_then_should_return_one_page", async () =
   const { kv: store } = kv("sessions", [okFrame({ kind: "page", page: { entries: [] } })])
   const page = await store.scan().fetch()
   assert.deepEqual(page.entries, [])
+})
+
+void test("given_a_scan_limit_when_set_then_should_clamp_to_the_cap_and_refuse_non_integers", async () => {
+  const { kv: store, transport } = kv("sessions", [
+    okFrame({ kind: "page", page: { entries: [] } })
+  ])
+  await store
+    .scan()
+    .limit(MAX_SCAN_LIMIT + 5)
+    .fetch()
+  const sent = decodeKvScan(
+    expectMap(decodeOne(transport.calls[0]?.payload ?? new Uint8Array(), "scan"), "scan"),
+    "scan"
+  )
+  assert.equal(sent.limit, MAX_SCAN_LIMIT)
+  for (const limit of [-1, 1.5, Number.NaN]) {
+    assert.throws(() => store.scan().limit(limit), InvalidError, String(limit))
+  }
+  assert.doesNotThrow(() => store.scan().limit(0))
+})
+
+void test("given_an_unsupported_kv_error_reply_when_called_then_should_keep_the_kv_class_and_classify_as_unsupported", async () => {
+  const { kv: store } = kv("sessions", [
+    replyFrame({ kind: "err", error: { kind: "unsupported", message: "not on this backend" } })
+  ])
+  await assert.rejects(
+    store.get(Uint8Array.of(1)),
+    (error: unknown) => error instanceof KvExecutionError && isUnsupported(error)
+  )
 })
 
 void test("given_an_invalid_namespace_when_a_call_is_made_then_should_reject_before_the_transport", async () => {

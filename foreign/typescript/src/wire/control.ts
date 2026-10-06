@@ -22,6 +22,44 @@ export interface IndexSchema {
   readonly inlinePayload: boolean
 }
 
+export class IndexSchemaBuilder {
+  private readonly fields: IndexField[] = []
+  private vectorPointer: string | undefined
+  private inline = false
+
+  /** Index the root-level JSON value `name` under the same index key. */
+  field(name: string): this {
+    this.fields.push({ name, pointer: `/${name}` })
+    return this
+  }
+
+  /** Index the JSON value at `pointer` (RFC 6901) under the index key `name`. */
+  fieldAt(name: string, pointer: string): this {
+    this.fields.push({ name, pointer })
+    return this
+  }
+
+  /** Extract the embedding vector from `pointer` instead of `/embedding`. */
+  vectorField(pointer: string): this {
+    this.vectorPointer = pointer
+    return this
+  }
+
+  /** Inline the payload by default for every record projected through this schema. */
+  inlinePayload(): this {
+    this.inline = true
+    return this
+  }
+
+  build(): IndexSchema {
+    return {
+      fields: [...this.fields],
+      ...(this.vectorPointer !== undefined ? { vectorField: this.vectorPointer } : {}),
+      inlinePayload: this.inline
+    }
+  }
+}
+
 export type ProjectionId = string & { readonly __projectionId: unique symbol }
 
 export function parseProjectionId(value: string): ProjectionId {
@@ -37,6 +75,10 @@ export type ProjectionKind =
   | { readonly kind: "row" }
   | { readonly kind: "graph" }
   | { readonly kind: "unrecognized"; readonly code: number }
+
+export function projectionKindIsRow(kind: ProjectionKind): boolean {
+  return kind.kind === "row"
+}
 
 export interface EntitySchema {
   readonly nodes: readonly NodeExtract[]
@@ -68,6 +110,121 @@ export interface Projection {
   readonly inlinePayloadDefault: boolean
 }
 
+export class ProjectionBuilder {
+  private readonly id: ProjectionId
+  private projectionName = ""
+  private projectionVersion = 1
+  private projectionKind: ProjectionKind = { kind: "row" }
+  private projectionContentType: ContentTypeValue = ContentType.Any
+  private fieldList: IndexField[] = []
+  private vectorPointer: string | undefined
+  private inlineExtraction = true
+  private entitySchema: EntitySchema | undefined
+  private inlineDefault = true
+
+  /** Starts a row projection that inlines the payload, at version 1, for any content type. */
+  constructor(id: string) {
+    this.id = parseProjectionId(id)
+  }
+
+  name(value: string): this {
+    this.projectionName = value
+    return this
+  }
+
+  version(value: number): this {
+    this.projectionVersion = value
+    return this
+  }
+
+  contentType(value: ContentTypeValue): this {
+    this.projectionContentType = value
+    return this
+  }
+
+  /** Replaces the whole index schema. */
+  extraction(value: IndexSchema): this {
+    this.fieldList = [...value.fields]
+    this.vectorPointer = value.vectorField
+    this.inlineExtraction = value.inlinePayload
+    return this
+  }
+
+  /** Makes this a graph projection with the given node and edge extraction plan. */
+  graph(schema: EntitySchema): this {
+    this.projectionKind = { kind: "graph" }
+    this.entitySchema = schema
+    return this
+  }
+
+  /** Indexes the root-level JSON value `name` under the same index key. */
+  field(name: string): this {
+    this.fieldList.push({ name, pointer: `/${name}` })
+    return this
+  }
+
+  /** Indexes each root-level JSON value in `names` under its own name. */
+  fields(names: Iterable<string>): this {
+    for (const name of names) this.field(name)
+    return this
+  }
+
+  /** Indexes the JSON value at `pointer` (RFC 6901) under the index key `name`. */
+  fieldAt(name: string, pointer: string): this {
+    this.fieldList.push({ name, pointer })
+    return this
+  }
+
+  /** Like `field`, with a storage type hint for columnar backends. */
+  fieldTyped(name: string, fieldType: FieldType): this {
+    this.fieldList.push({ name, pointer: `/${name}`, fieldType })
+    return this
+  }
+
+  /** Like `fieldAt`, with a storage type hint for columnar backends. */
+  fieldAtTyped(name: string, pointer: string, fieldType: FieldType): this {
+    this.fieldList.push({ name, pointer, fieldType })
+    return this
+  }
+
+  /** Extracts the embedding vector from `pointer`. */
+  vectorField(pointer: string): this {
+    this.vectorPointer = pointer
+    return this
+  }
+
+  /** Inlines the original payload alongside each row. This is already the default. */
+  inlinePayload(): this {
+    this.inlineDefault = true
+    this.inlineExtraction = true
+    return this
+  }
+
+  /** Keeps only the indexed values and leaves the payload on the log. */
+  indexOnly(): this {
+    this.inlineDefault = false
+    this.inlineExtraction = false
+    return this
+  }
+
+  build(): Projection {
+    return {
+      id: this.id,
+      name: this.projectionName,
+      version: this.projectionVersion,
+      kind: this.projectionKind,
+      contentType: this.projectionContentType,
+      extraction: {
+        fields: [...this.fieldList],
+        ...(this.vectorPointer !== undefined ? { vectorField: this.vectorPointer } : {}),
+        inlinePayload: this.inlineExtraction
+      },
+      ...(this.entitySchema !== undefined ? { entitySchema: this.entitySchema } : {}),
+      inlinePayloadDefault: this.inlineDefault
+    }
+  }
+}
+
 export type RetentionPolicy =
   | { readonly kind: "mirrorLog" }
   | { readonly kind: "keep" }
@@ -91,6 +248,87 @@ export interface ProjectionBinding {
   readonly retention?: RetentionPolicy
 }
 
+export class ProjectionBindingBuilder {
+  private sourceSelector: SourceSelector | undefined
+  private readonly allowed: ProjectionId[] = []
+  private defaultProjectionId: ProjectionId | undefined
+  private backendBinding: BackendBinding | undefined
+  private indexName: string | undefined
+  private notifyChanges = false
+  private retentionPolicy: RetentionPolicy | undefined
+
+  /** Sets the source stream and topic. Both are required. */
+  source(stream: string, topic: string): this {
+    this.sourceSelector = { stream, topic }
+    return this
+  }
+
+  selector(source: SourceSelector): this {
+    this.sourceSelector = source
+    return this
+  }
+
+  /** Allows records to route to this projection. */
+  allow(projection: string): this {
+    this.allowed.push(parseProjectionId(projection))
+    return this
+  }
+
+  /** The projection used when a record carries no projection reference. */
+  defaultProjection(projection: string): this {
+    this.defaultProjectionId = parseProjectionId(projection)
+    return this
+  }
+
+  /** Binds the operational index to an exact backend resource generation. */
+  backend(backend: BackendBinding): this {
+    this.backendBinding = backend
+    return this
+  }
+
+  /** How long the materialized rows live, independent of the source topic retention. */
+  retention(retention: RetentionPolicy): this {
+    this.retentionPolicy = retention
+    return this
+  }
+
+  /** The operational index name. Defaults to the source topic name. */
+  index(index: string): this {
+    this.indexName = index
+    return this
+  }
+
+  /** Publishes one change record per committed projector batch for this binding. */
+  notify(): this {
+    this.notifyChanges = true
+    return this
+  }
+
+  /** Throws `InvalidError` when no source was set. */
+  build(): ProjectionBinding {
+    const binding = this.tryBuild()
+    if (binding === undefined) throw new InvalidError("ProjectionBinding requires a source")
+    return binding
+  }
+
+  /** The binding, or `undefined` when no source was set. */
+  tryBuild(): ProjectionBinding | undefined {
+    const source = this.sourceSelector
+    if (source === undefined) return undefined
+    return {
+      source,
+      allowedProjections: [...this.allowed],
+      ...(this.defaultProjectionId !== undefined
+        ? { defaultProjection: this.defaultProjectionId }
+        : {}),
+      ...(this.backendBinding !== undefined ? { backend: this.backendBinding } : {}),
+      index: this.indexName ?? source.topic,
+      notify: this.notifyChanges,
+      ...(this.retentionPolicy !== undefined ? { retention: this.retentionPolicy } : {})
+    }
+  }
+}
+
 export type SchemaSource =
   | { readonly kind: "avro"; readonly schema: string }
   | {
@@ -106,6 +344,19 @@ export interface SchemaDef {
   readonly source: SchemaSource
   readonly name?: string
   readonly version?: number
+}
+
+export function schemaDefContentType(schema: SchemaDef): ContentTypeValue {
+  switch (schema.source.kind) {
+    case "avro":
+      return ContentType.Avro
+    case "protobuf":
+      return ContentType.Protobuf
+    case "jsonSchema":
+      return ContentType.Json
+    case "unknown":
+      return ContentType.Any
+  }
 }
 
 export type ControlCommand =

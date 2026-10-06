@@ -1,4 +1,4 @@
-import { AgentContext } from "./agent/context.js"
+import { AgentCtx } from "./agent/context.js"
 import type { AgentMessage } from "./agent/reliable-consumer.js"
 import { ADVERTISED_INBOX_ROUTE, type InboxRoute } from "./agent/router.js"
 import type { BytesLike } from "./client/bytes.js"
@@ -18,7 +18,7 @@ export function agentMessage(payload: BytesLike, provenance: Provenance): AgentM
   }
 }
 
-export function agentContext(
+export function agentCtx(
   laser: Laser,
   message: AgentMessage,
   options: {
@@ -26,8 +26,8 @@ export function agentContext(
     readonly respondOn?: string
     readonly inboxRoute?: InboxRoute
   } = {}
-): AgentContext {
-  return new AgentContext(laser, message, {
+): AgentCtx {
+  return AgentCtx.create(laser, message, {
     ...options,
     inboxRoute: options.inboxRoute ?? ADVERTISED_INBOX_ROUTE
   })

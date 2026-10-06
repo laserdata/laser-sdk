@@ -443,8 +443,8 @@ impl<'a> BatchPublishRequest<'a> {
     /// Without this, Iggy uses its balanced partitioner to choose one
     /// partition for the whole `send_messages` call. With it, every message
     /// lands on the same keyed partition, preserving per-key ordering.
-    pub fn partition_key(mut self, value: impl Into<String>) -> Self {
-        self.partition_key = Some(value.into());
+    pub fn partition_key(mut self, key: impl Into<String>) -> Self {
+        self.partition_key = Some(key.into());
         self
     }
 
@@ -628,35 +628,35 @@ impl<'a> BatchPublishRequest<'a> {
         self
     }
 
-    /// Append every `body` in `iter` encoded with `C`. Errors short-circuit
+    /// Append every `body` in `items` encoded with `C`. Errors short-circuit
     /// on the first encoding failure.
-    pub fn extend_encoded<C, I, T>(mut self, iter: I) -> Result<Self, LaserError>
+    pub fn extend_encoded<C, I, T>(mut self, items: I) -> Result<Self, LaserError>
     where
         I: IntoIterator<Item = T>,
         C: Codec<T>,
     {
-        for body in iter {
+        for body in items {
             self = self.add_encoded::<C, T>(&body)?;
         }
         Ok(self)
     }
 
-    /// Convenience: `.extend_encoded::<Json, _, _>(iter)`.
-    pub fn extend_json<I, T>(self, iter: I) -> Result<Self, LaserError>
+    /// Convenience: `.extend_encoded::<Json, _, _>(items)`.
+    pub fn extend_json<I, T>(self, items: I) -> Result<Self, LaserError>
     where
         I: IntoIterator<Item = T>,
         T: Serialize,
     {
-        self.extend_encoded::<Json, I, T>(iter)
+        self.extend_encoded::<Json, I, T>(items)
     }
 
-    /// Convenience: `.extend_encoded::<Msgpack, _, _>(iter)`.
-    pub fn extend_msgpack<I, T>(self, iter: I) -> Result<Self, LaserError>
+    /// Convenience: `.extend_encoded::<Msgpack, _, _>(items)`.
+    pub fn extend_msgpack<I, T>(self, items: I) -> Result<Self, LaserError>
     where
         I: IntoIterator<Item = T>,
         T: Serialize,
     {
-        self.extend_encoded::<Msgpack, I, T>(iter)
+        self.extend_encoded::<Msgpack, I, T>(items)
     }
 
     /// Number of records currently queued. Useful for callers that want to

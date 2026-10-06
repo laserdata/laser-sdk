@@ -5,6 +5,7 @@ import { CancelledError, InvalidError, TimeoutError } from "../../src/client/err
 import type { LaserTransport } from "../../src/iggy/apache-iggy.js"
 import type { FilteredReader, MatchedPage, MatchedRecord } from "../../src/managed/filters.js"
 import { Consumer } from "../../src/stream/consumer.js"
+import { withMessageJson } from "../../src/stream/message.js"
 
 function matched(offset: bigint): MatchedRecord {
   return {
@@ -12,8 +13,19 @@ function matched(offset: bigint): MatchedRecord {
     offset,
     frontier: 10n,
     evaluated: false,
-    payload: new Uint8Array([Number(offset)]),
-    headers: new Map(),
+    message: withMessageJson({
+      payload: new Uint8Array([Number(offset)]),
+      id: { partitionId: 0, offset },
+      partitionId: 0,
+      headers: new Map(),
+      position: { partitionId: 0, offset },
+      messageId: 0n,
+      checksum: 0n,
+      currentOffset: 10n,
+      timestampMicros: 0n,
+      originTimestampMicros: 0n,
+      headersMalformed: false
+    }),
     json: () => Number(offset)
   }
 }
@@ -52,12 +64,12 @@ void test("given_a_group_backlog_without_matches_when_next_times_out_then_should
       return Promise.resolve([undefined, true] as const)
     }
   } as unknown as FilteredReader
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     {} as LaserTransport,
     "stream",
     "topic",
     { kind: "group", name: "workers" },
-    { autoCommit: false, pollIntervalMs: 60_000 },
+    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 60_000 },
     reader
   )
   try {
@@ -83,17 +95,17 @@ void test("given_a_stalled_group_poll_when_next_times_out_then_should_keep_one_p
     },
     close: () => Promise.resolve()
   } as unknown as FilteredReader
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     {} as LaserTransport,
     "stream",
     "topic",
     { kind: "group", name: "workers" },
-    { autoCommit: false },
+    { commitPolicy: { kind: "disabled" } },
     reader
   )
   await assert.rejects(consumer.nextWithin(5), TimeoutError)
   finish?.([matchedPage([matched(0n)]), false])
-  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   assert.equal(rounds, 1, "a timed-out read resumes the same poll")
   await consumer.shutdown()
 })
@@ -111,12 +123,12 @@ void test(
       readRound: () => pending,
       close: () => Promise.resolve()
     } as unknown as FilteredReader
-    const consumer = new Consumer(
+    const consumer = Consumer.create(
       {} as LaserTransport,
       "stream",
       "topic",
       { kind: "group", name: "workers" },
-      { autoCommit: false },
+      { commitPolicy: { kind: "disabled" } },
       reader
     )
     const controller = new AbortController()
@@ -144,12 +156,12 @@ void test("given_a_stalled_group_poll_when_aborted_then_should_resume_its_late_r
     readRound: () => pending,
     close: () => Promise.resolve()
   } as unknown as FilteredReader
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     {} as LaserTransport,
     "stream",
     "topic",
     { kind: "group", name: "workers" },
-    { autoCommit: false },
+    { commitPolicy: { kind: "disabled" } },
     reader
   )
   const controller = new AbortController()
@@ -157,7 +169,7 @@ void test("given_a_stalled_group_poll_when_aborted_then_should_resume_its_late_r
   controller.abort()
   await assert.rejects(waiting, CancelledError)
   finish?.([matchedPage([matched(0n)]), false])
-  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   await consumer.shutdown()
 })
 
@@ -173,7 +185,7 @@ void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_
     handled: (record: MatchedRecord) => handled.push(record.offset),
     close: () => Promise.resolve()
   } as unknown as FilteredReader
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     {} as LaserTransport,
     "stream",
     "topic",
@@ -183,7 +195,7 @@ void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_
   )
   await assert.rejects(consumer.nextWithin(100, { signal: controller.signal }), CancelledError)
   assert.deepEqual(handled, [])
-  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   assert.deepEqual(handled, [], "delivery stays pending until the next call or shutdown")
   await consumer.shutdown()
   assert.deepEqual(handled, [0n])
@@ -198,7 +210,7 @@ void test("given_an_automatic_group_consumer_when_shutdown_with_buffered_records
     handled: (record: MatchedRecord) => handled.push(record.offset),
     close: () => Promise.resolve()
   } as unknown as FilteredReader
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     {} as LaserTransport,
     "stream",
     "topic",
@@ -206,9 +218,9 @@ void test("given_an_automatic_group_consumer_when_shutdown_with_buffered_records
     {},
     reader
   )
-  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   assert.deepEqual(handled, [])
-  assert.equal((await consumer.nextWithin(100)).offset, 1n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 1n)
   assert.deepEqual(handled, [0n])
   await consumer.shutdown()
   assert.deepEqual(handled, [0n, 1n], "offset two was never delivered")
@@ -223,7 +235,7 @@ void test("given_a_group_consumer_when_asynchronously_disposed_then_should_leave
       return Promise.resolve()
     }
   } as unknown as LaserTransport
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "stream",
     "topic",
@@ -248,15 +260,15 @@ void test("given_an_explicit_start_when_polling_multiple_batches_then_should_adv
       ])
     }
   } as unknown as LaserTransport
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "stream",
     "topic",
     { kind: "single", name: "reader", partitionId: 0 },
-    { startFrom: { kind: "offset", value: 4n }, autoCommit: false }
+    { startAt: { kind: "offset", value: 4n }, commitPolicy: { kind: "disabled" } }
   )
-  assert.equal((await consumer.nextWithin(100)).offset, 4n)
-  assert.equal((await consumer.nextWithin(100)).offset, 5n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 4n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 5n)
   assert.deepEqual(starts, [
     { kind: "offset", value: 4n },
     { kind: "offset", value: 5n }
@@ -281,8 +293,11 @@ void test("given_anonymous_consumers_when_polling_then_should_use_distinct_uncom
     }
   } as unknown as LaserTransport
   for (let index = 0; index < 2; index += 1) {
-    const consumer = new Consumer(transport, "stream", "topic", { kind: "single", partitionId: 0 })
-    assert.equal((await consumer.nextWithin(100)).offset, 0n)
+    const consumer = Consumer.create(transport, "stream", "topic", {
+      kind: "single",
+      partitionId: 0
+    })
+    assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   }
   assert.notDeepEqual(seen[0]?.target, seen[1]?.target)
   assert.equal(
@@ -312,12 +327,12 @@ void test("given_group_replay_when_reading_several_partitions_then_should_keep_i
       ])
     }
   } as unknown as LaserTransport
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "stream",
     "topic",
     { kind: "group", name: "replay" },
-    { startFrom: { kind: "offset", value: 4n }, autoCommit: false }
+    { startAt: { kind: "offset", value: 4n }, commitPolicy: { kind: "disabled" } }
   )
   for (let index = 0; index < 4; index += 1) await consumer.nextWithin(100)
   assert.deepEqual(starts, [
@@ -326,4 +341,107 @@ void test("given_group_replay_when_reading_several_partitions_then_should_keep_i
     [0, { kind: "offset", value: 5n }],
     [1, { kind: "offset", value: 5n }]
   ])
+})
+
+void test("given_group_commit_policies_when_records_are_delivered_then_should_store_the_prefix_at_their_points", async () => {
+  const cases = [
+    { policy: { kind: "each" }, flushes: [1, 2, 3] },
+    { policy: { kind: "every", count: 2 }, flushes: [0, 1, 1] },
+    { policy: { kind: "all" }, flushes: [0, 0, 1] },
+    { policy: { kind: "polling" }, flushes: [0, 0, 1] }
+  ] as const
+  for (const { policy, flushes } of cases) {
+    let stored = 0
+    let served = false
+    const reader = {
+      owns: () => true,
+      handled: () => undefined,
+      flushCompleted: () => {
+        stored += 1
+        return Promise.resolve()
+      },
+      readRound: () => {
+        if (served) return Promise.resolve([undefined, false] as const)
+        served = true
+        return Promise.resolve([
+          matchedPage([matched(0n), matched(1n), matched(2n)]),
+          false
+        ] as const)
+      },
+      close: () => Promise.resolve()
+    } as unknown as FilteredReader
+    const consumer = Consumer.create(
+      {} as LaserTransport,
+      "stream",
+      "topic",
+      { kind: "group", name: "workers" },
+      { commitPolicy: policy },
+      reader
+    )
+    const seen: number[] = []
+    await consumer.nextWithin(100)
+    for (let read = 0; read < 3; read += 1) {
+      if (read < 2) await consumer.nextWithin(100)
+      else await assert.rejects(consumer.nextWithin(5), TimeoutError)
+      seen.push(stored)
+    }
+    assert.deepEqual(seen, flushes, policy.kind)
+    await consumer.shutdown()
+  }
+})
+
+void test("given_a_native_group_consumer_that_did_not_join_when_shut_down_then_should_not_leave_the_group", async () => {
+  let left = 0
+  const transport = {
+    leaveConsumerGroup: () => {
+      left += 1
+      return Promise.resolve()
+    }
+  } as unknown as LaserTransport
+  const joined = Consumer.create(transport, "s", "t", { kind: "group", name: "workers" })
+  const detached = Consumer.create(
+    transport,
+    "s",
+    "t",
+    { kind: "group", name: "workers" },
+    { autoJoinGroup: false }
+  )
+  await detached.shutdown()
+  assert.equal(left, 0)
+  await joined.shutdown()
+  assert.equal(left, 1)
+})
+
+void test("given_no_poll_interval_when_a_native_poll_is_empty_then_should_poll_again_without_waiting", async () => {
+  let polls = 0
+  const transport = {
+    pollMessages: () => {
+      polls += 1
+      return Promise.resolve([])
+    }
+  } as unknown as LaserTransport
+  const consumer = Consumer.create(transport, "s", "t", {
+    kind: "single",
+    partitionId: 0,
+    name: "metrics"
+  })
+  await assert.rejects(consumer.nextWithin(50), TimeoutError)
+  assert.ok(polls > 5, `polled ${String(polls)} times in 50 ms`)
+  await consumer.shutdown()
+})
+
+void test("given_a_zero_polling_retry_interval_when_built_then_should_reject_it", () => {
+  assert.throws(
+    () =>
+      Consumer.create(
+        {} as LaserTransport,
+        "s",
+        "t",
+        { kind: "single", partitionId: 0 },
+        {
+          pollingRetryIntervalMs: 0
+        }
+      ),
+    InvalidError
+  )
 })

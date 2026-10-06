@@ -4,11 +4,11 @@ This example sends host CPU readings to a live fleet-view reader and a reading-h
 
 ## What it does
 
-1. Generates the Rust and Python reading model from one deterministic random walk: host, integer CPU percentage, sample count, health level, exact weighted CPU total, `message_type`, and timestamp.
+1. Generates the same reading model as the Rust and Python examples from one deterministic random walk: host, integer CPU percentage, sample count, health level, exact weighted CPU total, `message_type`, and timestamp.
 2. Publishes the readings to `metrics_feed` in paced batches while a named typed reader folds the live fleet view.
 3. Maintains last CPU, cumulative samples, weighted CPU total, sample-weighted mean CPU, and degraded readings per host without floating-point drift.
 4. Publishes the identical readings to the durable `readings` tape in bounded JSON batches.
-5. Registers the index-only `readings.v1` projection before publishing when query is available. Every tape batch explicitly calls `inlinePayload()`, so the managed row stores the body as well as the extracted columns.
+5. Registers the index-only `readings_<token>.v1` projection before publishing when query is available. Every tape batch explicitly calls `inlinePayload()`, so the managed row stores the body as well as the extracted columns.
 6. Queries per-host sample and weighted CPU sums, derives the mean CPU, and fetches one materialized payload through `READING_CODEC`.
 7. Replays only this run's durable tape as typed `Reading` values and verifies every host's weighted CPU total against the generated session.
 8. Registers the complete seven-field Avro writer schema, validates before transport I/O, publishes up to 500 readings to `readings_avro`, waits for materialization, and queries per-host weighted CPU totals on LaserData Cloud.
@@ -41,7 +41,7 @@ LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 
 ## Where to look (LaserData Cloud)
 
-- Query: the `readings` materialized tape, per-host sample and weighted CPU sums, and decodable inline payloads.
+- Query: the `readings_<token>` materialized tape (the run token keeps a rerun, or another language's example on the same deployment, out of this run's rows), per-host sample and weighted CPU sums, and decodable inline payloads.
 - Writer schemas: the allocated Avro schema used by `readings_avro`.
 - Messages: hot JSON readings on `metrics_feed`, durable JSON readings on `readings`, and validated Avro datums on `readings_avro`.
 - Bindings: the projection binding from the streaming topic to the managed table.

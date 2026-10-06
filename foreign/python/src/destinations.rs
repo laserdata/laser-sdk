@@ -5,16 +5,17 @@ use crate::errors::{InvalidError, to_pyerr};
 use laser_sdk::laser::Laser;
 use laser_sdk::wire::authz::SupervisorActorAssertion;
 use laser_sdk::wire::checkpoint::{
-    CheckpointOwnerId, CheckpointReadConsistency, CompletedAttempt, DestinationBlock,
-    DestinationBlockCode, DestinationListFilter, PreparedAttempt, PublicCheckpointMutation,
-    RepairRecord, RetentionGap,
+    CheckpointOwnerId, CheckpointReadConsistency, CheckpointRequestEnvelope, CheckpointRequestId,
+    CompletedAttempt, DestinationBlock, DestinationBlockCode, DestinationListFilter,
+    PreparedAttempt, PublicCheckpointMutation, RepairRecord, RetentionGap,
 };
 use laser_sdk::wire::destination::{
     DestinationDesiredState, DestinationId, MaterializationDestination, QueryRoute, QueryRouteId,
 };
 use laser_sdk::wire::schema::UuidValue;
+use laser_sdk::wire::source::SourceScope;
 use pyo3::prelude::*;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::str::FromStr;
 
 #[gen_stub_pymethods]
@@ -570,6 +571,61 @@ impl PyDestinations {
             Python::attach(|py| ser_to_py(py, &result))
         })
     }
+}
+
+/// Build the checkpoint request envelope dict `Laser.execute_checkpoint` takes,
+/// stamped with the checkpoint op version. `supervisor_assertion` attaches the
+/// signed supervisor actor a privileged mutation requires.
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (request_id, expected_global_state_revision, mutation, *, supervisor_assertion=None))]
+pub fn new_checkpoint_request_envelope(
+    py: Python<'_>,
+    request_id: &str,
+    expected_global_state_revision: u64,
+    mutation: &Bound<'_, PyAny>,
+    supervisor_assertion: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let request_id = CheckpointRequestId::from_str(request_id)
+        .map_err(|error| InvalidError::new_err(error.to_string()))?;
+    let mut envelope = CheckpointRequestEnvelope::new(
+        request_id,
+        expected_global_state_revision,
+        py_to_de(mutation)?,
+    );
+    if let Some(assertion) = supervisor_assertion {
+        envelope = envelope.with_supervisor_assertion(py_to_de(assertion)?);
+    }
+    ser_to_py(py, &envelope)
+}
+
+/// The `(feature, action)` grant a public checkpoint mutation dict requires.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn public_checkpoint_mutation_required_capability(
+    mutation: &Bound<'_, PyAny>,
+) -> PyResult<(String, String)> {
+    let mutation: PublicCheckpointMutation = py_to_de(mutation)?;
+    let (feature, action) = mutation.required_capability();
+    Ok((feature.to_string(), action.to_string()))
+}
+
+/// Build the `{"stream", "topic"}` source scope dict a destination reads from.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn new_source_scope(py: Python<'_>, stream: String, topic: String) -> PyResult<Py<PyAny>> {
+    ser_to_py(py, &SourceScope::new(stream, topic))
+}
+
+/// Check a supervisor actor assertion dict before sending it: version,
+/// nonzero identities, a validity window within the maximum lifetime, and
+/// the key id and signature lengths. Raises `InvalidError` on a violation.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn validate_supervisor_actor_assertion(assertion: &Bound<'_, PyAny>) -> PyResult<()> {
+    py_to_de::<SupervisorActorAssertion>(assertion)?
+        .validate()
+        .map_err(|error| InvalidError::new_err(error.to_string()))
 }
 
 fn parse_destination_id(value: &str) -> PyResult<DestinationId> {

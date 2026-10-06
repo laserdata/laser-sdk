@@ -7,11 +7,12 @@ import {
   type Projection,
   type ProjectionBinding,
   type QueryResult,
-  jsonCodec
+  Json
 } from "@laserdata/laser-sdk"
 
 import {
   batchSize,
+  indexFor,
   managedGate,
   messages,
   PARTITIONS,
@@ -27,6 +28,10 @@ export const EXAMPLE = "fleet-tape"
 const FEED = "metrics_feed"
 const TAPE = "readings"
 const AVRO_TAPE = "readings_avro"
+// Index names carry this run's token, so a rerun or another language's example on
+// the same deployment never shares their rows.
+const TAPE_INDEX = indexFor(TAPE)
+const AVRO_TAPE_INDEX = indexFor(AVRO_TAPE)
 const HOST = "host"
 const CPU = "cpu"
 const SAMPLES = "samples"
@@ -92,7 +97,7 @@ function decodeReading(value: unknown): Reading {
   }
 }
 
-const READING_CODEC = jsonCodec(decodeReading)
+const READING_CODEC = new Json(decodeReading)
 
 function readings(count: number): readonly Reading[] {
   const rng = new Rng(0x123456789abcdef0n)
@@ -119,13 +124,14 @@ function readings(count: number): readonly Reading[] {
 async function registerTape(
   laser: Laser,
   topic: string,
+  index: string,
   contentType: ContentType,
   inlinePayloadDefault = false
 ): Promise<void> {
-  const id = parseProjectionId(`${topic}.v1`)
+  const id = parseProjectionId(`${index}.v1`)
   const projection: Projection = {
     id,
-    name: topic,
+    name: index,
     version: 1,
     kind: { kind: "row" },
     contentType,
@@ -139,7 +145,7 @@ async function registerTape(
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    index: topic,
+    index,
     notify: true
   }
   await laser.projections().register(projection)
@@ -196,12 +202,9 @@ async function streamLiveView(
   values: readonly Reading[],
   size: number
 ): Promise<void> {
-  const records = await laser
-    .topic(FEED)
-    .json(READING_CODEC)
-    .records("fleet-tape-builder", {
-      batchSize: Math.max(size, 256)
-    })
+  const records = (await laser.topic(FEED).json(READING_CODEC).records("fleet-tape-builder")).batch(
+    Math.max(size, 256)
+  )
   const publishing = publishFeed(laser, values, size)
   const view = new Map<string, HostLoad>()
   let seen = 0
@@ -290,8 +293,8 @@ function groupTotals(result: QueryResult): ReadonlyMap<string, bigint> {
 }
 
 async function reportSamplesAndMean(laser: Laser): Promise<void> {
-  const samples = groupTotals(await laser.query(TAPE).sum(SAMPLES).groupBy([HOST]).fetch())
-  const cpuTotal = groupTotals(await laser.query(TAPE).sum(CPU_TOTAL).groupBy([HOST]).fetch())
+  const samples = groupTotals(await laser.query(TAPE_INDEX).sum(SAMPLES).groupBy([HOST]).fetch())
+  const cpuTotal = groupTotals(await laser.query(TAPE_INDEX).sum(CPU_TOTAL).groupBy([HOST]).fetch())
   printTable([
     ["host", "samples", "mean cpu"],
     ...[...samples]
@@ -303,7 +306,7 @@ async function reportSamplesAndMean(laser: Laser): Promise<void> {
       })
   ])
 
-  const payload = await laser.query(TAPE).fetchOne(READING_CODEC)
+  const payload = await laser.query(TAPE_INDEX).fetchOne(READING_CODEC)
   if (payload === undefined) throw new Error("materialized reading tape returned no payload")
   console.log(`payload round trip: ${payload.host} cpu ${String(payload.cpu)}% ${payload.level}`)
 }
@@ -336,15 +339,17 @@ async function publishAvroTape(
     .send()
   const avro = laser.topic(AVRO_TAPE)
   await avro.ensure(PARTITIONS)
-  await registerTape(laser, AVRO_TAPE, ContentType.Avro, true)
+  await registerTape(laser, AVRO_TAPE, AVRO_TAPE_INDEX, ContentType.Avro, true)
   await waitForSchema(laser, schemaId)
   const typed = await avro.schema(schemaId, decodeReading)
   const subset = values.slice(0, AVRO_READINGS_CAP)
   for (let start = 0; start < subset.length; start += size) {
     await typed.publishBatch(subset.slice(start, start + size))
   }
-  await waitForProjection(laser, AVRO_TAPE, subset.length)
-  const totals = groupTotals(await laser.query(AVRO_TAPE).sum(CPU_TOTAL).groupBy([HOST]).fetch())
+  await waitForProjection(laser, AVRO_TAPE_INDEX, subset.length)
+  const totals = groupTotals(
+    await laser.query(AVRO_TAPE_INDEX).sum(CPU_TOTAL).groupBy([HOST]).fetch()
+  )
   printTable([
     ["host", "Avro weighted CPU total"],
     ...[...totals]
@@ -362,7 +367,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   phase("warming up")
   await laser.topic(FEED).ensure(PARTITIONS)
   await laser.topic(TAPE).ensure(PARTITIONS)
-  if (capabilities.query.available) await registerTape(laser, TAPE, ContentType.Json)
+  if (capabilities.query.available) await registerTape(laser, TAPE, TAPE_INDEX, ContentType.Json)
 
   phase("streaming a live telemetry feed")
   console.log(`${String(count)} readings across ${String(OPENING.length)} hosts`)
@@ -373,7 +378,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   await publishTape(laser, values, chunk)
 
   if (managedGate(capabilities, "query", EXAMPLE)) {
-    await waitForProjection(laser, TAPE, values.length)
+    await waitForProjection(laser, TAPE_INDEX, values.length)
     phase("reading-tape analytics")
     await reportSamplesAndMean(laser)
   }

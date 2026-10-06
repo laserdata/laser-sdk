@@ -222,26 +222,21 @@ impl ScopedMemory {
     /// One consolidation pass over this conversation, keeping the most relevant
     /// `max_items`.
     pub async fn consolidate(&self, max_items: usize) -> Result<ConsolidationReport, LaserError> {
-        let scope = MemoryScope::builder()
-            .conversation(self.conversation)
-            .build();
-        self.handle.consolidate(&scope, max_items).await
+        self.handle.consolidate(&self.scope(), max_items).await
     }
 
-    /// Forget the item `id` in this conversation.
+    /// Forget the item `id`. The item is addressed by id alone, so an item
+    /// remembered in another conversation is forgotten too. The conversation
+    /// only stamps the tombstone's provenance.
     pub async fn forget(&self, id: MemoryId) -> Result<(), LaserError> {
         self.handle.forget(&self.scope(), id).await
     }
 
-    /// Record `feedback` on a recalled item in this conversation.
+    /// Record `feedback` on the item it targets, addressed by id alone like
+    /// [`forget`](Self::forget). The conversation only stamps the feedback
+    /// record's provenance.
     pub async fn improve(&self, feedback: Feedback) -> Result<MemoryId, LaserError> {
         self.handle.improve(&self.scope(), feedback).await
-    }
-
-    fn scope(&self) -> MemoryScope {
-        MemoryScope::builder()
-            .conversation(self.conversation)
-            .build()
     }
 
     /// The underlying handle, for the cross-conversation verbs this scoped face
@@ -253,5 +248,50 @@ impl ScopedMemory {
     /// This scoped memory's conversation id.
     pub fn conversation(&self) -> ConversationId {
         self.conversation
+    }
+
+    fn scope(&self) -> MemoryScope {
+        MemoryScope::builder()
+            .conversation(self.conversation)
+            .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::Embedder;
+
+    struct UnitEmbedder;
+
+    impl Embedder for UnitEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, LaserError> {
+            Ok(vec![1.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn given_an_item_of_another_conversation_when_forgotten_through_a_scope_then_should_remove_it_by_id()
+     {
+        let owner = ConversationId::new();
+        let handle = MemoryHandle::vector(UnitEmbedder);
+        let id = handle
+            .remember("a fact")
+            .scope(owner)
+            .send()
+            .await
+            .expect("remember");
+        let elsewhere = ScopedMemory {
+            handle,
+            conversation: ConversationId::new(),
+        };
+        elsewhere.forget(id).await.expect("forget by id");
+        let left = elsewhere
+            .handle()
+            .recall(owner)
+            .fetch()
+            .await
+            .expect("recall");
+        assert!(left.is_empty(), "the scope does not guard ownership");
     }
 }

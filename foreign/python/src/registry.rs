@@ -1,20 +1,23 @@
 use crate::agent::{PyAgentMessage, PyProvenance};
-use crate::agent_runtime::static_topic;
+use crate::agent_runtime::{
+    ParsedRoutePolicy, inbox_route, route_policy, route_result, static_topic,
+};
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
 use crate::convert::{payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::PySigningKey;
-use laser_sdk::agent::{AgentScope, ConsumerRef, ConsumptionStatus, RegisteredCard};
+use laser_sdk::agent::{
+    AgentScope, CapabilitySelector, ConsumerRef, ConsumptionStatus, RegisteredCard, Router,
+};
 use laser_sdk::laser::Laser;
 use laser_sdk::query::QueryExecutionId;
 use laser_sdk::types::{AgentId, ConsumerGroupName, ConversationId, PrincipalId};
-use laser_sdk::wire::agent::{
-    AgentCard, AgentPresence, CapabilityDescriptor, ChannelId, LogPosition,
-};
+use laser_sdk::wire::agent::{AgentCard, AgentPresence, CapabilityDescriptor, ChannelId};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{
+    gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pyfunction, gen_stub_pymethods,
+};
 use std::str::FromStr;
 
 fn agent_id(value: String) -> PyResult<AgentId> {
@@ -142,8 +145,8 @@ impl PyLaser {
         )
     }
 
-    /// One page of live connections and their advertised metadata, as a dict
-    /// `{"clients": [...], "next_cursor": int | None}`. Pass `next_cursor` back
+    /// One page of live connections and their advertised metadata, as a
+    /// `ClientMetadataPage`. Pass its `next_cursor` back
     /// as `after` for the next page. `metadata_only` keeps connections that
     /// advertised metadata, and `principal` narrows to one authenticated user.
     #[pyo3(signature = (*, metadata_only=false, principal=None, limit=None, after=None))]
@@ -157,23 +160,38 @@ impl PyLaser {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         future_into_py(py, async move {
-            let mut request = laser.client_metadata().with_metadata_only(metadata_only);
-            if let Some(principal) = principal {
-                request = request.principal(PrincipalId::new(principal));
-            }
-            if let Some(limit) = limit {
-                request = request.limit(limit);
-            }
-            if let Some(after) = after {
-                request = request.after(after);
-            }
-            let page = request.page().await.map_err(to_pyerr)?;
+            let page = client_metadata_request(&laser, metadata_only, principal, limit, after)
+                .page()
+                .await
+                .map_err(to_pyerr)?;
             Python::attach(|py| {
-                let dict = PyDict::new(py);
-                dict.set_item("clients", ser_to_py(py, &page.clients)?)?;
-                dict.set_item("next_cursor", page.next_cursor)?;
-                Ok(dict.into_any().unbind())
+                Ok(PyClientMetadataPage {
+                    clients: ser_to_py(py, &page.clients)?,
+                    next_cursor: page.next_cursor,
+                })
             })
+        })
+    }
+
+    /// Every live connection and its advertised metadata, walking the pages
+    /// from `after` (or the start) until the cursor runs out. `limit` sizes
+    /// each page. Prefer `client_metadata` when the set may be large.
+    #[pyo3(signature = (*, metadata_only=false, principal=None, limit=None, after=None))]
+    fn client_metadata_all<'py>(
+        &self,
+        py: Python<'py>,
+        metadata_only: bool,
+        principal: Option<u32>,
+        limit: Option<u32>,
+        after: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.inner.clone();
+        future_into_py(py, async move {
+            let clients = client_metadata_request(&laser, metadata_only, principal, limit, after)
+                .all()
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &clients))
         })
     }
 
@@ -188,7 +206,8 @@ impl PyLaser {
 
     /// Reassemble a chunk stream from the log: read `conversation` on `topic`,
     /// take the chunk envelopes for `channel` in sequence order, and replay
-    /// them into ordered events (the same dicts `ChunkAssembler` returns).
+    /// them into ordered `StreamEvent` dicts, the ones `ChunkAssembler.feed`
+    /// returns.
     fn reassemble_channel<'py>(
         &self,
         py: Python<'py>,
@@ -211,55 +230,20 @@ impl PyLaser {
         })
     }
 
-    /// Whether a consumer has committed past a log position. Name the consumer
-    /// with exactly one of `group` or `consumer`. `position` is
-    /// `(stream_id, topic_id, partition_id, offset)`. Returns
-    /// `{"consumed": True, "committed": int, "head": int}` or
-    /// `{"consumed": False, "behind_by": int}`.
-    #[pyo3(signature = (position, *, group=None, consumer=None))]
+    /// Whether the `target` consumer has committed past the `LogPosition`
+    /// `at`. Returns a `ConsumptionStatus`.
     fn consumed<'py>(
         &self,
         py: Python<'py>,
-        position: (u32, u32, u32, u64),
-        group: Option<String>,
-        consumer: Option<String>,
+        target: &PyConsumerRef,
+        at: &crate::agdx::PyLogPosition,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let target = match (group, consumer) {
-            (Some(group), None) => {
-                ConsumerRef::Group(ConsumerGroupName::new(group).map_err(|e| to_pyerr(e.into()))?)
-            }
-            (None, Some(consumer)) => ConsumerRef::Consumer(consumer),
-            _ => {
-                return Err(InvalidError::new_err(
-                    "pass exactly one of group= or consumer=",
-                ));
-            }
-        };
-        let (stream_id, topic_id, partition_id, offset) = position;
-        let at = LogPosition {
-            stream_id,
-            topic_id,
-            partition_id,
-            offset,
-        };
+        let target = target.to_rust()?;
+        let at = at.inner;
         let laser = self.inner.clone();
         future_into_py(py, async move {
             let status = laser.consumed(target, at).await.map_err(to_pyerr)?;
-            Python::attach(|py| {
-                let dict = PyDict::new(py);
-                match status {
-                    ConsumptionStatus::Consumed { committed, head } => {
-                        dict.set_item("consumed", true)?;
-                        dict.set_item("committed", committed)?;
-                        dict.set_item("head", head)?;
-                    }
-                    ConsumptionStatus::NotYetConsumed { behind_by } => {
-                        dict.set_item("consumed", false)?;
-                        dict.set_item("behind_by", behind_by)?;
-                    }
-                }
-                Ok(dict.into_any().unbind())
-            })
+            Ok(PyConsumptionStatus::from(status))
         })
     }
 
@@ -344,25 +328,103 @@ impl PyLaser {
     }
 }
 
-pub(crate) fn card_to_py(py: Python<'_>, card: &RegisteredCard) -> PyResult<Py<PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item("agent", card.agent.as_str())?;
-    dict.set_item("card", ser_to_py(py, &card.card)?)?;
-    dict.set_item("observed_at_micros", card.observed_at_micros)?;
-    Ok(dict.into_any().unbind())
+/// One agent's latest card, with the time the registry folded it in. A card
+/// older than its `ttl_micros` is treated as a dead agent.
+#[gen_stub_pyclass]
+#[pyclass(name = "RegisteredCard", frozen)]
+pub struct PyRegisteredCard {
+    pub(crate) inner: RegisteredCard,
 }
 
-// The inverse of `card_to_py`, for the pure checks on a card dict.
-fn card_from_py(card: &Bound<'_, PyDict>) -> PyResult<RegisteredCard> {
-    let field = |name: &str| {
-        card.get_item(name)?
-            .ok_or_else(|| InvalidError::new_err(format!("registered card is missing '{name}'")))
-    };
-    Ok(RegisteredCard {
-        agent: agent_id(field("agent")?.extract()?)?,
-        card: py_to_de(&field("card")?)?,
-        observed_at_micros: field("observed_at_micros")?.extract()?,
-    })
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyRegisteredCard {
+    /// Build a registered card from `agent`, its `card` (a dict mirroring
+    /// `AgentCard`), and the epoch micros the registry observed it.
+    #[new]
+    fn new(agent: String, card: &Bound<'_, PyAny>, observed_at_micros: u64) -> PyResult<Self> {
+        Ok(Self {
+            inner: RegisteredCard {
+                agent: agent_id(agent)?,
+                card: py_to_de(card)?,
+                observed_at_micros,
+            },
+        })
+    }
+
+    #[getter]
+    fn agent(&self) -> String {
+        self.inner.agent.as_str().to_owned()
+    }
+
+    /// The card, as a dict mirroring `AgentCard`.
+    #[getter]
+    fn card(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.inner.card)
+    }
+
+    /// When the registry observed this card (epoch micros).
+    #[getter]
+    fn observed_at_micros(&self) -> u64 {
+        self.inner.observed_at_micros
+    }
+
+    /// Whether the card is still fresh at `now_micros`. A card without a time
+    /// to live never expires.
+    fn is_fresh(&self, now_micros: u64) -> bool {
+        self.inner.is_fresh(now_micros)
+    }
+
+    /// Whether the card advertises `skill_id`.
+    fn serves(&self, skill_id: &str) -> bool {
+        self.inner.serves(skill_id)
+    }
+
+    /// Whether the card advertises `skill_id` and does not report it
+    /// unavailable.
+    fn available_for(&self, skill_id: &str) -> bool {
+        self.inner.available_for(skill_id)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RegisteredCard(agent={}, observed_at_micros={})",
+            self.inner.agent, self.inner.observed_at_micros
+        )
+    }
+}
+
+impl From<&RegisteredCard> for PyRegisteredCard {
+    fn from(card: &RegisteredCard) -> Self {
+        Self {
+            inner: card.clone(),
+        }
+    }
+}
+
+/// One page of live connections plus the cursor to fetch the next, returned
+/// by `Laser.client_metadata`.
+#[gen_stub_pyclass]
+#[pyclass(name = "ClientMetadataPage", frozen)]
+pub struct PyClientMetadataPage {
+    clients: Py<PyAny>,
+    next_cursor: Option<u32>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyClientMetadataPage {
+    /// The connections on this page, each a dict mirroring `ClientMetadata`.
+    #[getter]
+    fn clients(&self, py: Python<'_>) -> Py<PyAny> {
+        self.clients.clone_ref(py)
+    }
+
+    /// The `after` for the next page, or `None` on the last page.
+    #[getter]
+    fn next_cursor(&self) -> Option<u32> {
+        self.next_cursor
+    }
 }
 
 /// The agent card registry read model. Build it with `Laser.agent_registry`.
@@ -387,26 +449,6 @@ impl PyAgentRegistry {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyAgentRegistry {
-    /// True when the registered `card` dict is within its time to live at
-    /// `now_micros`. A card without a time to live is always fresh.
-    #[staticmethod]
-    fn card_is_fresh(card: &Bound<'_, PyDict>, now_micros: u64) -> PyResult<bool> {
-        Ok(card_from_py(card)?.is_fresh(now_micros))
-    }
-
-    /// True when the registered `card` dict advertises `skill`.
-    #[staticmethod]
-    fn card_serves(card: &Bound<'_, PyDict>, skill: &str) -> PyResult<bool> {
-        Ok(card_from_py(card)?.serves(skill))
-    }
-
-    /// True when the registered `card` dict advertises `skill` and reports it
-    /// available.
-    #[staticmethod]
-    fn card_available_for(card: &Bound<'_, PyDict>, skill: &str) -> PyResult<bool> {
-        Ok(card_from_py(card)?.available_for(skill))
-    }
-
     /// Fold new registry records. `now_micros` defaults to the current time.
     /// Returns the number of records folded.
     #[pyo3(signature = (now_micros=None))]
@@ -433,20 +475,15 @@ impl PyAgentRegistry {
         })
     }
 
-    /// Every folded card, as `{"agent", "card", "observed_at_micros"}` dicts.
-    fn agents(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
-        self.read(|registry| registry.agents().map(|card| card_to_py(py, card)).collect())
+    /// Every folded card.
+    fn agents(&self) -> PyResult<Vec<PyRegisteredCard>> {
+        self.read(|registry| Ok(registry.agents().map(PyRegisteredCard::from).collect()))
     }
 
     /// The folded card for `agent`, or `None`.
-    fn lookup(&self, py: Python<'_>, agent: String) -> PyResult<Option<Py<PyAny>>> {
+    fn lookup(&self, agent: String) -> PyResult<Option<PyRegisteredCard>> {
         let agent = agent_id(agent)?;
-        self.read(|registry| {
-            registry
-                .lookup(&agent)
-                .map(|card| card_to_py(py, card))
-                .transpose()
-        })
+        self.read(|registry| Ok(registry.lookup(&agent).map(PyRegisteredCard::from)))
     }
 
     /// The fresh, unquarantined cards advertising `skill_id` at `now_micros`
@@ -454,17 +491,16 @@ impl PyAgentRegistry {
     #[pyo3(signature = (skill_id, now_micros=None))]
     fn resolve(
         &self,
-        py: Python<'_>,
         skill_id: String,
         now_micros: Option<u64>,
-    ) -> PyResult<Vec<Py<PyAny>>> {
+    ) -> PyResult<Vec<PyRegisteredCard>> {
         let now = now_micros.unwrap_or_else(self::now_micros);
         self.read(|registry| {
-            registry
+            Ok(registry
                 .resolve(&skill_id, now)
                 .into_iter()
-                .map(|card| card_to_py(py, card))
-                .collect()
+                .map(PyRegisteredCard::from)
+                .collect())
         })
     }
 
@@ -491,6 +527,58 @@ impl PyAgentRegistry {
         })
     }
 
+    /// Resolve a route to its concrete target agents at `now_micros` (default
+    /// now). Name exactly one route: `to` is that one agent, `broadcast=True`
+    /// is no target, `to_capable` is the one agent the route `policy` picks,
+    /// and `all_capable` is every capable agent. `principal` pins the
+    /// authenticated principal. Raises when a capability route matches no live
+    /// agent.
+    #[pyo3(signature = (*, to=None, to_capable=None, all_capable=None, broadcast=false, principal=None, policy=None, now_micros=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_targets(
+        &self,
+        to: Option<String>,
+        to_capable: Option<String>,
+        all_capable: Option<String>,
+        broadcast: bool,
+        principal: Option<u32>,
+        policy: Option<&Bound<'_, PyAny>>,
+        now_micros: Option<u64>,
+    ) -> PyResult<Vec<String>> {
+        let ParsedRoutePolicy { policy, failure } = route_policy(policy)?;
+        let selector = |skill: String| {
+            let selector = CapabilitySelector::new(skill, policy.clone());
+            match principal {
+                Some(principal) => selector.principal(PrincipalId::new(principal)),
+                None => selector,
+            }
+        };
+        let router = match (to, to_capable, all_capable, broadcast) {
+            (Some(agent), None, None, false) => match principal {
+                Some(principal) => {
+                    Router::to_principal(agent_id(agent)?, PrincipalId::new(principal))
+                }
+                None => Router::to(agent_id(agent)?),
+            },
+            (None, Some(skill), None, false) => Router::ToCapable(selector(skill)),
+            (None, None, Some(skill), false) => Router::AllCapable(selector(skill)),
+            (None, None, None, true) => Router::Broadcast,
+            _ => {
+                return Err(InvalidError::new_err(
+                    "name exactly one of to / to_capable / all_capable / broadcast",
+                ));
+            }
+        };
+        let now = now_micros.unwrap_or_else(self::now_micros);
+        self.read(|registry| {
+            let targets = route_result(router.resolve_targets(registry, now), &failure)?;
+            Ok(targets
+                .into_iter()
+                .map(|agent| agent.as_str().to_owned())
+                .collect())
+        })
+    }
+
     /// The authenticated principal behind `agent`'s presence, or `None`.
     fn principal_for(&self, agent: String) -> PyResult<Option<u32>> {
         let agent = agent_id(agent)?;
@@ -500,6 +588,50 @@ impl PyAgentRegistry {
                 .map(|principal| principal.get()))
         })
     }
+}
+
+/// The inbox topic `agent` resolves to under an inbox `route`: a fixed topic
+/// name, or `None` for the agent's `advertised` live-presence inbox (from
+/// `AgentRegistry.inbox_for`), the `fixed_inbox=` value the agent methods
+/// take. Raises when the advertised route finds no inbox, rather than
+/// inventing a destination.
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (route, agent, advertised=None))]
+pub fn inbox_route_resolve(
+    route: Option<String>,
+    agent: String,
+    advertised: Option<String>,
+) -> PyResult<String> {
+    inbox_route(route)?
+        .resolve(&agent_id(agent)?, advertised.as_deref())
+        .map(|topic| topic.to_string())
+        .map_err(to_pyerr)
+}
+
+/// A presence dict for `agent` at the current presence version, declaring the
+/// `inbox` topic it consumes its work on when given. Pass it to
+/// `Laser.advertise_presence`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (agent, *, inbox=None))]
+pub fn agent_presence(py: Python<'_>, agent: String, inbox: Option<String>) -> PyResult<Py<PyAny>> {
+    let mut presence = AgentPresence::new(agent_id(agent)?.wire_id());
+    if let Some(inbox) = inbox {
+        presence = presence.with_inbox(inbox);
+    }
+    ser_to_py(py, &presence)
+}
+
+/// Check a `presence` dict against the caps. Raises `ValidateError` on a
+/// violation.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn validate_agent_presence(presence: &Bound<'_, PyAny>) -> PyResult<()> {
+    let presence: AgentPresence = py_to_de(presence)?;
+    presence
+        .validate()
+        .map_err(|error| crate::errors::validate_error(&error))
 }
 
 /// One agent identity over the fabric. Build it with `Laser.agent(id)`.
@@ -568,8 +700,8 @@ impl PyAgentScope {
     }
 
     /// Open a directed contract from this agent to one named `agent`, awaiting
-    /// the reply up to `deadline_ms` (default 30000). Returns a dict with
-    /// `state` and `body`, the shape `Laser.contract_report` returns. Use
+    /// the reply up to `deadline_ms` (default 30000). Returns the terminal
+    /// `Contract`, as `Laser.contract` does. Use
     /// `Laser.contract` for capability routing. Pass `agent=None` with `skill`
     /// to route by capability under the route `policy` word.
     #[pyo3(signature = (agent, payload, *, deadline_ms=30_000, skill=None, policy=None, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, registered=false))]
@@ -608,7 +740,7 @@ impl PyAgentScope {
         let laser = self.laser.clone();
         future_into_py(py, async move {
             let outcome = request.send(&laser).await?;
-            Python::attach(|py| crate::agent_runtime::contract_to_py(py, outcome))
+            Python::attach(|py| crate::agent_runtime::PyContract::from_rust(py, outcome))
         })
     }
 
@@ -643,5 +775,103 @@ impl PyAgentScope {
                 .await
                 .map_err(to_pyerr)
         })
+    }
+}
+
+fn client_metadata_request(
+    laser: &Laser,
+    metadata_only: bool,
+    principal: Option<u32>,
+    limit: Option<u32>,
+    after: Option<u32>,
+) -> laser_sdk::agent::ClientMetadataRequest<'_> {
+    let mut request = laser.client_metadata().with_metadata_only(metadata_only);
+    if let Some(principal) = principal {
+        request = request.principal(PrincipalId::new(principal));
+    }
+    if let Some(limit) = limit {
+        request = request.limit(limit);
+    }
+    if let Some(after) = after {
+        request = request.after(after);
+    }
+    request
+}
+
+/// Which consumer `Laser.consumed` probes: a deployment consumer group or a
+/// named individual consumer.
+#[gen_stub_pyclass_complex_enum]
+#[pyclass(name = "ConsumerRef", frozen)]
+pub enum PyConsumerRef {
+    Group(String),
+    Consumer(String),
+}
+
+impl PyConsumerRef {
+    fn to_rust(&self) -> PyResult<ConsumerRef> {
+        Ok(match self {
+            Self::Group(name) => ConsumerRef::Group(
+                ConsumerGroupName::new(name.clone()).map_err(|e| to_pyerr(e.into()))?,
+            ),
+            Self::Consumer(id) => ConsumerRef::Consumer(id.clone()),
+        })
+    }
+}
+
+/// Whether a target consumer has committed past a published message's position.
+#[gen_stub_pyclass_complex_enum]
+#[pyclass(name = "ConsumptionStatus", frozen, eq)]
+#[derive(PartialEq)]
+pub enum PyConsumptionStatus {
+    /// The target's stored offset is still behind the message by `behind_by`.
+    NotYetConsumed { behind_by: u64 },
+    /// The target has committed past the message: `committed` is its stored
+    /// offset, `head` the partition head at the time of the probe.
+    Consumed { committed: u64, head: u64 },
+}
+
+impl From<ConsumptionStatus> for PyConsumptionStatus {
+    fn from(status: ConsumptionStatus) -> Self {
+        match status {
+            ConsumptionStatus::NotYetConsumed { behind_by } => Self::NotYetConsumed { behind_by },
+            ConsumptionStatus::Consumed { committed, head } => Self::Consumed { committed, head },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PyConsumerRef, PyConsumptionStatus};
+    use laser_sdk::agent::{ConsumerRef, ConsumptionStatus};
+
+    #[test]
+    fn given_a_rust_status_when_converted_then_should_keep_its_offsets() {
+        assert!(
+            PyConsumptionStatus::from(ConsumptionStatus::Consumed {
+                committed: 9,
+                head: 12
+            }) == PyConsumptionStatus::Consumed {
+                committed: 9,
+                head: 12
+            }
+        );
+        assert!(
+            PyConsumptionStatus::from(ConsumptionStatus::NotYetConsumed { behind_by: 3 })
+                == PyConsumptionStatus::NotYetConsumed { behind_by: 3 }
+        );
+    }
+
+    #[test]
+    fn given_consumer_refs_when_converted_then_should_validate_group_names() {
+        pyo3::Python::initialize();
+        assert!(matches!(
+            PyConsumerRef::Group("workers".to_owned()).to_rust(),
+            Ok(ConsumerRef::Group(name)) if name.as_str() == "workers"
+        ));
+        assert!(matches!(
+            PyConsumerRef::Consumer("probe".to_owned()).to_rust(),
+            Ok(ConsumerRef::Consumer(id)) if id == "probe"
+        ));
+        assert!(PyConsumerRef::Group(String::new()).to_rust().is_err());
     }
 }

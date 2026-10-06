@@ -4,7 +4,7 @@ import type { GroupContext } from "./consumer-group.js"
 import type { GovernPublish, ObserveEffect, ResolveSchema } from "./topic.js"
 
 export class Stream {
-  constructor(
+  private constructor(
     private readonly transport: LaserTransport,
     readonly name: string,
     private readonly govern?: GovernPublish,
@@ -14,8 +14,21 @@ export class Stream {
     private readonly groups?: GroupContext
   ) {}
 
+  /** @internal */
+  static create(
+    transport: LaserTransport,
+    name: string,
+    govern?: GovernPublish,
+    resolveSchema?: ResolveSchema,
+    observe?: ObserveEffect,
+    onDelete?: () => void,
+    groups?: GroupContext
+  ): Stream {
+    return new Stream(transport, name, govern, resolveSchema, observe, onDelete, groups)
+  }
+
   topic(name: string): Topic {
-    return new Topic(
+    return Topic.create(
       this.transport,
       this.name,
       name,

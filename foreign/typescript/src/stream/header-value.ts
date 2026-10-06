@@ -1,4 +1,3 @@
-import type { IggyHeaderValue } from "../iggy/apache-iggy.js"
 import { InvalidError } from "../client/errors.js"
 
 function integer(name: string, value: number, minimum: number, maximum: number): number {
@@ -25,49 +24,67 @@ function floating(name: string, value: number): number {
   return value
 }
 
+/** Represents every Apache Iggy user-header kind. */
+export type HeaderValue =
+  | { readonly kind: "raw"; readonly value: Uint8Array }
+  | { readonly kind: "string"; readonly value: string }
+  | { readonly kind: "bool"; readonly value: boolean }
+  | { readonly kind: "int8"; readonly value: number }
+  | { readonly kind: "int16"; readonly value: number }
+  | { readonly kind: "int32"; readonly value: number }
+  | { readonly kind: "int64"; readonly value: bigint }
+  | { readonly kind: "int128"; readonly value: Uint8Array }
+  | { readonly kind: "uint8"; readonly value: number }
+  | { readonly kind: "uint16"; readonly value: number }
+  | { readonly kind: "uint32"; readonly value: number }
+  | { readonly kind: "uint64"; readonly value: bigint }
+  | { readonly kind: "uint128"; readonly value: Uint8Array }
+  | { readonly kind: "float"; readonly value: number }
+  | { readonly kind: "double"; readonly value: number }
+
 export const HeaderValue = {
-  string: (value: string): IggyHeaderValue => ({ kind: "string", value }),
-  bool: (value: boolean): IggyHeaderValue => ({ kind: "bool", value }),
-  int8: (value: number): IggyHeaderValue => ({
+  string: (value: string): HeaderValue => ({ kind: "string", value }),
+  bool: (value: boolean): HeaderValue => ({ kind: "bool", value }),
+  int8: (value: number): HeaderValue => ({
     kind: "int8",
     value: integer("int8", value, -128, 127)
   }),
-  int16: (value: number): IggyHeaderValue => ({
+  int16: (value: number): HeaderValue => ({
     kind: "int16",
     value: integer("int16", value, -32_768, 32_767)
   }),
-  int32: (value: number): IggyHeaderValue => ({
+  int32: (value: number): HeaderValue => ({
     kind: "int32",
     value: integer("int32", value, -2_147_483_648, 2_147_483_647)
   }),
-  int64: (value: bigint): IggyHeaderValue => ({
+  int64: (value: bigint): HeaderValue => ({
     kind: "int64",
     value: bigint("int64", value, -(1n << 63n), (1n << 63n) - 1n)
   }),
-  int128: (value: Uint8Array): IggyHeaderValue => ({
+  int128: (value: Uint8Array): HeaderValue => ({
     kind: "int128",
     value: integer128("int128", value)
   }),
-  uint8: (value: number): IggyHeaderValue => ({
+  uint8: (value: number): HeaderValue => ({
     kind: "uint8",
     value: integer("uint8", value, 0, 255)
   }),
-  uint16: (value: number): IggyHeaderValue => ({
+  uint16: (value: number): HeaderValue => ({
     kind: "uint16",
     value: integer("uint16", value, 0, 65_535)
   }),
-  uint32: (value: number): IggyHeaderValue => ({
+  uint32: (value: number): HeaderValue => ({
     kind: "uint32",
     value: integer("uint32", value, 0, 4_294_967_295)
   }),
-  uint64: (value: bigint): IggyHeaderValue => ({
+  uint64: (value: bigint): HeaderValue => ({
     kind: "uint64",
     value: bigint("uint64", value, 0n, (1n << 64n) - 1n)
   }),
-  uint128: (value: Uint8Array): IggyHeaderValue => ({
+  uint128: (value: Uint8Array): HeaderValue => ({
     kind: "uint128",
     value: integer128("uint128", value)
   }),
-  float: (value: number): IggyHeaderValue => ({ kind: "float", value: floating("float", value) }),
-  double: (value: number): IggyHeaderValue => ({ kind: "double", value: floating("double", value) })
+  float: (value: number): HeaderValue => ({ kind: "float", value: floating("float", value) }),
+  double: (value: number): HeaderValue => ({ kind: "double", value: floating("double", value) })
 } as const

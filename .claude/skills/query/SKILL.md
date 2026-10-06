@@ -39,7 +39,7 @@ Targets are explicit and mutually exclusive:
 
 Rust uses `laser.query(index)` and `laser.query_lakehouse(destination_id, generation)`. Python uses `laser.query(...)` and `laser.query_lakehouse(...)`. TypeScript uses `laser.query(...)` and `laser.queryLakehouse(...)`.
 
-Python builds predicate trees with `QueryFilter` (`pred`, `all`, `any`, `negate`) and passes them to `filter` and `having`. The aggregate alias is `agg_as` in Rust and Python and `aggregateAs` in TypeScript. Rust `deadline(Duration)` is relative, Python `deadline(seconds)` is relative and `deadline_micros` absolute, and TypeScript `deadline(milliseconds)` is relative and `deadlineMicros` absolute. The structured DSL includes exact matches, recursive filters, message type, a half-open time range, lexical and vector search, ordering, selection, aggregation, having, distinct, and typed raw SQL parameters. Raw SQL has an explicit dialect and cannot be mixed with the structured expression. Validation caps names, fields, predicates, parameters, SQL bytes, vector dimensions, cursor bytes, page size, and recursive depth before transport I/O.
+Python builds predicate trees with `Filter` (`pred`, `all`, `any`, `negate`) and passes them to `filter` and `having`. The aggregate alias is `agg_as` in Rust and Python and `aggAs` in TypeScript. Rust `deadline(Duration)` is relative, Python `deadline(seconds)` is relative and `deadline_micros` absolute, and TypeScript `deadline(milliseconds)` is relative and `deadlineMicros` absolute. The structured DSL includes exact matches, recursive filters, message type, a half-open time range, lexical and vector search, ordering, selection, aggregation, having, distinct, and typed raw SQL parameters. Raw SQL has an explicit dialect and cannot be mixed with the structured expression. Validation caps names, fields, predicates, parameters, SQL bytes, vector dimensions, cursor bytes, page size, and recursive depth before transport I/O.
 
 ## Typed results
 
@@ -47,9 +47,9 @@ Python builds predicate trees with `QueryFilter` (`pred`, `all`, `any`, `negate`
 
 Use the result accessor by logical field name rather than manually searching the schema:
 
-- Rust: `result.value(row, "amount")`, `value_text`, `value_u64`, and `value_i64`.
-- Python: `result.value(row, "amount")` and `value_text`.
-- TypeScript: `queryResultValue(result, row, "amount")` and `typedValueDiagnosticText(value)`.
+- Rust: `result.value(row, "latency_ms")`, `value_text`, `value_u64`, `value_i64`, and `field_index`.
+- Python: `result.value(row, "latency_ms")`, `value_text`, `value_u64`, `value_i64`, and `field_index`. Paging fields live on `result.page`.
+- TypeScript: `queryResultValue(result, row, "latency_ms")`, `queryResultValueText`, `queryResultValueU64`, `queryResultValueI64`, `queryResultFieldIndex`, and `typedValueDiagnosticText(value)`.
 
 Reject replies with invalid field structure, reserved-field pairs, row width, value types, nullability, row count, or page cursors. Also require valid engine identity, sufficient consistency, target evidence, and lakehouse checkpoint evidence. Do not use partially decoded success data.
 

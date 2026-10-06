@@ -14,3 +14,36 @@ pub struct Message {
     /// User headers decoded to strings (non-UTF-8 entries dropped).
     pub headers: BTreeMap<String, String>,
 }
+
+impl Message {
+    /// Decode the payload as JSON.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, crate::LaserError> {
+        serde_json::from_slice(&self.payload)
+            .map_err(|error| crate::LaserError::Codec(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(payload: &[u8]) -> Message {
+        Message {
+            payload: payload.to_vec(),
+            id: MessageId::new(0, 7),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn given_a_json_payload_when_decoding_then_should_return_the_value() {
+        let value: serde_json::Value = message(br#"{"n":1}"#).json().expect("json");
+        assert_eq!(value, serde_json::json!({"n": 1}));
+    }
+
+    #[test]
+    fn given_a_non_json_payload_when_decoding_then_should_return_a_codec_error() {
+        let error = message(b"\xff").json::<serde_json::Value>().unwrap_err();
+        assert!(matches!(error, crate::LaserError::Codec(_)));
+    }
+}

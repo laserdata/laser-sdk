@@ -1,18 +1,17 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
-use iggy::prelude::IggyMessage;
 use std::collections::BTreeMap;
 
 pub use iggy::prelude::{HeaderKey, HeaderValue};
 
 /// The Apache Iggy producer/consumer escape hatch: same types
 /// [`Topic::iggy_producer`]/[`Topic::iggy_consumer`]/[`Topic::iggy_consumer_group`]
-/// return, re-exported so reaching for them doesn't need an `iggy`
-/// dependency of your own.
+/// return, and the stored message a failed publish hands back, re-exported so
+/// reaching for them doesn't need an `iggy` dependency of your own.
 pub use iggy::prelude::{
     BackgroundConfig, BalancedSharding, DirectConfig, IggyConsumer, IggyConsumerBuilder,
-    IggyProducer, IggyProducerBuilder, OrderedSharding, SendMessagesConfirmationResponse,
-    SendMessagesResponse, Sharding,
+    IggyMessage, IggyProducer, IggyProducerBuilder, OrderedSharding,
+    SendMessagesConfirmationResponse, SendMessagesResponse, Sharding,
 };
 
 pub use laser_wire::codecs::{Cbor, Codec, Decoder, Json, Msgpack};
@@ -23,19 +22,18 @@ pub use laser_wire::headers::{
 pub use laser_wire::limits::MAX_INDEX_ENTRIES_PER_RECORD;
 
 mod consumer_group;
-pub mod producer_statistics;
+pub(crate) mod producer_statistics;
 mod publish;
 mod record;
 pub(crate) mod transport;
 
-pub use consumer_group::{
-    ConsumerGroup, ConsumerGroupInfo, CreateConsumerGroup, GroupFilter, GroupTarget,
-};
+pub(crate) use consumer_group::GroupTarget;
+pub use consumer_group::{ConsumerGroup, ConsumerGroupInfo, CreateConsumerGroup, GroupFilter};
 pub use publish::{BatchPublishRequest, PublishRequest};
 pub use record::{Record, RecordBuilder};
 pub use transport::{
     CommitPolicy, Consumer, ConsumerBuilder, ConsumerMessage, ConsumerStart, Headers, Producer,
-    ProducerBuilder, ProducerMessage, Routing,
+    ProducerBuilder, ProducerMessage, Routing, StoredOffset,
 };
 
 impl Laser {

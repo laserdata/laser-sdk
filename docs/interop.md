@@ -2,7 +2,7 @@
 
 AGDX is the SDK message format for agents on the log. A2A, MCP, and AG-UI adapters expose external interfaces over these records. Fields shared with AGDX map to envelope fields. Other data stays in the body with `agdx.ct = json` and returns unchanged.
 
-Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. Add `a2a-http` or `mcp-http` for the ready-made axum `router()`. They use log records through the Iggy transport. This guide describes their use. The [AGDX data exchange model](agdx.md) defines the underlying contract.
+Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. Add `a2a-http` or `mcp-http` for the ready-made axum `router()`. They use log records through the Iggy transport. This guide describes their use with Rust. Python and TypeScript expose the bridge adapters. The [parity matrix](parity.md) lists their spellings and the Rust-only pieces, such as the axum `router()`. The [AGDX data exchange model](agdx.md) defines the underlying contract.
 
 ## Streams, topics, and RBAC
 
@@ -13,7 +13,7 @@ let ops = laser.with_default_stream("ops-agents");
 let metrics = laser.with_default_stream("metrics-agents");
 
 // An A2A gateway on the ops stream.
-A2aBridge::new(
+let gateway = A2aBridge::new(
     ops.clone(),
     "ops-gateway".parse()?,
     AgentTopic::Commands,
@@ -21,7 +21,8 @@ A2aBridge::new(
 );
 
 // An agent on the metrics stream, sharing the one connection.
-Agent::builder()
+// Keep the handle: dropping it signals a graceful shutdown.
+let collector = Agent::builder()
     .id("collector".parse()?)
     .listen_on(AgentTopic::Commands)
     .handler(handler)
@@ -34,7 +35,7 @@ Agent::builder()
 Credentials and the hosted HTTP endpoint control access:
 
 - A `with_default_stream` view can access only streams permitted to its connection credentials.
-- Use separate `Laser::connect` calls for separate principals. Apache Iggy enforces stream and topic permissions. Protect a bridge JSON-RPC `router` with the hosting application authentication middleware.
+- Use separate `Laser::connect` calls for separate principals. Apache Iggy enforces stream and topic permissions. Protect a bridge JSON-RPC `router` with the hosting application authentication middleware. `laser_sdk::edge_auth::authorize_edge` checks the audience and scope of a decoded bearer token.
 
 Clients read streamed records by offset. After a disconnect, they can resume from a saved position and reconstruct the retained transcript. The [AGDX spec](agdx.md) defines the mapping. The `interop` example demonstrates the complete flow.
 
@@ -49,10 +50,10 @@ A2A v1.0 uses PascalCase operation names. The stateless bridge does not serve `L
 | `SendMessage` | Publish a typed AGDX `command` on a fresh task conversation, tunneling the whole params JSON in the body. The task id is the conversation. The A2A task identity rides `correlation` (derived from the conversation, so lookup stays stateless). Returns `Submitted`. |
 | `SendStreamingMessage` | Same publish as `SendMessage`. The stream is consumed log-natively (`Laser::reassemble_channel`), not re-emitted as SSE. |
 | `GetTask` | Read the reply topic, map the answering `response`/`error` envelope (matched by `correlation`) to the A2A task. `Working` until one lands. |
-| `CancelTask` | Publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`). Returns `Canceled`. |
+| `CancelTask` | Publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`). Returns `Canceled`. With `sign` and `with_signing_key`, the terminal is signed. |
 
 ```rust
-use laser_sdk::prelude::*;
+use laser_sdk::prelude::full::*;
 use std::sync::Arc;
 
 let bridge = Arc::new(A2aBridge::new(
@@ -74,12 +75,13 @@ A worker behind the bridge consumes the decoded command envelope (`message.envel
 | MCP method | Mapping |
 | --- | --- |
 | `initialize` | Echo the client's protocol version, and advertise only the capabilities served. |
-| `tools/list` | The tools configured via `with_tool` (`name`, optional `title`/`description`, `inputSchema`). |
-| `tools/call` | Publish an AGDX `command` (tool name in `tool`, params tunneled in the body), await the correlated `response`/`error` within a timeout, render the `tools/call` result (`content` + `isError`). |
+| `tools/list` | The tools configured via `with_tool` and `with_memory_tools` (`name`, optional `title`/`description`, `inputSchema`). |
+| `tools/call` | Publish an AGDX `command` (tool name in `tool`, params tunneled in the body), await the correlated `response`/`error` within a timeout (30 seconds by default, `with_timeout` sets another), render the `tools/call` result (`content` + `isError`). |
 | `resources/list` / `resources/read` | Resources configured via `with_resource`, served from configuration. |
 | `prompts/list` / `prompts/get` | Prompts configured via `with_prompt`, rendered into MCP prompt messages. |
 
 ```rust
+use laser_sdk::prelude::full::*;
 use std::sync::Arc;
 
 let mcp = Arc::new(
@@ -154,7 +156,7 @@ The mapping onto AGDX:
 - its checkpoint-fork onto the AGDX fork
 - its lifecycle `cause` (`toolCall` / `send` / `edge`) onto `cause` / `causal_parent`
 
-`Agdx::request_input(reply_topic, prompt, timeout)` publishes a prompt with a new correlation ID and waits for a response. `AgentCtx::respond_input(reply_topic, decision)` answers it. An AGDX `error` becomes `LaserError::Rejected`. These calls use existing command and response records. The `interop` example demonstrates them on `AgentTopic::HumanInput`.
+`Agdx::request_input(reply_topic, prompt, timeout)` publishes a prompt with a new correlation ID and waits for a response. `AgentCtx::respond_input(reply_topic, response)` answers it. An AGDX `error` becomes `LaserError::Rejected`. These calls use existing command and response records. The `interop` example demonstrates them on `AgentTopic::HumanInput`.
 
 ```rust
 // Pause for a human decision, resume with their answer.
@@ -193,3 +195,5 @@ let body = message.resolve_body(store).await?;
 ```
 
 [`BlobStore`]: https://docs.rs/laser-sdk
+
+`A2aBridge::handle_rpc` and `McpBridge::handle_rpc` accept a JSON value and return a JSON-RPC response without requiring HTTP. Python uses `await bridge.handle_rpc(request)`, and TypeScript uses `await bridge.handleRpc(input)`. Malformed requests return public error responses. Each bridge stamps its own ID in `bridge_hops`. Continue an existing path with `with_bridge_hops(previous)` and reject loops before publishing.

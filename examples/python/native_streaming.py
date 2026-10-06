@@ -34,7 +34,8 @@ async def receive_all(consumer, *, manual_commit: bool) -> None:
             if seen % PROGRESS_EVERY == 0 or seen == MESSAGE_COUNT:
                 print(
                     f"  received {seen}/{MESSAGE_COUNT}: partition={message.partition_id} "
-                    f"offset={message.offset} headers={message.headers} payload={message.payload!r}"
+                    f"offset={message.position.offset} headers={message.headers} "
+                    f"payload={message.payload!r}"
                 )
             if seen == MESSAGE_COUNT:
                 break

@@ -360,6 +360,25 @@ impl PolicyEvidence {
     }
 }
 
+/// Whether `evidence`, in log order for one conversation, is an unbroken
+/// chain: every record reproduces its own `receipt_digest` and names the
+/// previous record's digest as its `previous_digest`. A reordered, dropped,
+/// or edited record breaks the chain.
+pub fn verify_evidence_chain(evidence: &[PolicyEvidence]) -> bool {
+    let mut previous: Option<&str> = None;
+    for item in evidence {
+        if item.previous_digest.as_deref() != previous {
+            return false;
+        }
+        match item.clone().seal() {
+            Ok(sealed) if sealed.receipt_digest == item.receipt_digest => {}
+            _ => return false,
+        }
+        previous = Some(item.receipt_digest.as_str());
+    }
+    true
+}
+
 impl Laser {
     /// A clone of this `Laser` whose agent sends, typed or raw topic
     /// publishes, AGDX verbs, and memory writes run `governor` before the
@@ -711,7 +730,7 @@ fn apply(mode: GovernorMode, verdict: Verdict) -> AppliedVerdict {
             recorded: true,
             outcome: if enforced { "step_up" } else { "effected" },
             body: None,
-            denial: enforced.then(|| LaserError::StepUpRequired(scope)),
+            denial: enforced.then(|| LaserError::StepUpRequired { scope }),
         },
         Verdict::Defer => AppliedVerdict {
             recorded: true,
@@ -1070,7 +1089,7 @@ mod tests {
         );
         assert_eq!(step_up.outcome, "step_up");
         assert!(
-            matches!(step_up.denial, Some(LaserError::StepUpRequired(scope)) if scope == "storage:rotate")
+            matches!(step_up.denial, Some(LaserError::StepUpRequired { scope }) if scope == "storage:rotate")
         );
 
         let defer = apply(GovernorMode::Enforce, Verdict::Defer);
@@ -1158,6 +1177,22 @@ mod tests {
             second.previous_digest.as_deref(),
             Some(first.receipt_digest.as_str())
         );
+    }
+
+    #[test]
+    fn given_a_chain_when_reordered_or_edited_then_should_fail_verification() {
+        let first = sample_evidence().seal().expect("seals");
+        let mut second = sample_evidence();
+        second.decision_id = "01J0000000000000000000002".to_owned();
+        second.previous_digest = Some(first.receipt_digest.clone());
+        let second = second.seal().expect("seals");
+        assert!(verify_evidence_chain(&[first.clone(), second.clone()]));
+        assert!(verify_evidence_chain(&[]));
+        assert!(!verify_evidence_chain(&[second.clone(), first.clone()]));
+        assert!(!verify_evidence_chain(std::slice::from_ref(&second)));
+        let mut edited = second;
+        edited.reason = Some("edited".to_owned());
+        assert!(!verify_evidence_chain(&[first, edited]));
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 import type { Capabilities } from "../client/capabilities.js"
-import { GraphExecutionError, ProtocolError, UnsupportedError } from "../client/errors.js"
+import { GraphExecutionError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
 import {
   GraphNeighborsCommand,
@@ -24,10 +24,8 @@ import {
 import type { Filter } from "../wire/query.js"
 import { DEFAULT_RECALL_LIMIT } from "../wire/limits.js"
 
-export type GraphBackend = ManagedTransport
-
 async function executeGraph<Request>(
-  backend: GraphBackend,
+  backend: ManagedTransport,
   capabilities: Capabilities,
   command: ManagedCommand<Request, GraphReply>,
   request: Request
@@ -35,7 +33,6 @@ async function executeGraph<Request>(
   const reply = await executeManaged(backend, capabilities, command, request)
   if (reply.kind === "ok") return reply.result
   if (reply.kind === "err") {
-    if (reply.error.kind === "unsupported") throw new UnsupportedError(reply.error.message)
     throw new GraphExecutionError(`graph command failed: ${reply.error.kind}`, reply.error)
   }
   throw new ProtocolError(`graph: unrecognized reply variant \`${reply.tag}\``, {
@@ -61,12 +58,22 @@ export class GraphHandle {
   private asOfValue: bigint | undefined
   private conversationValue: string | undefined
 
-  constructor(
-    private readonly backend: GraphBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly name: string,
     private readonly nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    name: string,
+    nowMicros: () => bigint = () => BigInt(Date.now()) * 1000n
+  ): GraphHandle {
+    return new GraphHandle(backend, getCapabilities, name, nowMicros)
+  }
 
   /** Restricts traversal to elements asserted by one conversation. */
   conversation(conversationId: string): this {

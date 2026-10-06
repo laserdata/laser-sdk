@@ -3,6 +3,10 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import {
+  agentErrorCode,
+  agentErrorCodeFromCode,
+  deadLetterReasonCode,
+  deadLetterReasonFromCode,
   decodeAgentCard,
   decodeAgentDeadLetter,
   decodeAgentErrorBody,
@@ -15,13 +19,17 @@ import {
   encodeAgentPresence,
   encodeBodyRef,
   encodeSignature,
+  healthCode,
+  healthFromCode,
+  newAgentPresence,
   parseAgentId,
   parseAgentKind,
   parseIdempotencyKey,
   taskStateCode,
   taskStateDisplay,
   taskStateFromCode,
-  taskStateIsTerminal
+  taskStateIsTerminal,
+  validateAgentPresence
 } from "../../src/wire/agent.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 
@@ -168,4 +176,56 @@ void test("given_an_unrecognized_kind_when_parsed_then_should_throw_rather_than_
   assert.throws(() => {
     parseAgentKind("bogus", "test")
   }, /not a recognized agent envelope kind/)
+})
+
+void test("given_agent_dictionary_codes_when_mapped_then_should_match_the_pinned_codes_and_pass_unknown_through", () => {
+  const errors = [
+    "InvalidRequest",
+    "Unauthorized",
+    "Unsupported",
+    "DeadlineExceeded",
+    "Cancelled",
+    "ToolFailure",
+    "Internal"
+  ] as const
+  errors.forEach((name, index) => {
+    const code = agentErrorCodeFromCode(index + 1)
+    assert.deepEqual(code, { kind: "known", name })
+    assert.equal(agentErrorCode(code), index + 1)
+  })
+  const reasons = ["RetryExhausted", "Rejected", "DecodeFailed", "DeadlineExceeded"] as const
+  reasons.forEach((name, index) => {
+    const reason = deadLetterReasonFromCode(index + 1)
+    assert.deepEqual(reason, { kind: "known", name })
+    assert.equal(deadLetterReasonCode(reason), index + 1)
+  })
+  const healths = ["Healthy", "Degraded", "Unavailable"] as const
+  healths.forEach((name, index) => {
+    const health = healthFromCode(index + 1)
+    assert.deepEqual(health, { kind: "known", name })
+    assert.equal(healthCode(health), index + 1)
+  })
+  for (const [fromCode, toCode] of [
+    [agentErrorCodeFromCode, agentErrorCode],
+    [deadLetterReasonFromCode, deadLetterReasonCode],
+    [healthFromCode, healthCode]
+  ] as const) {
+    const future = fromCode(200)
+    assert.deepEqual(future, { kind: "unrecognized", code: 200 })
+    assert.equal(toCode(future as never), 200)
+  }
+})
+
+void test("given_a_presence_built_with_new_when_encoded_then_should_match_the_rust_fixture", async () => {
+  const presence = newAgentPresence(parseAgentId("source-agent"), "rollout-planner.work")
+  validateAgentPresence(presence)
+  const bytes = await readFixture("agent_presence.bin")
+  assert.deepEqual(Buffer.from(encodeNamed(encodeAgentPresence(presence))), Buffer.from(bytes))
+})
+
+void test("given_a_presence_inbox_over_the_cap_when_validated_then_should_reject_it", () => {
+  const presence = newAgentPresence(parseAgentId("worker"), "x".repeat(257))
+  assert.throws(() => {
+    validateAgentPresence(presence)
+  }, /inbox/)
 })

@@ -5,7 +5,7 @@ import { test } from "node:test"
 import { PolicyBlockedError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import { ActionDecision, GovernorMode, type ActionGovernor } from "../../src/govern.js"
-import { jsonCodec } from "../../src/stream/codecs.js"
+import { Json } from "../../src/stream/codecs.js"
 import { Record } from "../../src/stream/record.js"
 import { ContentType } from "../../src/wire/content.js"
 
@@ -41,7 +41,7 @@ async function pollFirst(
   partitionId: number,
   topicName = "events"
 ) {
-  return laser.iggyClient.message.poll({
+  return laser.client.message.poll({
     streamId: streamName,
     topicId: topicName,
     consumer: Consumer.Single,
@@ -70,7 +70,7 @@ void test("given_a_publish_request_with_a_json_body_when_sent_then_should_delive
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    await topic.publish().json({ host: "node-1" }, jsonCodec(decodeReading)).send()
+    await topic.publish().json({ host: "node-1" }, new Json(decodeReading)).send()
 
     const reply = await pollFirst(laser, topic.streamName, 0)
     assert.equal(reply.count, 1)
@@ -89,7 +89,7 @@ void test("given_a_publish_request_when_the_last_body_setter_wins_then_should_se
     await topic
       .publish()
       .payload(new TextEncoder().encode("first-body"))
-      .json({ host: "second-body" }, jsonCodec(decodeReading))
+      .json({ host: "second-body" }, new Json(decodeReading))
       .send()
 
     const reply = await pollFirst(laser, topic.streamName, 0)
@@ -140,7 +140,7 @@ void test("given_a_complete_record_when_published_then_should_preserve_every_con
       .inlinePayload()
       .send()
 
-    const message = await topic.consumer(0, { startFrom: { kind: "first" } }).nextWithin(1_000)
+    const message = await topic.consumer(0, { startAt: { kind: "first" } }).nextWithin(1_000)
     assert.deepEqual(message.headers.get("agdx.ct"), { kind: "uint8", value: 1 })
     assert.deepEqual(message.headers.get("agdx.sid"), { kind: "uint32", value: 7 })
     assert.deepEqual(message.headers.get("agdx.inline"), { kind: "bool", value: true })
@@ -172,7 +172,7 @@ void test("given_a_heterogeneous_publish_batch_when_sent_then_should_apply_defau
     assert.equal(committed.confirmations.length, 1)
     assert.equal(committed.confirmations[0]?.partitionId, 0)
 
-    const consumer = topic.consumer(0, { startFrom: { kind: "first" }, batchLength: 2 })
+    const consumer = topic.consumer(0, { startAt: { kind: "first" }, batchLength: 2 })
     const first = await consumer.nextWithin(1_000)
     const second = await consumer.nextWithin(1_000)
     assert.deepEqual(first.headers.get("agdx.ct"), { kind: "uint8", value: 1 })

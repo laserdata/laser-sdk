@@ -10,10 +10,10 @@ export function enterBridge(bridge: string, previous: readonly string[] = []): r
 
 export function bridgeHopMetadata(hops: readonly string[]): {
   readonly kind: "list"
-  readonly value: readonly { readonly kind: "string"; readonly value: string }[]
+  readonly value: readonly { readonly kind: "str"; readonly value: string }[]
 } {
   return {
     kind: "list",
-    value: hops.map((value) => ({ kind: "string", value }))
+    value: hops.map((value) => ({ kind: "str", value }))
   }
 }

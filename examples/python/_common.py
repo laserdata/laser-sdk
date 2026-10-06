@@ -197,7 +197,7 @@ async def start_projector(laser, topic, fields, *, index=None, content_type="jso
     `UnsupportedError`."""
     index = index or topic
     projection_id = f"{index}.v1"
-    await laser.register_projection(
+    await laser.projections().register(
         {
             "id": projection_id,
             "name": index,
@@ -210,7 +210,7 @@ async def start_projector(laser, topic, fields, *, index=None, content_type="jso
             "inline_payload_default": False,
         }
     )
-    await laser.apply_binding(
+    await laser.bindings().apply(
         {
             "source": {"stream": laser.default_stream, "topic": topic},
             "allowed_projections": [projection_id],
@@ -250,7 +250,7 @@ async def wait_for_projection(laser, index, expected) -> int:
         advanced = last < 0 or feed is None or bool(await feed.poll())
         if advanced:
             try:
-                total = (await laser.query(index).with_total().fetch()).total
+                total = (await laser.query(index).with_total().fetch()).page.total
             except ls.LaserError:
                 total = 0
             if total != last:

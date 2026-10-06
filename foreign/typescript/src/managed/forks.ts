@@ -1,5 +1,5 @@
 import type { Capabilities } from "../client/capabilities.js"
-import { ForkExecutionError, InvalidError } from "../client/errors.js"
+import { ForkExecutionError, InvalidError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
 import {
   ForkCreateCommand,
@@ -17,10 +17,8 @@ import {
   validateForkId
 } from "../wire/fork.js"
 
-export type ForkBackend = ManagedTransport
-
 async function executeFork<Request>(
-  backend: ForkBackend,
+  backend: ManagedTransport,
   capabilities: Capabilities,
   command: ManagedCommand<Request, ForkReply>,
   request: Request
@@ -29,15 +27,17 @@ async function executeFork<Request>(
   if (reply.kind === "ok") return reply.outcome
   if (reply.kind === "err")
     throw new ForkExecutionError(`fork command failed: ${reply.error.kind}`, reply.error)
-  return { kind: "unrecognized", tag: reply.tag, value: undefined }
+  throw new ProtocolError(`fork: unrecognized reply variant \`${reply.tag}\``, {
+    commandCode: command.code
+  })
 }
 
-function unexpected(op: string, outcome: ForkOutcome): ForkExecutionError {
-  return new ForkExecutionError(`fork ${op}: unexpected reply outcome \`${outcome.kind}\``, outcome)
+function unexpected(op: string, outcome: ForkOutcome): ProtocolError {
+  return new ProtocolError(`fork ${op}: unexpected reply outcome \`${outcome.kind}\``)
 }
 
 async function fetchForks(
-  backend: ForkBackend,
+  backend: ManagedTransport,
   capabilities: Capabilities
 ): Promise<readonly ForkInfo[]> {
   const outcome = await executeFork(backend, capabilities, ForkListCommand, undefined)
@@ -46,15 +46,25 @@ async function fetchForks(
 }
 
 /** Operates on one copy-on-write fork. */
-export class Fork {
-  constructor(
-    private readonly backend: ForkBackend,
+export class ForkHandle {
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
-    readonly forkId: string
+    readonly id: string
   ) {}
 
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    id: string
+  ): ForkHandle {
+    return new ForkHandle(backend, getCapabilities, id)
+  }
+
+  /** @internal */
   static async forks(
-    backend: ForkBackend,
+    backend: ManagedTransport,
     getCapabilities: () => Promise<Capabilities>
   ): Promise<readonly ForkInfo[]> {
     const capabilities = await getCapabilities()
@@ -63,14 +73,14 @@ export class Fork {
 
   /** Starts a fork creation request. */
   create(): ForkCreateRequest {
-    return new ForkCreateRequest(this.backend, this.getCapabilities, this.forkId)
+    return ForkCreateRequest.create(this.backend, this.getCapabilities, this.id)
   }
 
   /** Applies speculative rows to the trunk and returns the applied row count. */
   async promote(): Promise<number> {
     const capabilities = await this.getCapabilities()
     const outcome = await executeFork(this.backend, capabilities, ForkPromoteCommand, {
-      forkId: this.forkId
+      forkId: this.id
     })
     if (outcome.kind === "promoted") return outcome.rows
     throw unexpected("promote", outcome)
@@ -80,7 +90,7 @@ export class Fork {
   async squash(): Promise<boolean> {
     const capabilities = await this.getCapabilities()
     const outcome = await executeFork(this.backend, capabilities, ForkDeleteCommand, {
-      forkId: this.forkId
+      forkId: this.id
     })
     if (outcome.kind === "deleted") return outcome.removed
     throw unexpected("squash", outcome)
@@ -88,10 +98,10 @@ export class Fork {
 
   /** Starts a speculative row write at an exact log position. */
   putRow(table: string, partitionId: number, offset: bigint): ForkPutRequest {
-    return new ForkPutRequest(
+    return ForkPutRequest.create(
       this.backend,
       this.getCapabilities,
-      this.forkId,
+      this.id,
       table,
       partitionId,
       offset
@@ -105,11 +115,20 @@ export class ForkCreateRequest {
   private forkKind: ForkKind = "continuous"
   private forkTables: readonly string[] = []
 
-  constructor(
-    private readonly backend: ForkBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly forkId: string
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    forkId: string
+  ): ForkCreateRequest {
+    return new ForkCreateRequest(backend, getCapabilities, forkId)
+  }
 
   /** Creates a frozen snapshot at current trunk offsets. */
   severed(): this {
@@ -160,14 +179,26 @@ export class ForkPutRequest {
   private forkEmbedding: string | undefined
   private forkTombstone = false
 
-  constructor(
-    private readonly backend: ForkBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly forkId: string,
     private readonly table: string,
     private readonly partitionId: number,
     private readonly offset: bigint
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    forkId: string,
+    table: string,
+    partitionId: number,
+    offset: bigint
+  ): ForkPutRequest {
+    return new ForkPutRequest(backend, getCapabilities, forkId, table, partitionId, offset)
+  }
 
   /** Sets the row projection identity. */
   projection(id: string, version: number): this {

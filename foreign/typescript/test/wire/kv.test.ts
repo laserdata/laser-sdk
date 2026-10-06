@@ -34,7 +34,7 @@ import {
   encodeKvReply,
   encodeKvScan,
   encodeKvSet,
-  kvEntryKeyString,
+  kvEntryKeyStr,
   validateNamespace
 } from "../../src/wire/kv.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
@@ -238,7 +238,7 @@ void test("given_the_kv_reply_page_fixture_when_decoded_then_should_carry_the_en
   assert.equal(reply.outcome.page.entries.length, 1)
   const [entry] = reply.outcome.page.entries
   assert.ok(entry !== undefined)
-  assert.equal(kvEntryKeyString(entry), "user:1")
+  assert.equal(kvEntryKeyStr(entry), "user:1")
   assert.equal(entry.version, 0n)
 })
 
@@ -298,7 +298,7 @@ void test("given_namespaces_when_validated_then_should_enforce_bounds", () => {
 
 void test("given_a_binary_key_when_read_as_a_string_then_should_return_undefined_for_non_utf8", () => {
   const entry = { key: new Uint8Array([0xff, 0x00, 0xfe]), value: new Uint8Array(), version: 0n }
-  assert.equal(kvEntryKeyString(entry), undefined)
+  assert.equal(kvEntryKeyStr(entry), undefined)
 })
 
 void test("given_the_kv_namespaces_fixture_when_encoded_then_should_re_encode_byte_identically", async () => {
@@ -336,7 +336,7 @@ void test("given_a_binary_key_entry_when_round_tripped_then_should_preserve_raw_
   const bytes = encodeNamed(encodeKvEntry(entry))
   const back = decodeKvEntry(expectMap(decodeOne(bytes, "test"), "test"), "test")
   assert.deepEqual(back.key, entry.key)
-  assert.equal(kvEntryKeyString(back), undefined, "non-UTF-8 key has no string form")
+  assert.equal(kvEntryKeyStr(back), undefined, "non-UTF-8 key has no string form")
   assert.deepEqual(back.value, entry.value)
 })
 

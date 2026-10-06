@@ -1,8 +1,10 @@
 import { managedCapabilitiesFrom } from "../client/capabilities.js"
+import { decodeManagedReply } from "../client/managed.js"
 import { isRetryable } from "../agent/reliable-consumer.js"
 import { isPermissionDenied } from "../client/error-classify.js"
 import {
   AmbiguousMutationError,
+  ConfigError,
   InvalidError,
   KvExecutionError,
   LaserError,
@@ -42,6 +44,8 @@ import { encodeManagedRequestEnvelope, MANAGED_REQUEST_VERSION } from "../wire/m
 import type { Lease } from "./kv.js"
 
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 10_000
+
+const MAX_TIMER_MILLIS = 2_147_483_647n
 
 /** Reset must stop all in-flight work before returning. */
 export interface ManagedKvTransport {
@@ -105,10 +109,12 @@ function within<T>(pending: Promise<T>, milliseconds: number, what: string): Pro
 }
 
 function outcome(bytes: Uint8Array): KvOutcome {
-  const reply = decodeKvReply(decodeOne(bytes, "KvReply"), "KvReply")
+  const reply = decodeManagedReply(
+    (value) => decodeKvReply(decodeOne(value, "KvReply"), "KvReply"),
+    bytes
+  )
   if (reply.kind === "ok") return reply.outcome
   if (reply.kind === "err") {
-    if (reply.error.kind === "unsupported") throw new UnsupportedError(reply.error.message)
     throw new KvExecutionError(`kv coordination failed: ${reply.error.kind}`, reply.error)
   }
   throw new ProtocolError("kv coordination: unknown reply variant")
@@ -400,5 +406,63 @@ export class FencedLeaseClient implements AsyncDisposable {
     } finally {
       this.active -= 1
     }
+  }
+}
+
+/** Serializes one client's lease acquisitions over a dedicated coordination
+ * connection. An ambiguous acquisition waits out the requested TTL before it
+ * reports, so a caller cannot race a grant it never saw. The recovery keeps
+ * running when the caller stops waiting. */
+export class LeaseCoordinator implements AsyncDisposable {
+  private queue: Promise<unknown> = Promise.resolve()
+
+  /** Without a client every acquisition fails with `ConfigError`, as for an
+   * injected Iggy client that has no connection string to dial. */
+  constructor(private readonly client?: FencedLeaseClient) {}
+
+  static forConnection(connectionString: string | undefined): LeaseCoordinator {
+    return new LeaseCoordinator(
+      connectionString === undefined
+        ? undefined
+        : FencedLeaseClient.connectDedicated(connectionString)
+    )
+  }
+
+  acquire(request: KvLease): Promise<Lease> {
+    const acquired = this.queue.then(() => this.acquireNow(request))
+    this.queue = acquired.catch(() => undefined)
+    return acquired
+  }
+
+  async close(): Promise<void> {
+    await this.client?.close()
+  }
+
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.close()
+  }
+
+  private async acquireNow(request: KvLease): Promise<Lease> {
+    const client = this.client
+    if (client === undefined) {
+      throw new ConfigError(
+        "lease acquisition needs a connection-backed Laser, use FencedLeaseClient with a dedicated transport for an injected client"
+      )
+    }
+    try {
+      return await client.acquire(client.prepareAcquire(request))
+    } catch (error) {
+      if (error instanceof AmbiguousMutationError) await waitForLeaseExpiry(request.leaseTtlMicros)
+      throw error
+    }
+  }
+}
+
+async function waitForLeaseExpiry(leaseTtlMicros: bigint): Promise<void> {
+  let millis = (leaseTtlMicros + 999n) / 1_000n
+  while (millis > 0n) {
+    const chunk = millis > MAX_TIMER_MILLIS ? MAX_TIMER_MILLIS : millis
+    await new Promise((resolve) => setTimeout(resolve, Number(chunk)))
+    millis -= chunk
   }
 }

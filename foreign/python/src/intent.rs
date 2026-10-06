@@ -32,7 +32,7 @@ fn parse_choice(text: &str) -> PyResult<VoteChoice> {
 }
 
 fn intent_error(error: IntentError) -> PyErr {
-    InvalidError::new_err(error.to_string())
+    crate::errors::intent_error(&error)
 }
 
 /// How [`Vote`]s combine into a [`Decision`]. Mirrors `QuorumPolicy`, applied

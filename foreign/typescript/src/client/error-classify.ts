@@ -8,15 +8,18 @@ import {
   ConsumerGroupSetupError,
   FenceViolationError,
   FilterExecutionError,
-  FilterStopError,
+  FilterFaultError,
+  FilterOversizedRecordError,
   ForkExecutionError,
   GraphExecutionError,
   KvExecutionError,
   LaserError,
+  NoCapableAgentError,
+  NoInboxError,
   ProtocolError,
   QuarantinedError,
   QueryExecutionError,
-  RoutingError,
+  RoutePrincipalMismatchError,
   TransportError,
   UnsupportedError,
   publishCause
@@ -72,7 +75,7 @@ export function iggyErrorCode(error: unknown): number | undefined {
 /** The typed consumer-filter cause, when the failure is one. */
 export function filterReason(error: unknown): FilterErrorReason | undefined {
   const cause = publishCause(error)
-  return cause instanceof FilterExecutionError ? cause.reason : undefined
+  return cause instanceof FilterExecutionError ? cause.detail.reason : undefined
 }
 
 /** Whether the target stream or topic does not exist for this principal.
@@ -87,7 +90,7 @@ export function isStreamOrTopicNotFound(error: unknown): boolean {
  * is a grant, not a retry. */
 export function isPermissionDenied(error: unknown): boolean {
   const cause = publishCause(error)
-  if (cause instanceof RoutingError && cause.reason.kind === "principalMismatch") return true
+  if (cause instanceof RoutePrincipalMismatchError) return true
   const code = iggyErrorCode(error)
   if (code === IGGY_UNAUTHORIZED || code === IGGY_UNAUTHENTICATED) return true
   const reason = filterReason(error)
@@ -184,7 +187,7 @@ export function isNotLeader(error: unknown): boolean {
 /** Whether capability routing found no live agent for the skill. */
 export function isNoCapableAgent(error: unknown): boolean {
   const cause = publishCause(error)
-  return cause instanceof RoutingError && cause.reason.kind === "noCapableAgent"
+  return cause instanceof NoCapableAgentError
 }
 
 /** Whether a revocable lease was lost. */
@@ -310,9 +313,8 @@ export function code(error: unknown): ResultCode {
   if (iggy === IGGY_UNAUTHORIZED) return known("Forbidden")
   if (iggy === IGGY_UNAUTHENTICATED) return known("Unauthenticated")
   if (cause instanceof FilterExecutionError) return cause.detail.code
-  if (cause instanceof FilterStopError) {
-    return known(cause.stop === "fault" ? "InvalidArgument" : "TooLarge")
-  }
+  if (cause instanceof FilterFaultError) return known("InvalidArgument")
+  if (cause instanceof FilterOversizedRecordError) return known("TooLarge")
   if (cause instanceof ConsumerGroupSetupError) return code(cause.cause)
   if (cause instanceof QueryExecutionError) return surfaceCode(QUERY_CODES, detailKind(cause))
   if (cause instanceof KvExecutionError) return surfaceCode(KV_CODES, detailKind(cause))
@@ -325,9 +327,9 @@ export function code(error: unknown): ResultCode {
     return surfaceCode(CHECKPOINT_CODES, detailKind(cause))
   }
   if (cause instanceof TransportError && cause.retryable) return known("Unavailable")
-  if (cause instanceof RoutingError) {
-    return known(cause.reason.kind === "principalMismatch" ? "Forbidden" : "NotFound")
-  }
+  if (cause instanceof RoutePrincipalMismatchError) return known("Forbidden")
+  if (cause instanceof NoCapableAgentError || cause instanceof NoInboxError)
+    return known("NotFound")
   if (!(cause instanceof LaserError)) return known("Backend")
   switch (cause.kind) {
     case "unsupported":
@@ -371,6 +373,23 @@ export function code(error: unknown): ResultCode {
     case "policy-deferred":
     case "publish-failed":
     case "checkpoint":
+    case "id":
+    case "provenance":
       return known("Backend")
   }
+}
+
+export function publicErrorMessage(error: unknown): string {
+  const result = code(error)
+  if (result.kind !== "known") return "internal error"
+  const messages: Partial<Record<keyof typeof ResultCodeName, string>> = {
+    InvalidArgument: "invalid request",
+    Unsupported: "unsupported operation",
+    Conflict: "conflict",
+    Unauthenticated: "unauthenticated",
+    Forbidden: "forbidden",
+    StepUpRequired: "step-up authorization required",
+    NotFound: "not found"
+  }
+  return messages[result.name] ?? "internal error"
 }

@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import {
-  Feature,
+  feature,
   decodeBackendAnnounce,
   decodeHelloReply,
   encodeBackendAnnounce,
@@ -27,8 +27,8 @@ void test("given_the_backend_announce_fixture_when_decoded_then_should_preserve_
   assert.equal(announce.versions.kv, 1)
   assert.equal(announce.versions.fork, 1)
   assert.equal(announce.versions.checkpoint, 1)
-  assert.ok(opVersionsHasFeature(announce.versions, Feature.KV_CAS))
-  assert.ok(opVersionsHasFeature(announce.versions, Feature.DESTINATIONS))
+  assert.ok(opVersionsHasFeature(announce.versions, feature.KV_CAS))
+  assert.ok(opVersionsHasFeature(announce.versions, feature.DESTINATIONS))
   assert.equal(announce.topology, undefined)
 
   assert.equal(announce.backends.length, 2)
@@ -79,10 +79,10 @@ void test("given_the_hello_reply_features_fixture_when_decoded_then_should_prese
   const reply = decodeHelloReply(bytes)
   assert.equal(reply.versions.features, 259n)
   assert.equal(reply.versions.checkpoint, 1)
-  assert.ok(opVersionsHasFeature(reply.versions, Feature.KV_CAS))
-  assert.ok(opVersionsHasFeature(reply.versions, Feature.READ_YOUR_WRITES))
-  assert.ok(!opVersionsHasFeature(reply.versions, Feature.STRONG_CONSISTENCY))
-  assert.ok(opVersionsHasFeature(reply.versions, Feature.DESTINATIONS))
+  assert.ok(opVersionsHasFeature(reply.versions, feature.KV_CAS))
+  assert.ok(opVersionsHasFeature(reply.versions, feature.READ_YOUR_WRITES))
+  assert.ok(!opVersionsHasFeature(reply.versions, feature.STRONG_CONSISTENCY))
+  assert.ok(opVersionsHasFeature(reply.versions, feature.DESTINATIONS))
   assert.deepEqual(Buffer.from(encodeHelloReply(reply)), Buffer.from(bytes))
 })
 

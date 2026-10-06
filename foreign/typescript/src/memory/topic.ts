@@ -2,18 +2,23 @@ import { InvalidError, NoStreamError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import { MemoryHandle } from "./handle.js"
 
-const DEFAULT_MEMORY_TTL_MS = 30 * 24 * 60 * 60 * 1_000
+export const DEFAULT_MEMORY_TOPIC_TTL_MS = 30 * 24 * 60 * 60 * 1_000
 
 /** Configures and opens a durable memory topic. */
 export class MemoryTopicBuilder {
   private streamValue: string | undefined
   private partitionsValue = 1
-  private ttlMs: number | undefined = DEFAULT_MEMORY_TTL_MS
+  private ttlMs: number | undefined = DEFAULT_MEMORY_TOPIC_TTL_MS
 
-  constructor(
+  private constructor(
     private readonly laser: Laser,
     private readonly topic: string
   ) {}
+
+  /** @internal */
+  static create(laser: Laser, topic: string): MemoryTopicBuilder {
+    return new MemoryTopicBuilder(laser, topic)
+  }
 
   /** Selects a stream instead of the client's default stream. */
   stream(name: string): this {
@@ -53,9 +58,10 @@ export class MemoryTopicBuilder {
     await this.laser
       .stream(stream)
       .topic(this.topic)
-      .ensure(this.partitionsValue, {
-        messageExpiryMicros: this.ttlMs === undefined ? 0n : BigInt(this.ttlMs) * 1_000n
-      })
+      .ensureWithExpiry(
+        this.partitionsValue,
+        this.ttlMs === undefined ? undefined : BigInt(this.ttlMs) * 1_000n
+      )
     return MemoryHandle.logTopic(this.laser, this.topic, stream)
   }
 }

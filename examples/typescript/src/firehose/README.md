@@ -54,7 +54,7 @@ LASER_FIREHOSE_QUERY=false \
 
 ## Where to look (LaserData Cloud)
 
-- Query: one index per organization, named `org_00`, `org_01`, and so on, with payload selection enabled per record.
+- Query: one index per organization, named after its topic plus the run token (`org_00_<token>`), with payload selection enabled per record.
 - Bindings: one source-topic binding per organization.
 - Messages: deterministic telemetry bodies spread across the configured partitions.
 

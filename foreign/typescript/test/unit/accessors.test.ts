@@ -1,10 +1,13 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { Laser } from "../../src/client/laser.js"
-import { NoStreamError } from "../../src/client/errors.js"
-import type { IggyClient } from "../../src/iggy/apache-iggy.js"
+import { NoStreamError, PresenceConflictError } from "../../src/client/errors.js"
+import type { IggyClient, LaserTransport } from "../../src/iggy/apache-iggy.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
+import { encodeAgentPresence, newAgentPresence, parseAgentId } from "../../src/wire/agent.js"
+import { encodeNamed } from "../../src/wire/cbor.js"
+import { AGDX_SET_CLIENT_METADATA_CODE } from "../../src/wire/codes.js"
 
 // Accessors are free to construct: no IO happens until a terminal verb, so an
 // injected client that never talks to a server is enough to exercise all of them.
@@ -16,7 +19,7 @@ function fakeClient(): IggyClient {
 }
 
 async function laserWithStream(): Promise<Laser> {
-  return Laser.fromIggyClient(fakeClient(), { defaultStream: "fleet" })
+  return (await Laser.fromClient(fakeClient())).withDefaultStream("fleet")
 }
 
 void test("given_a_connected_client_when_reaching_the_log_then_should_address_streams_and_topics", async () => {
@@ -30,7 +33,7 @@ void test("given_a_connected_client_when_reaching_the_log_then_should_address_st
 })
 
 void test("given_no_default_stream_when_using_the_shortcut_then_should_reject_with_no_stream", async () => {
-  await using laser = await Laser.fromIggyClient(fakeClient())
+  await using laser = await Laser.fromClient(fakeClient())
 
   assert.equal(laser.defaultStream, undefined)
   assert.throws(() => laser.topic("readings"), NoStreamError)
@@ -40,7 +43,7 @@ void test("given_a_connected_client_when_reaching_the_managed_surfaces_then_shou
   await using laser = await laserWithStream()
 
   assert.equal(laser.kv("profiles").namespace, "profiles")
-  assert.equal(laser.fork("experiment-1").forkId, "experiment-1")
+  assert.equal(laser.fork("experiment-1").id, "experiment-1")
   assert.ok(laser.graph("kg"))
   assert.deepEqual(laser.query("readings_v1").intoQuery().target, {
     kind: "operational",
@@ -92,4 +95,28 @@ void test("given_a_context_scope_when_reaching_further_primitives_then_should_bi
 
   assert.equal(scope.memory("support") instanceof Object, true)
   assert.ok(scope.graph("services"))
+})
+
+void test("given_a_wire_presence_when_advertised_then_should_send_it_and_refuse_another_agent", async (t) => {
+  await using laser = await Laser.fromClient(fakeClient())
+  const sent: [number, Uint8Array][] = []
+  t.mock.method(
+    (laser as unknown as { transport: LaserTransport }).transport,
+    "sendManaged",
+    (code: number, payload: Uint8Array) => {
+      sent.push([code, payload])
+      return Promise.resolve(new Uint8Array())
+    }
+  )
+  const presence = newAgentPresence(parseAgentId("worker"), "worker.work")
+
+  await laser.advertisePresence(presence)
+
+  assert.deepEqual(sent, [
+    [AGDX_SET_CLIENT_METADATA_CODE, encodeNamed(encodeAgentPresence(presence))]
+  ])
+  await assert.rejects(
+    laser.advertisePresence(newAgentPresence(parseAgentId("other"))),
+    PresenceConflictError
+  )
 })

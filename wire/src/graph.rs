@@ -1,15 +1,16 @@
+use crate::agent::wire_id;
 use crate::error::InvalidError;
 use crate::limits::MAX_GRAPH_NAME_BYTES;
 use crate::query::{Consistency, Filter, Value};
 use serde::{Deserialize, Serialize};
 
-crate::agent::wire_id!(
+wire_id!(
     /// A graph node's identity. Content-addressed (the hash of the node's label
     /// and canonical value), so the same entity extracted from different messages
     /// converges on one node. Minted SDK- or projector-side.
     NodeId
 );
-crate::agent::wire_id!(
+wire_id!(
     /// A graph edge's identity. Content-addressed over its endpoints and type, so
     /// the same relationship is one edge however many times it is observed.
     EdgeId

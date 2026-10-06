@@ -146,9 +146,9 @@ pub mod full {
         PublishRequest, Record, RecordBuilder, Sharding,
     };
     #[cfg(feature = "streaming")]
-    pub use crate::stream::{ConsumerGroupInfo, CreateConsumerGroup, GroupTarget};
+    pub use crate::stream::{ConsumerGroupInfo, CreateConsumerGroup};
     #[cfg(feature = "runs")]
-    pub use laser_wire::agent_workflow::{AgentRunInfo, RunPage};
+    pub use laser_wire::agent_workflow::{AgentRunInfo, RunBudget, RunPage};
     #[cfg(feature = "destinations")]
     pub use laser_wire::checkpoint::{
         AttemptColumnMetrics, AttemptObject, CheckpointError, CheckpointMutationResult,
@@ -179,9 +179,7 @@ pub mod full {
         SchemaFingerprint, TypedValue, UuidValue,
     };
     #[cfg(feature = "destinations")]
-    pub use laser_wire::source::{
-        PhysicalClusterIncarnation, SourceCut, SourceIncarnation, SourcePartitionCut, SourceScope,
-    };
+    pub use laser_wire::source::{PhysicalClusterIncarnation, SourceIncarnation, SourceScope};
     // `Json` and `Msgpack` are codec marker types, intentionally NOT here
     // because the short names collide too easily with user code
     // (`serde_json::Value::Json`, custom `Json` types, etc.). Import

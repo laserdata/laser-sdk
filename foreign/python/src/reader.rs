@@ -127,8 +127,9 @@ impl PyCursor {
 pub struct PyMessage {
     #[pyo3(get)]
     pub payload: Vec<u8>,
+    /// Where the message sits on the log (partition and offset).
     #[pyo3(get)]
-    pub message_id: String,
+    pub id: crate::ids::PyMessageId,
     #[pyo3(get)]
     pub headers: BTreeMap<String, String>,
 }
@@ -137,7 +138,7 @@ impl From<Message> for PyMessage {
     fn from(message: Message) -> Self {
         Self {
             payload: message.payload,
-            message_id: message.id.to_string(),
+            id: message.id.into(),
             headers: message.headers,
         }
     }
@@ -156,7 +157,7 @@ impl PyMessage {
     fn __repr__(&self) -> String {
         format!(
             "Message(id={}, headers={}, bytes={})",
-            self.message_id,
+            self.id.inner,
             self.headers.len(),
             self.payload.len()
         )

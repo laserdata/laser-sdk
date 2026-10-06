@@ -51,6 +51,9 @@ import laser_sdk as ls
 EXAMPLE = "incident-desk"
 
 TICKETS_TOPIC = "support_tickets"
+# The index carries this run's token, so a rerun or another language's desk on the
+# same deployment never shares its rows.
+TICKETS_INDEX = _common.index_for(TICKETS_TOPIC)
 TRIAGE_FORK = "bulk-resolve-plan"
 
 EMBEDDING_DIMS = 64
@@ -197,8 +200,8 @@ def make_triage(llm, index: str):
         # The resolver shares the Commands topic. Grants are its traffic, free
         # text is ours. Never fail on foreign messages.
         try:
-            payload = message.json()
-        except ls.CodecError:
+            payload = json.loads(message.payload)
+        except ValueError:
             payload = None
         if isinstance(payload, dict) and "cluster" in payload and "units" in payload:
             return
@@ -229,8 +232,8 @@ def make_triage(llm, index: str):
                 deadline_micros=deadline_micros,
             )
             reply = await ctx.request(
-                ls.Topics.TOOL_CALLS,
-                ls.Topics.TOOL_RESULTS,
+                ls.AgentTopic.ToolCalls,
+                ls.AgentTopic.ToolResults,
                 f"{angle} for: {incident}".encode(),
                 correlation,
                 timeout_secs=TOOL_TIMEOUT,
@@ -260,7 +263,7 @@ def make_specialist(llm, semantic):
         query = bytes(message.payload).decode("utf-8", "replace")
         # Past resolutions are cross-incident knowledge: recall unscoped.
         recalled = await semantic.recall(semantic=query, limit=TOP_K)
-        remembered = [item.text for item in recalled]
+        remembered = [item.text() for item in recalled]
         print(f"  specialist: recalled {len(remembered)} past resolutions")
         answer = await llm.complete(
             f"Answer briefly: {query}\nWhat past incidents taught us:\n" + "\n".join(remembered)
@@ -277,12 +280,12 @@ def make_resolver(grants_namespace: str):
     async def resolver(ctx, message):
         # Triage shares the Commands topic. Free text is its traffic.
         try:
-            grant = message.json()
-        except ls.CodecError:
+            grant = json.loads(message.payload)
+        except ValueError:
             return
         if not (isinstance(grant, dict) and "cluster" in grant and "units" in grant):
             return
-        key = message.idempotency_key or "?"
+        key = message.provenance.idempotency_key or "?"
         if grant["units"] >= APPROVAL_UNITS:
             print(f"  resolver: large grant {key}, requesting approval")
             if not await _approved(ctx, grant):
@@ -290,7 +293,7 @@ def make_resolver(grants_namespace: str):
                 return
         store = ctx.laser().kv(grants_namespace)
         quota = await _read_u64(store, grant["cluster"]) + grant["units"]
-        await store.set(grant["cluster"]).payload(str(quota)).send()
+        await store.set(grant["cluster"]).bytes(str(quota)).send()
         print(f"  resolver: applied {key}, {grant['cluster']} quota now {quota}")
 
     return resolver
@@ -309,8 +312,8 @@ async def approver(ctx, message):
 async def _approved(ctx, grant) -> bool:
     request = ls.Provenance(conversation_id=ls.new_conversation_id(), agent="resolver")
     decision = await ctx.request(
-        ls.Topics.HUMAN_INPUT,
-        ls.Topics.RESPONSES,
+        ls.AgentTopic.HumanInput,
+        ls.AgentTopic.Responses,
         f"approve a {grant['units']} unit capacity grant to {grant['cluster']}?".encode(),
         request,
         timeout_secs=APPROVAL_TIMEOUT,
@@ -336,7 +339,7 @@ def make_kv_deduplicator(laser, namespace: str, ttl: float):
             print(f"  dedup: duplicate {key}, skipping")
             return False
         try:
-            await store.set(key).payload(b"1").ttl(ttl).send()
+            await store.set(key).bytes(b"1").ttl(ttl).send()
         except ls.LaserError as error:
             print(f"  dedup: write failed ({error}), processing anyway (at-least-once)")
         return True
@@ -377,7 +380,7 @@ async def ingest_tickets(laser, total: int, chunk: int) -> None:
 async def backlog_snapshot(laser) -> None:
     # The questions an on-call asks first, straight off the materialized index.
     by_severity = await (
-        laser.query(TICKETS_TOPIC)
+        laser.query(TICKETS_INDEX)
         .filter_eq("status", "open")
         .count()
         .group_by(["severity"])
@@ -407,7 +410,7 @@ async def send_grants(laser, conversation: str, grants) -> None:
     for key, cluster, units in grants:
         provenance = ls.Provenance(conversation_id=conversation, idempotency_key=key)
         await laser.send_agent(
-            ls.Topics.COMMANDS,
+            ls.AgentTopic.Commands,
             json.dumps({"cluster": cluster, "units": units}).encode(),
             provenance,
         )
@@ -423,7 +426,7 @@ async def coordination_demo(laser) -> None:
     account = "pool:demo"
 
     try:
-        version = await ledger.set(account).payload(b"0").expect_absent().commit()
+        version = await ledger.set(account).bytes(b"0").expect_absent().commit()
         print(f"  seeded the quota ledger at version {version} (compare-and-swap)")
     except ls.LaserError as error:
         if getattr(error, "version_conflict", False):
@@ -443,7 +446,7 @@ async def coordination_demo(laser) -> None:
         quota = int(bytes(entry.value).decode())
         try:
             version = await (
-                ledger.set(account).payload(str(quota + 25)).expect_version(entry.version).commit()
+                ledger.set(account).bytes(str(quota + 25)).expect_version(entry.version).commit()
             )
             print(f"  applied a grant via compare-and-swap, quota {quota + 25}")
             applied = True
@@ -460,7 +463,7 @@ async def coordination_demo(laser) -> None:
     # catch up instead of racing it. A stale outcome is retryable and distinct
     # from an unsupported level, and the unified result space tells them apart.
     try:
-        result = await laser.query(TICKETS_TOPIC).read_your_writes().limit(1).fetch()
+        result = await laser.query(TICKETS_INDEX).read_your_writes().limit(1).fetch()
         print(f"  read-your-writes query served fresh ({len(result.rows)} row)")
     except ls.LaserError as error:
         if getattr(error, "stale", False):
@@ -475,7 +478,7 @@ async def speculative_bulk_resolve(laser) -> None:
     # backlogs, then log the verdict. The fork stays open by default so it shows
     # up in LaserData Cloud. Set LASER_APPLY_PLAN=1 to act on the verdict.
     criticals = await (
-        laser.query(TICKETS_TOPIC)
+        laser.query(TICKETS_INDEX)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
         .filter_eq("component", "auth")
@@ -499,13 +502,13 @@ async def speculative_bulk_resolve(laser) -> None:
         if partition is None or offset is None:
             continue
         await (
-            fork.put_row(TICKETS_TOPIC, int(partition), int(offset))
+            fork.put_row(TICKETS_INDEX, int(partition), int(offset))
             .field("status", "resolved")
             .send()
         )
 
     forked_open = await (
-        laser.query(TICKETS_TOPIC)
+        laser.query(TICKETS_INDEX)
         .fork(TRIAGE_FORK)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
@@ -536,11 +539,11 @@ async def recover_incident(laser, conversation: str) -> dict:
     # database. An incident conversation is a few dozen steps, so a generous
     # bound is the honest full walk here.
     recovered = {"diagnosis": "", "findings": []}
-    trail = await laser.context(conversation).fetch(topics=[ls.Topics.RESPONSES], last_n=200)
+    trail = await laser.context(conversation).fetch(topics=[ls.AgentTopic.Responses], n=200)
     for message in trail:
         try:
-            step = message.json()
-        except ls.CodecError:
+            step = json.loads(message.payload)
+        except ValueError:
             continue
         if isinstance(step, dict) and "findings" in step:
             if step.get("diagnosis"):
@@ -561,7 +564,7 @@ async def main() -> None:
         await laser.topic(TICKETS_TOPIC).ensure(partitions=_common.PARTITIONS)
 
         caps = await laser.capabilities()
-        if not _common.managed_gate(caps.query, "the agentic incident desk", EXAMPLE):
+        if not _common.managed_gate(caps.query.available, "the agentic incident desk", EXAMPLE):
             return
         # Register before publishing a single ticket, so no event is missed by a
         # projector that starts afterwards.
@@ -570,19 +573,20 @@ async def main() -> None:
             laser,
             TICKETS_TOPIC,
             ["ticket_id", "message_type", "cluster", "component", "severity", "status", "ts"],
+            index=TICKETS_INDEX,
         )
 
         total = _common.messages(2_000)
         chunk = _common.batch(200)
         _common.phase("ingesting the ticket firehose (the desk's world model)")
         await ingest_tickets(laser, total, chunk)
-        await _common.wait_for_projection(laser, TICKETS_TOPIC, total)
+        await _common.wait_for_projection(laser, TICKETS_INDEX, total)
         await backlog_snapshot(laser)
 
         _common.phase("seeding semantic memory with past resolutions")
         # One shared in-process semantic index for the whole desk: seeded here, read
         # by every specialist call, and appended to as incidents resolve.
-        semantic = laser.vector_memory(embed)
+        semantic = ls.VectorMemory.governed(laser, embed)
         await seed_memory(semantic)
 
         _common.phase("spawning the desk: triage, specialist, resolver, approver")
@@ -593,28 +597,28 @@ async def main() -> None:
         grants_namespace = f"desk-grants-{run}"
         triage = laser.spawn_agent(
             "triage",
-            ls.Topics.COMMANDS,
-            make_triage(llm, TICKETS_TOPIC),
-            respond_on=ls.Topics.RESPONSES,
+            ls.AgentTopic.Commands,
+            make_triage(llm, TICKETS_INDEX),
+            respond_on=ls.AgentTopic.Responses,
             poll_interval_ms=10,
         )
         specialist = laser.spawn_agent(
             "specialist",
-            ls.Topics.TOOL_CALLS,
+            ls.AgentTopic.ToolCalls,
             make_specialist(llm, semantic),
-            respond_on=ls.Topics.TOOL_RESULTS,
+            respond_on=ls.AgentTopic.ToolResults,
             poll_interval_ms=10,
         )
         approver_agent = laser.spawn_agent(
             "approver",
-            ls.Topics.HUMAN_INPUT,
+            ls.AgentTopic.HumanInput,
             approver,
-            respond_on=ls.Topics.RESPONSES,
+            respond_on=ls.AgentTopic.Responses,
             poll_interval_ms=10,
         )
         resolver = laser.spawn_agent(
             "resolver",
-            ls.Topics.COMMANDS,
+            ls.AgentTopic.Commands,
             make_resolver(grants_namespace),
             poll_interval_ms=10,
             dedup=make_kv_deduplicator(laser, dedup_namespace, DEDUP_TTL),
@@ -628,13 +632,13 @@ async def main() -> None:
             incident = ls.new_conversation_id()
             print(f"  incident on conversation {incident}: {INCIDENT}")
             reply = await laser.request(
-                ls.Topics.COMMANDS,
-                ls.Topics.RESPONSES,
+                ls.AgentTopic.Commands,
+                ls.AgentTopic.Responses,
                 INCIDENT.encode(),
                 ls.Provenance(conversation_id=incident),
                 timeout_secs=DESK_TIMEOUT,
             )
-            diagnosed = reply.json()
+            diagnosed = json.loads(reply.payload)
             print(f"  diagnosis: {diagnosed['diagnosis']}")
 
             _common.phase("executing capacity grants effectively once")
@@ -689,7 +693,7 @@ async def main() -> None:
                 await agent.shutdown()
         _common.phase("done")
         print(
-            f"  inspect the run in LaserData Cloud: index '{TICKETS_TOPIC}', "
+            f"  inspect the run in LaserData Cloud: index '{TICKETS_INDEX}', "
             f"KV namespaces '{grants_namespace}' and '{dedup_namespace}'"
         )
     finally:

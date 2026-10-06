@@ -28,9 +28,9 @@ def start_another_conversation(world):
 
 @when(parsers.parse('I publish an AGDX command "{body}" via the typed producer'))
 def publish_agdx_command(world, body):
-    correlation = ls.new_correlation_id()
+    correlation = ls.mint_ulid()
     world.run(
-        lambda: world.laser.agdx(ls.Topics.COMMANDS, "producer", world.conversation).command(
+        lambda: world.laser.agdx(ls.AgentTopic.Commands, "producer", world.conversation).command(
             correlation, body.encode()
         )
     )
@@ -38,17 +38,27 @@ def publish_agdx_command(world, body):
 
 @then(parsers.parse('the AGDX command body is "{body}"'))
 def agdx_command_body_is(world, body):
-    assert any(message.agdx_body == body.encode() for message in world.assembled)
+    assert any(
+        message.envelope is not None and bytes(message.envelope["body"]) == body.encode()
+        for message in world.assembled
+    )
+
+
+def understood_by_bare_receiver(requiring):
+    envelope = ls.event_envelope(
+        ls.mint_ulid(), ls.new_conversation_id(), "sender", b"event", requiring=requiring
+    )
+    return ls.unmet_requirements(envelope, 0) == 0
 
 
 @when("I build an agent event requiring feature bits the receiver lacks")
 def build_required_event(world):
-    world.agent_event_understood = ls.agent_event_is_understood(1 << 8, 0)
+    world.agent_event_understood = understood_by_bare_receiver(1 << 8)
 
 
 @when("I build a plain agent event")
 def build_plain_event(world):
-    world.agent_event_understood = ls.agent_event_is_understood(0, 0)
+    world.agent_event_understood = understood_by_bare_receiver(0)
 
 
 @then("the receiver rejects it as not understood")

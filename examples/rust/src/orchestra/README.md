@@ -5,8 +5,8 @@ This example coordinates agents through capability discovery, contracts, fan-out
 Each agent opens its own connection and remains active during the run. The example pauses for Enter between phases. The Console Orchestration view can display the changes:
 
 1. Discovery - six agents connect and advertise a capability card and a live inbox. The orchestrator resolves them from the fused registry (cards folded from the registry topic), so it never hard-codes who can do what.
-2. Contract - a directed task to one capable agent with a deadline (`Laser::contract(Router::to_capable("classify"))`). The orchestrator learns the reply, or that it never came. Acknowledgment-on-pickup tells consumed from expired.
-3. Fan-out - a panel scattered to every capable agent (`Router::all_capable("diagnose")`). One diagnose agent advertises itself `Unavailable`, so capability resolution leaves it out with no orchestrator change, and the panel reaches two of the three.
+2. Contract - a directed task to one capable agent with a deadline (`Laser::contract(Router::to_capable("classify", RoutePolicy::Any))`). The orchestrator learns the reply, or that it never came. Acknowledgment-on-pickup tells consumed from expired.
+3. Fan-out - a panel scattered to every capable agent (`Router::all_capable("diagnose", RoutePolicy::Any)`). One diagnose agent advertises itself `Unavailable`, so capability resolution leaves it out with no orchestrator change, and the panel reaches two of the three.
 4. Workflow - a journalled, dependency-ordered run (`Laser::workflow`): `triage`, then a `diagnose` panel under a `verify_with` check, then `remediate`. A `Budget` caps the dispatches and wall clock, and each step builds its task from the prior steps' outputs. The journal shows the completed steps in the console's Workflow panel.
 5. Quarantine - an operator quarantines a misbehaving agent (`Laser::quarantine`), a registry fact every fused registry folds, and the next panel routes around it.
 6. Recovery - the operator reinstates it (`Laser::unquarantine`), and the panel is whole again.

@@ -5,9 +5,9 @@ description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`. The adapter (submit / t
 
 # A2A bridge
 
-The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios. Python binds the same bridges: `a2a_bridge(..., capabilities=, signing_key=)` with `signed_card(key)`, and `mcp_bridge(..., memory_tools=False, timeout_secs=None)`, matching Rust `with_capabilities`, `with_signing_key`, `signed_card`, `with_memory_tools`, and `with_timeout` (default 30 seconds).
+The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios. Python binds the same bridges as classes: `A2aBridge(laser, source, request_topic, reply_topic, capabilities=, signing_key=)` with `signed_card(key)`, and `McpBridge(laser, source, tool_topic, reply_topic, server_name, memory_tools=False, timeout_secs=None)`, matching Rust `with_capabilities`, `with_signing_key`, `signed_card`, `with_memory_tools`, and `with_timeout` (default 30 seconds).
 
-`a2a.rs` maps A2A requests to durable AGDX records. `a2a-bridge` enables the transport-independent `submit`, `task`, `cancel`, and `card` adapter. `a2a-http` adds the axum `router()`, `A2aMethod`, and JSON-RPC handlers. Neither feature is enabled by default. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first and follow [AGENTS.md](../../../AGENTS.md).
+`a2a.rs` maps A2A requests to durable AGDX records. `a2a-bridge` enables the transport-independent `submit`, `task`, `cancel`, and `card` adapter. `handle_rpc` dispatches JSON-RPC requests without HTTP. `a2a-http` adds the axum `router()`. Neither feature is enabled by default. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first and follow [AGENTS.md](../../../AGENTS.md).
 
 ## STOP and ask the user before
 
@@ -22,7 +22,7 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 - `AgentCard` / `AgentCardCapabilities` - the bridge's discovery doc (name = `source`, version, methods, `streaming`).
 - `A2aBridge::new(laser, source, request_topic, reply_topic)` - rides the typed AGDX verbs (`Laser::agdx`), not raw `send_agent`:
   - `submit(params_json) -> Task` (`SendMessage`): publish a typed AGDX `command` tunneling the whole params JSON byte-identical (`agdx.ct = json`) on a fresh task conversation. The task identity rides `correlation`, derived from the conversation via `correlation_of` so lookup stays stateless. Returns `Submitted`.
-  - `task(id) -> Task` (`tasks/get`): read the reply topic (envelope-aware `ContextAssembler`), map the answering `response`/`error` envelope with the matching `correlation` via `task_from_envelope`, else `Working`.
+  - `task(id) -> Task` (`GetTask`): read the reply topic (envelope-aware `ContextAssembler`), map the answering `response`/`error` envelope with the matching `correlation` via `task_from_envelope`, else `Working`.
   - `cancel(id) -> Task` (`CancelTask`): publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`), returns `Canceled`.
   - `card() -> AgentCard`: served at `GET /.well-known/agent-card.json`.
   - `router() -> axum::Router` (requires `a2a-http`): the JSON-RPC endpoint at `POST /` plus the card route. The adapter above is usable without it (serve it over any transport, or call `submit` / `task` / `cancel` directly).
@@ -31,7 +31,7 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 ## Rules specific to this area
 
 - The bridge owns no state: truth is the log. `submit`/`task` are pure functions over `Laser`, so the HTTP layer (`router`) is a thin shell and is testable by calling `submit`/`task` directly against Apache Iggy.
-- A bridge uses the stream selected by its `Laser` handle. Use `laser.with_stream(name)` to share one connection across stream-scoped views. Use separate connections for separate credentials. Reply reads use `AgentReplyReader`, `Laser::await_agdx_reply`, or `find_agdx_reply`. Avoid repeated full scans for an active reply wait.
+- A bridge uses the stream selected by its `Laser` handle. Use `laser.with_default_stream(name)` to share one connection across stream-scoped views. Use separate connections for separate credentials. Reply reads use `AgentReplyReader`, `Laser::await_agdx_reply`, or `find_agdx_reply`. Avoid repeated full scans for an active reply wait.
 - `authorize_edge` in `sdk/src/edge_auth.rs` checks token audience and required scopes. `EdgeDenial::StepUp` reports additional scope through `WWW-Authenticate`. Do not forward external tokens to the log. `sign::verify_delegation` binds `on_behalf_of` to the signed envelope. `laser_wire::authz::delegated_allow` intersects agent and invoking-user grants.
 - Keep model calls and business logic out of the bridge. It only translates the protocol to topic sends and log replays.
 
@@ -46,3 +46,5 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 - A `TaskState` or `A2aMethod` wire name drifting from the A2A spelling.
 - A bare method-name string literal in the dispatch instead of `A2aMethod`.
 - The router holding task state instead of replaying the log.
+
+Both `A2aBridge` and `McpBridge` expose `handle_rpc(JsonValue)` on their adapter features. Python binds it as `handle_rpc(request)` and TypeScript as `handleRpc(input)`. Python `A2aBridge.submit(params_json)` and `McpBridge.call_tool(name, params_json)` take raw JSON, as do TypeScript `submit` and `callTool(name, bytes)`. HTTP routes delegate to this dispatch. Every bridge stamps its own ID in `bridge_hops`, and `with_bridge_hops` continues a previous path while rejecting loops.

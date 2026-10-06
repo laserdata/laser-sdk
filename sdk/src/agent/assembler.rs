@@ -1,4 +1,5 @@
 use laser_wire::agent::{AgentEnvelope, AgentKind, TokenUsage};
+use serde::{Serialize, Serializer};
 
 // Synthetic finish reasons, reader-local: never published. The log keeps the
 // raw truth, the live view diverges from it in this one direction only.
@@ -8,11 +9,17 @@ pub const FINISH_REASON_ABANDONED: &str = "abandoned";
 /// proves the producer never published it).
 pub const FINISH_REASON_GAP: &str = "gap";
 
-/// One reassembled stream occurrence, in order.
-#[derive(Debug, Clone, PartialEq)]
+/// One reassembled stream occurrence, in order. Serializes as a record tagged
+/// by `kind` (`body`, `finished`, `failed`) with the variant's fields beside it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// The next body bytes of the stream.
-    Body { sequence: u64, payload: Vec<u8> },
+    Body {
+        sequence: u64,
+        #[serde(serialize_with = "as_bytes")]
+        payload: Vec<u8>,
+    },
     /// The stream ended. `synthetic` marks reader-local endings (gap,
     /// abandonment) that never reach the log.
     Finished {
@@ -22,7 +29,10 @@ pub enum StreamEvent {
     },
     /// The stream ended on a `kind = error` terminal. `body` is the encoded
     /// `AgentErrorBody`.
-    Failed { body: Vec<u8> },
+    Failed {
+        #[serde(serialize_with = "as_bytes")]
+        body: Vec<u8>,
+    },
 }
 
 /// Per-channel reassembly state machine, pure and clock-free (the consumer
@@ -135,6 +145,12 @@ impl ChunkAssembler {
         }
         events
     }
+}
+
+// Bytes as a byte string, not a sequence of numbers, so binary formats and
+// language bindings carry them as bytes.
+fn as_bytes<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(value)
 }
 
 #[cfg(test)]
@@ -291,6 +307,32 @@ mod tests {
         // Late chunks after local abandonment drop while the log keeps them.
         assert!(assembler.feed(&chunk(1, b"b")).is_empty());
         assert_eq!(assembler.late_dropped(), 1);
+    }
+
+    #[test]
+    fn given_stream_events_when_serialized_then_should_tag_each_with_its_kind() {
+        let body = serde_json::to_value(StreamEvent::Body {
+            sequence: 2,
+            payload: b"a".to_vec(),
+        })
+        .expect("serializes");
+        assert_eq!(
+            body,
+            serde_json::json!({"kind": "body", "sequence": 2, "payload": [97]})
+        );
+        let finished = serde_json::to_value(StreamEvent::Finished {
+            finish_reason: Some("stop".to_owned()),
+            usage: None,
+            synthetic: false,
+        })
+        .expect("serializes");
+        assert_eq!(
+            finished,
+            serde_json::json!({"kind": "finished", "finish_reason": "stop", "usage": null, "synthetic": false})
+        );
+        let failed =
+            serde_json::to_value(StreamEvent::Failed { body: vec![1] }).expect("serializes");
+        assert_eq!(failed, serde_json::json!({"kind": "failed", "body": [1]}));
     }
 
     fn chunk(sequence: u64, body: &[u8]) -> AgentEnvelope {

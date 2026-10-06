@@ -24,7 +24,7 @@ void test("given_a_consumer_group_when_messages_are_sent_then_should_receive_the
     await topic.send(utf8("two"))
 
     const groupName = `g-${randomUUID()}`
-    const consumer = await topic.consumerGroup(groupName).consumer({ startFrom: { kind: "first" } })
+    const consumer = await topic.consumerGroup(groupName).consumer({ startAt: { kind: "first" } })
     try {
       const one = await consumer.nextWithin(2_000)
       const two = await consumer.nextWithin(2_000)
@@ -47,8 +47,8 @@ void test("given_a_group_consumer_with_manual_commit_when_rejoined_then_should_r
 
     const groupName = `g-${randomUUID()}`
     const first = await topic.consumerGroup(groupName).consumer({
-      startFrom: { kind: "first" },
-      autoCommit: false
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" }
     })
     const alpha = await first.nextWithin(2_000)
     assert.equal(decodeUtf8(alpha.payload), "alpha")
@@ -56,8 +56,8 @@ void test("given_a_group_consumer_with_manual_commit_when_rejoined_then_should_r
     await first.shutdown()
 
     const rejoined = await topic.consumerGroup(groupName).consumer({
-      startFrom: { kind: "next" },
-      autoCommit: false
+      startAt: { kind: "next" },
+      commitPolicy: { kind: "disabled" }
     })
     try {
       const beta = await rejoined.nextWithin(2_000)
@@ -77,13 +77,13 @@ void test("given_manual_group_replay_when_reading_multiple_batches_then_should_n
     await topic.send(new TextEncoder().encode("first"))
     await topic.send(new TextEncoder().encode("second"))
     const consumer = await topic.consumerGroup(`replay-${randomUUID()}`).consumer({
-      startFrom: { kind: "first" },
-      autoCommit: false,
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" },
       batchLength: 1
     })
     try {
-      assert.equal((await consumer.nextWithin(3_000)).offset, 0n)
-      assert.equal((await consumer.nextWithin(3_000)).offset, 1n)
+      assert.equal((await consumer.nextWithin(3_000)).position.offset, 0n)
+      assert.equal((await consumer.nextWithin(3_000)).position.offset, 1n)
     } finally {
       await consumer.shutdown()
     }
@@ -102,21 +102,21 @@ void test("given_an_unbound_group_id_when_consumed_then_should_preserve_payloads
     const byId = topic.consumerGroupId(info.id)
     const first = await byId.consumer({
       batchLength: 1,
-      autoCommit: false,
-      startFrom: { kind: "first" }
+      commitPolicy: { kind: "disabled" },
+      startAt: { kind: "first" }
     })
     try {
       const record = await first.nextWithin(3_000)
-      assert.equal(record.offset, 0n)
+      assert.equal(record.position.offset, 0n)
       assert.deepEqual(record.payload, payloads[0])
       await first.commit(record)
     } finally {
       await first.shutdown()
     }
-    const resumed = await byId.consumer({ batchLength: 1, autoCommit: false })
+    const resumed = await byId.consumer({ batchLength: 1, commitPolicy: { kind: "disabled" } })
     try {
       const record = await resumed.nextWithin(3_000)
-      assert.equal(record.offset, 1n)
+      assert.equal(record.position.offset, 1n)
       assert.deepEqual(record.payload, payloads[1])
     } finally {
       await resumed.shutdown()
@@ -127,7 +127,7 @@ void test("given_an_unbound_group_id_when_consumed_then_should_preserve_payloads
         const page = await advanced.nextPage({ timeoutMs: 3_000 })
         assert.equal(page.policy.mode, "unfiltered")
         assert.deepEqual(
-          page.records.map((record) => record.payload),
+          page.records.map((record) => record.message.payload),
           payloads
         )
         assert.ok(page.records.every((record) => !record.evaluated))

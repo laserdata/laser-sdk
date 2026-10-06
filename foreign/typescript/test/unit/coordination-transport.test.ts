@@ -12,7 +12,7 @@ import {
 import { ApacheIggyTransport } from "../../src/iggy/apache-iggy.js"
 import { DedicatedKvTransport, FencedLeaseClient } from "../../src/managed/coordination.js"
 import { encodeOne, encodeNamed } from "../../src/wire/cbor.js"
-import { encodeBackendAnnounce, Feature } from "../../src/wire/hello.js"
+import { encodeBackendAnnounce, feature } from "../../src/wire/hello.js"
 import { encodeKvReply } from "../../src/wire/kv.js"
 
 function deferred<T>() {
@@ -31,7 +31,7 @@ const supported = encodeBackendAnnounce({
     fork: 1,
     agent: 1,
     graph: 1,
-    features: Feature.KV_FENCED_LEASES
+    features: feature.KV_FENCED_LEASES
   },
   backends: []
 })

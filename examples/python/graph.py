@@ -37,8 +37,8 @@ SERVICES = ("service:auth", "service:metrics")
 def entity_of(node: dict) -> str:
     """A node's `kind:value` form, the same spelling `link` accepted: the label
     it carries plus its content-addressed `value` attribute."""
-    kind = node["labels"][0] if node["labels"] else "entity"
-    return f"{kind}:{node['attrs'].get('value', '?')}"
+    kind = node["labels"][0] if node.get("labels") else "entity"
+    return f"{kind}:{dict(node.get('attrs', [])).get('value', '?')}"
 
 
 async def main() -> None:
@@ -54,12 +54,14 @@ async def main() -> None:
         for service in SERVICES:
             await graph.link(HOST, RELATION, service)
 
-        host_id = ls.node_id("host", "node-7")
-        services = await graph.neighbors(host_id, direction="out", edge_type=RELATION, depth=1)
+        host_id = ls.node_id_content("host", "node-7")
+        services = await graph.neighbors(host_id, "out", RELATION, 1)
 
+        # The reply carries the start node beside the nodes it reaches.
         print(f"  {HOST} {RELATION}:")
-        for node in services["nodes"]:
-            print(f"    {entity_of(node)}")
+        for node in services.get("nodes", []):
+            if (entity := entity_of(node)) != HOST:
+                print(f"    {entity}")
     finally:
         await laser.close()
 

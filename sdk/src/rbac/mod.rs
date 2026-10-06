@@ -5,10 +5,13 @@ use laser_wire::framing::encode_named;
 use serde::Serialize;
 
 pub use laser_wire::authz::{
-    Action, AuthzError, AuthzEvent, AuthzEventKind, AuthzHistoryReply, AuthzHistoryReq, AuthzReply,
-    AuthzSubject, BindRolesReq, BindingsReply, DefineRoleReq, DeleteRoleReq, Effect, Feature,
-    GetBindingsReq, GetRoleReq, Grant, ListRolesReply, ListRolesReq, ResourceKind, ResourcePattern,
-    Role, RoleBinding, WhoamiReply, WhoamiReq, delegated_allow, grants_allow, validate_role_name,
+    Action, AuthzError, AuthzEvent, AuthzEventKind, AuthzHistoryReply, AuthzSubject, Effect,
+    Feature, Grant, ResourceKind, ResourcePattern, Role, WhoamiReply, delegated_allow,
+    grants_allow, validate_role_name,
+};
+use laser_wire::authz::{
+    AuthzHistoryReq, AuthzReply, BindRolesReq, DefineRoleReq, DeleteRoleReq, GetBindingsReq,
+    GetRoleReq, ListRolesReq, WhoamiReq,
 };
 pub use laser_wire::codes::{
     AGDX_AUTHZ_BIND_ROLES_CODE, AGDX_AUTHZ_DEFINE_ROLE_CODE, AGDX_AUTHZ_DELETE_ROLE_CODE,

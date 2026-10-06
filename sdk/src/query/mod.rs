@@ -4,10 +4,7 @@
 // half (publish/query/browse/control builders, `Record` lowering onto iggy
 // headers) stays in this crate behind the `query` feature.
 
-pub use laser_wire::browse::{
-    BrowseOutcome, BrowseReply, DecodeRecord, GetProjection, GetSchema, ListProjections,
-    ListSchemas, ProjectionInfo, RegisterSchema, SchemaInfo,
-};
+pub use laser_wire::browse::{ProjectionInfo, SchemaInfo};
 pub use laser_wire::codes::{
     AGDX_COMMAND_BASE, AGDX_DECODE_RECORD_CODE, AGDX_FORK_BASE, AGDX_FORK_CREATE_CODE,
     AGDX_FORK_DELETE_CODE, AGDX_FORK_LIST_CODE, AGDX_FORK_PROMOTE_CODE, AGDX_FORK_PUT_CODE,
@@ -17,27 +14,23 @@ pub use laser_wire::codes::{
     QUERY_OP_VERSION,
 };
 pub use laser_wire::control::{
-    ControlCommand, ControlEnvelope, EdgeExtract, EntitySchema, FieldType, IndexField, IndexSchema,
-    IndexSchemaBuilder, NodeExtract, Projection, ProjectionBinding, ProjectionBindingBuilder,
-    ProjectionBuilder, ProjectionId, ProjectionKind, RetentionPolicy, SchemaDef, SchemaSource,
-    SourceSelector,
+    EdgeExtract, EntitySchema, FieldType, IndexField, IndexSchema, IndexSchemaBuilder, NodeExtract,
+    Projection, ProjectionBinding, ProjectionBindingBuilder, ProjectionBuilder, ProjectionId,
+    ProjectionKind, RetentionPolicy, SchemaDef, SchemaSource, SourceSelector,
 };
 pub use laser_wire::headers::{
     CONTENT_TYPE, FIELD_MESSAGE_TYPE, FIELD_TS, IDX_PREFIX, INLINE_PAYLOAD, PROJECTION_REF,
     SCHEMA_ID, VECTOR_FIELD, WINDOW_START,
 };
-pub use laser_wire::hello::HelloReply;
 pub use laser_wire::limits::{
     DEFAULT_STREAM_PAGE_SIZE, MAX_INDEX_ENTRIES_PER_RECORD, MAX_PAGE_SIZE,
 };
 pub use laser_wire::query::{
     AggCall, AggFunc, Aggregate, BoundaryRelation, CmpOp, Consistency, Dir, Filter, KeyMatch,
-    MaterializationBoundary, Page, Predicate, Query, QueryBuilder, QueryCancelEnvelope,
-    QueryCancelReply, QueryContext, QueryEngine, QueryEnvelope, QueryError, QueryErrorCode,
-    QueryExecutionId, QueryExecutionState, QueryExecutionStatus, QueryPageEnvelope,
-    QueryPageRequest, QueryReply, QueryResult, QueryStatusEnvelope, QueryStatusReply, QueryTarget,
-    RawSql, ResolvedQueryTarget, Row, Select, SnapshotSelector, Sort, SqlDialect, TextQuery, Value,
-    VectorQuery, Window,
+    MaterializationBoundary, Page, Predicate, Query, QueryBuilder, QueryContext, QueryEngine,
+    QueryError, QueryErrorCode, QueryExecutionId, QueryExecutionState, QueryExecutionStatus,
+    QueryPageRequest, QueryResult, QueryTarget, RawSql, ResolvedQueryTarget, Row, Select,
+    SnapshotSelector, Sort, SqlDialect, TextQuery, Value, VectorQuery, Window,
 };
 pub use laser_wire::result::ResultCode;
 pub use laser_wire::schema::TypedValue;

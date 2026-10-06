@@ -44,7 +44,7 @@ async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
         caps = await laser.capabilities()
-        if not _common.managed_gate(caps.kv, "state (kv)", EXAMPLE):
+        if not _common.managed_gate(caps.kv.available, "state (kv)", EXAMPLE):
             return
 
         _common.phase("set and get keyed state")
@@ -53,7 +53,7 @@ async def main() -> None:
         config = await store.get_typed(KEY)
         print(f"  {KEY} logs at {config['log_level']}")
 
-        if caps.kv_cas:
+        if caps.kv.cas:
             _common.phase("compare-and-swap: the write lands only if nobody moved first")
             entry = await store.get_entry(KEY)
             await store.set(KEY).json({"log_level": "debug"}).expect_version(entry.version).commit()
@@ -63,7 +63,7 @@ async def main() -> None:
                 f"{KEY} now logs at {raised['log_level']}"
             )
 
-        if caps.kv_fenced_leases:
+        if caps.kv.fenced_leases:
             _common.phase("lease and fenced write: at most one effective writer")
             lease = await store.lease(LEASE_KEY, HOLDER, LEASE_TTL_SECS)
             print(f"  {HOLDER} holds {LEASE_KEY} at fence {lease.token}")

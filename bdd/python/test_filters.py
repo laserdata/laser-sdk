@@ -85,12 +85,12 @@ def given_filter(bench, name):
 
 @when(parsers.parse('it evaluates the "{name}" record'))
 def evaluate_record(bench, name):
-    bench.verdict = bench.filter.evaluate(RECORDS[name])
+    bench.verdict = ls.CompiledFilter.compile(bench.filter).evaluate(RECORDS[name])
 
 
 @when(parsers.parse('it evaluates the "{name}" record with header "{key}" set to "{value}"'))
 def evaluate_record_with_header(bench, name, key, value):
-    bench.verdict = bench.filter.evaluate(RECORDS[name], {key: value})
+    bench.verdict = ls.CompiledFilter.compile(bench.filter).evaluate(RECORDS[name], {key: value})
 
 
 @then(parsers.re(r"the record is (?P<verdict>selected|rejected|a fault)"))
@@ -159,8 +159,8 @@ def managed_group(world):
         operation_id = uuid.uuid4().int
         first = await group.create(filter=safe_mode(), operation_id=operation_id)
         assert await group.create(filter=safe_mode(), operation_id=operation_id) == first
-        binding = first["filter"]
-        by_id = topic.consumer_group_id(first["id"])
+        binding = first.filter
+        by_id = topic.consumer_group_id(first.id)
         consumer = by_id.consumer(auto_commit="disabled")
         delivered = []
         try:
@@ -196,9 +196,7 @@ def read_unbound_consumer(world):
     async def read():
         topic = world.laser.topic(TOPIC)
         info = await topic.consumer_group("unbound-consumers").create()
-        consumer = topic.consumer_group_id(info["id"]).consumer(
-            batch_length=2, auto_commit="disabled"
-        )
+        consumer = topic.consumer_group_id(info.id).consumer(batch_length=2, auto_commit="disabled")
         delivered = []
         try:
             for _ in FEED:
@@ -286,7 +284,7 @@ def consume_bounded_scan(world):
         consumer = group.consumer(batch_length=100, auto_commit="disabled", polling="first")
         try:
             record = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
-            assert record.offset == 100
+            assert record.position.offset == 100
             assert await consumer.last_stored_offset(0) == 99
             await consumer.commit(record)
             return [record.payload]

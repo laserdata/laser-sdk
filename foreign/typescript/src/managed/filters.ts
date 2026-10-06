@@ -1,5 +1,5 @@
 import { resultCodeIsRetryable } from "../wire/result.js"
-import { jsonCodec } from "../stream/codecs.js"
+import { Json } from "../stream/codecs.js"
 import { decodeBrowseReply, encodeGetSchema } from "../wire/browse.js"
 import type { SchemaDef } from "../wire/control.js"
 import { AGDX_GET_SCHEMA_CODE, QUERY_OP_VERSION } from "../wire/codes.js"
@@ -8,7 +8,8 @@ import {
   AmbiguousMutationError,
   ConfigError,
   FilterExecutionError,
-  FilterStopError,
+  FilterFaultError,
+  FilterOversizedRecordError,
   InvalidError,
   type LaserError,
   ProtocolError,
@@ -17,17 +18,19 @@ import {
   TransportError,
   UnsupportedError
 } from "../client/errors.js"
-import { executeManaged, requireManagedCommand } from "../client/managed.js"
+import { decodeManagedReply, executeManaged, requireManagedCommand } from "../client/managed.js"
 import {
   type CoordinatorConnection,
   type HeaderFault,
-  type IggyHeaderValue,
   type LaserTransport,
   type NodeConnection,
   type PolledMessage,
   decodePolledBody,
   serverErrorCode
 } from "../iggy/apache-iggy.js"
+import type { HeaderValue } from "../stream/header-value.js"
+import type { ConsumerMessage } from "../stream/consumer.js"
+import { withMessageJson } from "../stream/message.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import { decodeOne, encodeNamed } from "../wire/cbor.js"
 import {
@@ -83,7 +86,7 @@ import {
   decodeFilterReply,
   encodeFilteredAck,
   encodeFilteredPollRequest,
-  nextFilteredStart,
+  filteredPageNextStart,
   validateCatalogPage,
   validateFilterGroupRef,
   validateFilterMutationRequest,
@@ -190,10 +193,9 @@ export interface MatchedRecord {
   readonly frontier: bigint
   /** `false` when the filter could not evaluate the record and a `pass` fault, foreign-record, or mismatch policy returned it unevaluated. */
   readonly evaluated: boolean
-  readonly payload: Uint8Array
-  readonly headers: ReadonlyMap<string, IggyHeaderValue>
-  /** The record's batch timestamp in whole microseconds, as stored. */
-  readonly timestampMicros?: bigint
+  /** The record as stored: payload, typed headers, id, and timestamps. Its
+   * `currentOffset` is the partition head when the record was read. */
+  readonly message: ConsumerMessage
   readonly [READER_TAG]?: ReaderTag
 }
 
@@ -1067,7 +1069,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       // from its stored offset and is read again at once under the policy the
       // group holds now. Only an explicit acknowledgment of a record read
       // under the old policy reports the change.
-      if (error instanceof FilterExecutionError && error.reason === "conflict") {
+      if (error instanceof FilterExecutionError && error.detail.reason === "conflict") {
         return { kind: "empty", more: true }
       }
       throw error
@@ -1141,23 +1143,21 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         }
       }
       if (blocked !== undefined) {
-        throw new FilterStopError(blocked.stop, partitionId, blocked.offset, blocked.reason)
+        throw blocked.stop === "fault"
+          ? new FilterFaultError(partitionId, blocked.offset, blocked.reason)
+          : new FilterOversizedRecordError(partitionId, blocked.offset)
       }
       return { kind: "empty", more: page.stop === "filled" || page.stop === "budget" }
     }
     const tag = { owner: this.owner, sequence }
     const records = messages.map((message): MatchedRecord => ({
-      json: () => jsonCodec((value) => value).decode(message.payload),
+      json: () => new Json().decode(message.payload),
       partitionId,
       offset: message.offset,
       frontier: page.frontier,
       evaluated: page.policy.mode === "filtered" && !unevaluated.has(message.offset),
-      payload: message.payload,
-      headers: message.headers,
       headersMalformed: message.headersMalformed !== undefined,
-      ...(message.timestampMicros !== undefined
-        ? { timestampMicros: message.timestampMicros }
-        : {}),
+      message: matchedMessage(partitionId, page.frontier, message),
       [READER_TAG]: tag
     }))
     const matched: MatchedPage = {
@@ -1181,7 +1181,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
   private restartAfter(partitionId: number, error: unknown): void {
     if (
       !(error instanceof FilterExecutionError) ||
-      (error.reason !== "source_changed" && error.reason !== "conflict")
+      (error.detail.reason !== "source_changed" && error.detail.reason !== "conflict")
     ) {
       return
     }
@@ -1189,7 +1189,7 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     for (let index = this.buffered.length - 1; index >= 0; index -= 1) {
       if (this.buffered[index]?.partitionId === partitionId) this.buffered.splice(index, 1)
     }
-    if (error.reason === "source_changed") this.settings.membership?.expire()
+    if (error.detail.reason === "source_changed") this.settings.membership?.expire()
     if (this.settings.guardEnabled) this.guard = undefined
   }
 
@@ -1262,7 +1262,10 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
         throw new TransportError(`filtered command ${String(code)} failed`, true, { cause })
       }
     }
-    const decoded = decodeFilterReply(decodeOne(reply, "filter reply"), "filter reply")
+    const decoded = decodeManagedReply(
+      (bytes) => decodeFilterReply(decodeOne(bytes, "filter reply"), "filter reply"),
+      reply
+    )
     if (decoded.kind === "ok") return decoded.outcome
     if (decoded.error.reason === "not_primary" || decoded.error.reason === "membership_stale") {
       await this.routes.invalidate(partitionId)
@@ -1472,7 +1475,7 @@ class PartitionProgress {
   record(sequence: number, page: FilteredPage, offsets: readonly bigint[]): void {
     this.retryAt = undefined
     this.firstSequence ??= sequence
-    this.current = nextFilteredStart(page, this.original)
+    this.current = filteredPageNextStart(page, this.original)
     this.stoppedAt =
       page.fault === undefined
         ? undefined
@@ -2057,7 +2060,7 @@ function checkGuard(
   messages: readonly {
     readonly offset: bigint
     readonly payload: Uint8Array
-    readonly headers: ReadonlyMap<string, IggyHeaderValue>
+    readonly headers: ReadonlyMap<string, HeaderValue>
     readonly headersMalformed?: HeaderFault
   }[],
   unevaluated: ReadonlySet<bigint>
@@ -2109,10 +2112,10 @@ function checkGuard(
     // it never reads does not fault the record there either.
     const outcome = headersFault(guard, message.headersMalformed)
       ? { verdict: "fault" as const, fault: "malformed" as const }
-      : guard.outcomeOf(
+      : guard.evaluateWithFault(
           {
             payload: message.payload,
-            headers: guard.needsHeaders ? filterHeaders(message.headers) : []
+            headers: guard.headerNeed === "none" ? [] : filterHeaders(message.headers)
           },
           limits
         )
@@ -2136,12 +2139,12 @@ function checkGuard(
 // structure and `agdx.ct` for a payload filter, nothing otherwise.
 function headersFault(guard: CompiledFilter, fault: HeaderFault | undefined): boolean {
   if (fault === undefined) return false
-  if (guard.readsHeaders) return true
-  return guard.needsHeaders && fault !== "entry"
+  const need = guard.headerNeed
+  return need === "all" || (need === "content_type" && fault !== "entry")
 }
 
 // The typed user headers, mapped exactly as the server maps them.
-function filterHeaders(headers: ReadonlyMap<string, IggyHeaderValue>): FilterHeader[] {
+function filterHeaders(headers: ReadonlyMap<string, HeaderValue>): FilterHeader[] {
   return [...headers].map(([key, header]): FilterHeader => {
     switch (header.kind) {
       case "bool":
@@ -2282,7 +2285,7 @@ function filterError(error: {
 // no longer owns. Reads are side-effect free, so the next one routes again.
 function isRouteLost(error: unknown): boolean {
   if (error instanceof FilterExecutionError) {
-    return error.reason === "not_primary" || error.reason === "membership_stale"
+    return error.detail.reason === "not_primary" || error.detail.reason === "membership_stale"
   }
   return serverErrorCode(error) === CONSUMER_GROUP_PARTITION_NOT_OWNED
 }
@@ -2423,4 +2426,28 @@ function validatePage(
     invalid()
   if (page.fault !== undefined && scannedTo !== undefined && scannedTo >= page.fault.offset)
     invalid()
+}
+
+// The stored record as the consumer hands it out, with the page frontier as
+// its partition head, like the Rust and Python readers.
+function matchedMessage(
+  partitionId: number,
+  frontier: bigint,
+  message: PolledMessage
+): ConsumerMessage {
+  const position = { partitionId, offset: message.offset }
+  return withMessageJson({
+    payload: message.payload,
+    id: position,
+    partitionId,
+    headers: message.headers,
+    position,
+    messageId: message.messageId ?? 0n,
+    checksum: message.checksum ?? 0n,
+    currentOffset: frontier,
+    timestampMicros: message.timestampMicros ?? 0n,
+    originTimestampMicros: message.originTimestampMicros ?? 0n,
+    ...(message.userHeaders !== undefined ? { userHeaders: message.userHeaders } : {}),
+    headersMalformed: message.headersMalformed !== undefined
+  })
 }

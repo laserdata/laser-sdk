@@ -21,7 +21,7 @@ void test("given_a_cached_stream_when_deleted_and_recreated_then_should_discard_
     await registry.refresh(0n)
     assert.equal(registry.isQuarantined(agent), true)
     const oldHub = await laser[INTERNAL_REPLY_HUB](AgentTopic.Responses)
-    if (externallyDeleted) await laser.iggyClient.stream.delete({ streamId: streamName })
+    if (externallyDeleted) await laser.client.stream.delete({ streamId: streamName })
     assert.equal(await stream.delete(), !externallyDeleted)
     await stream.ensure()
     const fresh = await laser.withDefaultStream(streamName).agentRegistry()
@@ -51,7 +51,7 @@ void test("given_a_published_card_and_quarantine_when_registry_refreshes_then_sh
     await laser.publishCard(planner, card)
     const registry = await laser.agentRegistry()
     assert.equal(await registry.refresh(1_000_000n), 1)
-    assert.equal(registry.resolve("plan", 1_000_000n)[0]?.agent.asString(), "planner")
+    assert.equal(registry.resolve("plan", 1_000_000n)[0]?.agent.asStr(), "planner")
 
     await laser.quarantine(operator, planner)
     assert.equal(await registry.refresh(1_000_001n), 1)
@@ -60,7 +60,7 @@ void test("given_a_published_card_and_quarantine_when_registry_refreshes_then_sh
 
     const resumed = await laser.agentRegistry()
     assert.equal(resumed.isQuarantined(planner), true)
-    assert.equal(resumed.lookup(planner)?.agent.asString(), "planner")
+    assert.equal(resumed.lookup(planner)?.agent.asStr(), "planner")
   } finally {
     await laser.close()
   }
@@ -68,13 +68,16 @@ void test("given_a_published_card_and_quarantine_when_registry_refreshes_then_sh
 
 void test("given_a_verifying_registry_when_privileged_facts_arrive_then_should_require_a_valid_operator_signature", async () => {
   const streamName = `laser-ts-test-${randomUUID()}`
-  const connected = await Laser.connectWithStream(CONNECTION_STRING, streamName)
   const operatorKey = SigningKey.fromBytes(new Uint8Array(32).fill(11))
   const agentKey = SigningKey.fromBytes(new Uint8Array(32).fill(12))
   const keys = new KeyRegistry()
   keys.enrollOperator("operator-principal", operatorKey.verifyingKey())
   keys.enroll("agent-principal", agentKey.verifyingKey())
-  const laser = connected.withVerifier(keys)
+  const laser = await Laser.builder()
+    .connectionString(CONNECTION_STRING)
+    .stream(streamName)
+    .verifier(keys)
+    .connect()
   try {
     await laser.stream(streamName).ensure()
     await laser.topic(AgentTopic.Registry).ensure(1)
@@ -104,6 +107,6 @@ void test("given_a_verifying_registry_when_privileged_facts_arrive_then_should_r
     assert.equal(await registry.refresh(1_000_004n), 1)
     assert.equal(registry.isQuarantined(planner), false)
   } finally {
-    await connected.close()
+    await laser.close()
   }
 })

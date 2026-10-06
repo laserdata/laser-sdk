@@ -238,8 +238,19 @@ impl ContextAssembler {
     /// Read the configured topics, order by Iggy timestamp, and apply the policy.
     /// Every (topic, partition) is drained concurrently: a conversation can span
     /// many partitions across several topics, and reading them serially makes
-    /// recovery pay one round trip after another.
+    /// recovery pay one round trip after another. Each partition read covers
+    /// at most the newest [`CONTEXT_READ_WINDOW`] records of its range.
     pub async fn assemble(self, laser: &Laser) -> Result<Vec<ContextMessage>, LaserError> {
+        self.read(laser, ReadSpan::Window).await
+    }
+
+    // Like `assemble`, but every partition read covers its whole range in
+    // bounded chunks, for a state fold that must see every record.
+    pub(crate) async fn replay(self, laser: &Laser) -> Result<Vec<ContextMessage>, LaserError> {
+        self.read(laser, ReadSpan::Whole).await
+    }
+
+    async fn read(self, laser: &Laser, span: ReadSpan) -> Result<Vec<ContextMessage>, LaserError> {
         let stream = Identifier::named(laser.stream_required()?)?;
 
         // Resolve each topic's partition count concurrently.
@@ -278,76 +289,67 @@ impl ContextAssembler {
                     .unwrap_or(0),
                 None => self.from_offsets.get(&partition).copied().unwrap_or(0),
             };
-            // A checkpoint holds the next offset to write, so a bounded read ends
-            // one before it.
             let until = self.to_checkpoint.as_ref().map(|checkpoint| {
                 checkpoint
                     .topic_offsets(&topic_name)
                     .and_then(|offsets| offsets.get(&partition).copied())
                     .unwrap_or(0)
             });
+            let lens = (self.conversation_id, self.across_subconversations);
             drains.spawn(async move {
+                let client = laser.client();
                 let consumer = Consumer::new(Identifier::named("laser-context-reader")?);
-                let range = match until {
-                    Some(next) => {
-                        let Some(end) = next.checked_sub(1).filter(|end| *end >= from) else {
-                            return Ok::<_, LaserError>((topic_idx, partition, Vec::new()));
-                        };
-                        // Anchor the window at the checkpoint, not at a tail that
-                        // may have moved far past it.
-                        let start = from.max(end.saturating_sub(CONTEXT_READ_WINDOW as u64 - 1));
-                        crate::poll::DrainRange::until(partition, start, end)
-                    }
-                    // Context selection keeps the most recent records, so a
-                    // partition longer than the drain ceiling is read from a
-                    // tail-anchored window rather than from its head.
-                    None => crate::poll::DrainRange::open(
-                        partition,
-                        crate::poll::tail_anchored_offset(
-                            &laser.client(),
-                            &stream,
-                            &topic_id,
-                            &consumer,
-                            partition,
-                            from,
-                        )
-                        .await?,
-                    ),
-                };
-                let batch = crate::poll::drain_partition(
-                    &laser.client(),
-                    &stream,
-                    &topic_id,
-                    &consumer,
-                    range,
-                    READ_BATCH,
+                let Some(mut range) = partition_range(
+                    &client, &stream, &topic_id, &consumer, partition, from, until, span,
                 )
-                .await?;
-                Ok::<_, LaserError>((topic_idx, partition, batch.messages))
+                .await?
+                else {
+                    return Ok::<_, LaserError>((topic_idx, Vec::new()));
+                };
+                // The conversation filter runs per chunk, so a replay holds only
+                // the matching records, never a whole partition.
+                let mut matched = Vec::new();
+                loop {
+                    let batch = crate::poll::drain_partition(
+                        &client, &stream, &topic_id, &consumer, range, READ_BATCH,
+                    )
+                    .await?;
+                    let read = batch.messages.len();
+                    for message in batch.messages {
+                        let Ok((provenance, envelope)) =
+                            crate::agent::provenance_and_envelope(&message)
+                        else {
+                            continue;
+                        };
+                        if in_conversation(&provenance, lens.0, lens.1) {
+                            matched.push((
+                                message.header.timestamp,
+                                ContextMessage {
+                                    id: MessageId::new(partition, message.header.offset),
+                                    provenance,
+                                    payload: message.payload.to_vec(),
+                                    envelope,
+                                    topic: topic_name.clone(),
+                                },
+                            ));
+                        }
+                    }
+                    if !reads_further(span, read, batch.next_offset, range.end) {
+                        break;
+                    }
+                    range.from = batch.next_offset;
+                }
+                Ok::<_, LaserError>((topic_idx, matched))
             });
         }
         let mut collected: Vec<(u64, usize, ContextMessage)> = Vec::new();
         while let Some(joined) = drains.join_next().await {
-            let (topic_idx, partition, messages) = joined.map_err(join_failed)??;
-            for message in messages {
-                let Ok((provenance, envelope)) = crate::agent::provenance_and_envelope(&message)
-                else {
-                    continue;
-                };
-                if self.matches(&provenance) {
-                    collected.push((
-                        message.header.timestamp,
-                        topic_idx,
-                        ContextMessage {
-                            id: MessageId::new(partition, message.header.offset),
-                            provenance,
-                            payload: message.payload.to_vec(),
-                            envelope,
-                            topic: self.topics[topic_idx].topic_string(),
-                        },
-                    ));
-                }
-            }
+            let (topic_idx, matched) = joined.map_err(join_failed)??;
+            collected.extend(
+                matched
+                    .into_iter()
+                    .map(|(timestamp, message)| (timestamp, topic_idx, message)),
+            );
         }
         // Order by Iggy-assigned timestamp: a single global clock across topics,
         // since each topic has its own independent offset space. Ties break on
@@ -368,15 +370,87 @@ impl ContextAssembler {
             .collect();
         Ok(self.policy.select(&ordered))
     }
+}
 
-    fn matches(&self, provenance: &Provenance) -> bool {
-        if provenance.conversation_id == self.conversation_id {
-            return true;
+// How much of its range one partition read covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadSpan {
+    // The newest `CONTEXT_READ_WINDOW` records, the context window.
+    Window,
+    // Every record, read in bounded chunks.
+    Whole,
+}
+
+// The offsets one partition read covers, `None` when the range is empty.
+#[allow(clippy::too_many_arguments)]
+async fn partition_range(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    consumer: &Consumer,
+    partition: u32,
+    from: u64,
+    until: Option<u64>,
+    span: ReadSpan,
+) -> Result<Option<crate::poll::DrainRange>, LaserError> {
+    // A checkpoint holds the next offset to write, and so does the tail a
+    // replay pins at its start, so a bounded read ends one before it. Pinning
+    // the tail keeps a replay of a busy partition from chasing new writes.
+    let next = match (until, span) {
+        (Some(next), _) => next,
+        // Context selection keeps the most recent records, so a partition
+        // longer than the drain ceiling is read from a tail-anchored window
+        // rather than from its head.
+        (None, ReadSpan::Window) => {
+            let start =
+                crate::poll::tail_anchored_offset(client, stream, topic, consumer, partition, from)
+                    .await?;
+            return Ok(Some(crate::poll::DrainRange::open(partition, start)));
         }
-        self.across_subconversations
-            && (provenance.root_conversation_id == Some(self.conversation_id)
-                || provenance.parent_conversation_id == Some(self.conversation_id))
+        (None, ReadSpan::Whole) => {
+            crate::poll::current_tail_offset(client, stream, topic, consumer, partition).await?
+        }
+    };
+    let Some(end) = next.checked_sub(1).filter(|end| *end >= from) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::poll::DrainRange::until(
+        partition,
+        range_start(span, from, end),
+        end,
+    )))
+}
+
+// Where a read ending at `end` starts. The context window is anchored at
+// `end`, not at a tail that may have moved far past it. A replay starts at
+// `from`.
+fn range_start(span: ReadSpan, from: u64, end: u64) -> u64 {
+    match span {
+        ReadSpan::Window => from.max(end.saturating_sub(CONTEXT_READ_WINDOW as u64 - 1)),
+        ReadSpan::Whole => from,
     }
+}
+
+// Whether a replay drains another chunk after one that read `read` records
+// and resumes at `next_offset`. A drain stops at its record ceiling, so only a
+// full chunk can leave records behind, and never past `end`.
+fn reads_further(span: ReadSpan, read: usize, next_offset: u64, end: Option<u64>) -> bool {
+    span == ReadSpan::Whole
+        && read >= CONTEXT_READ_WINDOW
+        && end.is_none_or(|end| next_offset <= end)
+}
+
+fn in_conversation(
+    provenance: &Provenance,
+    conversation: ConversationId,
+    across_subconversations: bool,
+) -> bool {
+    if provenance.conversation_id == conversation {
+        return true;
+    }
+    across_subconversations
+        && (provenance.root_conversation_id == Some(conversation)
+            || provenance.parent_conversation_id == Some(conversation))
 }
 
 fn join_failed(error: tokio::task::JoinError) -> LaserError {
@@ -386,6 +460,41 @@ fn join_failed(error: tokio::task::JoinError) -> LaserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_range_longer_than_the_window_when_replayed_then_should_start_at_its_first_offset() {
+        let end = 25_000;
+        assert_eq!(range_start(ReadSpan::Whole, 0, end), 0);
+        assert_eq!(
+            range_start(ReadSpan::Window, 0, end),
+            end - CONTEXT_READ_WINDOW as u64 + 1
+        );
+        assert_eq!(range_start(ReadSpan::Window, 20_000, end), 20_000);
+    }
+
+    #[test]
+    fn given_a_full_chunk_when_replaying_then_should_read_on_until_the_range_ends() {
+        assert!(reads_further(
+            ReadSpan::Whole,
+            CONTEXT_READ_WINDOW,
+            10_000,
+            Some(24_999)
+        ));
+        assert!(!reads_further(
+            ReadSpan::Whole,
+            CONTEXT_READ_WINDOW,
+            25_000,
+            Some(24_999)
+        ));
+        assert!(
+            !reads_further(ReadSpan::Whole, 42, 10_042, Some(24_999)),
+            "a short chunk reached the tail"
+        );
+        assert!(
+            !reads_further(ReadSpan::Window, CONTEXT_READ_WINDOW, 10_000, Some(24_999)),
+            "a context read covers one window"
+        );
+    }
 
     #[test]
     fn given_a_checkpoint_when_queried_by_topic_then_should_return_only_its_own_offsets() {

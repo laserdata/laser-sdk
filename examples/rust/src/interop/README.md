@@ -4,7 +4,7 @@ This example exposes one agent through A2A, MCP, and AG-UI adapters. The agent r
 
 ## What it does
 
-- A2A. `A2aBridge` exposes the worker to A2A JSON-RPC clients. `message/send` publishes a typed AGDX command on a fresh task conversation, `tasks/get` reads back the worker's answer mapped onto the A2A task.
+- A2A. `A2aBridge` exposes the worker to A2A JSON-RPC clients. `SendMessage` publishes a typed AGDX command on a fresh task conversation, and `GetTask` reads back the worker's answer mapped onto the A2A task.
 - MCP. `McpBridge` is an MCP tool server. `tools/list` advertises the configured tools, and `tools/call` reaches the same worker as an AGDX command and renders the correlated reply as a tool result.
 - AG-UI. A chat answer is streamed onto the log as an AGDX chunk stream, then `agui_events` renders that conversation as AG-UI `TEXT_MESSAGE_*` events.
 - Human-in-the-loop. An orchestrator pauses on a human with `Agdx::request_input`, and an approver agent resolves the interrupt with `AgentCtx::respond_input`, both riding AGDX command and response over the log (no new wire).

@@ -1,9 +1,17 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { ConfigError, TimeoutError, TransportError } from "../../src/client/errors.js"
+import {
+  ConfigError,
+  InvalidError,
+  PublishFailedError,
+  TimeoutError,
+  TransportError
+} from "../../src/client/errors.js"
 import { publishOptions } from "../../src/client/publish-options.js"
 import { Laser } from "../../src/client/laser.js"
 import { ApacheIggyTransport, type IggyClient } from "../../src/iggy/apache-iggy.js"
+import { isPermissionDenied } from "../../src/client/error-classify.js"
+import { ConversationId } from "../../src/types/ids.js"
 
 type Send = IggyClient["message"]["send"]
 
@@ -27,12 +35,12 @@ void test("given_publish_defaults_when_resolved_then_should_allow_remote_latency
   assert.deepEqual(publishOptions(), { timeoutMs: 60_000, maxRetries: 3, retryBackoffMs: 250 })
 })
 
-void test("given_invalid_publish_settings_when_connected_then_should_reject_before_io", () => {
+void test("given_invalid_publish_settings_when_connected_then_should_reject_before_io", async () => {
   for (const value of [0, -1, NaN, Infinity, 0x8000_0000]) {
-    assert.throws(() => Laser.builder().publishTimeout(value).connect(), ConfigError)
-    assert.throws(() => Laser.builder().publishRetryBackoff(value).connect(), ConfigError)
+    await assert.rejects(Laser.builder().publishTimeout(value).connect(), ConfigError)
+    await assert.rejects(Laser.builder().publishRetryBackoff(value).connect(), ConfigError)
   }
-  assert.throws(() => Laser.builder().publishMaxRetries(-1).connect(), ConfigError)
+  await assert.rejects(Laser.builder().publishMaxRetries(-1).connect(), ConfigError)
 })
 
 void test("given_a_transient_publish_failure_when_retried_then_should_keep_ids_payload_and_routing", async () => {
@@ -87,7 +95,8 @@ void test("given_a_long_outage_when_retries_exhaust_then_should_reject_and_allow
       kind: "partition",
       partition: 0
     }),
-    TransportError
+    (error: unknown) =>
+      error instanceof PublishFailedError && error.publishCause() instanceof TransportError
   )
   assert.equal(attempts, 3)
   offline = false
@@ -109,7 +118,8 @@ void test("given_a_permanent_server_error_when_publishing_then_should_not_retry"
       kind: "partition",
       partition: 0
     }),
-    TransportError
+    (error: unknown) =>
+      error instanceof PublishFailedError && error.publishCause() instanceof TransportError
   )
   assert.equal(attempts, 1)
 })
@@ -128,7 +138,8 @@ void test("given_a_stalled_publish_with_no_retries_when_timed_out_then_should_cl
       kind: "partition",
       partition: 0
     }),
-    TimeoutError
+    (error: unknown) =>
+      error instanceof PublishFailedError && error.publishCause() instanceof TimeoutError
   )
   assert.equal(destroyed, 1)
 })
@@ -175,9 +186,138 @@ void test("given_slow_partition_lookup_when_timed_out_then_should_never_send_lat
   })
   await assert.rejects(
     adapted.sendMessages("stream", "topic", [new Uint8Array([1])], { kind: "balanced" }),
-    TimeoutError
+    (error: unknown) =>
+      error instanceof PublishFailedError && error.publishCause() instanceof TimeoutError
   )
   finishLookup()
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(sends, 0)
+})
+
+void test("given_a_transient_partition_reply_when_publishing_then_should_retry_it", async () => {
+  for (const errorCode of [3004, 3007, 10002]) {
+    let attempts = 0
+    const client = await transport(() => {
+      attempts += 1
+      return attempts === 1
+        ? Promise.reject(Object.assign(new Error("partition not ready"), { errorCode }))
+        : Promise.resolve({ confirmations: [] })
+    })
+    await client.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 0
+    })
+    assert.equal(attempts, 2)
+  }
+})
+
+void test("given_an_expired_session_on_an_injected_client_when_publishing_then_should_not_retry_without_a_reconnect", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    return Promise.reject(Object.assign(new Error("unauthenticated"), { errorCode: 40 }))
+  })
+  await assert.rejects(
+    client.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 0
+    }),
+    PublishFailedError
+  )
+  assert.equal(attempts, 1)
+})
+
+void test("given_an_empty_batch_when_publishing_then_should_send_nothing_and_keep_the_connection", async () => {
+  let destroyed = 0
+  const client = await transport(
+    () => Promise.reject(new Error("cannot send an empty message batch")),
+    2,
+    () => {
+      destroyed += 1
+    }
+  )
+  assert.deepEqual(await client.sendMessages("stream", "topic", [], { kind: "balanced" }), {
+    confirmations: []
+  })
+  assert.deepEqual(await client.sendMessagesWithHeaders("stream", "topic", []), {
+    confirmations: []
+  })
+  assert.equal(destroyed, 0)
+})
+
+void test("given_a_large_batch_when_a_later_request_fails_then_should_report_the_confirmed_requests_and_the_tail_with_its_ids", async () => {
+  const requests: Parameters<Send>[0][] = []
+  const confirmation = { streamId: 1, topicId: 2, partitionId: 0, baseOffset: 0n }
+  const client = await transport((request) => {
+    requests.push(request)
+    return requests.length === 1
+      ? Promise.resolve({ confirmations: [confirmation] })
+      : Promise.reject(Object.assign(new Error("forbidden"), { errorCode: 41 }))
+  })
+  const records = Array.from({ length: 1_500 }, (_, index) => ({
+    payload: new Uint8Array([index % 256]),
+    headers: new Map(),
+    ...(index === 1_200 ? { id: 77n } : {})
+  }))
+  await assert.rejects(
+    client.sendMessagesWithHeaders("stream", "topic", records, undefined, 0),
+    (error: unknown) => {
+      assert.ok(error instanceof PublishFailedError)
+      assert.deepEqual(error.committed, [confirmation])
+      assert.equal(error.unconfirmed.length, 500)
+      assert.equal(error.unconfirmed[200]?.id, 77n)
+      assert.deepEqual(
+        error.unconfirmed.map((record) => record.id),
+        requests[1]?.messages.map((message) => message.id)
+      )
+      return true
+    }
+  )
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0]?.messages.length, 1_000)
+})
+
+void test("given_an_empty_or_oversized_partition_key_when_publishing_then_should_reject_before_io", async () => {
+  const client = await transport(() => Promise.reject(new Error("must not send")))
+  await assert.rejects(
+    client.sendMessagesWithHeaders(
+      "s",
+      "t",
+      [{ payload: new Uint8Array([1]), headers: new Map() }],
+      ""
+    ),
+    InvalidError
+  )
+  await assert.rejects(
+    client.sendMessagesWithHeaders(
+      "s",
+      "t",
+      [{ payload: new Uint8Array([1]), headers: new Map() }],
+      new Uint8Array(256)
+    ),
+    InvalidError
+  )
+})
+
+void test("given_a_refused_agent_send_when_published_then_should_report_a_publish_failure_with_its_record", async () => {
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    topic: { get: () => Promise.resolve({ partitionsCount: 1 }) },
+    message: {
+      send: () => Promise.reject(Object.assign(new Error("forbidden"), { errorCode: 41 }))
+    },
+    destroy: () => Promise.resolve()
+  } as unknown as IggyClient
+  await using laser = (await Laser.fromClient(client)).withDefaultStream("fleet")
+  await assert.rejects(
+    laser.sendAgent("commands", new Uint8Array([1]), { conversationId: ConversationId.new() }),
+    (error: unknown) => {
+      assert.ok(error instanceof PublishFailedError)
+      assert.equal(error.stream, "fleet")
+      assert.equal(error.topic, "commands")
+      assert.equal(error.unconfirmed.length, 1)
+      assert.ok(isPermissionDenied(error))
+      return true
+    }
+  )
 })

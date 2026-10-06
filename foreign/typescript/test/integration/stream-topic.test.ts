@@ -66,9 +66,9 @@ void test("given_agent_bootstrap_when_called_then_should_create_nine_topics_per_
   await using laser = await Laser.connectWithStream(CONNECTION_STRING, streamName)
   try {
     await laser.bootstrap(2)
-    const stream = await laser.iggyClient.stream.get({ streamId: streamName })
+    const stream = await laser.client.stream.get({ streamId: streamName })
     assert.equal(stream?.topicsCount, 9)
-    const topics = await laser.iggyClient.topic.list({ streamId: streamName })
+    const topics = await laser.client.topic.list({ streamId: streamName })
     assert.equal(
       topics.every((topic) => topic.partitionsCount === 2),
       true

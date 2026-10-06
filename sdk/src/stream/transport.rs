@@ -7,9 +7,10 @@ use crate::types::MessageId;
 use bytes::Bytes;
 use futures::Stream;
 use iggy::prelude::{
-    AutoCommit, AutoCommitWhen, BackgroundConfig, ConsumerGroupClient, DirectConfig, Identifier,
-    IggyConsumer, IggyConsumerBuilder, IggyExpiry, IggyMessage, IggyProducer, IggyTimestamp,
-    MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage, SendMessagesResponse,
+    AutoCommit, AutoCommitWhen, BackgroundConfig, ConsumerGroupClient, ConsumerOffsetClient,
+    DirectConfig, Identifier, IggyConsumer, IggyConsumerBuilder, IggyExpiry, IggyMessage,
+    IggyProducer, IggyTimestamp, MaxTopicSize, Partitioning, PollingStrategy, ReceivedMessage,
+    SendMessagesResponse,
 };
 use laser_wire::filter::{FilterRef, FilteredStart};
 use serde::de::DeserializeOwned;
@@ -803,6 +804,12 @@ impl ConsumerBuilder {
                 Err(error) => return Err(error),
             }
         };
+        let offset_owner = OffsetOwner {
+            laser: self.topic.laser.clone(),
+            stream: self.topic.stream()?.to_owned(),
+            topic: self.topic.name.clone(),
+            consumer: group_offset_consumer(&group)?,
+        };
         let offsets = Arc::new(std::sync::Mutex::new(GroupOffsets::default()));
         Ok(Consumer {
             yielded_zero: BTreeSet::new(),
@@ -824,6 +831,7 @@ impl ConsumerBuilder {
             next_future: std::sync::Mutex::new(None),
             offsets: Some(offsets),
             returned_native: std::sync::Mutex::new(VecDeque::new()),
+            offset_owner,
         })
     }
 
@@ -845,6 +853,22 @@ impl ConsumerBuilder {
                 })
             }
             _ => None,
+        };
+        let offset_owner = OffsetOwner {
+            laser: self.topic.laser.clone(),
+            stream: self.topic.stream()?.to_owned(),
+            topic: self.topic.name.clone(),
+            consumer: match (&self.target, &native_group) {
+                (ConsumerTarget::Partition { name, .. }, _) => {
+                    iggy::prelude::Consumer::new(Identifier::named(name)?)
+                }
+                (ConsumerTarget::Group(_), Some(group)) => {
+                    iggy::prelude::Consumer::group(Identifier::named(group)?)
+                }
+                (ConsumerTarget::Group(_), None) => {
+                    return Err(LaserError::Config("consumer group name is absent"));
+                }
+            },
         };
         let group = matches!(self.target, ConsumerTarget::Group(_));
         let mut builder: IggyConsumerBuilder = match &self.target {
@@ -903,6 +927,7 @@ impl ConsumerBuilder {
             next_future: std::sync::Mutex::new(None),
             offsets: None,
             returned_native: std::sync::Mutex::new(VecDeque::new()),
+            offset_owner,
         })
     }
 }
@@ -931,6 +956,20 @@ fn policy_aware(capabilities: &Capabilities) -> Result<bool, LaserError> {
         )),
         HelloOutcome::Answered | HelloOutcome::Rejected => Ok(false),
     }
+}
+
+// The server identity a group's offsets are stored under, by name or by its
+// native 32-bit id.
+fn group_offset_consumer(group: &ConsumerGroup) -> Result<iggy::prelude::Consumer, LaserError> {
+    let id =
+        match (group.name(), group.id()) {
+            (Some(name), _) => Identifier::named(name)?,
+            (None, Some(id)) => Identifier::numeric(u32::try_from(id).map_err(|_| {
+                LaserError::Invalid("consumer group id exceeds 32 bits".to_owned())
+            })?)?,
+            (None, None) => return Err(LaserError::Config("consumer group name is absent")),
+        };
+    Ok(iggy::prelude::Consumer::group(id))
 }
 
 /// When the group engine asks whether to store the handled prefix.
@@ -1058,6 +1097,17 @@ pub struct Consumer {
     next_future: std::sync::Mutex<Option<NextFuture>>,
     offsets: Option<Arc<std::sync::Mutex<GroupOffsets>>>,
     returned_native: std::sync::Mutex<VecDeque<ConsumerMessage>>,
+    offset_owner: OffsetOwner,
+}
+
+/// A consumer's offset as the server stores it, read by
+/// [`Consumer::stored_offset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredOffset {
+    /// The offset the server stored for the consumer.
+    pub stored_offset: u64,
+    /// The partition's current head offset.
+    pub current_offset: u64,
 }
 
 type NextFuture = Pin<Box<dyn Future<Output = Option<Result<ConsumerMessage, LaserError>>> + Send>>;
@@ -1072,6 +1122,15 @@ struct ConsumerGroupTarget {
     stream: String,
     topic: String,
     group: String,
+}
+
+// The identity the server stores a consumer's offsets under: its consumer
+// name, or its group.
+struct OffsetOwner {
+    laser: crate::laser::Laser,
+    stream: String,
+    topic: String,
+    consumer: iggy::prelude::Consumer,
 }
 
 /// The offsets a policy-aware group consumer reports: the last record it
@@ -1362,6 +1421,28 @@ impl Consumer {
         }
     }
 
+    /// Read the offset the server stores for this consumer, or for its group,
+    /// on `partition`, with the partition's current head. `None` when the
+    /// server stores nothing for it yet. A server read, unlike the local
+    /// bookkeeping of [`last_stored_offset`](Self::last_stored_offset).
+    pub async fn stored_offset(&self, partition: u32) -> Result<Option<StoredOffset>, LaserError> {
+        let owner = &self.offset_owner;
+        let info = owner
+            .laser
+            .client()
+            .get_consumer_offset(
+                &owner.consumer,
+                &Identifier::named(&owner.stream)?,
+                &Identifier::named(&owner.topic)?,
+                Some(partition),
+            )
+            .await?;
+        Ok(info.map(|info| StoredOffset {
+            stored_offset: info.stored_offset,
+            current_offset: info.current_offset,
+        }))
+    }
+
     /// Stop polling and leave the group. Automatic policies store the handled
     /// prefix first. For group consumers, a clean stop marks the last
     /// delivery handled. Native polling commits before delivery, so its
@@ -1491,6 +1572,21 @@ mod tests {
         shared::<Consumer>();
         shared::<ConsumerBuilder>();
         shared::<ConsumerMessage>();
+    }
+
+    #[test]
+    fn given_a_group_handle_when_its_stored_offset_is_addressed_then_should_name_the_group() {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        let topic = laser.stream("fleet").topic("readings");
+        let named = group_offset_consumer(&topic.consumer_group("workers")).expect("named group");
+        assert_eq!(named.kind, iggy::prelude::ConsumerKind::ConsumerGroup);
+        assert_eq!(named.id, Identifier::named("workers").expect("valid name"));
+        let numeric = group_offset_consumer(&topic.consumer_group_id(7)).expect("numeric group");
+        assert_eq!(numeric.id, Identifier::numeric(7).expect("valid id"));
+        assert!(matches!(
+            group_offset_consumer(&topic.consumer_group_id(u64::from(u32::MAX) + 1)),
+            Err(LaserError::Invalid(_))
+        ));
     }
 
     #[test]

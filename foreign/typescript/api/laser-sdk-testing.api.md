@@ -10,14 +10,14 @@ import { SimpleClient } from 'apache-iggy';
 
 // Warning: (ae-forgotten-export) The symbol "Laser" needs to be exported by the entry point testing.d.ts
 // Warning: (ae-forgotten-export) The symbol "AgentMessage" needs to be exported by the entry point testing.d.ts
-// Warning: (ae-forgotten-export) The symbol "AgentContext" needs to be exported by the entry point testing.d.ts
+// Warning: (ae-forgotten-export) The symbol "AgentCtx" needs to be exported by the entry point testing.d.ts
 //
 // @public (undocumented)
-export function agentContext(laser: Laser, message: AgentMessage, options?: {
+export function agentCtx(laser: Laser, message: AgentMessage, options?: {
     readonly agent?: AgentId;
     readonly respondOn?: string;
     readonly inboxRoute?: InboxRoute;
-}): AgentContext;
+}): AgentCtx;
 
 // Warning: (ae-forgotten-export) The symbol "BytesLike" needs to be exported by the entry point testing.d.ts
 // Warning: (ae-forgotten-export) The symbol "Provenance" needs to be exported by the entry point testing.d.ts

@@ -209,6 +209,28 @@ export function decodeRole(map: CborMap, context: string): Role {
   }
 }
 
+/** The roles bound to one user, by the server-stamped user id. */
+export interface RoleBinding {
+  readonly userId: number
+  readonly roles: readonly string[]
+}
+
+export function encodeRoleBinding(binding: RoleBinding): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["user_id", binding.userId],
+    ["roles", [...binding.roles]]
+  ])
+}
+
+export function decodeRoleBinding(map: CborMap, context: string): RoleBinding {
+  return {
+    userId: field.requiredU32(map, "user_id", context),
+    roles: field.requiredArray(map, "roles", context, (item, index) =>
+      expectString(item, `${context}.roles[${String(index)}]`)
+    )
+  }
+}
+
 export function validateRoleName(name: string): void {
   if (name.length === 0) {
     throw new InvalidError("role name must not be empty")
@@ -363,18 +385,29 @@ export function delegatedAllow(
   )
 }
 
-export function encodeWhoamiReq(): Map<string, unknown> {
-  return new Map<string, unknown>([["v", AUTHZ_OP_VERSION]])
+export interface WhoamiReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
+}
+
+export function encodeWhoamiReq(req: WhoamiReq = {}): Map<string, unknown> {
+  return new Map<string, unknown>([["v", req.v ?? AUTHZ_OP_VERSION]])
+}
+
+export function decodeWhoamiReq(map: CborMap, context: string): WhoamiReq {
+  return { v: field.requiredU32(map, "v", context) }
 }
 
 export interface WhoamiReply {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly roles: readonly string[]
   readonly grants: readonly Grant[]
 }
 
 export function encodeWhoamiReply(reply: WhoamiReply): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", reply.v ?? AUTHZ_OP_VERSION],
     ["roles", [...reply.roles]],
     ["grants", reply.grants.map((grant) => encodeGrant(grant))]
   ])
@@ -382,6 +415,7 @@ export function encodeWhoamiReply(reply: WhoamiReply): Map<string, unknown> {
 
 export function decodeWhoamiReply(map: CborMap, context: string): WhoamiReply {
   return {
+    v: field.requiredU32(map, "v", context),
     roles: field.requiredArray(map, "roles", context, (item) => expectString(item, context)),
     grants: field.requiredArray(map, "grants", context, (item, index) =>
       decodeGrant(
@@ -393,13 +427,15 @@ export function decodeWhoamiReply(map: CborMap, context: string): WhoamiReply {
 }
 
 export interface ListRolesReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly namePrefix?: string
   readonly search?: string
 }
 
 export function encodeListRolesReq(req: ListRolesReq): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", AUTHZ_OP_VERSION)
+  map.set("v", req.v ?? AUTHZ_OP_VERSION)
   if (req.namePrefix !== undefined) map.set("name_prefix", req.namePrefix)
   if (req.search !== undefined) map.set("search", req.search)
   return map
@@ -409,24 +445,28 @@ export function decodeListRolesReq(map: CborMap, context: string): ListRolesReq 
   const namePrefix = field.optionalString(map, "name_prefix", context)
   const search = field.optionalString(map, "search", context)
   return {
+    v: field.requiredU32(map, "v", context),
     ...(namePrefix !== undefined ? { namePrefix } : {}),
     ...(search !== undefined ? { search } : {})
   }
 }
 
 export interface ListRolesReply {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly roles: readonly Role[]
 }
 
 export function encodeListRolesReply(reply: ListRolesReply): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", reply.v ?? AUTHZ_OP_VERSION],
     ["roles", reply.roles.map((role) => encodeRole(role))]
   ])
 }
 
 export function decodeListRolesReply(map: CborMap, context: string): ListRolesReply {
   return {
+    v: field.requiredU32(map, "v", context),
     roles: field.requiredArray(map, "roles", context, (item, index) =>
       decodeRole(
         expectMap(item, `${context}.roles[${String(index)}]`),
@@ -437,60 +477,75 @@ export function decodeListRolesReply(map: CborMap, context: string): ListRolesRe
 }
 
 export interface GetRoleReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly name: string
 }
 
 export function encodeGetRoleReq(req: GetRoleReq): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", req.v ?? AUTHZ_OP_VERSION],
     ["name", req.name]
   ])
 }
 
 export function decodeGetRoleReq(map: CborMap, context: string): GetRoleReq {
-  return { name: field.requiredString(map, "name", context) }
+  return {
+    v: field.requiredU32(map, "v", context),
+    name: field.requiredString(map, "name", context)
+  }
 }
 
 export interface GetBindingsReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly userId: number
 }
 
 export function encodeGetBindingsReq(req: GetBindingsReq): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", req.v ?? AUTHZ_OP_VERSION],
     ["user_id", req.userId]
   ])
 }
 
 export function decodeGetBindingsReq(map: CborMap, context: string): GetBindingsReq {
-  return { userId: field.requiredU32(map, "user_id", context) }
+  return {
+    v: field.requiredU32(map, "v", context),
+    userId: field.requiredU32(map, "user_id", context)
+  }
 }
 
 export interface BindingsReply {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly roles: readonly string[]
 }
 
 export function encodeBindingsReply(reply: BindingsReply): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", reply.v ?? AUTHZ_OP_VERSION],
     ["roles", [...reply.roles]]
   ])
 }
 
 export function decodeBindingsReply(map: CborMap, context: string): BindingsReply {
   return {
+    v: field.requiredU32(map, "v", context),
     roles: field.requiredArray(map, "roles", context, (item) => expectString(item, context))
   }
 }
 
 export interface DefineRoleReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly role: Role
   readonly mutationId?: string
 }
 
 export function encodeDefineRoleReq(req: DefineRoleReq): Map<string, unknown> {
   const map = new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", req.v ?? AUTHZ_OP_VERSION],
     ["role", encodeRole(req.role)]
   ])
   if (req.mutationId !== undefined) map.set("mutation_id", req.mutationId)
@@ -500,19 +555,22 @@ export function encodeDefineRoleReq(req: DefineRoleReq): Map<string, unknown> {
 export function decodeDefineRoleReq(map: CborMap, context: string): DefineRoleReq {
   const mutationId = field.optionalString(map, "mutation_id", context)
   return {
+    v: field.requiredU32(map, "v", context),
     role: decodeRole(field.requiredMap(map, "role", context), `${context}.role`),
     ...(mutationId !== undefined ? { mutationId } : {})
   }
 }
 
 export interface DeleteRoleReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly name: string
   readonly mutationId?: string
 }
 
 export function encodeDeleteRoleReq(req: DeleteRoleReq): Map<string, unknown> {
   const map = new Map<string, unknown>([
-    ["v", AUTHZ_OP_VERSION],
+    ["v", req.v ?? AUTHZ_OP_VERSION],
     ["name", req.name]
   ])
   if (req.mutationId !== undefined) map.set("mutation_id", req.mutationId)
@@ -522,12 +580,15 @@ export function encodeDeleteRoleReq(req: DeleteRoleReq): Map<string, unknown> {
 export function decodeDeleteRoleReq(map: CborMap, context: string): DeleteRoleReq {
   const mutationId = field.optionalString(map, "mutation_id", context)
   return {
+    v: field.requiredU32(map, "v", context),
     name: field.requiredString(map, "name", context),
     ...(mutationId !== undefined ? { mutationId } : {})
   }
 }
 
 export interface BindRolesReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly userId: number
   readonly roles: readonly string[]
   readonly expectRevision?: bigint
@@ -536,7 +597,7 @@ export interface BindRolesReq {
 
 export function encodeBindRolesReq(req: BindRolesReq): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", AUTHZ_OP_VERSION)
+  map.set("v", req.v ?? AUTHZ_OP_VERSION)
   map.set("user_id", req.userId)
   map.set("roles", [...req.roles])
   if (req.expectRevision !== undefined) map.set("expect_revision", req.expectRevision)
@@ -548,6 +609,7 @@ export function decodeBindRolesReq(map: CborMap, context: string): BindRolesReq 
   const expectRevision = field.optionalU64(map, "expect_revision", context)
   const mutationId = field.optionalString(map, "mutation_id", context)
   return {
+    v: field.requiredU32(map, "v", context),
     userId: field.requiredU32(map, "user_id", context),
     roles: field.requiredArray(map, "roles", context, (item) => expectString(item, context)),
     ...(expectRevision !== undefined ? { expectRevision } : {}),
@@ -588,6 +650,8 @@ export function decodeAuthzSubject(value: unknown, context: string): AuthzSubjec
 }
 
 export interface AuthzHistoryReq {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly subject: AuthzSubject
   readonly afterRevision?: bigint
   readonly limit: number
@@ -595,7 +659,7 @@ export interface AuthzHistoryReq {
 
 export function encodeAuthzHistoryReq(req: AuthzHistoryReq): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", AUTHZ_OP_VERSION)
+  map.set("v", req.v ?? AUTHZ_OP_VERSION)
   map.set("subject", encodeAuthzSubject(req.subject))
   if (req.afterRevision !== undefined) map.set("after_revision", req.afterRevision)
   map.set("limit", req.limit)
@@ -605,6 +669,7 @@ export function encodeAuthzHistoryReq(req: AuthzHistoryReq): Map<string, unknown
 export function decodeAuthzHistoryReq(map: CborMap, context: string): AuthzHistoryReq {
   const afterRevision = field.optionalU64(map, "after_revision", context)
   return {
+    v: field.requiredU32(map, "v", context),
     subject: decodeAuthzSubject(map.get("subject"), context),
     ...(afterRevision !== undefined ? { afterRevision } : {}),
     limit: field.requiredU32(map, "limit", context)
@@ -680,13 +745,15 @@ export function decodeAuthzEvent(map: CborMap, context: string): AuthzEvent {
 }
 
 export interface AuthzHistoryReply {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly events: readonly AuthzEvent[]
   readonly nextAfterRevision?: bigint
 }
 
 export function encodeAuthzHistoryReply(reply: AuthzHistoryReply): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", AUTHZ_OP_VERSION)
+  map.set("v", reply.v ?? AUTHZ_OP_VERSION)
   map.set(
     "events",
     reply.events.map((event) => encodeAuthzEvent(event))
@@ -698,6 +765,7 @@ export function encodeAuthzHistoryReply(reply: AuthzHistoryReply): Map<string, u
 export function decodeAuthzHistoryReply(map: CborMap, context: string): AuthzHistoryReply {
   const nextAfterRevision = field.optionalU64(map, "next_after_revision", context)
   return {
+    v: field.requiredU32(map, "v", context),
     events: field.requiredArray(map, "events", context, (item, index) =>
       decodeAuthzEvent(
         expectMap(item, `${context}.events[${String(index)}]`),

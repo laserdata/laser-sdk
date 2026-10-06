@@ -29,11 +29,10 @@ import type {
   SourceSelector
 } from "../wire/control.js"
 
-export type BrowseBackend = ManagedTransport
 export type PublishControl = (command: ControlCommand) => Promise<void>
 
 async function executeBrowse<Request>(
-  backend: BrowseBackend,
+  backend: ManagedTransport,
   capabilities: Capabilities,
   command: ManagedCommand<Request, BrowseReply>,
   request: Request
@@ -54,11 +53,20 @@ function unexpected(op: string, outcome: BrowseOutcome): ProtocolError {
 }
 
 export class Projections {
-  constructor(
-    private readonly backend: BrowseBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly publishControl: PublishControl
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    publishControl: PublishControl
+  ): Projections {
+    return new Projections(backend, getCapabilities, publishControl)
+  }
 
   async register(projection: Projection): Promise<void> {
     if (projection.kind.kind === "graph") {
@@ -97,7 +105,7 @@ export class Projections {
   }
 
   list(): ProjectionsRequest {
-    return new ProjectionsRequest(this.backend, this.getCapabilities)
+    return ProjectionsRequest.create(this.backend, this.getCapabilities)
   }
 }
 
@@ -107,10 +115,18 @@ export class ProjectionsRequest {
   private idPrefixFilter: string | undefined
   private searchFilter: string | undefined
 
-  constructor(
-    private readonly backend: BrowseBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>
+  ): ProjectionsRequest {
+    return new ProjectionsRequest(backend, getCapabilities)
+  }
 
   forTopic(topic: string): this {
     this.topicNames.push(topic)
@@ -152,7 +168,12 @@ export class ProjectionsRequest {
 }
 
 export class Bindings {
-  constructor(private readonly publishControl: PublishControl) {}
+  private constructor(private readonly publishControl: PublishControl) {}
+
+  /** @internal */
+  static create(publishControl: PublishControl): Bindings {
+    return new Bindings(publishControl)
+  }
 
   async apply(binding: ProjectionBinding): Promise<void> {
     await this.publishControl({ kind: "applyBinding", binding })
@@ -168,14 +189,23 @@ export class Bindings {
 }
 
 export class Schemas {
-  constructor(
-    private readonly backend: BrowseBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly publishControl: PublishControl
   ) {}
 
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    publishControl: PublishControl
+  ): Schemas {
+    return new Schemas(backend, getCapabilities, publishControl)
+  }
+
   register(source: SchemaSource): RegisterSchemaRequest {
-    return new RegisterSchemaRequest(this.backend, this.getCapabilities, source)
+    return RegisterSchemaRequest.create(this.backend, this.getCapabilities, source)
   }
 
   async drop(id: number): Promise<void> {
@@ -206,11 +236,20 @@ export class RegisterSchemaRequest {
   private schemaName: string | undefined
   private schemaVersion: number | undefined
 
-  constructor(
-    private readonly backend: BrowseBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly source: SchemaSource
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    source: SchemaSource
+  ): RegisterSchemaRequest {
+    return new RegisterSchemaRequest(backend, getCapabilities, source)
+  }
 
   name(name: string): this {
     this.schemaName = name

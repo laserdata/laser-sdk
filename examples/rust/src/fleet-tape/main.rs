@@ -1,6 +1,6 @@
 use laser_examples::{
-    PARTITIONS, fresh_run, init_tracing, laser, managed_feature_ready, phase, start_projector,
-    stream_for,
+    PARTITIONS, ensure_view, fresh_run, index_for, init_tracing, laser, managed_feature_ready,
+    phase, stream_for,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::schema_codecs::CompiledSchema;
@@ -27,7 +27,6 @@ const FEED_GROUP: &str = "fleet-tape-builder";
 // The schema-first tape (managed deployment): the same readings replay as raw
 // Avro datums, decoded by a writer schema LaserData Cloud allocated an id for.
 const AVRO_TAPE_TOPIC: &str = "readings_avro";
-const AVRO_PROJECTION: &str = "readings_avro.v1";
 const READING_AVRO_SCHEMA: &str = r#"{
     "type":"record","name":"HostReading",
     "fields":[
@@ -241,13 +240,21 @@ async fn main() -> Result<(), LaserError> {
 
         // Start the projector before the feed opens so no reading is missed, then warm
         // the hot-path producer and consumer up front so the live phase below times
-        // the fleet, not the one-off connection and consumer-group handshakes.
-        let projector = if query_available {
-            Some(start_projector(&laser, TAPE_TOPIC, ContentType::Json, COLUMNS).await?)
+        // the fleet, not the one-off connection and consumer-group handshakes. The
+        // index carries this run's token, so a rerun or another language's example
+        // on the same deployment never shares its rows.
+        if query_available {
+            ensure_view(
+                &laser,
+                TAPE_TOPIC,
+                &index_for(TAPE_TOPIC),
+                ContentType::Json,
+                COLUMNS,
+            )
+            .await?;
         } else {
             managed_feature_ready(false, "reading-tape analytics", "fleet-tape");
-            None
-        };
+        }
         let producer = build_feed_producer(&laser, &data_stream).await?;
         let mut consumer = build_fleet_consumer(&laser, &data_stream).await?;
 
@@ -291,9 +298,6 @@ async fn main() -> Result<(), LaserError> {
             info!("writer schemas need Laser Stack or LaserData Cloud, skipping the Avro tape");
         }
 
-        if let Some(projector) = projector {
-            projector.shutdown().await;
-        }
         Ok(())
     })
     .await
@@ -450,11 +454,12 @@ async fn index_tape(laser: &Laser, readings: &[Reading]) -> Result<(), LaserErro
 // Poll until the projector has indexed every reading, tolerant of a not-yet-created
 // index while a remote LaserData Cloud applies the projection.
 async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), LaserError> {
+    let index = index_for(TAPE_TOPIC);
     let deadline = Instant::now() + PROJECTOR_TIMEOUT;
     let mut last = usize::MAX;
     loop {
         let total = laser
-            .query(TAPE_TOPIC)
+            .query(&index)
             .with_total()
             .fetch()
             .await
@@ -479,15 +484,16 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
 // Query the materialized tape: per-host sample counts, and the sample-weighted
 // mean CPU derived from two grouped sums (mean = cpu_total / samples).
 async fn report_samples_and_mean(laser: &Laser) -> Result<(), LaserError> {
+    let index = index_for(TAPE_TOPIC);
     let start = Instant::now();
     let samples = laser
-        .query(TAPE_TOPIC)
+        .query(&index)
         .sum(SAMPLES)
         .group_by([HOST])
         .fetch()
         .await?;
     let cpu_total = laser
-        .query(TAPE_TOPIC)
+        .query(&index)
         .sum(CPU_TOTAL)
         .group_by([HOST])
         .fetch()
@@ -586,11 +592,13 @@ async fn avro_tape(laser: &Laser, readings: &[Reading]) -> Result<(), LaserError
     info!("LaserData Cloud allocated writer-schema id {schema_id} for the HostReading schema");
 
     laser.topic(AVRO_TAPE_TOPIC).ensure(PARTITIONS).await?;
+    let index = index_for(AVRO_TAPE_TOPIC);
+    let projection = format!("{index}.v1");
     laser
         .projections()
         .register(
-            Projection::builder(AVRO_PROJECTION)
-                .name("readings_avro")
+            Projection::builder(projection.clone())
+                .name(index.clone())
                 .version(1)
                 .content_type(ContentType::Avro)
                 .fields(COLUMNS.iter().copied())
@@ -602,9 +610,9 @@ async fn avro_tape(laser: &Laser, readings: &[Reading]) -> Result<(), LaserError
         .apply(
             ProjectionBinding::builder()
                 .source(stream_for("fleet-tape"), AVRO_TAPE_TOPIC)
-                .allow(AVRO_PROJECTION)
-                .default_projection(AVRO_PROJECTION)
-                .index(AVRO_TAPE_TOPIC)
+                .allow(projection.clone())
+                .default_projection(projection.clone())
+                .index(index.clone())
                 .build(),
         )
         .await?;
@@ -623,16 +631,16 @@ async fn avro_tape(laser: &Laser, readings: &[Reading]) -> Result<(), LaserError
     })?;
     let slice = &readings[..readings.len().min(AVRO_READINGS_CAP)];
     let tape = laser.topic(AVRO_TAPE_TOPIC);
-    let mut request = tape.publish_batch().projection_ref(AVRO_PROJECTION);
+    let mut request = tape.publish_batch().projection_ref(projection);
     for reading in slice {
         request = request.add_avro(&compiled, schema_id, reading)?;
     }
     request.send().await?;
     info!("published {} readings as raw Avro datums", slice.len());
 
-    wait_for_table(laser, AVRO_TAPE_TOPIC, slice.len()).await?;
+    wait_for_table(laser, &index, slice.len()).await?;
     let per_host = laser
-        .query(AVRO_TAPE_TOPIC)
+        .query(&index)
         .sum(CPU_TOTAL)
         .group_by([HOST])
         .fetch()

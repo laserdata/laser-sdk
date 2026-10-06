@@ -34,7 +34,8 @@ async def test_given_release_when_repeated_after_ambiguity_then_should_keep_the_
     client = ls.FencedLeaseClient(transport)
     operation = client.prepare_release(RELEASE)
     assert operation.operation_id > 0
-    assert operation.ambiguous_recovery == {"kind": "repeat_prepared"}
+    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.repeat_prepared()
+    assert operation.ambiguous_recovery.kind == "repeat_prepared"
     with pytest.raises(ls.LaserError) as failure:
         await client.release(operation)
     assert failure.value.ambiguous_mutation
@@ -74,10 +75,9 @@ async def test_given_a_stalled_acquisition_when_timed_out_then_should_report_rec
     transport = Stalled()
     client = ls.FencedLeaseClient(transport).with_attempt_timeout(0.005)
     operation = client.prepare_acquire(ACQUIRE)
-    assert operation.ambiguous_recovery == {
-        "kind": "wait_for_lease_expiry",
-        "ttl_micros": 1_000_000,
-    }
+    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.wait_for_lease_expiry(1.0)
+    assert operation.ambiguous_recovery != ls.AmbiguousMutationRecovery.wait_for_lease_expiry(2.0)
+    assert operation.ambiguous_recovery.kind == "wait_for_lease_expiry"
     with pytest.raises(ls.LaserError) as failure:
         await client.acquire(operation)
     assert failure.value.ambiguous_mutation

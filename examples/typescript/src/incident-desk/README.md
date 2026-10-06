@@ -11,11 +11,11 @@ This example runs an incident desk for a host fleet whose agents coordinate thro
 5. Fans three deadline-bounded specialist questions from triage, then synthesizes the findings through the example-owned LLM seam.
 6. Applies capacity grants through a KV-backed deduplicator even though every grant command is sent twice.
 7. Routes grants of 100 units or more through a correlated human approval gate before the resolver changes state.
-8. Stores the diagnosis as durable memory under the incident conversation.
+8. Remembers the diagnosis as a durable summary in the vector memory the specialist recalls from.
 9. Writes a speculative bulk-resolution row into the `bulk-resolve-plan` fork and optionally promotes it.
 10. Rebuilds the incident from agent command, response, tool, and result topics through `ConversationState`.
 
-The example requires query, KV compare-and-swap, and forks for the full desk. On Apache Iggy it reports the missing managed surfaces and exits before starting the agents.
+The example requires query, KV compare-and-swap, and forks for the full desk. On Apache Iggy it reports the first missing managed surface and exits before starting the agents.
 
 ## Run it
 
@@ -46,11 +46,10 @@ Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to replace the deterministic `MockLl
 
 ## Where to look (LaserData Cloud)
 
-- Query: the `support_tickets` world model, including payload selection for the original ticket JSON.
-- KV: `desk-grants-<run>` quotas and `desk-dedup-<run>` idempotency keys. The run ID is printed in the namespace.
+- Query: the `support_tickets_<token>` world model (the run token keeps a rerun, or another language's desk on the same deployment, out of this run's rows), including payload selection for the original ticket JSON.
+- KV: `desk-grants-<run>` quotas and `desk-dedup-<run>` idempotency keys. The run ID is part of each namespace name.
 - Forks: `bulk-resolve-plan`, left open unless `LASER_APPLY_PLAN=1`.
 - Conversations: commands, specialist calls, approvals, responses, and the replayed incident audit trail.
-- Memory: the diagnosis remembered under the incident conversation.
 
 ## Highlights
 

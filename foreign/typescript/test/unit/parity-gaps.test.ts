@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 import { createAgdx } from "../../src/agent/agdx.js"
-import type { AgentContext } from "../../src/agent/context.js"
+import type { AgentCtx } from "../../src/agent/context.js"
 import { ContractBuilder } from "../../src/agent/contract.js"
 import { MemoryHandler } from "../../src/agent/memory-handler.js"
 import {
@@ -90,7 +90,7 @@ const payloads = (count: number) =>
 
 void test("given_a_batch_longer_than_batch_length_when_sent_directly_then_should_split_it_into_sequential_requests", async () => {
   const { transport, calls } = recordingTransport()
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     batchLength: 2,
     createStream: false,
     createTopic: false
@@ -105,7 +105,7 @@ void test("given_a_batch_longer_than_batch_length_when_sent_directly_then_should
 
 void test("given_a_failure_mid_batch_when_sent_directly_then_should_report_the_committed_prefix_and_the_unconfirmed_tail", async () => {
   const { transport } = recordingTransport((call) => call === 2)
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     batchLength: 2,
     retries: 0,
     createStream: false,
@@ -122,14 +122,14 @@ void test("given_a_failure_mid_batch_when_sent_directly_then_should_report_the_c
 
 void test("given_a_zero_batch_length_when_building_a_producer_then_should_refuse_it", () => {
   assert.throws(
-    () => new Producer(recordingTransport().transport, "fleet", "readings", { batchLength: 0 }),
+    () => Producer.create(recordingTransport().transport, "fleet", "readings", { batchLength: 0 }),
     InvalidError
   )
 })
 
 void test("given_a_linger_gap_when_sending_twice_then_should_wait_out_the_rest_of_it", async () => {
   const { transport } = recordingTransport()
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     lingerMs: 40,
     createStream: false,
     createTopic: false
@@ -142,7 +142,7 @@ void test("given_a_linger_gap_when_sending_twice_then_should_wait_out_the_rest_o
 
 void test("given_background_mode_when_sending_then_should_queue_without_confirmations_and_write_on_flush", async () => {
   const { transport, calls } = recordingTransport()
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     background: { lingerMs: 10_000 },
     createStream: false,
     createTopic: false
@@ -162,21 +162,25 @@ void test("given_background_mode_when_sending_then_should_queue_without_confirma
 
 void test("given_background_mode_when_the_batch_length_is_reached_then_should_flush_without_waiting_for_linger", async () => {
   const { transport, calls } = recordingTransport()
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     background: { batchLength: 2, lingerMs: 10_000 },
     createStream: false,
     createTopic: false
   })
   await producer.send(new Uint8Array([1]))
+  assert.equal(calls.length, 0)
   await producer.send(new Uint8Array([2]))
-  await producer.flush()
-  assert.equal(calls.length, 1)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(
+    calls.map((call) => call.length),
+    [2]
+  )
   await producer.shutdown()
 })
 
 void test("given_a_failed_background_write_when_flushing_then_should_reject_with_the_failure_once", async () => {
   const { transport } = recordingTransport(() => true)
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     retries: 0,
     background: { lingerMs: 0 },
     createStream: false,
@@ -190,7 +194,7 @@ void test("given_a_failed_background_write_when_flushing_then_should_reject_with
 void test("given_a_background_error_handler_when_a_write_fails_then_should_receive_the_failure", async () => {
   const { transport } = recordingTransport(() => true)
   const failures: PublishFailedError[] = []
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     retries: 0,
     background: {
       lingerMs: 0,
@@ -224,10 +228,10 @@ void test("given_topic_size_limits_when_provisioning_then_should_create_the_topi
       return Promise.resolve()
     }
   } as unknown as LaserTransport
-  await new Producer(transport, "fleet", "readings", { maxTopicBytes: 1024n }).send(
+  await Producer.create(transport, "fleet", "readings", { maxTopicBytes: 1024n }).send(
     new Uint8Array([1])
   )
-  await new Producer(transport, "fleet", "readings", { unlimitedTopicSize: true }).send(
+  await Producer.create(transport, "fleet", "readings", { unlimitedTopicSize: true }).send(
     new Uint8Array([1])
   )
   assert.deepEqual(created, [{ maxTopicSize: 1024n }, { maxTopicSize: UNLIMITED_TOPIC_SIZE }])
@@ -237,8 +241,8 @@ const noopExecutor: QueryExecutor = () => Promise.reject(new Error("not executed
 
 void test("given_a_lakehouse_target_when_selecting_a_snapshot_then_should_set_the_selector", () => {
   const target = lakehouseTarget(DestinationId.fromU128(7n), 1n)
-  const bySnapshot = new QueryRequest(target, noopExecutor).atSnapshot(42n).intoQuery()
-  const byTime = new QueryRequest(target, noopExecutor).atTimestampMicros(1_000n).intoQuery()
+  const bySnapshot = QueryRequest.create(target, noopExecutor).atSnapshot(42n).intoQuery()
+  const byTime = QueryRequest.create(target, noopExecutor).atTimestampMicros(1_000n).intoQuery()
   assert.deepEqual(bySnapshot.target.kind === "lakehouse" && bySnapshot.target.snapshot, {
     kind: "snapshot_id",
     value: 42n
@@ -269,7 +273,7 @@ void test("given_expiry_only_when_a_producer_provisions_then_should_use_create_i
       return Promise.resolve()
     }
   } as unknown as LaserTransport
-  await new Producer(transport, "fleet", "readings", { messageExpiryMicros: 1_000_000n }).send(
+  await Producer.create(transport, "fleet", "readings", { expireAfterMicros: 1_000_000n }).send(
     new Uint8Array([1])
   )
   assert.deepEqual(created, [{ messageExpiryMicros: 1_000_000n }])
@@ -277,9 +281,9 @@ void test("given_expiry_only_when_a_producer_provisions_then_should_use_create_i
 })
 
 void test("given_an_operational_target_when_selecting_a_snapshot_then_should_refuse_it", () => {
-  assert.throws(() => new QueryRequest("readings", noopExecutor).atSnapshot(1n), InvalidError)
+  assert.throws(() => QueryRequest.create("readings", noopExecutor).atSnapshot(1n), InvalidError)
   assert.throws(
-    () => new QueryRequest("readings", noopExecutor).atTimestampMicros(1n),
+    () => QueryRequest.create("readings", noopExecutor).atTimestampMicros(1n),
     InvalidError
   )
 })
@@ -287,7 +291,8 @@ void test("given_an_operational_target_when_selecting_a_snapshot_then_should_ref
 void test("given_no_row_ceiling_when_streaming_typed_rows_then_should_refuse_it", () => {
   assert.throws(
     () =>
-      new QueryRequest("readings", noopExecutor).rowsTyped({
+      QueryRequest.create("readings", noopExecutor).rowsTyped({
+        contentType: "raw",
         encode: (value: string) => new TextEncoder().encode(value),
         decode: (bytes: Uint8Array) => new TextDecoder().decode(bytes)
       }),
@@ -302,9 +307,9 @@ void test("given_memory_handles_when_reading_the_backend_then_should_name_the_re
     improve: () => Promise.reject(new Error("unused")),
     forget: () => Promise.resolve()
   }
-  const vector = new MemoryHandle(new VectorMemory())
+  const vector = MemoryHandle.create(new VectorMemory({ embed: () => Promise.resolve([1]) }))
   assert.equal(vector.backend, "vector")
-  assert.equal(new MemoryHandle(custom).backend, "custom")
+  assert.equal(MemoryHandle.create(custom).backend, "custom")
   assert.equal(
     vector.reranker({ rerank: (_query, items) => Promise.resolve(items) }).backend,
     "vector"
@@ -314,9 +319,9 @@ void test("given_memory_handles_when_reading_the_backend_then_should_name_the_re
 void test("given_an_agent_scope_when_opening_a_contract_then_should_send_as_that_agent", () => {
   const router = { kind: "broadcast" } as unknown as Router
   const laser = {
-    contract: (route: Router) => new ContractBuilder(laser as unknown as Laser, route)
+    contract: (route: Router) => ContractBuilder.create(laser as unknown as Laser, route)
   }
-  const scope = new AgentScope(laser as unknown as Laser, AgentId.new("rotator"))
+  const scope = AgentScope.create(laser as unknown as Laser, AgentId.new("rotator"))
   const builder = scope.contract(router)
   assert.ok(builder instanceof ContractBuilder)
 })
@@ -352,7 +357,7 @@ void test("given_backend_observations_when_reading_readiness_then_should_mirror_
 void test("given_capabilities_when_checking_open_only_then_should_match_only_the_open_set", () => {
   assert.equal(isOpenOnly(OPEN_CAPABILITIES), true)
   assert.equal(isOpenOnly({ ...OPEN_CAPABILITIES, watch: true }), false)
-  assert.equal(isOpenOnly({ ...OPEN_CAPABILITIES, hello: "answered" }), false)
+  assert.equal(isOpenOnly({ ...OPEN_CAPABILITIES, hello: "answered" }), true)
 })
 
 void test("given_a_swappable_governor_when_swapping_then_should_return_the_previous_and_expose_the_current", () => {
@@ -370,7 +375,7 @@ void test("given_a_swappable_governor_when_swapping_then_should_return_the_previ
 
 void test("given_an_empty_flush_when_background_records_arrive_then_should_still_drain_them", async () => {
   const { transport, calls } = recordingTransport()
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     background: { lingerMs: 10_000 },
     createStream: false,
     createTopic: false
@@ -389,7 +394,7 @@ void test("given_an_empty_flush_when_background_records_arrive_then_should_still
 
 void test("given_a_throwing_background_callback_when_a_write_fails_then_should_preserve_the_publish_failure", async () => {
   const { transport } = recordingTransport(() => true)
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     retries: 0,
     background: {
       lingerMs: 0,
@@ -409,7 +414,7 @@ void test("given_a_throwing_background_callback_when_a_write_fails_then_should_p
 
 void test("given_a_rejected_background_callback_when_a_write_fails_then_should_preserve_the_publish_failure", async () => {
   const { transport } = recordingTransport(() => true)
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     retries: 0,
     background: {
       lingerMs: 0,
@@ -437,7 +442,7 @@ void test("given_a_partially_committed_transport_chunk_when_sending_then_should_
         new TransportError("permanent", false)
       )
     )
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     batchLength: 2,
     retries: 0,
     createStream: false,
@@ -461,7 +466,7 @@ void test("given_a_send_waiting_for_provisioning_when_shutdown_finishes_then_sho
     new Promise<void>((resolve) => {
       provisioned = resolve
     })
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     background: { lingerMs: 10_000 },
     createTopic: false
   })
@@ -475,7 +480,7 @@ void test("given_a_send_waiting_for_provisioning_when_shutdown_finishes_then_sho
 
 void test("given_two_failed_background_writes_when_flushing_then_should_report_the_records_of_both", async () => {
   const { transport } = recordingTransport(() => true)
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     retries: 0,
     background: { lingerMs: 0 },
     createStream: false,
@@ -507,7 +512,7 @@ void test("given_a_shutdown_in_flight_when_shutdown_is_called_again_then_should_
       return { confirmations: [] }
     }
   } as unknown as LaserTransport
-  const producer = new Producer(transport, "fleet", "readings", {
+  const producer = Producer.create(transport, "fleet", "readings", {
     background: { lingerMs: 60_000 },
     createStream: false,
     createTopic: false
@@ -526,7 +531,9 @@ void test("given_a_message_expiry_when_the_transport_cannot_set_it_then_should_r
     ensureStream: () => Promise.resolve(),
     ensureTopic: () => Promise.resolve()
   } as unknown as LaserTransport
-  const producer = new Producer(transport, "fleet", "readings", { messageExpiryMicros: 1_000_000n })
+  const producer = Producer.create(transport, "fleet", "readings", {
+    expireAfterMicros: 1_000_000n
+  })
   await assert.rejects(producer.send(new Uint8Array([1])), (error: unknown) => {
     assert.ok(error instanceof PublishFailedError)
     return error.publishCause() instanceof InvalidError
@@ -698,7 +705,10 @@ void test("given_prune_summarized_when_consolidated_then_should_forget_the_folde
     kindItem(MemoryKind.Fact, "node-8 is a metrics host")
   ]
   const store = new KindMemory(items)
-  const scoped = new ScopedMemory(MemoryHandle.custom(store), ConversationId.derive("consolidate"))
+  const scoped = ScopedMemory.create(
+    MemoryHandle.custom(store),
+    ConversationId.derive("consolidate")
+  )
   const report = await scoped.consolidate(1, {
     summarizer: joiningSummarizer,
     pruneSummarized: true
@@ -780,25 +790,21 @@ function handledMessage(agent?: AgentId): AgentMessage {
   } as unknown as AgentMessage
 }
 
-const noContext = {} as unknown as AgentContext
+const noContext = {} as unknown as AgentCtx
 
 void test("given_auto_remember_when_a_message_is_handled_then_should_remember_it_after_the_handler", async () => {
-  const memory = MemoryHandle.vector()
+  const memory = MemoryHandle.vector({ embed: () => Promise.resolve([1]) })
   const conversation = ConversationId.derive("incident-42")
   let seenBeforeRemember = -1
   const inner: AgentHandler = {
     handle: async (_message, context) => {
       assert.equal(context, noContext)
-      seenBeforeRemember = (await memory.recall().conversation(conversation).fetch()).length
+      seenBeforeRemember = (await memory.recall(conversation).fetch()).length
     }
   }
   const handler = new MemoryHandler(inner, memory).autoRemember(MemoryKind.Message)
   await handler.handle(handledMessage(AgentId.new("triage")), noContext)
-  const items = await memory
-    .recall()
-    .conversation(conversation)
-    .agent(AgentId.new("triage"))
-    .fetch()
+  const items = await memory.recall(conversation).agent(AgentId.new("triage")).fetch()
   assert.equal(seenBeforeRemember, 0)
   const [remembered] = items
   assert.ok(remembered !== undefined, "the handled message was remembered")

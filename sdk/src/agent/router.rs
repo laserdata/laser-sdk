@@ -453,11 +453,11 @@ mod tests {
         assert_eq!(pick(RoutePolicy::Fastest).as_deref(), Some("fast"));
         assert_eq!(pick(RoutePolicy::LeastLoaded).as_deref(), Some("idle"));
         assert_eq!(
-            pick(RoutePolicy::Sticky("fast".parse().unwrap())).as_deref(),
+            pick(RoutePolicy::Sticky("fast".parse().expect("valid agent id"))).as_deref(),
             Some("fast")
         );
         // Sticky to an absent agent falls back to a candidate.
-        assert!(pick(RoutePolicy::Sticky("gone".parse().unwrap())).is_some());
+        assert!(pick(RoutePolicy::Sticky("gone".parse().expect("valid agent id"))).is_some());
     }
 
     #[test]
@@ -540,26 +540,30 @@ mod tests {
 
     #[test]
     fn given_a_fixed_inbox_route_when_resolved_then_should_use_that_topic_ignoring_presence() {
-        let agent: AgentId = "metrics".parse().unwrap();
+        let agent: AgentId = "metrics".parse().expect("valid agent id");
         let route = InboxRoute::Fixed(AgentTopic::Commands);
         // Fixed ignores the advertised inbox entirely.
-        let id = route.resolve(&agent, Some("some.other.topic")).unwrap();
+        let id = route
+            .resolve(&agent, Some("some.other.topic"))
+            .expect("a fixed route resolves");
         assert_eq!(id.to_string(), "agent.commands");
     }
 
     #[test]
     fn given_an_advertised_route_when_an_inbox_is_present_then_should_resolve_to_it() {
-        let agent: AgentId = "metrics".parse().unwrap();
+        let agent: AgentId = "metrics".parse().expect("valid agent id");
         let id = InboxRoute::Advertised
             .resolve(&agent, Some("metrics.work.2026"))
-            .unwrap();
+            .expect("an advertised inbox resolves");
         assert_eq!(id.to_string(), "metrics.work.2026");
     }
 
     #[test]
     fn given_an_advertised_route_when_no_inbox_then_should_error_without_a_fallback() {
-        let agent: AgentId = "metrics".parse().unwrap();
-        let error = InboxRoute::Advertised.resolve(&agent, None).unwrap_err();
+        let agent: AgentId = "metrics".parse().expect("valid agent id");
+        let error = InboxRoute::Advertised
+            .resolve(&agent, None)
+            .expect_err("no inbox fails");
         assert!(
             matches!(error, LaserError::NoInbox { agent } if agent == "metrics"),
             "advertised route with no inbox must fail loud, never fall back to a shared topic",

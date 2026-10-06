@@ -55,7 +55,6 @@ void test("given_untrusted_crash_fields_when_summarized_then_should_escape_and_t
       agent: AgentId.new("planner")
     },
     payload: new TextEncoder().encode(`${"x".repeat(201)}\nforged`),
-    timestampMicros: 1n,
     topic: "agent.commands"
   }
   const context = new CrashContext(

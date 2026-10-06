@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.5.4" # typed streaming plus provenance
+laser-sdk = "0.6.0" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.5.4", features = ["agent", "managed"] }
+laser-sdk = { version = "0.6.0", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -68,7 +68,7 @@ This example uses only the default `streaming` and `provenance` features and run
 
 Direct producers, topic sends, and publish builders return `SendMessagesResponse`. Each confirmation identifies the stream, topic, partition, and first offset in a batch. A server that does not report offsets returns an empty list. Completion follows the topic durability policy. An offset identifies a position only within its stream, topic, and partition.
 
-Apache Iggy retries initial TCP connections and reconnects dropped connections. The default is unlimited retries at one-second intervals. Use `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` to change this behavior. After reconnecting, the client reapplies the credentials from the connection string.
+Apache Iggy retries a failed dial and reconnects a dropped connection, by default without limit at one-second intervals. The 30-second connect budget described under [Connect and publish limits](#connect-and-publish-limits) stops the retries of the initial connect. Use `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` to change the reconnect behavior. After reconnecting, the client reapplies the credentials from the connection string.
 
 For `*.laserdata.cloud` and `*.laserdata.com`, `connect` and `connect_with_stream` enable TLS with the bundled LaserData root CA. A CA is a certificate authority used to establish trust. The SDK stores this certificate in a directory that only the current user can access. It reuses the file only when its bytes match the bundled certificate.
 
@@ -302,68 +302,6 @@ Choose the read API that provides the behavior your application needs.
 
 Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` for typed builders. Use `topic.producer()` for a persistent producer with batching, retries, topology discovery, and routing. `topic.batching()` adds governed batches that flush by size or time. `contract(..)` sends a directed task, and `workflow(name)` runs steps in dependency order. Apache Iggy builders and the client remain available for detailed configuration.
 
-## Features
-
-- `default = ["streaming", "provenance"]`
-- `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. The SDK uses Iggy's native VSR transport. Managed reads use the non-replicated extension path, and managed authorization writes use dedicated replicated operation codes.
-- `provenance`, wire contract + provenance encoding/decoding
-- `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
-- `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
-- `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
-- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent()`, then `.commit()`. `.send()` is unconditional and refuses a builder that carries a precondition with `LaserError::Invalid`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
-- `streaming` includes consumer-group policies, group-aware consumers, explicit acknowledgment readers and group filter administration. The supporting server selects matching records for a bound group and returns all records for an unbound group. Configuration needs a ready catalog. `filters` adds only the local evaluator and the advanced reader's optional `local_guard` check. A reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset.
-- capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
-- `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)
-- `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
-- `a2a-http` / `mcp-http`, the ready-made axum `router()` for each bridge
-- `agui`, AG-UI state sync and event rendering over the log
-- `sign` provides Ed25519 signing and verification. `Agent::builder().signing_key(..)` signs pickup and terminal replies, including `respond_input`. `Agent::builder().verifier(..)` rejects unsigned or invalid records before handling. `LaserBuilder::verifier(..)` applies the same requirement to correlated reply waits.
-
-Signatures bind observed headers and are evaluated at the server-recorded timestamp. Signed `quarantine` and `unquarantine` facts require operator keys. `A2aBridge::signed_card` and `sign::verify_card` support detached JWS over the canonical card. `KvKeyRegistry` stores versioned keys in the managed platform.
-
-## Observability
-
-The SDK creates `tracing` spans under the `laser` target. Publication, polls, and managed calls use `debug`. Connections, agent startup, workflows, and contracts use `info`. Fields include `conversation`, `correlation`, `agent`, `topic`, `index`, `operation`, and managed command `code`. The AGDX specification defines their mapping to record headers. An OpenTelemetry subscriber can connect client spans with traces derived from records.
-
-The SDK supplies spans through `tracing`. Your application supplies the subscriber and exporter. The following example uses `tracing-opentelemetry` to show the connection. It is illustrative and does not compile as part of this crate:
-
-```rust,ignore
-use tracing_subscriber::layer::SubscriberExt;
-
-let tracer = opentelemetry_otlp::new_pipeline().tracing().install_simple()?;
-tracing::subscriber::set_global_default(
-    tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer)),
-)?;
-```
-
-## Prelude
-
-`use laser_sdk::prelude::*` imports the common accessors and types, about 70 items. `use laser_sdk::prelude::full::*` also imports bridge types, extension traits, projection types, and memory configuration. Prefer the smaller set and explicit imports for application code.
-
-## Documentation
-
-The [repository README](https://github.com/laserdata/laser-sdk#readme) links to `docs/tutorial.md`. The tutorial covers publication, projections, queries, batches, codecs, stream isolation, and agents. The API reference is on [docs.rs](https://docs.rs/laser-sdk). The protocol home is [agdxprotocol.ai](https://agdxprotocol.ai).
-
-## License
-
-Apache-2.0. Copyright LaserData, Inc.
-
-Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of these marks does not imply endorsement by the Apache Software Foundation.
-
-## Connect timeout
-
-Connecting gives up after 30 seconds. Set another budget with the Rust `connect_timeout` builder method, the Python `connect_timeout_ms` connect argument, or the TypeScript `connectTimeout` builder method. The environment variable is `LASER_CONNECT_TIMEOUT_MS`, and explicit configuration overrides it. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe. An expired budget returns a timeout error that says whether the server never accepted the connection or never answered the login. `stream(name).delete()` removes a stream you no longer need, and `close()` ends the shared connection.
-
-See [connect timeout and cleanup](../docs/connect-timeout.md).
-
-## Publish recovery
-
-Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
-
-Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
-
-See [publish recovery and outage handling](../docs/publish-recovery.md).
-
 ## Consumer filters
 
 **Configure the group once, then consume using only its name or ID.** The filter runs on the server. Matching records retain their original payloads, headers and offsets. An unbound group receives all records through the same consumer API:
@@ -411,4 +349,58 @@ Group consumers acknowledge through the fenced group contract. Automatic policie
 
 For an application checkpoint inside a filtered page, call `reader.ack_through(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ack_page` when the whole page is complete.
 
-The [0.5.4 client behavior guide](../docs/client-behavior.md) documents prepared coordination, owned agent lifetimes, memory reports, and the matching Python and TypeScript APIs.
+## Features
+
+- `default = ["streaming", "provenance"]`
+- `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. The SDK uses Iggy's native VSR transport. Managed reads use the non-replicated extension path, and managed authorization writes use dedicated replicated operation codes.
+- `provenance`, wire contract + provenance encoding/decoding
+- `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
+- `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
+- `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
+- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent()`, then `.commit()`. `.send()` is unconditional and refuses a builder that carries a precondition with `LaserError::Invalid`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
+- `streaming` includes consumer-group policies, group-aware consumers, explicit acknowledgment readers and group filter administration. The supporting server selects matching records for a bound group and returns all records for an unbound group. Configuration needs a ready catalog. `filters` adds only the local evaluator and the advanced reader's optional `local_guard` check. A reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset.
+- capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
+- `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)
+- `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
+- `a2a-http` / `mcp-http`, the ready-made axum `router()` for each bridge
+- `agui`, AG-UI state sync and event rendering over the log
+- `sign` provides Ed25519 signing and verification. `Agent::builder().signing_key(..)` signs pickup and terminal replies, including `respond_input`. `Agent::builder().verifier(..)` rejects unsigned or invalid records before handling. `LaserBuilder::verifier(..)` applies the same requirement to correlated reply waits.
+
+Signatures bind observed headers and are evaluated at the server-recorded timestamp. Signed `quarantine` and `unquarantine` facts require operator keys. `A2aBridge::signed_card` and `sign::verify_card` support detached JWS over the canonical card. `KvKeyRegistry` stores versioned keys in the managed platform.
+
+## Observability
+
+The SDK creates `tracing` spans under the `laser` target. Publication, polls, and managed calls use `debug`. Connections, agent startup, workflows, and contracts use `info`. Fields include `conversation`, `correlation`, `agent`, `topic`, `index`, `operation`, and managed command `code`. The AGDX specification defines their mapping to record headers. An OpenTelemetry subscriber can connect client spans with traces derived from records.
+
+The SDK supplies spans through `tracing`. Your application supplies the subscriber and exporter. The following example uses `tracing-opentelemetry` to show the connection. It is illustrative and does not compile as part of this crate:
+
+```rust,ignore
+use tracing_subscriber::layer::SubscriberExt;
+
+let tracer = opentelemetry_otlp::new_pipeline().tracing().install_simple()?;
+tracing::subscriber::set_global_default(
+    tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer)),
+)?;
+```
+
+## Prelude
+
+`use laser_sdk::prelude::*` imports the common accessors and types, about 70 items. `use laser_sdk::prelude::full::*` also imports bridge types, extension traits, projection types, and memory configuration. Prefer the smaller set and explicit imports for application code.
+
+## Connect and publish limits
+
+`Laser::connect` gives up after 30 seconds. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe, and an expired budget returns `LaserError::Timeout` naming the stage that stalled. Each publish attempt times out after 60 seconds and is retried three times, with delays that start at 250 milliseconds, double after each failure, and stop growing at 30 seconds. `LaserBuilder::connect_timeout`, `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff` change these limits and override `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` variables. A publish that gives up returns `LaserError::PublishFailed` with the committed ranges and the unconfirmed records. `stream(name).delete()` removes a stream you no longer need, and `Laser::close` ends the shared connection. See [connect timeout and cleanup](../docs/connect-timeout.md) and [publish recovery](../docs/publish-recovery.md).
+
+## Upgrading to 0.6.0
+
+0.6.0 is a minor release with breaking changes. Keep each `AgentHandle` until `shutdown` or `join`, because dropping it now stops the agent. `Capabilities::sessions` and `durable_dedup` are gone, and fork row embeddings take `f32` values instead of a string. The [client behavior guide](../docs/client-behavior.md) lists every change across the three clients.
+
+## Documentation
+
+The [repository README](https://github.com/laserdata/laser-sdk#readme) links to `docs/tutorial.md`. The tutorial covers publication, projections, queries, batches, codecs, stream isolation, and agents. The API reference is on [docs.rs](https://docs.rs/laser-sdk). The protocol home is [agdxprotocol.ai](https://agdxprotocol.ai).
+
+## License
+
+Apache-2.0. Copyright LaserData, Inc.
+
+Apache and Apache Iggy are trademarks of the Apache Software Foundation. Use of these marks does not imply endorsement by the Apache Software Foundation.

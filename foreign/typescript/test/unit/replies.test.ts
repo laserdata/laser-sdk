@@ -1,18 +1,14 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { TimeoutError } from "../../src/client/errors.js"
-import type {
-  ConsumerTarget,
-  IggyHeaderValue,
-  LaserTransport,
-  PolledMessage
-} from "../../src/iggy/apache-iggy.js"
+import type { ConsumerTarget, LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
+import type { HeaderValue } from "../../src/stream/header-value.js"
 import { agentMessageBody } from "../../src/agent/reliable-consumer.js"
-import { ReplyHub } from "../../src/agent/replies.js"
+import { ReplyHub, findAgdxReply } from "../../src/agent/replies.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
 import { ConversationId } from "../../src/types/ids.js"
-import type { PollingStrategy } from "../../src/stream/polling-strategy.js"
+import type { ConsumerStart } from "../../src/stream/consumer-start.js"
 import { encodeAgentEnvelope, parseAgentId, responseEnvelope } from "../../src/wire/agent.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
 import { AGENT_OP_VERSION } from "../../src/wire/codes.js"
@@ -38,7 +34,7 @@ function replyMessage(correlationId: string, offset: bigint): PolledMessage {
 }
 
 interface ScriptedPoll {
-  readonly strategy: PollingStrategy["kind"]
+  readonly strategy: ConsumerStart["kind"]
   readonly result: readonly PolledMessage[]
 }
 
@@ -63,7 +59,7 @@ function fakeTransport(script: readonly ScriptedPoll[]): LaserTransport {
       _streamId: string,
       _topicId: string,
       _target: ConsumerTarget,
-      strategy: PollingStrategy
+      strategy: ConsumerStart
     ): Promise<readonly PolledMessage[]> {
       const next = remaining.find((entry) => entry.strategy === strategy.kind)
       if (next === undefined) return Promise.resolve([])
@@ -176,7 +172,7 @@ function agdxReply(
     contentType: contentTypeCode(ContentType.Cbor),
     agentVersion: AGENT_OP_VERSION
   })
-  const headers = new Map<string, IggyHeaderValue>([
+  const headers = new Map<string, HeaderValue>([
     [AGENT_VERSION, { kind: "uint32", value: AGENT_OP_VERSION }],
     [CONTENT_TYPE, { kind: "uint8", value: contentTypeCode(ContentType.Cbor) }]
   ])
@@ -260,4 +256,51 @@ void test("given_a_verifier_when_the_bound_signer_replies_then_should_resolve_wi
   } finally {
     hub.stop()
   }
+})
+
+function scannedTopic(messages: readonly PolledMessage[]): LaserTransport {
+  const transport: Pick<LaserTransport, "findTopicPartitionCount" | "pollMessages"> = {
+    findTopicPartitionCount: () => Promise.resolve(1),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart
+    ): Promise<readonly PolledMessage[]> {
+      const from = strategy.kind === "offset" ? strategy.value : 0n
+      return Promise.resolve(messages.filter((message) => message.offset >= from))
+    }
+  }
+  return transport as LaserTransport
+}
+
+void test("given_two_verified_replies_when_looked_up_then_should_return_the_first_in_log_order", async () => {
+  const correlation = CorrelationId.fromU128(0x0404n)
+  const transport = scannedTopic([
+    agdxReply(correlation, "first", 0n, toolKey),
+    agdxReply(correlation, "second", 1n, toolKey)
+  ])
+  const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
+  assert.equal(new TextDecoder().decode(found?.body), "first")
+})
+
+void test("given_a_verifier_when_only_an_unsigned_reply_exists_then_should_find_nothing", async () => {
+  const correlation = CorrelationId.fromU128(0x0405n)
+  const transport = scannedTopic([agdxReply(correlation, "forged-unsigned", 0n)])
+  assert.equal(
+    await findAgdxReply(transport, "stream", "replies", correlation, enrolled()),
+    undefined
+  )
+  const unverified = await findAgdxReply(transport, "stream", "replies", correlation)
+  assert.equal(new TextDecoder().decode(unverified?.body), "forged-unsigned")
+})
+
+void test("given_a_forged_reply_before_a_verified_one_when_looked_up_then_should_skip_the_forgery", async () => {
+  const correlation = CorrelationId.fromU128(0x0406n)
+  const transport = scannedTopic([
+    agdxReply(correlation, "forged", 0n),
+    agdxReply(correlation, "honest", 1n, toolKey)
+  ])
+  const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
+  assert.equal(new TextDecoder().decode(found?.body), "honest")
 })

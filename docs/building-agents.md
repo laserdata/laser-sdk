@@ -1,10 +1,10 @@
 # Building agentic apps
 
-This guide builds a support-triage workflow, then maps related application tasks to SDK calls. Start with the [tutorial](tutorial.md) for individual operations. Read the [AGDX notes](agdx.md) for the data contract.
+This guide builds a support-triage workflow, then maps related application tasks to SDK calls. Start with the [tutorial](tutorial.md) for individual operations. Read the [AGDX notes](agdx.md) for the data contract. The snippets use Rust, the reference SDK. The [three-language guides](https://docs.laserdata.cloud/laser-sdk) show each feature in TypeScript, Rust, and Python, and the [parity matrix](parity.md) maps every Rust call to its Python and TypeScript spelling.
 
 Applications append records to topics and read them by offset. Memory, state, and queryable views derive from these records. Agents use the same log to coordinate and retain history.
 
-All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code runs through Apache Iggy's VSR cluster client. Managed query, KV-backed memory, graph, forks, run registry, and live presence use the custom command band, while replicated authorization mutations are promoted by the fork server.
+All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code runs through Apache Iggy's VSR cluster client. Managed query, KV-backed memory, graph, forks, run registry, and live presence use the custom command band. The streaming server promotes authorization mutations to dedicated replicated operations.
 
 ## The primitives, and the call that reaches each
 
@@ -14,7 +14,7 @@ All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code ru
 | Read from an offset, resumably | a `Cursor` | `laser.stream("support").topic("triage.actions").replay()?` then `poll` / `from_offsets` |
 | Run an agent on a topic | `Agent::builder` | `.listen_on(AgentTopic::Commands).respond_on(..).handler(H).build().spawn(laser)` |
 | Ask an agent and await the reply | the agent accessor | `laser.agent("caller".parse()?).ask(req, reply, body, &prov, timeout).await?`, or `ctx.request(..)` inside a handler |
-| Stream a large result in chunks | `AgdxStream` | `laser.agdx(..).stream(corr, "context").buffered(64, linger)` then `finish` |
+| Stream a large result in chunks | `AgdxStream` | `laser.agdx(..).stream(corr, "chat").buffered(64, linger)` then `finish` |
 | Send a large body by reference | a claim-check | `.claim_check(&store, threshold)` on the publish, `resolve_body(&store)` on read |
 | Make an external effect happen once | a KV compare-and-swap | `laser.kv("effects").set(key).bytes(b).expect_absent().commit().await?` |
 | Look up structured facts | the query surface | `laser.query("readings").where_eq(..).fetch_typed::<Reading>().await?`, or `.raw_sql(SqlDialect::DataFusion, ..)` |
@@ -73,7 +73,7 @@ laser.bind_roles(user_id, vec!["support-reader".into()]).await?;
 let who = laser.whoami().await?;
 ```
 
-End-to-end enforcement lives in Iggy fork and LaserData managed plane. In this repo the contract is pinned by `wire/tests/wire_fixtures.rs` and `wire/tests/constants.rs`. Rust, Python, and TypeScript test the typed client surface and shared governance scenarios. The mirrored `governance` examples exercise live role and binding calls when a deployment advertises `authz`.
+End-to-end enforcement lives in the Iggy fork and the LaserData managed plane. In this repo the contract is pinned by `wire/tests/wire_fixtures.rs` and `wire/tests/constants.rs`. Rust, Python, and TypeScript test the typed client surface and shared governance scenarios. The mirrored `governance` examples exercise live role and binding calls when a deployment advertises `authz`.
 
 ## The scenario: a support-triage desk
 
@@ -90,6 +90,8 @@ let mut classifier = Agent::builder()
     .build()
     .spawn(laser.clone());
 ```
+
+The returned `AgentHandle` owns the running agent. Dropping it signals a graceful shutdown, so keep it until the desk is done. Call `shutdown().await` to wait for the in-flight message and read the consumer result.
 
 The retriever reads the classification and queries relevant facts. It uses the structured query API or read-only SQL for a join. It returns context as chunk records.
 
@@ -122,7 +124,7 @@ match laser
 }
 ```
 
-The escalator applies the approval policy. Above the threshold, it requests human input and marks the task `input-required`. An approver reads the human-input topic and answers through `ctx.respond_input(..)`.
+The escalator applies the approval policy. Above the threshold, it requests human input and waits for the decision. An approver reads the human-input topic and answers through `ctx.respond_input(..)`.
 
 ```rust
 let decision = ctx
@@ -142,9 +144,9 @@ The following examples map support tasks to SDK calls.
 laser.memory("profiles").set("host:node-7", config_json).await?;
 ```
 
-A recorded `set` preserves the preference change in log history. Read retained records to inspect the writer, time, and later changes.
+A recorded `set` preserves the configuration change in log history. Read retained records to inspect the writer, time, and later changes.
 
-A human-input request marks the task `input-required` and waits for a correlated response. Consoles and agents can read its topic. With a verifier, only a valid signed response can resume the request. An approver with a signing key uses `ctx.respond_input(..)` to provide that response.
+A human-input request publishes a prompt and waits for a correlated response. Consoles and agents can read its topic. With a verifier, only a valid signed response can resume the request. An approver with a signing key uses `ctx.respond_input(..)` to provide that response.
 
 ```rust
 let decision = laser
@@ -193,4 +195,6 @@ Observability, analytics, and lakehouse consumers can read the same topics indep
 
 ## What the SDK gives you, and where you write code
 
-Apache Iggy owns the log, transport, and offsets. Laser SDK adds typed records, replay helpers, agent processing, chunk assembly, and managed operation clients. Applications supply handler logic and model integrations through `Embedder`, `LlmClient`, `Reranker`, and `Summarizer`. Managed features require a deployment that provides their backend services.
+Apache Iggy owns the log, transport, and offsets. Laser SDK adds typed records, replay helpers, agent processing, chunk assembly, and managed operation clients. Applications supply handler logic and model integrations through `Embedder`, `Reranker`, and `Summarizer`. The SDK ships no model client, and the examples define their own `LlmClient` seam. Managed features require a deployment that provides their backend services.
+
+Periodic consolidation uses the agent identity as its owner scope when the agent has an ID. A summarizer writes one summary per conversation. Python hooks accept a callable or an object implementing the corresponding method, with either a direct result or an awaitable. Asynchronous hooks keep event-loop context and receive cancellation when their operation stops.

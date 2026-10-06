@@ -1,5 +1,5 @@
-import { CodecError, TypedDecodeError } from "../client/errors.js"
-import type { IggyHeaderValue } from "../iggy/apache-iggy.js"
+import { CodecError, LaserError, TypedDecodeError } from "../client/errors.js"
+import type { HeaderValue } from "./header-value.js"
 import type { SendMessagesResponse } from "../iggy/apache-iggy.js"
 import type { CompiledSchema } from "../schema-codecs.js"
 import type { MessageId } from "../types/ids.js"
@@ -9,7 +9,7 @@ import {
   type ContentType as ContentTypeValue
 } from "../wire/content.js"
 import type { Codec } from "./codecs.js"
-import type { Cursor, CursorOptions } from "./cursor.js"
+import type { Cursor } from "./cursor.js"
 import type { RawSendOptions } from "./topic.js"
 import type { Topic } from "./topic.js"
 
@@ -17,10 +17,8 @@ export type TypedTopicKind = "json" | "cbor" | "schema"
 
 export interface TypedRecord<T> {
   readonly value: T
-  readonly partitionId: number
-  readonly offset: bigint
   readonly position: MessageId
-  readonly headers: ReadonlyMap<string, IggyHeaderValue>
+  readonly headers: ReadonlyMap<string, HeaderValue>
 }
 
 export type TypedPollResult<T> =
@@ -34,14 +32,27 @@ export interface TypedContract {
 }
 
 export class TypedTopic<T> {
-  constructor(
-    private readonly topic: Topic,
+  private constructor(
+    /** The untyped handle underneath, for the verbs the typed form does not wrap. */
+    readonly topic: Topic,
     private readonly codec: Codec<T>,
-    readonly kind: TypedTopicKind,
+    private readonly kind: TypedTopicKind,
     private readonly contract: TypedContract = {
       contentType: kind === "json" ? ContentType.Json : ContentType.Cbor
     }
   ) {}
+
+  /** @internal */
+  static create<T>(
+    topic: Topic,
+    codec: Codec<T>,
+    kind: TypedTopicKind,
+    contract: TypedContract = {
+      contentType: kind === "json" ? ContentType.Json : ContentType.Cbor
+    }
+  ): TypedTopic<T> {
+    return new TypedTopic(topic, codec, kind, contract)
+  }
 
   async publish(value: T, options?: RawSendOptions): Promise<SendMessagesResponse> {
     if (options?.key !== undefined && options.partition !== undefined) {
@@ -75,9 +86,9 @@ export class TypedTopic<T> {
     return this.topic.batch(payloads, { ...options, headers })
   }
 
-  async records(readerName: string, options?: CursorOptions): Promise<TypedRecords<T>> {
-    const cursor = await this.topic.replay({ ...options, readerName })
-    return new TypedRecords(cursor, this.codec, this.contract.compiled)
+  async records(readerName: string): Promise<TypedRecords<T>> {
+    const cursor = (await this.topic.replay()).named(readerName)
+    return TypedRecords.create(cursor, this.codec, this.contract.compiled)
   }
 
   private encode(value: T): Uint8Array {
@@ -89,8 +100,8 @@ export class TypedTopic<T> {
   }
 
   private contractHeaders(
-    headers: ReadonlyMap<string, IggyHeaderValue> | undefined
-  ): ReadonlyMap<string, IggyHeaderValue> {
+    headers: ReadonlyMap<string, HeaderValue> | undefined
+  ): ReadonlyMap<string, HeaderValue> {
     const contract = new Map(headers)
     contract.set("agdx.ct", {
       kind: "uint8",
@@ -109,7 +120,7 @@ function decodeRecord<T>(
     readonly payload: Uint8Array
     readonly partitionId: number
     readonly offset: bigint
-    readonly headers: ReadonlyMap<string, IggyHeaderValue>
+    readonly headers: ReadonlyMap<string, HeaderValue>
   },
   compiled?: CompiledSchema
 ): TypedPollResult<T> {
@@ -119,30 +130,39 @@ function decodeRecord<T>(
       kind: "record",
       record: {
         value: codec.decode(message.payload),
-        partitionId: message.partitionId,
-        offset: message.offset,
         position: { partitionId: message.partitionId, offset: message.offset },
         headers: message.headers
       }
     }
   } catch (cause) {
+    const source =
+      cause instanceof LaserError
+        ? cause
+        : new CodecError("typed record payload does not decode", "typed-topic", "decode", {
+            cause
+          })
     return {
       kind: "error",
       error: new TypedDecodeError(
         "failed to decode typed record",
         { partitionId: message.partitionId, offset: message.offset },
-        { cause }
+        source
       )
     }
   }
 }
 
 export class TypedRecords<T> {
-  constructor(
+  private constructor(
     private readonly cursor: Cursor,
     private readonly codec: Codec<T>,
     private readonly compiled?: CompiledSchema
   ) {}
+
+  /** @internal */
+  static create<T>(cursor: Cursor, codec: Codec<T>, compiled?: CompiledSchema): TypedRecords<T> {
+    return new TypedRecords(cursor, codec, compiled)
+  }
 
   get offsets(): ReadonlyMap<number, bigint> {
     return this.cursor.offsets
@@ -159,7 +179,7 @@ export class TypedRecords<T> {
   }
 
   async poll(options?: { readonly signal?: AbortSignal }): Promise<readonly TypedPollResult<T>[]> {
-    const batch = await this.cursor.poll(options)
+    const batch = await this.cursor.pollRecords(options)
     return batch.map((message) => decodeRecord(this.codec, message, this.compiled))
   }
 
@@ -167,7 +187,7 @@ export class TypedRecords<T> {
     readonly signal?: AbortSignal
     readonly pollIntervalMs?: number
   }): AsyncIterable<TypedPollResult<T>> {
-    for await (const message of this.cursor.stream(options)) {
+    for await (const message of this.cursor.streamRecords(options)) {
       yield decodeRecord(this.codec, message, this.compiled)
     }
   }

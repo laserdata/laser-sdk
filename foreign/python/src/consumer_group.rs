@@ -2,8 +2,9 @@ use crate::async_bridge::future_into_py;
 use crate::convert::{duration_seconds, payload_bytes, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::filters::{PyConsumerFilter, PyFilteredReader, filter_headers, filtered_start};
+use crate::stream::PyTopic;
 use crate::transport::{ConsumerConfig, PyConsumer, configure_consumer};
-use laser_sdk::filters::{GroupFilterSpec, ReadMode};
+use laser_sdk::filters::{FilteredStart, GroupFilterSpec, ReadMode};
 use laser_sdk::stream::{ConsumerGroup, ConsumerGroupInfo};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -17,6 +18,16 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 #[pyclass(name = "ConsumerGroup", frozen)]
 pub struct PyConsumerGroup {
     group: ConsumerGroup,
+    topic: PyTopic,
+}
+
+/// A consumer group as the server knows it, returned by `ConsumerGroup.create`
+/// and `ConsumerGroup.info`.
+#[gen_stub_pyclass]
+#[pyclass(name = "ConsumerGroupInfo", frozen, eq, skip_from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyConsumerGroupInfo {
+    info: ConsumerGroupInfo,
 }
 
 /// A consumer group's filter policy. Build it with `ConsumerGroup.filter`.
@@ -29,8 +40,8 @@ pub struct PyGroupFilter {
 }
 
 impl PyConsumerGroup {
-    pub(crate) const fn new(group: ConsumerGroup) -> Self {
-        Self { group }
+    pub(crate) const fn new(group: ConsumerGroup, topic: PyTopic) -> Self {
+        Self { group, topic }
     }
 }
 
@@ -49,14 +60,19 @@ impl PyConsumerGroup {
         self.group.id()
     }
 
+    /// The topic this group consumes.
+    #[getter]
+    fn topic(&self) -> PyTopic {
+        self.topic.clone()
+    }
+
     /// Create the group, with an optional filter policy configured in the
     /// same call: a `filter` definition saved as the group's own filter, or
     /// one of its own revisions as `filter_id` and `revision`. Idempotent: an
     /// existing group is kept and the same policy keeps its binding. A group
     /// that runs another policy raises `FilterError` with reason `conflict`.
     /// Pass `operation_id` to resume the same configuration after a crash.
-    /// Returns a dict with `id`, `name`, `identity`, and `filter` (the
-    /// binding, or `None` for an unbound group).
+    /// Returns the `ConsumerGroupInfo`.
     #[pyo3(signature = (*, filter=None, filter_id=None, revision=None, operation_id=None))]
     fn create<'py>(
         &self,
@@ -77,17 +93,16 @@ impl PyConsumerGroup {
                 create = create.operation_id(operation_id);
             }
             let info = create.build().await.map_err(to_pyerr)?;
-            Python::attach(|py| group_info(py, &info))
+            Ok(PyConsumerGroupInfo { info })
         })
     }
 
-    /// The group as the server knows it: `id`, `name`, `identity`, and
-    /// `filter` (the active binding, or `None`).
+    /// The group as the server knows it.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let group = self.group.clone();
         future_into_py(py, async move {
             let info = group.info().await.map_err(to_pyerr)?;
-            Python::attach(|py| group_info(py, &info))
+            Ok(PyConsumerGroupInfo { info })
         })
     }
 
@@ -152,8 +167,8 @@ impl PyConsumerGroup {
     /// Pages selected by the group's policy with original offsets, an independent
     /// scan budget, and explicit acknowledgments. An unbound group returns every
     /// record without evaluating its payload.
-    /// `start` is `next` (the default), `first`, or `last`, or use
-    /// `start_offset` / `start_timestamp_micros`.
+    /// `start` is `next` (the default), `first`, `last`, `{"offset": n}`, or
+    /// `{"timestamp": micros}`.
     /// `count` bounds records per page, default 100. `max_examined` bounds
     /// the source records one page examines, independent of `count`.
     /// `max_reply_bytes` bounds record bytes per page.
@@ -163,9 +178,7 @@ impl PyConsumerGroup {
     /// `idle_interval` is seconds, finite and non-negative.
     #[pyo3(signature = (
         *,
-        start="next",
-        start_offset=None,
-        start_timestamp_micros=None,
+        start=None,
         count=None,
         max_examined=None,
         max_reply_bytes=None,
@@ -179,9 +192,7 @@ impl PyConsumerGroup {
     fn reader<'py>(
         &self,
         py: Python<'py>,
-        start: &str,
-        start_offset: Option<u64>,
-        start_timestamp_micros: Option<u64>,
+        start: Option<&Bound<'_, PyAny>>,
         count: Option<u32>,
         max_examined: Option<u32>,
         max_reply_bytes: Option<u32>,
@@ -191,7 +202,10 @@ impl PyConsumerGroup {
         idle_interval: Option<f64>,
         partitions: Option<Vec<u32>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let start = filtered_start(start, start_offset, start_timestamp_micros)?;
+        let start = start
+            .map(filtered_start)
+            .transpose()?
+            .unwrap_or(FilteredStart::Next);
         let read_mode = match read_mode {
             "primary" => ReadMode::Primary,
             "local" => ReadMode::Local,
@@ -237,6 +251,47 @@ impl PyConsumerGroup {
 
     fn __repr__(&self) -> String {
         format!("ConsumerGroup({})", label(&self.group))
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyConsumerGroupInfo {
+    /// The native numeric group id.
+    #[getter]
+    const fn id(&self) -> u32 {
+        self.info.id
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.info.name.clone()
+    }
+
+    /// The exact group incarnation inside its stream and topic incarnations,
+    /// as a dict. A recreated group is another identity and inherits no
+    /// policy.
+    #[getter]
+    fn identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.info.identity)
+    }
+
+    /// The active policy binding as a dict, `None` for an unbound group whose
+    /// readers receive every record.
+    #[getter]
+    fn filter(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.info
+            .filter
+            .as_ref()
+            .map(|binding| ser_to_py(py, binding))
+            .transpose()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ConsumerGroupInfo(id={}, name={})",
+            self.info.id, self.info.name
+        )
     }
 }
 
@@ -443,19 +498,4 @@ fn group_policy(
             "pass either `filter`, or both `filter_id` and `revision`",
         )),
     }
-}
-
-fn group_info(py: Python<'_>, info: &ConsumerGroupInfo) -> PyResult<Py<PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item("id", info.id)?;
-    dict.set_item("name", &info.name)?;
-    dict.set_item("identity", ser_to_py(py, &info.identity)?)?;
-    dict.set_item(
-        "filter",
-        match &info.filter {
-            Some(binding) => ser_to_py(py, binding)?,
-            None => py.None(),
-        },
-    )?;
-    Ok(dict.into_any().unbind())
 }

@@ -1,18 +1,23 @@
 use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning};
-use crate::convert::{payload_bytes, py_to_de, py_to_typed_value, ser_to_py};
+use crate::convert::{json_to_py, payload_bytes, py_to_de, py_to_typed_value, ser_to_py};
 use crate::errors::{ConfigError, InvalidError, to_pyerr};
 use crate::transport::PyConsumerMessage;
+use laser_sdk::LaserError;
 use laser_sdk::filters::{
-    Coerce, ConsumerFilter, FaultPolicy, FilterExpr, FilterHeader, FilteredReader, FilteredStart,
-    HeaderScalar, MatchedPage, MatchedRecord, RecordPolicy, TextMatch, TimestampFormat,
+    Coerce, ConsumerFilter, ExecutionMode, FaultPolicy, FilterError, FilterErrorReason, FilterExpr,
+    FilterHeader, FilteredReader, FilteredStart, HeaderScalar, MatchedPage, MatchedRecord,
+    ReadMode, RecordPolicy, TextMatch, TimestampFormat,
 };
 use laser_sdk::query::CmpOp;
-use laser_sdk::wire::filter::FieldPath;
-use laser_sdk::wire::filter::eval::{CompiledFilter, DecodeLimits, FilterRecord, HeaderRef};
+use laser_sdk::wire::filter::eval::{
+    CompiledFilter, DecodeLimits, FilterRecord, HeaderNeed, HeaderRef,
+};
+use laser_sdk::wire::filter::{AppliedPolicy, FaultReason, FieldPath, PathSegment, TextPredicate};
+use laser_sdk::wire::schema::Digest32;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, OnceLock};
@@ -83,20 +88,36 @@ impl PyFilterExpr {
         })
     }
 
-    /// The payload path exists. An explicit `null` counts as present.
+    /// The payload path exists. An explicit `null` counts as present. An
+    /// invalid path raises `InvalidError`.
     #[staticmethod]
     fn present(path: &str) -> PyResult<Self> {
-        Ok(Self {
-            inner: FilterExpr::Present(field_path(path)?),
-        })
+        Self::try_present(path)
     }
 
-    /// The payload path does not exist.
+    /// The payload path exists, for an untrusted `path`. An invalid path
+    /// raises `InvalidError`.
+    #[staticmethod]
+    fn try_present(path: &str) -> PyResult<Self> {
+        FilterExpr::try_present(path)
+            .map(|inner| Self { inner })
+            .map_err(|error| InvalidError::new_err(error.to_string()))
+    }
+
+    /// The payload path does not exist. An invalid path raises
+    /// `InvalidError`.
     #[staticmethod]
     fn absent(path: &str) -> PyResult<Self> {
-        Ok(Self {
-            inner: FilterExpr::Absent(field_path(path)?),
-        })
+        Self::try_absent(path)
+    }
+
+    /// The payload path does not exist, for an untrusted `path`. An invalid
+    /// path raises `InvalidError`.
+    #[staticmethod]
+    fn try_absent(path: &str) -> PyResult<Self> {
+        FilterExpr::try_absent(path)
+            .map(|inner| Self { inner })
+            .map_err(|error| InvalidError::new_err(error.to_string()))
     }
 
     /// Compare one typed user header, keyed exactly.
@@ -111,35 +132,37 @@ impl PyFilterExpr {
     /// `contains`, `glob`, or `regex`. A value of another type is a type
     /// mismatch, which follows the filter's mismatch policy.
     #[staticmethod]
-    #[pyo3(signature = (field, kind, pattern, case_insensitive=false))]
-    fn text(field: String, kind: &str, pattern: String, case_insensitive: bool) -> PyResult<Self> {
-        let expr = FilterExpr::text(field, text_match(kind)?, pattern);
+    fn text(field: String, kind: &str, pattern: String) -> PyResult<Self> {
         Ok(Self {
-            inner: if case_insensitive {
-                expr.case_insensitive()
-            } else {
-                expr
-            },
+            inner: FilterExpr::text(field, text_match(kind)?, pattern),
         })
     }
 
     /// Match one text user header, keyed exactly, the way `text` matches a field.
     #[staticmethod]
-    #[pyo3(signature = (key, kind, pattern, case_insensitive=false))]
-    fn header_text(
-        key: String,
-        kind: &str,
-        pattern: String,
-        case_insensitive: bool,
-    ) -> PyResult<Self> {
-        let expr = FilterExpr::header_text(key, text_match(kind)?, pattern);
+    fn header_text(key: String, kind: &str, pattern: String) -> PyResult<Self> {
         Ok(Self {
-            inner: if case_insensitive {
-                expr.case_insensitive()
-            } else {
-                expr
-            },
+            inner: FilterExpr::header_text(key, text_match(kind)?, pattern),
         })
+    }
+
+    /// A copy whose text match ignores case. Any other node is returned as is.
+    fn case_insensitive(&self) -> Self {
+        Self {
+            inner: self.inner.clone().case_insensitive(),
+        }
+    }
+
+    /// Whether evaluating this node can require the decoded payload.
+    #[getter]
+    fn reads_payload(&self) -> bool {
+        self.inner.reads_payload()
+    }
+
+    /// Whether evaluating this node can require the record headers.
+    #[getter]
+    fn reads_headers(&self) -> bool {
+        self.inner.reads_headers()
     }
 
     /// Rebuild an expression from its wire dict.
@@ -160,6 +183,49 @@ impl PyFilterExpr {
     }
 }
 
+/// A validated location inside a decoded payload: object keys separated by
+/// `.` and array indexes as `[n]`, such as `after.ground_stations[0]`. Build
+/// it with `FieldPath.parse`.
+#[gen_stub_pyclass]
+#[pyclass(name = "FieldPath", frozen, eq, skip_from_py_object)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct PyFieldPath {
+    inner: FieldPath,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyFieldPath {
+    /// Parse the text form. An invalid path raises `InvalidError`.
+    #[staticmethod]
+    fn parse(text: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: field_path(text)?,
+        })
+    }
+
+    /// The path steps: a `str` object key or an `int` array index each.
+    #[getter]
+    fn segments(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.inner
+            .segments()
+            .iter()
+            .map(|segment| match segment {
+                PathSegment::Key(key) => Ok(key.into_pyobject(py)?.into_any().unbind()),
+                PathSegment::Index(index) => Ok(index.into_pyobject(py)?.into_any().unbind()),
+            })
+            .collect()
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FieldPath({})", self.inner)
+    }
+}
+
 /// One consumer filter: an expression, the payload codec, and the fault
 /// policy. Its `digest` identifies exactly these semantics.
 #[gen_stub_pyclass]
@@ -167,36 +233,11 @@ impl PyFilterExpr {
 #[derive(Clone)]
 pub struct PyConsumerFilter {
     pub(crate) inner: ConsumerFilter,
-    // Compiled on the first local evaluation and reused after it.
-    compiled: OnceLock<Arc<CompiledFilter>>,
 }
 
 impl From<ConsumerFilter> for PyConsumerFilter {
     fn from(inner: ConsumerFilter) -> Self {
-        Self {
-            inner,
-            compiled: OnceLock::new(),
-        }
-    }
-}
-
-impl PyConsumerFilter {
-    fn compiled(&self, schemas: Option<&Bound<'_, PyAny>>) -> PyResult<Arc<CompiledFilter>> {
-        if let Some(schemas) = schemas {
-            let schemas: Vec<laser_sdk::wire::control::SchemaDef> = py_to_de(schemas)?;
-            return Ok(Arc::new(
-                CompiledFilter::compile_with_schemas(&self.inner, &schemas)
-                    .map_err(|error| InvalidError::new_err(error.to_string()))?,
-            ));
-        }
-        if let Some(compiled) = self.compiled.get() {
-            return Ok(Arc::clone(compiled));
-        }
-        let compiled = Arc::new(
-            CompiledFilter::compile(&self.inner)
-                .map_err(|error| InvalidError::new_err(error.to_string()))?,
-        );
-        Ok(Arc::clone(self.compiled.get_or_init(|| compiled)))
+        Self { inner }
     }
 }
 
@@ -206,6 +247,25 @@ fn decode_limits(max_payload_bytes: Option<usize>, max_depth: Option<usize>) -> 
         max_payload_bytes: max_payload_bytes.unwrap_or(defaults.max_payload_bytes),
         max_depth: max_depth.unwrap_or(defaults.max_depth),
     }
+}
+
+// Run `evaluate` over one sample record with the interpreter released, since a
+// large payload can take a while to decode.
+fn on_record<T: Send>(
+    py: Python<'_>,
+    payload: &Bound<'_, PyAny>,
+    headers: Option<&Bound<'_, PyDict>>,
+    evaluate: impl FnOnce(&FilterRecord<'_>) -> T + Send,
+) -> PyResult<T> {
+    let payload = payload_bytes(payload)?;
+    let headers = filter_headers(headers)?;
+    let headers: Vec<HeaderRef<'_>> = headers.iter().map(HeaderRef::from).collect();
+    Ok(py.detach(|| {
+        evaluate(&FilterRecord {
+            payload: &payload,
+            headers: &headers,
+        })
+    }))
 }
 
 #[gen_stub_pymethods]
@@ -258,28 +318,32 @@ impl PyConsumerFilter {
     }
 
     /// A copy with the malformed-payload policy: stop, pass, or drop.
-    fn with_fault_policy(&self, policy: &str) -> PyResult<Self> {
-        Ok(self.inner.clone().with_fault_policy(fault(policy)?).into())
+    fn with_fault_policy(&self, fault_policy: &str) -> PyResult<Self> {
+        Ok(self
+            .inner
+            .clone()
+            .with_fault_policy(fault(fault_policy)?)
+            .into())
     }
 
     /// A copy whose records in another format (another `agdx.ct` codec, or a
     /// writer schema the filter does not list) are skipped (`reject`, the
     /// default) or delivered unevaluated (`pass`).
-    fn with_foreign_policy(&self, policy: &str) -> PyResult<Self> {
+    fn with_foreign_policy(&self, foreign_policy: &str) -> PyResult<Self> {
         Ok(self
             .inner
             .clone()
-            .with_foreign_policy(record_policy(policy)?)
+            .with_foreign_policy(record_policy(foreign_policy)?)
             .into())
     }
 
     /// A copy whose records with a value of a type a predicate cannot compare
     /// are skipped (`reject`, the default) or delivered unevaluated (`pass`).
-    fn with_mismatch_policy(&self, policy: &str) -> PyResult<Self> {
+    fn with_mismatch_policy(&self, mismatch_policy: &str) -> PyResult<Self> {
         Ok(self
             .inner
             .clone()
-            .with_mismatch_policy(record_policy(policy)?)
+            .with_mismatch_policy(record_policy(mismatch_policy)?)
             .into())
     }
 
@@ -294,69 +358,22 @@ impl PyConsumerFilter {
         ser_to_py(py, &self.inner)
     }
 
-    /// Evaluate the filter locally with the evaluator the server runs:
-    /// `selected`, `rejected`, or `fault`. `headers` carries typed user headers.
-    #[pyo3(signature = (payload, headers=None, *, schemas=None, max_payload_bytes=None, max_depth=None))]
-    fn evaluate(
-        &self,
-        py: Python<'_>,
-        payload: &Bound<'_, PyAny>,
-        headers: Option<&Bound<'_, PyDict>>,
-        schemas: Option<&Bound<'_, PyAny>>,
-        max_payload_bytes: Option<usize>,
-        max_depth: Option<usize>,
-    ) -> PyResult<String> {
-        let compiled = self.compiled(schemas)?;
-        let payload = payload_bytes(payload)?;
-        let headers = filter_headers(headers)?;
-        let headers: Vec<HeaderRef<'_>> = headers.iter().map(HeaderRef::from).collect();
-        let limits = decode_limits(max_payload_bytes, max_depth);
-        let verdict = py.detach(|| {
-            compiled.evaluate(
-                &FilterRecord {
-                    payload: &payload,
-                    headers: &headers,
-                },
-                &limits,
-            )
-        });
-        Ok(verdict.to_string())
-    }
-
-    /// Evaluate the filter locally and explain the verdict as the server
-    /// would: a dict with `verdict`, an optional `fault`, and the `root`
-    /// explanation tree with one node per predicate.
-    #[pyo3(signature = (payload, headers=None, *, schemas=None, max_payload_bytes=None, max_depth=None))]
-    fn explain(
-        &self,
-        py: Python<'_>,
-        payload: &Bound<'_, PyAny>,
-        headers: Option<&Bound<'_, PyDict>>,
-        schemas: Option<&Bound<'_, PyAny>>,
-        max_payload_bytes: Option<usize>,
-        max_depth: Option<usize>,
-    ) -> PyResult<Py<PyAny>> {
-        let compiled = self.compiled(schemas)?;
-        let payload = payload_bytes(payload)?;
-        let headers = filter_headers(headers)?;
-        let headers: Vec<HeaderRef<'_>> = headers.iter().map(HeaderRef::from).collect();
-        let limits = decode_limits(max_payload_bytes, max_depth);
-        let explanation = py.detach(|| {
-            compiled.explain(
-                &FilterRecord {
-                    payload: &payload,
-                    headers: &headers,
-                },
-                &limits,
-            )
-        });
-        ser_to_py(py, &explanation)
-    }
-
     /// The SHA-256 digest of the filter's semantics.
     #[getter]
     fn digest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, self.inner.digest().as_bytes())
+    }
+
+    /// The filter op version.
+    #[getter]
+    const fn v(&self) -> u32 {
+        self.inner.v
+    }
+
+    /// The evaluator version the filter was built for.
+    #[getter]
+    const fn evaluator_version(&self) -> u32 {
+        self.inner.evaluator_version
     }
 
     #[getter]
@@ -369,6 +386,25 @@ impl PyConsumerFilter {
         self.inner.fault_policy.to_string()
     }
 
+    /// `reject` or `pass` for records in another format.
+    #[getter]
+    fn foreign_policy(&self) -> String {
+        self.inner.foreign_policy.to_string()
+    }
+
+    /// `reject` or `pass` for records whose value type a predicate cannot
+    /// compare.
+    #[getter]
+    fn mismatch_policy(&self) -> String {
+        self.inner.mismatch_policy.to_string()
+    }
+
+    /// Immutable writer schema ids permitted for Avro or Protobuf payloads.
+    #[getter]
+    fn schema_refs(&self) -> Vec<u32> {
+        self.inner.schema_refs.clone()
+    }
+
     #[getter]
     fn expr(&self) -> PyFilterExpr {
         PyFilterExpr {
@@ -378,6 +414,156 @@ impl PyConsumerFilter {
 
     fn __eq__(&self, other: &Self) -> bool {
         self.inner == other.inner
+    }
+}
+
+/// A validated filter compiled once for repeated local evaluation with the
+/// evaluator the server runs. Build it with `CompiledFilter.compile`.
+#[gen_stub_pyclass]
+#[pyclass(name = "CompiledFilter", frozen)]
+pub struct PyCompiledFilter {
+    inner: Arc<CompiledFilter>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCompiledFilter {
+    /// Validate and compile `filter`. `schemas` lists the writer schema dicts
+    /// an Avro or Protobuf filter decodes with. An invalid filter raises
+    /// `InvalidError`.
+    #[staticmethod]
+    #[pyo3(signature = (filter, schemas=None))]
+    fn compile(filter: &PyConsumerFilter, schemas: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let compiled = match schemas {
+            Some(schemas) => {
+                let schemas: Vec<laser_sdk::wire::control::SchemaDef> = py_to_de(schemas)?;
+                CompiledFilter::compile_with_schemas(&filter.inner, &schemas)
+            }
+            None => CompiledFilter::compile(&filter.inner),
+        }
+        .map_err(|error| InvalidError::new_err(error.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(compiled),
+        })
+    }
+
+    /// The SHA-256 digest of the compiled filter's semantics.
+    #[getter]
+    fn digest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, self.inner.digest().as_bytes())
+    }
+
+    /// The filter this was compiled from.
+    #[getter]
+    fn filter(&self) -> PyConsumerFilter {
+        self.inner.filter().clone().into()
+    }
+
+    /// The malformed-payload policy: `stop`, `pass`, or `drop`.
+    #[getter]
+    fn fault_policy(&self) -> String {
+        self.inner.fault_policy().to_string()
+    }
+
+    /// The fault policy a record that faulted for `reason` follows. A record
+    /// in another format follows the foreign policy, a type mismatch the
+    /// mismatch policy, and a broken payload the fault policy.
+    fn policy_for(&self, reason: &str) -> PyResult<String> {
+        Ok(self.inner.policy_for(fault_reason(reason)?).to_string())
+    }
+
+    /// The record policy (`reject` or `pass`) that covers `reason`, or None
+    /// for a decode fault.
+    fn record_policy(&self, reason: &str) -> PyResult<Option<String>> {
+        Ok(self
+            .inner
+            .record_policy(fault_reason(reason)?)
+            .map(|policy| policy.to_string()))
+    }
+
+    /// Whether evaluation decodes the payload.
+    #[getter]
+    fn reads_payload(&self) -> bool {
+        self.inner.reads_payload()
+    }
+
+    /// Whether evaluation reads user headers.
+    #[getter]
+    fn reads_headers(&self) -> bool {
+        self.inner.reads_headers()
+    }
+
+    /// Which headers to decode before evaluating: `none`, `content_type`
+    /// (only `agdx.ct`), or `all`.
+    #[getter]
+    fn header_need(&self) -> &'static str {
+        match self.inner.header_need() {
+            HeaderNeed::None => "none",
+            HeaderNeed::ContentType => "content_type",
+            HeaderNeed::All => "all",
+        }
+    }
+
+    /// `selected`, `rejected`, or `fault` for one record. `headers` carries
+    /// typed user headers.
+    #[pyo3(signature = (payload, headers=None, *, max_payload_bytes=None, max_depth=None))]
+    fn evaluate(
+        &self,
+        py: Python<'_>,
+        payload: &Bound<'_, PyAny>,
+        headers: Option<&Bound<'_, PyDict>>,
+        max_payload_bytes: Option<usize>,
+        max_depth: Option<usize>,
+    ) -> PyResult<String> {
+        let limits = decode_limits(max_payload_bytes, max_depth);
+        let verdict = on_record(py, payload, headers, |record| {
+            self.inner.evaluate(record, &limits)
+        })?;
+        Ok(verdict.to_string())
+    }
+
+    /// The verdict plus the fault reason when the record could not be
+    /// evaluated, as `(verdict, reason)`.
+    #[pyo3(signature = (payload, headers=None, *, max_payload_bytes=None, max_depth=None))]
+    fn evaluate_with_fault(
+        &self,
+        py: Python<'_>,
+        payload: &Bound<'_, PyAny>,
+        headers: Option<&Bound<'_, PyDict>>,
+        max_payload_bytes: Option<usize>,
+        max_depth: Option<usize>,
+    ) -> PyResult<(String, Option<String>)> {
+        let limits = decode_limits(max_payload_bytes, max_depth);
+        let (verdict, fault) = on_record(py, payload, headers, |record| {
+            self.inner.evaluate_with_fault(record, &limits)
+        })?;
+        Ok((verdict.to_string(), fault.map(|reason| reason.to_string())))
+    }
+
+    /// Explain the verdict: a dict with `verdict`, an optional `fault`, and
+    /// the `root` explanation tree with one node per predicate.
+    #[pyo3(signature = (payload, headers=None, *, max_payload_bytes=None, max_depth=None))]
+    fn explain(
+        &self,
+        py: Python<'_>,
+        payload: &Bound<'_, PyAny>,
+        headers: Option<&Bound<'_, PyDict>>,
+        max_payload_bytes: Option<usize>,
+        max_depth: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let limits = decode_limits(max_payload_bytes, max_depth);
+        let explanation = on_record(py, payload, headers, |record| {
+            self.inner.explain(record, &limits)
+        })?;
+        ser_to_py(py, &explanation)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CompiledFilter(codec={}, fault_policy={})",
+            self.inner.filter().codec,
+            self.inner.fault_policy()
+        )
     }
 }
 
@@ -592,15 +778,16 @@ impl PyFilteredReader {
         })
     }
 
-    /// Whether `record` was read by this reader in its current membership, so
-    /// it can still be acknowledged. A rejoin retires every earlier page.
+    /// Whether `page` was read by this reader in its current membership, so
+    /// its records can still be acknowledged. A rejoin retires every earlier
+    /// page.
     fn owns<'py>(
         &self,
         py: Python<'py>,
-        record: PyRef<'_, PyMatchedRecord>,
+        page: PyRef<'_, PyMatchedPage>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
-        let page = Arc::clone(&record.page);
+        let page = Arc::clone(&page.page);
         future_into_py(py, async move {
             Ok(state.lock().await.open()?.owns(&page.page))
         })
@@ -903,6 +1090,12 @@ impl PyMatchedRecord {
         Ok(self.message(py)?.borrow(py).headers_malformed)
     }
 
+    /// Decode the record's payload as JSON.
+    fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value: serde_json::Value = self.record().json().map_err(to_pyerr)?;
+        json_to_py(py, &value)
+    }
+
     /// The record as a `ConsumerMessage`: payload, typed headers, id, and
     /// timestamps. Decoded once, then shared.
     #[getter]
@@ -922,29 +1115,140 @@ impl PyMatchedRecord {
     }
 }
 
-pub(crate) fn filtered_start(
-    start: &str,
-    offset: Option<u64>,
-    timestamp_micros: Option<u64>,
-) -> PyResult<FilteredStart> {
-    match (offset, timestamp_micros) {
-        (Some(offset), None) => return Ok(FilteredStart::Offset(offset)),
-        (None, Some(micros)) => return Ok(FilteredStart::Timestamp(micros)),
-        (Some(_), Some(_)) => {
-            return Err(InvalidError::new_err(
-                "pass at most one of `start_offset` and `start_timestamp_micros`",
-            ));
-        }
-        (None, None) => {}
+// `next`, `first`, `last`, or the serde form of another start, such as
+// `{"offset": 5}` or `{"timestamp": 1700000000000000}`.
+pub(crate) fn filtered_start(start: &Bound<'_, PyAny>) -> PyResult<FilteredStart> {
+    py_to_de(start)
+}
+
+/// Whether the execution `mode` (`filtered` or `unfiltered`) evaluates a filter.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn execution_mode_is_filtered(mode: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(py_to_de::<ExecutionMode>(mode)?.is_filtered())
+}
+
+/// Whether the fault `reason` means the record is in another format, which
+/// the foreign policy covers.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn fault_reason_is_foreign(reason: &str) -> PyResult<bool> {
+    Ok(fault_reason(reason)?.is_foreign())
+}
+
+/// Whether the read `mode` (`primary` or `local`) reads the partition primary.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn read_mode_is_primary(mode: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(py_to_de::<ReadMode>(mode)?.is_primary())
+}
+
+/// Whether the record `policy` (`reject` or `pass`) skips the record.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn record_policy_is_reject(policy: &str) -> PyResult<bool> {
+    Ok(record_policy(policy)?.is_reject())
+}
+
+/// The result code a filter error `reason` classifies as, such as
+/// `InvalidArgument`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn filter_error_reason_code(reason: &Bound<'_, PyAny>) -> PyResult<String> {
+    Ok(format!(
+        "{:?}",
+        py_to_de::<FilterErrorReason>(reason)?.code()
+    ))
+}
+
+// `FilterError.invalid`: the `FilterError` an `InvalidError` becomes, with
+// reason `invalid_request`, returned without raising it. The exception class
+// cannot carry Rust methods, so `errors::register` attaches it.
+#[pyfunction]
+pub(crate) fn filter_error_invalid(
+    py: Python<'_>,
+    error: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    if !error.is_instance_of::<InvalidError>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "error must be an InvalidError",
+        ));
     }
-    match start {
-        "next" => Ok(FilteredStart::Next),
-        "first" => Ok(FilteredStart::First),
-        "last" => Ok(FilteredStart::Last),
-        other => Err(InvalidError::new_err(format!(
-            "start must be `next`, `first`, or `last`, got `{other}`"
-        ))),
-    }
+    let message = error.str()?.to_string();
+    let filter = FilterError::invalid(laser_sdk::wire::error::InvalidError::new(message));
+    Ok(to_pyerr(LaserError::Filter(filter))
+        .into_value(py)
+        .into_any())
+}
+
+// `FilterError.check_version`: raise `FilterError` with reason
+// `version_skew` when `v` is not the filter op version this build speaks.
+#[pyfunction]
+pub(crate) fn filter_error_check_version(v: u32) -> PyResult<()> {
+    FilterError::check_version(v).map_err(|error| to_pyerr(LaserError::Filter(error)))
+}
+
+/// Epoch microseconds of an integer timestamp in `format` (`epoch_seconds`,
+/// `epoch_millis`, or `epoch_micros`), or None when it is out of range or the
+/// format reads text.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn timestamp_format_micros_from_integer(
+    format: &Bound<'_, PyAny>,
+    value: i128,
+) -> PyResult<Option<i64>> {
+    Ok(py_to_de::<TimestampFormat>(format)?.micros_from_integer(value))
+}
+
+/// Epoch microseconds of a text timestamp in `format`, or None when the text
+/// does not parse.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn timestamp_format_micros_from_text(
+    format: &Bound<'_, PyAny>,
+    text: &str,
+) -> PyResult<Option<i64>> {
+    Ok(py_to_de::<TimestampFormat>(format)?.micros_from_text(text))
+}
+
+/// Validate a text predicate dict (`field`, `kind`, `pattern`, and an
+/// optional `case_insensitive`) by compiling its pattern. An invalid one
+/// raises `InvalidError`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn text_predicate_validate(predicate: &Bound<'_, PyAny>) -> PyResult<()> {
+    py_to_de::<TextPredicate>(predicate)?
+        .validate()
+        .map_err(|error| InvalidError::new_err(error.to_string()))
+}
+
+/// The applied-policy dict of an independent consumer or a bound group that
+/// ran the filter with the 32-byte `digest`.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn applied_policy_filtered(
+    py: Python<'_>,
+    group_id: Option<u64>,
+    digest: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let digest = <[u8; Digest32::BYTES]>::try_from(payload_bytes(digest)?.as_slice())
+        .map_err(|_| InvalidError::new_err("digest must be 32 bytes"))?;
+    ser_to_py(
+        py,
+        &AppliedPolicy::filtered(group_id, Digest32::new(digest)),
+    )
+}
+
+/// The applied-policy dict of a group without a binding, which reads every
+/// record.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub(crate) fn applied_policy_unfiltered(
+    py: Python<'_>,
+    group_id: u64,
+    policy_generation: u64,
+) -> PyResult<Py<PyAny>> {
+    ser_to_py(py, &AppliedPolicy::unfiltered(group_id, policy_generation))
 }
 
 fn cmp_op(op: &str) -> PyResult<CmpOp> {
@@ -983,6 +1287,14 @@ fn record_policy(policy: &str) -> PyResult<RecordPolicy> {
     policy.parse().map_err(|_| {
         InvalidError::new_err(format!(
             "a record policy must be `reject` or `pass`, got `{policy}`"
+        ))
+    })
+}
+
+fn fault_reason(reason: &str) -> PyResult<FaultReason> {
+    serde_json::from_value(serde_json::Value::String(reason.to_owned())).map_err(|_| {
+        InvalidError::new_err(format!(
+            "reason must be `missing_schema`, `schema_not_allowed`, `schema_mismatch`, `malformed`, `too_large`, `too_deep`, `foreign_codec`, or `type_mismatch`, got `{reason}`"
         ))
     })
 }

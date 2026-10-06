@@ -78,15 +78,15 @@ async def test_given_a_custom_snapshot_when_state_resumes_then_should_skip_inclu
     await laser.bootstrap(1)
     conversation = ls.new_conversation_id()
     context = laser.context(conversation)
-    await context.append(ls.Topics.COMMANDS, b"1")
-    checkpoint = await context.checkpoint([ls.Topics.COMMANDS])
+    await context.append(ls.AgentTopic.Commands, b"1")
+    checkpoint = await context.checkpoint([ls.AgentTopic.Commands])
     as_of = {
         partition: offset - 1
-        for partition, offset in checkpoint.topic_offsets(ls.Topics.COMMANDS).items()
+        for partition, offset in checkpoint.topic_offsets(ls.AgentTopic.Commands).items()
         if offset > 0
     }
     assert as_of
-    await context.append(ls.Topics.COMMANDS, b"2")
+    await context.append(ls.AgentTopic.Commands, b"2")
     seen = []
 
     class Backend:
@@ -99,7 +99,7 @@ async def test_given_a_custom_snapshot_when_state_resumes_then_should_skip_inclu
             pass
 
     total = await context.state_with(
-        Backend(), [ls.Topics.COMMANDS], 0, lambda state, message: state + int(message.payload)
+        Backend(), [ls.AgentTopic.Commands], 0, lambda state, message: state + int(message.payload)
     )
     assert total == 12
     assert seen == [conversation]

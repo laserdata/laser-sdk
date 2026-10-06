@@ -1,11 +1,5 @@
 import { readFile } from "node:fs/promises"
-import {
-  ConsumerFilter,
-  FilterExpr,
-  CompiledSchema,
-  cborCodec,
-  type Laser
-} from "@laserdata/laser-sdk"
+import { ConsumerFilter, FilterExpr, CompiledSchema, Cbor, type Laser } from "@laserdata/laser-sdk"
 import type { SchemaSource } from "@laserdata/laser-sdk/full"
 import { phase } from "../common.js"
 
@@ -59,7 +53,7 @@ export async function runCodecs(laser: Laser, stream: string): Promise<void> {
         }
         compiled = CompiledSchema.compile({ id, source })
       }
-      const cbor = cborCodec(reading)
+      const cbor = new Cbor(reading)
       const topicName = `fleet_${codec}`
       const topic = laser.topic(topicName)
       await topic.ensure(1)
@@ -68,11 +62,11 @@ export async function runCodecs(laser: Laser, stream: string): Promise<void> {
         { satellite: "sat-042", mode: "safe", battery: 20 },
         { satellite: "sat-042", mode: "nominal", battery: 60 }
       ]
+      // A registered schema encodes the Avro or Protobuf body and stamps its id.
+      const typed = id === undefined ? undefined : await topic.schema(id, reading)
       for (const value of feed) {
-        const payload = compiled === undefined ? cbor.encode(value) : compiled.encode(value)
-        const publish = topic.publish().rawBytes(payload, codec)
-        if (id !== undefined) publish.schemaId(id)
-        await publish.send()
+        if (typed === undefined) await topic.publish().rawBytes(cbor.encode(value), codec).send()
+        else await typed.publish(value)
       }
       const expr = FilterExpr.pred("mode", "eq", "safe")
       const schemaRefs = id === undefined ? [] : [id]
@@ -89,8 +83,8 @@ export async function runCodecs(laser: Laser, stream: string): Promise<void> {
         const record = await reader.nextRecord({ timeoutMs: 15_000 })
         const selected =
           compiled === undefined
-            ? cbor.decode(record.payload)
-            : reading(compiled.decode(record.payload))
+            ? cbor.decode(record.message.payload)
+            : reading(compiled.decode(record.message.payload))
         console.log(
           `  ${codec}: ${selected.satellite} entered ${selected.mode} mode at ${String(selected.battery)}% battery, 1 of 3 records delivered`
         )

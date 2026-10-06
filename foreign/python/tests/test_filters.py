@@ -71,7 +71,7 @@ async def publish(laser, payloads):
 
 async def bound_group(laser, name, definition=None):
     """Create `name` with a filter as its policy. A group filter needs the catalog."""
-    if not (await laser.capabilities()).filters_catalog:
+    if not (await laser.capabilities()).filters.catalog:
         pytest.skip("a consumer group filter needs a managed plane")
     await laser.topic(TOPIC).ensure(1)
     group = laser.topic(TOPIC).consumer_group(name)
@@ -109,15 +109,15 @@ async def test_given_no_plane_when_probed_then_should_serve_group_reads_without_
     laser,
 ):
     capabilities = await laser.capabilities()
-    if capabilities.filters_catalog:
+    if capabilities.filters.catalog:
         pytest.skip("a plane serves the filter catalog on this stack")
 
-    assert capabilities.filters is True
-    assert capabilities.filters_group_policy_reads is True
+    assert capabilities.filters.native is True
+    assert capabilities.filters.group_policy_reads is True
 
 
 async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refuse(laser):
-    if (await laser.capabilities()).filters_catalog:
+    if (await laser.capabilities()).filters.catalog:
         pytest.skip("a plane serves the filter catalog on this stack")
     await laser.topic(TOPIC).ensure(1)
     group = laser.topic(TOPIC).consumer_group("anomaly-desk")
@@ -129,12 +129,13 @@ async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_shoul
         await group.filter().configure(safe_mode_filter())
 
     plain = await group.create()
-    assert plain["name"] == "anomaly-desk"
-    assert plain["filter"] is None
-    assert plain["identity"]["group_id"] == plain["id"]
-    by_id = laser.topic(TOPIC).consumer_group_id(plain["id"])
-    assert (by_id.name, by_id.id) == (None, plain["id"])
-    assert (await by_id.info())["name"] == "anomaly-desk"
+    assert plain.name == "anomaly-desk"
+    assert group.topic.name == TOPIC
+    assert plain.filter is None
+    assert plain.identity["group_id"] == plain.id
+    by_id = laser.topic(TOPIC).consumer_group_id(plain.id)
+    assert (by_id.name, by_id.id) == (None, plain.id)
+    assert (await by_id.info()).name == "anomaly-desk"
 
 
 async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_record(laser):
@@ -145,7 +146,7 @@ async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_re
         delivered = []
         for _ in range(3):
             message = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
-            delivered.append(message.offset)
+            delivered.append(message.position.offset)
             await consumer.commit(message)
         assert delivered == [0, 1, 2], "a group without a filter receives everything"
         assert await consumer.last_consumed_offset(0) == 2
@@ -154,7 +155,7 @@ async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_re
             await consumer.store_offset(1, partition=0)
     finally:
         await consumer.shutdown()
-    assert (await group.info())["filter"] is None
+    assert (await group.info()).filter is None
 
 
 async def test_given_an_unbound_group_id_when_read_then_should_preserve_arbitrary_payloads(laser):
@@ -163,11 +164,11 @@ async def test_given_an_unbound_group_id_when_read_then_should_preserve_arbitrar
     payloads = [b"\xff\x00\x80", b"second"]
     await topic.producer(partition=0, partitions=1).send_batch(payloads)
     info = await topic.consumer_group("numeric-plain-desk").create()
-    by_id = topic.consumer_group_id(info["id"])
+    by_id = topic.consumer_group_id(info.id)
     consumer = by_id.consumer(batch_length=1, polling="first", auto_commit="disabled")
     try:
         first = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
-        assert first.offset == 0
+        assert first.position.offset == 0
         assert first.payload == payloads[0]
         await consumer.commit(first)
     finally:
@@ -175,7 +176,7 @@ async def test_given_an_unbound_group_id_when_read_then_should_preserve_arbitrar
     resumed = by_id.consumer(batch_length=1, auto_commit="disabled")
     try:
         second = await asyncio.wait_for(resumed.next(), READ_TIMEOUT)
-        assert second.offset == 1
+        assert second.position.offset == 1
         assert second.payload == payloads[1]
     finally:
         await resumed.shutdown()
@@ -205,7 +206,7 @@ async def test_given_a_normal_group_read_when_cancelled_before_start_then_should
         with pytest.raises(asyncio.CancelledError):
             await pending
         record = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
-        assert record.offset == 0
+        assert record.position.offset == 0
         await consumer.commit(record)
     finally:
         await consumer.shutdown()
@@ -244,7 +245,7 @@ async def test_given_a_normal_group_read_when_cancelled_at_delivery_then_should_
             for callback, args in callbacks:
                 callback(*args)
         record = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
-        assert record.offset == 0, "the unreceived message was returned to the consumer"
+        assert record.position.offset == 0, "the unreceived message was returned to the consumer"
         await consumer.commit(record)
     finally:
         await consumer.shutdown()
@@ -281,7 +282,7 @@ async def test_given_a_cancelled_normal_group_delivery_when_shutdown_then_should
     resumed = group.consumer(batch_length=1, auto_commit="disabled")
     try:
         record = await asyncio.wait_for(resumed.next(), READ_TIMEOUT)
-        assert record.offset == 0, "shutdown must preserve the undelivered message"
+        assert record.position.offset == 0, "shutdown must preserve the undelivered message"
     finally:
         await resumed.shutdown()
 
@@ -294,7 +295,7 @@ async def test_given_a_group_with_a_filter_when_consumed_then_should_deliver_onl
         delivered = []
         for _ in range(2):
             message = await asyncio.wait_for(consumer.next(), READ_TIMEOUT)
-            delivered.append(message.offset)
+            delivered.append(message.position.offset)
             await consumer.commit(message)
         assert delivered == [0, 2], "the server ran the group's filter"
     finally:
@@ -325,7 +326,7 @@ async def test_given_a_group_filter_when_deleted_then_should_release_the_group_a
 async def test_given_group_9_and_groups_90_to_97_when_deleted_then_should_find_the_exact_filter(
     laser,
 ):
-    if not (await laser.capabilities()).filters_catalog:
+    if not (await laser.capabilities()).filters.catalog:
         pytest.skip("a consumer group filter needs a managed plane")
     topic = laser.topic(TOPIC)
     await topic.ensure(1)
@@ -335,13 +336,13 @@ async def test_given_group_9_and_groups_90_to_97_when_deleted_then_should_find_t
     for index in range(98):
         candidate = topic.consumer_group(f"delete-worker-{index}")
         info = await candidate.create()
-        if info["id"] == 9:
+        if info.id == 9:
             group = candidate
             before = await group.filter().configure(safe_mode_filter())
-        elif 90 <= info["id"] <= 97:
+        elif 90 <= info.id <= 97:
             binding = await candidate.filter().configure(safe_mode_filter())
             collisions.append((candidate, binding))
-        if info["id"] == 97:
+        if info.id == 97:
             break
     assert group is not None
     assert before is not None
@@ -369,7 +370,19 @@ async def test_given_edge_records_when_read_inline_then_should_return_matches_at
     assert offsets(page) == [0, 2, 3]
     assert page.records[1].message.payload == DECOMMISSION.encode()
     assert page.policy["digest"] == safe_mode_filter().digest
+    assert page.records[1].json() == json.loads(DECOMMISSION)
+    assert await filtered.owns(page) is True
     await filtered.ack_page(page)
+    await filtered.close()
+
+
+async def test_given_an_offset_start_when_reading_then_should_skip_earlier_matches(laser):
+    await publish(laser, [SAFE_MODE, SAFE_MODE_VALUES, DECOMMISSION, TELEMETRY])
+    filtered = await reader(laser, "safe-mode-from-offset", start={"offset": 2})
+
+    page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
+
+    assert offsets(page) == [2, 3]
     await filtered.close()
 
 
@@ -683,11 +696,11 @@ def test_given_shared_codec_cases_when_evaluated_locally_then_should_match_rust_
                 ("uint64", value["value"]) if value["kind"] == "uint" else value["value"]
             )
         filter = ls.ConsumerFilter.from_dict(case["filter"])
+        compiled = ls.CompiledFilter.compile(filter, corpus["schemas"])
         assert (
-            filter.evaluate(
+            compiled.evaluate(
                 bytes.fromhex(case["payload_hex"]),
                 headers,
-                schemas=corpus["schemas"],
                 max_payload_bytes=case["max_payload_bytes"],
                 max_depth=case["max_depth"],
             )
@@ -699,7 +712,7 @@ def test_given_shared_codec_cases_when_evaluated_locally_then_should_match_rust_
 async def test_given_a_binary_group_filter_when_configured_then_should_preview_guard_pause_and_ack(
     laser, codec
 ):
-    if not (await laser.capabilities()).filters_catalog:
+    if not (await laser.capabilities()).filters.catalog:
         pytest.skip("requires a managed plane")
     corpus = json.loads(
         (Path(__file__).resolve().parents[3] / "wire/fixtures/filter_codec_cases.json").read_text()
@@ -717,10 +730,10 @@ async def test_given_a_binary_group_filter_when_configured_then_should_preview_g
                 for schema in corpus["schemas"]
                 if schema["id"] == definition["schema_refs"][0]
             )
-            schema_id = await laser.register_schema(source)
+            schema_id = await laser.schemas().register(source)
 
             async def visible():
-                while await laser.get_schema(schema_id) is None:
+                while await laser.schemas().get(schema_id) is None:
                     await asyncio.sleep(0.05)
 
             await asyncio.wait_for(visible(), READ_TIMEOUT)
@@ -730,13 +743,13 @@ async def test_given_a_binary_group_filter_when_configured_then_should_preview_g
         filter = ls.ConsumerFilter.from_dict(definition)
         await laser.topic(TOPIC).producer(partition=0, partitions=1).send(payload, headers=headers)
         created = await group.create(filter=filter)
-        binding = created["filter"]
+        binding = created.filter
         assert binding["revision"] == 1
         sample = await group.filter().test(payload, headers=headers)
         assert sample["explanation"]["verdict"] == "selected"
         preview = await group.filter().preview(0)
         assert preview["matched"] == 1
-        by_id = laser.topic(TOPIC).consumer_group_id(created["id"])
+        by_id = laser.topic(TOPIC).consumer_group_id(created.id)
         filtered = await by_id.reader(start="first", local_guard=True)
         record = await asyncio.wait_for(filtered.next_record(), READ_TIMEOUT)
         assert record.message.payload == payload
@@ -753,7 +766,7 @@ async def test_given_a_binary_group_filter_when_configured_then_should_preview_g
         if binding is not None:
             await group.filter().release()
         if schema_id is not None:
-            await laser.drop_schema(schema_id)
+            await laser.schemas().drop(schema_id)
 
 
 async def test_given_pass_faults_when_guarded_then_should_verify_server_bounds(laser):

@@ -1,4 +1,5 @@
 use crate::agent::Laser;
+use crate::bridge_hops::hops_metadata;
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
@@ -10,46 +11,22 @@ use axum::extract::State;
 use axum::routing::post;
 use laser_wire::agent::{
     self as agdx, AgentEnvelope, AgentId, CapabilityDescriptor, ContentRef, CorrelationId,
-    OPERATION_CHAT,
+    METADATA_BRIDGE_HOPS, OPERATION_CHAT,
 };
 use laser_wire::content::ContentType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-#[cfg(feature = "a2a-http")]
 use serde_json::to_value;
-#[cfg(feature = "a2a-http")]
 use std::str::FromStr;
 #[cfg(feature = "a2a-http")]
 use std::sync::Arc;
-#[cfg(feature = "a2a-http")]
 use strum::{Display, EnumString};
 
+pub use crate::bridge_hops::enter_bridge;
 pub use laser_wire::agent::TaskState;
 
-/// Append this bridge to the ordered loop-guard path.
-///
-/// A bridge must reject a message when its own id is already present. The
-/// returned list is ready to store under `bridge_hops` metadata.
-pub fn enter_bridge(bridge: &str, previous: &[String]) -> Result<Vec<String>, LaserError> {
-    if bridge.is_empty() {
-        return Err(LaserError::Invalid(
-            "bridge id must not be empty".to_owned(),
-        ));
-    }
-    if previous.iter().any(|hop| hop == bridge) {
-        return Err(LaserError::Invalid(format!(
-            "bridge loop detected at `{bridge}`"
-        )));
-    }
-    let mut hops = previous.to_vec();
-    hops.push(bridge.to_owned());
-    Ok(hops)
-}
-
-#[cfg(feature = "a2a-http")]
 const JSONRPC_VERSION: &str = "2.0";
 // JSON-RPC reserved range ends at -32000, and -32000..=-32099 is for application errors.
-#[cfg(feature = "a2a-http")]
 const APP_ERROR_CODE: i32 = -32000;
 
 /// The A2A JSON-RPC methods the bridge serves. `Display`/`FromStr` (strum) carry
@@ -58,7 +35,6 @@ const APP_ERROR_CODE: i32 = -32000;
 /// bridge is stateless over the log, and an unknown method already answers with
 /// the bridge's application error code (`APP_ERROR_CODE`, -32000), not JSON-RPC's
 /// reserved -32601 method-not-found.
-#[cfg(feature = "a2a-http")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
 pub enum A2aMethod {
     #[strum(serialize = "SendMessage")]
@@ -223,6 +199,7 @@ pub struct Task {
 /// A JSON-RPC request envelope.
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
+    #[serde(default)]
     pub id: JsonValue,
     pub method: String,
     #[serde(default)]
@@ -296,6 +273,9 @@ pub struct A2aBridge {
     request_topic: AgentTopic<'static>,
     reply_topic: AgentTopic<'static>,
     capabilities: Vec<CapabilityDescriptor>,
+    // The `bridge_hops` path stamped on every record the bridge publishes,
+    // ending in its own id.
+    hops: Vec<String>,
     /// When set, control records the bridge emits (the cancel) are signed, so a
     /// verifying consumer can authorize them against the enrolled key. Closes the
     /// unauthenticated-cancel hole. Requires the `sign` feature.
@@ -316,15 +296,27 @@ impl A2aBridge {
         request_topic: AgentTopic<'static>,
         reply_topic: AgentTopic<'static>,
     ) -> Self {
+        let hops = vec![source.as_str().to_owned()];
         Self {
             laser,
             source,
             request_topic,
             reply_topic,
             capabilities: Vec::new(),
+            hops,
             #[cfg(feature = "sign")]
             signing_key: None,
         }
+    }
+
+    /// Continue the loop-guard path of work that already crossed other
+    /// bridges: `previous` is its `bridge_hops`, and this bridge's id is
+    /// appended to it. Every record the bridge publishes carries the path.
+    /// Refuses a path that already holds this bridge, the loop the guard
+    /// exists to stop.
+    pub fn with_bridge_hops(mut self, previous: &[String]) -> Result<Self, LaserError> {
+        self.hops = enter_bridge(self.source.as_str(), previous)?;
+        Ok(self)
     }
 
     /// Sign the control records the bridge emits (the cancel) with `key`, so a
@@ -359,6 +351,7 @@ impl A2aBridge {
             .agdx(self.request_topic.clone(), self.source.clone(), task.into())
             .command(correlation_of(task), params_json)
             .with_operation(OPERATION_CHAT)
+            .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(&self.hops))
             .content_type(ContentType::Json)
             .send()
             .await?;
@@ -417,7 +410,8 @@ impl A2aBridge {
         );
         let send = producer
             .fail(correlation_of(conversation), &error)?
-            .with_task_state(TaskState::Canceled);
+            .with_task_state(TaskState::Canceled)
+            .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(&self.hops));
         // Sign the cancel when a key is configured, so a verifying consumer can
         // authorize it. Without a key it rides unsigned, and a topic that
         // mandates verification rejects it.
@@ -491,6 +485,73 @@ impl A2aBridge {
         Ok(card)
     }
 
+    pub async fn handle_rpc(&self, request: JsonValue) -> JsonRpcResponse {
+        let id = request.get("id").cloned().unwrap_or(JsonValue::Null);
+        match self.dispatch_rpc(&request).await {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => {
+                tracing::warn!(error = %error, "A2A request failed");
+                JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION,
+                    id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: APP_ERROR_CODE,
+                        message: crate::error::public_error_message(&error).to_owned(),
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn dispatch_rpc(&self, request: &JsonValue) -> Result<JsonValue, LaserError> {
+        // Serde also reads a struct from an array, so the object check comes first.
+        if !request.is_object() {
+            return Err(LaserError::HandlerConfig(
+                "A2A JSON-RPC request must be an object".to_owned(),
+            ));
+        }
+        let JsonRpcRequest { method, params, .. } = JsonRpcRequest::deserialize(request)
+            .map_err(|_| LaserError::HandlerConfig("A2A method must be a string".to_owned()))?;
+        let params = if params.is_null() {
+            JsonValue::Object(Default::default())
+        } else {
+            params
+        };
+        let task = match A2aMethod::from_str(&method) {
+            Ok(A2aMethod::MessageSend | A2aMethod::MessageStream) => {
+                let body = serde_json::to_vec(&params)
+                    .map_err(|error| LaserError::Codec(error.to_string()))?;
+                self.submit(body).await?
+            }
+            Ok(operation @ (A2aMethod::TasksGet | A2aMethod::TasksCancel)) => {
+                let id = params
+                    .as_object()
+                    .and_then(|params| params.get("id"))
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        LaserError::HandlerConfig("A2A task id must be a string".to_owned())
+                    })?;
+                if operation == A2aMethod::TasksGet {
+                    self.task(id).await?
+                } else {
+                    self.cancel(id).await?
+                }
+            }
+            Err(_) => {
+                return Err(LaserError::HandlerConfig(format!(
+                    "unknown A2A method `{method}`"
+                )));
+            }
+        };
+        to_value(task).map_err(|error| LaserError::Codec(error.to_string()))
+    }
+
     /// An axum router: the JSON-RPC endpoint at `/` plus the Agent Card at the
     /// A2A well-known discovery path. Requires the `a2a-http` feature. The bridge
     /// adapter (`submit` / `task` / `cancel` / `card`) is usable without it.
@@ -521,79 +582,9 @@ fn correlation_of(conversation: ConversationId) -> CorrelationId {
 #[cfg(feature = "a2a-http")]
 async fn handle_rpc(
     State(bridge): State<Arc<A2aBridge>>,
-    axum::Json(request): axum::Json<JsonRpcRequest>,
+    axum::Json(request): axum::Json<JsonValue>,
 ) -> axum::Json<JsonRpcResponse> {
-    let outcome = match A2aMethod::from_str(&request.method) {
-        // `message/send` and `message/stream` both publish the task. The stream
-        // is consumed log-natively over Iggy (`Laser::reassemble_channel`), not
-        // re-emitted as SSE, so they map to the same publish here.
-        Ok(A2aMethod::MessageSend | A2aMethod::MessageStream) => {
-            match serde_json::to_vec(&request.params) {
-                // The whole params object tunnels byte-identical in the AGDX body.
-                Ok(params_json) => bridge.submit(params_json).await,
-                Err(error) => Err(LaserError::Codec(format!(
-                    "message params are not serializable: {error}"
-                ))),
-            }
-        }
-        Ok(A2aMethod::TasksGet) => {
-            let id = request
-                .params
-                .get("id")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default();
-            bridge.task(id).await
-        }
-        Ok(A2aMethod::TasksCancel) => {
-            let id = request
-                .params
-                .get("id")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default();
-            bridge.cancel(id).await
-        }
-        Err(_) => Err(LaserError::HandlerConfig(format!(
-            "unknown A2A method `{}`",
-            request.method
-        ))),
-    };
-    let response = match outcome {
-        Ok(task) => match to_value(task) {
-            Ok(value) => JsonRpcResponse {
-                jsonrpc: JSONRPC_VERSION,
-                id: request.id,
-                result: Some(value),
-                error: None,
-            },
-            Err(error) => {
-                tracing::warn!(error = %error, "A2A reply serialization failed");
-                JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION,
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: APP_ERROR_CODE,
-                        message: "internal error".to_owned(),
-                    }),
-                }
-            }
-        },
-        Err(error) => {
-            // The detail stays local: `Display` names streams, topics, and
-            // transport state that an unauthenticated caller must not see.
-            tracing::warn!(error = %error, method = %request.method, "A2A request failed");
-            JsonRpcResponse {
-                jsonrpc: JSONRPC_VERSION,
-                id: request.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: APP_ERROR_CODE,
-                    message: crate::error::public_error_message(&error).to_owned(),
-                }),
-            }
-        }
-    };
-    axum::Json(response)
+    axum::Json(bridge.handle_rpc(request).await)
 }
 
 #[cfg(test)]
@@ -677,6 +668,57 @@ mod tests {
             task_from_envelope("t-1", &failure).status.state,
             TaskState::Failed
         );
+    }
+
+    fn bridge() -> A2aBridge {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        A2aBridge::new(
+            laser,
+            "a2a-edge".parse().expect("valid agent id"),
+            AgentTopic::Commands,
+            AgentTopic::Responses,
+        )
+    }
+
+    #[tokio::test]
+    async fn given_malformed_rpc_requests_when_dispatched_then_should_echo_ids_and_return_public_errors()
+     {
+        for request in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!([7, "GetTask", {"id": "invalid"}]),
+            serde_json::json!({"id": 7}),
+            serde_json::json!({"id": 7, "method": "unknown"}),
+            serde_json::json!({"id": 7, "method": "GetTask", "params": {"id": 12}}),
+            serde_json::json!({"id": 7, "method": "CancelTask", "params": []}),
+            serde_json::json!({"id": 7, "method": "GetTask", "params": {"id": "invalid"}}),
+        ] {
+            let expected = request.get("id").cloned().unwrap_or(JsonValue::Null);
+            let response = bridge().handle_rpc(request).await;
+            assert_eq!(response.id, expected);
+            assert_eq!(response.jsonrpc, "2.0");
+            assert!(response.result.is_none());
+            let error = response.error.expect("malformed request returns an error");
+            assert_eq!(error.code, -32000);
+            assert_eq!(error.message, "invalid request");
+        }
+    }
+
+    #[test]
+    fn given_a_new_bridge_when_built_then_should_stamp_its_own_id_as_the_hop_path() {
+        assert_eq!(bridge().hops, ["a2a-edge"]);
+    }
+
+    #[test]
+    fn given_an_upstream_hop_path_when_continued_then_should_append_this_bridge() {
+        let bridge = bridge()
+            .with_bridge_hops(&["mcp-edge".to_owned()])
+            .expect("no loop");
+        assert_eq!(bridge.hops, ["mcp-edge", "a2a-edge"]);
+        assert!(matches!(
+            bridge.with_bridge_hops(&["a2a-edge".to_owned()]),
+            Err(LaserError::Invalid(_))
+        ));
     }
 
     #[test]

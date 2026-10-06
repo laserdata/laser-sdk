@@ -156,7 +156,7 @@ async fn given_a_step_up_governor_when_a_request_runs_then_should_surface_the_sc
         )
         .await
         .expect_err("the request pauses on a step-up");
-    assert!(matches!(&error, LaserError::StepUpRequired(scope) if scope == "storage:rotate"));
+    assert!(matches!(&error, LaserError::StepUpRequired { scope } if scope == "storage:rotate"));
 
     let evidence = eventually(|| async {
         let all = audit_evidence(&laser).await;

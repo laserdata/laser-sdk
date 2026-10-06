@@ -16,8 +16,11 @@ import {
   encodeGraphReplyFrame,
   encodeGraphUpsertFrame,
   EdgeId,
+  edgeDirIsOut,
   graphEdgeRelate,
+  graphEdgeValid,
   graphEdgeValidAt,
+  graphReturnIsNodes,
   graphNodeEntity,
   NodeId,
   validateGraphName
@@ -67,12 +70,30 @@ void test("given_an_edge_validity_window_when_checked_then_should_hold_only_insi
   assert.equal(graphEdgeValidAt(open, 0n) && graphEdgeValidAt(open, (1n << 64n) - 1n), true)
 })
 
+void test("given_an_edge_when_given_a_validity_window_then_should_keep_its_identity", () => {
+  const edge = graphEdgeRelate(graphNodeEntity("User", "a"), "in", graphNodeEntity("Pool", "b"))
+  const windowed = graphEdgeValid(edge, 100n, 200n)
+  assert.equal(windowed.id.equals(edge.id), true)
+  assert.equal(windowed.validFrom, 100n)
+  assert.equal(windowed.validTo, 200n)
+  const reopened = graphEdgeValid(windowed, undefined, 300n)
+  assert.equal("validFrom" in reopened, false)
+  assert.equal(reopened.validTo, 300n)
+})
+
+void test("given_graph_defaults_when_checked_then_should_recognize_only_the_omitted_values", () => {
+  assert.equal(edgeDirIsOut("out"), true)
+  assert.equal(edgeDirIsOut("both"), false)
+  assert.equal(graphReturnIsNodes("nodes"), true)
+  assert.equal(graphReturnIsNodes("paths"), false)
+})
+
 void test("given_the_graph_node_fixture_when_decoded_then_should_re_encode_byte_identically", async () => {
   const bytes = await readFixture("graph_node.bin")
   const map = expectMap(decodeOne(bytes, "graph_node"), "graph_node")
   const node = decodeGraphNode(map, "graph_node")
   assert.deepEqual(node.labels, ["Doc"])
-  assert.deepEqual(node.attrs, [["value", { kind: "string", value: "spec" }]])
+  assert.deepEqual(node.attrs, [["value", { kind: "str", value: "spec" }]])
   assert.deepEqual(node.embedding, [0.10000000149011612, 0.20000000298023224, 0.30000001192092896])
   const reencoded = encodeGraphNodeFrame(node)
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))

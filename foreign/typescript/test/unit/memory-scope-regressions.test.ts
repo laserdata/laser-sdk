@@ -14,7 +14,7 @@ import {
   type Embedder
 } from "../../src/memory/types.js"
 import { VectorMemory } from "../../src/memory/vector-memory.js"
-import { ConversationId } from "../../src/types/ids.js"
+import { AgentId, ConversationId } from "../../src/types/ids.js"
 import type { KvEntry, KvPage } from "../../src/wire/kv.js"
 
 function entry(id: bigint, conversation: ConversationId, user: string, app: string): KvEntry {
@@ -76,7 +76,7 @@ void test("given_paged_user_and_application_memory_when_recalled_without_convers
       ]
     }
   ])
-  const items = await handle.recall({ user: "reader", application: "diagnostics" }, { limit: 2 })
+  const items = await handle.recall({ user: "reader", app: "diagnostics" }, { limit: 2 })
   assert.deepEqual(
     items.map((item) => item.id.asU128()),
     [5n, 4n]
@@ -112,12 +112,12 @@ void test("given_a_repeating_scan_cursor_when_memory_is_recalled_then_should_ref
 })
 
 void test("given_builtin_vector_memory_when_consolidated_then_should_append_summary_kind_in_a_durable_scope", async () => {
-  const store = new VectorMemory()
-  const handle = new MemoryHandle(store)
+  const store = new VectorMemory({ embed: () => Promise.resolve([1]) })
+  const handle = MemoryHandle.create(store)
   const conversation = ConversationId.derive("summary")
   await handle
     .remember(new TextEncoder().encode("turn"))
-    .conversation(conversation)
+    .scope(conversation)
     .kind(MemoryKind.Message)
     .send()
   await handle.consolidate({ conversation }, 10, {
@@ -202,4 +202,74 @@ void test("given_hybrid_signals_when_recalled_then_should_report_additive_scores
     items[1]?.signals.find((signal) => signal.strategy === RecallStrategy.Semantic)?.rank,
     0
   )
+})
+
+void test("given_turns_in_two_conversations_when_consolidated_then_should_store_one_summary_each", async () => {
+  const first = ConversationId.derive("first")
+  const second = ConversationId.derive("second")
+  const agent = AgentId.new("planner")
+  const turn = (id: bigint, conversation: ConversationId, body: string) => ({
+    id: MemoryId.fromU128(id),
+    payload: new TextEncoder().encode(body),
+    kind: MemoryKind.Message,
+    provenance: { conversationId: conversation },
+    signals: []
+  })
+  const writes: { scope: MemoryScope; kind: MemoryKind; body: string }[] = []
+  const summarized: string[][] = []
+  const handle = MemoryHandle.custom({
+    remember: () => Promise.reject(new Error("typed append was bypassed")),
+    append: (scope, id, kind, payload) => {
+      writes.push({ scope, kind, body: new TextDecoder().decode(payload) })
+      return Promise.resolve(id)
+    },
+    recall: () =>
+      Promise.resolve([
+        turn(4n, first, "f2"),
+        turn(3n, second, "s1"),
+        turn(2n, first, "f1"),
+        { ...turn(1n, second, "fact"), kind: MemoryKind.Fact }
+      ]),
+    forget: () => Promise.resolve(),
+    improve: () => Promise.resolve(MemoryId.new())
+  })
+  const report = await handle.consolidate({ agent }, 10, {
+    summarizer: {
+      summarize: (bodies) => {
+        const texts = bodies.map((body) => new TextDecoder().decode(body))
+        summarized.push(texts)
+        return Promise.resolve(new TextEncoder().encode(texts.join("+")))
+      }
+    }
+  })
+  assert.equal(report.summarized, 3)
+  assert.deepEqual(summarized, [["f2", "f1"], ["s1"]])
+  assert.deepEqual(
+    writes.map(({ scope, kind, body }) => [
+      scope.conversation?.toString(),
+      scope.agent?.asStr(),
+      scope.lifetime,
+      kind,
+      body
+    ]),
+    [
+      [first.toString(), "planner", Lifetime.Durable, MemoryKind.Summary, "f2+f1"],
+      [second.toString(), "planner", Lifetime.Durable, MemoryKind.Summary, "s1"]
+    ]
+  )
+
+  const store = new VectorMemory({ embed: () => Promise.resolve([1]) })
+  const vector = MemoryHandle.create(store)
+  await vector.remember(new TextEncoder().encode("a")).scope(first).kind(MemoryKind.Message).send()
+  await vector.remember(new TextEncoder().encode("b")).scope(second).kind(MemoryKind.Message).send()
+  await vector.consolidate({}, 10, {
+    summarizer: { summarize: () => Promise.resolve(new TextEncoder().encode("summary")) }
+  })
+  for (const conversation of [first, second]) {
+    const summaries = (await store.recall({ conversation }, {})).filter(
+      (item) => item.kind === MemoryKind.Summary
+    )
+    assert.equal(summaries.length, 1)
+    assert.equal(summaries[0]?.provenance.conversationId.toString(), conversation.toString())
+  }
 })

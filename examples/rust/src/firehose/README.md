@@ -47,7 +47,7 @@ cargo run --release --example firehose
 
 ## Where to look (LaserData Cloud)
 
-- Query: one index per org (`org_00`, `org_01`, ...), each materialized from its own projection, queried for rows per index, count by severity, slowest requests, and the grand total.
+- Query: one index per org, named after its topic plus the run token (`org_00_<token>`), each materialized from its own projection, queried for rows per index, count by severity, slowest requests, and the grand total.
 
 ## Highlights
 

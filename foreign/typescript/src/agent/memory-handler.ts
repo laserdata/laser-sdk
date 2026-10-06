@@ -1,6 +1,6 @@
 import type { MemoryHandle } from "../memory/handle.js"
 import type { MemoryKind } from "../memory/types.js"
-import type { AgentContext } from "./context.js"
+import type { AgentCtx } from "./context.js"
 import type { AgentHandler, AgentMessage } from "./reliable-consumer.js"
 
 /**
@@ -28,12 +28,12 @@ export class MemoryHandler implements AgentHandler {
     return this
   }
 
-  async handle(message: AgentMessage, context: AgentContext): Promise<void> {
+  async handle(message: AgentMessage, context: AgentCtx): Promise<void> {
     await this.handler.handle(message, context)
     if (this.rememberKind === undefined) return
     const remember = this.memory
       .remember(message.payload.slice())
-      .conversation(message.provenance.conversationId)
+      .scope(message.provenance.conversationId)
       .kind(this.rememberKind)
     if (message.provenance.agent !== undefined) remember.agent(message.provenance.agent)
     try {

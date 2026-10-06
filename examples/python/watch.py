@@ -40,7 +40,9 @@ async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
         caps = await laser.capabilities()
-        if not _common.managed_gate(caps.query and caps.watch, "the change feed", EXAMPLE):
+        if not _common.managed_gate(
+            caps.query.available and caps.watch, "the change feed", EXAMPLE
+        ):
             return
 
         _common.phase("watch a view, then publish something that advances it")

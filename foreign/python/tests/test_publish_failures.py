@@ -102,10 +102,16 @@ async def test_given_a_stalled_connection_when_a_producer_sends_then_should_hono
         if initialized:
             await producer.init()
         forwarding.clear()
-        with pytest.raises(ls.TimeoutError) as failure:
+        with pytest.raises(ls.LaserError) as failure:
             await asyncio.wait_for(producer.send(b"pending"), 2)
-        assert failure.value.committed == []
-        assert failure.value.unconfirmed_count == (1 if initialized else None)
+        if initialized:
+            assert isinstance(failure.value, ls.PublishFailedError)
+            assert isinstance(failure.value.__cause__, ls.TimeoutError)
+            assert failure.value.committed == []
+            assert [message.payload for message in failure.value.unconfirmed] == [b"pending"]
+            assert failure.value.retryable
+        else:
+            assert type(failure.value) is ls.TimeoutError
     finally:
         forwarding.set()
         await laser.close()
@@ -125,9 +131,11 @@ async def test_given_a_confirmed_chunk_when_the_next_times_out_then_should_prese
         producer = laser.topic("pulse").producer(batch_length=1, partition=0)
         await producer.init()
         pause_after_reply[0] = 1
-        with pytest.raises(ls.TimeoutError) as failure:
+        with pytest.raises(ls.PublishFailedError) as failure:
             await asyncio.wait_for(producer.send_batch([b"first", b"second", b"third"]), 2)
-        assert failure.value.unconfirmed_count == 2
+        assert isinstance(failure.value.__cause__, ls.TimeoutError)
+        assert [message.payload for message in failure.value.unconfirmed] == [b"second", b"third"]
+        assert len({message.message_id for message in failure.value.unconfirmed}) == 2
         assert len(failure.value.committed) == 1
         assert failure.value.committed[0].base_offset == 0
     finally:
@@ -177,8 +185,9 @@ async def test_given_a_stopped_server_when_a_producer_sends_then_should_time_out
         await producer.send(b"warm")
         await asyncio.to_thread(server.stop)
         started = time.monotonic()
-        with pytest.raises(ls.TimeoutError):
+        with pytest.raises(ls.PublishFailedError) as failure:
             await asyncio.wait_for(producer.send(b"lost"), 60)
+        assert isinstance(failure.value.__cause__, ls.TimeoutError)
         assert time.monotonic() - started < 30, "the publish budget should bound the failed send"
     finally:
         if laser is not None:
@@ -193,10 +202,12 @@ async def test_given_a_deleted_stream_when_a_producer_sends_then_should_name_cau
     producer = laser.topic("pulse").producer(retries=1, retry_interval_ms=100)
     await producer.send(b"first")
     await laser.stream(stream).delete()
-    with pytest.raises(ls.TransportError) as failure:
+    with pytest.raises(ls.PublishFailedError) as failure:
         await producer.send_batch([b"a", b"b", b"c"])
     assert str(failure.value).startswith(f"publish failed to {stream}/pulse: ")
-    assert failure.value.unconfirmed_count == 3
+    assert (failure.value.stream, failure.value.topic) == (stream, "pulse")
+    assert isinstance(failure.value.__cause__, ls.TransportError)
+    assert [message.payload for message in failure.value.unconfirmed] == [b"a", b"b", b"c"]
     assert failure.value.committed == []
     assert failure.value.not_found
     assert failure.value.code == "NotFound"

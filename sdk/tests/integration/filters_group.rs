@@ -9,11 +9,9 @@ use crate::harness;
 use crate::test_iggy::TestIggy;
 use laser_sdk::capabilities::{Capabilities, HelloOutcome};
 use laser_sdk::filters::{
-    CatalogPosition, ConsumerFilter, ExecutionMode, FaultReason, FilterBinding, FilterBindingPage,
-    FilterError, FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef,
-    FilterMutation, FilterMutationOutcome, FilterMutationResult, FilterMutationStatus,
-    FilterRevisionInfo, FilterRevisionPage, FilterRevisionRef, FilterState, FilteredStart,
-    GroupFilterSpec, GroupPolicyUnbound,
+    ConsumerFilter, ExecutionMode, FaultReason, FilterBinding, FilterError, FilterErrorReason,
+    FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterRevisionInfo, FilterRevisionPage,
+    FilterRevisionRef, FilterState, FilteredStart, GroupFilterSpec,
 };
 use laser_sdk::iggy::prelude::{
     Consumer, ConsumerGroupClient, ConsumerOffsetClient, HeaderKey, HeaderValue, Identifier,
@@ -29,6 +27,10 @@ use laser_sdk::wire::codes::{
     FORK_OP_VERSION, KV_OP_VERSION, QUERY_OP_VERSION,
 };
 use laser_sdk::wire::filter::FilterMutationRequest;
+use laser_sdk::wire::filter::{
+    CatalogPosition, FilterBindingPage, FilterMutation, FilterMutationOutcome,
+    FilterMutationResult, FilterMutationStatus, GroupPolicyUnbound,
+};
 use laser_sdk::wire::filter::{
     FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterPage, FilterPolicyRef,
     FilterSummary, GetFilterBinding, ListFilterBindings, ListFilterRevisions, ListFilters,

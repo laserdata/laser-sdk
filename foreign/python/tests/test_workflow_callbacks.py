@@ -27,16 +27,17 @@ async def test_given_async_workflow_callbacks_when_run_then_should_await_build_a
 
     agent = laser.spawn_agent(
         "workflow-worker",
-        ls.Topics.COMMANDS,
+        ls.AgentTopic.Commands,
         handle,
-        respond_on=ls.Topics.RESPONSES,
+        respond_on=ls.AgentTopic.Responses,
         poll_interval_ms=10,
     )
     try:
         await agent.ready()
-        workflow = laser.workflow("async-workflow", fixed_inbox=ls.Topics.COMMANDS)
+        workflow = laser.workflow("async-workflow", fixed_inbox=ls.AgentTopic.Commands)
         workflow.step("first", to="workflow-worker", build=Builder(), verify=Check())
-        assert await workflow.run() == {"first": b"task:reply"}
+        outcome = await workflow.run()
+        assert outcome.outputs == {"first": b"task:reply"}
         assert seen == [b"task"]
     finally:
         await agent.shutdown()
@@ -61,14 +62,14 @@ async def test_given_async_compensation_when_a_later_build_fails_then_should_awa
 
     agent = laser.spawn_agent(
         "rollback-worker",
-        ls.Topics.COMMANDS,
+        ls.AgentTopic.Commands,
         handle,
-        respond_on=ls.Topics.RESPONSES,
+        respond_on=ls.AgentTopic.Responses,
         poll_interval_ms=10,
     )
     try:
         await agent.ready()
-        workflow = laser.workflow("rollback-workflow", fixed_inbox=ls.Topics.COMMANDS)
+        workflow = laser.workflow("rollback-workflow", fixed_inbox=ls.AgentTopic.Commands)
         workflow.step(
             "first", to="rollback-worker", build=lambda outputs: b"do", compensate=compensate
         )
@@ -94,14 +95,14 @@ async def test_given_async_verifier_error_when_a_step_replies_then_should_keep_t
 
     agent = laser.spawn_agent(
         "verified-worker",
-        ls.Topics.COMMANDS,
+        ls.AgentTopic.Commands,
         handle,
-        respond_on=ls.Topics.RESPONSES,
+        respond_on=ls.AgentTopic.Responses,
         poll_interval_ms=10,
     )
     try:
         await agent.ready()
-        workflow = laser.workflow("verified-workflow", fixed_inbox=ls.Topics.COMMANDS)
+        workflow = laser.workflow("verified-workflow", fixed_inbox=ls.AgentTopic.Commands)
         workflow.step("first", to="verified-worker", build=lambda outputs: b"task", verify=verify)
         with pytest.raises(ls.ProtocolError, match="verification refused"):
             await workflow.run()

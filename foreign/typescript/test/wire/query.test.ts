@@ -1,18 +1,26 @@
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
+import path from "node:path"
 import test from "node:test"
 import { decodeOne, expectMap } from "../../src/wire/cbor.js"
 import { QUERY_OP_VERSION } from "../../src/wire/codes.js"
 import { BackendResourceId, QueryExecutionId } from "../../src/wire/ids.js"
 import {
   consistencyGateCheck,
+  consistencyIsEventual,
   decodeQueryEnvelope,
   decodeQueryEnvelopeFrame,
   encodeQueryEnvelopeFrame,
   newQuery,
+  operationalQuery,
   operationalTarget,
   pageAtLeast,
   pageTotalPages,
+  queryResultFieldIndex,
   queryResultValue,
+  queryResultValueI64,
+  queryResultValueText,
+  queryResultValueU64,
   validateQuery,
   validateQueryExecutionStatus,
   validateQueryResult,
@@ -76,6 +84,13 @@ void test("typed result rows are positional and preserve non-string values", () 
     kind: "long",
     value: 42n
   })
+  assert.equal(queryResultFieldIndex(result, "payload"), 1)
+  assert.equal(queryResultFieldIndex(result, "absent"), undefined)
+  assert.equal(queryResultValueText(result, row, "cpu"), "42")
+  assert.equal(queryResultValueText(result, row, "payload"), "0x0102")
+  assert.equal(queryResultValueU64(result, row, "cpu"), 42n)
+  assert.equal(queryResultValueI64(result, row, "cpu"), 42n)
+  assert.equal(queryResultValueI64(result, row, "payload"), undefined)
   validateQueryResult(result)
 })
 
@@ -142,4 +157,56 @@ void test("consistency and page helpers do not fabricate stronger reads or total
   })
   assert.equal(pageAtLeast({ offset: 40n, limit: 20, hasMore: false }, 20), 60n)
   assert.equal(pageTotalPages({ offset: 0n, limit: 3, total: 10n, hasMore: false }), 4n)
+  assert.equal(pageAtLeast({ limit: 20, hasMore: false }, 20), undefined)
+  assert.equal(pageAtLeast({ offset: (1n << 64n) - 1n, limit: 20, hasMore: false }, 1), undefined)
+  assert.ok(consistencyIsEventual("eventual"))
+  assert.equal(consistencyIsEventual("strong"), false)
+})
+
+void test("given_an_operational_query_when_built_then_should_target_the_index", () => {
+  const executionId = QueryExecutionId.fromU128(9n)
+  assert.deepEqual(
+    operationalQuery(executionId, "readings", 5n),
+    newQuery(operationalTarget("readings"), executionId, 5n)
+  )
+})
+
+// Rust decodes an integer field only from a CBOR integer and a float field only
+// from a CBOR float, so a re-encoded Rust frame must keep every byte.
+void test("given_rust_query_envelope_fixtures_when_re_encoded_then_should_be_byte_identical", async () => {
+  const fixtures = path.resolve(process.cwd(), "../../wire/fixtures")
+  for (const name of [
+    "query_envelope.bin",
+    "query_envelope_aggregate.bin",
+    "query_envelope_raw_sql.bin",
+    "query_envelope_read_your_writes.bin",
+    "query_envelope_text.bin"
+  ]) {
+    const bytes = new Uint8Array(await readFile(path.join(fixtures, name)))
+    const reencoded = encodeQueryEnvelopeFrame(decodeQueryEnvelopeFrame(bytes))
+    assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes), name)
+  }
+})
+
+void test("given_a_query_with_integral_floats_when_encoded_then_should_keep_integers_and_floats_apart", () => {
+  const query = {
+    ...newQuery(operationalTarget("readings"), QueryExecutionId.fromU128(1n), 10_000n),
+    byKey: [{ field: "cpu", value: { kind: "double" as const, value: 2 } }],
+    vector: { field: "vec", embedding: [1, 0.5], topK: 3 }
+  }
+  const bytes = Buffer.from(encodeQueryEnvelopeFrame({ v: QUERY_OP_VERSION, query }))
+  const after = (key: string): number => {
+    const encoded = Buffer.concat([Buffer.from([0x60 + key.length]), Buffer.from(key)])
+    const at = bytes.indexOf(encoded)
+    assert.ok(at >= 0, key)
+    return bytes[at + encoded.length] ?? -1
+  }
+  // map(2), "v", unsigned 1
+  assert.deepEqual([...bytes.subarray(0, 4)], [0xa2, 0x61, 0x76, 0x01])
+  assert.equal(after("top_k"), 0x03)
+  assert.equal(after("limit"), 0x18)
+  assert.equal(after("embedding"), 0x82)
+  assert.equal(bytes[bytes.indexOf(Buffer.from("embedding")) + 10], 0xf9)
+  const double = bytes.indexOf(Buffer.from("double"))
+  assert.equal(bytes[bytes.indexOf(Buffer.from("value"), double) + 5], 0xf9)
 })

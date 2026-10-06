@@ -6,6 +6,7 @@ import "protobufjs/ext/descriptor.js"
 import { CodecError, InvalidError } from "./client/errors.js"
 import { toNodeBuffer } from "./iggy/apache-iggy.js"
 import type { Codec } from "./stream/codecs.js"
+import { ContentType } from "./wire/content.js"
 import type { SchemaDef } from "./wire/control.js"
 
 export type CompiledSchemaKind = "avro" | "protobuf" | "jsonSchema"
@@ -36,6 +37,65 @@ function lowerDecodedValue(value: unknown): unknown {
     )
   }
   return value
+}
+
+function prepareAvroValue(type: AvroType, value: unknown): unknown {
+  switch (type.typeName) {
+    case "bytes":
+    case "fixed":
+      if (value instanceof Uint8Array) return toNodeBuffer(value)
+      if (
+        Array.isArray(value) &&
+        value.every(
+          (byte: unknown) =>
+            typeof byte === "number" && Number.isInteger(byte) && byte >= 0 && byte <= 255
+        )
+      ) {
+        return toNodeBuffer(Uint8Array.from(value as number[]))
+      }
+      return value
+    case "record":
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return value
+      return Object.fromEntries(
+        (type as avro.types.RecordType).fields.map((field) => [
+          field.name,
+          prepareAvroValue(field.type, (value as Record<string, unknown>)[field.name])
+        ])
+      )
+    case "array":
+      return Array.isArray(value)
+        ? value.map((item: unknown) =>
+            prepareAvroValue((type as avro.types.ArrayType).itemsType, item)
+          )
+        : value
+    case "map":
+      return typeof value === "object" && value !== null && !Array.isArray(value)
+        ? Object.fromEntries(
+            Object.entries(value).map(([key, item]) => [
+              key,
+              prepareAvroValue((type as avro.types.MapType).valuesType as AvroType, item)
+            ])
+          )
+        : value
+    case "union:unwrapped":
+      for (const branch of (type as avro.types.UnwrappedUnionType).types) {
+        const candidate = prepareAvroValue(branch, value)
+        if (branch.isValid(candidate)) return candidate
+      }
+      return value
+    case "union:wrapped":
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return value
+      return Object.fromEntries(
+        Object.entries(value).map(([key, item]) => {
+          const branch = (type as avro.types.WrappedUnionType).types.find(
+            (branch) => branch.branchName === key
+          )
+          return [key, branch === undefined ? item : prepareAvroValue(branch, item)]
+        })
+      )
+    default:
+      return value
+  }
 }
 
 export class CompiledSchema {
@@ -160,14 +220,36 @@ export class CompiledSchema {
     }
   }
 
-  encode(value: unknown): Uint8Array {
+  /**
+   * Encode `body` as a raw Avro datum, exactly the bytes a producer stamps
+   * alongside `agdx.sid`. Avro schemas only, any other kind throws
+   * `InvalidError`.
+   */
+  encodeAvro(body: unknown): Uint8Array {
+    if (this.definition.kind !== "avro") {
+      throw new InvalidError("encodeAvro requires an Avro schema")
+    }
+    return encodeAvroDatum(this.definition.schema, body)
+  }
+
+  /** @internal */
+  codec<T>(decodeValue: (value: unknown) => T): Codec<T> {
+    return {
+      contentType:
+        this.definition.kind === "avro"
+          ? ContentType.Avro
+          : this.definition.kind === "protobuf"
+            ? ContentType.Protobuf
+            : ContentType.Json,
+      encode: (value) => this.encodeBody(value),
+      decode: (payload) => decodeValue(this.decode(payload))
+    }
+  }
+
+  private encodeBody(value: unknown): Uint8Array {
     switch (this.definition.kind) {
       case "avro":
-        try {
-          return Uint8Array.from(this.definition.schema.toBuffer(value))
-        } catch (cause) {
-          throw codecError("body does not match the Avro schema", "encode", cause)
-        }
+        return encodeAvroDatum(this.definition.schema, value)
       case "protobuf": {
         const validation = this.definition.message.verify(value as Record<string, unknown>)
         if (validation !== null) {
@@ -192,11 +274,12 @@ export class CompiledSchema {
         }
     }
   }
+}
 
-  codec<T>(decodeValue: (value: unknown) => T): Codec<T> {
-    return {
-      encode: (value) => this.encode(value),
-      decode: (payload) => decodeValue(this.decode(payload))
-    }
+function encodeAvroDatum(schema: AvroType, value: unknown): Uint8Array {
+  try {
+    return Uint8Array.from(schema.toBuffer(prepareAvroValue(schema, value)))
+  } catch (cause) {
+    throw codecError("body does not match the Avro schema", "encode", cause)
   }
 }

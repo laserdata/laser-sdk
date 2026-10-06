@@ -8,16 +8,11 @@ export interface BlobStore {
   get(reference: string): Promise<Uint8Array>
 }
 
-export interface CheckedBody {
-  readonly payload: Uint8Array
-  readonly contentType?: typeof ContentType.Ref
-}
-
 export async function checkIn(
   store: BlobStore,
   thresholdBytes: number,
   payload: Uint8Array
-): Promise<CheckedBody> {
+): Promise<{ readonly payload: Uint8Array; readonly contentType?: typeof ContentType.Ref }> {
   if (payload.byteLength < thresholdBytes) return { payload: payload.slice() }
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", payload))
   const reference = await store.put(payload.slice())

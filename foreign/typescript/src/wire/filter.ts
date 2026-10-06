@@ -137,6 +137,15 @@ export class FieldPath {
     return new FieldPath(segments)
   }
 
+  static tryParse(text: string): FieldPath | undefined {
+    try {
+      return FieldPath.parse(text)
+    } catch (error) {
+      if (error instanceof InvalidError) return undefined
+      throw error
+    }
+  }
+
   toString(): string {
     return this.segments
       .map((segment, position) => {
@@ -259,6 +268,10 @@ export type FaultPolicy = "stop" | "pass" | "drop"
  */
 export type RecordPolicy = "reject" | "pass"
 
+export function recordPolicyIsReject(policy: RecordPolicy): boolean {
+  return policy === "reject"
+}
+
 /** How a text predicate matches, from cheapest to most expensive. */
 export type TextMatch = "equals" | "prefix" | "suffix" | "contains" | "glob" | "regex"
 
@@ -272,30 +285,6 @@ export interface TextPredicate {
   readonly pattern: string
   readonly caseInsensitive?: boolean
 }
-
-/**
- * A declarative predicate over one record. Comparison truth is three-valued: a
- * missing field or a type mismatch is unknown, and an unknown root selects
- * nothing.
- */
-export type FilterExpr =
-  | { readonly kind: "all"; readonly children: readonly FilterExpr[] }
-  | { readonly kind: "any"; readonly children: readonly FilterExpr[] }
-  | { readonly kind: "not"; readonly child: FilterExpr }
-  | { readonly kind: "pred"; readonly predicate: Predicate }
-  | { readonly kind: "pred_as"; readonly predicate: CoercedPredicate }
-  | { readonly kind: "present"; readonly path: FieldPath }
-  | { readonly kind: "absent"; readonly path: FieldPath }
-  | { readonly kind: "header"; readonly predicate: HeaderPredicate }
-  | { readonly kind: "text"; readonly predicate: TextPredicate }
-  | { readonly kind: "header_text"; readonly predicate: TextPredicate }
-
-/**
- * A literal in the builders. An integral `number` or a `bigint` is a `long`, a
- * fractional `number` a `double`. Pass a {@link TypedValue} for another kind.
- */
-export type FilterLiteral =
-  string | number | bigint | boolean | null | TypedValue | readonly FilterLiteral[]
 
 /** Builders for the `FilterExpr` type. */
 export const FilterExpr = {
@@ -323,6 +312,16 @@ export const FilterExpr = {
   absent(path: string): FilterExpr {
     return { kind: "absent", path: FieldPath.parse(path) }
   },
+  /** Presence of a payload path, `undefined` for an invalid path. */
+  tryPresent(path: string): FilterExpr | undefined {
+    const parsed = FieldPath.tryParse(path)
+    return parsed === undefined ? undefined : { kind: "present", path: parsed }
+  },
+  /** Absence of a payload path, `undefined` for an invalid path. */
+  tryAbsent(path: string): FilterExpr | undefined {
+    const parsed = FieldPath.tryParse(path)
+    return parsed === undefined ? undefined : { kind: "absent", path: parsed }
+  },
   header(key: string, op: CmpOp, value: FilterLiteral): FilterExpr {
     return { kind: "header", predicate: { key, op, value: typedLiteral(value) } }
   },
@@ -333,6 +332,30 @@ export const FilterExpr = {
     return { kind: "header_text", predicate: textPredicate(key, kind, pattern, caseInsensitive) }
   }
 } as const
+
+/**
+ * A declarative predicate over one record. Comparison truth is three-valued: a
+ * missing field or a type mismatch is unknown, and an unknown root selects
+ * nothing.
+ */
+export type FilterExpr =
+  | { readonly kind: "all"; readonly children: readonly FilterExpr[] }
+  | { readonly kind: "any"; readonly children: readonly FilterExpr[] }
+  | { readonly kind: "not"; readonly child: FilterExpr }
+  | { readonly kind: "pred"; readonly predicate: Predicate }
+  | { readonly kind: "pred_as"; readonly predicate: CoercedPredicate }
+  | { readonly kind: "present"; readonly path: FieldPath }
+  | { readonly kind: "absent"; readonly path: FieldPath }
+  | { readonly kind: "header"; readonly predicate: HeaderPredicate }
+  | { readonly kind: "text"; readonly predicate: TextPredicate }
+  | { readonly kind: "header_text"; readonly predicate: TextPredicate }
+
+/**
+ * A literal in the builders. An integral `number` or a `bigint` is a `long`, a
+ * fractional `number` a `double`. Pass a {@link TypedValue} for another kind.
+ */
+export type FilterLiteral =
+  string | number | bigint | boolean | null | TypedValue | readonly FilterLiteral[]
 
 function textPredicate(
   fieldName: string,
@@ -403,6 +426,13 @@ export const ConsumerFilter = {
   /** The same filter under another policy for a field of an unexpected type. */
   withMismatchPolicy(filter: ConsumerFilter, mismatchPolicy: RecordPolicy): ConsumerFilter {
     return { ...filter, mismatchPolicy }
+  },
+  /**
+   * SHA-256 over a domain tag and the canonical JSON encoding of the filter.
+   * Two filters get the same digest exactly when their encodings are equal.
+   */
+  digest(filter: ConsumerFilter): Uint8Array {
+    return consumerFilterDigest(filter)
   }
 } as const
 
@@ -431,6 +461,12 @@ function typedLiteral(value: FilterLiteral): TypedValue {
     return { kind: "list", value: (value as readonly FilterLiteral[]).map(typedLiteral) }
   }
   return value as TypedValue
+}
+
+/** Makes a text match case-insensitive. Any other node is returned as is. */
+export function filterExprCaseInsensitive(expr: FilterExpr): FilterExpr {
+  if (expr.kind !== "text" && expr.kind !== "header_text") return expr
+  return { kind: expr.kind, predicate: { ...expr.predicate, caseInsensitive: true } }
 }
 
 export function filterExprReadsPayload(expr: FilterExpr): boolean {
@@ -593,11 +629,11 @@ function validateNode(expr: FilterExpr, depth: number, nodes: { count: number })
       return
     case "text":
       FieldPath.parse(expr.predicate.field)
-      validateTextPredicate(expr.predicate)
+      textPredicateValidate(expr.predicate)
       return
     case "header_text":
       validateHeaderKey(expr.predicate.field)
-      validateTextPredicate(expr.predicate)
+      textPredicateValidate(expr.predicate)
   }
 }
 
@@ -611,7 +647,7 @@ function validateHeaderKey(key: string): void {
 // The server compiles regexes with the Rust engine and is the authority on
 // their syntax. These checks refuse what no SDK accepts, so a filter fails here
 // before it travels.
-function validateTextPredicate(predicate: TextPredicate): void {
+export function textPredicateValidate(predicate: TextPredicate): void {
   if (UTF8.encode(predicate.pattern).byteLength > MAX_FILTER_STRING_BYTES) {
     throw new InvalidError(`a text pattern exceeds ${String(MAX_FILTER_STRING_BYTES)}B`)
   }
@@ -782,10 +818,10 @@ function coercedLiteralParses(coerce: Coerce, value: TypedValue): boolean {
     return value.kind === "string" && ExactDecimal.parse(value.value) !== undefined
   }
   if (value.kind === "string") {
-    return timestampFromText(coerce.format, value.value) !== undefined
+    return timestampFormatMicrosFromText(coerce.format, value.value) !== undefined
   }
   if (value.kind === "int" || value.kind === "long") {
-    return timestampFromInteger(coerce.format, BigInt(value.value)) !== undefined
+    return timestampFormatMicrosFromInteger(coerce.format, BigInt(value.value)) !== undefined
   }
   return false
 }
@@ -847,7 +883,7 @@ export class ExactDecimal {
   }
 
   /** The exact value of a finite double, `undefined` for infinities and NaN. */
-  static fromDouble(value: number): ExactDecimal | undefined {
+  static fromF64(value: number): ExactDecimal | undefined {
     if (!Number.isFinite(value)) return undefined
     if (value === 0) return ExactDecimal.normalized(false, "", "")
     const [mantissa = "", exponentText = "0"] = Math.abs(value).toExponential().split("e")
@@ -910,14 +946,20 @@ function inI64(value: bigint): bigint | undefined {
 }
 
 /** Microseconds since the epoch for a text value, `undefined` when it does not parse exactly. */
-export function timestampFromText(format: TimestampFormat, text: string): bigint | undefined {
+export function timestampFormatMicrosFromText(
+  format: TimestampFormat,
+  text: string
+): bigint | undefined {
   if (format === "rfc3339") return rfc3339Micros(text)
   if (!/^[+-]?\d+$/.test(text)) return undefined
-  return timestampFromInteger(format, BigInt(text))
+  return timestampFormatMicrosFromInteger(format, BigInt(text))
 }
 
 /** Microseconds since the epoch for an integer value, `undefined` on overflow or for RFC 3339. */
-export function timestampFromInteger(format: TimestampFormat, value: bigint): bigint | undefined {
+export function timestampFormatMicrosFromInteger(
+  format: TimestampFormat,
+  value: bigint
+): bigint | undefined {
   if (inI64(value) === undefined) return undefined
   switch (format) {
     case "rfc3339":
@@ -1045,6 +1087,10 @@ export type FilterConsumer =
   | { readonly kind: "consumer"; readonly name: string }
   | { readonly kind: "group"; readonly name: string }
 
+export function filterConsumerIsGroup(consumer: FilterConsumer): boolean {
+  return consumer.kind !== "consumer"
+}
+
 /** Which filter a read executes. */
 export type FilterRef =
   | { readonly kind: "inline"; readonly filter: ConsumerFilter }
@@ -1062,6 +1108,10 @@ export type FilterRef =
  */
 export type ExecutionMode = "filtered" | "unfiltered"
 
+export function executionModeIsFiltered(mode: ExecutionMode): boolean {
+  return mode === "filtered"
+}
+
 /** A position in the catalog's control log. */
 export interface CatalogPosition {
   readonly partitionId: number
@@ -1072,6 +1122,10 @@ export interface CatalogPosition {
 
 /** Which replica serves the read. */
 export type ReadMode = "primary" | "local"
+
+export function readModeIsPrimary(mode: ReadMode): boolean {
+  return mode === "primary"
+}
 
 /** The exact source history a page was read from. */
 export interface SourceGeneration {
@@ -1135,6 +1189,19 @@ export type FaultReason =
   | "foreign_codec"
   | "type_mismatch"
 
+/**
+ * Whether the record is in another format than the filter reads, which follows
+ * the filter's foreign policy instead of its fault policy.
+ */
+export function faultReasonIsForeign(reason: FaultReason): boolean {
+  return (
+    reason === "foreign_codec" ||
+    reason === "missing_schema" ||
+    reason === "schema_not_allowed" ||
+    reason === "schema_mismatch"
+  )
+}
+
 export interface RecordFault {
   readonly offset: bigint
   readonly reason: FaultReason
@@ -1148,6 +1215,24 @@ export interface AppliedPolicy {
   readonly revision?: number
   readonly mode: ExecutionMode
   readonly policyGeneration: bigint
+}
+
+/** The policy an independent consumer or a bound group ran: one filter. */
+export function appliedPolicyFiltered(
+  groupId: bigint | undefined,
+  digest: Uint8Array
+): AppliedPolicy {
+  return {
+    ...(groupId === undefined ? {} : { groupId }),
+    digest,
+    mode: "filtered",
+    policyGeneration: 0n
+  }
+}
+
+/** The policy of a group without a binding: every record. */
+export function appliedPolicyUnfiltered(groupId: bigint, policyGeneration: bigint): AppliedPolicy {
+  return { groupId, mode: "unfiltered", policyGeneration }
 }
 
 /** One page of a filtered read. `records` is a standard polled-messages body. */
@@ -1170,7 +1255,7 @@ export interface FilteredPage {
 }
 
 /** The start of the next request: continue after `page`, or repeat `original`. */
-export function nextFilteredStart(page: FilteredPage, original: FilteredStart): FilteredStart {
+export function filteredPageNextStart(page: FilteredPage, original: FilteredStart): FilteredStart {
   if (page.nextScanOffset === undefined) return original
   return {
     kind: "continue",
@@ -1315,6 +1400,28 @@ export interface FilterError {
   readonly code: ResultCode
   readonly reason: FilterErrorReason
   readonly message: string
+}
+
+export function filterErrorInvalid(error: InvalidError): FilterError {
+  return {
+    code: { kind: "known", name: "InvalidArgument" },
+    reason: "invalid_request",
+    message: error.message
+  }
+}
+
+/**
+ * Refuses a request of another filter op version as `version_skew` before its
+ * shape is validated, so a client of another build can tell a version gap from
+ * a malformed request. `undefined` for the supported version.
+ */
+export function filterErrorCheckVersion(v: number): FilterError | undefined {
+  if (v === FILTER_OP_VERSION) return undefined
+  return {
+    code: { kind: "known", name: "VersionSkew" },
+    reason: "version_skew",
+    message: `filter request version ${String(v)} is not supported, expected ${String(FILTER_OP_VERSION)}`
+  }
 }
 
 export type FilterOutcome =

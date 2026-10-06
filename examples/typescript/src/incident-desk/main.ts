@@ -5,12 +5,11 @@ import {
   ContentType,
   ConversationId,
   ConversationState,
-  FULL_REPLAY,
   KvExecutionError,
   MemoryHandle,
   MemoryKind,
   agentMessageBody,
-  jsonCodec,
+  Json,
   parseProjectionId,
   routeTo,
   type AgentHandle,
@@ -27,6 +26,7 @@ import {
   batchSize,
   decodeUtf8,
   envBoolean,
+  indexFor,
   managedGate,
   messages,
   phase,
@@ -38,6 +38,9 @@ import { defaultLlm } from "../llm.js"
 
 export const EXAMPLE = "incident-desk"
 const TICKETS = "support_tickets"
+// The index carries this run's token, so a rerun or another language's desk on the
+// same deployment never shares its rows.
+const TICKETS_INDEX = indexFor(TICKETS)
 const PLAN = "bulk-resolve-plan"
 const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
 const fixedTools = { kind: "fixed" as const, topic: AgentTopic.ToolCalls }
@@ -80,7 +83,7 @@ function ticketValue(value: unknown): Ticket {
   return item as Ticket
 }
 
-const TICKET_CODEC = jsonCodec(ticketValue)
+const TICKET_CODEC = new Json(ticketValue)
 
 class SimpleEmbedder {
   embed(text: string): Promise<readonly number[]> {
@@ -125,10 +128,10 @@ class KvDeduplicator implements Deduplicator {
 }
 
 async function registerTickets(laser: Laser): Promise<void> {
-  const id = parseProjectionId(`${TICKETS}.v1`)
+  const id = parseProjectionId(`${TICKETS_INDEX}.v1`)
   const projection: Projection = {
     id,
-    name: TICKETS,
+    name: TICKETS_INDEX,
     version: 1,
     kind: { kind: "row" },
     contentType: ContentType.Json,
@@ -144,8 +147,8 @@ async function registerTickets(laser: Laser): Promise<void> {
     source: { stream: laser.defaultStream ?? "", topic: TICKETS },
     allowedProjections: [id],
     defaultProjection: id,
-    index: TICKETS,
-    notify: false
+    index: TICKETS_INDEX,
+    notify: true
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)
@@ -178,8 +181,8 @@ async function ingest(laser: Laser, count: number): Promise<void> {
       .extendJson(values.slice(start, start + chunk), TICKET_CODEC)
       .send()
   }
-  await waitForProjection(laser, TICKETS, count)
-  const payload = await laser.query(TICKETS).fetchOne(TICKET_CODEC)
+  await waitForProjection(laser, TICKETS_INDEX, count)
+  const payload = await laser.query(TICKETS_INDEX).fetchOne(TICKET_CODEC)
   if (payload === undefined) throw new Error("materialized tickets returned no payload")
   console.log(`ticket payload round trip: ${payload.ticket_id}/${payload.component}`)
 }
@@ -218,6 +221,7 @@ async function spawnDesk(
         await context.respond(utf8(await llm.complete(`${incident}\n${findings.join("\n")}`)))
       }
     })
+    .build()
     .spawn(laser)
   const specialist = Agent.builder()
     .id(AgentId.new("specialist"))
@@ -237,6 +241,7 @@ async function spawnDesk(
         )
       }
     })
+    .build()
     .spawn(laser)
   const approver = Agent.builder()
     .id(AgentId.new("approver"))
@@ -247,6 +252,7 @@ async function spawnDesk(
         return context.respondInput(AgentTopic.Responses, utf8("approved"))
       }
     })
+    .build()
     .spawn(laser)
   const grants = laser.kv(grantNamespace)
   const resolver = Agent.builder()
@@ -276,6 +282,7 @@ async function spawnDesk(
           .send()
       }
     })
+    .build()
     .spawn(laser)
   const handles = [triage, specialist, resolver, approver]
   await Promise.all(handles.map((handle) => handle.ready()))
@@ -365,8 +372,8 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   phase("speculating a bulk-resolve plan in a fork")
   const fork = laser.fork(PLAN)
-  await fork.create().tables([TICKETS]).send()
-  await fork.putRow(TICKETS, 0, 0n).field("status", "resolved").send()
+  await fork.create().tables([TICKETS_INDEX]).send()
+  await fork.putRow(TICKETS_INDEX, 0, 0n).field("status", "resolved").send()
   if (envBoolean("LASER_APPLY_PLAN", false)) await fork.promote()
   console.log(`speculative fork: ${PLAN}`)
 
@@ -375,7 +382,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     laser,
     incident,
     [AgentTopic.Commands, AgentTopic.Responses, AgentTopic.ToolCalls, AgentTopic.ToolResults],
-    FULL_REPLAY,
+    { kind: "full" },
     0,
     (total) => total + 1
   )

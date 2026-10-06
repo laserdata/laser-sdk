@@ -35,9 +35,9 @@ struct Record {
 }
 
 #[derive(Clone)]
-pub struct ProducerRecorder(Arc<Mutex<Record>>);
+pub(crate) struct ProducerRecorder(Arc<Mutex<Record>>);
 
-pub struct ProducerObservation {
+pub(crate) struct ProducerObservation {
     recorder: ProducerRecorder,
     started: Instant,
     records: u64,
@@ -52,7 +52,7 @@ fn now() -> u64 {
 }
 
 impl ProducerRecorder {
-    pub fn new(laser: &Laser, stream: String, topic: String, confirmed: bool) -> Self {
+    pub(crate) fn new(laser: &Laser, stream: String, topic: String, confirmed: bool) -> Self {
         let timestamp = now();
         let recorder = Self(Arc::new(Mutex::new(Record {
             statistics: ProducerStatistics {
@@ -173,7 +173,7 @@ impl ProducerRecorder {
         recorder
     }
 
-    pub fn begin(&self, records: u64, bytes: u64) -> ProducerObservation {
+    pub(crate) fn begin(&self, records: u64, bytes: u64) -> ProducerObservation {
         let mut record = self.0.lock().unwrap_or_else(|p| p.into_inner());
         record.statistics.submitted_records =
             record.statistics.submitted_records.saturating_add(records);
@@ -190,7 +190,7 @@ impl ProducerRecorder {
         }
     }
 
-    pub fn snapshot(&self) -> ProducerStatistics {
+    pub(crate) fn snapshot(&self) -> ProducerStatistics {
         let record = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let mut statistics = record.statistics.clone();
         let percentile = |numerator: u64| {
@@ -218,7 +218,7 @@ impl ProducerRecorder {
 }
 
 impl ProducerObservation {
-    pub fn finish(self, success: bool) {
+    pub(crate) fn finish(self, success: bool) {
         let mut record = self.recorder.0.lock().unwrap_or_else(|p| p.into_inner());
         let statistics = &mut record.statistics;
         statistics.last_activity_millis = now();

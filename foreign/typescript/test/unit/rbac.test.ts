@@ -16,10 +16,10 @@ import {
 import { decodeOne, encodeOne, expectMap } from "../../src/wire/cbor.js"
 import type { AuthzReply, Role } from "../../src/wire/authz.js"
 import { encodeAuthzReply } from "../../src/wire/authz.js"
-import { Feature } from "../../src/wire/hello.js"
+import { feature } from "../../src/wire/hello.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
-  versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: Feature.AUTHZ },
+  versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: feature.AUTHZ },
   backends: []
 })
 

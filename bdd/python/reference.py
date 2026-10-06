@@ -35,6 +35,7 @@ class DataStackModel:
             "checkpoint_revision": 0,
             "effective_state": "disabled",
             "next_offset": 0,
+            "retained_offset": 0,
         }
         self.operation = {"id": f"operation-{self.global_revision}"}
 
@@ -54,8 +55,13 @@ class DataStackModel:
         destination["effective_state"] = "running"
         self.operation = {"id": f"operation-{self.global_revision}"}
 
-    def record_gap(self, name):
+    def record_gap(self, name, required_offset, retained_offset):
         destination = self.destinations[name]
+        # A gap means the log no longer holds the offset the destination needs.
+        if retained_offset <= required_offset:
+            self.error = {"kind": "invalid"}
+            return
+        destination["retained_offset"] = retained_offset
         self.global_revision += 1
         destination["checkpoint_revision"] += 1
         destination["effective_state"] = "blocked"
@@ -64,6 +70,10 @@ class DataStackModel:
         destination = self.destinations[name]
         if destination["checkpoint_revision"] != expected_checkpoint_revision:
             self.error = {"kind": "conflict", "observed_revision": self.global_revision}
+            return
+        # Accepting a gap resumes where the log still has records.
+        if next_offset < destination["retained_offset"]:
+            self.error = {"kind": "invalid"}
             return
         self.global_revision += 1
         destination["checkpoint_revision"] += 1
@@ -293,12 +303,15 @@ def _crockford(value):
 
 def memory_content_id(agent, kind_code, body):
     """The content-addressed memory id for an owner and body, byte-for-byte the
-    Rust `MemoryId::content`. Stream is unset in these scenarios."""
+    Rust `MemoryId::content`. Stream, user, and application are unset in these
+    scenarios."""
     seed = bytearray()
     seed.append(0)  # empty stream segment
     if agent:
         seed += agent.encode()
     seed.append(0)
+    seed.append(0)  # empty user segment
+    seed.append(0)  # empty application segment
     seed.append(kind_code)
     seed += body
     seed = bytes(seed)

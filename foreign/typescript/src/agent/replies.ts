@@ -2,10 +2,21 @@ import { CancelledError, TimeoutError } from "../client/errors.js"
 import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
 import { NOOP_OBSERVER, type LaserObserver } from "../observe.js"
 import type { KeyRegistry } from "../signing.js"
-import { decodeAgentMessage, type AgentMessage } from "./reliable-consumer.js"
+import { AgentKind, type AgentEnvelope } from "../wire/agent.js"
+import type { CorrelationId } from "../wire/ids.js"
+import {
+  decodeAgentMessage,
+  type AgentMessage,
+  type DecodedAgentMessage
+} from "./reliable-consumer.js"
+import { longTimeout } from "./timer.js"
 
 const REPLY_BATCH = 200
 const REPLY_POLL_INTERVAL_MS = 20
+
+// A point lookup reads at most this many batches per partition, like Rust.
+const MAX_LOOKUP_PASSES = 32
+const LOOKUP_BATCH = 1_000
 
 // Ceiling on replies buffered for one subscribed correlation with no consumer
 // pulling them. A flood must not be retained in full.
@@ -23,11 +34,11 @@ function raceWithTimeout<T>(
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const abort = (): void => {
-      clearTimeout(timer)
+      timer.cancel()
       onDone()
       reject(new CancelledError("reply wait aborted", { cause: signal?.reason }))
     }
-    const timer = setTimeout(() => {
+    const timer = longTimeout(() => {
       signal?.removeEventListener("abort", abort)
       onDone()
       reject(new TimeoutError("reply"))
@@ -39,12 +50,12 @@ function raceWithTimeout<T>(
     signal?.addEventListener("abort", abort, { once: true })
     promise
       .then((value) => {
-        clearTimeout(timer)
+        timer.cancel()
         signal?.removeEventListener("abort", abort)
         resolve(value)
       })
       .catch((error: unknown) => {
-        clearTimeout(timer)
+        timer.cancel()
         signal?.removeEventListener("abort", abort)
         reject(error instanceof Error ? error : new Error(String(error)))
       })
@@ -70,6 +81,46 @@ interface StreamWaiter {
 interface ReplyWaiter {
   readonly settle: (message: AgentMessage) => void
   readonly expectedSigner?: string
+}
+
+/** The first AGDX response or error carrying `correlation` on a reply topic,
+ * read forward from the start of each partition. With a verifier only a reply
+ * that verifies counts, so a forged answer cannot settle the lookup. */
+export async function findAgdxReply(
+  transport: LaserTransport,
+  stream: string,
+  topic: string,
+  correlation: CorrelationId,
+  verifier?: KeyRegistry
+): Promise<AgentEnvelope | undefined> {
+  const partitions = await transport.findTopicPartitionCount(stream, topic)
+  if (partitions === undefined) return undefined
+  const offsets = new Array<bigint>(partitions).fill(0n)
+  for (let pass = 0; pass < MAX_LOOKUP_PASSES; pass += 1) {
+    let readAny = false
+    for (let partitionId = 0; partitionId < partitions; partitionId += 1) {
+      const messages = await transport.pollMessages(
+        stream,
+        topic,
+        { kind: "single", partitionId },
+        { kind: "offset", value: offsets[partitionId] ?? 0n },
+        LOOKUP_BATCH,
+        false
+      )
+      for (const message of messages) {
+        readAny = true
+        offsets[partitionId] = message.offset + 1n
+        const envelope = matchingReply(
+          decodeAgentMessage({ ...message, partitionId }),
+          correlation,
+          verifier
+        )
+        if (envelope !== undefined) return envelope
+      }
+    }
+    if (!readAny) return undefined
+  }
+  return undefined
 }
 
 export class ReplyHub {
@@ -282,4 +333,29 @@ export class ReplyHub {
     }
     return waiter !== undefined || streamWaiter !== undefined
   }
+}
+
+function matchingReply(
+  decoded: DecodedAgentMessage,
+  correlation: CorrelationId,
+  verifier: KeyRegistry | undefined
+): AgentEnvelope | undefined {
+  if (decoded.kind === "error") return undefined
+  const envelope = decoded.message.envelope
+  if (
+    envelope?.correlation?.equals(correlation) !== true ||
+    (envelope.kind !== AgentKind.Response && envelope.kind !== AgentKind.Error)
+  ) {
+    return undefined
+  }
+  if (verifier === undefined) return envelope
+  if (decoded.signatureContext === undefined || decoded.observedAtMicros === undefined) {
+    return undefined
+  }
+  try {
+    verifier.verifyObservedAt(envelope, decoded.signatureContext, decoded.observedAtMicros)
+  } catch {
+    return undefined
+  }
+  return envelope
 }

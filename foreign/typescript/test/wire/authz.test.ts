@@ -23,6 +23,11 @@ import {
 } from "../../src/wire/authz.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
+  type SupervisorActorAssertion,
+  validateSupervisorAssertion
+} from "../../src/wire/checkpoint.js"
+import { CheckpointRequestId, DestinationId } from "../../src/wire/ids.js"
+import {
   AGDX_AGENT_SUBMIT_CODE,
   AGDX_BATCH_CODE,
   AGDX_CHECKPOINT_CODE,
@@ -210,4 +215,34 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
   assert.equal(actionIndex("authz", "admin"), 53)
   assert.equal(actionIndex("kv_lease", "admin"), 58)
   assert.equal(actionIndex("kv_fence", "read"), 60)
+})
+
+void test("given_a_supervisor_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {
+  const valid: SupervisorActorAssertion = {
+    claims: {
+      v: 1,
+      requestId: CheckpointRequestId.fromU128(1n),
+      deploymentId: 2,
+      cloudUserId: 3,
+      action: "record_repair",
+      destinationId: DestinationId.fromU128(4n),
+      destinationGeneration: 5n,
+      issuedAtMicros: 1_000n,
+      expiresAtMicros: 1_000n + 300_000_000n
+    },
+    keyId: new Uint8Array(8),
+    signature: new Uint8Array(64)
+  }
+  validateSupervisorAssertion(valid)
+  const broken: readonly [SupervisorActorAssertion, RegExp][] = [
+    [{ ...valid, claims: { ...valid.claims, v: 2 } }, /version/],
+    [{ ...valid, claims: { ...valid.claims, cloudUserId: 0 } }, /nonzero/],
+    [{ ...valid, claims: { ...valid.claims, expiresAtMicros: 1_000n + 300_000_001n } }, /window/],
+    [{ ...valid, signature: new Uint8Array(63) }, /signature/]
+  ]
+  for (const [assertion, message] of broken) {
+    assert.throws(() => {
+      validateSupervisorAssertion(assertion)
+    }, message)
+  }
 })

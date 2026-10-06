@@ -25,6 +25,7 @@ import {
   encodeCheckpointRequestFrame,
   encodeDestinationCheckpointStatus,
   encodePublicCheckpointMutation,
+  publicCheckpointMutationRequiredCapability,
   validateCheckpointRequest,
   validateDestinationCheckpointStatus
 } from "../../src/wire/checkpoint.js"
@@ -435,6 +436,38 @@ void test("public checkpoint requests cannot be confused with replicated mutatio
 
   const replicatedBytes = await fixture("checkpoint_mutation_replicated.bin")
   assert.throws(() => decodeCheckpointRequestFrame(replicatedBytes))
+})
+
+void test("checkpoint mutations name the capability that authorizes them", async () => {
+  const request = decodeCheckpointRequestFrame(await fixture("checkpoint_request_public.bin"))
+  assert.deepEqual(publicCheckpointMutationRequiredCapability(request.mutation), [
+    "destination",
+    "write"
+  ])
+  const scope = {
+    destinationId:
+      request.mutation.kind === "register_destination"
+        ? request.mutation.destination.id
+        : assert.fail("fixture must register a destination"),
+    destinationGeneration: 1n,
+    expectedCheckpointRevision: 1n
+  }
+  assert.deepEqual(
+    publicCheckpointMutationRequiredCapability({
+      kind: "accept_retention_gap",
+      ...scope,
+      nextOffset: 7n
+    }),
+    ["checkpoint", "admin"]
+  )
+  assert.deepEqual(
+    publicCheckpointMutationRequiredCapability({
+      kind: "clear_block",
+      ...scope,
+      expectedCode: "decode"
+    }),
+    ["checkpoint", "write"]
+  )
 })
 
 void test("checkpoint mutation result variants match the Rust fixtures", async () => {

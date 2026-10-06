@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { test } from "node:test"
+import { test, type TestContext } from "node:test"
 
 import { Agent } from "../../src/agent/builder.js"
 import {
@@ -48,6 +48,7 @@ void test(
           return new Promise<ConsolidationReport>(() => undefined)
         }
       })
+      .build()
       .spawn({} as Laser)
     await handle.ready()
     await handle.shutdown()
@@ -78,6 +79,7 @@ void test(
           return new Promise<ConsolidationReport>(() => undefined)
         }
       })
+      .build()
       .spawn({} as Laser)
     await handle.ready()
     const joined = handle.join()
@@ -101,9 +103,75 @@ void test(
           return new Promise<ConsolidationReport>(() => undefined)
         }
       })
+      .build()
       .spawn({} as Laser)
     await assert.rejects(handle.join(), NoStreamError)
     assert.equal(signal?.aborted, true)
     await assert.rejects(handle.ready(), NoStreamError)
+  }
+)
+
+// The consumer reports ready and parks until shutdown, then drains for `settleMs`.
+function parkedRun(t: TestContext, settleMs = 0): void {
+  t.mock.method(
+    ReliableConsumer.prototype,
+    "run",
+    async (_laser: Laser, _handler: AgentHandler, control: ReliableConsumerControl) => {
+      control.ready?.()
+      await new Promise<void>((resolve) => {
+        control.signal?.addEventListener(
+          "abort",
+          () => {
+            setTimeout(resolve, settleMs)
+          },
+          { once: true }
+        )
+      })
+    }
+  )
+}
+
+void test(
+  "given_an_agent_with_an_id_when_consolidation_ticks_then_should_scope_the_pass_to_that_agent",
+  { timeout: 1000 },
+  async (t) => {
+    parkedRun(t)
+    const scopes: unknown[] = []
+    const handle = builder()
+      .consolidator({
+        consolidate: (scope) => {
+          scopes.push(scope)
+          return Promise.resolve({ summarized: 0, reweighted: 0, pruned: 0, derived: 0 })
+        }
+      })
+      .build()
+      .spawn({} as Laser)
+    await handle.ready()
+    await handle.shutdown()
+    assert.deepEqual(scopes[0], { agent: AgentId.new("consolidating-worker") })
+  }
+)
+
+void test(
+  "given_intervals_beyond_the_timer_range_when_running_then_should_neither_tick_again_nor_cut_the_grace_short",
+  { timeout: 2000 },
+  async (t) => {
+    parkedRun(t, 30)
+    let passes = 0
+    const handle = builder()
+      .consolidateEvery(2 ** 31 + 10)
+      .shutdownGrace(2 ** 31 + 10)
+      .consolidator({
+        consolidate: () => {
+          passes += 1
+          return Promise.resolve({ summarized: 0, reweighted: 0, pruned: 0, derived: 0 })
+        }
+      })
+      .build()
+      .spawn({} as Laser)
+    await handle.ready()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(passes, 1)
+    await handle.shutdown()
   }
 )

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { InvalidError } from "../../src/client/errors.js"
+import { CancelledError, InvalidError } from "../../src/client/errors.js"
 import { topologicalOrder } from "../../src/agent/workflow.js"
 import { Workflow } from "../../src/agent/workflow.js"
 import type { Contract } from "../../src/agent/contract.js"
@@ -97,7 +97,7 @@ void test("given_an_exclusive_namespace_when_dispatched_then_should_propagate_it
     }
   } as unknown as Laser
 
-  const outcome = await new Workflow(fake, "orchestrator")
+  const outcome = await Workflow.create(fake, "orchestrator")
     .step("effect", routeTo(AgentId.new("worker")), () => new TextEncoder().encode("apply"))
     .exclusiveIn("incident-effects")
     .run()
@@ -168,7 +168,7 @@ void test(
       }
     } as unknown as Laser
 
-    const running = new Workflow(fake, "orchestrator")
+    const running = Workflow.create(fake, "orchestrator")
       .step("effect", routeTo(AgentId.new("worker")), () => new Uint8Array())
       .exclusive()
       .run()
@@ -245,7 +245,7 @@ void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_
     sendAgent: () => Promise.resolve()
   } as unknown as Laser
 
-  const outcome = await new Workflow(fake, "orchestrator")
+  const outcome = await Workflow.create(fake, "orchestrator")
     .step("effect", routeTo(AgentId.new("worker")), () => new TextEncoder().encode("apply"))
     .exclusive()
     .onTimeout("reassign")
@@ -255,4 +255,34 @@ void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_
   assert.notEqual(holders[0], holders[1])
   assert.deepEqual(released, holders)
   assert.deepEqual(fences, [1n, 2n])
+})
+
+void test("given_a_registered_run_with_a_cancel_request_when_executed_then_should_name_the_run", async () => {
+  const states: string[] = []
+  const status = {
+    withCorrelation: () => status,
+    withTaskState: (state: { readonly name: string }) => {
+      states.push(state.name)
+      return status
+    },
+    withMetadata: () => status,
+    send: () => Promise.resolve()
+  }
+  const fake = {
+    capabilities: () => Promise.resolve({ agentWorkflow: true }),
+    context: () => ({ fetch: () => Promise.resolve([]) }),
+    runs: () => ({
+      submitWith: () => Promise.resolve({ runId: "run-9" }),
+      status: () => Promise.resolve({ cancelRequested: true })
+    }),
+    agdx: () => ({ status: () => status })
+  } as unknown as Laser
+  await assert.rejects(
+    Workflow.create(fake, "orchestrator")
+      .step("effect", routeTo(AgentId.new("worker")), () => new TextEncoder().encode("apply"))
+      .registered()
+      .run(),
+    (error: unknown) => error instanceof CancelledError && error.run === "run-9"
+  )
+  assert.deepEqual(states, ["Working", "Canceled"])
 })

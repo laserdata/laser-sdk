@@ -18,11 +18,16 @@ const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
 async function pause(label: string): Promise<void> {
   console.log(label)
   if (envBoolean("LASER_NON_INTERACTIVE", false)) return
-  using input = createInterface({
+  // Node 22.14 has no `Symbol.dispose` on a readline interface, so close it by hand.
+  const input = createInterface({
     input: process.stdin,
     output: process.stdout
   })
-  await input.question("Press Enter to continue: ")
+  try {
+    await input.question("Press Enter to continue: ")
+  } finally {
+    input.close()
+  }
 }
 
 function spawnWorker(laser: Laser, name: string, delayMs = 0): AgentHandle {
@@ -40,6 +45,7 @@ function spawnWorker(laser: Laser, name: string, delayMs = 0): AgentHandle {
         )
       }
     })
+    .build()
     .spawn(laser)
 }
 

@@ -5,9 +5,8 @@ Services write to it and read from it like a group chat that never loses a
 message. New readers start from the beginning or jump straight to now.
 
 What it shows:
-  - open a typed topic handle (`cls=` auto-encodes and decodes `Reading`)
-  - publish two records
-  - replay them back through that same typed reader
+  - publish two `Reading` records as JSON
+  - replay them back through a typed handle (`json(Reading)` decodes each record)
 
 Run it twice and the second run replays four readings: the log keeps every record,
 and a fresh reader starts at offset 0. That is the primitive, not a bug.
@@ -42,7 +41,7 @@ async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
         _common.phase("write two messages, then read them back")
-        topic = laser.stream(STREAM).topic(TOPIC, cls=Reading)
+        topic = laser.stream(STREAM).topic(TOPIC)
         await topic.ensure(2)
 
         for reading in (Reading(host="node-1", cpu=42), Reading(host="node-2", cpu=91)):
@@ -50,7 +49,7 @@ async def main() -> None:
 
         # One typed handle pins the contract: `Reading` in on publish, `Reading` out
         # on replay. The reader starts at offset 0 and ends once it is caught up.
-        reader = topic.records("log-example")
+        reader = topic.json(Reading).records("log-example")
         while (record := await reader.next()) is not None:
             print(f"  reading {record.value.host} cpu {record.value.cpu}")
     finally:

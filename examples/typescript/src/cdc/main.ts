@@ -77,9 +77,10 @@ interface Feed {
   readonly strictMatches: number
 }
 
-export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
+/** `false` when the deployment serves no filter catalog and nothing ran. */
+export async function run(laser: Laser, _signal: AbortSignal): Promise<boolean> {
   const capabilities = await laser.capabilities()
-  if (!managedGate(capabilities, "filterCatalog", EXAMPLE, "consumer group filters")) return
+  if (!managedGate(capabilities, "filterCatalog", EXAMPLE, "consumer group filters")) return false
   const stream = laser.defaultStream ?? ""
   const topic = laser.stream(stream).topic(TOPIC)
 
@@ -116,14 +117,17 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   )
 
   phase("consume as the group: the application names the group, the server runs its filter")
-  const consumer = await desk.consumer({ startFrom: { kind: "first" }, autoCommit: false })
+  const consumer = await desk.consumer({
+    startAt: { kind: "first" },
+    commitPolicy: { kind: "disabled" }
+  })
   let deliveredBytes = 0
   try {
     for (let handled = 0; handled < feed.strictMatches; handled += 1) {
       const message = await consumer.nextWithin(READ_TIMEOUT_MS)
       const change = JSON.parse(decodeUtf8(message.payload)) as FleetChange
       console.log(
-        `  partition ${String(message.partitionId)} offset ${message.offset.toString()}: ${describe(change)}`
+        `  partition ${String(message.partitionId)} offset ${message.position.offset.toString()}: ${describe(change)}`
       )
       deliveredBytes += message.payload.byteLength
       await consumer.commit(message)
@@ -171,6 +175,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   await runCodecs(laser, stream)
 
   await manageRevisions(laser, stream, desk, binding, feed.strictMatches)
+  return true
 }
 
 // Binary alert frames carry their priority as a header. A pager group with a
@@ -200,7 +205,7 @@ async function routeAlerts(laser: Laser, stream: string): Promise<void> {
     for (let handled = 0; handled < 2; handled += 1) {
       const record = await pager.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
       console.log(
-        `  critical alert at offset ${record.offset.toString()}: ${String(record.payload.byteLength)} opaque bytes`
+        `  critical alert at offset ${record.offset.toString()}: ${String(record.message.payload.byteLength)} opaque bytes`
       )
       await pager.ack(record)
     }
@@ -223,7 +228,7 @@ async function manageRevisions(
   const draft = await desk
     .filter()
     .revise(binding.revision, ConsumerFilter.json(safeModeTransition()))
-  const revisions = await desk.filter().revisions({ page: 0, pageSize: 10 })
+  const revisions = await desk.filter().revisions(0, 10)
   console.log(
     `  revision ${String(draft.revision)} drafted, the group lists ${String(revisions.total)} revisions and still runs revision ${String(binding.revision)}`
   )
@@ -238,7 +243,7 @@ async function manageRevisions(
   const reader = await variant.reader().count(1).localGuard(true).start({ kind: "first" }).build()
   try {
     const first = await reader.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
-    const change = JSON.parse(decodeUtf8(first.payload)) as FleetChange
+    const change = JSON.parse(decodeUtf8(first.message.payload)) as FleetChange
     console.log(`  ${variantName}: ${describe(change)}`)
 
     phase("pause the variant: new reads stop, in-flight work still acknowledges")
@@ -248,7 +253,7 @@ async function manageRevisions(
       await reader.tryNextPage()
       throw new Error("a disabled revision kept reading")
     } catch (error) {
-      if (!(error instanceof FilterExecutionError) || error.reason !== "revision_disabled")
+      if (!(error instanceof FilterExecutionError) || error.detail.reason !== "revision_disabled")
         throw error
       console.log("  paused: the server refuses new reads with revision_disabled")
     }
@@ -266,7 +271,7 @@ async function manageRevisions(
     await desk.filter().configure(ConsumerFilter.json(safeModeTransition()))
     throw new Error("a running policy was replaced")
   } catch (error) {
-    if (!(error instanceof FilterExecutionError) || error.reason !== "conflict") throw error
+    if (!(error instanceof FilterExecutionError) || error.detail.reason !== "conflict") throw error
     console.log("  refused with conflict: create a new group for another policy")
   }
 

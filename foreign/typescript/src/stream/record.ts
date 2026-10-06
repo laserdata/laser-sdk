@@ -1,5 +1,5 @@
 import { InvalidError } from "../client/errors.js"
-import type { IggyHeaderValue } from "../iggy/apache-iggy.js"
+import type { HeaderValue } from "./header-value.js"
 import { ContentType, contentTypeCode } from "../wire/content.js"
 import {
   CONTENT_TYPE,
@@ -69,11 +69,12 @@ export class Record {
     return this
   }
 
-  header(key: string, value: string): this {
+  metadata(key: string, value: string): this {
     this.metadataValues.push([key, value])
     return this
   }
 
+  /** @internal */
   snapshot(): RecordSnapshot {
     return {
       ...(this.contentTypeValue !== undefined ? { contentType: this.contentTypeValue } : {}),
@@ -89,7 +90,7 @@ export class Record {
   }
 }
 
-function stringHeader(headers: Map<string, IggyHeaderValue>, key: string, value: string): void {
+function stringHeader(headers: Map<string, HeaderValue>, key: string, value: string): void {
   const size = encoder.encode(value).byteLength
   if (value.length === 0) throw new InvalidError(`header \`${key}\` value must not be empty`)
   if (size > HEADER_VALUE_MAX) {
@@ -100,7 +101,7 @@ function stringHeader(headers: Map<string, IggyHeaderValue>, key: string, value:
   headers.set(key, { kind: "string", value })
 }
 
-function headerValueBytes(value: IggyHeaderValue): number {
+function headerValueBytes(value: HeaderValue): number {
   switch (value.kind) {
     case "raw":
     case "int128":
@@ -126,9 +127,9 @@ function headerValueBytes(value: IggyHeaderValue): number {
   }
 }
 
-export function recordHeaders(record: Record): ReadonlyMap<string, IggyHeaderValue> {
+export function recordHeaders(record: Record): ReadonlyMap<string, HeaderValue> {
   const value = record.snapshot()
-  const headers = new Map<string, IggyHeaderValue>()
+  const headers = new Map<string, HeaderValue>()
   if (value.contentType !== undefined) {
     headers.set(CONTENT_TYPE, { kind: "uint8", value: contentTypeCode(value.contentType) })
   }
@@ -211,7 +212,7 @@ export function mergeRecord(defaults: Record, override: Record): Record {
   if (base.inlinePayload || own.inlinePayload) merged.inlinePayload()
   for (const [key, value] of base.index) merged.index(key, value)
   for (const [key, value] of own.index) merged.index(key, value)
-  for (const [key, value] of base.metadata) merged.header(key, value)
-  for (const [key, value] of own.metadata) merged.header(key, value)
+  for (const [key, value] of base.metadata) merged.metadata(key, value)
+  for (const [key, value] of own.metadata) merged.metadata(key, value)
   return merged
 }

@@ -11,12 +11,14 @@ pub struct DestinationState {
     pub checkpoint_revision: u64,
     pub effective_state: &'static str,
     pub next_offset: u64,
+    pub retained_offset: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
     Conflict { observed_revision: u64 },
     Cancelled,
+    Invalid,
     NotFound,
 }
 
@@ -44,6 +46,7 @@ impl DataStackModel {
                 checkpoint_revision: 0,
                 effective_state: "disabled",
                 next_offset: 0,
+                retained_offset: 0,
             },
         );
         Ok(AcceptedOperation {
@@ -79,13 +82,18 @@ impl DataStackModel {
     pub fn record_retention_gap(
         &mut self,
         name: &str,
-        _required_offset: u64,
-        _retained_offset: u64,
+        required_offset: u64,
+        retained_offset: u64,
     ) -> Result<(), ModelError> {
         let destination = self
             .destinations
             .get_mut(name)
             .ok_or(ModelError::NotFound)?;
+        // A gap means the log no longer holds the offset the destination needs.
+        if retained_offset <= required_offset {
+            return Err(ModelError::Invalid);
+        }
+        destination.retained_offset = retained_offset;
         self.global_revision += 1;
         destination.checkpoint_revision += 1;
         destination.effective_state = "blocked";
@@ -106,6 +114,10 @@ impl DataStackModel {
             return Err(ModelError::Conflict {
                 observed_revision: self.global_revision,
             });
+        }
+        // Accepting a gap resumes where the log still has records.
+        if next_offset < destination.retained_offset {
+            return Err(ModelError::Invalid);
         }
         self.global_revision += 1;
         destination.checkpoint_revision += 1;

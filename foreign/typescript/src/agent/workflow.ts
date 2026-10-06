@@ -21,11 +21,18 @@ export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence"
 const WORKFLOW_LEASE_TTL_MICROS = 60_000_000n
 
 export class Budget {
-  private constructor(
-    readonly tokenLimit?: bigint,
-    readonly wallClockLimitMs?: number,
-    readonly invocationLimit?: number
-  ) {}
+  /** @internal */
+  readonly tokenLimit: bigint | undefined
+  /** @internal */
+  readonly wallClockLimitMs: number | undefined
+  /** @internal */
+  readonly invocationLimit: number | undefined
+
+  private constructor(tokenLimit?: bigint, wallClockLimitMs?: number, invocationLimit?: number) {
+    this.tokenLimit = tokenLimit
+    this.wallClockLimitMs = wallClockLimitMs
+    this.invocationLimit = invocationLimit
+  }
 
   static unlimited(): Budget {
     return new Budget()
@@ -56,7 +63,7 @@ export interface StepContext {
 }
 
 export type StepFn = (context: StepContext) => BytesLike | Promise<BytesLike>
-export type WorkflowVerifier = (output: Uint8Array) => boolean | Promise<boolean>
+export type Verifier = (output: Uint8Array) => boolean | Promise<boolean>
 export type OnTimeout = "fail" | "reassign"
 
 interface Step {
@@ -64,7 +71,7 @@ interface Step {
   readonly target: Router
   readonly build: StepFn
   readonly after: string[]
-  verifier?: WorkflowVerifier
+  verifier?: Verifier
   exclusive: boolean
   fenceNamespace?: string
   onTimeout: OnTimeout
@@ -74,10 +81,6 @@ interface Step {
 export interface WorkflowOutcome {
   readonly outputs: ReadonlyMap<string, Uint8Array>
   readonly runId: ConversationId
-}
-
-export interface WorkflowRunOptions {
-  readonly signal?: AbortSignal
 }
 
 interface CompletedDispatch {
@@ -170,10 +173,15 @@ export class Workflow {
   private readonly steps: Step[] = []
   private registerRun = false
 
-  constructor(
+  private constructor(
     private readonly laser: Laser,
-    readonly name: string
+    private readonly name: string
   ) {}
+
+  /** @internal */
+  static create(laser: Laser, name: string): Workflow {
+    return new Workflow(laser, name)
+  }
 
   budget(budget: Budget): this {
     this.budgetValue = budget
@@ -195,7 +203,7 @@ export class Workflow {
     return this
   }
 
-  step(label: string, target: Router, build: StepFn): StepBuilder {
+  step(label: string, target: Router, build: StepFn): StepHandle {
     const step: Step = {
       label,
       target,
@@ -205,10 +213,11 @@ export class Workflow {
       onTimeout: "fail"
     }
     this.steps.push(step)
-    return new StepBuilder(this, step)
+    return StepHandle.create(this, step)
   }
 
-  async run(options: WorkflowRunOptions = {}): Promise<WorkflowOutcome> {
+  /** Aborting `signal` cancels the run, as dropping the run future does in Rust. */
+  async run(options: { readonly signal?: AbortSignal } = {}): Promise<WorkflowOutcome> {
     if (this.registerRun && !(await this.laser.capabilities()).agentWorkflow) {
       throw new UnsupportedError(
         "a registered workflow requires a plane that serves the run registry"
@@ -278,7 +287,9 @@ export class Workflow {
         (await this.laser.runs().status(registeredRun)).cancelRequested
       ) {
         await this.compensate(completed, outputs)
-        throw new CancelledError(`workflow run \`${registeredRun}\` was cancelled`)
+        throw new CancelledError(`workflow run \`${registeredRun}\` was cancelled`, {
+          run: registeredRun
+        })
       }
       try {
         this.validateStep(step)
@@ -583,18 +594,23 @@ function renewalTick(milliseconds: number): { readonly promise: Promise<void>; c
   }
 }
 
-export class StepBuilder {
-  constructor(
+export class StepHandle {
+  private constructor(
     private readonly owner: Workflow,
     private readonly current: Step
   ) {}
+
+  /** @internal */
+  static create(owner: Workflow, current: Step): StepHandle {
+    return new StepHandle(owner, current)
+  }
 
   after(label: string): this {
     this.current.after.push(label)
     return this
   }
 
-  verifyWith(verifier: WorkflowVerifier): this {
+  verifyWith(verifier: Verifier): this {
     this.current.verifier = verifier
     return this
   }
@@ -640,15 +656,11 @@ export class StepBuilder {
     return this
   }
 
-  step(label: string, target: Router, build: StepFn): StepBuilder {
+  step(label: string, target: Router, build: StepFn): StepHandle {
     return this.owner.step(label, target, build)
   }
 
-  done(): Workflow {
-    return this.owner
-  }
-
-  run(options: WorkflowRunOptions = {}): Promise<WorkflowOutcome> {
+  run(options: { readonly signal?: AbortSignal } = {}): Promise<WorkflowOutcome> {
     return this.owner.run(options)
   }
 }

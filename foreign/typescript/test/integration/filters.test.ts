@@ -10,11 +10,13 @@ import { test, type TestContext } from "node:test"
 import {
   ConfigError,
   ConsumerGroupSetupError,
-  FilterStopError,
+  FilterFaultError,
   InvalidError,
   UnsupportedError
 } from "../../src/client/errors.js"
+import { filterReason } from "../../src/client/error-classify.js"
 import { Laser } from "../../src/client/laser.js"
+import type { ConsumerMessage } from "../../src/stream/consumer.js"
 import type { ConsumerGroup } from "../../src/stream/consumer-group.js"
 import { HeaderValue } from "../../src/stream/header-value.js"
 import type { FilteredReader, FilteredReaderBuilder } from "../../src/managed/filters.js"
@@ -148,7 +150,7 @@ void test("given_edge_records_when_read_through_the_group_filter_then_should_ret
       page.records.map((record) => record.offset),
       [0n, 2n, 3n]
     )
-    assert.equal(new TextDecoder().decode(page.records[1]?.payload), DECOMMISSION)
+    assert.equal(new TextDecoder().decode(page.records[1]?.message.payload), DECOMMISSION)
     assert.deepEqual(page.policy.digest, consumerFilterDigest(safeModeFilter()))
     await filtered.ackPage(page)
     await filtered.close()
@@ -232,10 +234,9 @@ void test("given_a_malformed_record_when_reading_then_should_deliver_matches_the
     )
     await filtered.ackPage(page)
     await assert.rejects(filtered.nextPage(), (error: unknown) => {
-      assert.ok(error instanceof FilterStopError)
-      assert.equal(error.stop, "fault")
+      assert.ok(error instanceof FilterFaultError)
       assert.equal(error.offset, 1n)
-      assert.equal(error.faultReason, "malformed")
+      assert.equal(error.reason, "malformed")
       return true
     })
     await filtered.close()
@@ -330,15 +331,15 @@ void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record
     await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
     const group = laser.stream(stream).topic(TOPIC).consumerGroup("plain-desk")
     const consumer = await group.consumer({
-      startFrom: { kind: "first" },
-      autoCommit: false,
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" },
       pollIntervalMs: 5
     })
     try {
       const delivered: bigint[] = []
       for (let index = 0; index < 3; index += 1) {
         const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-        delivered.push(message.offset)
+        delivered.push(message.position.offset)
         await consumer.commit(message)
       }
       assert.deepEqual(delivered, [0n, 1n, 2n], "a group without a filter receives everything")
@@ -347,10 +348,11 @@ void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record
       await assert.rejects(
         consumer.commit({
           payload: new Uint8Array(),
+          id: { partitionId: 0, offset: 1n },
           partitionId: 0,
           offset: 1n,
           headers: new Map()
-        }),
+        } as unknown as ConsumerMessage),
         InvalidError,
         "only a delivered message commits"
       )
@@ -366,15 +368,15 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     const group = await boundGroup(laser, stream, "anomaly-desk")
     await publish(laser, stream, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
     const consumer = await group.consumer({
-      startFrom: { kind: "first" },
-      autoCommit: false,
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" },
       pollIntervalMs: 5
     })
     try {
       const delivered: bigint[] = []
       for (let index = 0; index < 2; index += 1) {
         const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-        delivered.push(message.offset)
+        delivered.push(message.position.offset)
         await consumer.commit(message)
       }
       assert.deepEqual(delivered, [0n, 2n], "the server ran the group's filter")
@@ -387,7 +389,8 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
     assert.equal(binding.policyGeneration, 1n)
     await assert.rejects(
       group.filter().configure(ConsumerFilter.json(FilterExpr.present("kind"))),
-      (error: unknown) => error instanceof FilterExecutionError && error.reason === "conflict"
+      (error: unknown) =>
+        error instanceof FilterExecutionError && error.detail.reason === "conflict"
     )
     const released = await group.filter().release()
     assert.deepEqual(released.digest, binding.digest)
@@ -459,7 +462,7 @@ void test("given_typed_custom_headers_when_filtered_then_should_preserve_types_a
     try {
       const record = await filtered.nextRecord({ timeoutMs: READ_TIMEOUT_MS })
       assert.equal(record.offset, 1n)
-      assert.deepEqual(record.payload, Uint8Array.of(0xff, 0x00))
+      assert.deepEqual(record.message.payload, Uint8Array.of(0xff, 0x00))
       await filtered.ack(record)
       assert.equal(await filtered.tryNextPage(), undefined)
     } finally {
@@ -519,8 +522,8 @@ void test(
       for (let partition = 0; partition < 9; partition += 1)
         await topic.send(new TextEncoder().encode(SAFE_MODE), { partition })
       const consumer = await topic.consumerGroup("cluster-desk").consumer({
-        startFrom: { kind: "first" },
-        autoCommit: false,
+        startAt: { kind: "first" },
+        commitPolicy: { kind: "disabled" },
         batchLength: 1,
         pollIntervalMs: 5
       })
@@ -528,7 +531,7 @@ void test(
         const seen = new Set<number>()
         for (let index = 0; index < 9; index += 1) {
           const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-          assert.equal(message.offset, 0n)
+          assert.equal(message.position.offset, 0n)
           seen.add(message.partitionId)
           await consumer.commit(message)
         }
@@ -699,7 +702,8 @@ void test("given_a_group_filter_when_members_rejoin_then_should_resume_and_refus
       }
       await assert.rejects(
         group.create({ filter: ConsumerFilter.json(FilterExpr.present("other")) }),
-        (error: unknown) => error instanceof ConsumerGroupSetupError && error.reason === "conflict"
+        (error: unknown) =>
+          error instanceof ConsumerGroupSetupError && filterReason(error.cause) === "conflict"
       )
       assert.deepEqual((await group.filter().get())?.digest, created.filter?.digest)
     } finally {
@@ -739,8 +743,11 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
         try {
           await stale.tryNextPage()
         } catch (error) {
-          if (error instanceof FilterExecutionError && error.reason === "not_found") refused = true
-          else if (!(error instanceof FilterExecutionError && error.reason === "source_changed"))
+          if (error instanceof FilterExecutionError && error.detail.reason === "not_found")
+            refused = true
+          else if (!(
+            error instanceof FilterExecutionError && error.detail.reason === "source_changed"
+          ))
             throw error
         }
       }

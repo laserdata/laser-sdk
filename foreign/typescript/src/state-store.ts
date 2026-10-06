@@ -35,7 +35,7 @@ function hexKey(key: string): string {
 }
 
 export class FileStore implements StateStore {
-  constructor(readonly root: string) {}
+  constructor(private readonly root: string) {}
 
   async get(key: string): Promise<Uint8Array | undefined> {
     try {

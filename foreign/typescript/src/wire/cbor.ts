@@ -19,10 +19,15 @@ const DECODE_OPTIONS = {
   }
 } as const
 
+// A prebuilt token, such as `cborFloat`, encodes as itself instead of as an
+// object map of its fields.
+const tokenEncoder = (value: unknown) => (value instanceof Token ? [value] : null)
+
 const ENCODE_OPTIONS = {
   mapSorter: () => 0,
   typeEncoders: {
-    bigint: bigIntEncoder
+    bigint: bigIntEncoder,
+    Object: tokenEncoder
   }
 } as const
 
@@ -30,9 +35,17 @@ const FORCE_FLOAT_ENCODE_OPTIONS = {
   mapSorter: () => 0,
   typeEncoders: {
     bigint: bigIntEncoder,
-    number: (value: number) => [new Token(Type.float, value)]
+    number: (value: number) => [new Token(Type.float, value)],
+    Object: tokenEncoder
   }
 } as const
+
+// A number that the wire declares as f32 or f64. It stays a CBOR float even when
+// it is integral, since the Rust decoder rejects an integer for a float field.
+/** @internal */
+export function cborFloat(value: number): Token {
+  return new Token(Type.float, value)
+}
 
 export type CborMap = ReadonlyMap<unknown, unknown>
 

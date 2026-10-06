@@ -99,7 +99,9 @@ class World:
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
         )
-        self.run(lambda: self.laser.send_agent(ls.Topics.COMMANDS, payload.encode(), provenance))
+        self.run(
+            lambda: self.laser.send_agent(ls.AgentTopic.Commands, payload.encode(), provenance)
+        )
 
     def assemble(self):
         self.assembled = self.run(lambda: self.laser.assemble_context(self.conversation))

@@ -18,6 +18,9 @@ pub mod agui;
 pub mod batching;
 #[cfg(feature = "agent")]
 pub mod blob;
+// The `bridge_hops` loop guard both protocol bridges stamp.
+#[cfg(any(feature = "a2a-bridge", feature = "mcp-bridge"))]
+mod bridge_hops;
 pub mod capabilities;
 #[cfg(feature = "streaming")]
 mod connect_options;

@@ -4,7 +4,8 @@ import {
   CodecError,
   ConsumerGroupSetupError,
   FilterExecutionError,
-  FilterStopError,
+  FilterFaultError,
+  FilterOversizedRecordError,
   HandlerError,
   InvalidError,
   LaserError,
@@ -15,7 +16,8 @@ import {
 } from "../client/errors.js"
 import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
-import type { IggyHeaderValue, LaserTransport } from "../iggy/apache-iggy.js"
+import type { LaserTransport } from "../iggy/apache-iggy.js"
+import type { HeaderValue } from "../stream/header-value.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import { decodeProvenanceHeaders, type Provenance } from "../provenance/provenance.js"
 import { SystemClock, type Clock } from "../runtime/clock.js"
@@ -42,7 +44,7 @@ import { type ContentType, contentTypeFromCode } from "../wire/content.js"
 import { AGENT_VERSION, CONTENT_TYPE, FENCE } from "../wire/headers.js"
 import type { LogPosition } from "../wire/ids.js"
 import type { Consumer, ConsumerMessage } from "../stream/consumer.js"
-import { AgentContext } from "./context.js"
+import { AgentCtx } from "./context.js"
 import { ADVERTISED_INBOX_ROUTE, type InboxRoute } from "./router.js"
 
 const DEDUP_SCOPE_SEP = "\u001f"
@@ -53,6 +55,9 @@ const FENCE_MAP_SOFT_CAP = 16_384
 const FENCE_ENTRY_TTL_MICROS = 600_000_000n
 
 const FENCE_SWEEP_INTERVAL_MICROS = 1_000_000n
+// How many verified record ids a consumer remembers to refuse a replay of the
+// exact signed bytes, sized like the fence map.
+const VERIFIED_RECORD_WINDOW = 16_384
 
 function tryAgentId(value: string): AgentId | undefined {
   try {
@@ -66,7 +71,7 @@ function fenceFromMetadata(
   metadata: ReadonlyMap<string, { readonly kind: string; readonly value?: unknown }> | undefined
 ): bigint | undefined {
   const entry = metadata?.get(FENCE)
-  if (entry?.kind !== "int") return undefined
+  if (entry?.kind !== "int" && entry?.kind !== "uint") return undefined
   const value = entry.value
   return typeof value === "bigint" && value >= 0n ? value : undefined
 }
@@ -93,7 +98,7 @@ export interface ReceivedAgentMessage {
   readonly partitionId: number
   readonly offset: bigint
   readonly timestampMicros?: bigint
-  readonly headers: ReadonlyMap<string, IggyHeaderValue>
+  readonly headers: ReadonlyMap<string, HeaderValue>
 }
 
 export interface ProvenanceAndEnvelope {
@@ -250,7 +255,7 @@ export class SlidingWindow implements Deduplicator {
 export function dedupKey(provenance: Provenance): string | undefined {
   if (provenance.idempotencyKey === undefined) return undefined
   return provenance.agent !== undefined
-    ? `${provenance.agent.asString()}${DEDUP_SCOPE_SEP}${provenance.idempotencyKey}`
+    ? `${provenance.agent.asStr()}${DEDUP_SCOPE_SEP}${provenance.idempotencyKey}`
     : provenance.idempotencyKey
 }
 
@@ -288,7 +293,7 @@ export function acceptFence(
 }
 
 export interface AgentHandler {
-  handle(message: AgentMessage, context: AgentContext): Promise<void>
+  handle(message: AgentMessage, context: AgentCtx): Promise<void>
 }
 
 export type HandlerResult =
@@ -296,7 +301,11 @@ export type HandlerResult =
 
 export interface AgentMiddleware {
   beforeHandle?(message: AgentMessage): Promise<void>
-  afterHandle?(message: AgentMessage, result: HandlerResult, attempt: number): Promise<void>
+  afterHandle?(
+    message: AgentMessage,
+    result: { readonly kind: "ok" } | { readonly kind: "error"; readonly error: LaserError },
+    attempt: number
+  ): Promise<void>
 }
 
 export interface DeadLetterSink {
@@ -326,7 +335,9 @@ export interface ReliableConsumerOptions {
   readonly deduplicator?: Deduplicator
   readonly warmDedup?: boolean
   readonly middleware?: readonly AgentMiddleware[]
-  readonly deadLetterSink?: DeadLetterSink
+  readonly onDeadLetter?: DeadLetterSink
+  /** Deadline and fence checks read this clock, the system clock by default.
+   * @internal */
   readonly clock?: Clock
   readonly verifier?: KeyRegistry
   readonly signingKey?: SigningKey
@@ -360,6 +371,8 @@ export function isRetryable(error: LaserError): boolean {
     case "ambiguous-mutation":
     case "unsupported":
     case "invalid":
+    case "id":
+    case "provenance":
     case "codec":
     case "protocol":
     case "handler-config":
@@ -398,7 +411,9 @@ export function isRetryable(error: LaserError): boolean {
       if (cause instanceof ConsumerGroupSetupError) {
         return cause.cause instanceof LaserError && isRetryable(cause.cause)
       }
-      if (cause instanceof FilterStopError) return false
+      if (cause instanceof FilterFaultError || cause instanceof FilterOversizedRecordError) {
+        return false
+      }
       return cause instanceof FilterExecutionError && resultCodeIsRetryable(cause.detail.code)
     case "timeout":
     case "handler":
@@ -422,6 +437,17 @@ async function nextOrIdle(
     )
       return undefined
     throw error
+  }
+}
+
+// The worker reads the record's log offset, which a delivery carries in its position.
+function received(message: ConsumerMessage): ReceivedAgentMessage {
+  return {
+    payload: message.payload,
+    partitionId: message.partitionId,
+    offset: message.position.offset,
+    timestampMicros: message.timestampMicros,
+    headers: message.headers
   }
 }
 
@@ -519,6 +545,9 @@ function shutdownControl(control: ReliableConsumerControl, graceMs: number) {
 class ReliableWorker {
   private readonly highWaterFence = new Map<string, FenceEntry>()
   private readonly fenceSweep: FenceSweepState = { lastSweepMicros: 0n }
+  // A signature binds the envelope to no log position, so the exact signed
+  // bytes verify again wherever a writer replays them.
+  private readonly verifiedRecords = new SlidingWindow(VERIFIED_RECORD_WINDOW)
 
   constructor(
     private readonly laser: Laser,
@@ -537,7 +566,7 @@ class ReliableWorker {
     > &
       Pick<
         ReliableConsumerOptions,
-        "agent" | "deadLetterSink" | "respondOn" | "signingKey" | "verifier"
+        "agent" | "onDeadLetter" | "respondOn" | "signingKey" | "verifier"
       > & { readonly hardSignal: AbortSignal },
     private readonly streamId: number,
     private readonly topicId: number
@@ -582,6 +611,8 @@ class ReliableWorker {
         await this.deadLetter(message, "Rejected", 0, "signature verification failed")
         return
       }
+      const record = message.envelope?.record
+      if (record !== undefined && !(await this.verifiedRecords.observe(record.toString()))) return
     }
     const fence = message.provenance.fenceToken
     if (
@@ -607,7 +638,7 @@ class ReliableWorker {
     }
     if (this.cancelled()) return
     await this.ackOnPickup(message)
-    const context = new AgentContext(this.laser, message, {
+    const context = AgentCtx.create(this.laser, message, {
       ...(this.options.agent !== undefined ? { agent: this.options.agent } : {}),
       ...(this.options.respondOn !== undefined ? { respondOn: this.options.respondOn } : {}),
       ...(this.options.signingKey !== undefined ? { signingKey: this.options.signingKey } : {}),
@@ -746,7 +777,7 @@ class ReliableWorker {
       publishError = handlerError(error)
     }
     try {
-      await this.options.deadLetterSink?.onDeadLetter(message, capsule, publishError)
+      await this.options.onDeadLetter?.onDeadLetter(message, capsule, publishError)
     } catch {
       // Dead-letter sinks observe the terminal delivery decision.
     }
@@ -755,7 +786,7 @@ class ReliableWorker {
 }
 
 export class ReliableConsumer {
-  readonly options: ReliableConsumerOptions
+  private readonly options: ReliableConsumerOptions
 
   constructor(options: ReliableConsumerOptions) {
     if (
@@ -789,9 +820,12 @@ export class ReliableConsumer {
     const deduplicator =
       this.options.deduplicator ?? new SlidingWindow(this.options.dedupWindow ?? 10_000)
     // The runtime owns its delivery contract over the native group consumer.
-    const group = laser.topic(this.options.topic).consumerGroup(this.options.group.asString())
+    const group = laser.topic(this.options.topic).consumerGroup(this.options.group.asStr())
     const openConsumer = (): Promise<Consumer> =>
-      group[INTERNAL_NATIVE_CONSUMER]({ autoCommit: false, pollIntervalMs }, "propagate")
+      group[INTERNAL_NATIVE_CONSUMER](
+        { commitPolicy: { kind: "disabled" }, pollIntervalMs },
+        "propagate"
+      )
     let consumer = await openConsumer()
     if (this.options.warmDedup === true) {
       await this.warmDedup(laser, deduplicator, this.options.dedupWindow ?? 10_000)
@@ -813,8 +847,8 @@ export class ReliableConsumer {
         deduplicator,
         ...(this.options.agent !== undefined ? { agent: this.options.agent } : {}),
         ...(this.options.respondOn !== undefined ? { respondOn: this.options.respondOn } : {}),
-        ...(this.options.deadLetterSink !== undefined
-          ? { deadLetterSink: this.options.deadLetterSink }
+        ...(this.options.onDeadLetter !== undefined
+          ? { onDeadLetter: this.options.onDeadLetter }
           : {}),
         ...(this.options.verifier !== undefined ? { verifier: this.options.verifier } : {}),
         ...(this.options.signingKey !== undefined ? { signingKey: this.options.signingKey } : {})
@@ -877,7 +911,7 @@ export class ReliableConsumer {
     while (control.signal?.aborted !== true) {
       const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
       if (message === undefined) continue
-      if (!(await consumeUntilDone(worker.consume(message), control.hardSignal))) return
+      if (!(await consumeUntilDone(worker.consume(received(message)), control.hardSignal))) return
       if (control.hardAborted?.() !== true) await consumer.commit(message)
     }
   }
@@ -901,7 +935,7 @@ export class ReliableConsumer {
     while (control.signal?.aborted !== true && failure === undefined) {
       const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
       if (message === undefined) continue
-      const position = `${String(message.partitionId)}:${message.offset.toString()}`
+      const position = `${String(message.partitionId)}:${message.position.offset.toString()}`
       if (scheduled.has(position)) continue
       const messageBytes = message.payload.byteLength + headerBytes(message.headers)
       while (
@@ -923,7 +957,7 @@ export class ReliableConsumer {
       const lane = (existing ?? Promise.resolve())
         .then(async () => {
           if (currentFailure() !== undefined || control.hardAborted?.() === true) return
-          await worker.consume(message)
+          await worker.consume(received(message))
           if (control.hardAborted?.() !== true) await consumer.commit(message)
         })
         .catch((error: unknown) => {
@@ -953,7 +987,7 @@ export class ReliableConsumer {
       const offset = await transport.getConsumerOffset(
         stream,
         this.options.topic,
-        { kind: "group", name: this.options.group.asString() },
+        { kind: "group", name: this.options.group.asStr() },
         partitionId
       )
       if (offset === undefined) continue
@@ -978,7 +1012,7 @@ export class ReliableConsumer {
   }
 }
 
-function headerBytes(headers: ReadonlyMap<string, IggyHeaderValue>): number {
+function headerBytes(headers: ReadonlyMap<string, HeaderValue>): number {
   let size = 0
   for (const [key, value] of headers) {
     size += TEXT_ENCODER.encode(key).byteLength

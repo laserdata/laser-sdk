@@ -5,7 +5,7 @@ This example groups messages by conversation and reads them under a token budget
 ## What it shows
 
 - Appends a command and a response to a fresh conversation with `ctx.append(topic, payload)`.
-- Reads the conversation back under a policy chain - the last 20 turns capped to a 4,000-token budget: `ctx.fetchWith(topics, new ContextChain([new LastN(20), new TokenBudget(4_000)]))`. The shape of a prompt's context is a declared policy, not slicing logic spread through the application.
+- Reads the conversation back under a policy chain - the last 20 turns capped to a 4,000-token budget: `ctx.fetchWith(topics, new Chain([new LastN(20), new TokenBudget(4_000)]))`. The shape of a prompt's context is a declared policy, not slicing logic spread through the application.
 - Prints the assembled turns in order.
 
 Runs against Apache Iggy - no LaserData Cloud needed.

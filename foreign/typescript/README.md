@@ -4,7 +4,7 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> The current release is `0.5.4`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.6.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
@@ -37,7 +37,7 @@ Use a `user:password@host:port` connection string. The SDK supplies the Apache I
 
 `Laser.connectEnv()` reads `LASER_CONNECTION_STRING` and optional `LASER_STREAM`. `Laser.local()` uses the default local server. `Laser.builder()` accepts a connection string, separate credentials, or an Apache Iggy client. For an injected client, select whether Laser SDK owns or borrows it.
 
-For owned connections, the SDK retries initial connections and reconnects dropped sockets. The default is unlimited retries at one-second intervals. Set `reconnection_retries` to a non-negative integer to limit retries. Set `reconnection_interval` to a duration such as `250ms`, `1s`, or `1m`. The caller controls the lifecycle and reconnect policy of an injected client.
+For owned connections, the SDK retries a failed dial and reconnects dropped sockets, by default without limit at one-second intervals. The 30-second connect budget stops the retries of the initial connection. Add `reconnection_retries` to the connection string with a non-negative integer to limit retries, and `reconnection_interval` with a duration such as `250ms`, `1s`, or `1m`, for example `iggy:iggy@127.0.0.1:8090?reconnection_retries=5&reconnection_interval=250ms`. The caller controls the lifecycle and reconnect policy of an injected client.
 
 The TypeScript SDK uses Iggy's native VSR transport for owned and injected clients.
 
@@ -46,11 +46,11 @@ The TypeScript SDK uses Iggy's native VSR transport for owned and injected clien
 `laser.stream(name).topic(name)` addresses any stream. `laser.topic(name)` is the default-stream shortcut. Topics support:
 
 - raw, JSON, CBOR, MessagePack, Avro, Protobuf, and JSON Schema records
-- exact headers, metadata, indexes, projection and schema IDs, inline payload, claim-check, routing keys, explicit partitions, and heterogeneous batches
+- exact headers, indexes, projection and schema IDs, inline payload, claim-check, routing keys, explicit partitions, and heterogeneous batches
 - direct producers with bounded retry, explicit batching, and stream and topic creation on the first send (`createStream`, `createTopic`, `partitions`)
 - a size-and-time batching publisher through `topic.batching()`
 - standalone and consumer-group readers with first, last, next, offset, or timestamp starts
-- the ten Rust commit policies through `commitPolicy` (`autoCommit` is the `polling` or `disabled` shorthand), explicit `commit`, `storeOffset`, `deleteOffset`, and `lastStoredOffset`, replay, cancellation, and bounded `nextWithin()` waits that fail with `TimeoutError`
+- the ten Rust commit policies through `commitPolicy`, such as `{ kind: "disabled" }` for manual commits, explicit `commit`, `storeOffset`, `deleteOffset`, and `lastStoredOffset`, replay, cancellation, and bounded `nextWithin()` waits that fail with `TimeoutError`
 
 Delivery is at least once, so records can repeat. Ordering applies within each selected partition. Make external effects idempotent, which means safe to repeat. For operations that require a lease holder token, use fenced managed coordination.
 
@@ -58,17 +58,17 @@ Producers and publish builders return `SendMessagesResponse`. A confirmation ide
 
 ## Runtime-checked records
 
-TypeScript types do not exist at runtime. A typed topic therefore takes a codec that checks decoded values. A generic type parameter alone cannot check incoming bytes.
+TypeScript types do not exist at runtime. A typed topic therefore takes a codec that checks decoded values. A generic type parameter alone cannot check incoming bytes. The `Json`, `Cbor`, `Msgpack`, and `Bson` codec classes take an optional decode check, and a custom `Codec<T>` declares its `contentType` with `encode` and `decode`.
 
 ```ts
-import { jsonCodec } from "@laserdata/laser-sdk"
+import { Json } from "@laserdata/laser-sdk"
 
 interface Reading {
   readonly host: string
   readonly cpu: number
 }
 
-const readingCodec = jsonCodec<Reading>((value) => {
+const readingCodec = new Json<Reading>((value) => {
   if (typeof value !== "object" || value === null)
     throw new TypeError("a reading must be an object")
   const reading = value as Record<string, unknown>
@@ -96,12 +96,7 @@ LaserData Cloud and Laser Stack report their capabilities at connection time and
 The root client provides queries, projections, schemas, key-value state, forks, graphs, access roles, runs, change feeds, and managed batches. Query calls use managed commands. They do not use a request topic. Reference data from the Rust implementation defines the expected AGDX encoding for each client.
 
 ```ts
-import {
-  graphNodeEntity,
-  queryResultValue,
-  typedValueDiagnosticText,
-  utf8
-} from "@laserdata/laser-sdk"
+import { graphNodeEntity, queryResultValue, typedValueDiagnosticText } from "@laserdata/laser-sdk"
 
 const degraded = await laser.query("readings_v1").whereEq("status", "degraded").limit(20).fetch()
 for (const row of degraded.rows) {
@@ -109,7 +104,7 @@ for (const row of degraded.rows) {
   console.log(cpu === undefined ? "missing" : typedValueDiagnosticText(cpu))
 }
 
-const key = utf8("service:auth")
+const key = new TextEncoder().encode("service:auth")
 await laser.kv("config").set(key).json({ log_level: "debug" }).ttl(300_000_000n).send()
 const stored = await laser.kv("config").get(key)
 
@@ -119,12 +114,15 @@ const nearby = await laser.graph("ops").neighbors(auth.id, "out", undefined, 2)
 
 `result.fields` defines the ordered result schema. Each `row.values` entry matches the field at the same position. Tagged values preserve numeric widths, decimal precision, timestamps, UUIDs, bytes, nested values, and nullability. Use `queryResultValue()` to select a field by name. Use `typedValueDiagnosticText()` for stable display text.
 
-The first page can use an offset. Later pages use the `nextCursor` supplied by the server. `hasMore` is true exactly when that cursor is present. `fetchAll()` follows these cursors. Each page contains at most 1000 rows.
+The first page can use an offset. Later pages use the `result.page.nextCursor` supplied by the server. `result.page.hasMore` is true exactly when that cursor is present. `fetchAll()` follows these cursors. Each page contains at most 1000 rows.
 
 A query has a stable execution identity and an absolute deadline, 30 seconds after the request was built unless you set `deadlineMicros(epochMicros)` or the relative `deadline(milliseconds)`. `status()` and `cancel()` use dedicated managed commands and fail locally when the deployment does not advertise those capabilities. `laser.executeQuery(query)`, `queryPage(executionId, cursor, deadlineMicros)`, `queryStatus(executionId)`, and `cancelQuery(executionId)` are the lower-level forms:
 
 ```ts
-const request = laser.query("readings_v1").filterGte("cpu", 90).deadline(10_000)
+const request = laser
+  .query("readings_v1")
+  .filterGte("cpu", { kind: "int", value: 90 })
+  .deadline(10_000)
 const page = await request.fetch()
 const status = await request.status()
 if (status.state === "running") await request.cancel()
@@ -136,7 +134,7 @@ Lakehouse queries name one destination generation and can select a retained snap
 const historical = await laser
   .queryLakehouse(destinationId, destinationGeneration)
   .atSnapshot(snapshotId)
-  .filterEq("host_id", "node-7")
+  .filterEq("host_id", { kind: "string", value: "node-7" })
   .limit(100)
   .fetch()
 
@@ -177,19 +175,21 @@ Accessors select operations without performing I/O. Methods such as `send()`, `f
 
 A replay cursor saves offsets only after all partition reads succeed. A failed or canceled poll leaves them unchanged. Each request reads at most 10,000 messages. Further polls resume from the saved offsets. The TypeScript cursor stream continues waiting for new records until it is stopped.
 
-Durable memory can use the default audit topic through `laser.memory(namespace)`, an existing isolated topic through `laser.memoryOnTopic(topic)`, or a configured topic:
+Durable memory can use the default audit topic through `laser.memory(namespace)`, an existing isolated topic through `laser.memoryOnTopic(topic)`, or a configured topic. Each form needs a stream, from `Laser.connectWithStream()` or `withDefaultStream()`. `memoryTopic(topic).stream(name)` and `memoryOnTopic(topic, stream)` name one directly:
 
 ```ts
 const incidents = await laser.memoryTopic("incidents").partitions(4).ttl(86_400_000).build()
 
-await incidents.remember(utf8("auth uses the read replica")).send()
+await incidents.remember(new TextEncoder().encode("auth uses the read replica")).send()
 ```
 
-Memory topic and consumer duration inputs use milliseconds. KV `ttl`, `expire`, and `expireAt` take microsecond `bigint` values. `noExpiry()` keeps the raw memory history until ordinary topic retention removes it.
+Memory topic and consumer duration inputs use milliseconds. KV `ttl` and `expire` take a lifetime and `expireAt` takes an absolute time, all as microsecond `bigint` values. `noExpiry()` keeps the raw memory history until ordinary topic retention removes it.
 
-**Filter before the network.** Configure a consumer group's policy once. Its ordinary consumers and page readers then receive the selected records with their original payloads, headers and offsets. The shared CDC feed delivers **4 of 240 records**, saving **98.5% of payload transfer**. An unbound group receives all records without payload decoding.
+Configure a consumer group's policy once. Its ordinary consumers and page readers then receive the selected records with their original payloads, headers and offsets. An unbound group receives all records without payload decoding.
 
 ```ts
+import { ConsumerFilter, FilterExpr } from "@laserdata/laser-sdk"
+
 const safeMode = ConsumerFilter.json(
   FilterExpr.all([
     FilterExpr.pred("table", "eq", "satellites"),
@@ -202,10 +202,10 @@ const group = topic.consumerGroup("anomaly-desk")
 await group.create({ filter: safeMode }) // Run once during setup.
 
 // Every consumer instance needs only the group name or the returned group ID.
-const consumer = await group.consumer({ batchLength: 100, autoCommit: false })
+const consumer = await group.consumer({ batchLength: 100, commitPolicy: { kind: "disabled" } })
 try {
   const record = await consumer.nextWithin(15_000) // TimeoutError when nothing matched in time
-  console.log(record.partitionId, record.offset, record.json())
+  console.log(record.position.partitionId, record.position.offset, record.json())
   await consumer.commit(record)
 } finally {
   await consumer.shutdown()
@@ -218,7 +218,7 @@ For batch handling, build `await group.reader().count(100).maxExamined(1000).bui
 
 `group.filter()` provides `configure`, `get`, `revisions`, `revise`, `setRevisionEnabled`, `release`, `delete`, `preview` and `test`. `delete()` removes the group's own filter with every revision and releases the group first. Use `configureAs(operationId, policy)` when setup must resume with the same operation ID after a lost reply. `topic.consumerGroupId(id)` addresses the same saved group by numeric ID. Catalog failures, denied reads and paused revisions never broaden into unfiltered delivery. Original Apache Iggy uses native group consumption, while an older managed server without group-aware reads returns an explicit upgrade error.
 
-Filters support JSON, CBOR, Avro, Protobuf and typed headers. `CompiledFilter.compile(filter).evaluate(record)` checks records locally with exact integers. `ConsumerFilter.withFaultPolicy`, `withForeignPolicy` and `withMismatchPolicy` control invalid records. Passed invalid records and unfiltered records have `evaluated` false. Malformed headers set `headersMalformed` without discarding valid entries or the payload. Server refusals throw `FilterExecutionError`, and fault or oversized stops throw `FilterStopError` with the stop reason. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
+Filters support JSON, CBOR, Avro, Protobuf and typed headers. `CompiledFilter.compile(filter).evaluate(record)` checks records locally with exact integers. `ConsumerFilter.withFaultPolicy`, `withForeignPolicy` and `withMismatchPolicy` control invalid records. Passed invalid records and unfiltered records have `evaluated` false. Malformed headers set `headersMalformed` without discarding valid entries or the payload. Server refusals throw `FilterExecutionError`. A fault stop throws `FilterFaultError` with its `reason`, and an oversized stop throws `FilterOversizedRecordError`. `filterReason(error)` reads the reason from any of them. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
 ## Agents and coordination
 
@@ -226,7 +226,7 @@ The agent layer adds record origins, typed AGDX messages, routing, discovery, re
 
 Sessions group one agent's conversation through `laser.sessions().create(id)`. `append(kind, data)` records a turn, and `context()` returns typed turns for a model. Turn kinds are `instruction`, `response`, `model.response`, `tool.call`, `tool.result`, and `human.input`. `memory().search(query)` searches memory scoped to the conversation.
 
-A checkpoint records the next offset for each topic partition. `checkpoint()`, `turnsAt`, `turnsSince`, `stateAt`, and `replay` support reads and state reconstruction around those saved offsets. `Checkpoint.fromJSON(JSON.stringify(checkpoint))` restores a saved checkpoint. `laser.sessions({ stream, topics, memoryNamespace, contextTurns, contextTokens })` configures the stream, topics, memory namespace, and context limits.
+A checkpoint records the next offset for each topic partition. `checkpoint()`, `turnsAt`, `turnsSince`, `stateAt`, and `replay` support reads and state reconstruction around those saved offsets. `Checkpoint.fromJSON(JSON.stringify(checkpoint))` restores a saved checkpoint. `laser.sessions(new SessionConfig().stream(name).topic(kind, topic).memoryNamespace(ns).contextTurns(n).contextTokens(n))` configures the stream, topics, memory namespace, and context limits. Each turn kind needs a distinct topic.
 
 The root package provides context, snapshots, memory, governance, intent records, signing, delegation, A2A, MCP, AG-UI, and edge authorization. A configured verifier rejects unsigned or invalid replies for contracts, shared reply readers, and `requestInput`. It binds signatures to the observed headers and server timestamp. An agent with a signing key signs its `respond` and `respondInput` replies. `KvKeyRegistry` manages versioned keys through the platform. The SDK records model-call metadata but does not call a model.
 
@@ -238,10 +238,11 @@ await using handle = Agent.builder()
   .listenOn(AgentTopic.Commands)
   .respondOn(AgentTopic.Responses)
   .handler({
-    handle(message, context) {
-      return context.respond(message.payload)
+    handle(message, ctx) {
+      return ctx.respond(message.payload)
     }
   })
+  .build()
   .spawn(laser)
 
 await handle.ready()
@@ -254,18 +255,58 @@ Waiting operations accept `AbortSignal` or an explicit timeout where their contr
 
 SDK failures extend `LaserError` and carry a stable `kind`. Separate subclasses identify configuration, timeout, cancellation, unknown mutation outcomes, unsupported operations, encoding, transport, policy, and signature failures. Catch a specific subclass when it needs different recovery. Otherwise, report the base error and its cause.
 
-A failed publish throws `PublishFailedError` with the `stream`, `topic`, the `committed` confirmations, and the `unconfirmed` records. `publishCause()` reaches the original failure. The classifiers mirror the Rust `LaserError` methods and answer through any publish wrapping: `isPermissionDenied`, `isUnsupported`, `isNotFound`, `isUnavailable`, `isNotLeader`, `isStale`, `isVersionSkew`, `isVersionConflict`, `isAmbiguousMutation`, `isStreamOrTopicNotFound`, `isNoCapableAgent`, `isLeaseLost`, `isFenceViolation`, `isBudgetExceeded`, `isQuarantined`, `filterReason`, and `code`, which returns the unified result code. `utf8(text)` and `decodeUtf8(bytes)` convert payloads.
+A failed publish throws `PublishFailedError` with the `stream`, `topic`, the `committed` confirmations, and the `unconfirmed` records. `publishCause()` reaches the original failure, so an `instanceof TransportError` check around a publish no longer matches. The classifiers mirror the Rust `LaserError` methods and answer through any publish wrapping: `isPermissionDenied`, `isUnsupported`, `isNotFound`, `isUnavailable`, `isNotLeader`, `isStale`, `isVersionSkew`, `isVersionConflict`, `isAmbiguousMutation`, `isStreamOrTopicNotFound`, `isNoCapableAgent`, `isLeaseLost`, `isFenceViolation`, `isBudgetExceeded`, `isQuarantined`, `isRetryable`, `filterReason`, `iggyErrorCode`, and `code`, which returns the unified result code. Routing failures throw `NoCapableAgentError`, `NoInboxError`, or `RoutePrincipalMismatchError`. Invalid identifiers throw `IdError` and malformed provenance headers throw `ProvenanceError`. Payloads are `Uint8Array`, so `TextEncoder` and `TextDecoder` convert text.
 
 `Laser.connect*()` owns its Apache Iggy client. `Laser.builder()` can own or borrow an injected client. `Laser`, `Producer`, `Consumer`, and `AgentHandle` support `await using`. Their `close()` and `shutdown()` methods are safe to repeat. `close()` on any `Laser` view ends the shared connection for every view. Disposing a scoped view with `await using` leaves the root connection open.
+
+## Connect timeout
+
+Connecting gives up after 30 seconds. Set another budget in milliseconds with `Laser.builder().connectTimeout()` or the `LASER_CONNECT_TIMEOUT_MS` environment variable. Explicit configuration overrides the variable. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe. An expired budget rejects with a `TimeoutError` that says whether the server never accepted the connection or never answered the login. `laser.stream(name).delete()` removes a stream you no longer need, and `laser.close()` ends the shared connection. See [connect timeout and cleanup](../../docs/connect-timeout.md).
+
+## Publish recovery
+
+Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Set them with `publishTimeout`, `publishMaxRetries`, and `publishRetryBackoff` on `Laser.builder()`, or with `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides the variables. Exhausted retries reject with a `PublishFailedError`, so check `committed` before resending. A batching publisher from `topic.batching()` keeps a failed timer flush until `send()`, `flush()`, or `close()` reports it. See [publish recovery and outage handling](../../docs/publish-recovery.md).
+
+## Consumer filter groups and offsets
+
+**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `maxUnackedPages`, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+Avro and Protobuf filters use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. Headers-only filters work with any payload format. Filtering preserves original bytes and offsets.
+
+For an application checkpoint inside a filtered page, call `reader.ackThrough(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ackPage` when the whole page is complete.
+
+Consumer-filter patterns use the server's bounded Rust regex engine. TypeScript validates structure and lets the server decide regex syntax. A local `CompiledFilter` refuses regex predicates, because only the server's engine defines their meaning. A filter permits four compiled glob or regex predicates, with a 256 KiB program budget each. Enabling `localGuard(true)` on a reader whose filter has regex predicates throws a `ConfigError` instead of skipping verification. Guards verify unevaluated records under the server's reported decoder bounds and the applicable pass policy.
+
+## 0.6.0 additions
+
+These match the Rust and Python surfaces:
+
+- Producer options `batchLength`, `lingerMs`, `maxTopicBytes`, `unlimitedTopicSize`, and `background`. In background mode a send returns once its records are buffered, and `shutdown()` drains the buffer, closes, and reports a background send failure.
+- `QueryRequest.atSnapshot(id)`, `atTimestampMicros(ts)`, and `rowsTyped(codec)`.
+- `MemoryHandle.backend`, `AgentScope.contract(router)`, and `SwappableGovernor.current()`.
+- Capability helpers `isOpenOnly`, `servesConsistency`, `isReady`, `readinessReasons`, `enabledBackends`, and `unreadyBackends`.
+- `AgdxSend.claimCheck(store, thresholdBytes)` moves a body at or over the threshold to the blob store before signing.
+- `ConversationId.asU128()` returns the raw 128-bit ULID value.
+- `MemoryHandle.consolidate` and `ScopedMemory.consolidate` take `{ summarizer, pruneSummarized }` to fold `message` items into one summary per conversation and to forget the folded items.
+- `filterCapsEvaluates(filters, evaluatorVersion, codec)` tells whether the server evaluates a filter exactly as this build does.
+- `KeyRecord.keyId()` returns the 8-byte identifier of the record's public key.
+- `MemoryHandler` wraps an agent handler, and `autoRemember(kind)` remembers each handled message under its conversation.
+- `cardIsFresh`, `cardServes`, and `cardAvailableFor` check the freshness, the skills, and the advertised health of a registered card.
+- `new ProjectionBuilder(id)`, `new ProjectionBindingBuilder()`, and `new IndexSchemaBuilder()` build projection declarations with the Rust defaults.
+- `laser.fork(id)` returns a `ForkHandle` whose `id` names the fork.
+
+## 0.6.0 breaking changes
+
+0.6.0 changes several TypeScript signatures. A publish that gives up throws `PublishFailedError` around the original error, `Consumer.nextWithin` throws `TimeoutError` instead of returning `null`, and `Kv.expire` takes a lifetime while `expireAt` takes an absolute time. `ConsolidationReport` reports `summarized`, `reweighted`, `pruned`, and `derived`, and `Consolidator.consolidate(scope, signal?)` no longer receives a memory argument. Fork row embeddings take numbers. The [client behavior guide](../../docs/client-behavior.md) lists every change with its replacement.
 
 ## Package exports
 
 - `@laserdata/laser-sdk` is the ordinary application surface
-- `@laserdata/laser-sdk/full` adds the complete native wire namespace
-- `@laserdata/laser-sdk/testing` provides clocks, stores, fake transports, factories, observers, and bounded eventually checks
+- `@laserdata/laser-sdk/full` adds the native `wire` namespace
+- `@laserdata/laser-sdk/testing` provides `TestClock`, `InMemoryStore`, and the `agentMessage` and `agentCtx` factories for handler tests
 - `@laserdata/laser-sdk/opentelemetry` adapts the observer seam to OpenTelemetry
 
-`laser.iggyClient` (a property) is the Apache Iggy escape hatch for native administrative or transport operations that Laser does not wrap.
+`laser.client` (a property) is the Apache Iggy escape hatch for native administrative or transport operations that Laser does not wrap.
 
 ## Examples and verification
 
@@ -281,45 +322,3 @@ npm run verify
 ## Security and license
 
 Report security issues through the repository security policy. The package is Apache-2.0 licensed. Apache and Apache Iggy are trademarks of the Apache Software Foundation.
-
-## Connect timeout
-
-Connecting gives up after 30 seconds. Set another budget with the Rust `connect_timeout` builder method, the Python `connect_timeout_ms` connect argument, or the TypeScript `connectTimeout` builder method. The environment variable is `LASER_CONNECT_TIMEOUT_MS`, and explicit configuration overrides it. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe. An expired budget returns a timeout error that says whether the server never accepted the connection or never answered the login. `stream(name).delete()` removes a stream you no longer need, and `close()` ends the shared connection.
-
-See [connect timeout and cleanup](../../docs/connect-timeout.md).
-
-## Publish recovery
-
-Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
-
-See [publish recovery and outage handling](../../docs/publish-recovery.md).
-
-## Consumer filter groups and offsets
-
-**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh named consumer using `Next` starts at the first retained record. Ordinary consumers auto-commit each polled batch before delivery by default, so a later consumer can resume after records the application did not process. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `maxUnackedPages`, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
-
-**Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
-
-For an application checkpoint inside a filtered page, call `reader.ackThrough(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ackPage` when the whole page is complete. Regex predicates reject an enabled TypeScript local guard instead of silently skipping verification.
-
-Consumer-filter patterns use the server's bounded Rust regex engine. TypeScript validates structure and lets the server decide regex syntax. A local `CompiledFilter` refuses regex predicates, because only the server's engine defines their meaning. A filter permits four compiled glob or regex predicates, with a 256 KiB program budget each. Local guards reject regex filters explicitly. Guards verify unevaluated records under the server's reported decoder bounds and the applicable pass policy.
-
-## 0.5.4 additions
-
-These match the Rust and Python surfaces:
-
-- Producer options `batchLength`, `lingerMs`, `maxTopicBytes`, `unlimitedTopicSize`, and `background`. In background mode a send returns once queued, `flush()` drains the queue, and `shutdown()` flushes before closing.
-- `QueryRequest.atSnapshot(id)`, `atTimestampMicros(ts)`, and `rowsTyped(codec)`.
-- `MemoryHandle.backend`, `AgentScope.contract(router)`, and `SwappableGovernor.current()`.
-- Capability helpers `isOpenOnly`, `servesConsistency`, `isReady`, `readinessReasons`, `enabledBackends`, and `unreadyBackends`.
-- `AgdxSend.claimCheck(store, thresholdBytes)` moves a body at or over the threshold to the blob store before signing.
-- `ConversationId.asU128()` returns the raw 128-bit ULID value.
-- `MemoryHandle.consolidate` and `ScopedMemory.consolidate` take `{ summarizer, pruneSummarized }` to fold `message` items into one summary and to forget the folded items.
-- `filterCapsEvaluates(filters, evaluatorVersion, codec)` tells whether the server evaluates a filter exactly as this build does.
-- `KeyRecord.keyId()` returns the 8-byte identifier of the record's public key.
-- `MemoryHandler` wraps an agent handler, and `autoRemember(kind)` remembers each handled message under its conversation.
-- `cardIsFresh`, `cardServes`, and `cardAvailableFor` check the freshness, the skills, and the advertised health of a registered card.
-
-Batching producers serialize flushes. A failed timer flush never stops the timer. Its failure is kept until `flush()` or `close()` reports it, after that call has drained the queue. `send()` reports only the failure of its own inline flush. Several kept failures arrive as one publish failure that lists the records of every failed batch. Inspect a publish failure before retrying because some records can already be committed.
-
-ConsolidationReport uses summarized, reweighted, pruned, and derived. The old scanned, kept, and forgotten aliases are removed. Consolidators own their memory and receive a scope. Coordination clients expose terminal close and asynchronous disposal. ManagedKvTransport.close is optional, with reset as its default. See [client behavior and migration](../../docs/client-behavior.md).

@@ -13,9 +13,31 @@ use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 use std::collections::BTreeMap;
 
+/// A source of the current time in epoch microseconds. Subclass it and
+/// override `now_micros` for a custom clock.
+#[gen_stub_pyclass]
+#[pyclass(name = "Clock", subclass, frozen)]
+pub struct PyClock;
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyClock {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    /// The current time, epoch microseconds.
+    fn now_micros(&self) -> PyResult<u64> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "a Clock subclass must override now_micros",
+        ))
+    }
+}
+
 /// The current time in epoch microseconds from the native Rust clock.
 #[gen_stub_pyclass]
-#[pyclass(name = "SystemClock", frozen)]
+#[pyclass(name = "SystemClock", extends = PyClock, frozen)]
 pub struct PySystemClock {
     inner: SystemClock,
 }
@@ -24,8 +46,8 @@ pub struct PySystemClock {
 #[pymethods]
 impl PySystemClock {
     #[new]
-    fn new() -> Self {
-        Self { inner: SystemClock }
+    fn new() -> PyClassInitializer<PySystemClock> {
+        PyClassInitializer::from(PyClock).add_subclass(PySystemClock { inner: SystemClock })
     }
 
     fn now_micros(&self) -> u64 {
@@ -35,7 +57,7 @@ impl PySystemClock {
 
 /// A shared test clock with native unsigned 64-bit time and wrapping advance.
 #[gen_stub_pyclass]
-#[pyclass(name = "TestClock", frozen)]
+#[pyclass(name = "TestClock", extends = PyClock, frozen)]
 pub struct PyTestClock {
     inner: TestClock,
 }
@@ -45,10 +67,10 @@ pub struct PyTestClock {
 impl PyTestClock {
     #[new]
     #[pyo3(signature = (start_micros=0))]
-    fn new(start_micros: u64) -> Self {
-        Self {
+    fn new(start_micros: u64) -> PyClassInitializer<PyTestClock> {
+        PyClassInitializer::from(PyClock).add_subclass(PyTestClock {
             inner: TestClock::new(start_micros),
-        }
+        })
     }
 
     fn now_micros(&self) -> u64 {
@@ -83,10 +105,10 @@ pub fn sign_card_value(
 pub fn verify_card(
     card: &Bound<'_, PyAny>,
     signature: &Bound<'_, PyAny>,
-    verifying_key: Vec<u8>,
+    verifying: Vec<u8>,
 ) -> PyResult<()> {
-    let key = KeyRecord::from_verifying_bytes("card", &verifying_key, KeyKind::Agent)
-        .map_err(to_pyerr)?;
+    let key =
+        KeyRecord::from_verifying_bytes("card", &verifying, KeyKind::Agent).map_err(to_pyerr)?;
     laser_sdk::sign::verify_card(&py_to_json(card)?, &py_to_de(signature)?, &key.verifying)
         .map_err(to_pyerr)
 }

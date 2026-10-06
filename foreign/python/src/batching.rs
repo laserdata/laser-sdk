@@ -10,7 +10,9 @@ use tokio::sync::Mutex;
 
 /// A size-and-time batching publisher, built by `Topic.batching`. `send`
 /// queues a payload and flushes inline when a size bound trips, `flush` sends
-/// what is queued, and `close` flushes and stops the linger timer.
+/// what is queued, and `close` flushes and stops the linger timer. A failed
+/// linger flush never stops the timer. Its failure is kept and raised by the
+/// next `send`, `flush`, or `close`, whichever comes first.
 #[gen_stub_pyclass]
 #[pyclass(name = "BatchingProducer", frozen)]
 pub struct PyBatchingProducer {
@@ -50,7 +52,10 @@ impl PyBatchingProducer {
 #[pymethods]
 impl PyBatchingProducer {
     /// Queue `payload` with optional `headers`. Flushes inline when a size
-    /// bound trips, so backpressure lands on the sender.
+    /// bound trips, so backpressure lands on the sender, and raises that
+    /// flush's failure with this record unconfirmed. When a linger flush
+    /// failed before this call, the record is not queued: it raises that kept
+    /// failure with this record added to its unconfirmed records, once.
     #[pyo3(signature = (payload, *, headers=None))]
     fn send<'py>(
         &self,
@@ -68,7 +73,8 @@ impl PyBatchingProducer {
         })
     }
 
-    /// Flush everything queued as one batch append. A no-op on an empty queue.
+    /// Flush everything queued as one batch append, then raise the failure an
+    /// earlier linger flush kept, if any. A no-op on an empty queue.
     fn flush<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -77,7 +83,8 @@ impl PyBatchingProducer {
         })
     }
 
-    /// Flush and stop the linger timer. Later sends raise `InvalidError`.
+    /// Flush and stop the linger timer, then raise a kept linger failure.
+    /// Later sends raise `InvalidError`.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {

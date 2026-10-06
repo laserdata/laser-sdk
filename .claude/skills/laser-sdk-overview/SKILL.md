@@ -16,14 +16,15 @@ Repo-wide rules (verification order, idiomatic-traits, no `cargo install`, no em
 - [Module map](#module-map)
 - [Shipped vs planned](#shipped-vs-planned)
 - [Cite by symbol, not line number](#cite-by-symbol-not-line-number)
+- [Client behavior docs](#client-behavior-docs)
 
 ## What this crate is
 
 Laser SDK uses an append-only log for source records. Projections, queries, key-value state, and forks provide views over that data. AGDX defines the shared exchange contract.
 
-The workspace publishes `laser-wire`, the Rust `laser-sdk`, Python bindings, and a native TypeScript client, all at version `0.5.4`. The three clients expose the same public surface. The [cross-SDK parity matrix](../../../docs/parity.md) maps every Rust symbol to its Python and TypeScript spelling and records each deliberate difference. Update it in the same change as any public API. Rust defines the codes, envelopes, dictionaries, limits, and reference files. Python calls the Rust implementation. TypeScript uses the same encoded files and behavior scenarios. The SDKs do not call language models.
+The workspace publishes `laser-wire`, the Rust `laser-sdk`, Python bindings, and a native TypeScript client, all at version `0.6.0`. The three clients expose streaming, managed, and agent surfaces. The [cross-SDK parity matrix](../../../docs/parity.md) maps Rust types, fields, error payloads, constants, and callable APIs to their Python and TypeScript forms, and reports unresolved mappings and peer-only APIs. Update it in the same change as any public API. Rust defines the codes, envelopes, dictionaries, limits, and reference files. Python calls the Rust implementation. TypeScript uses the same encoded files and behavior scenarios. The SDKs do not call language models.
 
-`laser_sdk::prelude::*` imports common accessors and types, about 35 items. `laser_sdk::prelude::full::*` also imports bridge, projection, and memory types. Examples and integration tests use `full`. Application code can use the smaller prelude with explicit imports. `ReliableConsumer` is the public consumer, and `ReliableWorker` is its private message adapter.
+`laser_sdk::prelude::*` imports the common accessors and types. `laser_sdk::prelude::full::*` also imports bridge, projection, and memory types. Examples and integration tests use `full`. Application code can use the smaller prelude with explicit imports. `ReliableConsumer` is the public consumer, and `ReliableWorker` is its private message adapter.
 
 `Laser::connect(connection_string)` opens a connection. `laser.stream(name)` selects a stream with `ensure()` and `topic(name)` methods. `laser.stream(name).topic(name)` addresses a topic explicitly. `laser.topic(name)` uses the default selected by `connect_with_stream` or `with_default_stream`. Without a default, it returns `NoStream`.
 
@@ -86,14 +87,6 @@ The one canonical inventory lives in [AGENTS.md](../../../AGENTS.md#what-is-ship
 
 Refer to `Laser::send_agent`, `ReliableConsumer::run`, `keys::CONVERSATION_ID`, not line numbers. Lines drift, symbols do not.
 
-## Publish recovery
+## Client behavior docs
 
-Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
-
-Publish attempts default to 60 seconds with three retries. Retry delays start at 250 ms, double after each failure, and stop increasing at 30 seconds.
-
-Connect budgets use Rust `connect_timeout`, Python `connect_timeout_ms`, and TypeScript `connectTimeout`, overriding `LASER_CONNECT_TIMEOUT_MS` (default 30000, see [connect timeout and cleanup](../../../docs/connect-timeout.md)). Rust builder methods are `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff`. Python `Laser.connect` keywords are `publish_timeout_ms`, `publish_max_retries`, and `publish_retry_backoff_ms`. TypeScript builder methods are `publishTimeout`, `publishMaxRetries`, and `publishRetryBackoff`. Explicit configuration overrides `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`.
-
-Exhausted retries return an error for the application to handle. They do not exit the process. Preserve message identity and confirmed chunks across retries. See [publish recovery](../../../docs/publish-recovery.md).
-
-The [client behavior guide](../../../docs/client-behavior.md) covers all 0.5.4 changes. Prepared coordination, memory summaries and handlers, full context controls, callback cancellation, and agent ownership are shared across the clients. The parity gate includes generated builders.
+Connect and publish defaults, failure reports, and the 0.6.0 upgrade steps each have one owning page: [connect timeout and cleanup](../../../docs/connect-timeout.md), [publish recovery](../../../docs/publish-recovery.md), [producer statistics](../../../docs/producer-statistics.md), and [client behavior](../../../docs/client-behavior.md). Link to them instead of restating defaults here or in another skill.

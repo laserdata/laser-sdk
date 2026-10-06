@@ -1,6 +1,7 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
 use crate::consumer_group::PyConsumerGroup;
+use crate::convert::BodyValue;
 use crate::errors::{InvalidError, to_pyerr};
 use crate::publish::{PyBatchPublish, PyPublish};
 use crate::reader::PyCursor;
@@ -8,11 +9,10 @@ use crate::transport::{
     ConsumerConfig, ProducerSettings, PyConsumer, PyProducer, configure_consumer,
     positive_duration_ms, routing,
 };
-use crate::typed::{PyTypedRecords, body_to_json};
+use crate::typed::{PyTypedTopic, TypedForm, body_to_json};
 use iggy::prelude::IggyExpiry;
 use laser_sdk::error::LaserError;
 use laser_sdk::laser::Laser;
-use laser_sdk::typed::TypedTopic;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -34,18 +34,10 @@ impl PyLaser {
     /// The topic accessor against the default stream, the one-word shortcut
     /// (`laser.stream(name).topic(name)` addresses any topic on any stream).
     /// Raises the typed no-stream error at the verbs when the client was
-    /// connected without a default stream. Pass `cls=` (a dataclass or
-    /// pydantic model) for the typed handle: `publish(body)` encodes it and
-    /// `records(reader_name)` decodes every record back into the class.
-    #[pyo3(signature = (name, *, cls=None))]
-    fn topic(&self, name: String, cls: Option<Py<PyAny>>) -> PyTopic {
-        PyTopic {
-            laser: self.inner.clone(),
-            stream: None,
-            name,
-            cls,
-            form: TopicForm::Json,
-        }
+    /// connected without a default stream. `json(cls)`, `cbor(cls)`, and
+    /// `schema(schema_id, cls)` open the typed handle over it.
+    fn topic(&self, name: String) -> PyTopic {
+        PyTopic::new(self.inner.clone(), None, name)
     }
 }
 
@@ -66,17 +58,9 @@ impl PyStream {
         self.name.clone()
     }
 
-    /// A topic on this stream. Pass `cls=` (a dataclass or pydantic model)
-    /// for the typed handle.
-    #[pyo3(signature = (name, *, cls=None))]
-    fn topic(&self, name: String, cls: Option<Py<PyAny>>) -> PyTopic {
-        PyTopic {
-            laser: self.laser.clone(),
-            stream: Some(self.name.clone()),
-            name,
-            cls,
-            form: TopicForm::Json,
-        }
+    /// A topic on this stream.
+    fn topic(&self, name: String) -> PyTopic {
+        PyTopic::new(self.laser.clone(), Some(self.name.clone()), name)
     }
 
     /// Idempotently create this stream.
@@ -105,36 +89,33 @@ impl PyStream {
 /// One topic: where records live. Publish to it, replay it, ensure it. Build
 /// with `Laser.topic` (default stream) or `Stream.topic`.
 #[gen_stub_pyclass]
-#[pyclass(name = "Topic")]
+#[pyclass(name = "Topic", skip_from_py_object)]
+#[derive(Clone)]
 pub struct PyTopic {
     laser: Laser,
     stream: Option<String>,
     name: String,
-    cls: Option<Py<PyAny>>,
-    form: TopicForm,
-}
-
-// How the typed handle encodes bodies and decodes records: the JSON serde form
-// (the default), the CBOR serde form, or a registered writer schema resolved
-// and compiled once when the handle is built.
-#[derive(Clone)]
-enum TopicForm {
-    Json,
-    Cbor,
-    Schema(Box<TypedTopic<serde_json::Value>>),
-}
-
-impl TopicForm {
-    fn typed(&self, topic: laser_sdk::stream::Topic) -> TypedTopic<serde_json::Value> {
-        match self {
-            Self::Json => topic.json(),
-            Self::Cbor => topic.cbor(),
-            Self::Schema(typed) => (**typed).clone(),
-        }
-    }
 }
 
 impl PyTopic {
+    pub(crate) fn new(laser: Laser, stream: Option<String>, name: String) -> Self {
+        Self {
+            laser,
+            stream,
+            name,
+        }
+    }
+
+    fn typed(&self, cls: Option<Py<PyAny>>, form: TypedForm) -> PyTypedTopic {
+        PyTypedTopic::new(
+            self.laser.clone(),
+            self.stream.clone(),
+            self.name.clone(),
+            cls,
+            form,
+        )
+    }
+
     fn handle(&self) -> laser_sdk::stream::Topic {
         match &self.stream {
             Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
@@ -154,38 +135,32 @@ impl PyTopic {
 
     /// Start publishing a single record. Chain `.index(..)`, `.json(..)` /
     /// `.msgpack(..)` / `.payload(..)`, then `await .send()`. With `body`
-    /// given, the record is already typed: a dataclass instance, a pydantic
-    /// model, or any JSON-shaped value is encoded as JSON with `agdx.ct`
-    /// stamped, and the builder is ready to `.send()`.
+    /// given, a dataclass instance, a pydantic model, or any JSON-shaped value
+    /// is encoded as JSON with `agdx.ct` stamped, and the builder is ready to
+    /// `.send()`.
     #[pyo3(signature = (body=None))]
     fn publish(&self, body: Option<&Bound<'_, PyAny>>) -> PyResult<PyPublish> {
         let request = PyPublish::new(self.laser.clone(), self.stream.clone(), self.name.clone());
-        match (body, &self.form) {
-            (Some(body), TopicForm::Json) => Ok(request.with_json_body(body_to_json(body)?)),
-            (Some(body), form) => {
-                request.with_typed_body(form.typed(self.handle()), body_to_json(body)?)
-            }
-            (None, TopicForm::Json) => Ok(request),
-            (None, _) => Err(InvalidError::new_err(
-                "a CBOR or schema-bound publish requires a body",
-            )),
+        match body {
+            Some(body) => Ok(request.with_json_body(body_to_json(body)?)),
+            None => Ok(request),
         }
     }
 
-    /// The typed handle in the CBOR serde form: the same contract as `cls=`
-    /// with a binary self-describing body and `agdx.ct=cbor`. `publish(body)`
-    /// encodes CBOR and `records(reader_name)` decodes it back into `cls`, or
-    /// into a plain Python object when no class is set.
+    /// The typed handle in the JSON serde form: `publish(body)` encodes the
+    /// body (a dataclass, a pydantic model, or any JSON-shaped value) with
+    /// `agdx.ct=json`, and `records(reader_name)` decodes every record back
+    /// into `cls`, or into a plain Python object when no class is set.
     #[pyo3(signature = (cls=None))]
-    fn cbor(&self, cls: Option<Py<PyAny>>) -> PyTopic {
-        PyTopic {
-            laser: self.laser.clone(),
-            stream: self.stream.clone(),
-            name: self.name.clone(),
-            cls: cls
-                .or_else(|| Python::attach(|py| self.cls.as_ref().map(|cls| cls.clone_ref(py)))),
-            form: TopicForm::Cbor,
-        }
+    fn json(&self, cls: Option<Py<PyAny>>) -> PyTypedTopic {
+        self.typed(cls, TypedForm::Json)
+    }
+
+    /// The typed handle in the CBOR serde form: the same contract as `json`
+    /// with a binary self-describing body and `agdx.ct=cbor`.
+    #[pyo3(signature = (cls=None))]
+    fn cbor(&self, cls: Option<Py<PyAny>>) -> PyTypedTopic {
+        self.typed(cls, TypedForm::Cbor)
     }
 
     /// The typed handle bound to registered writer schema `schema_id`: resolves
@@ -202,50 +177,15 @@ impl PyTopic {
         schema_id: u32,
         cls: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let stream = self.stream.clone();
-        let name = self.name.clone();
-        let cls = cls.or_else(|| self.cls.as_ref().map(|cls| cls.clone_ref(py)));
+        let topic = PyTopic::new(self.laser.clone(), self.stream.clone(), self.name.clone());
+        let handle = self.handle();
         future_into_py(py, async move {
-            let topic = match &stream {
-                Some(stream) => laser.stream(stream.clone()).topic(&*name),
-                None => laser.topic(&*name),
-            };
-            let typed = topic
-                .schema::<serde_json::Value>(schema_id)
+            let typed = handle
+                .schema::<BodyValue>(schema_id)
                 .await
                 .map_err(to_pyerr)?;
-            Ok(PyTopic {
-                laser,
-                stream,
-                name,
-                cls,
-                form: TopicForm::Schema(Box::new(typed)),
-            })
+            Ok(topic.typed(cls, TypedForm::Schema(Box::new(typed))))
         })
-    }
-
-    /// The typed reader over this topic under the consumer identity
-    /// `reader_name`, decoding every record into the topic's `cls` (pass
-    /// `cls=` at `laser.topic(..)`, `cbor(..)`, or `schema(..)`). A topic
-    /// without a class yields each decoded value as a plain Python object.
-    /// Own the offsets exactly like `replay()`: persist `offsets` and resume
-    /// with `from_offsets=`.
-    #[pyo3(signature = (reader_name, *, batch=None, from_offsets=None))]
-    fn records(
-        &self,
-        reader_name: String,
-        batch: Option<u32>,
-        from_offsets: Option<Vec<u64>>,
-    ) -> PyTypedRecords {
-        PyTypedRecords::new(
-            self.form.typed(self.handle()),
-            self.name.clone(),
-            Python::attach(|py| self.cls.as_ref().map(|cls| cls.clone_ref(py))),
-            reader_name,
-            batch,
-            from_offsets.unwrap_or_default(),
-        )
     }
 
     /// One raw message with explicit user `headers` (a dict of header name to
@@ -274,15 +214,15 @@ impl PyTopic {
 
     /// Many raw payloads in one Iggy send, all sharing `partition_key` (or
     /// balanced when `None`). An empty list is a cheap no-op.
-    #[pyo3(signature = (payloads, *, partition_key=None))]
+    #[pyo3(signature = (messages, *, partition_key=None))]
     fn batch<'py>(
         &self,
         py: Python<'py>,
-        payloads: Vec<Bound<'_, PyAny>>,
+        messages: Vec<Bound<'_, PyAny>>,
         partition_key: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let handle = self.handle();
-        let messages = payloads
+        let messages = messages
             .iter()
             .map(|payload| {
                 let bytes = crate::convert::payload_bytes(payload)?;
@@ -337,11 +277,12 @@ impl PyTopic {
     /// below the typed publish API: tune batching/linger/retries,
     /// topology creation, and default key or partition, then `await send(...)`.
     /// `background=True` switches to Apache Iggy's buffered, sharded send mode
-    /// (`background_shards` workers, flushing at `batch_length` records or
-    /// after `linger_ms`). A send then returns once the record is queued, so
-    /// call `await producer.shutdown()` before exit or buffered records are
-    /// lost.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0, background=false, background_shards=1))]
+    /// with its defaults, and `background=BackgroundConfig(...)` configures it
+    /// (shards, sharding, flush limits, byte budget, in-flight writes,
+    /// backpressure, error callback). `batch_length` and `linger_ms` apply to
+    /// direct mode only. A send then returns once the record is queued, so call
+    /// `await producer.shutdown()` before exit.
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0, background=None))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
@@ -356,14 +297,8 @@ impl PyTopic {
         partitions: u32,
         message_expiry: &str,
         max_topic_size: u64,
-        background: bool,
-        background_shards: usize,
+        background: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyProducer> {
-        if background && background_shards == 0 {
-            return Err(InvalidError::new_err(
-                "producer background_shards must be greater than zero",
-            ));
-        }
         if batch_length == 0 {
             return Err(InvalidError::new_err(
                 "producer batch_length must be greater than zero",
@@ -395,7 +330,18 @@ impl PyTopic {
                 .parse::<IggyExpiry>()
                 .map_err(InvalidError::new_err)?,
             max_topic_size,
-            background: background.then_some(background_shards),
+            background: match background.filter(|value| !value.is_none()) {
+                None => None,
+                Some(value) => match value.cast::<crate::transport::PyBackgroundConfig>() {
+                    Ok(config) => Some(crate::transport::BackgroundSettings::from(config.get())),
+                    Err(_) => value
+                        .extract::<bool>()
+                        .map_err(|_| {
+                            InvalidError::new_err("background must be a bool or a BackgroundConfig")
+                        })?
+                        .then(crate::transport::BackgroundSettings::default),
+                },
+            },
         };
         Ok(PyProducer::new(
             self.laser.stream(stream.clone()).topic(&*self.name),
@@ -462,7 +408,7 @@ impl PyTopic {
             Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
             None => self.laser.topic(&*self.name),
         };
-        PyConsumerGroup::new(handle.consumer_group(group))
+        PyConsumerGroup::new(handle.consumer_group(group), self.clone())
     }
 
     /// `consumer_group` by the group's native numeric id. The id names a
@@ -472,7 +418,7 @@ impl PyTopic {
             Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
             None => self.laser.topic(&*self.name),
         };
-        PyConsumerGroup::new(handle.consumer_group_id(id))
+        PyConsumerGroup::new(handle.consumer_group_id(id), self.clone())
     }
 
     /// A resumable, offset-addressable reader over this topic. Each `poll()`

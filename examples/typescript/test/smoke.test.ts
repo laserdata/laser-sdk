@@ -13,7 +13,7 @@ import { run as runCdc } from "../src/cdc/main.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
-async function withLaser(name: string, run: (laser: Laser) => Promise<void>): Promise<void> {
+async function withLaser<T>(name: string, run: (laser: Laser) => Promise<T>): Promise<T> {
   await using laser = await Laser.connectWithStream(
     CONNECTION_STRING,
     `laser-ts-example-${name}-${randomUUID()}`
@@ -21,7 +21,7 @@ async function withLaser(name: string, run: (laser: Laser) => Promise<void>): Pr
   const stream = laser.stream(laser.defaultStream ?? "")
   await stream.ensure()
   try {
-    await run(laser)
+    return await run(laser)
   } finally {
     await stream.delete()
   }
@@ -36,14 +36,16 @@ void test(
     process.env["LASER_MESSAGES"] = "24"
     process.env["LASER_BATCH"] = "8"
     try {
-      await withLaser("native", (laser) => runNativeStreaming(laser, AbortSignal.timeout(30_000)))
+      const summary = await withLaser("native", (laser) =>
+        runNativeStreaming(laser, AbortSignal.timeout(30_000))
+      )
+      assert.deepEqual(summary, { published: 24, automatic: 24, manual: 24 })
     } finally {
       if (previousMessages === undefined) delete process.env["LASER_MESSAGES"]
       else process.env["LASER_MESSAGES"] = previousMessages
       if (previousBatch === undefined) delete process.env["LASER_BATCH"]
       else process.env["LASER_BATCH"] = previousBatch
     }
-    assert.ok(true)
   }
 )
 
@@ -51,8 +53,13 @@ void test(
   "given_the_interop_agents_when_run_then_should_complete_every_bridge_flow",
   { concurrency: false, timeout: 45_000 },
   async () => {
-    await withLaser("interop", (laser) => runInterop(laser, AbortSignal.timeout(40_000)))
-    assert.ok(true)
+    const summary = await withLaser("interop", (laser) =>
+      runInterop(laser, AbortSignal.timeout(40_000))
+    )
+    assert.notEqual(summary.a2a, "")
+    assert.notEqual(summary.mcp, "")
+    assert.ok(summary.aguiEvents > 0)
+    assert.equal(summary.decision, "approved")
   }
 )
 
@@ -60,8 +67,26 @@ void test(
   "given_the_log_primitive_when_run_then_should_publish_and_replay_both_readings",
   { concurrency: false },
   async () => {
-    await withLaser("log", (laser) => runLog(laser, AbortSignal.timeout(30_000)))
-    assert.ok(true)
+    const { readings, appended } = await withLaser("log", async (laser) => {
+      const topic = laser.stream("fleet").topic("readings")
+      await topic.ensure(2)
+      const count = async (): Promise<bigint> => {
+        const cursor = await topic.replay()
+        let total = 0n
+        for (;;) {
+          const page = await cursor.poll()
+          if (page.length === 0) return total
+          total += BigInt(page.length)
+        }
+      }
+      const before = await count()
+      const readings = await runLog(laser, AbortSignal.timeout(30_000))
+      return { readings, appended: (await count()) - before }
+    })
+    assert.equal(appended, 2n)
+    const values = readings.map((reading) => `${reading.host}:${String(reading.cpu)}`)
+    assert.ok(values.includes("node-1:42"))
+    assert.ok(values.includes("node-2:91"))
   }
 )
 
@@ -69,8 +94,10 @@ void test(
   "given_the_recall_primitive_when_run_then_should_remember_and_recall_in_process",
   { concurrency: false },
   async () => {
-    await withLaser("recall", (laser) => runRecall(laser, AbortSignal.timeout(30_000)))
-    assert.ok(true)
+    const recalled = await withLaser("recall", (laser) =>
+      runRecall(laser, AbortSignal.timeout(30_000))
+    )
+    assert.deepEqual(recalled, ["node-7 sits in the eu-west pool, rotates keys monthly"])
   }
 )
 
@@ -78,8 +105,10 @@ void test(
   "given_the_context_primitive_when_run_then_should_assemble_the_conversation",
   { concurrency: false },
   async () => {
-    await withLaser("context", (laser) => runContext(laser, AbortSignal.timeout(30_000)))
-    assert.ok(true)
+    const turns = await withLaser("context", (laser) =>
+      runContext(laser, AbortSignal.timeout(30_000))
+    )
+    assert.deepEqual(turns, ["drain node-7", "drained, 0 connections left"])
   }
 )
 
@@ -87,16 +116,18 @@ void test(
   "given_the_agent_primitive_when_run_then_should_complete_the_contract",
   { concurrency: false, timeout: 30_000 },
   async () => {
-    await withLaser("agent", (laser) => runAgent(laser, AbortSignal.timeout(25_000)))
-    assert.ok(true)
+    const contract = await withLaser("agent", (laser) =>
+      runAgent(laser, AbortSignal.timeout(25_000))
+    )
+    assert.deepEqual(contract, { kind: "completed", reply: "on it" })
   }
 )
 
 void test(
   "given_the_fleet_change_feed_when_filtered_then_should_deliver_only_safe_mode_records",
   { concurrency: false, timeout: 60_000 },
-  async () => {
-    await withLaser("cdc", (laser) => runCdc(laser, AbortSignal.timeout(55_000)))
-    assert.ok(true)
+  async (t) => {
+    const ran = await withLaser("cdc", (laser) => runCdc(laser, AbortSignal.timeout(55_000)))
+    if (!ran) t.skip("consumer group filters need a deployment that serves the filter catalog")
   }
 )

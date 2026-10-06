@@ -1,14 +1,13 @@
 use laser_wire::checkpoint::CheckpointReadConsistency;
 use laser_wire::filter::FilterCodec;
-use laser_wire::hello::FilterAnnounce;
 use laser_wire::query::Consistency;
 
 pub use laser_wire::destination::BackendResourceId;
 pub use laser_wire::hello::{
     BackendDescriptor, BackendDesiredState, BackendImplementation, BackendLimits, BackendMode,
     BackendObservedState, BackendReadiness, BackendReadinessCode, BackendReadinessReason,
-    MaintenanceCapabilities, MaterializationCapability, OpVersions, QueryCapabilities,
-    QueryPagingCapability, SchemaCapabilities, TimeTravelCapability,
+    FilterAnnounce, MaintenanceCapabilities, MaterializationCapability, OpVersions,
+    QueryCapabilities, QueryPagingCapability, SchemaCapabilities, TimeTravelCapability,
 };
 
 /// What the connected infrastructure serves beyond the open SDK surface. The open
@@ -213,7 +212,9 @@ impl Capabilities {
     /// True when the connected infrastructure advertised nothing beyond the open
     /// SDK (`OPEN`).
     pub fn is_open_only(&self) -> bool {
-        *self == Self::OPEN
+        let mut open = Self::OPEN;
+        open.hello = self.hello;
+        *self == open
     }
 
     pub fn backend(&self, resource_id: BackendResourceId) -> Option<&BackendDescriptor> {
@@ -629,6 +630,21 @@ mod tests {
                 .map(|reason| reason.code),
             Some(BackendReadinessCode::ConfigurationPending)
         );
+    }
+
+    #[test]
+    fn given_open_capabilities_when_the_probe_outcome_changes_then_should_still_be_open_only() {
+        for hello in [
+            HelloOutcome::Unknown,
+            HelloOutcome::Answered,
+            HelloOutcome::Rejected,
+            HelloOutcome::Failed,
+        ] {
+            let mut caps = Capabilities::OPEN;
+            caps.hello = hello;
+            assert!(caps.is_open_only());
+            assert!(!caps.with_managed(true).is_open_only());
+        }
     }
 
     #[test]

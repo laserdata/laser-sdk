@@ -1,5 +1,6 @@
 import { InvalidError } from "../client/errors.js"
 import { mintUlidValue, type UlidSource } from "../runtime/ulid.js"
+import { Json } from "../stream/codecs.js"
 import { ConversationId } from "../types/ids.js"
 import type { AgentId } from "../types/ids.js"
 import { contentId } from "../wire/hashing.js"
@@ -40,6 +41,8 @@ export const RecallStrategy = {
 
 export type RecallStrategy = (typeof RecallStrategy)[keyof typeof RecallStrategy]
 
+const RRF_K = 60
+
 const KIND_CODES: Readonly<Record<MemoryKind, number>> = {
   [MemoryKind.Fact]: 1,
   [MemoryKind.Message]: 2,
@@ -47,6 +50,12 @@ const KIND_CODES: Readonly<Record<MemoryKind, number>> = {
   [MemoryKind.Entity]: 4,
   [MemoryKind.Feedback]: 5,
   [MemoryKind.Procedure]: 6
+}
+
+/** A stable one-byte discriminator, mixed into a content-addressed id so the
+ * same body under different kinds gets distinct ids. */
+export function memoryKindCode(kind: MemoryKind): number {
+  return KIND_CODES[kind]
 }
 
 export function memoryClass(kind: MemoryKind): MemoryClass {
@@ -73,14 +82,24 @@ export class MemoryId {
     return MemoryId.fromU128(crockfordDecode(text))
   }
 
+  /** A deterministic id over `owner`, `kind`, and `body`, so a deduped remember
+   * stores one item. The owner is the durable scope (stream, agent, user, and
+   * application, never the conversation), so the same fact in two
+   * conversations is one durable memory and two users never share an id. The
+   * segments match Rust `MemoryId::content` byte for byte. */
   static content(owner: MemoryScope, kind: MemoryKind, body: Uint8Array): MemoryId {
     const encoder = new TextEncoder()
+    const separator = Uint8Array.of(0)
     const segments = [
       encoder.encode(owner.stream ?? ""),
-      Uint8Array.of(0),
-      encoder.encode(owner.agent?.asString() ?? ""),
-      Uint8Array.of(0),
-      Uint8Array.of(KIND_CODES[kind]),
+      separator,
+      encoder.encode(owner.agent?.asStr() ?? ""),
+      separator,
+      encoder.encode(owner.user ?? ""),
+      separator,
+      encoder.encode(owner.app ?? ""),
+      separator,
+      Uint8Array.of(memoryKindCode(kind)),
       body
     ]
     return MemoryId.fromU128(contentId(segments))
@@ -104,7 +123,7 @@ export interface MemoryScope {
   readonly user?: string
   readonly agent?: AgentId
   readonly conversation?: ConversationId
-  readonly application?: string
+  readonly app?: string
   readonly lifetime?: Lifetime
 }
 
@@ -126,6 +145,20 @@ export interface MemoryItem {
   readonly score?: number
   readonly signals: readonly RecallSignal[]
   readonly source?: SourceRef
+}
+
+/** The memory item payload as UTF-8, lossy. */
+export function memoryItemText(item: MemoryItem): string {
+  return new TextDecoder().decode(item.payload)
+}
+
+/** Decodes the memory item payload as JSON, through `decodeValue` when given.
+ * A payload that is not JSON fails with `CodecError`. */
+export function memoryItemJson<T = unknown>(
+  item: MemoryItem,
+  decodeValue: (value: unknown) => T = (value) => value as T
+): T {
+  return new Json(decodeValue).decode(item.payload)
 }
 
 export interface MemoryQuery {
@@ -172,7 +205,7 @@ export interface Summarizer {
 /** The optional passes of one consolidation run. */
 export interface ConsolidateOptions {
   /** Adds the summarize pass: the `message` items in the scope are folded
-   * through this into one durable summary per pass. */
+   * through this into one durable summary per conversation. */
   readonly summarizer?: Summarizer
   /** Forgets the items a summarize pass folded, so the summary replaces them. */
   readonly pruneSummarized?: boolean
@@ -210,34 +243,34 @@ export function toContextBlock(items: readonly MemoryItem[], tokenBudget?: numbe
   return blocks.join("\n\n")
 }
 
+/** Fuses ranked lists by reciprocal rank. Each item scores the sum of
+ * `1 / (60 + rank)` over the lists that surfaced it, where `rank` is the item's
+ * own first signal rank, and an item without a signal contributes nothing. A
+ * fused item keeps every signal it arrived with. */
 export function fuseReciprocalRank(
   signals: readonly (readonly MemoryItem[])[],
   limit: number
 ): readonly MemoryItem[] {
-  const byId = new Map<string, MemoryItem>()
+  const fused = new Map<string, MemoryItem>()
   for (const ranked of signals) {
-    ranked.forEach((candidate, rank) => {
+    for (const candidate of ranked) {
       const key = candidate.id.toString()
-      const contribution = 1 / (60 + rank)
-      const held = byId.get(key)
-      const signal: RecallSignal = {
-        strategy: candidate.signals[0]?.strategy ?? RecallStrategy.Auto,
-        rank,
-        ...(candidate.score !== undefined ? { score: candidate.score } : {})
-      }
-      byId.set(
+      const first = candidate.signals[0]
+      const contribution = first === undefined ? 0 : 1 / (RRF_K + first.rank)
+      const held = fused.get(key)
+      fused.set(
         key,
         held === undefined
-          ? { ...candidate, score: contribution, signals: [signal] }
+          ? { ...candidate, score: contribution, signals: [...candidate.signals] }
           : {
               ...held,
               score: (held.score ?? 0) + contribution,
-              signals: [...held.signals, signal]
+              signals: [...held.signals, ...candidate.signals]
             }
       )
-    })
+    }
   }
-  return [...byId.values()]
+  return [...fused.values()]
     .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
     .slice(0, limit)
 }

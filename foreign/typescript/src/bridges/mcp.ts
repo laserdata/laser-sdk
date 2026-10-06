@@ -1,10 +1,5 @@
-import {
-  CodecError,
-  HandlerConfigError,
-  InvalidError,
-  publicErrorMessage,
-  TimeoutError
-} from "../client/errors.js"
+import { publicErrorMessage } from "../client/error-classify.js"
+import { CodecError, HandlerConfigError, InvalidError, TimeoutError } from "../client/errors.js"
 import { INTERNAL_REPLY_HUB } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ConversationId, type AgentId } from "../types/ids.js"
@@ -22,7 +17,7 @@ import {
   CorrelationId,
   type RecordId
 } from "../wire/ids.js"
-import { SDK_VERSION, type JsonRpcResponse } from "./a2a.js"
+import { SDK_VERSION } from "./a2a.js"
 import { bridgeHopMetadata, enterBridge } from "./hops.js"
 
 export const MCP_DEFAULT_PROTOCOL_VERSION = "2025-11-25"
@@ -68,13 +63,31 @@ export interface McpTool {
 }
 
 export interface McpContent {
-  readonly type: "text"
+  readonly kind: "text"
   readonly text: string
 }
 
 export interface McpToolResult {
   readonly content: readonly McpContent[]
   readonly isError?: true
+}
+
+export interface McpRpcRequest {
+  readonly id?: unknown
+  readonly method: string
+  readonly params?: unknown
+}
+
+export interface McpRpcError {
+  readonly code: number
+  readonly message: string
+}
+
+export interface McpRpcResponse {
+  readonly jsonrpc: "2.0"
+  readonly id: unknown
+  readonly result?: unknown
+  readonly error?: McpRpcError
 }
 
 interface ResourceEntry {
@@ -122,7 +135,7 @@ export function toolCallFromRequest(
 export function toolResultFromEnvelope(envelope: AgentEnvelope): McpToolResult {
   const text = new TextDecoder().decode(envelope.body)
   return {
-    content: text.length === 0 ? [] : [{ type: "text", text }],
+    content: text.length === 0 ? [] : [{ kind: "text", text }],
     ...(envelope.kind === AgentKind.Error ? { isError: true } : {})
   }
 }
@@ -139,13 +152,13 @@ export class McpBridge {
     private readonly source: AgentId,
     private readonly toolTopic: string,
     private readonly replyTopic: string,
-    readonly serverName: string
+    private readonly serverName: string
   ) {
-    this.hops = enterBridge(source.asString())
+    this.hops = enterBridge(source.asStr())
   }
 
   withBridgeHops(previous: readonly string[]): this {
-    this.hops = enterBridge(this.source.asString(), previous)
+    this.hops = enterBridge(this.source.asStr(), previous)
     return this
   }
 
@@ -246,11 +259,17 @@ export class McpBridge {
     }
   }
 
-  callTool(name: string, params: unknown): Promise<McpToolResult> {
-    return this.callToolJson(name, jsonBytes(params))
+  /** `tools/call`: route the call to the agent and await its tool result.
+   * `paramsJson` is the JSON the call carries, raw JSON bytes or a value to
+   * encode as JSON. */
+  callTool(name: string, paramsJson: unknown): Promise<McpToolResult> {
+    return this.sendToolCall(
+      name,
+      paramsJson instanceof Uint8Array ? paramsJson : jsonBytes(paramsJson)
+    )
   }
 
-  async callToolJson(name: string, paramsJson: Uint8Array): Promise<McpToolResult> {
+  private async sendToolCall(name: string, paramsJson: Uint8Array): Promise<McpToolResult> {
     const conversation = ConversationId.new()
     const correlation = CorrelationId.parse(conversation.toString())
     const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic)
@@ -281,7 +300,7 @@ export class McpBridge {
     }
   }
 
-  async handleRpc(input: unknown): Promise<JsonRpcResponse> {
+  async handleRpc(input: unknown): Promise<McpRpcResponse> {
     let id: unknown = null
     try {
       const request = jsonObject(input, "MCP JSON-RPC request")
@@ -315,7 +334,9 @@ export class McpBridge {
           result = this.getPrompt(this.requiredString(params, "name"))
           break
         case McpMethod.ToolsCall:
-          result = await this.callToolJson(this.requiredString(params, "name"), jsonBytes(params))
+          result = toolResultJson(
+            await this.sendToolCall(this.requiredString(params, "name"), jsonBytes(params))
+          )
           break
         default:
           throw new HandlerConfigError(`unknown MCP method \`${method}\``)
@@ -337,5 +358,13 @@ export class McpBridge {
     const value = object[key]
     if (typeof value !== "string") throw new HandlerConfigError(`MCP ${key} must be a string`)
     return value
+  }
+}
+
+// MCP spells a content item's kind `type` on the wire.
+function toolResultJson(result: McpToolResult): unknown {
+  return {
+    content: result.content.map((item) => ({ type: item.kind, text: item.text })),
+    ...(result.isError === true ? { isError: true } : {})
   }
 }

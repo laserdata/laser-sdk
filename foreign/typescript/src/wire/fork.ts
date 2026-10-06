@@ -57,6 +57,8 @@ export function decodeForkInfo(map: CborMap, context: string): ForkInfo {
 }
 
 export interface ForkCreate {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly forkId: string
   readonly parent?: string
   readonly kind: ForkKind
@@ -65,7 +67,7 @@ export interface ForkCreate {
 
 export function encodeForkCreate(create: ForkCreate): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", FORK_OP_VERSION)
+  map.set("v", create.v ?? FORK_OP_VERSION)
   map.set("fork_id", create.forkId)
   if (create.parent !== undefined) map.set("parent", create.parent)
   map.set("kind", create.kind)
@@ -79,6 +81,7 @@ export function decodeForkCreate(map: CborMap, context: string): ForkCreate {
     ? parseForkKind(field.requiredString(map, "kind", context), context)
     : "continuous"
   return {
+    v: field.requiredU32(map, "v", context),
     forkId: field.requiredString(map, "fork_id", context),
     ...(parent !== undefined ? { parent } : {}),
     kind,
@@ -89,40 +92,61 @@ export function decodeForkCreate(map: CborMap, context: string): ForkCreate {
 }
 
 export interface ForkDelete {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly forkId: string
 }
 
 export function encodeForkDelete(del: ForkDelete): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", FORK_OP_VERSION],
+    ["v", del.v ?? FORK_OP_VERSION],
     ["fork_id", del.forkId]
   ])
 }
 
 export function decodeForkDelete(map: CborMap, context: string): ForkDelete {
-  return { forkId: field.requiredString(map, "fork_id", context) }
+  return {
+    v: field.requiredU32(map, "v", context),
+    forkId: field.requiredString(map, "fork_id", context)
+  }
 }
 
 export interface ForkPromote {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly forkId: string
 }
 
 export function encodeForkPromote(promote: ForkPromote): Map<string, unknown> {
   return new Map<string, unknown>([
-    ["v", FORK_OP_VERSION],
+    ["v", promote.v ?? FORK_OP_VERSION],
     ["fork_id", promote.forkId]
   ])
 }
 
 export function decodeForkPromote(map: CborMap, context: string): ForkPromote {
-  return { forkId: field.requiredString(map, "fork_id", context) }
+  return {
+    v: field.requiredU32(map, "v", context),
+    forkId: field.requiredString(map, "fork_id", context)
+  }
 }
 
-export function encodeForkList(): Map<string, unknown> {
-  return new Map<string, unknown>([["v", FORK_OP_VERSION]])
+export interface ForkList {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
+}
+
+export function encodeForkList(request: ForkList = {}): Map<string, unknown> {
+  return new Map<string, unknown>([["v", request.v ?? FORK_OP_VERSION]])
+}
+
+export function decodeForkList(map: CborMap, context: string): ForkList {
+  return { v: field.requiredU32(map, "v", context) }
 }
 
 export interface ForkPut {
+  /** The operation version, the current one when absent. */
+  readonly v?: number
   readonly forkId: string
   readonly table: string
   readonly partitionId: number
@@ -153,7 +177,7 @@ function decodeStringMap(map: CborMap, context: string): ReadonlyMap<string, str
 
 export function encodeForkPut(put: ForkPut): Map<string, unknown> {
   const map = new Map<string, unknown>()
-  map.set("v", FORK_OP_VERSION)
+  map.set("v", put.v ?? FORK_OP_VERSION)
   map.set("fork_id", put.forkId)
   map.set("table", put.table)
   map.set("partition_id", put.partitionId)
@@ -174,6 +198,7 @@ export function decodeForkPut(map: CborMap, context: string): ForkPut {
   const payload = field.optionalBytes(map, "payload", context)
   const embedding = field.optionalString(map, "embedding", context)
   return {
+    v: field.requiredU32(map, "v", context),
     forkId: field.requiredString(map, "fork_id", context),
     table: field.requiredString(map, "table", context),
     partitionId: field.requiredU32(map, "partition_id", context),

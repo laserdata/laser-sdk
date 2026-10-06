@@ -35,7 +35,7 @@ import {
   CorrelationId,
   RecordId
 } from "../../src/wire/ids.js"
-import type { PollingStrategy } from "../../src/stream/polling-strategy.js"
+import type { ConsumerStart } from "../../src/stream/consumer-start.js"
 
 interface SentBatch {
   readonly stream: string
@@ -135,7 +135,7 @@ class FakeTransport implements LaserTransport {
     _stream: string,
     _topic: string,
     _target: ConsumerTarget,
-    strategy: PollingStrategy
+    strategy: ConsumerStart
   ): Promise<readonly PolledMessage[]> {
     if (strategy.kind === "last") return Promise.resolve([])
     return Promise.resolve(this.replies.splice(0))
@@ -185,7 +185,7 @@ void test("given_a_refined_command_when_sent_then_should_stamp_typed_headers_and
     .withIdempotencyKey(parseIdempotencyKey("attempt-1"))
     .withDeadlineMicros(1_717_171_777_000_000n)
     .withOperation("chat")
-    .withMetadata("priority", { kind: "string", value: "high" })
+    .withMetadata("priority", { kind: "str", value: "high" })
     .contentType(ContentType.Json)
     .send()
 
@@ -209,7 +209,7 @@ void test("given_a_refined_command_when_sent_then_should_stamp_typed_headers_and
   assert.equal(envelope.kind, AgentKind.Command)
   assert.equal(envelope.correlation?.asU128(), 5n)
   assert.equal(envelope.idempotencyKey, "attempt-1")
-  assert.equal(envelope.metadata?.get("priority")?.kind, "string")
+  assert.equal(envelope.metadata?.get("priority")?.kind, "str")
 })
 
 void test("given_a_buffered_chunk_stream_when_finished_then_should_append_chunks_and_terminal_once", async () => {

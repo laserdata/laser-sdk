@@ -1,4 +1,7 @@
-import { CodecError, HandlerConfigError, publicErrorMessage } from "../client/errors.js"
+import { publicErrorMessage } from "../client/error-classify.js"
+import { findAgdxReply } from "../agent/replies.js"
+import { CodecError, HandlerConfigError, NoStreamError } from "../client/errors.js"
+import { INTERNAL_TRANSPORT, INTERNAL_VERIFIER } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import { signCardValue, type AgentCardSignature, type SigningKey } from "../signing.js"
@@ -26,8 +29,8 @@ import { bridgeHopMetadata, enterBridge } from "./hops.js"
 
 export const A2A_PROTOCOL_VERSION = "1.0"
 export const A2A_JSONRPC_BINDING = "JSONRPC"
-export const A2A_APP_ERROR_CODE = -32_000
-export const SDK_VERSION = "0.5.4"
+const A2A_APP_ERROR_CODE = -32_000
+export const SDK_VERSION = "0.6.0"
 
 export const A2aMethod = {
   MessageSend: "SendMessage",
@@ -59,7 +62,7 @@ export interface AgentSkill {
   readonly outputModes?: readonly string[]
 }
 
-export interface A2aAgentCard {
+export interface AgentCard {
   readonly name: string
   readonly description: string
   readonly version: string
@@ -71,17 +74,36 @@ export interface A2aAgentCard {
   readonly signatures?: readonly AgentCardSignature[]
 }
 
-export interface A2aTask {
+export interface TaskStatus {
+  readonly state: TaskState
+}
+
+export interface Artifact {
+  readonly text: string
+}
+
+export interface Task {
   readonly id: string
-  readonly status: { readonly state: TaskState }
-  readonly artifacts: readonly { readonly text: string }[]
+  readonly status: TaskStatus
+  readonly artifacts: readonly Artifact[]
+}
+
+export interface JsonRpcRequest {
+  readonly id?: unknown
+  readonly method: string
+  readonly params?: unknown
+}
+
+export interface JsonRpcError {
+  readonly code: number
+  readonly message: string
 }
 
 export interface JsonRpcResponse {
   readonly jsonrpc: "2.0"
   readonly id: unknown
   readonly result?: unknown
-  readonly error?: { readonly code: number; readonly message: string }
+  readonly error?: JsonRpcError
 }
 
 function jsonObject(value: unknown, context: string): Readonly<Record<string, unknown>> {
@@ -138,7 +160,7 @@ export function commandFromMessageSend(
   )
 }
 
-export function taskFromEnvelope(taskId: string, envelope: AgentEnvelope): A2aTask {
+export function taskFromEnvelope(taskId: string, envelope: AgentEnvelope): Task {
   const state: TaskState =
     envelope.taskState ??
     (envelope.kind === AgentKind.Error
@@ -152,7 +174,7 @@ export function taskFromEnvelope(taskId: string, envelope: AgentEnvelope): A2aTa
   }
 }
 
-export function taskToJson(task: A2aTask): unknown {
+export function taskToJson(task: Task): unknown {
   return {
     id: task.id,
     status: { state: taskStateDisplay(task.status.state) },
@@ -171,11 +193,11 @@ export class A2aBridge {
     private readonly requestTopic: string,
     private readonly replyTopic: string
   ) {
-    this.hops = enterBridge(source.asString())
+    this.hops = enterBridge(source.asStr())
   }
 
   withBridgeHops(previous: readonly string[]): this {
-    this.hops = enterBridge(this.source.asString(), previous)
+    this.hops = enterBridge(this.source.asStr(), previous)
     return this
   }
 
@@ -189,15 +211,19 @@ export class A2aBridge {
     return this
   }
 
-  async submit(params: unknown): Promise<A2aTask> {
-    return this.submitJson(jsonBytes(params, "A2A message params"))
-  }
-
-  async submitJson(paramsJson: Uint8Array): Promise<A2aTask> {
+  /** Publishes the params as a task. Raw JSON as bytes or a string rides
+   * byte-identical, any other value is encoded as JSON first. */
+  async submit(paramsJson: unknown): Promise<Task> {
+    const body =
+      paramsJson instanceof Uint8Array
+        ? paramsJson.slice()
+        : typeof paramsJson === "string"
+          ? new TextEncoder().encode(paramsJson)
+          : jsonBytes(paramsJson, "A2A message params")
     const task = ConversationId.new()
     await this.laser
       .agdx(this.requestTopic, this.source, task)
-      .command(correlationOf(task), paramsJson)
+      .command(correlationOf(task), body)
       .withOperation(OPERATION_CHAT)
       .withMetadata(METADATA_BRIDGE_HOPS, bridgeHopMetadata(this.hops))
       .contentType(ContentType.Json)
@@ -209,22 +235,26 @@ export class A2aBridge {
     }
   }
 
-  async task(id: string): Promise<A2aTask> {
+  async task(id: string): Promise<Task> {
     let conversation: ConversationId
     try {
       conversation = ConversationId.parse(id)
     } catch (cause) {
       throw new HandlerConfigError(`invalid task id \`${id}\``, { cause })
     }
-    const correlation = correlationOf(conversation)
-    const messages = await this.laser
-      .context(conversation)
-      .fetch([this.replyTopic], Number.MAX_SAFE_INTEGER)
-    const answer = messages.findLast(
-      (message) =>
-        message.envelope?.correlation?.equals(correlation) === true &&
-        (message.envelope.kind === AgentKind.Response || message.envelope.kind === AgentKind.Error)
-    )?.envelope
+    const stream = this.laser.defaultStream
+    if (stream === undefined) {
+      throw new NoStreamError(
+        "an A2A task lookup requires a default stream, use connectWithStream() or withDefaultStream()"
+      )
+    }
+    const answer = await findAgdxReply(
+      this.laser[INTERNAL_TRANSPORT](),
+      stream,
+      this.replyTopic,
+      correlationOf(conversation),
+      this.laser[INTERNAL_VERIFIER]()
+    )
     return answer === undefined
       ? {
           id,
@@ -234,7 +264,7 @@ export class A2aBridge {
       : taskFromEnvelope(id, answer)
   }
 
-  async cancel(id: string): Promise<A2aTask> {
+  async cancel(id: string): Promise<Task> {
     let conversation: ConversationId
     try {
       conversation = ConversationId.parse(id)
@@ -259,9 +289,9 @@ export class A2aBridge {
     }
   }
 
-  card(): A2aAgentCard {
+  card(): AgentCard {
     return {
-      name: this.source.asString(),
+      name: this.source.asStr(),
       description: "LaserData AGDX bridge over the durable log",
       version: SDK_VERSION,
       supportedInterfaces: [
@@ -290,7 +320,7 @@ export class A2aBridge {
     }
   }
 
-  signedCard(key: SigningKey): A2aAgentCard {
+  signedCard(key: SigningKey): AgentCard {
     const card = this.card()
     return { ...card, signatures: [signCardValue(key, card)] }
   }
@@ -303,11 +333,11 @@ export class A2aBridge {
       const method = request["method"]
       if (typeof method !== "string") throw new HandlerConfigError("A2A method must be a string")
       const params = request["params"] ?? {}
-      let task: A2aTask
+      let task: Task
       switch (method) {
         case A2aMethod.MessageSend:
         case A2aMethod.MessageStream:
-          task = await this.submit(params)
+          task = await this.submit(jsonBytes(params, "A2A message params"))
           break
         case A2aMethod.TasksGet:
         case A2aMethod.TasksCancel: {

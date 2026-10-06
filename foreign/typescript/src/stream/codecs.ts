@@ -2,32 +2,146 @@ import { decode as decodeMessagePack, encode as encodeMessagePack } from "@msgpa
 
 import { CodecError } from "../client/errors.js"
 import { decodeOne, encodeOne } from "../wire/cbor.js"
+import { ContentType } from "../wire/content.js"
+import type { KvEntry } from "../wire/kv.js"
+import { decodeBsonDocument, encodeBsonDocument } from "./bson.js"
 
-export interface Codec<T> {
+/** The decode half of a codec. */
+export interface Decoder<T> {
+  decode(payload: Uint8Array): T
+}
+
+/**
+ * Encoding strategy for a typed body. `contentType` is the tag stamped on
+ * `agdx.ct` so consumers can decode downstream.
+ */
+export interface Codec<T> extends Decoder<T> {
+  readonly contentType: ContentType
   encode(value: T): Uint8Array
-  decode(bytes: Uint8Array): T
 }
 
-export type ValueDecoder<T> = (value: unknown) => T
+/**
+ * The built-in JSON codec. `decodeValue` checks a decoded value and narrows it
+ * to `T`, and the codec passes the decoded value through without it.
+ */
+export class Json<T = unknown> implements Codec<T> {
+  readonly contentType: ContentType = ContentType.Json
 
-function encodeJson(value: unknown): Uint8Array {
-  try {
-    if (value === undefined || typeof value === "function" || typeof value === "symbol") {
-      throw new TypeError("value has no JSON representation")
+  constructor(private readonly decodeValue: (value: unknown) => T = (value) => value as T) {}
+
+  encode(value: T): Uint8Array {
+    try {
+      if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+        throw new TypeError("value has no JSON representation")
+      }
+      return new TextEncoder().encode(JSON.stringify(value))
+    } catch (cause) {
+      throw new CodecError("value does not encode as JSON", "json", "encode", { cause })
     }
-    const json = JSON.stringify(value)
-    return new TextEncoder().encode(json)
-  } catch (cause) {
-    throw new CodecError("value does not encode as JSON", "json", "encode", { cause })
+  }
+
+  decode(payload: Uint8Array): T {
+    let value: unknown
+    try {
+      value = JSON.parse(new TextDecoder().decode(payload)) as unknown
+    } catch (cause) {
+      throw new CodecError("payload does not decode as JSON", "json", "decode", { cause })
+    }
+    return this.decodeValue(value)
   }
 }
 
-function decodeJson(bytes: Uint8Array): unknown {
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes)) as unknown
-  } catch (cause) {
-    throw new CodecError("payload does not decode as JSON", "json", "decode", { cause })
+/** The built-in CBOR codec. `decodeValue` narrows a decoded value to `T`. */
+export class Cbor<T = unknown> implements Codec<T> {
+  readonly contentType: ContentType = ContentType.Cbor
+
+  constructor(private readonly decodeValue: (value: unknown) => T = (value) => value as T) {}
+
+  encode(value: T): Uint8Array {
+    try {
+      return encodeOne(value)
+    } catch (cause) {
+      throw new CodecError("value does not encode as CBOR", "cbor", "encode", { cause })
+    }
   }
+
+  decode(payload: Uint8Array): T {
+    return this.decodeValue(lowerCborValue(decodeOne(payload, "typed CBOR payload")))
+  }
+}
+
+/**
+ * The built-in MessagePack codec, with named-map encoding so field names
+ * round-trip with JSON-shaped consumers. `decodeValue` narrows a decoded value
+ * to `T`.
+ */
+export class Msgpack<T = unknown> implements Codec<T> {
+  readonly contentType: ContentType = ContentType.Msgpack
+
+  constructor(private readonly decodeValue: (value: unknown) => T = (value) => value as T) {}
+
+  encode(value: T): Uint8Array {
+    try {
+      return encodeMessagePack(messagePackValue(value), { useBigInt64: true })
+    } catch (cause) {
+      throw new CodecError("value does not encode as MessagePack", "msgpack", "encode", {
+        cause
+      })
+    }
+  }
+
+  decode(payload: Uint8Array): T {
+    let value: unknown
+    try {
+      value = decodeMessagePack(payload, { useBigInt64: true })
+    } catch (cause) {
+      throw new CodecError("payload does not decode as MessagePack", "msgpack", "decode", {
+        cause
+      })
+    }
+    return this.decodeValue(value)
+  }
+}
+
+/**
+ * The built-in BSON codec. The top-level body must be a document (an object or
+ * a string-keyed map). `decodeValue` narrows a decoded value to `T`.
+ */
+export class Bson<T = unknown> implements Codec<T> {
+  readonly contentType: ContentType = ContentType.Bson
+
+  constructor(private readonly decodeValue: (value: unknown) => T = (value) => value as T) {}
+
+  encode(value: T): Uint8Array {
+    try {
+      return encodeBsonDocument(value)
+    } catch (cause) {
+      throw new CodecError("value does not encode as BSON", "bson", "encode", { cause })
+    }
+  }
+
+  decode(payload: Uint8Array): T {
+    let value: unknown
+    try {
+      value = decodeBsonDocument(payload)
+    } catch (cause) {
+      throw new CodecError("payload does not decode as BSON", "bson", "decode", { cause })
+    }
+    return this.decodeValue(value)
+  }
+}
+
+/** Decode a key-value entry's value as JSON, narrowed by `decodeValue` when given. */
+export function kvEntryDecodeValue<T = unknown>(
+  entry: KvEntry,
+  decodeValue?: (value: unknown) => T
+): T {
+  return new Json(decodeValue).decode(entry.value)
+}
+
+/** Decode a key-value entry's value with any decoder. */
+export function kvEntryDecodeValueWith<T>(entry: KvEntry, decoder: Decoder<T>): T {
+  return decoder.decode(entry.value)
 }
 
 function lowerCborValue(value: unknown): unknown {
@@ -40,28 +154,6 @@ function lowerCborValue(value: unknown): unknown {
     return new Map(entries.map(([key, nested]) => [key, lowerCborValue(nested)]))
   }
   return value
-}
-
-export function jsonCodec<T>(decodeValue: ValueDecoder<T>): Codec<T> {
-  return {
-    encode: encodeJson,
-    decode: (bytes) => decodeValue(decodeJson(bytes))
-  }
-}
-
-export function cborCodec<T>(decodeValue: ValueDecoder<T>): Codec<T> {
-  return {
-    encode(value): Uint8Array {
-      try {
-        return encodeOne(value)
-      } catch (cause) {
-        throw new CodecError("value does not encode as CBOR", "cbor", "encode", { cause })
-      }
-    },
-    decode(bytes): T {
-      return decodeValue(lowerCborValue(decodeOne(bytes, "typed CBOR payload")))
-    }
-  }
 }
 
 function messagePackValue(value: unknown, depth = 0): unknown {
@@ -94,28 +186,4 @@ function messagePackValue(value: unknown, depth = 0): unknown {
     )
   }
   return value
-}
-
-export function messagePackCodec<T>(decodeValue: ValueDecoder<T>): Codec<T> {
-  return {
-    encode(value): Uint8Array {
-      try {
-        return encodeMessagePack(messagePackValue(value), { useBigInt64: true })
-      } catch (cause) {
-        throw new CodecError("value does not encode as MessagePack", "msgpack", "encode", {
-          cause
-        })
-      }
-    },
-    decode(bytes): T {
-      try {
-        return decodeValue(decodeMessagePack(bytes, { useBigInt64: true }))
-      } catch (cause) {
-        if (cause instanceof CodecError) throw cause
-        throw new CodecError("payload does not decode as MessagePack", "msgpack", "decode", {
-          cause
-        })
-      }
-    }
-  }
 }

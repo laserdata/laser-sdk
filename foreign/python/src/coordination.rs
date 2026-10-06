@@ -1,4 +1,4 @@
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{HookLoop, call_hook, future_into_py};
 use crate::convert::{duration_seconds, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::kv::PyLease;
@@ -10,8 +10,7 @@ use laser_sdk::kv::{
     SharedKvTransport,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
-use pyo3_async_runtimes::tokio::into_future;
+use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::sync::Arc;
 
@@ -37,8 +36,11 @@ impl ManagedKvTransport for Transport {
 
 type Client = FencedLeaseClient<Transport>;
 
+// A transport over a Python object. Its methods can be sync or async, and an
+// abandoned call, such as a send past its attempt timeout, cancels its task.
 struct HookTransport {
     hooks: Py<PyAny>,
+    fallback: HookLoop,
 }
 
 impl HookTransport {
@@ -48,24 +50,17 @@ impl HookTransport {
         code: Option<u32>,
         frame: &[u8],
     ) -> Result<Py<PyAny>, LaserError> {
-        let result = Python::attach(|py| {
+        call_hook(&self.fallback, |call| {
+            let py = call.py();
             let hooks = self.hooks.bind(py);
-            let value = match code {
-                Some(code) => hooks.call_method1(name, (code, PyBytes::new(py, frame)))?,
-                None if name == "ready" && !hooks.hasattr(name)? => return Ok(Ok(py.None())),
-                None => hooks.call_method0(name)?,
-            };
-            if value.hasattr("__await__")? {
-                Ok(Err(into_future(value)?))
-            } else {
-                Ok(Ok(value.unbind()))
+            match code {
+                Some(code) => call.call_method(hooks, name, (code, PyBytes::new(py, frame))),
+                None if name == "ready" && !hooks.hasattr(name)? => Ok(py.None()),
+                None => call.call_method(hooks, name, ()),
             }
         })
-        .map_err(crate::errors::from_callback_error)?;
-        match result {
-            Ok(value) => Ok(value),
-            Err(future) => future.await.map_err(crate::errors::from_callback_error),
-        }
+        .await
+        .map_err(crate::errors::from_callback_error)
     }
 }
 
@@ -191,22 +186,69 @@ impl PyPreparedMutation {
         self.inner.operation_id()
     }
 
+    /// The recovery an ambiguous result of this mutation requires.
     #[getter]
-    fn ambiguous_recovery(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value = PyDict::new(py);
-        match self.inner.ambiguous_recovery() {
-            AmbiguousMutationRecovery::WaitForLeaseExpiry(ttl) => {
-                value.set_item("kind", "wait_for_lease_expiry")?;
-                value.set_item("ttl_micros", ttl.as_micros())?;
-            }
-            AmbiguousMutationRecovery::RepeatPrepared => {
-                value.set_item("kind", "repeat_prepared")?
-            }
+    fn ambiguous_recovery(&self) -> PyAmbiguousMutationRecovery {
+        PyAmbiguousMutationRecovery {
+            inner: self.inner.ambiguous_recovery(),
+        }
+    }
+}
+
+/// The recovery a caller must use when a prepared mutation raises an
+/// ambiguous-mutation error. `kind` is `wait_for_lease_expiry` (do not acquire
+/// again until the requested lease TTL has elapsed), `repeat_prepared` (repeat
+/// the same `PreparedMutation`), or `reconcile_target_precondition` (read the
+/// target and reconcile through the fenced CAS precondition).
+#[gen_stub_pyclass]
+#[pyclass(name = "AmbiguousMutationRecovery", frozen, eq, skip_from_py_object)]
+#[derive(Clone, PartialEq)]
+pub struct PyAmbiguousMutationRecovery {
+    inner: AmbiguousMutationRecovery,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAmbiguousMutationRecovery {
+    /// Wait `ttl_secs`, the requested lease TTL, before acquiring again.
+    #[staticmethod]
+    fn wait_for_lease_expiry(ttl_secs: f64) -> PyResult<Self> {
+        Ok(Self {
+            inner: AmbiguousMutationRecovery::WaitForLeaseExpiry(duration_seconds(
+                ttl_secs, "ttl_secs",
+            )?),
+        })
+    }
+
+    /// Repeat the exact prepared mutation, keeping its operation id.
+    #[staticmethod]
+    fn repeat_prepared() -> Self {
+        Self {
+            inner: AmbiguousMutationRecovery::RepeatPrepared,
+        }
+    }
+
+    /// Read the target and reconcile through the fenced CAS precondition.
+    #[staticmethod]
+    fn reconcile_target_precondition() -> Self {
+        Self {
+            inner: AmbiguousMutationRecovery::ReconcileTargetPrecondition,
+        }
+    }
+
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner {
+            AmbiguousMutationRecovery::WaitForLeaseExpiry(_) => "wait_for_lease_expiry",
+            AmbiguousMutationRecovery::RepeatPrepared => "repeat_prepared",
             AmbiguousMutationRecovery::ReconcileTargetPrecondition => {
-                value.set_item("kind", "reconcile_target_precondition")?
+                "reconcile_target_precondition"
             }
         }
-        Ok(value.into_any().unbind())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AmbiguousMutationRecovery({:?})", self.inner)
     }
 }
 
@@ -228,7 +270,8 @@ impl PyFencedLeaseClient {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyFencedLeaseClient {
-    /// The transport supplies send(code, frame) and reset(). Reset must stop all in-flight work before it returns.
+    /// The transport supplies send(code, frame) and reset(), and optionally ready() and close(), each sync or async.
+    /// A send still running when its attempt times out is cancelled before reset() is called. Reset must stop all other in-flight work before it returns.
     #[new]
     fn new(transport: &Bound<'_, PyAny>) -> PyResult<Self> {
         let transport: SharedKvTransport =
@@ -242,6 +285,7 @@ impl PyFencedLeaseClient {
                 }
                 Arc::new(HookTransport {
                     hooks: transport.clone().unbind(),
+                    fallback: HookLoop::capture(transport.py()),
                 })
             };
         Ok(Self {
@@ -316,10 +360,10 @@ impl PyFencedLeaseClient {
     fn acquire<'py>(
         &self,
         py: Python<'py>,
-        operation: &PyPreparedMutation,
+        op: &PyPreparedMutation,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
-        let operation = operation.inner.clone();
+        let operation = op.inner.clone();
         future_into_py(py, async move {
             client
                 .acquire(&operation)
@@ -329,13 +373,9 @@ impl PyFencedLeaseClient {
         })
     }
 
-    fn renew<'py>(
-        &self,
-        py: Python<'py>,
-        operation: &PyPreparedMutation,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn renew<'py>(&self, py: Python<'py>, op: &PyPreparedMutation) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
-        let operation = operation.inner.clone();
+        let operation = op.inner.clone();
         future_into_py(py, async move {
             client
                 .renew(&operation)
@@ -348,10 +388,10 @@ impl PyFencedLeaseClient {
     fn release<'py>(
         &self,
         py: Python<'py>,
-        operation: &PyPreparedMutation,
+        op: &PyPreparedMutation,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
-        let operation = operation.inner.clone();
+        let operation = op.inner.clone();
         future_into_py(py, async move {
             client.release(&operation).await.map_err(to_pyerr)
         })
@@ -360,10 +400,10 @@ impl PyFencedLeaseClient {
     fn cas_fenced<'py>(
         &self,
         py: Python<'py>,
-        operation: &PyPreparedMutation,
+        op: &PyPreparedMutation,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
-        let operation = operation.inner.clone();
+        let operation = op.inner.clone();
         future_into_py(py, async move {
             client.cas_fenced(&operation).await.map_err(to_pyerr)
         })

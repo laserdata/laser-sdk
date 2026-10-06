@@ -42,8 +42,8 @@ CLASSIFY = "classify"
 DIAGNOSE = "diagnose"
 REMEDIATE = "remediate"
 SLOW_TASK = "slow-task"
-COMMANDS = ls.Topics.COMMANDS
-RESPONSES = ls.Topics.RESPONSES
+COMMANDS = ls.AgentTopic.Commands
+RESPONSES = ls.AgentTopic.Responses
 INCIDENT = b"auth API latency spike"
 ORCHESTRATOR = "orchestrator"
 
@@ -74,7 +74,7 @@ async def main() -> None:
         reply = await laser.contract(
             CLASSIFY, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
         )
-        print("classifier replied:", reply.decode() if reply else "<did not complete>")
+        print("classifier replied:", completed_body(reply) or "<did not complete>")
         await pause("CONTRACT: a directed task completed (see it in the Contracts panel)")
 
         _common.phase("Fan-out: a panel scattered to every capable agent")
@@ -109,8 +109,8 @@ async def main() -> None:
             after=["diagnose"],
             build=lambda outputs: b"remediate: " + outputs.get("diagnose", b""),
         )
-        outputs = await wf.run()
-        print(f"workflow completed and journalled: {len(outputs)} steps")
+        outcome = await wf.run()
+        print(f"workflow completed and journalled: {len(outcome.outputs)} steps")
         await pause("WORKFLOW: the run journalled triage -> diagnose -> remediate (Workflow panel)")
 
         _common.phase("Quarantine: an operator pulls a misbehaving agent")
@@ -136,14 +136,14 @@ async def main() -> None:
         slow = await laser.contract(
             SLOW_TASK, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=1_000
         )
-        if slow is None:
+        if not isinstance(slow, ls.Contract.Completed):
             print("the slow agent missed the deadline, recovering on a healthy agent")
             recovered = await laser.contract(
                 REMEDIATE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
             )
-            print("recovered:", recovered.decode() if recovered else "<did not complete>")
+            print("recovered:", completed_body(recovered) or "<did not complete>")
         else:
-            print("unexpectedly fast:", slow.decode())
+            print("unexpectedly fast:", completed_body(slow))
         await pause("EXPIRY: the slow agent timed out, the task recovered on a healthy agent")
 
         print(
@@ -208,6 +208,13 @@ async def diagnose_panel(laser) -> int:
         DIAGNOSE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
     )
     return len(bodies)
+
+
+def completed_body(outcome) -> str | None:
+    """The reply text of a completed contract, or `None` for any other outcome."""
+    if isinstance(outcome, ls.Contract.Completed):
+        return bytes(outcome[0].body()).decode()
+    return None
 
 
 async def pause(prompt: str) -> None:

@@ -36,35 +36,51 @@ void test("given_each_turn_kind_when_mapped_then_should_ride_its_topic_and_read_
 })
 
 void test("given_a_custom_layout_when_a_kind_moves_topic_then_should_map_both_ways", () => {
-  const config = new SessionConfig({
-    stream: "support",
-    topics: { instruction: "support.turns" },
-    memoryNamespace: "support.sessions",
-    contextTurns: 10,
-    contextTokens: 800
-  })
+  const config = new SessionConfig()
+    .stream("support")
+    .topic("instruction", "support.turns")
+    .memoryNamespace("support.sessions")
+    .contextTurns(10)
+    .contextTokens(800)
   assert.equal(config.topicFor("instruction"), "support.turns")
   assert.equal(config.topicFor("tool.call"), AgentTopic.ToolCalls)
   assert.equal(config.kindFor("support.turns"), "instruction")
   assert.equal(config.kindFor(AgentTopic.Commands), undefined)
-  assert.equal(config.stream, "support")
-  assert.equal(config.memoryNamespace, "support.sessions")
-  assert.equal(config.contextTurns, 10)
-  assert.equal(config.contextTokens, 800)
-  assert.deepEqual(new SessionConfig().topicList, DEFAULT_SESSION_TOPICS)
+  assert.equal(config.streamName, "support")
+  assert.equal(config.memoryNamespaceName, "support.sessions")
+  assert.equal(config.contextTurnBound, 10)
+  assert.equal(config.contextTokenBound, 800)
+  assert.deepEqual(new SessionConfig().topics(), DEFAULT_SESSION_TOPICS)
 })
 
-void test("given_two_kinds_on_one_topic_when_configured_then_should_be_rejected", () => {
+void test("given_chained_setters_when_configuring_then_should_return_new_configs", () => {
+  const base = new SessionConfig()
+  const config = base
+    .stream("support")
+    .topic("instruction", "support.turns")
+    .memoryNamespace("support.sessions")
+    .contextTurns(10)
+    .contextTokens(800)
+  assert.equal(config.streamName, "support")
+  assert.equal(config.topicFor("instruction"), "support.turns")
+  assert.equal(config.memoryNamespaceName, "support.sessions")
+  assert.equal(config.contextTurnBound, 10)
+  assert.equal(config.contextTokenBound, 800)
+  assert.equal(base.streamName, undefined)
+  assert.equal(base.topicFor("instruction"), AgentTopic.Commands)
+})
+
+void test("given_two_kinds_on_one_topic_when_opening_sessions_then_should_be_rejected", () => {
+  const laser = {} as Laser
   assert.throws(
-    () => new SessionConfig({ topics: { response: AgentTopic.Commands } }),
+    () => Sessions.create(laser, new SessionConfig().topic("response", AgentTopic.Commands)),
     InvalidError
   )
 })
 
 void test("given_a_checkpoint_when_round_tripped_through_json_then_should_keep_every_offset", () => {
   const checkpoint = Checkpoint.fromJSON({
-    "agent.commands": { "0": "5", "1": "2" },
-    "agent.llm_io": {}
+    per_topic: { "agent.commands": { "0": 5, "1": 2 }, "agent.llm_io": {} }
   })
   assert.deepEqual(
     checkpoint.topicOffsets("agent.commands"),
@@ -76,11 +92,31 @@ void test("given_a_checkpoint_when_round_tripped_through_json_then_should_keep_e
   assert.deepEqual(checkpoint.topicOffsets("agent.llm_io"), new Map())
   assert.equal(checkpoint.topicOffsets("agent.tool_calls"), undefined)
   assert.equal(checkpoint.isEmpty(), false)
-  assert.equal(Checkpoint.empty().isEmpty(), true)
+  assert.equal(Checkpoint.fromJSON({ per_topic: {} }).isEmpty(), true)
   const restored = Checkpoint.fromJSON(JSON.stringify(checkpoint))
   assert.deepEqual(restored.toJSON(), checkpoint.toJSON())
-  assert.throws(() => Checkpoint.fromJSON(["nope"]), TypeError)
-  assert.throws(() => Checkpoint.fromJSON({ topic: { x: "1" } }), TypeError)
+  assert.throws(() => Checkpoint.fromJSON(["nope"]), InvalidError)
+  assert.throws(() => Checkpoint.fromJSON({ per_topic: { topic: { x: 1 } } }), InvalidError)
+})
+
+void test("given_the_rust_checkpoint_json_when_read_then_should_round_trip_byte_for_byte", () => {
+  const rust = '{"per_topic":{"agent.commands":{"0":5,"7":18446744073709551615},"agent.llm_io":{}}}'
+  const checkpoint = Checkpoint.fromJSON(rust)
+  assert.equal(checkpoint.topicOffsets("agent.commands")?.get(7), 18446744073709551615n)
+  assert.equal(JSON.stringify(checkpoint), rust)
+})
+
+void test("given_an_offset_that_is_not_a_u64_when_read_then_should_reject_it", () => {
+  for (const offset of ["-1", "1.5", "18446744073709551616", '"5"']) {
+    assert.throws(
+      () => Checkpoint.fromJSON(`{"per_topic":{"agent.commands":{"0":${offset}}}}`),
+      InvalidError,
+      offset
+    )
+  }
+  assert.throws(() => Checkpoint.fromJSON('{"per_topic":{"t":{"4294967296":1}}}'), InvalidError)
+  assert.throws(() => Checkpoint.fromJSON("{"), InvalidError)
+  assert.throws(() => Checkpoint.fromJSON({ "agent.commands": { "0": 5 } }), InvalidError)
 })
 
 interface Call {
@@ -140,10 +176,10 @@ function fakeRecall(namespace: string) {
 
 void test("given_a_fake_laser_when_sessions_are_opened_then_should_derive_and_route_turns", async () => {
   const { laser, calls, streams } = fakeLaser(new Map())
-  const sessions = new Sessions(laser, {
-    stream: "support",
-    topics: { instruction: "support.turns" }
-  })
+  const sessions = Sessions.create(
+    laser,
+    new SessionConfig().stream("support").topic("instruction", "support.turns")
+  )
   assert.deepEqual(streams, ["support"])
   const session = sessions.create("agent-42")
   assert.ok(sessions.create("agent-42").conversation.equals(session.conversation))
@@ -156,12 +192,15 @@ void test("given_a_fake_laser_when_sessions_are_opened_then_should_derive_and_ro
     ["support.turns", AgentTopic.ToolCalls]
   )
   assert.deepEqual((session.graph("kg") as unknown as { name: string }).name, "kg")
-  assert.equal(session.config.memoryNamespace, DEFAULT_SESSION_MEMORY_NAMESPACE)
+  assert.equal(session.config.memoryNamespaceName, DEFAULT_SESSION_MEMORY_NAMESPACE)
 })
 
 void test("given_a_scoped_memory_when_searched_then_should_run_a_keyword_recall_in_the_namespace", async () => {
   const { laser } = fakeLaser(new Map())
-  const session = new Sessions(laser, { memoryNamespace: "support.sessions" }).start()
+  const session = Sessions.create(
+    laser,
+    new SessionConfig().memoryNamespace("support.sessions")
+  ).start()
   const hits = (await session.memory().search("login bug", 3)) as unknown as readonly {
     namespace: string
     text: string
@@ -188,8 +227,11 @@ void test("given_topic_tails_when_a_checkpoint_is_captured_then_should_record_ea
       [AgentTopic.LlmIo, new Map([[0, 1n]])]
     ])
   )
-  const checkpoint = await new Sessions(laser).start().checkpoint()
-  assert.deepEqual([...checkpoint.topics].sort(), [...DEFAULT_SESSION_TOPICS].sort())
+  const checkpoint = await Sessions.create(laser).start().checkpoint()
+  assert.deepEqual(
+    Object.keys(checkpoint.toJSON().per_topic).sort(),
+    [...DEFAULT_SESSION_TOPICS].sort()
+  )
   assert.deepEqual(
     checkpoint.topicOffsets(AgentTopic.Commands),
     new Map([
@@ -227,9 +269,7 @@ void test("given_a_cursor_with_an_upper_bound_when_polled_then_should_stop_each_
       return Promise.resolve(messages)
     }
   }
-  const cursor = new Cursor(transport as unknown as LaserTransport, "s", "t", [0, 1], {
-    batchSize: 4
-  })
+  const cursor = Cursor.create(transport as unknown as LaserTransport, "s", "t", [0, 1]).batch(4)
   cursor.fromOffsets(new Map([[0, 2n]])).until(
     new Map([
       [0, 5n],
@@ -238,7 +278,7 @@ void test("given_a_cursor_with_an_upper_bound_when_polled_then_should_stop_each_
   )
   const first = await cursor.poll()
   assert.deepEqual(
-    first.map((message) => [message.partitionId, message.offset]),
+    first.map((message) => [message.id.partitionId, message.id.offset]),
     [
       [0, 2n],
       [0, 3n],
@@ -267,7 +307,7 @@ void test("given_a_topic_when_tails_are_read_then_should_report_the_next_offset_
           : []
       )
   } as unknown as LaserTransport
-  const present = new Topic(transport, "s", "present")
+  const present = Topic.create(transport, "s", "present")
   assert.equal(await present.partitionCount(), 2)
   assert.deepEqual(
     await present.tailOffsets(),
@@ -276,7 +316,7 @@ void test("given_a_topic_when_tails_are_read_then_should_report_the_next_offset_
       [1, 0n]
     ])
   )
-  const missing = new Topic(transport, "s", "missing")
+  const missing = Topic.create(transport, "s", "missing")
   assert.equal(await missing.partitionCount(), undefined)
   assert.deepEqual(await missing.tailOffsets(), new Map())
 })

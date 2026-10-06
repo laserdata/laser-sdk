@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
 import { Laser } from "../../src/client/laser.js"
-import { AgentContext, REQUIRE_ALL } from "../../src/agent/context.js"
+import { AgentCtx, REQUIRE_ALL } from "../../src/agent/context.js"
 import { decodeAgentMessage } from "../../src/agent/reliable-consumer.js"
 import { capabilitySelector } from "../../src/agent/router.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
@@ -44,7 +44,7 @@ void test("given_an_agent_topology_when_bootstrapped_then_should_send_and_correl
     assert.ok(request !== undefined)
     const received = decodeProvenanceHeaders(request.headers)
     assert.ok(received.conversationId.equals(provenance.conversationId))
-    assert.equal(received.agent?.asString(), "requester")
+    assert.equal(received.agent?.asStr(), "requester")
     assert.ok(received.correlationId !== undefined)
 
     await laser.sendAgent(AgentTopic.Responses, new TextEncoder().encode("answer"), {
@@ -71,7 +71,7 @@ void test("given_attributed_provenance_when_spawning_then_should_preserve_root_a
     const child = laser.spawnSubconversation(parent)
     assert.ok(child.parentConversationId?.equals(parent.conversationId))
     assert.ok(child.rootConversationId?.equals(root))
-    assert.equal(child.agent?.asString(), "orchestrator")
+    assert.equal(child.agent?.asStr(), "orchestrator")
     assert.ok(!child.conversationId.equals(parent.conversationId))
   } finally {
     await laser.close()
@@ -89,12 +89,12 @@ void test("given_a_handled_message_when_responding_then_should_chain_causality_a
       agent: AgentId.new("requester"),
       correlationId: "request-1"
     })
-    const received = (await (await laser.topic(AgentTopic.Commands).replay()).poll())[0]
+    const received = (await (await laser.topic(AgentTopic.Commands).replay()).pollRecords())[0]
     assert.ok(received !== undefined)
     const decoded = decodeAgentMessage(received)
     assert.equal(decoded.kind, "message")
 
-    const context = new AgentContext(laser, decoded.message, {
+    const context = AgentCtx.create(laser, decoded.message, {
       agent: AgentId.new("worker"),
       respondOn: AgentTopic.Responses
     })
@@ -103,8 +103,8 @@ void test("given_a_handled_message_when_responding_then_should_chain_causality_a
     const reply = (await responses.poll())[0]
     assert.ok(reply !== undefined)
     const provenance = decodeProvenanceHeaders(reply.headers)
-    assert.equal(provenance.agent?.asString(), "worker")
-    assert.equal(provenance.targetAgentId?.asString(), "requester")
+    assert.equal(provenance.agent?.asStr(), "worker")
+    assert.equal(provenance.targetAgentId?.asStr(), "requester")
     assert.equal(provenance.correlationId, "request-1")
     assert.deepEqual(provenance.causalParent, decoded.message.id)
   } finally {
@@ -133,7 +133,7 @@ void test("given_two_capable_agents_when_fanning_out_then_should_gather_each_cor
       payload: new TextEncoder().encode("parent"),
       id: { partitionId: 0, offset: 0n }
     }
-    const context = new AgentContext(laser, message, {
+    const context = AgentCtx.create(laser, message, {
       agent: AgentId.new("orchestrator"),
       respondOn: AgentTopic.Responses,
       inboxRoute: { kind: "fixed", topic: "shared-inbox" }
@@ -165,7 +165,7 @@ void test("given_two_capable_agents_when_fanning_out_then_should_gather_each_cor
     const result = await gathered
     assert.equal(result.ok.length, 2)
     assert.equal(result.failures.length, 0)
-    assert.deepEqual(result.ok.map(([agent]) => agent.asString()).sort(), ["worker-a", "worker-b"])
+    assert.deepEqual(result.ok.map(([agent]) => agent.asStr()).sort(), ["worker-a", "worker-b"])
   } finally {
     await laser.close()
   }

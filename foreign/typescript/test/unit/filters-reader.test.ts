@@ -381,6 +381,47 @@ void test("given_inconsistent_reply_metadata_when_reading_without_a_guard_then_s
   }
 })
 
+void test("given_stored_record_headers_when_matched_then_should_carry_them_to_the_record", async () => {
+  const served = page("local", { offsets: [0n] })
+  const records = served.records.slice()
+  const view = new DataView(records.buffer)
+  const frame = 16 + 256
+  view.setBigUint64(16 + 24, 1_000n, true)
+  view.setBigUint64(frame, 42n, true)
+  view.setBigUint64(frame + 8, 7n, true)
+  view.setUint32(frame + 28, 5, true)
+  const filtered = reader(
+    baseTransport(() => Promise.resolve(pageReply({ ...served, records }))),
+    "local"
+  )
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert.equal(record?.message.checksum, 42n)
+  assert.equal(record.message.messageId, 7n)
+  assert.equal(record.message.originTimestampMicros, 1_005n)
+  assert.equal(record.message.userHeaders, undefined)
+  assert.equal(record.message.currentOffset, record.frontier)
+  await filtered.close()
+})
+
+void test("given_a_command_error_reply_when_reading_then_should_classify_its_result_code", async () => {
+  const refusal = encodeNamed(
+    new Map<string, unknown>([
+      ["code", "unsupported"],
+      ["message", "filtered reads are not served"]
+    ])
+  )
+  const filtered = reader(
+    baseTransport(() => Promise.resolve(refusal)),
+    "local"
+  )
+  await assert.rejects(
+    filtered.tryNextPage(),
+    (error: unknown) =>
+      error instanceof UnsupportedError && error.message === "filtered reads are not served"
+  )
+  await filtered.close()
+})
+
 void test("given_local_pages_when_never_acknowledged_then_should_keep_reading_past_the_pending_cap", async () => {
   let next = 0n
   const transport = baseTransport(() => {
@@ -395,7 +436,11 @@ void test("given_local_pages_when_never_acknowledged_then_should_keep_reading_pa
     const found = await filtered.tryNextPage()
     assert.equal(found?.records.length, 1, `page ${String(read)} is read`)
     assert.equal(found.safeAckOffset, undefined, "a local page offers no acknowledgment")
-    assert.equal(found.records[0]?.timestampMicros, 1_700_000_000_123_456n, "micros stay exact")
+    assert.equal(
+      found.records[0]?.message.timestampMicros,
+      1_700_000_000_123_456n,
+      "micros stay exact"
+    )
   }
   await filtered.close()
 })
@@ -808,7 +853,7 @@ for (const refusals of [1, 2]) {
         await assert.rejects(
           filtered.tryNextPage(),
           (error: unknown) =>
-            error instanceof FilterExecutionError && error.reason === "not_primary"
+            error instanceof FilterExecutionError && error.detail.reason === "not_primary"
         )
       assert.equal(polls, 2)
     } finally {

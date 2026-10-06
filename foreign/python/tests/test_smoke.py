@@ -37,8 +37,10 @@ def test_provenance_round_trips_fields():
     provenance = ls.Provenance(agent="planner", idempotency_key="k1", input_tokens=10, cost_usd=0.5)
     assert provenance.agent == "planner"
     assert provenance.idempotency_key == "k1"
-    assert provenance.input_tokens == 10
-    assert provenance.cost_usd == 0.5
+    assert provenance.usage.input_tokens == 10
+    assert provenance.usage.output_tokens is None
+    assert provenance.usage.cost_usd == 0.5
+    assert ls.Provenance().usage is None
     assert provenance.conversation_id  # a fresh ULID
 
 
@@ -69,7 +71,7 @@ async def test_standalone_vector_memory_needs_no_connection():
         return [1.0, 0.0] if "auth" in text else [0.0, 1.0]
 
     conversation = ls.new_conversation_id()
-    memory = ls.Memory.vector(embed)
+    memory = ls.MemoryHandle.vector(embed)
     expected = await memory.remember("auth uses the read replica", conversation=conversation)
     await memory.remember("storage uses idempotency keys", conversation=conversation)
 

@@ -6,9 +6,9 @@ import {
   AgentTopic,
   CorrelationId,
   InvalidError,
-  OPERATION_CHAT,
   enterBridge
 } from "@laserdata/laser-sdk"
+import { wire } from "@laserdata/laser-sdk/full"
 
 import type { LaserWorld } from "../world.js"
 
@@ -90,7 +90,7 @@ When(
     const conversation = this.requireConversation()
     const stream = laser
       .agdx(AgentTopic.LlmIo, AgentId.new("assistant"), conversation)
-      .stream(CorrelationId.parse(conversation.toString()), OPERATION_CHAT)
+      .stream(CorrelationId.parse(conversation.toString()), wire.OPERATION_CHAT)
     await stream.write(encoder.encode(first))
     await stream.write(encoder.encode(second))
     await stream.finish("stop")

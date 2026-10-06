@@ -1,3 +1,4 @@
+import { INTERNAL_RETURN_DELIVERY } from "../../src/client/internals.js"
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
@@ -31,11 +32,12 @@ import {
   ForkExecutionError,
   InvalidError,
   KvExecutionError,
+  NoCapableAgentError,
   NoRespondTopicError,
   PublishFailedError,
   QuarantinedError,
   QueryExecutionError,
-  RoutingError,
+  RoutePrincipalMismatchError,
   TimeoutError,
   TransportError,
   UnsupportedError,
@@ -66,12 +68,7 @@ function iggyFailure(errorCode: number): TransportError {
 void test("given_each_rust_classifier_when_applied_to_its_failure_then_should_answer_true", () => {
   assert.equal(isPermissionDenied(iggyFailure(41)), true)
   assert.equal(isPermissionDenied(iggyFailure(40)), true)
-  assert.equal(
-    isPermissionDenied(
-      new RoutingError("mismatch", { kind: "principalMismatch", agent: "metrics", expected: 1 })
-    ),
-    true
-  )
+  assert.equal(isPermissionDenied(new RoutePrincipalMismatchError("metrics", 1)), true)
   assert.equal(
     isPermissionDenied(new CheckpointExecutionError("denied", { kind: "unauthorized" })),
     true
@@ -88,10 +85,7 @@ void test("given_each_rust_classifier_when_applied_to_its_failure_then_should_an
   assert.equal(isNotLeader(new KvExecutionError("moved", { kind: "notLeader" })), true)
   assert.equal(isLeaseLost(new KvExecutionError("lost", { kind: "leaseLost" })), true)
   assert.equal(isAmbiguousMutation(new AmbiguousMutationError("unknown")), true)
-  assert.equal(
-    isNoCapableAgent(new RoutingError("none", { kind: "noCapableAgent", skill: "rollback" })),
-    true
-  )
+  assert.equal(isNoCapableAgent(new NoCapableAgentError("rollback")), true)
   assert.equal(isFenceViolation(new FenceViolationError(3n, 4n)), true)
   assert.equal(isBudgetExceeded(new BudgetExceededError(10n, 11n)), true)
   assert.equal(isQuarantined(new QuarantinedError("metrics")), true)
@@ -143,7 +137,7 @@ void test("given_a_topic_send_failure_when_published_then_should_report_every_re
   const transport = {
     sendMessages: () => Promise.reject(new TransportError("down", true))
   } as unknown as LaserTransport
-  const topic = new Topic(transport, "fleet", "readings")
+  const topic = Topic.create(transport, "fleet", "readings")
   await assert.rejects(topic.batch([utf8("a"), utf8("b")]), (error: unknown) => {
     assert.ok(error instanceof PublishFailedError)
     assert.equal(error.stream, "fleet")
@@ -182,7 +176,7 @@ function item(body: string): MemoryItem {
 
 void test("given_scoped_memory_when_consolidating_then_should_keep_the_newest_items", async () => {
   const backend = new ListMemory([item("a"), item("b"), item("c")])
-  const scoped = new ScopedMemory(MemoryHandle.custom(backend), ConversationId.new())
+  const scoped = ScopedMemory.create(MemoryHandle.custom(backend), ConversationId.new())
   const report = await scoped.consolidate(1)
   assert.equal(report.pruned, 2)
   assert.equal(report.reweighted, 0)
@@ -191,7 +185,7 @@ void test("given_scoped_memory_when_consolidating_then_should_keep_the_newest_it
 })
 
 void test("given_a_vector_handle_when_named_verbs_are_called_then_should_refuse_unsupported", () => {
-  const handle = MemoryHandle.vector()
+  const handle = MemoryHandle.vector({ embed: () => Promise.resolve([1]) })
   assert.throws(() => handle.set("plan", utf8("{}")), UnsupportedError)
   assert.throws(() => handle.fetch("plan"), UnsupportedError)
   assert.throws(() => handle.remove("plan"), UnsupportedError)
@@ -215,8 +209,8 @@ void test("given_a_checkpoint_error_when_mutating_then_should_raise_the_checkpoi
     },
     backends: []
   })
-  const destinations = new Destinations(transport, () =>
-    Promise.resolve({ ...caps, destinations: { available: true, checkpointVersion: 1 } })
+  const destinations = Destinations.create(transport, () =>
+    Promise.resolve({ ...caps, destinations: { available: true, consistency: "linearizable" } })
   )
   await assert.rejects(
     destinations.setDesiredState(0n, DestinationId.fromU128(1n), 1n, 1n, "enabled"),
@@ -226,10 +220,14 @@ void test("given_a_checkpoint_error_when_mutating_then_should_raise_the_checkpoi
 
 void test("given_a_size_bound_when_batching_then_should_flush_one_append_per_full_batch", async () => {
   const batches: number[] = []
-  const producer = new BatchingProducerBuilder((records) => {
-    batches.push(records.length)
-    return Promise.resolve()
-  })
+  const producer = BatchingProducerBuilder.create(
+    (records) => {
+      batches.push(records.length)
+      return Promise.resolve()
+    },
+    "fleet",
+    "readings"
+  )
     .maxRecords(2)
     .linger(60_000)
     .build()
@@ -277,7 +275,7 @@ void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_
     polled(0n, { host: "node-1" }),
     polled(1n, { host: "node-2" })
   ])
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "fleet",
     "readings",
@@ -297,12 +295,12 @@ void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_
 
 void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_should_track_them", async () => {
   const { transport, stored, deleted } = nativeTransport([polled(0n, {})])
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { autoCommit: false, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0 }
   )
   await consumer.storeOffset(7n)
   assert.deepEqual(stored, [[0, 7n]])
@@ -315,18 +313,19 @@ void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_shou
 
 void test("given_a_returned_delivery_when_reading_again_then_should_yield_it_first", async () => {
   const { transport } = nativeTransport([polled(0n, { host: "node-1" }), polled(1n, {})])
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { autoCommit: false, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0 }
   )
   const first = await consumer.nextWithin(100)
-  consumer.returnDelivery(first)
-  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  consumer[INTERNAL_RETURN_DELIVERY](first)
+  assert.equal(await consumer.nextWithin(100), first)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 1n)
   assert.throws(() => {
-    consumer.returnDelivery(first)
+    consumer[INTERNAL_RETURN_DELIVERY](first)
   }, InvalidError)
   await consumer.shutdown()
 })
@@ -343,33 +342,19 @@ void test("given_records_at_or_below_the_consumed_offset_when_polled_again_then_
     const transport = {
       pollMessages: () => Promise.resolve(polls.shift() ?? [])
     } as unknown as LaserTransport
-    const consumer = new Consumer(
+    const consumer = Consumer.create(
       transport,
       "fleet",
       "readings",
       { kind: "single", partitionId: 0, name: "metrics" },
-      { autoCommit: false, pollIntervalMs: 0, allowReplay }
+      { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0, allowReplay }
     )
     const offsets: bigint[] = []
-    while (offsets.length < expected.length) offsets.push((await consumer.nextWithin(100)).offset)
+    while (offsets.length < expected.length)
+      offsets.push((await consumer.nextWithin(100)).position.offset)
     assert.deepEqual(offsets, [...expected])
     await consumer.shutdown()
   }
-})
-
-void test("given_conflicting_commit_options_when_built_then_should_reject_them", () => {
-  const { transport } = nativeTransport([])
-  assert.throws(
-    () =>
-      new Consumer(
-        transport,
-        "fleet",
-        "readings",
-        { kind: "single", partitionId: 0, name: "metrics" },
-        { autoCommit: true, commitPolicy: { kind: "each" } }
-      ),
-    InvalidError
-  )
 })
 
 // A partition holding more raw records than the context read window: one turn
@@ -400,8 +385,7 @@ function contextLaser(conversation: ConversationId, total: number): Laser {
     topic: (name: string) => ({
       partitionCount: () => Promise.resolve(1),
       tailOffsets: () => Promise.resolve(new Map([[0, BigInt(total)]])),
-      replay: (options: { readonly batchSize: number }) =>
-        Promise.resolve(new Cursor(transport, "fleet", name, [0], options))
+      replay: () => Promise.resolve(Cursor.create(transport, "fleet", name, [0]))
     })
   } as unknown as Laser
 }
@@ -410,7 +394,8 @@ void test("given_turns_before_the_read_window_when_assembling_then_should_read_o
   const conversation = ConversationId.new()
   const total = CONTEXT_READ_WINDOW + 5
   const laser = contextLaser(conversation, total)
-  const open = await ContextAssembler.builder(conversation)
+  const open = await ContextAssembler.builder()
+    .conversationId(conversation)
     .topics(["agent.commands"])
     .policy(new LastN(100))
     .build()
@@ -419,8 +404,9 @@ void test("given_turns_before_the_read_window_when_assembling_then_should_read_o
     open.map((message) => decodeUtf8(message.payload)),
     [`turn-${String(total - 1)}`]
   )
-  const atStart = Checkpoint.fromJSON({ "agent.commands": { "0": "5" } })
-  const before = await ContextAssembler.builder(conversation)
+  const atStart = Checkpoint.fromJSON({ per_topic: { "agent.commands": { "0": 5 } } })
+  const before = await ContextAssembler.builder()
+    .conversationId(conversation)
     .topics(["agent.commands"])
     .policy(new LastN(100))
     .toCheckpoint(atStart)
@@ -438,10 +424,14 @@ void test("given_a_failed_timer_flush_when_closing_the_batcher_then_should_repor
   const attempt = new Promise<void>((resolve) => {
     attempted = resolve
   })
-  const producer = new BatchingProducerBuilder(() => {
-    attempted()
-    return Promise.reject(failure)
-  })
+  const producer = BatchingProducerBuilder.create(
+    () => {
+      attempted()
+      return Promise.reject(failure)
+    },
+    "fleet",
+    "readings"
+  )
     .linger(1)
     .build()
   const keepAlive = setTimeout(attempted, 1_000)
@@ -455,99 +445,102 @@ void test("given_a_failed_timer_flush_when_closing_the_batcher_then_should_repor
   }
 })
 
-void test("given_records_queued_after_a_failed_timer_flush_when_closing_then_should_append_them_and_report_the_failure", async () => {
-  const failure = new PublishFailedError("fleet", "readings", [], [], new Error("append refused"))
-  const appended: string[][] = []
-  let failed!: () => void
-  const firstFailed = new Promise<void>((resolve) => {
-    failed = resolve
-  })
-  let calls = 0
-  const producer = new BatchingProducerBuilder((records) => {
-    calls += 1
-    if (calls === 1) {
-      failed()
-      return Promise.reject(failure)
-    }
-    appended.push(records.map((record) => decodeUtf8(record.payload)))
-    return Promise.resolve()
-  })
-    .linger(1)
-    .build()
-  const keepAlive = setTimeout(failed, 1_000)
-  try {
-    await producer.send(utf8("a"))
-    await firstFailed
-    await producer.send(utf8("b"))
-    await assert.rejects(producer.close(), (error: unknown) => error === failure)
-    assert.deepEqual(appended, [["b"]])
-  } finally {
-    clearTimeout(keepAlive)
-  }
-})
-
-void test("given_two_failed_timer_flushes_when_flushing_then_should_report_the_records_of_both", async () => {
-  const waiting: (() => void)[] = []
-  const attempt = (): Promise<void> =>
-    new Promise<void>((resolve) => {
-      waiting.push(resolve)
-    })
-  let calls = 0
-  const producer = new BatchingProducerBuilder((records) => {
-    calls += 1
-    waiting.shift()?.()
-    return Promise.reject(
-      new PublishFailedError(
-        "fleet",
-        "readings",
-        [],
-        records,
-        new Error(`refused ${String(calls)}`)
-      )
-    )
-  })
-    .linger(1)
-    .build()
-  const keepAlive = setTimeout(() => {
-    for (const resolve of waiting.splice(0)) resolve()
-  }, 1_000)
-  try {
-    const first = attempt()
-    await producer.send(utf8("a"))
-    await first
-    const second = attempt()
-    await producer.send(utf8("b"))
-    await second
-    await assert.rejects(producer.flush(), (error: unknown) => {
-      assert.ok(error instanceof PublishFailedError)
-      assert.deepEqual(
-        error.unconfirmed.map((record) => decodeUtf8(record.payload)),
-        ["a", "b"]
-      )
-      assert.equal((error.cause as Error).message, "refused 1")
-      return true
-    })
-    await producer.close()
-  } finally {
-    clearTimeout(keepAlive)
-  }
-})
-
-void test("given_a_kept_timer_failure_when_a_size_bound_trips_then_should_not_report_it_to_the_sender", async () => {
+void test("given_a_kept_failure_without_records_when_sending_then_should_list_the_refused_record", async () => {
   const failure = new Error("append refused")
   let failed!: () => void
   const firstFailed = new Promise<void>((resolve) => {
     failed = resolve
   })
   let calls = 0
-  const producer = new BatchingProducerBuilder(() => {
-    calls += 1
-    if (calls === 1) {
+  const producer = BatchingProducerBuilder.create(
+    () => {
+      calls += 1
       failed()
       return Promise.reject(failure)
-    }
-    return Promise.resolve()
+    },
+    "fleet",
+    "readings"
+  )
+    .linger(1)
+    .build()
+  const keepAlive = setTimeout(failed, 1_000)
+  try {
+    await producer.send(utf8("a"))
+    await firstFailed
+    await assert.rejects(producer.send(utf8("b")), (error: unknown) => {
+      assert.ok(error instanceof PublishFailedError)
+      assert.equal(error.stream, "fleet")
+      assert.equal(error.topic, "readings")
+      assert.equal(error.cause, failure)
+      assert.deepEqual(
+        error.unconfirmed.map((record) => decodeUtf8(record.payload)),
+        ["b"]
+      )
+      return true
+    })
+    await producer.close()
+    assert.equal(calls, 1)
+  } finally {
+    clearTimeout(keepAlive)
+  }
+})
+
+void test("given_a_kept_timer_failure_when_flushing_then_should_report_it_once", async () => {
+  let failed!: () => void
+  const firstFailed = new Promise<void>((resolve) => {
+    failed = resolve
   })
+  const producer = BatchingProducerBuilder.create(
+    (records) => {
+      failed()
+      return Promise.reject(
+        new PublishFailedError("fleet", "readings", [], records, new Error("refused"))
+      )
+    },
+    "fleet",
+    "readings"
+  )
+    .linger(1)
+    .build()
+  const keepAlive = setTimeout(failed, 1_000)
+  try {
+    await producer.send(utf8("a"))
+    await firstFailed
+    await assert.rejects(producer.flush(), (error: unknown) => {
+      assert.ok(error instanceof PublishFailedError)
+      assert.deepEqual(
+        error.unconfirmed.map((record) => decodeUtf8(record.payload)),
+        ["a"]
+      )
+      return true
+    })
+    await producer.flush()
+    await producer.close()
+  } finally {
+    clearTimeout(keepAlive)
+  }
+})
+
+void test("given_a_kept_timer_failure_when_sending_then_should_report_it_with_the_refused_record_unqueued", async () => {
+  let failed!: () => void
+  const firstFailed = new Promise<void>((resolve) => {
+    failed = resolve
+  })
+  let calls = 0
+  const producer = BatchingProducerBuilder.create(
+    (records) => {
+      calls += 1
+      if (calls === 1) {
+        failed()
+        return Promise.reject(
+          new PublishFailedError("fleet", "readings", [], records, new Error("append refused"))
+        )
+      }
+      return Promise.resolve()
+    },
+    "fleet",
+    "readings"
+  )
     .maxRecords(2)
     .linger(1)
     .build()
@@ -555,9 +548,17 @@ void test("given_a_kept_timer_failure_when_a_size_bound_trips_then_should_not_re
   try {
     await producer.send(utf8("a"))
     await firstFailed
-    await producer.send(utf8("b"))
-    await producer.send(utf8("c"))
-    await assert.rejects(producer.close(), (error: unknown) => error === failure)
+    await new Promise((resolve) => setImmediate(resolve))
+    await assert.rejects(producer.send(utf8("b")), (error: unknown) => {
+      assert.ok(error instanceof PublishFailedError)
+      assert.deepEqual(
+        error.unconfirmed.map((record) => decodeUtf8(record.payload)),
+        ["a", "b"]
+      )
+      return true
+    })
+    await producer.close()
+    assert.equal(calls, 1)
   } finally {
     clearTimeout(keepAlive)
   }
@@ -573,23 +574,23 @@ void test("given_a_failed_offset_store_when_a_record_is_yielded_then_should_deli
       ? Promise.reject(new TransportError("socket closed", true))
       : storeOffset(...args)
   }
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
     { commitPolicy: { kind: "each" }, pollIntervalMs: 0 }
   )
-  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 0n)
   assert.equal(consumer.lastStoredOffset(0), undefined)
-  assert.equal((await consumer.nextWithin(100)).offset, 1n)
+  assert.equal((await consumer.nextWithin(100)).position.offset, 1n)
   assert.deepEqual(stored, [[0, 1n]])
   await consumer.shutdown()
 })
 
 void test("given_a_deleted_offset_when_shutting_down_then_should_not_store_it_again", async () => {
   const { transport, stored, deleted } = nativeTransport([polled(0n, {})])
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "fleet",
     "readings",
@@ -607,12 +608,12 @@ void test("given_a_failing_poll_when_the_deadline_is_short_then_should_time_out_
   const transport = {
     pollMessages: () => Promise.reject(new TransportError("socket closed", true))
   } as unknown as LaserTransport
-  const consumer = new Consumer(
+  const consumer = Consumer.create(
     transport,
     "fleet",
     "readings",
     { kind: "single", partitionId: 0, name: "metrics" },
-    { autoCommit: false, pollIntervalMs: 0 }
+    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0 }
   )
   const started = Date.now()
   await assert.rejects(consumer.nextWithin(30), TimeoutError)

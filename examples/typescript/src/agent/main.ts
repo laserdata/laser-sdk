@@ -1,5 +1,4 @@
 import {
-  ANY_ROUTE_POLICY,
   Agent,
   AgentId,
   AgentTopic,
@@ -14,7 +13,11 @@ const CAPABILITY = "resolve-ticket"
 const DEADLINE_MS = 60_000
 const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
 
-export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
+/** How the contract ended and the reply text when it completed. */
+export async function run(
+  laser: Laser,
+  _signal: AbortSignal
+): Promise<{ readonly kind: string; readonly reply?: string }> {
   // The well-known agent topics (commands, responses, registry, ...) must exist
   // before an agent's consumer group joins one.
   await laser.bootstrap(PARTITIONS)
@@ -37,13 +40,14 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
         return context.respond(utf8("on it"))
       }
     })
+    .build()
     .spawn(laser)
   await triage.ready()
 
   // A contract is a directed task with a deadline and a real answer: consumed,
   // completed, failed, or timed out. Routed by capability, not by name.
   const contract = await laser
-    .contract(routeToCapable(CAPABILITY, ANY_ROUTE_POLICY))
+    .contract(routeToCapable(CAPABILITY, { kind: "any" }))
     .from(AgentId.new("orchestrator"))
     .payload(utf8("ticket #42 is stuck"))
     .inboxRoute(fixedCommands)
@@ -51,10 +55,12 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     .send()
 
   if (contract.kind === "completed") {
-    console.log(`  contract completed: ${decodeUtf8(agentMessageBody(contract.reply))}`)
-  } else {
-    console.log(`  contract ended without a reply: ${contract.kind}`)
+    const reply = decodeUtf8(agentMessageBody(contract.reply))
+    console.log(`  contract completed: ${reply}`)
+    return { kind: contract.kind, reply }
   }
+  console.log(`  contract ended without a reply: ${contract.kind}`)
+  return { kind: contract.kind }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await runExample(EXAMPLE, run)

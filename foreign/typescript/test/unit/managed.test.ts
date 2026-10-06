@@ -3,13 +3,20 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, managedCapabilitiesFrom } from "../../src/client/capabilities.js"
-import { KvExecutionError, UnsupportedError } from "../../src/client/errors.js"
+import {
+  CodecError,
+  InvalidError,
+  KvExecutionError,
+  ProtocolError,
+  UnsupportedError
+} from "../../src/client/errors.js"
 import { isVersionSkew } from "../../src/client/error-classify.js"
 import { executeManaged } from "../../src/client/managed.js"
+import { encodeNamed } from "../../src/wire/cbor.js"
 import { Destinations } from "../../src/managed/destinations.js"
 import { decodeCheckpointRequestFrame } from "../../src/wire/checkpoint.js"
 import { KvSetCommand } from "../../src/wire/commands.js"
-import { Feature } from "../../src/wire/hello.js"
+import { feature } from "../../src/wire/hello.js"
 import { CheckpointRequestId, DestinationId } from "../../src/wire/ids.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
@@ -110,11 +117,11 @@ void test("given_a_supervisor_assertion_when_mutating_then_should_reuse_its_sign
       agent: 1,
       graph: 1,
       checkpoint: 1,
-      features: Feature.DESTINATIONS
+      features: feature.DESTINATIONS
     },
     backends: []
   })
-  const destinations = new Destinations(transport, () => Promise.resolve(capabilities))
+  const destinations = Destinations.create(transport, () => Promise.resolve(capabilities))
 
   await destinations.acceptRetentionGap(3n, destinationId, 4n, 5n, 6n, {
     claims: {
@@ -135,4 +142,82 @@ void test("given_a_supervisor_assertion_when_mutating_then_should_reuse_its_sign
 
   assert.ok(capturedPayload !== undefined)
   assert.equal(decodeCheckpointRequestFrame(capturedPayload).requestId.asU128(), requestId.asU128())
+})
+
+function commandError(code: string, message: string): Uint8Array {
+  return encodeNamed(
+    new Map<string, unknown>([
+      ["code", code],
+      ["message", message]
+    ])
+  )
+}
+
+function answering(reply: Uint8Array) {
+  return { sendManaged: (): Promise<Uint8Array> => Promise.resolve(reply) }
+}
+
+const SET_REQUEST = { namespace: "sessions", key: Uint8Array.of(1), value: Uint8Array.of(2) }
+
+void test("given_a_command_error_reply_when_executing_then_should_classify_its_result_code", async () => {
+  await assert.rejects(
+    executeManaged(
+      answering(commandError("unsupported", "not served")),
+      managed,
+      KvSetCommand,
+      SET_REQUEST
+    ),
+    (error: unknown) =>
+      error instanceof UnsupportedError &&
+      error.message === "not served" &&
+      error.surface === "managed"
+  )
+  for (const code of ["invalid_argument", "version_skew"]) {
+    await assert.rejects(
+      executeManaged(answering(commandError(code, "bad")), managed, KvSetCommand, SET_REQUEST),
+      InvalidError
+    )
+  }
+  await assert.rejects(
+    executeManaged(
+      answering(commandError("not_found", "gone")),
+      managed,
+      KvSetCommand,
+      SET_REQUEST
+    ),
+    (error: unknown) =>
+      error instanceof ProtocolError && error.message === "NotFound: gone" && error.resultCode === 2
+  )
+})
+
+void test("given_an_undecodable_reply_that_is_no_command_error_when_executing_then_should_keep_the_codec_error", async () => {
+  await assert.rejects(
+    executeManaged(
+      answering(commandError("no_such_code", "x")),
+      managed,
+      KvSetCommand,
+      SET_REQUEST
+    ),
+    CodecError
+  )
+  await assert.rejects(
+    executeManaged(answering(Uint8Array.of(0xff)), managed, KvSetCommand, SET_REQUEST),
+    CodecError
+  )
+})
+
+void test("given_a_command_error_with_a_newer_code_when_executing_then_should_report_it_as_unrecognized", async () => {
+  const reply = encodeNamed(
+    new Map<string, unknown>([
+      ["code", new Map<string, unknown>([["unrecognized", 42]])],
+      ["message", "later"]
+    ])
+  )
+  await assert.rejects(
+    executeManaged(answering(reply), managed, KvSetCommand, SET_REQUEST),
+    (error: unknown) =>
+      error instanceof ProtocolError &&
+      error.message === "Unrecognized(42): later" &&
+      error.resultCode === 42
+  )
 })

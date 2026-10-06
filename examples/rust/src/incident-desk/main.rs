@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use futures::future::join_all;
 use laser_examples::{
-    LlmClient, PARTITIONS, batch, default_llm, env_bool, fresh_run, init_tracing, laser,
-    managed_feature_ready, messages, phase, start_projector, stream_for,
+    LlmClient, PARTITIONS, batch, default_llm, ensure_view, env_bool, fresh_run, index_for,
+    init_tracing, laser, managed_feature_ready, messages, phase, stream_for,
 };
 use laser_sdk::iggy::prelude::IggyTimestamp;
 use laser_sdk::prelude::full::*;
@@ -159,9 +159,13 @@ async fn main() -> Result<(), LaserError> {
         if !managed_feature_ready(capabilities.managed, "the agentic desk", "incident-desk") {
             return Ok(());
         }
-        let _projector = start_projector(
+        // The index carries this run's token, so a rerun or another language's
+        // desk on the same deployment never shares its rows.
+        let index = index_for(TICKETS_TOPIC);
+        ensure_view(
             &laser,
             TICKETS_TOPIC,
+            &index,
             ContentType::Json,
             &[
                 "ticket_id",
@@ -179,7 +183,7 @@ async fn main() -> Result<(), LaserError> {
         let chunk = batch(200);
         phase("ingesting the ticket firehose (the desk's world model)");
         ingest_tickets(&laser, total, chunk).await?;
-        wait_for_index(&laser, TICKETS_TOPIC, total as usize).await?;
+        wait_for_index(&laser, &index, total as usize).await?;
         backlog_snapshot(&laser).await?;
 
         phase("seeding semantic memory with past resolutions");
@@ -196,7 +200,7 @@ async fn main() -> Result<(), LaserError> {
             .respond_on(AgentTopic::Responses)
             .handler(Triage {
                 llm: llm.clone(),
-                index: TICKETS_TOPIC.to_owned(),
+                index: index.clone(),
             })
             .build()
             .spawn(laser.clone());
@@ -303,7 +307,7 @@ async fn main() -> Result<(), LaserError> {
         }
         phase("done");
         info!(
-            "inspect the run in LaserData Cloud: index `{TICKETS_TOPIC}`, \
+            "inspect the run in LaserData Cloud: index `{index}`, \
              KV namespaces `{grants_namespace}` and `{dedup_namespace}`"
         );
         Ok(())
@@ -417,8 +421,9 @@ async fn wait_for_index(laser: &Laser, index: &str, expected: usize) -> Result<(
 
 // The questions an on-call asks first, straight off the materialized index.
 async fn backlog_snapshot(laser: &Laser) -> Result<(), LaserError> {
+    let index = index_for(TICKETS_TOPIC);
     let by_severity = laser
-        .query(TICKETS_TOPIC)
+        .query(&index)
         .filter_eq("status", "open")
         .count()
         .group_by(["severity"])
@@ -796,6 +801,7 @@ async fn read_u64(store: &Kv, key: &str) -> Result<u64, LaserError> {
 // outcome and we log it rather than failing, the exact branch a real client
 // uses to adapt to a deployment's capabilities, never a silent fallback.
 async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
+    let index = index_for(TICKETS_TOPIC);
     let ledger = laser.kv("desk_quota_ledger");
     let account = "pool:demo";
 
@@ -873,7 +879,7 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
     // retryable, distinct from an unsupported level, and the unified result
     // space tells them apart.
     match laser
-        .query(TICKETS_TOPIC)
+        .query(&index)
         .read_your_writes()
         .limit(1)
         .fetch()
@@ -899,8 +905,9 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
 // up in LaserData Cloud. Set LASER_APPLY_PLAN=1 to act on the verdict instead:
 // promote when the plan clears the backlog, squash when it does not.
 async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
+    let index = index_for(TICKETS_TOPIC);
     let criticals = laser
-        .query(TICKETS_TOPIC)
+        .query(&index)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
         .filter_eq("component", "auth")
@@ -925,14 +932,14 @@ async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
         let (Some(partition), Some(offset)) = (partition, offset) else {
             continue;
         };
-        fork.put_row(TICKETS_TOPIC, partition, offset)
+        fork.put_row(&index, partition, offset)
             .field("status", "resolved")
             .send()
             .await?;
     }
 
     let forked_open = laser
-        .query(TICKETS_TOPIC)
+        .query(&index)
         .fork(TRIAGE_FORK)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")

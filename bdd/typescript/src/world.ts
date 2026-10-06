@@ -101,12 +101,14 @@ interface DestinationState {
   checkpointRevision: number
   effectiveState: "disabled" | "running" | "blocked"
   nextOffset: number
+  retainedOffset: number
 }
 
 export type DataStackError =
   | { readonly kind: "conflict"; readonly observedRevision: number }
   | { readonly kind: "cancelled" }
   | { readonly kind: "notFound" }
+  | { readonly kind: "invalid" }
 
 export class DataStackModel {
   private globalRevision = 0
@@ -125,7 +127,8 @@ export class DataStackModel {
       definitionRevision: 1,
       checkpointRevision: 0,
       effectiveState: "disabled",
-      nextOffset: 0
+      nextOffset: 0,
+      retainedOffset: 0
     })
     this.operation = { id: `operation-${String(this.globalRevision)}` }
   }
@@ -148,12 +151,18 @@ export class DataStackModel {
     this.operation = { id: `operation-${String(this.globalRevision)}` }
   }
 
-  recordGap(name: string): void {
+  recordGap(name: string, requiredOffset: number, retainedOffset: number): void {
     const destination = this.destinations.get(name)
     if (destination === undefined) {
       this.error = { kind: "notFound" }
       return
     }
+    // A gap means the log no longer holds the offset the destination needs.
+    if (retainedOffset <= requiredOffset) {
+      this.error = { kind: "invalid" }
+      return
+    }
+    destination.retainedOffset = retainedOffset
     this.globalRevision += 1
     destination.checkpointRevision += 1
     destination.effectiveState = "blocked"
@@ -167,6 +176,11 @@ export class DataStackModel {
     }
     if (destination.checkpointRevision !== expectedCheckpointRevision) {
       this.error = { kind: "conflict", observedRevision: this.globalRevision }
+      return
+    }
+    // Accepting a gap resumes where the log still has records.
+    if (nextOffset < destination.retainedOffset) {
+      this.error = { kind: "invalid" }
       return
     }
     this.globalRevision += 1

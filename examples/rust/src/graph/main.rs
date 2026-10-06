@@ -32,9 +32,15 @@ async fn main() -> Result<(), LaserError> {
             .neighbors(host, EdgeDir::Out, Some(RELATION.to_owned()), 1)
             .await?;
 
+        // The reply carries the start node beside the nodes it reaches.
         println!("  {HOST} {RELATION}:");
-        for node in &services.nodes {
-            println!("    {}", entity_of(node));
+        for entity in services
+            .nodes
+            .iter()
+            .map(entity_of)
+            .filter(|entity| entity != HOST)
+        {
+            println!("    {entity}");
         }
         Ok(())
     })

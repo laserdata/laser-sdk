@@ -23,7 +23,7 @@ function source(commit: () => Promise<void>) {
   let delivered = false
   const message = {
     partitionId: 0,
-    offset: 0n,
+    position: { partitionId: 0, offset: 0n },
     timestampMicros: 1n,
     payload: new TextEncoder().encode("work"),
     headers: encodeProvenanceHeaders({ conversationId: ConversationId.derive("grace") })

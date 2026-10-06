@@ -32,6 +32,10 @@ TOPIC = "clickstream"
 # The validated ingest (managed only): events on this topic stamp a registered
 # JSON Schema's id, so a malformed payload never materializes.
 GUARDED_TOPIC = "clickstream_guarded"
+# Index names carry this run's token, so a rerun or another language's example on
+# the same deployment never shares their rows.
+INDEX = _common.index_for(TOPIC)
+GUARDED_INDEX = _common.index_for(GUARDED_TOPIC)
 EVENT_JSON_SCHEMA = """{
     "type":"object",
     "required":["user_id","message_type","route","latency_ms","ts"],
@@ -102,14 +106,14 @@ async def main() -> None:
         events = clickstream(count)
 
         # Register the projector before publishing so no event is missed (managed only).
-        if caps.query:
-            await _common.start_projector(laser, TOPIC, COLUMNS)
+        if caps.query.available:
+            await _common.start_projector(laser, TOPIC, COLUMNS, index=INDEX)
 
         _common.phase("hot path: a live reader tails the stream while the producer runs")
         await live_monitor(laser, events)
 
-        if _common.managed_gate(caps.query, "query", EXAMPLE):
-            await _common.wait_for_projection(laser, TOPIC, count)
+        if _common.managed_gate(caps.query.available, "query", EXAMPLE):
+            await _common.wait_for_projection(laser, INDEX, count)
             _common.phase("read model: ad-hoc analytics over the query layer")
             await run_analytics(laser)
             _common.phase("read model: a resumable downstream reader")
@@ -199,29 +203,29 @@ async def live_monitor(laser: ls.Laser, events: list[dict]) -> None:
 
 async def run_analytics(laser: ls.Laser) -> None:
     """The analytics read model: the aggregates a dashboard asks of a clickstream."""
-    by_kind = await laser.query(TOPIC).count().group_by([MESSAGE_TYPE]).fetch()
+    by_kind = await laser.query(INDEX).count().group_by([MESSAGE_TYPE]).fetch()
     print("events by kind:")
     for row in by_kind.rows:
         kind = by_kind.value_text(row, MESSAGE_TYPE) or "?"
         count = by_kind.value_text(row, "count") or "0"
         print(f"  {kind:<12} {count}")
 
-    slowest = await laser.query(TOPIC).order_desc(LATENCY_MS).limit(3).fetch()
+    slowest = await laser.query(INDEX).order_desc(LATENCY_MS).limit(3).fetch()
     print("slowest 3 routes:")
     for row in slowest.rows:
         latency = slowest.value_text(row, LATENCY_MS) or "?"
         route = slowest.value_text(row, ROUTE) or "?"
         print(f"  {latency:>5}ms  {route}")
 
-    errors = await laser.query(TOPIC).message_type("error").count().fetch()
+    errors = await laser.query(INDEX).message_type("error").count().fetch()
     print(f"errors: {scalar(errors)}")
 
     first_window = (
-        await laser.query(TOPIC).time_range(BASE_US, BASE_US + 5 * ONE_MINUTE_US).count().fetch()
+        await laser.query(INDEX).time_range(BASE_US, BASE_US + 5 * ONE_MINUTE_US).count().fetch()
     )
     print(f"events in the first 5 minutes: {scalar(first_window)}")
 
-    per_minute = await laser.query(TOPIC).count().window(TS, ONE_MINUTE_US).fetch()
+    per_minute = await laser.query(INDEX).count().window(TS, ONE_MINUTE_US).fetch()
     print("events per minute:")
     for row in per_minute.rows:
         bucket = per_minute.value_text(row, "window_start") or "?"
@@ -229,7 +233,7 @@ async def run_analytics(laser: ls.Laser) -> None:
         print(f"  bucket {bucket}: {count}")
 
     by_kind_metrics = (
-        await laser.query(TOPIC)
+        await laser.query(INDEX)
         .avg(LATENCY_MS)
         .count_distinct(ROUTE)
         .group_by([MESSAGE_TYPE])
@@ -272,13 +276,13 @@ async def run_guarded_ingest(laser: ls.Laser) -> None:
     """Register the Event JSON Schema, publish one well-formed and one malformed
     event both stamping the id, and show only the well-formed one materialized.
     The malformed one is rejected by the schema and never pollutes the index."""
-    schema_id = await laser.register_schema(
+    schema_id = await laser.schemas().register(
         {"kind": "json_schema", "schema": EVENT_JSON_SCHEMA}, name="clickstream_event"
     )
     print(f"the managed plane allocated writer-schema id {schema_id} for the Event guard")
 
     await laser.topic(GUARDED_TOPIC).ensure(partitions=_common.PARTITIONS)
-    await _common.start_projector(laser, GUARDED_TOPIC, COLUMNS)
+    await _common.start_projector(laser, GUARDED_TOPIC, COLUMNS, index=GUARDED_INDEX)
 
     # Well-formed: passes the schema, materializes.
     valid = {
@@ -300,10 +304,10 @@ async def run_guarded_ingest(laser: ls.Laser) -> None:
     }
     await laser.topic(GUARDED_TOPIC).publish().json(malformed).schema_id(schema_id).send()
 
-    await _common.wait_for_projection(laser, GUARDED_TOPIC, 1)
+    await _common.wait_for_projection(laser, GUARDED_INDEX, 1)
     # Give the projector a beat to settle the second publish before pinning the count.
     await asyncio.sleep(1.0)
-    settled = (await laser.query(GUARDED_TOPIC).with_total().fetch()).total
+    settled = (await laser.query(GUARDED_INDEX).with_total().fetch()).page.total
     if settled == 1:
         print(
             "guarded index holds 1 row: the valid error event landed, the malformed event "

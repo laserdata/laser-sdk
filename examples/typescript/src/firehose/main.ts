@@ -1,6 +1,6 @@
 import {
   ContentType,
-  jsonCodec,
+  Json,
   parseProjectionId,
   type Laser,
   type Projection,
@@ -11,6 +11,7 @@ import {
   batchSize,
   envBoolean,
   envInteger,
+  indexFor,
   managedGate,
   PARTITIONS,
   phase,
@@ -51,7 +52,7 @@ function decodeTelemetry(value: unknown): Telemetry {
   return record as Telemetry
 }
 
-const TELEMETRY_CODEC = jsonCodec(decodeTelemetry)
+const TELEMETRY_CODEC = new Json(decodeTelemetry)
 
 function telemetry(org: string, sequence: number, payloadBytes: number, rng: Rng): Telemetry {
   return {
@@ -65,11 +66,11 @@ function telemetry(org: string, sequence: number, payloadBytes: number, rng: Rng
   }
 }
 
-async function registerOrg(laser: Laser, topic: string): Promise<void> {
-  const id = parseProjectionId(`${topic}.v1`)
+async function registerOrg(laser: Laser, topic: string, index: string): Promise<void> {
+  const id = parseProjectionId(`${index}.v1`)
   const projection: Projection = {
     id,
-    name: topic,
+    name: index,
     version: 1,
     kind: { kind: "row" },
     contentType: ContentType.Json,
@@ -86,8 +87,8 @@ async function registerOrg(laser: Laser, topic: string): Promise<void> {
     source: { stream: laser.defaultStream ?? "", topic },
     allowedProjections: [id],
     defaultProjection: id,
-    index: topic,
-    notify: false
+    index,
+    notify: true
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)
@@ -152,7 +153,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   )
   if (envBoolean("LASER_FIREHOSE_REGISTER", true) && managedGate(capabilities, "query", EXAMPLE)) {
     phase("provisioning topics and indexes")
-    for (const topic of topics) await registerOrg(laser, topic)
+    for (const topic of topics) await registerOrg(laser, topic, indexFor(topic))
   }
 
   phase("firing the hose")
@@ -170,14 +171,13 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   if (capabilities.query.available && envBoolean("LASER_FIREHOSE_QUERY", true)) {
     phase("sample analytics over the firehose")
-    await waitForProjection(laser, topics[0] ?? "org_00", 1)
-    const sample = await laser
-      .query(topics[0] ?? "org_00")
-      .withTotal()
-      .limit(5)
-      .fetch()
+    // Index names carry this run's token, so another run or another language's
+    // firehose never shares an index (or its rows) with this one.
+    const index = indexFor(topics[0] ?? "org_00")
+    await waitForProjection(laser, index, 1)
+    const sample = await laser.query(index).withTotal().limit(5).fetch()
     console.log(`sample index total: ${(sample.page.total ?? 0n).toString()}`)
-    const payload = await laser.query(topics[0] ?? "org_00").fetchOne(TELEMETRY_CODEC)
+    const payload = await laser.query(index).fetchOne(TELEMETRY_CODEC)
     if (payload === undefined) throw new Error("materialized telemetry returned no payload")
     console.log(`sample payload: ${payload.org}/${payload.service} in ${payload.region}`)
   }

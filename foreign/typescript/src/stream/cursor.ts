@@ -1,11 +1,13 @@
 import type { LaserTransport } from "../iggy/apache-iggy.js"
 import { CancelledError, InvalidError } from "../client/errors.js"
-import type { ConsumedMessage } from "./consumer.js"
-import type { PollingStrategy } from "./polling-strategy.js"
+import type { ConsumerStart } from "./consumer-start.js"
+import { type Message, withMessageJson } from "./message.js"
 
-export interface CursorOptions {
-  readonly batchSize?: number
-  readonly readerName?: string
+// A cursor read with the log fields the SDK's own readers order and resume by.
+interface CursorRecord extends Message {
+  readonly partitionId: number
+  readonly offset: bigint
+  readonly timestampMicros?: bigint
 }
 
 const DEFAULT_BATCH_SIZE = 100
@@ -31,21 +33,28 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export class Cursor {
-  private batchSize: number
+  private batchSize = DEFAULT_BATCH_SIZE
   private readonly partitionOffsets: Map<number, bigint>
   private readonly partitionEnds = new Map<number, bigint>()
-  private readonly readerName: string | undefined
+  private readerName: string | undefined
 
-  constructor(
+  private constructor(
     private readonly transport: LaserTransport,
     private readonly streamName: string,
     private readonly topicName: string,
-    partitionIds: readonly number[],
-    options: CursorOptions = {}
+    partitionIds: readonly number[]
   ) {
-    this.batchSize = batchSize(options.batchSize ?? DEFAULT_BATCH_SIZE)
-    this.readerName = options.readerName
     this.partitionOffsets = new Map(partitionIds.map((id) => [id, 0n]))
+  }
+
+  /** @internal */
+  static create(
+    transport: LaserTransport,
+    streamName: string,
+    topicName: string,
+    partitionIds: readonly number[]
+  ): Cursor {
+    return new Cursor(transport, streamName, topicName, partitionIds)
   }
 
   get offsets(): ReadonlyMap<number, bigint> {
@@ -61,7 +70,10 @@ export class Cursor {
     return this
   }
 
-  /** Stops each partition at its exclusive `ends` offset instead of the tail. */
+  /**
+   * Stops each partition at its exclusive `ends` offset instead of the tail.
+   * @internal
+   */
   until(ends: ReadonlyMap<number, bigint>): this {
     for (const [partitionId, end] of ends) {
       if (this.partitionOffsets.has(partitionId)) this.partitionEnds.set(partitionId, end)
@@ -74,16 +86,33 @@ export class Cursor {
     return this
   }
 
-  async poll(options: { readonly signal?: AbortSignal } = {}): Promise<readonly ConsumedMessage[]> {
+  /**
+   * Attributes the reads to a named reader. Offsets stay client-owned, the
+   * name only identifies the reader on the server.
+   * @internal
+   */
+  named(readerName: string): this {
+    this.readerName = readerName
+    return this
+  }
+
+  async poll(options: { readonly signal?: AbortSignal } = {}): Promise<readonly Message[]> {
+    return this.pollRecords(options)
+  }
+
+  /** @internal */
+  async pollRecords(
+    options: { readonly signal?: AbortSignal } = {}
+  ): Promise<readonly CursorRecord[]> {
     if (options.signal?.aborted === true) {
       throw new CancelledError("poll aborted", { cause: options.signal.reason })
     }
-    const results: ConsumedMessage[] = []
+    const results: CursorRecord[] = []
     const nextOffsets = new Map(this.partitionOffsets)
     for (const [partitionId, offset] of this.partitionOffsets) {
       const end = this.partitionEnds.get(partitionId)
       if (end !== undefined && offset >= end) continue
-      const strategy: PollingStrategy = { kind: "offset", value: offset }
+      const strategy: ConsumerStart = { kind: "offset", value: offset }
       const polled = await this.transport.pollMessages(
         this.streamName,
         this.topicName,
@@ -102,7 +131,12 @@ export class Cursor {
           nextOffsets.set(partitionId, end)
           break
         }
-        results.push(message)
+        results.push(
+          withMessageJson({
+            ...message,
+            id: { partitionId: message.partitionId, offset: message.offset }
+          })
+        )
         nextOffsets.set(partitionId, message.offset + 1n)
       }
     }
@@ -112,12 +146,21 @@ export class Cursor {
     return results
   }
 
-  async *stream(
+  stream(
     options: { readonly signal?: AbortSignal; readonly pollIntervalMs?: number } = {}
-  ): AsyncIterable<ConsumedMessage> {
+  ): AsyncIterable<Message> {
+    return this.streamRecords(options)
+  }
+
+  /** @internal */
+  async *streamRecords(
+    options: { readonly signal?: AbortSignal; readonly pollIntervalMs?: number } = {}
+  ): AsyncIterable<CursorRecord> {
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
     for (;;) {
-      const batch = await this.poll(options.signal === undefined ? {} : { signal: options.signal })
+      const batch = await this.pollRecords(
+        options.signal === undefined ? {} : { signal: options.signal }
+      )
       if (batch.length === 0) {
         await delay(pollIntervalMs, options.signal)
         continue

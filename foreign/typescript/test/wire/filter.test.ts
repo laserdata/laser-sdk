@@ -15,7 +15,6 @@ import {
   ExactDecimal,
   FieldPath,
   FilterExpr,
-  consumerFilterDigest,
   consumerFilterJson,
   decodeCatalogPosition,
   decodeConsumerFilter,
@@ -34,7 +33,7 @@ import {
   encodeFilteredPollRequest,
   parseCanonicalJson,
   rustDouble,
-  timestampFromText,
+  timestampFormatMicrosFromText,
   validateConsumerFilter,
   validateFilterTestRequest
 } from "../../src/wire/filter.js"
@@ -199,7 +198,7 @@ void test("given_the_json_filter_fixture_when_digested_then_should_match_the_rus
   }
 
   assert.equal(consumerFilterJson(filter), JSON.stringify(JSON.parse(text)))
-  assert.deepEqual([...consumerFilterDigest(filter)], validation.digest)
+  assert.deepEqual([...ConsumerFilter.digest(filter)], validation.digest)
 })
 
 void test("given_the_json_mutation_fixture_when_decoded_then_should_keep_the_operation_id_exact", async () => {
@@ -260,7 +259,11 @@ void test("given_the_shared_corpus_when_evaluated_then_should_reproduce_every_ve
     }
     assert.equal(compiled.explain(record, limits).verdict, verdict, item.name)
     if (entry.has("fault"))
-      assert.equal(compiled.faultReason(record, limits) ?? null, entry.get("fault"), item.name)
+      assert.equal(
+        compiled.evaluateWithFault(record, limits).fault ?? null,
+        entry.get("fault"),
+        item.name
+      )
   }
   assert.deepEqual(failures, [])
 })
@@ -298,18 +301,18 @@ void test("given_decimals_when_compared_then_should_ignore_notation", () => {
   assert.equal(parse("-0").compare(parse("0")), 0)
   assert.equal(parse("12.5").compare(parse("9.99")), 1)
   assert.equal(parse("-12.5").compare(parse("-9.99")), -1)
-  assert.equal(ExactDecimal.fromDouble(0.1)?.compare(parse("0.1")), 0)
+  assert.equal(ExactDecimal.fromF64(0.1)?.compare(parse("0.1")), 0)
   assert.equal(ExactDecimal.parse("5."), undefined)
 })
 
 void test("given_rfc3339_instants_when_parsed_then_should_normalize_to_utc_micros", () => {
   assert.equal(
-    timestampFromText("rfc3339", "2026-09-21T18:04:12.331Z"),
-    timestampFromText("rfc3339", "2026-09-21T20:04:12.331000+02:00")
+    timestampFormatMicrosFromText("rfc3339", "2026-09-21T18:04:12.331Z"),
+    timestampFormatMicrosFromText("rfc3339", "2026-09-21T20:04:12.331000+02:00")
   )
-  assert.equal(timestampFromText("rfc3339", "1969-12-31T23:59:59.999999Z"), -1n)
-  assert.equal(timestampFromText("rfc3339", "2026-09-21T18:04:12.331000"), undefined)
-  assert.equal(timestampFromText("rfc3339", "2026-02-29T00:00:00Z"), undefined)
+  assert.equal(timestampFormatMicrosFromText("rfc3339", "1969-12-31T23:59:59.999999Z"), -1n)
+  assert.equal(timestampFormatMicrosFromText("rfc3339", "2026-09-21T18:04:12.331000"), undefined)
+  assert.equal(timestampFormatMicrosFromText("rfc3339", "2026-02-29T00:00:00Z"), undefined)
 })
 
 void test("given_an_invalid_filter_when_validated_then_should_be_rejected", () => {

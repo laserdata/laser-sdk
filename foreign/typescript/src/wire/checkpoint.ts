@@ -1,4 +1,5 @@
 import { CodecError, InvalidError } from "../client/errors.js"
+import type { Action, Feature } from "./authz.js"
 import {
   type CborMap,
   decodeOne,
@@ -42,7 +43,7 @@ import {
   decodeTypedValue,
   encodeLogicalSchemaRef,
   encodeTypedValue,
-  validateTypedValue
+  typedValueValidateCanonical
 } from "./schema.js"
 import {
   type SourceIncarnation,
@@ -66,6 +67,7 @@ export type CheckpointReadConsistency = "linearizable" | "potentially_stale"
 export type DestinationEffectiveState =
   "disabled" | "waiting_for_backend" | "ready" | "running" | "blocked"
 export type PartitionLifecycleState = "active" | "removed" | "recreated"
+export type PartitionLifecycleChange = "removed" | "recreated"
 export type DestinationBlockCode =
   | "decode"
   | "schema"
@@ -231,19 +233,24 @@ export interface DestinationCheckpointStatus {
   readonly consistency: CheckpointReadConsistency
 }
 
+export type SupervisorAssertionAction =
+  "accept_retention_gap" | "supersede_generation" | "record_repair"
+
+export interface SupervisorActorClaims {
+  readonly v: number
+  readonly requestId: CheckpointRequestId
+  readonly deploymentId: number
+  readonly cloudUserId: number
+  readonly action: SupervisorAssertionAction
+  readonly destinationId: DestinationId
+  readonly destinationGeneration: bigint
+  readonly expectedRevision?: bigint
+  readonly issuedAtMicros: bigint
+  readonly expiresAtMicros: bigint
+}
+
 export interface SupervisorActorAssertion {
-  readonly claims: {
-    readonly v: number
-    readonly requestId: CheckpointRequestId
-    readonly deploymentId: number
-    readonly cloudUserId: number
-    readonly action: "accept_retention_gap" | "supersede_generation" | "record_repair"
-    readonly destinationId: DestinationId
-    readonly destinationGeneration: bigint
-    readonly expectedRevision?: bigint
-    readonly issuedAtMicros: bigint
-    readonly expiresAtMicros: bigint
-  }
+  readonly claims: SupervisorActorClaims
   readonly keyId: Uint8Array
   readonly signature: Uint8Array
 }
@@ -349,6 +356,34 @@ export type PublicCheckpointMutation =
       readonly expectedCheckpointRevision: bigint
       readonly repair: RepairRecord
     }
+
+export function publicCheckpointMutationRequiredCapability(
+  mutation: PublicCheckpointMutation
+): readonly [Feature, Action] {
+  switch (mutation.kind) {
+    case "register_destination":
+    case "register_query_route":
+    case "remove_query_route":
+    case "bind_table":
+    case "set_desired_state":
+    case "add_partition":
+    case "observe_partition_lifecycle":
+      return ["destination", "write"]
+    case "accept_retention_gap":
+    case "supersede_generation":
+    case "record_repair":
+      return ["checkpoint", "admin"]
+    case "acquire_lease":
+    case "renew_lease":
+    case "takeover_lease":
+    case "prepare":
+    case "complete":
+    case "record_block":
+    case "clear_block":
+    case "record_retention_gap":
+      return ["checkpoint", "write"]
+  }
+}
 
 export interface CheckpointRequestEnvelope {
   readonly v: number
@@ -1152,9 +1187,7 @@ export function validatePublicCheckpointMutation(value: PublicCheckpointMutation
 }
 
 function validateSupervisorAssertionBinding(value: CheckpointRequestEnvelope): void {
-  let required:
-    | readonly [SupervisorActorAssertion["claims"]["action"], DestinationId, bigint, bigint]
-    | undefined
+  let required: readonly [SupervisorAssertionAction, DestinationId, bigint, bigint] | undefined
   switch (value.mutation.kind) {
     case "accept_retention_gap":
       required = [
@@ -1372,8 +1405,8 @@ function validateAttemptColumnMetrics(value: AttemptColumnMetrics): void {
     value.nanCount > value.valueCount - value.nullCount
   )
     throw new InvalidError("attempt column metrics are invalid")
-  if (value.lowerBound !== undefined) validateTypedValue(value.lowerBound)
-  if (value.upperBound !== undefined) validateTypedValue(value.upperBound)
+  if (value.lowerBound !== undefined) typedValueValidateCanonical(value.lowerBound)
+  if (value.upperBound !== undefined) typedValueValidateCanonical(value.upperBound)
   if ((value.lowerBound === undefined) !== (value.upperBound === undefined))
     throw new InvalidError("attempt column bounds must be both present or both absent")
 }

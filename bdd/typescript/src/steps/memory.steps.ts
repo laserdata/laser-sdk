@@ -22,7 +22,7 @@ class TokenEmbedder implements Embedder {
 }
 
 Given("an empty memory store", function (this: LaserWorld) {
-  this.memory = MemoryHandle.vector()
+  this.memory = MemoryHandle.vector(new TokenEmbedder())
   this.memoryIds.clear()
 })
 
@@ -101,7 +101,7 @@ function requireMemory(world: LaserWorld): MemoryHandle {
 }
 
 async function recalled(world: LaserWorld, limit: number): Promise<readonly string[]> {
-  return (await requireMemory(world).recall().recent().limit(limit).fetch()).map((item) =>
+  return (await requireMemory(world).recall().limit(limit).fetch()).map((item) =>
     decoder.decode(item.payload)
   )
 }

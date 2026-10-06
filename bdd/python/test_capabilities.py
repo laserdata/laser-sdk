@@ -27,12 +27,12 @@ def read_capabilities(world):
 
 @then("managed query is unavailable")
 def query_unavailable(world):
-    assert world.caps.query is False
+    assert world.caps.query.available is False
 
 
 @then("managed key-value is unavailable")
 def kv_unavailable(world):
-    assert world.caps.kv is False
+    assert world.caps.kv.available is False
 
 
 @then("forks are unavailable")
@@ -42,9 +42,9 @@ def forks_unavailable(world):
 
 @then("the coordination features are unavailable")
 def coordination_unavailable(world):
-    assert world.caps.kv_cas is False
+    assert world.caps.kv.cas is False
     # Consistency is one ordered level. Raw Apache Iggy serves only the weakest.
-    assert world.caps.query_consistency == "eventual"
+    assert world.caps.query.consistency == "eventual"
 
 
 @when(parsers.parse('I run a query against topic "{topic}"'))
@@ -61,7 +61,7 @@ def run_ryw_query(world, topic):
     parsers.parse('I compare-and-swap key "{key}" in namespace "{namespace}" expecting it absent')
 )
 def compare_and_swap(world, key, namespace):
-    world.capture(lambda: world.laser.kv(namespace).set(key).payload(b"x").expect_absent().commit())
+    world.capture(lambda: world.laser.kv(namespace).set(key).bytes(b"x").expect_absent().commit())
 
 
 @when(
@@ -72,7 +72,7 @@ def compare_and_swap(world, key, namespace):
 )
 def send_set_with_precondition(world, key, namespace, version):
     world.capture(
-        lambda: world.laser.kv(namespace).set(key).payload(b"debug").expect_version(version).send()
+        lambda: world.laser.kv(namespace).set(key).bytes(b"debug").expect_version(version).send()
     )
 
 

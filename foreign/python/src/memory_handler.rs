@@ -1,16 +1,18 @@
 use crate::agent::PyAgentMessage;
-use crate::async_bridge::future_into_py;
+use crate::async_bridge::{PyHook, future_into_py};
 use crate::errors::to_pyerr;
 use crate::memory::{Backend, PyMemory, RememberOptions, map_kind};
 use laser_sdk::memory::MemoryKind;
 use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::into_future;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
+/// Wraps an agent handler, a callable or an object with `handle(ctx,
+/// message)` that returns directly or through an awaitable. Calling the
+/// wrapper runs the handler, and cancelling that call cancels it.
 #[gen_stub_pyclass]
 #[pyclass(name = "MemoryHandler")]
 pub struct PyMemoryHandler {
-    handler: Py<PyAny>,
+    handler: PyHook,
     memory: Backend,
     kind: Option<MemoryKind>,
 }
@@ -19,12 +21,12 @@ pub struct PyMemoryHandler {
 #[pymethods]
 impl PyMemoryHandler {
     #[new]
-    fn new(handler: Py<PyAny>, memory: &PyMemory) -> Self {
-        Self {
-            handler,
+    fn new(inner: &Bound<'_, PyAny>, memory: &PyMemory) -> PyResult<Self> {
+        Ok(Self {
+            handler: PyHook::new(inner, "handle", "a memory handler's handler")?,
             memory: memory.backend(),
             kind: None,
-        }
+        })
     }
 
     /// Remember successful messages under their conversation. Memory failures do not repeat the handler.
@@ -42,14 +44,14 @@ impl PyMemoryHandler {
         context: Py<PyAny>,
         message: Py<PyAgentMessage>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let handler = self.handler.clone_ref(py);
+        let handler = self.handler.clone();
         let memory = self.memory.clone();
         let kind = self.kind;
         let inner = message.borrow(py).inner.clone();
         future_into_py(py, async move {
-            let pending =
-                Python::attach(|py| into_future(handler.bind(py).call1((context, message))?))?;
-            pending.await?;
+            handler
+                .call(|py| (context, message).into_pyobject(py))
+                .await?;
             if let Some(kind) = kind {
                 let _ = memory
                     .remember(

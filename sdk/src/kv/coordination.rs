@@ -2,11 +2,11 @@ use crate::error::LaserError;
 use crate::iggy::prelude::Client;
 use crate::kv::{
     AGDX_KV_CAS_FENCED_CODE, AGDX_KV_GET_CODE, AGDX_KV_LEASE_CODE, AGDX_KV_LEASE_RENEW_CODE,
-    AGDX_KV_RELEASE_CODE, KvCasFenced, KvEntry, KvGet, KvLease, KvLeaseRenew, KvOutcome, KvRelease,
-    KvReply, Lease,
+    AGDX_KV_RELEASE_CODE, KvCasFenced, KvEntry, KvGet, KvLease, KvLeaseRenew, KvRelease, Lease,
 };
 use crate::laser::Laser;
 use laser_wire::framing::encode_named;
+use laser_wire::kv::{KvOutcome, KvReply};
 use laser_wire::mutation::{MANAGED_REQUEST_VERSION, ManagedRequestEnvelope};
 use laser_wire::validate::Validate;
 use std::future::Future;

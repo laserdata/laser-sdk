@@ -1,4 +1,4 @@
-import { RoutingError } from "../client/errors.js"
+import { NoCapableAgentError, NoInboxError, RoutePrincipalMismatchError } from "../client/errors.js"
 import type { Provenance } from "../provenance/provenance.js"
 import type { AgentId, PrincipalId } from "../types/ids.js"
 import type { CapabilityDescriptor } from "../wire/agent.js"
@@ -178,17 +178,9 @@ function principalMismatch(
   registry: RegistryView,
   agent: AgentId,
   expected: PrincipalId
-): RoutingError {
+): RoutePrincipalMismatchError {
   const actual = registry.principalFor(agent)?.get()
-  return new RoutingError(
-    `agent \`${agent.asString()}\` is not authenticated as principal ${expected.get().toString()}`,
-    {
-      kind: "principalMismatch",
-      agent: agent.asString(),
-      expected: expected.get(),
-      ...(actual !== undefined ? { actual } : {})
-    }
-  )
+  return new RoutePrincipalMismatchError(agent.asStr(), expected.get(), actual)
 }
 
 function trustedCandidates(
@@ -227,20 +219,14 @@ export function resolveTargets(
       const candidates = trustedCandidates(registry, router.selector, nowMicros)
       const selected = selectRoute(router.selector.skill, candidates, router.selector.policy)
       if (selected === undefined) {
-        throw new RoutingError(`no live agent advertises capability \`${router.selector.skill}\``, {
-          kind: "noCapableAgent",
-          skill: router.selector.skill
-        })
+        throw new NoCapableAgentError(router.selector.skill)
       }
       return [selected]
     }
     case "allCapable": {
       const candidates = trustedCandidates(registry, router.selector, nowMicros)
       if (candidates.length === 0) {
-        throw new RoutingError(`no live agent advertises capability \`${router.selector.skill}\``, {
-          kind: "noCapableAgent",
-          skill: router.selector.skill
-        })
+        throw new NoCapableAgentError(router.selector.skill)
       }
       return candidates.map((card) => card.agent)
     }
@@ -259,10 +245,7 @@ export function resolveInboxRoute(
 ): string {
   if (route.kind === "fixed") return route.topic
   if (advertised === undefined) {
-    throw new RoutingError(`no inbox advertised for agent \`${agent.asString()}\``, {
-      kind: "noInbox",
-      agent: agent.asString()
-    })
+    throw new NoInboxError(agent.asStr())
   }
   return advertised
 }

@@ -1,6 +1,8 @@
 use crate::agent::PyProvenance;
 use crate::async_bridge::future_into_py;
-use crate::convert::{payload_bytes, py_to_de, py_to_json};
+use crate::convert::{
+    BodyValue, codec_content_type, codec_encode, payload_bytes, py_to_de, py_to_json,
+};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::schema::PyCompiledSchema;
 use crate::transport::PySendMessagesResponse;
@@ -15,6 +17,19 @@ use std::str::FromStr;
 fn parse_content_type(value: &str) -> PyResult<ContentType> {
     ContentType::from_str(value)
         .map_err(|_| InvalidError::new_err(format!("unknown content type '{value}'")))
+}
+
+// A codec-encoded body: raw bytes under the codec's content type, or a plain
+// payload when it declares none.
+fn encoded_body(payload: Vec<u8>, content_type: Option<ContentType>) -> Body {
+    match content_type {
+        Some(content_type) => Body::Raw {
+            payload,
+            content_type,
+            schema_id: None,
+        },
+        None => Body::Bytes(payload),
+    }
 }
 
 /// How a record's body is encoded. JSON / MessagePack carry a depythonized
@@ -32,6 +47,8 @@ enum Body {
     },
     Json(serde_json::Value),
     Msgpack(serde_json::Value),
+    // A body the typed topic handle encodes in its own form.
+    Typed(BodyValue),
     Arrow {
         payload: Vec<u8>,
         metadata: ArrowIpcMessageMetadata,
@@ -53,7 +70,7 @@ pub struct PyPublish {
     partition_key: Option<String>,
     provenance: Option<laser_sdk::provenance::Provenance>,
     body: Body,
-    typed: Option<laser_sdk::typed::TypedTopic<serde_json::Value>>,
+    typed: Option<laser_sdk::typed::TypedTopic<BodyValue>>,
     claim_check: Option<(Py<PyAny>, usize)>,
 }
 
@@ -78,12 +95,12 @@ impl PyPublish {
 
     pub(crate) fn with_typed_body(
         mut self,
-        topic: laser_sdk::typed::TypedTopic<serde_json::Value>,
-        value: serde_json::Value,
+        topic: laser_sdk::typed::TypedTopic<BodyValue>,
+        value: BodyValue,
     ) -> PyResult<Self> {
         // Validate now, then reuse the handle's cached codec at send time.
         let _ = topic.publish(&value).map_err(to_pyerr)?;
-        self.body = Body::Json(value);
+        self.body = Body::Typed(value);
         self.typed = Some(topic);
         Ok(self)
     }
@@ -152,30 +169,47 @@ impl PyPublish {
     /// JSON-serializable Python value (dict, list, scalar).
     fn json<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.typed = None;
-        slf.body = Body::Json(py_to_json(value)?);
+        slf.body = Body::Json(py_to_json(body)?);
         Ok(slf)
     }
 
     /// Encode the body as MessagePack and stamp `agdx.ct=msgpack`.
     fn msgpack<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.typed = None;
-        slf.body = Body::Msgpack(py_to_json(value)?);
+        slf.body = Body::Msgpack(py_to_json(body)?);
+        Ok(slf)
+    }
+
+    /// Encode `value` with a user `codec`, any object with `encode(value) ->
+    /// bytes` and `decode(data) -> value`, and stamp `content_type` (else the
+    /// codec's `content_type` attribute, else none). A codec failure raises
+    /// `CodecError` with the codec's exception as its cause.
+    #[pyo3(signature = (body, codec, content_type=None))]
+    fn encode_with<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        body: &Bound<'_, PyAny>,
+        codec: &Bound<'_, PyAny>,
+        content_type: Option<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let payload = codec_encode(codec, body)?;
+        slf.typed = None;
+        slf.body = encoded_body(payload, codec_content_type(codec, content_type)?);
         Ok(slf)
     }
 
     /// Use raw payload bytes (str, bytes, or bytearray) with no content-type tag.
     fn payload<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.typed = None;
-        slf.body = Body::Bytes(payload_bytes(value)?);
+        slf.body = Body::Bytes(payload_bytes(payload)?);
         Ok(slf)
     }
 
@@ -184,13 +218,13 @@ impl PyPublish {
     /// hand the bytes and the codec tag in one call.
     fn raw_bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
         content_type: String,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let content_type = parse_content_type(&content_type)?;
         slf.typed = None;
         slf.body = Body::Raw {
-            payload: payload_bytes(value)?,
+            payload: payload_bytes(payload)?,
             content_type,
             schema_id: None,
         };
@@ -200,12 +234,12 @@ impl PyPublish {
     /// Publish one complete self-contained Arrow IPC stream with validated metadata.
     fn arrow_ipc<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
         metadata: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.typed = None;
         slf.body = Body::Arrow {
-            payload: payload_bytes(value)?,
+            payload: payload_bytes(payload)?,
             metadata: py_to_de(metadata)?,
         };
         Ok(slf)
@@ -219,11 +253,11 @@ impl PyPublish {
         mut slf: PyRefMut<'py, Self>,
         schema: &PyCompiledSchema,
         schema_id: u32,
-        value: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let payload = schema
             .inner
-            .encode_avro(&py_to_json(value)?)
+            .encode_avro(&BodyValue::from_py(body)?)
             .map_err(to_pyerr)?;
         slf.typed = None;
         slf.body = Body::Raw {
@@ -277,7 +311,7 @@ impl PyPublish {
                 None => laser.topic(&*topic),
             };
             let mut request = match (&typed, &body) {
-                (Some(typed), Body::Json(value)) => typed.publish(value).map_err(to_pyerr)?,
+                (Some(typed), Body::Typed(value)) => typed.publish(value).map_err(to_pyerr)?,
                 _ => handle.publish(),
             };
             if let Some((store, threshold)) = &claim_check {
@@ -318,7 +352,7 @@ impl PyPublish {
                         None => request,
                     }
                 }
-                Body::Json(_) if typed.is_some() => request,
+                Body::Typed(_) => request,
                 Body::Json(value) => request.json(&value).map_err(to_pyerr)?,
                 Body::Msgpack(value) => request.msgpack(&value).map_err(to_pyerr)?,
                 Body::Arrow { payload, metadata } => {
@@ -376,6 +410,9 @@ pub struct PyBatchPublish {
     headers: Vec<(String, String)>,
     partition_key: Option<String>,
     bodies: Vec<BatchEntry>,
+    // Bodies a typed topic handle encodes in its own form, sent ahead of the
+    // records added afterwards like the SDK's typed batch builder.
+    typed: Option<(laser_sdk::typed::TypedTopic<BodyValue>, Vec<BodyValue>)>,
 }
 
 impl PyBatchPublish {
@@ -391,7 +428,28 @@ impl PyBatchPublish {
             headers: Vec::new(),
             partition_key: None,
             bodies: Vec::new(),
+            typed: None,
         }
+    }
+
+    pub(crate) fn with_json_bodies(mut self, values: Vec<serde_json::Value>) -> Self {
+        self.bodies.extend(
+            values
+                .into_iter()
+                .map(|value| BatchEntry::plain(Body::Json(value))),
+        );
+        self
+    }
+
+    pub(crate) fn with_typed_bodies(
+        mut self,
+        topic: laser_sdk::typed::TypedTopic<BodyValue>,
+        values: Vec<BodyValue>,
+    ) -> PyResult<Self> {
+        // Encode now so a body the form rejects raises before the send.
+        let _ = topic.publish_batch(&values).map_err(to_pyerr)?;
+        self.typed = Some((topic, values));
+        Ok(self)
     }
 }
 
@@ -440,14 +498,14 @@ impl PyBatchPublish {
 
     /// Append one JSON-encoded record. `projection_ref` overrides the batch
     /// default for this record.
-    #[pyo3(signature = (value, *, projection_ref=None))]
+    #[pyo3(signature = (body, *, projection_ref=None))]
     fn add_json<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
         projection_ref: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.bodies.push(BatchEntry::projected(
-            Body::Json(py_to_json(value)?),
+            Body::Json(py_to_json(body)?),
             projection_ref,
         ));
         Ok(slf)
@@ -455,14 +513,14 @@ impl PyBatchPublish {
 
     /// Append one MessagePack-encoded record. `projection_ref` overrides the batch
     /// default for this record.
-    #[pyo3(signature = (value, *, projection_ref=None))]
+    #[pyo3(signature = (body, *, projection_ref=None))]
     fn add_msgpack<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
         projection_ref: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.bodies.push(BatchEntry::projected(
-            Body::Msgpack(py_to_json(value)?),
+            Body::Msgpack(py_to_json(body)?),
             projection_ref,
         ));
         Ok(slf)
@@ -470,14 +528,14 @@ impl PyBatchPublish {
 
     /// Append one raw-bytes record. `projection_ref` overrides the batch
     /// default for this record.
-    #[pyo3(signature = (value, *, projection_ref=None))]
+    #[pyo3(signature = (payload, *, projection_ref=None))]
     fn add_payload<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
         projection_ref: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.bodies.push(BatchEntry::projected(
-            Body::Bytes(payload_bytes(value)?),
+            Body::Bytes(payload_bytes(payload)?),
             projection_ref,
         ));
         Ok(slf)
@@ -486,17 +544,17 @@ impl PyBatchPublish {
     /// Append one already-encoded record plus its content type (e.g. "avro",
     /// "protobuf", "cbor"). Use it for bodies you encoded with another library.
     /// `projection_ref` overrides the batch default for this record.
-    #[pyo3(signature = (value, content_type, *, projection_ref=None))]
+    #[pyo3(signature = (payload, content_type, *, projection_ref=None))]
     fn add_raw_bytes<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
         content_type: String,
         projection_ref: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let content_type = parse_content_type(&content_type)?;
         slf.bodies.push(BatchEntry::projected(
             Body::Raw {
-                payload: payload_bytes(value)?,
+                payload: payload_bytes(payload)?,
                 content_type,
                 schema_id: None,
             },
@@ -505,7 +563,63 @@ impl PyBatchPublish {
         Ok(slf)
     }
 
-    /// Append one raw-bytes record with complete per-record metadata. Batch defaults do not carry over.
+    /// Append one record encoded with a user `codec` (see
+    /// `PublishRequest.encode_with`), stamped with `content_type` or the
+    /// codec's `content_type` attribute.
+    #[pyo3(signature = (body, codec, content_type=None))]
+    fn add_encoded<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        body: &Bound<'_, PyAny>,
+        codec: &Bound<'_, PyAny>,
+        content_type: Option<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let payload = codec_encode(codec, body)?;
+        let body = encoded_body(payload, codec_content_type(codec, content_type)?);
+        slf.bodies.push(BatchEntry::plain(body));
+        Ok(slf)
+    }
+
+    /// `add_encoded` plus a per-record `projection_ref`.
+    #[pyo3(signature = (projection_ref, body, codec, content_type=None))]
+    fn add_encoded_with_projection<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        projection_ref: String,
+        body: &Bound<'_, PyAny>,
+        codec: &Bound<'_, PyAny>,
+        content_type: Option<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let payload = codec_encode(codec, body)?;
+        let body = encoded_body(payload, codec_content_type(codec, content_type)?);
+        slf.bodies
+            .push(BatchEntry::projected(body, Some(projection_ref)));
+        Ok(slf)
+    }
+
+    /// Append every value in `items` encoded with `codec`. The first codec
+    /// failure raises and appends nothing from `items`.
+    #[pyo3(signature = (items, codec, content_type=None))]
+    fn extend_encoded<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        items: &Bound<'_, PyAny>,
+        codec: &Bound<'_, PyAny>,
+        content_type: Option<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let content_type = codec_content_type(codec, content_type)?;
+        let mut bodies = Vec::new();
+        for item in items.try_iter()? {
+            bodies.push(BatchEntry::plain(encoded_body(
+                codec_encode(codec, &item?)?,
+                content_type,
+            )));
+        }
+        slf.bodies.extend(bodies);
+        Ok(slf)
+    }
+
+    /// Append one raw-bytes record with its own metadata. Batch defaults fill
+    /// what the record leaves unset: content type, projection ref, schema id,
+    /// and inline payload, while batch index entries and headers merge with
+    /// the record's own and the record wins on a shared key.
     /// `logical_schema_fingerprint` accepts 32 bytes and is valid only with the Arrow content type.
     #[pyo3(signature = (payload, *, content_type=None, index=None, headers=None, projection_ref=None, schema_id=None, inline_payload=false, logical_schema_fingerprint=None))]
     #[allow(clippy::too_many_arguments)]
@@ -551,11 +665,11 @@ impl PyBatchPublish {
     /// Append one complete self-contained Arrow IPC stream with validated metadata.
     fn add_arrow_ipc<'py>(
         mut slf: PyRefMut<'py, Self>,
-        value: &Bound<'_, PyAny>,
+        payload: &Bound<'_, PyAny>,
         metadata: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.bodies.push(BatchEntry::plain(Body::Arrow {
-            payload: payload_bytes(value)?,
+            payload: payload_bytes(payload)?,
             metadata: py_to_de(metadata)?,
         }));
         Ok(slf)
@@ -569,11 +683,11 @@ impl PyBatchPublish {
         mut slf: PyRefMut<'py, Self>,
         schema: &PyCompiledSchema,
         schema_id: u32,
-        value: &Bound<'_, PyAny>,
+        body: &Bound<'_, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let payload = schema
             .inner
-            .encode_avro(&py_to_json(value)?)
+            .encode_avro(&BodyValue::from_py(body)?)
             .map_err(to_pyerr)?;
         slf.bodies.push(BatchEntry::plain(Body::Raw {
             payload,
@@ -609,10 +723,11 @@ impl PyBatchPublish {
 
     /// Number of records queued so far.
     fn __len__(&self) -> usize {
-        self.bodies.len()
+        self.bodies.len() + self.typed.as_ref().map_or(0, |(_, values)| values.len())
     }
 
-    /// Flush every queued record in a single Iggy send. Returns the count sent.
+    /// Flush every queued record in a single Iggy send. Returns the
+    /// `SendMessagesResponse` with one confirmation per committed range.
     fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let stream = self.stream.clone();
@@ -624,12 +739,16 @@ impl PyBatchPublish {
         let headers = self.headers.clone();
         let partition_key = self.partition_key.clone();
         let bodies = self.bodies.clone();
+        let typed = self.typed.clone();
         future_into_py(py, async move {
             let handle = match &stream {
                 Some(stream) => laser.stream(stream.clone()).topic(&*topic),
                 None => laser.topic(&*topic),
             };
-            let mut request = handle.publish_batch();
+            let mut request = match &typed {
+                Some((typed, values)) => typed.publish_batch(values).map_err(to_pyerr)?,
+                None => handle.publish_batch(),
+            };
             if inline {
                 request = request.inline_payload();
             }
@@ -701,6 +820,7 @@ impl PyBatchPublish {
                         ),
                         Body::Json(value) => request.add_json(&value).map_err(to_pyerr)?,
                         Body::Msgpack(value) => request.add_msgpack(&value).map_err(to_pyerr)?,
+                        Body::Typed(value) => request.add_json(&value).map_err(to_pyerr)?,
                         Body::Arrow { payload, metadata } => {
                             request.add_arrow_ipc(payload, metadata).map_err(to_pyerr)?
                         }

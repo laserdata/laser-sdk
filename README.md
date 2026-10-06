@@ -189,7 +189,7 @@ await audit.publish().json(event).send()
 
 # Views + graph + change feed
 rows = await laser.query("readings_v1").where_eq("status", "degraded").limit(10).fetch()
-nearby = await laser.graph("kg").neighbors(node, direction="out", depth=2)
+nearby = await laser.graph("kg").neighbors(node, dir="out", depth=2)
 feed = laser.watch(index="readings_v1")
 
 # State
@@ -198,9 +198,9 @@ await laser.kv("sessions").set("user:42").json(session).ttl(300).send()
 # Fabric: one task streams its messages, keeps its memory, resolves its deps
 ctx = laser.context(conversation)
 await ctx.append("audit", b"step done")
-facts = await ctx.memory(laser.memory("support")).recall(semantic="rollout incidents")
-turns = await ctx.fetch(last_n=20, token_budget=4_000)
-deps = await ctx.graph("services").neighbors(node, direction="out", depth=2)
+facts = await ctx.memory("support").recall(semantic="rollout incidents")
+turns = await ctx.fetch(n=20, token_budget=4_000)
+deps = await ctx.graph("services").neighbors(node, dir="out", depth=2)
 
 # Session: the same conversation as typed turns, context, memory, and replay
 session = laser.sessions().create("agent-42")
@@ -248,6 +248,7 @@ const facts = await ctx
 
 // Session: the same conversation as typed turns, context, memory, and replay
 const session = laser.sessions().create("agent-42")
+const encode = (text: string) => new TextEncoder().encode(text)
 await session.append("instruction", encode("summarize the ticket"))
 await session.append("model.response", encode("it is a login bug"))
 const turns = await session.context()
@@ -329,6 +330,18 @@ Laser Stack runs the LaserData Apache Iggy fork with `laser-plane`. Apache Iggy 
 
 Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the public LaserData CA bundled with the SDK. `LASER_TLS_CERT=<path>` enables TLS with an explicit CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup. Other hosts keep the TLS settings from their connection string when neither variable is set.
 
+## Consumer groups and offsets
+
+Provision a filtered group once, then consume it by name or ID. Every consumer in the group shares its policy and divides the partitions, so use separate groups for A/B revisions to keep their offsets independent. A fresh consumer that starts at `Next` begins at the first retained record. Under the polling commit policy a native consumer can store a polled batch's offset before the application has handled it, and a group-aware automatic commit advances only past records already delivered, on the next read or at shutdown. When that matters, disable automatic commits and commit after processing. Filtered readers acknowledge explicitly and keep at most 1024 unacknowledged record-bearing pages per partition by default (`max_unacked_pages` in Rust and Python, `maxUnackedPages` in TypeScript), so a reader that never acknowledges stops at the bound instead of growing without limit. An unnamed TypeScript consumer gets an isolated identity and does not commit automatically. Give it a stable name to resume durable progress. Codec profiles and examples are in the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
+
+## Connect and publish limits
+
+Connecting gives up after 30 seconds. Each publish attempt times out after 60 seconds and is retried three times with exponential backoff. Every client can change these limits on its builder or connect call, or through `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` environment variables. A publish that gives up returns an error listing the committed and unconfirmed records, and it never exits the process. See [connect timeout and cleanup](docs/connect-timeout.md) and [publish recovery](docs/publish-recovery.md).
+
+## Upgrading to 0.6.0
+
+0.6.0 is a minor release with breaking changes in all three clients. The [client behavior guide](docs/client-behavior.md) lists each one with the code change it needs.
+
 ## Documentation
 
 - [Tutorial](docs/tutorial.md): a progressive guide from one message to projections, queries, vector recall, codecs, multi-stream topologies, and the agent fabric.
@@ -396,31 +409,3 @@ At-least-once with idempotent operations, per-conversation (per-partition) order
 ## License
 
 Apache-2.0. Copyright LaserData, Inc. Apache and Apache Iggy are trademarks of the Apache Software Foundation, and use does not imply endorsement.
-
-## Connect timeout
-
-Connecting gives up after 30 seconds. Set another budget with the Rust `connect_timeout` builder method, the Python `connect_timeout_ms` connect argument, or the TypeScript `connectTimeout` builder method. The environment variable is `LASER_CONNECT_TIMEOUT_MS`, and explicit configuration overrides it. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe. An expired budget returns a timeout error that says whether the server never accepted the connection or never answered the login. `stream(name).delete()` removes a stream you no longer need, and `close()` ends the shared connection.
-
-See [connect timeout and cleanup](docs/connect-timeout.md).
-
-## Publish recovery
-
-Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
-
-Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle. That error reports the committed and unconfirmed records in all three SDKs: Rust `LaserError::PublishFailed`, Python `committed` and `unconfirmed_count` on the raised exception, and TypeScript `PublishFailedError`.
-
-See [publish recovery and outage handling](docs/publish-recovery.md).
-
-## Producer statistics
-
-Producers can report submitted, confirmed, and failed sends plus publish latency percentiles over a separate observer connection. Set `LASER_PRODUCER_TELEMETRY_INTERVAL_MS` (default 10000, zero disables) and `LASER_PRODUCER_TELEMETRY_MAX_PRODUCERS` (default 32) before creating producers. A telemetry error never fails a publish. The Producers tab of a topic in Stream UI shows the reports of the connected node.
-
-See [producer statistics](docs/producer-statistics.md).
-
-## Consumer filter groups and offsets
-
-**Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh consumer using `Next` starts at the first retained record. Native consumers can commit a polled batch before delivery under the polling policy. Group-aware automatic commits advance only the delivered prefix on the next read or shutdown. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages` in Rust and Python and `maxUnackedPages` in TypeScript, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
-
-**Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
-
-The [0.5.4 client behavior guide](docs/client-behavior.md) covers prepared coordination, memory summaries, callback cancellation, and migration from the earlier defaults.

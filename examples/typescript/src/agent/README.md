@@ -4,9 +4,9 @@ This example runs an agent that handles tasks from the log. It demonstrates capa
 
 ## What it shows
 
-- Run a `triage` handler on the commands topic with replies on the responses topic. Advertise its capability and enable pickup acknowledgments.
+- Runs a `triage` handler on the commands topic with replies on the responses topic. It advertises its capability and enables pickup acknowledgments.
 - Emits a `Working` status on pickup (`.ackOnPickup()`), so a contract caller can tell the command was consumed. Redelivery after a crash comes from commit-after-success.
-- Sends it a deadline-bounded contract by capability, not by name: `laser.contract(routeToCapable("resolve-ticket", ANY_ROUTE_POLICY)).from(...).payload(...).inboxRoute(...).deadline(60_000).send()`.
+- Sends it a deadline-bounded contract by capability, not by name: `laser.contract(routeToCapable("resolve-ticket", { kind: "any" })).from(...).payload(...).inboxRoute(...).deadline(60_000).send()`.
 - Reads the outcome (`completed` / `failed` / `notConsumed` / `timedOut`) and prints the decoded reply.
 
 Runs against Apache Iggy - no LaserData Cloud needed.

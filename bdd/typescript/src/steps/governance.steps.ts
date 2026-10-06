@@ -3,7 +3,9 @@ import { Given, Then, When } from "@cucumber/cucumber"
 import {
   ActionDecision,
   AgentTopic,
+  decodePolicyEvidence,
   GovernorMode,
+  POLICY_DECISION_OPERATION,
   PolicyBlockedError,
   type ActionGovernor
 } from "@laserdata/laser-sdk"
@@ -66,7 +68,14 @@ Then(
   /^the audit topic records a "([^"]+)" decision with outcome "([^"]+)"$/,
   async function (this: LaserWorld, decision: string, outcome: string) {
     await eventual(async () => {
-      const evidence = await this.requireLaser().policyEvidence(this.requireConversation())
+      const messages = await this.requireLaser()
+        .context(this.requireConversation())
+        .fetch([AgentTopic.Audit], Number.MAX_SAFE_INTEGER)
+      const evidence = messages.flatMap((message) =>
+        message.envelope?.operation === POLICY_DECISION_OPERATION
+          ? [decodePolicyEvidence(message.envelope.body)]
+          : []
+      )
       return evidence.some((item) => item.decision === decision && item.outcome === outcome)
         ? true
         : undefined

@@ -1,15 +1,30 @@
 import {
   ContentType,
-  decodeUtf8,
   Laser,
   parseProjectionId,
   type Capabilities,
-  type CapabilitySurface,
   type GraphNode,
   type MemoryItem,
   type Projection,
   type ProjectionBinding
 } from "@laserdata/laser-sdk"
+
+// The deployment features an example can require before it runs.
+export type ExampleFeature =
+  | "managed"
+  | "query"
+  | "destinations"
+  | "kv"
+  | "kvCas"
+  | "kvCasFenced"
+  | "kvFencedLeases"
+  | "graph"
+  | "forks"
+  | "agentWorkflow"
+  | "watch"
+  | "authz"
+  | "filters"
+  | "filterCatalog"
 
 export const LOCAL_CONNECTION_STRING = "iggy:iggy@127.0.0.1:8090"
 export const DEFAULT_PORT = 8090
@@ -88,7 +103,7 @@ export async function connectExample(
   const stream = streamFor(example, env)
   const laser = await Laser.builder()
     .connectionString(resolveConnectionString(env))
-    .defaultStream(stream)
+    .stream(stream)
     .connect()
   try {
     await resetStream(laser, example, env)
@@ -116,7 +131,7 @@ export async function resetStream(
 
 export async function runExample(
   example: string,
-  run: (laser: Laser, signal: AbortSignal) => Promise<void>
+  run: (laser: Laser, signal: AbortSignal) => Promise<unknown>
 ): Promise<void> {
   await using laser = await connectExample(example)
   using shutdown = installShutdownSignals()
@@ -125,7 +140,7 @@ export async function runExample(
 
 export function managedGate(
   capabilities: Capabilities,
-  feature: CapabilitySurface,
+  feature: ExampleFeature,
   example: string,
   label: string = feature
 ): boolean {
@@ -199,7 +214,16 @@ export class Rng {
   }
 }
 
-export { decodeUtf8, utf8 } from "@laserdata/laser-sdk"
+const UTF8_ENCODER = new TextEncoder()
+const UTF8_DECODER = new TextDecoder()
+
+export function utf8(text: string): Uint8Array {
+  return UTF8_ENCODER.encode(text)
+}
+
+export function decodeUtf8(bytes: Uint8Array): string {
+  return UTF8_DECODER.decode(bytes)
+}
 
 export function printHits(label: string, hits: readonly MemoryItem[]): void {
   console.log(label)
@@ -211,7 +235,7 @@ export function printHits(label: string, hits: readonly MemoryItem[]): void {
 
 export function graphNodeValue(node: GraphNode): string {
   for (const [key, value] of node.attrs) {
-    if (key === "value" && value.kind === "string") return value.value
+    if (key === "value" && value.kind === "str") return value.value
   }
   return "?"
 }
@@ -463,7 +487,7 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function surfaceAvailable(capabilities: Capabilities, feature: CapabilitySurface): boolean {
+function surfaceAvailable(capabilities: Capabilities, feature: ExampleFeature): boolean {
   switch (feature) {
     case "managed":
       return capabilities.managed

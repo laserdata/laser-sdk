@@ -36,7 +36,7 @@ python3 event_analytics.py
 
 With no environment set, the examples connect to `iggy:iggy@127.0.0.1:8090`.
 
-For projections, query, KV, forks, graph, and runs, start Laser Stack with `./scripts/up` from its checkout and use the `LASER_CONNECTION_STRING` it prints.
+For projections, query, KV, forks, graph, and runs, start [Laser Stack](https://github.com/laserdata/laser-stack) with `./scripts/up` from its checkout and use the `LASER_CONNECTION_STRING` it prints.
 
 ## Run against LaserData Cloud
 
@@ -61,8 +61,10 @@ LASER_TOKEN='<token>' \
 | `LASER_USERNAME`, `LASER_PASSWORD` | username and password auth |
 | `LASER_NO_TLS=1` | disable the automatic TLS attach |
 | `LASER_STREAM` | override the data stream for every example (default: `laser-<example>-python`, reset at the start of a run and kept afterwards so the result stays on the server for inspection) |
-| `LASER_MESSAGES`, `LASER_BATCH` | volume knobs for the publishing examples |
-| `LASER_FIREHOSE_*` | the firehose's own knobs (`MESSAGES`, `ORGS`, `CONCURRENCY`, `PAYLOAD_BYTES`, `BATCH`, `PARTITIONS`, `REGISTER`, `QUERY`) |
+| `LASER_MESSAGES`, `LASER_BATCH` | volume knobs: `LASER_MESSAGES` scales `event_analytics.py`, `fleet_tape.py`, and `incident_desk.py`, and `LASER_BATCH` sets the incident desk's ingest batch size |
+| `LASER_FIREHOSE_*` | the firehose's own knobs (`MESSAGES`, `ORGS`, `CONCURRENCY`, `PAYLOAD_BYTES`, `BATCH`, `PARTITIONS`, `REGISTER`, `QUERY`, `PROGRESS_EVERY`) |
+| `LASER_GOVERNANCE_USER_ID` | the Apache Iggy user ID the governance example binds its roles to (default 1) |
+| `LASER_CONNECT_TIMEOUT_MS`, `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, `LASER_PUBLISH_RETRY_BACKOFF_MS` | the connect and publish budgets that `Laser.connect` reads, see [connect timeout and cleanup](../../docs/connect-timeout.md) and [publish recovery](../../docs/publish-recovery.md) |
 | `LASER_APPLY_PLAN=1` | the incident desk acts on the speculative fork's verdict (promote or squash) instead of leaving it open |
 | `LASER_DESK_GRANT_TIMEOUT_SECS` | the incident desk's grant-apply deadline (default 180s), raise it for a heavily rate-limited deployment |
 | `ANTHROPIC_API_KEY` | the incident desk uses real Claude for its LLM seam instead of the deterministic mock (`ANTHROPIC_MODEL` optional) |
@@ -77,13 +79,13 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 | [`query.py`](query.py) | Views | declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch.py`](watch.py) | Change feed | react to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
 | [`kv.py`](kv.py) | State | set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
-| [`cdc.py`](cdc.py) | Consumer filters | read four safe-mode events out of a 240-record feed of typed dataclasses, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (bindings need plane) | no | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
+| [`cdc.py`](cdc.py) | Consumer filters | read four safe-mode events out of a 240-record feed of typed dataclasses, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group | yes | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
 | [`graph.py`](graph.py) | Graph | link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall.py`](recall.py) | Memory | all four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
 | [`context.py`](context.py) | Context | assemble one conversation under a last-N bound and a token budget | no | [`/laser-sdk/context`](https://docs.laserdata.cloud/laser-sdk/context) |
 | [`agent.py`](agent.py) | Fabric | spawn a handler agent and send it a deadline-bounded contract | no | [`/laser-sdk/fabric`](https://docs.laserdata.cloud/laser-sdk/fabric) |
 
-`recall.py` is the Memory primitive's example - it is not named `memory` because that name already belongs to the full scenario below (one of Memory's four verbs instead).
+`recall.py` is the Memory primitive's example. It is not named `memory` because the full scenario below already owns that name, and `recall` is one of Memory's four verbs.
 
 ## Deep-dive scenarios
 
@@ -91,7 +93,7 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 | --- | --- | --- |
 | [`native_streaming.py`](native_streaming.py) | generic | Laser's direct VSR producer and live consumer-group path: tuned batching/linger/retries, exact-width typed headers, keyed routing, 1000 messages published and drained through interval-or-each auto commit, then again through explicit commit-after-success offsets. |
 | [`event_analytics.py`](event_analytics.py) | generic | one clickstream, every read model: a cursor folds a live ops ticker while the producer streams, the managed plane materializes a queryable index for request mix / slowest-route / windowed analytics, a second cursor resumes from a checkpoint, and a registered JSON Schema guards the index against malformed events (the analytics, resume, and schema phases skip cleanly on Apache Iggy) |
-| [`fleet_tape.py`](fleet_tape.py) | generic | a fleet telemetry tape with two readers on one connection: host CPU readings stream to a feed topic where a cursor folds a live fleet view (last CPU, sample-weighted mean CPU, samples per host), and the same readings index to a queryable tape for sample and mean CPU aggregates, then a typed handle (`laser.topic(name, cls=Reading)`) replays the tape as dataclass values to audit the totals (the tape analytics skip on Apache Iggy) |
+| [`fleet_tape.py`](fleet_tape.py) | generic | a fleet telemetry tape with two readers on one connection: host CPU readings stream to a feed topic where a cursor folds a live fleet view (last CPU, sample-weighted mean CPU, samples per host), and the same readings index to a queryable tape for sample and mean CPU aggregates, then a typed handle (`laser.topic(name).json(Reading)`) replays the tape as dataclass values to audit the totals (the tape analytics skip on Apache Iggy) |
 | [`firehose.py`](firehose.py) | generic | a volume load generator: many concurrent producers publish big, richly indexed telemetry events across many org indexes, each materialized into its own queryable index, then a few sample analytics run. Scaled by the `LASER_FIREHOSE_*` knobs |
 | [`incident_desk.py`](incident_desk.py) | agentic | the full-AGDX showcase, peer of the Rust `incident-desk`: a ticket firehose into a queryable index, semantic memory recall, a four-agent desk (triage queries the index and fans deadline-bounded specialist calls, the specialist answers from recalled memory plus the LLM, a key-value-deduplicated resolver applies capacity grants effectively once behind a durable approval gate, the approver stands in for the human), a compare-and-swap quota-ledger retry loop with read-your-writes, speculative bulk-resolution in a copy-on-write fork, and the whole incident rebuilt from its conversation as the audit trail (semantic memory is in-process, the index, key-value, and fork phases skip cleanly on Apache Iggy) |
 | [`memory.py`](memory.py) | agentic | agentic memory, three facets, peer of the Rust `memory`: the four memory verbs as one loop over a vector memory (remember, recall the semantically closest, improve from an operator upvote, forget a superseded fact), then the same verbs durable over a memory topic materialized into a versioned key-value read view, then the knowledge graph over the same ops domain (upsert services and components, read a node's neighbors, traverse from every `Service` to what it depends on). The durable-memory and graph facets skip cleanly on Apache Iggy, and the durable memories and named graph are browsable in the console's Memory and graph-explorer views |
@@ -103,6 +105,6 @@ Every example runs green on a local Apache Iggy. The managed phases (query, key-
 
 **Consumer filters save 98.5% of payload transfer in the CDC example.** [cdc.py](cdc.py) reads 4 of 240 records from a shared feed. It uses dataclasses, record-by-record acknowledgments, one-byte numeric headers, previews, and saved group policies. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
 
-The CDC managed phase also demonstrates **create-and-bind setup, numeric group IDs, and independent A/B groups**. Revision pause stops new reads while allowing in-flight acknowledgments, then resume continues the same policy.
+The CDC managed phase also demonstrates **create-and-bind setup, the group's numeric ID, and independent A/B groups**. Revision pause stops new reads while allowing in-flight acknowledgments, then resume continues the same policy.
 
 The CDC example also filters fields inside **CBOR, Avro, and Protobuf payloads** with matching typed fleet readings. Install its optional dependencies with `uv sync --extra examples` from `foreign/python`. The shared schemas live in `examples/shared/`. Avro and Protobuf require plane for writer-schema registration.

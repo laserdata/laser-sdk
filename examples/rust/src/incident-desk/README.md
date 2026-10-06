@@ -48,7 +48,7 @@ LASER_DESK_GRANT_TIMEOUT_SECS=600 \
 
 ## Where to look (LaserData Cloud)
 
-- Query: index `support_tickets` (the world model).
+- Query: index `support_tickets_<token>` (the world model). The run token keeps a rerun, or another language's desk on the same deployment, out of this run's rows.
 - KV: namespaces `desk-grants-<run>` (the applied quotas) and `desk-dedup-<run>` (the idempotency keys that blocked the redelivery), plus `desk_quota_ledger` from the coordination demo. The run logs the exact names.
 - Forks: `bulk-resolve-plan` stays open after a default run (with `LASER_APPLY_PLAN=1` it was promoted or squashed by the end).
 - Messages: the agent topics carry the whole conversation, provenance headers included.

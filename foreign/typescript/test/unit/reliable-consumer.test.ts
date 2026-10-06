@@ -12,6 +12,7 @@ import {
   isRetryable,
   retryBackoff,
   retryDelayMs,
+  ReliableConsumer,
   SlidingWindow,
   type FenceEntry,
   type FenceSweepState,
@@ -26,7 +27,15 @@ import {
   RejectedError,
   TransportError
 } from "../../src/client/errors.js"
-import type { IggyHeaderValue } from "../../src/iggy/apache-iggy.js"
+import { CancelledError } from "../../src/client/errors.js"
+import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import type { Laser } from "../../src/client/laser.js"
+import type { HeaderValue } from "../../src/stream/header-value.js"
+import { KeyRegistry, SigningKey } from "../../src/signing.js"
+import type { Consumer, ConsumerMessage } from "../../src/stream/consumer.js"
+import { ConsumerGroupName } from "../../src/types/ids.js"
+import { AGENT_OP_VERSION } from "../../src/wire/codes.js"
+import { ContentType, contentTypeCode } from "../../src/wire/content.js"
 import type { Provenance } from "../../src/provenance/provenance.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import { AgentId, ConversationId as SdkConversationId } from "../../src/types/ids.js"
@@ -133,7 +142,7 @@ void test("given_an_agdx_message_when_decoded_then_should_synthesize_provenance_
     new TextEncoder().encode("do-the-thing")
   )
   const payload = envelopePayload(envelope)
-  const headers = new Map<string, IggyHeaderValue>([[AGENT_VERSION, { kind: "uint32", value: 1 }]])
+  const headers = new Map<string, HeaderValue>([[AGENT_VERSION, { kind: "uint32", value: 1 }]])
   const { provenance, envelope: decoded } = provenanceAndEnvelope({
     payload,
     partitionId: 0,
@@ -141,7 +150,7 @@ void test("given_an_agdx_message_when_decoded_then_should_synthesize_provenance_
     headers
   })
   assert.ok(provenance.conversationId.equals(SdkConversationId.parse(conversation.toString())))
-  assert.equal(provenance.agent?.asString(), "planner")
+  assert.equal(provenance.agent?.asStr(), "planner")
   assert.ok(decoded !== undefined)
   assert.deepEqual(
     agentMessageBody({
@@ -168,7 +177,7 @@ void test("given_a_plain_message_when_decoded_then_should_read_provenance_from_h
 })
 
 void test("given_a_content_type_header_when_read_then_should_map_the_code", () => {
-  const headers = new Map<string, IggyHeaderValue>([[CONTENT_TYPE, { kind: "uint8", value: 1 }]])
+  const headers = new Map<string, HeaderValue>([[CONTENT_TYPE, { kind: "uint8", value: 1 }]])
   assert.equal(
     contentTypeOf({ payload: new Uint8Array(), partitionId: 0, offset: 0n, headers }),
     "json"
@@ -200,4 +209,79 @@ void test("given_permanent_and_transient_errors_when_classified_then_should_retr
     true
   )
   assert.equal(isRetryable(new AuthzExecutionError("forbidden", { kind: "unauthorized" })), false)
+})
+
+void test("given_a_replayed_signed_record_when_consumed_then_should_handle_it_once", async () => {
+  const key = SigningKey.fromBytes(new Uint8Array(32).fill(61))
+  const registry = new KeyRegistry()
+  registry.enroll("caller", key.verifyingKey())
+  const envelope = commandEnvelope(
+    RecordId.fromU128(0x77n),
+    ConversationId.fromU128(5n),
+    parseAgentId("caller"),
+    CorrelationId.fromU128(6n),
+    new TextEncoder().encode("rotate")
+  )
+  const contentType = contentTypeCode(ContentType.Cbor)
+  const signed = {
+    ...envelope,
+    signature: key.signWithContext(envelope, { contentType, agentVersion: AGENT_OP_VERSION })
+  }
+  // The same signed bytes, written twice to the topic.
+  const deliveries = [0n, 1n].map(
+    (offset) =>
+      ({
+        partitionId: 0,
+        position: { partitionId: 0, offset },
+        timestampMicros: BigInt(Date.now()) * 1000n,
+        payload: envelopePayload(signed),
+        headers: new Map<string, HeaderValue>([
+          [AGENT_VERSION, { kind: "uint32", value: AGENT_OP_VERSION }],
+          [CONTENT_TYPE, { kind: "uint8", value: contentType }]
+        ])
+      }) as unknown as ConsumerMessage
+  )
+  const stop = new AbortController()
+  const consumer = {
+    nextWithin: (_waitMs: number, options?: { signal?: AbortSignal }) => {
+      const next = deliveries.shift()
+      if (next !== undefined) return Promise.resolve(next)
+      if (deliveries.length === 0) stop.abort()
+      return new Promise<ConsumerMessage>((_resolve, reject) => {
+        const abort = (): void => {
+          reject(new CancelledError("stopped"))
+        }
+        options?.signal?.addEventListener("abort", abort, { once: true })
+        if (options?.signal?.aborted === true) abort()
+      })
+    },
+    commit: () => Promise.resolve(),
+    shutdown: () => Promise.resolve()
+  } as unknown as Consumer
+  const laser = {
+    defaultStream: "agents",
+    topic: () => ({
+      consumerGroup: () => ({ [INTERNAL_NATIVE_CONSUMER]: () => Promise.resolve(consumer) })
+    }),
+    [INTERNAL_TRANSPORT]: () => ({
+      resolveStreamTopicIds: () => Promise.resolve({ streamId: 1, topicId: 2 })
+    })
+  } as unknown as Laser
+  let handled = 0
+  await new ReliableConsumer({
+    group: ConsumerGroupName.forAgent(AgentId.new("worker")),
+    topic: "commands",
+    verifier: registry,
+    shutdownGraceMs: 100
+  }).run(
+    laser,
+    {
+      handle: () => {
+        handled += 1
+        return Promise.resolve()
+      }
+    },
+    { signal: stop.signal }
+  )
+  assert.equal(handled, 1)
 })

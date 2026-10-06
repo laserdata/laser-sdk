@@ -38,7 +38,7 @@ def test_given_a_test_clock_when_advanced_then_should_use_native_unsigned_time()
 
 def test_given_a_signed_card_when_changed_then_should_refuse_the_signature():
     key = ls.SigningKey(bytes(range(32)))
-    card = {"name": "planner", "version": "0.5.4", "skills": []}
+    card = {"name": "planner", "version": "0.6.0", "skills": []}
     signature = ls.sign_card_value(key, card)
     assert ls.verify_card(card, signature, key.verifying_key) is None
     card["signatures"] = [signature]
@@ -135,7 +135,7 @@ def test_given_invalid_envelope_ids_when_converted_then_should_refuse_before_pub
 
 
 async def test_given_duplicate_ranked_candidates_when_fused_then_should_preserve_signals():
-    memory = ls.Memory.vector(lambda _: [1.0])
+    memory = ls.MemoryHandle.vector(lambda _: [1.0])
     await memory.remember("first")
     await memory.remember("second")
     items = await memory.recall(semantic="query", limit=2)
@@ -179,3 +179,26 @@ async def test_given_corrupt_blob_bytes_when_resolved_then_should_refuse_unverif
     store.values["blob:1"] = b"wrong"
     with pytest.raises(ls.LaserError):
         await ls.resolve_body(store, capsule)
+
+
+def test_given_an_enrolled_signer_when_verifying_at_a_time_then_should_return_the_principal():
+    key = ls.SigningKey(bytes(range(32)))
+    registry = ls.KeyRegistry()
+    registry.enroll_operator("operator-9", key.verifying_key)
+    envelope = command()
+    envelope["signature"] = key.sign(envelope)
+    verified = registry.verify_at(envelope, 1)
+    assert isinstance(verified, ls.VerifiedPrincipal)
+    assert (verified.principal, verified.kind) == ("operator-9", "operator")
+
+
+def test_given_the_clock_base_when_subclassed_then_should_share_the_clock_type():
+    class FixedClock(ls.Clock):
+        def now_micros(self):
+            return 42
+
+    assert isinstance(ls.SystemClock(), ls.Clock)
+    assert isinstance(ls.TestClock(), ls.Clock)
+    assert FixedClock().now_micros() == 42
+    with pytest.raises(NotImplementedError):
+        ls.Clock().now_micros()

@@ -39,13 +39,24 @@ import {
 } from "../wire/ids.js"
 
 export class Destinations {
-  constructor(
+  private constructor(
     private readonly transport: ManagedTransport,
     private readonly capabilities: () => Promise<Capabilities>
   ) {}
 
+  /** @internal */
+  static create(
+    transport: ManagedTransport,
+    capabilities: () => Promise<Capabilities>
+  ): Destinations {
+    return new Destinations(transport, capabilities)
+  }
+
   /** Sends one checkpoint request envelope, the deep form behind every
-   * mutation helper. Mirrors the Rust `Laser::execute_checkpoint`. */
+   * mutation helper and `Laser.executeCheckpoint`.
+   *
+   * @internal
+   */
   async executeCheckpoint(request: CheckpointRequestEnvelope): Promise<CheckpointMutationResult> {
     const reply = await executeManaged(
       this.transport,

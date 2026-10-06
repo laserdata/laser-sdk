@@ -2,14 +2,17 @@ use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::query::{
     AGDX_QUERY_CODE, AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch,
-    MAX_PAGE_SIZE, QUERY_OP_VERSION, Query, QueryCancelEnvelope, QueryCancelReply, QueryEnvelope,
-    QueryError, QueryExecutionId, QueryExecutionStatus, QueryPageEnvelope, QueryReply, QueryResult,
-    QueryStatusEnvelope, QueryStatusReply, QueryTarget, RawSql, Row, SnapshotSelector, Sort,
-    SqlDialect, TextQuery, TypedValue, VECTOR_FIELD, VectorQuery, Window,
+    QUERY_OP_VERSION, Query, QueryError, QueryExecutionId, QueryExecutionStatus, QueryResult,
+    QueryTarget, RawSql, Row, SnapshotSelector, Sort, SqlDialect, TextQuery, TypedValue,
+    VECTOR_FIELD, VectorQuery, Window,
 };
 use crate::stream::Decoder;
 use crate::types::{ConversationId, MintUlid};
 use laser_wire::framing::encode_named;
+use laser_wire::query::{
+    QueryCancelEnvelope, QueryCancelReply, QueryEnvelope, QueryPageEnvelope, QueryReply,
+    QueryStatusEnvelope, QueryStatusReply,
+};
 use laser_wire::schema::ORIGINAL_PAYLOAD_FIELD_NAME;
 use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
@@ -111,26 +114,6 @@ impl Laser {
             return Err(QueryError::Version {
                 expected: versions.query,
                 got: QUERY_OP_VERSION,
-            }
-            .into());
-        }
-        // Fail fast on an over-cap page before the round trip. `top_k` on a
-        // vector query is the same page bound under a different name.
-        if query.page.limit > MAX_PAGE_SIZE as u32 {
-            return Err(QueryError::TooLarge {
-                what: "limit".to_owned(),
-                size: u64::from(query.page.limit),
-                cap: MAX_PAGE_SIZE as u64,
-            }
-            .into());
-        }
-        if let Some(vector) = &query.vector
-            && vector.top_k > MAX_PAGE_SIZE as u32
-        {
-            return Err(QueryError::TooLarge {
-                what: "top_k".to_owned(),
-                size: u64::from(vector.top_k),
-                cap: MAX_PAGE_SIZE as u64,
             }
             .into());
         }
@@ -296,6 +279,14 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
+    /// Replace the absolute execution deadline, in Unix epoch microseconds.
+    /// A caller that already holds a deadline passes it through unchanged
+    /// instead of converting it back into a relative budget.
+    pub fn deadline_micros(mut self, deadline_micros: u64) -> Self {
+        self.query.deadline_micros = deadline_micros;
+        self
+    }
+
     /// The identity shared by execution, cursor pages, status, and cancellation.
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.query.execution_id
@@ -440,8 +431,8 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
-    /// Limit the page to `n` rows. Above `MAX_PAGE_SIZE` is rejected with
-    /// `QueryError::TooLarge`. Zero is invalid.
+    /// Limit the page to `n` rows. Zero or above `MAX_PAGE_SIZE` is rejected
+    /// as [`LaserError::Invalid`] before the request is sent.
     pub fn limit(mut self, n: usize) -> Self {
         self.query.page.limit = u32::try_from(n).unwrap_or(u32::MAX);
         self
@@ -773,7 +764,7 @@ impl<'a> QueryRequest<'a> {
     // an unbounded walk is never handed out directly (the bounded-reads law),
     // and the public `stream` verb belongs to Iggy topology root alone.
     // Auto-paginates with `limit` (or 100 if unset) and stops when the worker
-    // reports `has_more = false` (or an empty page, whichever comes first).
+    // reports `has_more = false`, an empty page, or no new cursor.
     // Aggregate and vector queries are single-page by construction: `offset`
     // is not a meaningful cursor for either shape.
     fn page_stream(mut self) -> QueryStream<'a> {
@@ -969,9 +960,9 @@ where
 /// The auto-paginating row walk behind [`QueryRequest::rows`] and
 /// [`QueryRequest::fetch_all`]. Holds the `Query` and refills its buffer by
 /// continuing it with the server-issued opaque cursor when a local page drains,
-/// until the worker reports `has_more = false` (or returns an empty page,
-/// whichever comes first). The empty-page guard rules out an infinite loop if
-/// the worker ever skews on the `has_more` flag.
+/// until the worker reports `has_more = false`, returns an empty page, or
+/// returns no new cursor, whichever comes first. The empty-page and cursor
+/// guards rule out an infinite loop if the worker skews on `has_more`.
 struct QueryStream<'a> {
     laser: &'a Laser,
     query: Query,
@@ -1005,16 +996,31 @@ impl<'a> QueryStream<'a> {
             return Ok(None);
         }
         let page = self.laser.execute_query(self.query.clone()).await?;
-        let fetched = page.rows.len();
-        // Empty page always terminates: belt-and-braces against a worker that
-        // mis-reports `has_more` and would otherwise wedge the loop.
-        self.finished = self.single_page || fetched == 0 || !page.page.has_more;
+        self.finished = self.single_page
+            || page_ends_walk(
+                page.rows.len(),
+                &page.page,
+                self.query.page.cursor.as_deref(),
+            );
         self.query.page.cursor = page.page.next_cursor.clone();
         self.query.page.offset = None;
         self.fields = page.fields;
         self.buffer = page.rows.into_iter();
         Ok(self.buffer.next())
     }
+}
+
+// Whether a fetched page is the last one the walk reads. An empty page, a
+// page without more rows, and a page that reports more rows but gives no new
+// cursor all end it. Continuing without a cursor would restart at page one and
+// continuing with the same cursor would repeat the page, both forever.
+fn page_ends_walk(fetched: usize, page: &laser_wire::query::Page, sent: Option<&str>) -> bool {
+    fetched == 0
+        || !page.has_more
+        || page
+            .next_cursor
+            .as_deref()
+            .is_none_or(|next| Some(next) == sent)
 }
 
 /// The bounded row walk returned by [`QueryRequest::rows`]: the auto-paginating
@@ -1092,6 +1098,36 @@ impl<T: DeserializeOwned> TypedQueryRows<'_, T> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn given_an_over_cap_limit_when_executed_then_should_be_invalid_before_any_round_trip() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        let query = laser
+            .query("readings")
+            .limit(crate::query::MAX_PAGE_SIZE + 1)
+            .into_query();
+        assert!(matches!(
+            laser.execute_query(query).await,
+            Err(LaserError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn given_more_rows_without_a_new_cursor_when_paging_then_should_end_the_walk() {
+        let page = |has_more: bool, next_cursor: Option<&str>| laser_wire::query::Page {
+            offset: None,
+            limit: 2,
+            total: None,
+            has_more,
+            next_cursor: next_cursor.map(str::to_owned),
+        };
+        assert!(!page_ends_walk(2, &page(true, Some("b")), Some("a")));
+        assert!(page_ends_walk(2, &page(true, None), Some("a")));
+        assert!(page_ends_walk(2, &page(true, None), None));
+        assert!(page_ends_walk(2, &page(true, Some("a")), Some("a")));
+        assert!(page_ends_walk(0, &page(true, Some("b")), Some("a")));
+        assert!(page_ends_walk(2, &page(false, Some("b")), Some("a")));
+    }
+
     #[test]
     fn given_a_cursor_when_set_then_should_replace_the_offset() {
         let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
@@ -1105,5 +1141,15 @@ mod tests {
         let query = laser.query("readings").cursor("c-2").offset(5).into_query();
         assert_eq!(query.page.cursor, None);
         assert_eq!(query.page.offset, Some(5));
+    }
+
+    #[test]
+    fn given_an_absolute_deadline_when_set_then_should_carry_it_unchanged() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        let query = laser
+            .query("readings")
+            .deadline_micros(1_700_000_000_000_000)
+            .into_query();
+        assert_eq!(query.deadline_micros, 1_700_000_000_000_000);
     }
 }

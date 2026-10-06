@@ -1,6 +1,10 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { RoutingError } from "../../src/client/errors.js"
+import {
+  NoCapableAgentError,
+  NoInboxError,
+  RoutePrincipalMismatchError
+} from "../../src/client/errors.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import type { Provenance } from "../../src/provenance/provenance.js"
 import {
@@ -37,7 +41,7 @@ function registry(
       )
     },
     principalFor(agent: AgentId): PrincipalId | undefined {
-      const value = principals[agent.asString()]
+      const value = principals[agent.asStr()]
       return value !== undefined ? PrincipalId.new(value) : undefined
     }
   }
@@ -68,7 +72,7 @@ function card(
 void test("given_a_route_to_an_agent_when_applied_then_should_set_the_target", () => {
   const provenance: Provenance = { conversationId: ConversationId.new() }
   const applied = applyRoute(routeTo(AgentId.new("executor")), provenance)
-  assert.equal(applied.targetAgentId?.asString(), "executor")
+  assert.equal(applied.targetAgentId?.asStr(), "executor")
 })
 
 void test("given_a_broadcast_route_when_applied_then_should_clear_the_target", () => {
@@ -87,11 +91,11 @@ void test("given_candidates_when_selected_by_policy_then_should_pick_the_best_by
   const idle = card("idle", 5, 5, 10)
   const candidates = [cheap, fast, idle]
 
-  assert.equal(selectRoute("diagnose", candidates, { kind: "cheapest" })?.asString(), "cheap")
-  assert.equal(selectRoute("diagnose", candidates, { kind: "fastest" })?.asString(), "fast")
-  assert.equal(selectRoute("diagnose", candidates, { kind: "leastLoaded" })?.asString(), "idle")
+  assert.equal(selectRoute("diagnose", candidates, { kind: "cheapest" })?.asStr(), "cheap")
+  assert.equal(selectRoute("diagnose", candidates, { kind: "fastest" })?.asStr(), "fast")
+  assert.equal(selectRoute("diagnose", candidates, { kind: "leastLoaded" })?.asStr(), "idle")
   assert.equal(
-    selectRoute("diagnose", candidates, { kind: "sticky", agent: AgentId.new("fast") })?.asString(),
+    selectRoute("diagnose", candidates, { kind: "sticky", agent: AgentId.new("fast") })?.asStr(),
     "fast"
   )
   assert.ok(
@@ -104,12 +108,12 @@ void test("given_a_principal_bound_selector_when_filtering_then_should_drop_fore
   const trusted = card("trusted", 1, undefined, undefined)
   const foreign = card("foreign", 2, undefined, undefined)
   const filtered = filterCandidatesByPrincipal([trusted, foreign], PrincipalId.new(7), (agent) => {
-    if (agent.asString() === "trusted") return PrincipalId.new(7)
-    if (agent.asString() === "foreign") return PrincipalId.new(9)
+    if (agent.asStr() === "trusted") return PrincipalId.new(7)
+    if (agent.asStr() === "foreign") return PrincipalId.new(9)
     return undefined
   })
   assert.equal(filtered.length, 1)
-  assert.equal(filtered[0]?.agent.asString(), "trusted")
+  assert.equal(filtered[0]?.agent.asStr(), "trusted")
 })
 
 void test("given_a_principal_bound_route_when_reading_required_identity_then_should_return_principal", () => {
@@ -120,7 +124,7 @@ void test("given_a_principal_bound_route_when_reading_required_identity_then_sho
 void test("given_direct_and_broadcast_routes_when_resolved_then_should_return_explicit_targets", () => {
   const empty = registry([])
   assert.deepEqual(
-    resolveTargets(routeTo(AgentId.new("metrics")), empty, 0n).map((agent) => agent.asString()),
+    resolveTargets(routeTo(AgentId.new("metrics")), empty, 0n).map((agent) => agent.asStr()),
     ["metrics"]
   )
   assert.deepEqual(resolveTargets(routeBroadcast(), empty, 0n), [])
@@ -133,13 +137,13 @@ void test("given_capable_agents_when_resolving_routes_then_should_apply_single_a
 
   assert.deepEqual(
     resolveTargets(routeToCapable("diagnose", { kind: "fastest" }), view, 0n).map((agent) =>
-      agent.asString()
+      agent.asStr()
     ),
     ["fast"]
   )
   assert.deepEqual(
     resolveTargets(routeAllCapable("diagnose", { kind: "any" }), view, 0n).map((agent) =>
-      agent.asString()
+      agent.asStr()
     ),
     ["cheap", "fast"]
   )
@@ -148,7 +152,7 @@ void test("given_capable_agents_when_resolving_routes_then_should_apply_single_a
 void test("given_no_capable_agent_when_resolving_then_should_fail_without_broadcasting", () => {
   assert.throws(
     () => resolveTargets(routeToCapable("diagnose", { kind: "any" }), registry([]), 0n),
-    (error: unknown) => error instanceof RoutingError && error.reason.kind === "noCapableAgent"
+    (error: unknown) => error instanceof NoCapableAgentError
   )
 })
 
@@ -164,10 +168,7 @@ void test("given_principal_bound_routes_when_identity_differs_then_should_report
   for (const route of [direct, capable]) {
     assert.throws(
       () => resolveTargets(route, view, 0n),
-      (error: unknown) =>
-        error instanceof RoutingError &&
-        error.reason.kind === "principalMismatch" &&
-        error.reason.actual === 9
+      (error: unknown) => error instanceof RoutePrincipalMismatchError && error.actual === 9
     )
   }
 })
@@ -198,7 +199,7 @@ void test("given_a_custom_scorer_when_selected_then_should_rank_over_the_same_ca
   }
 
   assert.equal(
-    selectRoute("diagnose", candidates, { kind: "custom", scorer: highestLoad })?.asString(),
+    selectRoute("diagnose", candidates, { kind: "custom", scorer: highestLoad })?.asStr(),
     "cheap"
   )
   assert.equal(
@@ -224,5 +225,5 @@ void test("given_an_advertised_route_when_an_inbox_is_present_then_should_resolv
 
 void test("given_an_advertised_route_when_no_inbox_then_should_error_without_a_fallback", () => {
   const agent = AgentId.new("metrics")
-  assert.throws(() => resolveInboxRoute(ADVERTISED_INBOX_ROUTE, agent, undefined), RoutingError)
+  assert.throws(() => resolveInboxRoute(ADVERTISED_INBOX_ROUTE, agent, undefined), NoInboxError)
 })

@@ -12,7 +12,6 @@ import {
   FieldPath,
   type FilterExplanation,
   type FilterExpr,
-  type FilterHeader,
   type TimestampFormat,
   type RecordPolicy,
   type TextMatch,
@@ -20,11 +19,12 @@ import {
   type Truth,
   type Verdict,
   consumerFilterDigest,
+  faultReasonIsForeign,
   globTokens,
   type GlobToken,
   parseCanonicalJson,
-  timestampFromInteger,
-  timestampFromText,
+  timestampFormatMicrosFromInteger,
+  timestampFormatMicrosFromText,
   validateConsumerFilter
 } from "./filter.js"
 import type { CmpOp } from "./query.js"
@@ -52,12 +52,6 @@ const KNOWN_CONTENT_TYPES: ReadonlySet<number> = new Set([
   8,
   ANY_CONTENT_TYPE
 ])
-const FOREIGN_REASONS: ReadonlySet<FaultReason> = new Set<FaultReason>([
-  "foreign_codec",
-  "missing_schema",
-  "schema_not_allowed",
-  "schema_mismatch"
-])
 
 /** Bounds on decoding one payload, checked before the payload is parsed. */
 export interface DecodeLimits {
@@ -73,8 +67,31 @@ export const DEFAULT_DECODE_LIMITS: DecodeLimits = {
 /** One record as the evaluator sees it. */
 export interface FilterRecord {
   readonly payload: Uint8Array
-  readonly headers: readonly FilterHeader[]
+  readonly headers: readonly HeaderRef[]
 }
+
+/** One user header of a record as the evaluator reads it. */
+export interface HeaderRef {
+  readonly key: string
+  readonly value: HeaderValueRef
+}
+
+/** A typed user header value. Mirrors `HeaderScalar`. */
+export type HeaderValueRef =
+  | { readonly kind: "bool"; readonly value: boolean }
+  | { readonly kind: "int"; readonly value: bigint }
+  | { readonly kind: "uint"; readonly value: bigint }
+  | { readonly kind: "float"; readonly value: number }
+  | { readonly kind: "string"; readonly value: string }
+  | { readonly kind: "raw"; readonly value: Uint8Array }
+
+/** What a caller decodes from a record's header block before evaluating. */
+export type HeaderNeed =
+  /** No header is read. */
+  | "none"
+  /** Only `agdx.ct`, to keep a record in another codec out of the decoder. */
+  | "content_type"
+  | "all"
 
 /**
  * A decoded payload value. Objects are maps, integers that fit i64 or u64 are
@@ -151,9 +168,13 @@ export class CompiledFilter {
     return this.root.readsHeaders || this.filter.schemaRefs.length > 0
   }
 
-  /** Whether a caller must pass the record headers: a payload filter reads agdx.ct first. */
-  get needsHeaders(): boolean {
-    return this.readsHeaders || this.root.readsPayload
+  /**
+   * Which headers a caller has to decode before evaluating. A payload filter
+   * without header predicates needs only `agdx.ct`.
+   */
+  get headerNeed(): HeaderNeed {
+    if (this.readsHeaders) return "all"
+    return this.root.readsPayload ? "content_type" : "none"
   }
 
   static compile(filter: ConsumerFilter, schemas: readonly SchemaDef[] = []): CompiledFilter {
@@ -184,19 +205,11 @@ export class CompiledFilter {
   }
 
   /** The verdict and, for a fault or a policy rejection, its reason, from one decode. */
-  outcomeOf(
+  evaluateWithFault(
     record: FilterRecord,
     limits: DecodeLimits = DEFAULT_DECODE_LIMITS
   ): { verdict: Verdict; fault?: FaultReason } {
     return this.outcome(this.context(record, limits))
-  }
-
-  /** The fault reason of a record `evaluate` judged a fault, `undefined` otherwise. */
-  faultReason(
-    record: FilterRecord,
-    limits: DecodeLimits = DEFAULT_DECODE_LIMITS
-  ): FaultReason | undefined {
-    return this.outcome(this.context(record, limits)).fault
   }
 
   /**
@@ -205,11 +218,16 @@ export class CompiledFilter {
    * payload the fault policy. A `reject` record policy maps to `drop`.
    */
   policyFor(reason: FaultReason): FaultPolicy {
-    let policy: RecordPolicy
-    if (FOREIGN_REASONS.has(reason)) policy = this.filter.foreignPolicy ?? "reject"
-    else if (reason === "type_mismatch") policy = this.filter.mismatchPolicy ?? "reject"
-    else return this.filter.faultPolicy
+    const policy = this.recordPolicy(reason)
+    if (policy === undefined) return this.filter.faultPolicy
     return policy === "pass" ? "pass" : "drop"
+  }
+
+  /** The record policy that covers `reason`, `undefined` for a decode fault. */
+  recordPolicy(reason: FaultReason): RecordPolicy | undefined {
+    if (faultReasonIsForeign(reason)) return this.filter.foreignPolicy ?? "reject"
+    if (reason === "type_mismatch") return this.filter.mismatchPolicy ?? "reject"
+    return undefined
   }
 
   /** Each node's truth, for sample tests. The verdict is the delivery verdict of `evaluate`. */
@@ -242,9 +260,7 @@ export class CompiledFilter {
       if (!(error instanceof PayloadFault)) throw error
       reason = error.reason
     }
-    const recordPolicy = FOREIGN_REASONS.has(reason) || reason === "type_mismatch"
-    if (recordPolicy && this.policyFor(reason) === "drop")
-      return { verdict: "rejected", fault: reason }
+    if (this.recordPolicy(reason) === "reject") return { verdict: "rejected", fault: reason }
     return { verdict: "fault", fault: reason }
   }
 }
@@ -535,9 +551,9 @@ function compileCoercedLiteral(coerce: Coerce, value: TypedValue): CoercedLitera
   if (coerce.kind === "timestamp") {
     const micros =
       value.kind === "string"
-        ? timestampFromText(coerce.format, value.value)
+        ? timestampFormatMicrosFromText(coerce.format, value.value)
         : value.kind === "int" || value.kind === "long"
-          ? timestampFromInteger(coerce.format, BigInt(value.value))
+          ? timestampFormatMicrosFromInteger(coerce.format, BigInt(value.value))
           : undefined
     comparable = micros === undefined ? undefined : { kind: "instant", micros }
   } else {
@@ -686,7 +702,7 @@ class Context {
   }
 }
 
-function headerScalar(header: FilterHeader): Scalar {
+function headerScalar(header: HeaderRef): Scalar {
   switch (header.value.kind) {
     case "bool":
       return { kind: "bool", value: header.value.value }
@@ -948,14 +964,14 @@ function coerceValue(coerce: Coerce, value: JsonValue): Comparable | undefined {
   let decimal: ExactDecimal | undefined
   if (typeof value === "string") decimal = ExactDecimal.parse(value)
   else if (typeof value === "bigint") decimal = ExactDecimal.fromInteger(value)
-  else if (typeof value === "number") decimal = ExactDecimal.fromDouble(value)
+  else if (typeof value === "number") decimal = ExactDecimal.fromF64(value)
   return decimal === undefined ? undefined : { kind: "decimal", decimal }
 }
 
 function timestampOfValue(format: TimestampFormat, value: JsonValue): bigint | undefined {
-  if (typeof value === "string") return timestampFromText(format, value)
+  if (typeof value === "string") return timestampFormatMicrosFromText(format, value)
   if (format === "rfc3339") return undefined
-  return typeof value === "bigint" ? timestampFromInteger(format, value) : undefined
+  return typeof value === "bigint" ? timestampFormatMicrosFromInteger(format, value) : undefined
 }
 
 function scalarOf(value: JsonValue): Scalar {

@@ -4,15 +4,17 @@ use crate::kv::{
     AGDX_KV_DELETE_MANY_CODE, AGDX_KV_EXISTS_CODE, AGDX_KV_EXPIRE_CODE, AGDX_KV_GET_CODE,
     AGDX_KV_LEASE_RENEW_CODE, AGDX_KV_MOVE_CODE, AGDX_KV_NAMESPACES_CODE, AGDX_KV_PATCH_CODE,
     AGDX_KV_RELEASE_CODE, AGDX_KV_SCAN_CODE, AGDX_KV_SET_CODE, CasExpect, DEFAULT_SCAN_LIMIT,
-    KV_LEASE_OP_VERSION, KV_OP_VERSION, KvCas, KvCasFenced, KvCopy, KvDelete, KvDeleteMany,
-    KvEntry, KvError, KvExists, KvExpire, KvGet, KvLease, KvLeaseRenew, KvMetadata,
-    KvNamespaceInfo, KvNamespaces, KvOutcome, KvPage, KvPatch, KvRelease, KvReply, KvScan, KvSet,
-    MAX_KEY_BYTES, MAX_VALUE_BYTES,
+    KV_LEASE_OP_VERSION, KV_OP_VERSION, KvCasFenced, KvEntry, KvError, KvGet, KvLease,
+    KvLeaseRenew, KvMetadata, KvNamespaceInfo, KvPage, KvRelease, MAX_KEY_BYTES, MAX_VALUE_BYTES,
 };
 use crate::laser::Laser;
 use crate::stream::{Codec, Decoder};
 use crate::types::ConversationId;
 use laser_wire::framing::encode_named;
+use laser_wire::kv::{
+    KvCas, KvCopy, KvDelete, KvDeleteMany, KvExists, KvExpire, KvNamespaces, KvOutcome, KvPatch,
+    KvReply, KvScan, KvSet,
+};
 use laser_wire::mutation::MutationPosition;
 use laser_wire::validate::Validate;
 use serde::Serialize;
@@ -301,8 +303,19 @@ impl Kv {
         key: impl AsRef<[u8]>,
         ttl: Option<Duration>,
     ) -> Result<u64, LaserError> {
-        let key = validated_key(key.as_ref())?;
         let expires_at_micros = ttl.map(|ttl| now_micros().saturating_add(duration_micros(ttl)));
+        self.expire_at(key, expires_at_micros).await
+    }
+
+    /// Set the entry's absolute expiry (epoch microseconds) in place without
+    /// rewriting its value. `None` clears the expiry. Returns the entry's
+    /// (unchanged) version.
+    pub async fn expire_at(
+        &self,
+        key: impl AsRef<[u8]>,
+        expires_at_micros: Option<u64>,
+    ) -> Result<u64, LaserError> {
+        let key = validated_key(key.as_ref())?;
         let request = KvExpire {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
@@ -1210,6 +1223,19 @@ mod tests {
         ));
         assert!(matches!(
             kv.release("key", "holder", 0).await,
+            Err(LaserError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_key_when_expiring_at_then_should_reject_before_transport() {
+        let kv = fenced_laser().kv("state");
+        assert!(matches!(
+            kv.expire_at("", Some(1)).await,
+            Err(LaserError::Invalid(_))
+        ));
+        assert!(matches!(
+            kv.expire_at("", None).await,
             Err(LaserError::Invalid(_))
         ));
     }

@@ -1,4 +1,5 @@
 use crate::agent::Laser;
+use crate::bridge_hops::{enter_bridge, hops_metadata};
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
@@ -8,23 +9,20 @@ use axum::Router;
 use axum::extract::State;
 #[cfg(feature = "mcp-http")]
 use axum::routing::post;
-use laser_wire::agent::{self as agdx, AgentEnvelope, AgentId, CorrelationId};
+use laser_wire::agent::{
+    self as agdx, AgentEnvelope, AgentId, CorrelationId, METADATA_BRIDGE_HOPS,
+};
 use laser_wire::content::ContentType;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "mcp-http")]
 use serde_json::to_value;
 use serde_json::{Value as JsonValue, json};
-#[cfg(feature = "mcp-http")]
 use std::str::FromStr;
 #[cfg(feature = "mcp-http")]
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "mcp-http")]
 use strum::{Display, EnumString};
 
-#[cfg(feature = "mcp-http")]
 const JSONRPC_VERSION: &str = "2.0";
-#[cfg(feature = "mcp-http")]
 const APP_ERROR_CODE: i32 = -32000;
 // Echoed when the client sends no protocolVersion (an MCP server otherwise
 // echoes the client's requested version on initialize).
@@ -32,7 +30,6 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MCP JSON-RPC methods the bridge serves.
-#[cfg(feature = "mcp-http")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
 pub enum McpMethod {
     #[strum(serialize = "initialize")]
@@ -172,6 +169,9 @@ pub struct McpBridge {
     resources: Vec<ResourceEntry>,
     prompts: Vec<PromptEntry>,
     timeout: Duration,
+    // The `bridge_hops` path stamped on every tool call, ending in this
+    // bridge's own id.
+    hops: Vec<String>,
 }
 
 // A resource plus the text `resources/read` returns for it.
@@ -199,6 +199,7 @@ impl McpBridge {
         reply_topic: AgentTopic<'static>,
         server_name: impl Into<String>,
     ) -> Self {
+        let hops = vec![source.as_str().to_owned()];
         Self {
             laser,
             source,
@@ -209,7 +210,18 @@ impl McpBridge {
             resources: Vec::new(),
             prompts: Vec::new(),
             timeout: DEFAULT_CALL_TIMEOUT,
+            hops,
         }
+    }
+
+    /// Continue the loop-guard path of a call that already crossed other
+    /// bridges: `previous` is its `bridge_hops`, and this bridge's id is
+    /// appended to it. Every tool call the bridge publishes carries the path.
+    /// Refuses a path that already holds this bridge, the loop the guard
+    /// exists to stop.
+    pub fn with_bridge_hops(mut self, previous: &[String]) -> Result<Self, LaserError> {
+        self.hops = enter_bridge(self.source.as_str(), previous)?;
+        Ok(self)
     }
 
     /// Advertise a resource (served from `text` on `resources/read`).
@@ -389,6 +401,7 @@ impl McpBridge {
             )
             .command(correlation, params_json)
             .with_tool(name.to_owned())
+            .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(&self.hops))
             .content_type(ContentType::Json)
             .send()
             .await?;
@@ -397,6 +410,85 @@ impl McpBridge {
             .await_agdx_reply(&mut reader, correlation, self.timeout)
             .await?;
         Ok(tool_result_from_envelope(&envelope))
+    }
+
+    pub async fn handle_rpc(&self, request: JsonValue) -> McpRpcResponse {
+        let id = request.get("id").cloned().unwrap_or(JsonValue::Null);
+        match self.dispatch_rpc(&request).await {
+            Ok(result) => McpRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => {
+                tracing::warn!(error = %error, "MCP request failed");
+                McpRpcResponse {
+                    jsonrpc: JSONRPC_VERSION,
+                    id,
+                    result: None,
+                    error: Some(McpRpcError {
+                        code: APP_ERROR_CODE,
+                        message: crate::error::public_error_message(&error).to_owned(),
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn dispatch_rpc(&self, request: &JsonValue) -> Result<JsonValue, LaserError> {
+        // Serde also reads a struct from an array, so the object check comes first.
+        if !request.is_object() {
+            return Err(LaserError::HandlerConfig(
+                "MCP JSON-RPC request must be an object".to_owned(),
+            ));
+        }
+        let McpRpcRequest { method, params, .. } = McpRpcRequest::deserialize(request)
+            .map_err(|_| LaserError::HandlerConfig("MCP method must be a string".to_owned()))?;
+        let value = if params.is_null() {
+            JsonValue::Object(Default::default())
+        } else {
+            params
+        };
+        let params = value
+            .as_object()
+            .ok_or_else(|| LaserError::HandlerConfig("MCP params must be an object".to_owned()))?;
+        let required = |key| {
+            params
+                .get(key)
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| LaserError::HandlerConfig(format!("MCP {key} must be a string")))
+        };
+        match McpMethod::from_str(&method) {
+            Ok(McpMethod::Initialize) => {
+                let version = params
+                    .get("protocolVersion")
+                    .map(|value| {
+                        value.as_str().ok_or_else(|| {
+                            LaserError::HandlerConfig(
+                                "MCP protocolVersion must be a string".to_owned(),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                Ok(self.initialize(version))
+            }
+            Ok(McpMethod::ToolsList) => Ok(self.list_tools()),
+            Ok(McpMethod::ResourcesList) => Ok(self.list_resources()),
+            Ok(McpMethod::ResourcesRead) => self.read_resource(required("uri")?),
+            Ok(McpMethod::PromptsList) => Ok(self.list_prompts()),
+            Ok(McpMethod::PromptsGet) => self.get_prompt(required("name")?),
+            Ok(McpMethod::ToolsCall) => {
+                let name = required("name")?;
+                let body = serde_json::to_vec(&value)
+                    .map_err(|error| LaserError::Codec(error.to_string()))?;
+                let result = self.call_tool(name, body).await?;
+                to_value(result).map_err(|error| LaserError::Codec(error.to_string()))
+            }
+            Err(_) => Err(LaserError::HandlerConfig(format!(
+                "unknown MCP method `{method}`"
+            ))),
+        }
     }
 
     /// An axum router exposing the MCP JSON-RPC endpoint at `/`. Requires the
@@ -410,6 +502,7 @@ impl McpBridge {
 /// A JSON-RPC request envelope.
 #[derive(Debug, Deserialize)]
 pub struct McpRpcRequest {
+    #[serde(default)]
     pub id: JsonValue,
     pub method: String,
     #[serde(default)]
@@ -437,82 +530,9 @@ pub struct McpRpcError {
 #[cfg(feature = "mcp-http")]
 async fn handle_mcp(
     State(bridge): State<Arc<McpBridge>>,
-    axum::Json(request): axum::Json<McpRpcRequest>,
+    axum::Json(request): axum::Json<JsonValue>,
 ) -> axum::Json<McpRpcResponse> {
-    let outcome = match McpMethod::from_str(&request.method) {
-        Ok(McpMethod::Initialize) => Ok(bridge.initialize(
-            request
-                .params
-                .get("protocolVersion")
-                .and_then(JsonValue::as_str),
-        )),
-        Ok(McpMethod::ToolsList) => Ok(bridge.list_tools()),
-        Ok(McpMethod::ResourcesList) => Ok(bridge.list_resources()),
-        Ok(McpMethod::ResourcesRead) => {
-            let uri = request
-                .params
-                .get("uri")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default();
-            bridge.read_resource(uri)
-        }
-        Ok(McpMethod::PromptsList) => Ok(bridge.list_prompts()),
-        Ok(McpMethod::PromptsGet) => {
-            let name = request
-                .params
-                .get("name")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default();
-            bridge.get_prompt(name)
-        }
-        Ok(McpMethod::ToolsCall) => {
-            let name = request
-                .params
-                .get("name")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            // The whole params object tunnels byte-identical in the AGDX body.
-            match serde_json::to_vec(&request.params) {
-                Ok(params_json) => match bridge.call_tool(&name, params_json).await {
-                    Ok(result) => {
-                        to_value(result).map_err(|error| LaserError::Codec(error.to_string()))
-                    }
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(LaserError::Codec(format!(
-                    "tools/call params are not serializable: {error}"
-                ))),
-            }
-        }
-        Err(_) => Err(LaserError::HandlerConfig(format!(
-            "unknown MCP method `{}`",
-            request.method
-        ))),
-    };
-    let response = match outcome {
-        Ok(result) => McpRpcResponse {
-            jsonrpc: JSONRPC_VERSION,
-            id: request.id,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => {
-            // The detail stays local: `Display` names streams, topics, and
-            // transport state that an unauthenticated caller must not see.
-            tracing::warn!(error = %error, method = %request.method, "MCP request failed");
-            McpRpcResponse {
-                jsonrpc: JSONRPC_VERSION,
-                id: request.id,
-                result: None,
-                error: Some(McpRpcError {
-                    code: APP_ERROR_CODE,
-                    message: crate::error::public_error_message(&error).to_owned(),
-                }),
-            }
-        }
-    };
-    axum::Json(response)
+    axum::Json(bridge.handle_rpc(request).await)
 }
 
 #[cfg(test)]
@@ -548,6 +568,78 @@ mod tests {
             McpMethod::PromptsGet
         );
         assert!("completion/complete".parse::<McpMethod>().is_err());
+    }
+
+    fn bridge() -> McpBridge {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        McpBridge::new(
+            laser,
+            "mcp-edge".parse().expect("valid agent id"),
+            AgentTopic::Commands,
+            AgentTopic::Responses,
+            "tools",
+        )
+    }
+
+    #[tokio::test]
+    async fn given_rpc_catalog_requests_when_dispatched_then_should_work_without_http() {
+        let bridge = bridge();
+        let response = bridge
+            .handle_rpc(json!({"id": "init", "method": "initialize"}))
+            .await;
+        assert_eq!(response.id, "init");
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result.expect("initialize succeeds")["protocolVersion"],
+            DEFAULT_PROTOCOL_VERSION
+        );
+        let response = bridge
+            .handle_rpc(json!({"method": "tools/list", "params": null}))
+            .await;
+        assert_eq!(response.id, JsonValue::Null);
+        assert_eq!(response.result, Some(json!({"tools": []})));
+    }
+
+    #[tokio::test]
+    async fn given_malformed_rpc_requests_when_dispatched_then_should_echo_ids_and_return_public_errors()
+     {
+        for request in [
+            json!(null),
+            json!([]),
+            json!([7, "tools/list", null]),
+            json!({"id": 7}),
+            json!({"id": 7, "method": "unknown"}),
+            json!({"id": 7, "method": "initialize", "params": {"protocolVersion": null}}),
+            json!({"id": 7, "method": "tools/list", "params": []}),
+            json!({"id": 7, "method": "resources/read"}),
+            json!({"id": 7, "method": "prompts/get", "params": {"name": 12}}),
+            json!({"id": 7, "method": "tools/call", "params": {"name": false}}),
+        ] {
+            let expected = request.get("id").cloned().unwrap_or(JsonValue::Null);
+            let response = bridge().handle_rpc(request).await;
+            assert_eq!(response.id, expected);
+            assert!(response.result.is_none());
+            let error = response.error.expect("malformed request returns an error");
+            assert_eq!(error.code, -32000);
+            assert_eq!(error.message, "invalid request");
+        }
+    }
+
+    #[test]
+    fn given_a_new_bridge_when_built_then_should_stamp_its_own_id_as_the_hop_path() {
+        assert_eq!(bridge().hops, ["mcp-edge"]);
+    }
+
+    #[test]
+    fn given_an_upstream_hop_path_when_continued_then_should_append_this_bridge() {
+        let bridge = bridge()
+            .with_bridge_hops(&["a2a-edge".to_owned()])
+            .expect("no loop");
+        assert_eq!(bridge.hops, ["a2a-edge", "mcp-edge"]);
+        assert!(matches!(
+            bridge.with_bridge_hops(&["mcp-edge".to_owned()]),
+            Err(LaserError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -4,12 +4,16 @@ import { test } from "node:test"
 import {
   ActionDecision,
   ActionKind,
+  AgentTopic,
   ConversationId,
+  decodePolicyEvidence,
   GovernorMode,
   Laser,
   MemoryBackend,
+  POLICY_DECISION_OPERATION,
   PolicyBlockedError,
-  type ActionGovernor
+  type ActionGovernor,
+  type PolicyEvidence
 } from "../../src/index.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
@@ -32,14 +36,11 @@ void test("given_a_blocking_governor_when_vector_memory_writes_then_should_recor
     const conversation = ConversationId.new()
     const memory = laser.memoryWith("governed-vector", MemoryBackend.Vector)
     await assert.rejects(
-      memory
-        .remember(new TextEncoder().encode("must not persist"))
-        .conversation(conversation)
-        .send(),
+      memory.remember(new TextEncoder().encode("must not persist")).scope(conversation).send(),
       PolicyBlockedError
     )
-    assert.deepEqual(await memory.recall().conversation(conversation).fetch(), [])
-    const evidence = await laser.policyEvidence(conversation)
+    assert.deepEqual(await memory.recall(conversation).fetch(), [])
+    const evidence = await auditEvidence(laser, conversation)
     assert.equal(evidence.length, 1)
     const decision = evidence[0]
     assert.ok(decision !== undefined)
@@ -49,3 +50,17 @@ void test("given_a_blocking_governor_when_vector_memory_writes_then_should_recor
     await connected.close()
   }
 })
+
+async function auditEvidence(
+  laser: Laser,
+  conversation: ConversationId
+): Promise<readonly PolicyEvidence[]> {
+  const messages = await laser
+    .context(conversation)
+    .fetch([AgentTopic.Audit], Number.MAX_SAFE_INTEGER)
+  return messages.flatMap((message) =>
+    message.envelope?.operation === POLICY_DECISION_OPERATION
+      ? [decodePolicyEvidence(message.envelope.body)]
+      : []
+  )
+}

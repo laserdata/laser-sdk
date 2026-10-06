@@ -1,17 +1,16 @@
-import type { Capabilities } from "../client/capabilities.js"
+import { type Capabilities, requireCapability } from "../client/capabilities.js"
 import {
-  AmbiguousMutationError,
   InvalidError,
   KvExecutionError,
   ProtocolError,
-  TransportError,
   UnsupportedError
 } from "../client/errors.js"
-import { executeManaged, type ManagedTransport } from "../client/managed.js"
+import { decodeManagedReply, executeManaged, type ManagedTransport } from "../client/managed.js"
 import { executeBatch } from "./batch.js"
+import { LeaseCoordinator } from "./coordination.js"
 import { saturatingAdd } from "../runtime/clock.js"
 import type { Codec } from "../stream/codecs.js"
-import { jsonCodec, messagePackCodec } from "../stream/codecs.js"
+import { Json, Msgpack } from "../stream/codecs.js"
 import type { BatchItem } from "../wire/batch.js"
 import {
   KvCasCommand,
@@ -22,7 +21,6 @@ import {
   KvExistsCommand,
   KvExpireCommand,
   KvGetCommand,
-  KvLeaseCommand,
   KvLeaseRenewCommand,
   KvMoveCommand,
   KvNamespacesCommand,
@@ -42,7 +40,12 @@ import {
   type KvReply,
   validateNamespace
 } from "../wire/kv.js"
-import { DEFAULT_SCAN_LIMIT, MAX_KEY_BYTES, MAX_VALUE_BYTES } from "../wire/limits.js"
+import {
+  DEFAULT_SCAN_LIMIT,
+  MAX_KEY_BYTES,
+  MAX_SCAN_LIMIT,
+  MAX_VALUE_BYTES
+} from "../wire/limits.js"
 import type { MutationPosition } from "../wire/mutation.js"
 
 /** A granted revocable lease: the fencing token, the TTL the store granted,
@@ -54,10 +57,12 @@ export interface Lease {
   readonly position: MutationPosition
 }
 
-export type KvBackend = ManagedTransport
+// A store built without the client's coordinator has no connection to acquire
+// a lease on, as for an injected client.
+const NO_LEASE_COORDINATOR = new LeaseCoordinator()
 
 async function executeKv<Request>(
-  backend: KvBackend,
+  backend: ManagedTransport,
   capabilities: Capabilities,
   namespace: string | undefined,
   command: ManagedCommand<Request, KvReply>,
@@ -68,23 +73,11 @@ async function executeKv<Request>(
   const reply = await executeManaged(backend, capabilities, command, request, options)
   if (reply.kind === "ok") return reply.outcome
   if (reply.kind === "err") {
-    if (reply.error.kind === "unsupported") throw new UnsupportedError(reply.error.message)
     throw new KvExecutionError(`kv command failed: ${reply.error.kind}`, reply.error)
   }
   throw new ProtocolError(`kv: unrecognized reply variant \`${reply.tag}\``, {
     commandCode: command.code
   })
-}
-
-const MAX_TIMER_MILLIS = 2_147_483_647n
-
-async function waitForLeaseExpiry(leaseTtlMicros: bigint): Promise<void> {
-  let millis = (leaseTtlMicros + 999n) / 1_000n
-  while (millis > 0n) {
-    const chunk = millis > MAX_TIMER_MILLIS ? MAX_TIMER_MILLIS : millis
-    await new Promise((resolve) => setTimeout(resolve, Number(chunk)))
-    millis -= chunk
-  }
 }
 
 function unexpected(op: string, outcome: KvOutcome): ProtocolError {
@@ -110,7 +103,7 @@ function validatedValue(value: Uint8Array): void {
 }
 
 async function fetchNamespaces(
-  backend: KvBackend,
+  backend: ManagedTransport,
   capabilities: Capabilities
 ): Promise<readonly KvNamespaceInfo[]> {
   const outcome = await executeKv(backend, capabilities, undefined, KvNamespacesCommand, undefined)
@@ -120,14 +113,26 @@ async function fetchNamespaces(
 
 /** A namespace-scoped managed key-value view. */
 export class Kv {
-  constructor(
-    private readonly backend: KvBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
-    readonly namespace: string
+    readonly namespace: string,
+    private readonly leases?: LeaseCoordinator
   ) {}
 
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    namespace: string,
+    leases?: LeaseCoordinator
+  ): Kv {
+    return new Kv(backend, getCapabilities, namespace, leases)
+  }
+
+  /** @internal */
   static async namespaces(
-    backend: KvBackend,
+    backend: ManagedTransport,
     getCapabilities: () => Promise<Capabilities>
   ): Promise<readonly KvNamespaceInfo[]> {
     const capabilities = await getCapabilities()
@@ -178,12 +183,17 @@ export class Kv {
   }
 
   async getTyped<T>(key: Uint8Array, decodeValue: (value: unknown) => T): Promise<T | undefined> {
-    return this.getAs(key, jsonCodec(decodeValue))
+    return this.getAs(key, new Json(decodeValue))
   }
 
   /** Starts a value write or compare-and-swap request. */
   set(key: Uint8Array): KvSetRequest {
-    return new KvSetRequest(this.backend, this.getCapabilities, this.namespace, validatedKey(key))
+    return KvSetRequest.create(
+      this.backend,
+      this.getCapabilities,
+      this.namespace,
+      validatedKey(key)
+    )
   }
 
   /** Starts a compare-and-swap that requires a live lease at
@@ -196,7 +206,7 @@ export class Kv {
     fenceToken: bigint
   ): KvCasFencedRequest {
     validateNamespace(fenceNamespace)
-    return new KvCasFencedRequest(
+    return KvCasFencedRequest.create(
       this.backend,
       this.getCapabilities,
       this.namespace,
@@ -276,45 +286,14 @@ export class Kv {
    * `MIN_LEASE_TTL_MICROS`..=`MAX_LEASE_TTL_MICROS`. The store may grant less and
    * never more, so anything outside that range throws `InvalidError` before the
    * round trip, and a holder needing longer renews. Needs the `kvFencedLeases`
-   * capability. */
+   * capability. Acquisitions are serialized per client over a dedicated
+   * connection, each attempt bounded by `DEFAULT_ATTEMPT_TIMEOUT_MS`. An
+   * ambiguous outcome waits through the requested TTL, then throws
+   * `AmbiguousMutationError`. */
   async lease(key: Uint8Array, holderId: string, leaseTtlMicros: bigint): Promise<Lease> {
-    const capabilities = await this.getCapabilities()
-    let outcome: KvOutcome
-    try {
-      outcome = await executeKv(
-        this.backend,
-        capabilities,
-        this.namespace,
-        KvLeaseCommand,
-        {
-          namespace: this.namespace,
-          key: validatedKey(key),
-          leaseTtlMicros,
-          holderId
-        },
-        { retryAfterReconnect: false }
-      )
-    } catch (error) {
-      if (
-        !(error instanceof AmbiguousMutationError) &&
-        !(error instanceof TransportError && error.retryable)
-      ) {
-        throw error
-      }
-      await waitForLeaseExpiry(leaseTtlMicros)
-      throw new AmbiguousMutationError(
-        "lease acquisition outcome is unknown; its requested TTL elapsed before retry was allowed",
-        { cause: error }
-      )
-    }
-    if (outcome.kind === "leased") {
-      return {
-        token: outcome.leaseToken,
-        grantedTtlMicros: outcome.grantedTtlMicros,
-        position: outcome.position
-      }
-    }
-    throw unexpected("lease", outcome)
+    const request = { namespace: this.namespace, key: validatedKey(key), leaseTtlMicros, holderId }
+    requireCapability(await this.getCapabilities(), "kvFencedLeases")
+    return (this.leases ?? NO_LEASE_COORDINATOR).acquire(request)
   }
 
   /** Extends a held lease without changing its token. `leaseTtlMicros` obeys the
@@ -367,7 +346,7 @@ export class Kv {
 
   /** Starts an atomic value copy that preserves remaining expiry. */
   copyTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest {
-    return new KvCopyRequest(
+    return KvCopyRequest.create(
       this.backend,
       this.getCapabilities,
       this.namespace,
@@ -378,7 +357,7 @@ export class Kv {
   }
 
   moveTo(key: Uint8Array, toKey: Uint8Array): KvCopyRequest {
-    return new KvCopyRequest(
+    return KvCopyRequest.create(
       this.backend,
       this.getCapabilities,
       this.namespace,
@@ -397,11 +376,10 @@ export class Kv {
     }))
     const results = await executeBatch(this.backend, capabilities, ops)
     return results.map((slot) => {
-      const reply = KvGetCommand.decode(slot)
+      const reply = decodeManagedReply((bytes) => KvGetCommand.decode(bytes), slot)
       if (reply.kind === "ok" && reply.outcome.kind === "value") return reply.outcome.entry?.value
       if (reply.kind === "ok") throw unexpected("get", reply.outcome)
       if (reply.kind === "err") {
-        if (reply.error.kind === "unsupported") throw new UnsupportedError(reply.error.message)
         throw new KvExecutionError(`kv command failed: ${reply.error.kind}`, reply.error)
       }
       throw new ProtocolError(`kv: unrecognized reply variant in a batch slot \`${reply.tag}\``)
@@ -410,11 +388,11 @@ export class Kv {
 
   /** Starts a filtered bulk delete. */
   deleteMany(): KvDeleteManyRequest {
-    return new KvDeleteManyRequest(this.backend, this.getCapabilities, this.namespace)
+    return KvDeleteManyRequest.create(this.backend, this.getCapabilities, this.namespace)
   }
 
   scan(): KvScanRequest {
-    return new KvScanRequest(this.backend, this.getCapabilities, this.namespace)
+    return KvScanRequest.create(this.backend, this.getCapabilities, this.namespace)
   }
 }
 
@@ -424,12 +402,22 @@ export class KvSetRequest {
   private expiresAtMicros: bigint | undefined
   private expect: CasExpect | undefined
 
-  constructor(
-    private readonly backend: KvBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly namespace: string,
     private readonly key: Uint8Array
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    namespace: string,
+    key: Uint8Array
+  ): KvSetRequest {
+    return new KvSetRequest(backend, getCapabilities, namespace, key)
+  }
 
   bytes(payload: Uint8Array): this {
     this.value = payload
@@ -442,17 +430,11 @@ export class KvSetRequest {
   }
 
   json(value: unknown): this {
-    return this.encodeWith(
-      jsonCodec((decoded) => decoded),
-      value
-    )
+    return this.encodeWith(new Json(), value)
   }
 
   msgpack(value: unknown): this {
-    return this.encodeWith(
-      messagePackCodec((decoded) => decoded),
-      value
-    )
+    return this.encodeWith(new Msgpack(), value)
   }
 
   expiresAt(epochMicros: bigint): this {
@@ -524,8 +506,8 @@ export class KvCasFencedRequest {
   private expiresAtMicros: bigint | undefined
   private expect: CasExpect | undefined
 
-  constructor(
-    private readonly backend: KvBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly namespace: string,
     private readonly key: Uint8Array,
@@ -533,6 +515,27 @@ export class KvCasFencedRequest {
     private readonly fenceKey: Uint8Array,
     private readonly fenceToken: bigint
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    namespace: string,
+    key: Uint8Array,
+    fenceNamespace: string,
+    fenceKey: Uint8Array,
+    fenceToken: bigint
+  ): KvCasFencedRequest {
+    return new KvCasFencedRequest(
+      backend,
+      getCapabilities,
+      namespace,
+      key,
+      fenceNamespace,
+      fenceKey,
+      fenceToken
+    )
+  }
 
   bytes(payload: Uint8Array): this {
     this.value = payload
@@ -545,17 +548,11 @@ export class KvCasFencedRequest {
   }
 
   json(value: unknown): this {
-    return this.encodeWith(
-      jsonCodec((decoded) => decoded),
-      value
-    )
+    return this.encodeWith(new Json(), value)
   }
 
   msgpack(value: unknown): this {
-    return this.encodeWith(
-      messagePackCodec((decoded) => decoded),
-      value
-    )
+    return this.encodeWith(new Msgpack(), value)
   }
 
   expiresAt(epochMicros: bigint): this {
@@ -621,11 +618,20 @@ export class KvScanRequest {
   private pageLimit = DEFAULT_SCAN_LIMIT
   private pageCursor: Uint8Array | undefined
 
-  constructor(
-    private readonly backend: KvBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly namespace: string
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    namespace: string
+  ): KvScanRequest {
+    return new KvScanRequest(backend, getCapabilities, namespace)
+  }
 
   /** Restricts a memory namespace scan to one conversation. */
   conversation(conversationId: string): this {
@@ -649,8 +655,12 @@ export class KvScanRequest {
     return this
   }
 
+  /** Caps the page at `n` entries, clamped to `MAX_SCAN_LIMIT`. */
   limit(n: number): this {
-    this.pageLimit = n
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new InvalidError("scan limit must be a non-negative integer")
+    }
+    this.pageLimit = Math.min(n, MAX_SCAN_LIMIT)
     return this
   }
 
@@ -723,11 +733,20 @@ export class KvDeleteManyRequest {
   private boundKeyContains: string | undefined
   private boundConversation: string | undefined
 
-  constructor(
-    private readonly backend: KvBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly namespace: string
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    namespace: string
+  ): KvDeleteManyRequest {
+    return new KvDeleteManyRequest(backend, getCapabilities, namespace)
+  }
 
   conversation(conversationId: string): this {
     this.boundConversation = conversationId
@@ -775,14 +794,26 @@ export class KvDeleteManyRequest {
 export class KvCopyRequest {
   private toNamespaceOverride: string | undefined
 
-  constructor(
-    private readonly backend: KvBackend,
+  private constructor(
+    private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
     private readonly namespace: string,
     private readonly key: Uint8Array,
     private readonly toKey: Uint8Array,
     private readonly deleteSource: boolean
   ) {}
+
+  /** @internal */
+  static create(
+    backend: ManagedTransport,
+    getCapabilities: () => Promise<Capabilities>,
+    namespace: string,
+    key: Uint8Array,
+    toKey: Uint8Array,
+    deleteSource: boolean
+  ): KvCopyRequest {
+    return new KvCopyRequest(backend, getCapabilities, namespace, key, toKey, deleteSource)
+  }
 
   intoNamespace(namespace: string): this {
     this.toNamespaceOverride = namespace

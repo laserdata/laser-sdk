@@ -12,6 +12,7 @@ import type { Provenance } from "../provenance/provenance.js"
 import type { AgentId } from "../types/ids.js"
 import type { SigningKey } from "../signing.js"
 import type { AgentMessage } from "./reliable-consumer.js"
+import { longTimeout } from "./timer.js"
 import {
   ADVERTISED_INBOX_ROUTE,
   resolveInboxRoute,
@@ -61,7 +62,7 @@ export function quorumSatisfied(policy: GatherPolicy, successes: number): boolea
   return policy.kind === "quorum" && successes >= policy.needed
 }
 
-export interface AgentContextOptions {
+export interface AgentCtxOptions {
   readonly agent?: AgentId
   readonly respondOn?: string
   readonly inboxRoute?: InboxRoute
@@ -85,16 +86,16 @@ function asLaserError(error: unknown): LaserError {
 }
 
 function deadlineTimer(ms: number): { readonly promise: Promise<"deadline">; cancel(): void } {
-  let timer: ReturnType<typeof setTimeout>
+  let timer: { cancel(): void } | undefined
   const promise = new Promise<"deadline">((resolve) => {
-    timer = setTimeout(() => {
+    timer = longTimeout(() => {
       resolve("deadline")
     }, ms)
   })
   return {
     promise,
     cancel: () => {
-      clearTimeout(timer)
+      timer?.cancel()
     }
   }
 }
@@ -140,23 +141,31 @@ async function gatherBranches(
   return { ok, failures }
 }
 
-export class AgentContext {
+export class AgentCtx {
+  /** @internal */
   readonly agent: AgentId | undefined
+  /** @internal */
   readonly respondOn: string | undefined
+  /** @internal */
   readonly inboxRoute: InboxRoute
   private readonly signingKey: SigningKey | undefined
   private readonly nowMicros: () => bigint
 
-  constructor(
+  private constructor(
     readonly laser: Laser,
     readonly message: AgentMessage,
-    options: AgentContextOptions = {}
+    options: AgentCtxOptions = {}
   ) {
     this.agent = options.agent
     this.respondOn = options.respondOn
     this.inboxRoute = options.inboxRoute ?? ADVERTISED_INBOX_ROUTE
     this.signingKey = options.signingKey
     this.nowMicros = options.nowMicros ?? (() => BigInt(Date.now()) * 1000n)
+  }
+
+  /** @internal */
+  static create(laser: Laser, message: AgentMessage, options: AgentCtxOptions = {}): AgentCtx {
+    return new AgentCtx(laser, message, options)
   }
 
   async respond(payload: BytesLike): Promise<void> {
@@ -166,11 +175,8 @@ export class AgentContext {
     }
     const sender = this.message.provenance.agent
     const envelope = this.message.envelope
-    if (
-      this.signingKey !== undefined &&
-      envelope?.correlation !== undefined &&
-      this.agent !== undefined
-    ) {
+    if (this.signingKey !== undefined && envelope?.correlation !== undefined) {
+      if (this.agent === undefined) throw new HandlerConfigError("a signing agent must have an id")
       let response = this.laser
         .agdx(topic, this.agent, this.message.provenance.conversationId)
         .respond(envelope.correlation, payload)

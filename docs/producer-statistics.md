@@ -11,7 +11,7 @@ Set the variables before creating producers.
 | Report interval | `LASER_PRODUCER_TELEMETRY_INTERVAL_MS` | `10000` | `0` disables, otherwise `1000` through `60000` |
 | Reported handles per connection | `LASER_PRODUCER_TELEMETRY_MAX_PRODUCERS` | `32` | `0` through `32` |
 
-Handles past the limit publish normally and are left out of the report. A report fits the 64 KiB metadata limit, expires after three intervals, and disappears when the observer disconnects. A producer id stays stable for the life of its handle, across reconnects. Injected clients that cannot open a second authenticated connection do not report.
+Values outside a range are clamped to it. Handles past the limit publish normally and are left out of the report. A report fits the 64 KiB metadata limit, expires after three intervals, and disappears when the observer disconnects. A producer id stays stable for the life of its handle, across reconnects. Injected clients that cannot open a second authenticated connection do not report.
 
 ## What is counted
 
@@ -23,7 +23,7 @@ Handles past the limit publish normally and are left out of the report. A report
 | Last success | The last successful application call. |
 | Retries | Unavailable when the native client does not expose its attempts. |
 
-A failed batch can have committed a prefix that the confirmed counters leave out. The counters are SDK reports, not durable delivery totals, exactly-once evidence, billing, or authorization input.
+A failed batch can have committed a prefix that the confirmed counters leave out. The counters are SDK reports. Do not use them as durable delivery totals, exactly-once evidence, usage accounting, or authorization input.
 
 ## Latency
 
