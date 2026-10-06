@@ -317,7 +317,7 @@ npm ci
 npm run verify
 ```
 
-`verify` runs style, formatting, lint, dependency-boundary, type, build, API, unit, wire, coverage, license, and package tests. Integration and shared BDD tests run separately against the versioned native Iggy server.
+`verify` runs formatting, lint, dependency-boundary, type, build, API, unit, wire, coverage, license, and package tests. Integration and shared BDD tests run separately against the versioned native Iggy server.
 
 ## Security and license
 

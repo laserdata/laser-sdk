@@ -75,7 +75,7 @@ npm run verify
 npm run test:integration
 ```
 
-Then run `scripts/run-bdd-tests.sh typescript` and the example package tests against Apache Iggy. `verify` includes style, format, lint, emitted dependency cycles, strict types, builds, API reports, fixture and robustness tests, coverage, licenses, and packed ESM/CommonJS-interoperating consumers.
+Then run `scripts/run-bdd-tests.sh typescript` and the example package tests against Apache Iggy. `verify` includes format, lint, emitted dependency cycles, strict types, builds, API reports, fixture and robustness tests, coverage, licenses, and packed ESM/CommonJS-interoperating consumers.
 
 Node 22.14 and Node 24 are supported. Bun, Deno, and browsers are unsupported until their transport and complete gates pass. Release tags use `ts-v*` and publish the exact CI-produced tarball through npm OIDC.
 

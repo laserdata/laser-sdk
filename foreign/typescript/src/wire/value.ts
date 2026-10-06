@@ -12,7 +12,7 @@ export type Value =
   | { readonly kind: "list"; readonly value: readonly Value[] }
 
 const INTEGER_INPUT = /^[+-]?\d+$/
-const DECIMAL_INPUT = /^[+-]?(?:\d+\.?\d*|\.\d+)$/
+const DECIMAL_INPUT = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/
 const I64_MIN = -(1n << 63n)
 const I64_MAX = (1n << 63n) - 1n
 const U64_MAX = (1n << 64n) - 1n

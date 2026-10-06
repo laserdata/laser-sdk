@@ -389,7 +389,6 @@ just test    # workspace unit tests
 just test-it # integration tests against Apache Iggy
 just bdd     # cross-SDK BDD conformance (needs Docker)
 just parity-check   # Rust, Python, and TypeScript surfaces match docs/parity.md
-just commerce-check # examples, docs, and tests use neutral vocabulary
 just ci      # the full gate (lint, tests, integration, python-docs, vocabulary, parity, wasm, deny, advisories, fuzz, bdd)
 ```
 

@@ -83,7 +83,7 @@ Consumer-group reads use `FilterRef::Group`. A bound group runs its saved revisi
 
 ## Changes in 0.6.0
 
-The 0.6.0 release regenerated the reference files with neutral payload vocabulary and left every operation version at 1. The encoding did not change. Client lifecycle and upgrade steps are in [client behavior](../docs/client-behavior.md).
+The 0.6.0 release regenerated the reference files and left every operation version at 1. The encoding did not change. Client lifecycle and upgrade steps are in [client behavior](../docs/client-behavior.md).
 
 ## License
 

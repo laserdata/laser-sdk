@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import { test } from "node:test"
 import { decodeValue, encodeValue, valueFromInput } from "../../src/wire/value.js"
 
@@ -18,11 +19,32 @@ void test("given_typed_input_when_inferred_then_should_pick_the_narrowest_scalar
   })
   assert.deepEqual(valueFromInput("1.5"), { kind: "float", value: 1.5 })
   assert.deepEqual(valueFromInput(".5"), { kind: "float", value: 0.5 })
+  assert.deepEqual(valueFromInput("1."), { kind: "float", value: 1 })
+  assert.deepEqual(valueFromInput("+.5"), { kind: "float", value: 0.5 })
+  assert.deepEqual(valueFromInput("-.5"), { kind: "float", value: -0.5 })
+  assert.deepEqual(valueFromInput("0001.50"), { kind: "float", value: 1.5 })
   assert.deepEqual(valueFromInput("1e9"), { kind: "str", value: "1e9" })
   assert.deepEqual(valueFromInput("inf"), { kind: "str", value: "inf" })
   assert.deepEqual(valueFromInput("1.2.3"), { kind: "str", value: "1.2.3" })
   assert.deepEqual(valueFromInput(""), { kind: "str", value: "" })
   assert.deepEqual(valueFromInput("+"), { kind: "str", value: "+" })
+})
+
+void test("given_long_malformed_numbers_when_inferred_then_should_finish_within_a_bound", () => {
+  const module = new URL("../../src/wire/value.js", import.meta.url).href
+  const code = `
+    import assert from "node:assert/strict"
+    import { valueFromInput } from ${JSON.stringify(module)}
+    const zeros = "0".repeat(100_000)
+    for (const input of [zeros + "x", zeros + ".0x", "+" + zeros + "x", "." + zeros + "x"]) {
+      assert.deepEqual(valueFromInput(input), { kind: "str", value: input })
+    }
+  `
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", code], {
+    encoding: "utf8",
+    timeout: 5_000
+  })
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr)
 })
 
 void test("given_integers_past_i64_when_decoded_then_should_read_as_uint_like_rust", () => {

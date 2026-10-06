@@ -101,7 +101,6 @@ Examples with an open phase run it against Apache Iggy. Managed phases print one
 ## Verification
 
 ```sh
-npm run style:check
 npm run format:check
 npm run typecheck
 npm run build

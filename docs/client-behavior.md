@@ -11,7 +11,7 @@ Each item is one breaking change. Names that only moved keep working under their
 ### All clients
 
 - `Capabilities` no longer has `sessions` or `durable_dedup` (TypeScript `durableDedup`). No server ever set them, so they were always false. Rust also drops `Capabilities::with_sessions` and `with_durable_dedup`, and Python drops the `sessions=` and `durable_dedup=` keywords of `with_capabilities`.
-- Two scenario examples were replaced: `incident-desk` and `fleet-tape` take their place in all three languages. Fixture payloads use neutral systems vocabulary. A project that embeds the fixture corpus must take the regenerated files.
+- Two scenario examples were replaced: `incident-desk` and `fleet-tape` take their place in all three languages. Fixture payloads were updated. A project that embeds the fixture corpus must take the regenerated files.
 - Periodic agent consolidation passes the agent's own scope, with the agent id set and every other field empty. It used to pass an empty scope and summarize the whole namespace. A consolidator with a summarizer now writes one durable `Summary` per conversation, scoped and attributed to that conversation, instead of one summary per pass. Pruning still covers the whole consolidation scope.
 - Deduplicated memory content ids now include the user and the application in the owner. An id minted by 0.5 `dedup` no longer matches, so re-remembering a 0.5 item with dedup stores a second item.
 - Folded memory recall skips 0.5 memory records, because they lack the `agdx.mem.ns` header. There is no fallback. Re-remember anything you still need from 0.5.

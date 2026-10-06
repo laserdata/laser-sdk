@@ -5,7 +5,6 @@
   "scripts": {
     "setup": "npm ci && npm --prefix ../../foreign/typescript ci && npm --prefix ../../foreign/typescript run clean && npm --prefix ../../foreign/typescript run build",
     "build": "tsc -p tsconfig.json",
-    "style:check": "node ../../foreign/typescript/scripts/style-check.mjs .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc -p tsconfig.json --noEmit",

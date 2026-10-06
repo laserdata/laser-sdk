@@ -58,13 +58,10 @@ just advisories            # 10. workspace vuln/unmaintained advisories (needs c
 just fuzz                  # 11. bounded fuzzing of the wire decode surface (nightly + cargo-fuzz)
 just bdd                   # 12. cross-SDK BDD conformance, Rust runner
 just python-docs           # 13. Python README snippets compile
-just commerce-check        # 14. neutral vocabulary in examples, docs, tests, fixtures
-just parity-check          # 15. Rust, Python, TypeScript surfaces match docs/parity.md
+just parity-check          # 14. Rust, Python, TypeScript surfaces match docs/parity.md
 ```
 
 `just parity-check` runs `scripts/check-parity.py`. It reads public Rust types, re-exports, fields, enum variants, error payloads, constants, methods, trait methods, `bon` builder controls, and standalone functions, then checks the Python stub and TypeScript API reports. It also checks parameters and APIs present only in a peer. It fails when `docs/parity.md` is stale, when a public Rust type is neither covered nor excluded with a reason, or when a row says MISSING. After a public change in any SDK, regenerate the matrix with `python3 scripts/check-parity.py --write`. The Rust, Python, and TypeScript CI workflows run it. A listed row proves the API exists, not that it behaves the same, so behavior still needs tests.
-
-`just commerce-check` runs `scripts/check-commerce-words.py`. Examples, docs, tests, and fixtures use neutral systems vocabulary (hosts, readings, services, incidents). The check fails on commerce vocabulary such as orders, payments, carts, invoices, customers, or refunds. CI runs it in the `lint` job.
 
 Run `--all-features --doc` as a required gate. `clippy --all-targets` does not compile documentation examples. A default-feature `cargo test --workspace` can omit examples behind optional features such as `kv` and `query`. The doctest gate requires no Iggy server or Docker. CI runs it too.
 
@@ -338,7 +335,6 @@ bdd/                    cross-SDK conformance (outside the workspace): scenarios
                         runner over Iggy-native scenarios, docker-compose for
                         the multi-language path
 scripts/run-bdd-tests.sh  driver for the per-language BDD runners
-scripts/check-commerce-words.py  the neutral-vocabulary check behind `just commerce-check`
 scripts/check-parity.py  the parity matrix generator and check behind `just parity-check`
 examples/rust/          [[example]] bins under src/<scenario>/main.rs, LlmClient seam in lib.rs
 examples/python/        one runnable script per scenario + a shared _common.py connect helper

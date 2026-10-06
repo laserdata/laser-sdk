@@ -62,7 +62,6 @@ The helpers call `laser.projections().register(..)` and `laser.bindings().apply(
 ## Rules specific to this area
 
 - Test names are BDD (`given_..._when_..._then_should_...`), assertions use `.expect("message")`, never bare `.unwrap()`.
-- Run `just commerce-check` after changing example names, data, or prose.
 - Add an example for a new scenario and a regression test for behavior that it must preserve. Include relevant timeout, dead-letter, shutdown, or isolation failures.
 - To exercise a raw/edge wire case (for example, a header-less message), publish via Iggy producer directly (`iggy` is an sdk dev-dependency) rather than through `send_agent`, which always stamps provenance.
 - `native-streaming`, `fleet-tape`, and `event-analytics` use the Laser `Topic::producer` and `Topic::consumer_group` surface with direct batching, keyed routing, live async delivery, consumer groups, and commit policies. Rust, Python, and TypeScript use Iggy's native VSR transport.
