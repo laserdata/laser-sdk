@@ -31,14 +31,14 @@ use tracing::info;
 
 // What the assistant knows, each line one remembered fact.
 const KNOWLEDGE: &[&str] = &[
-    "checkout latency spikes are usually database connection pool exhaustion",
-    "billing double-charges trace back to retries without an idempotency key",
+    "gateway latency spikes are usually database connection pool exhaustion",
+    "duplicate config pushes trace back to retries without an idempotency key",
     "search returning stale results means the nightly index rebuild failed",
-    "checkout pages recover fastest by failing over to the read replica",
+    "gateway pages recover fastest by failing over to the read replica",
     "auth token errors after a deploy come from the rotated signing key",
-    "cart abandonment climbs when the cache eviction rate is set too aggressive",
-    "inventory drift is the message queue dropping inventory-adjustment events",
-    "recommendation gaps appear when the search index lags behind the catalog",
+    "storage read misses climb when the cache eviction rate is set too aggressive",
+    "metrics gaps are the message queue dropping sample events",
+    "recommendation gaps appear when the search index lags behind the source data",
 ];
 
 // Bag-of-words embedding width for the model seam below.
@@ -76,7 +76,7 @@ async fn main() -> Result<(), LaserError> {
 
     // RECALL. A question recalls the closest facts, ordered by similarity.
     phase("Recall");
-    let question = "checkout is slow during the sale";
+    let question = "gateway is slow during the rollout";
     let hits = recall(&memory, conversation, question, 3).await?;
     print_hits(&format!("recall for {question:?}:"), &hits);
 
@@ -182,10 +182,7 @@ async fn main() -> Result<(), LaserError> {
         phase("Scope the session: messages and memory under one conversation");
         let session = laser.context(conversation);
         session
-            .append(
-                AgentTopic::Audit,
-                b"incident opened: checkout slow".to_vec(),
-            )
+            .append(AgentTopic::Audit, b"incident opened: gateway slow".to_vec())
             .await?;
         let scoped_hits = session
             .memory("incidents")
@@ -207,26 +204,26 @@ async fn main() -> Result<(), LaserError> {
         // of pairs.
         phase("Build the knowledge graph");
         let services = [
-            "checkout",
-            "billing",
+            "gateway",
+            "config",
             "search",
-            "cart",
+            "storage",
             "auth",
             "recommendations",
-            "inventory",
+            "metrics",
             "notifications",
         ];
         let components = [
-            "orders-db",
+            "hosts-db",
             "db-pool",
             "read-replica",
             "search-index",
             "signing-key",
             "cache",
-            "payment-gateway",
+            "token-service",
             "message-queue",
         ];
-        let teams = ["payments", "search-platform", "core-platform"];
+        let teams = ["identity", "search-platform", "core-platform"];
         let incidents = ["INC-101", "INC-102"];
 
         // Every entity as a node, kept by value so the relationships below can wire
@@ -264,34 +261,34 @@ async fn main() -> Result<(), LaserError> {
 
         // (from, relationship, to) triples, resolved against the nodes above.
         let relationships: &[(&str, &str, &str)] = &[
-            ("checkout", "depends_on", "orders-db"),
-            ("checkout", "depends_on", "db-pool"),
-            ("checkout", "depends_on", "payment-gateway"),
-            ("checkout", "mitigated_by", "read-replica"),
-            ("billing", "depends_on", "orders-db"),
-            ("billing", "depends_on", "signing-key"),
-            ("billing", "depends_on", "payment-gateway"),
+            ("gateway", "depends_on", "hosts-db"),
+            ("gateway", "depends_on", "db-pool"),
+            ("gateway", "depends_on", "token-service"),
+            ("gateway", "mitigated_by", "read-replica"),
+            ("config", "depends_on", "hosts-db"),
+            ("config", "depends_on", "signing-key"),
+            ("config", "depends_on", "token-service"),
             ("search", "depends_on", "search-index"),
             ("search", "depends_on", "cache"),
             ("search", "mitigated_by", "cache"),
-            ("cart", "depends_on", "cache"),
-            ("cart", "depends_on", "orders-db"),
+            ("storage", "depends_on", "cache"),
+            ("storage", "depends_on", "hosts-db"),
             ("auth", "depends_on", "signing-key"),
             ("recommendations", "depends_on", "search-index"),
             ("recommendations", "depends_on", "cache"),
-            ("inventory", "depends_on", "orders-db"),
-            ("inventory", "depends_on", "message-queue"),
+            ("metrics", "depends_on", "hosts-db"),
+            ("metrics", "depends_on", "message-queue"),
             ("notifications", "depends_on", "message-queue"),
-            ("read-replica", "replicates", "orders-db"),
-            ("payments", "owns", "checkout"),
-            ("payments", "owns", "billing"),
+            ("read-replica", "replicates", "hosts-db"),
+            ("identity", "owns", "gateway"),
+            ("identity", "owns", "config"),
             ("search-platform", "owns", "search"),
             ("search-platform", "owns", "recommendations"),
             ("core-platform", "owns", "auth"),
-            ("core-platform", "owns", "cart"),
-            ("core-platform", "owns", "inventory"),
+            ("core-platform", "owns", "storage"),
+            ("core-platform", "owns", "metrics"),
             ("core-platform", "owns", "notifications"),
-            ("INC-101", "affected", "checkout"),
+            ("INC-101", "affected", "gateway"),
             ("INC-101", "affected", "db-pool"),
             ("INC-102", "affected", "search"),
             ("INC-102", "affected", "search-index"),
@@ -321,7 +318,7 @@ async fn main() -> Result<(), LaserError> {
             .collect();
         let mitigations = edges.iter().filter(|e| e.valid_from.is_some()).count();
         let nodes: Vec<GraphNode> = by_value.values().cloned().collect();
-        let checkout = by_value["checkout"].clone();
+        let gateway = by_value["gateway"].clone();
         let incident = by_value["INC-101"].clone();
         info!(
             "built {} nodes and {} edges ({mitigations} bitemporal, carrying a valid-from)",
@@ -365,14 +362,14 @@ async fn main() -> Result<(), LaserError> {
         laser.graph(GRAPH).upsert(nodes, edges).await?;
         info!("registered and upserted the '{GRAPH}' graph, browsable in the console explorer");
 
-        // NEIGHBORS. The cheap one-hop read: checkout and everything it points at, its
+        // NEIGHBORS. The cheap one-hop read: gateway and everything it points at, its
         // dependencies and its failover.
         phase("Read a node's neighbors");
         let around = laser
             .graph(GRAPH)
-            .neighbors(checkout.id, EdgeDir::Out, None, 1)
+            .neighbors(gateway.id, EdgeDir::Out, None, 1)
             .await?;
-        print_nodes("checkout's one-hop neighborhood", &around.nodes);
+        print_nodes("gateway's one-hop neighborhood", &around.nodes);
 
         // TRAVERSE. From every Service, follow `depends_on` to the components the
         // whole platform rests on, the structural view recall cannot give.
@@ -414,31 +411,31 @@ async fn main() -> Result<(), LaserError> {
         // `source` as a live click-through to that KV entry (or to the message, for a
         // projector-built graph). Node source is first-writer, edge source last-writer.
         phase("Trace a node back to its source");
-        if let Some(node) = around.nodes.iter().find(|node| node.id == checkout.id) {
+        if let Some(node) = around.nodes.iter().find(|node| node.id == gateway.id) {
             match &node.source {
                 Some(SourceRef::Kv { namespace, key }) => {
-                    info!("checkout's source record is {namespace}/{key}")
+                    info!("gateway's source record is {namespace}/{key}")
                 }
-                Some(other) => info!("checkout came from {other:?}"),
-                None => info!("checkout carries no source"),
+                Some(other) => info!("gateway came from {other:?}"),
+                None => info!("gateway carries no source"),
             }
         }
 
         // BITEMPORAL. The `mitigated_by` edges carry a valid-from, so an "as of" read
-        // sees the graph as it was then. Before the mitigation was applied, checkout
+        // sees the graph as it was then. Before the mitigation was applied, gateway
         // has no failover. After, the read-replica mitigation appears. Same query, two
         // points in valid-time.
         phase("Read the graph as of a point in time");
         let before = laser
             .graph(GRAPH)
-            .start_ids(vec![checkout.id])
+            .start_ids(vec![gateway.id])
             .out("mitigated_by")
             .as_of(MITIGATION_SINCE_US - 1)
             .fetch()
             .await?;
         let after = laser
             .graph(GRAPH)
-            .start_ids(vec![checkout.id])
+            .start_ids(vec![gateway.id])
             .out("mitigated_by")
             .as_of(MITIGATION_SINCE_US + 1)
             .fetch()
@@ -447,11 +444,11 @@ async fn main() -> Result<(), LaserError> {
             result
                 .nodes
                 .iter()
-                .filter(|node| node.id != checkout.id)
+                .filter(|node| node.id != gateway.id)
                 .count()
         };
         info!(
-            "checkout mitigations before the rollout: {}, after: {}",
+            "gateway mitigations before the rollout: {}, after: {}",
             reached(&before),
             reached(&after)
         );

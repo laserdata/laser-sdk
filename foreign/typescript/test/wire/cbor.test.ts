@@ -41,8 +41,8 @@ void test("given_duplicate_map_keys_when_decoded_then_should_reject", () => {
 })
 
 void test("given_field_readers_when_reading_a_map_then_should_distinguish_absent_from_wrong_type", () => {
-  const map = expectMap(decodeOne(encodeNamed(new Map([["name", "orders"]])), "test"), "test")
-  assert.equal(field.requiredString(map, "name", "test"), "orders")
+  const map = expectMap(decodeOne(encodeNamed(new Map([["name", "readings"]])), "test"), "test")
+  assert.equal(field.requiredString(map, "name", "test"), "readings")
   assert.equal(field.optionalString(map, "missing", "test"), undefined)
   assert.throws(() => field.requiredString(map, "missing", "test"))
   assert.throws(() => field.requiredBytes(map, "name", "test"))

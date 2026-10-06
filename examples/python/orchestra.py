@@ -24,8 +24,8 @@ console shows a live, populated fabric the entire time. Each phase:
                   orchestrator recovers by re-dispatching to a healthy one.
 
 Routing uses a fixed inbox topic so it runs against Apache Iggy.
-Presence advertisement is best-effort: it lights up the console's presence panel
-against Iggy, and is a harmless no-op against Iggy.
+Presence advertisement is best-effort: a managed deployment records it, and it is
+a no-op against Apache Iggy.
 
     python3 orchestra.py
 """
@@ -44,7 +44,7 @@ REMEDIATE = "remediate"
 SLOW_TASK = "slow-task"
 COMMANDS = ls.Topics.COMMANDS
 RESPONSES = ls.Topics.RESPONSES
-INCIDENT = b"checkout API latency spike"
+INCIDENT = b"auth API latency spike"
 ORCHESTRATOR = "orchestrator"
 
 

@@ -229,8 +229,8 @@ where
                 .await
         });
         AgentHandle {
-            shutdown,
-            task,
+            shutdown: Some(shutdown),
+            task: Some(task),
             ready: Some(ready_rx),
             consolidation,
         }
@@ -276,11 +276,11 @@ pub(crate) async fn advertise(
     Ok(())
 }
 
-/// Owns a spawned agent. Dropping it detaches the task and leaves it running, as
-/// before. Call `shutdown` (or `join`) to stop it and observe a consumer error.
+/// Owns a spawned agent. Dropping it signals a graceful stop and stops consolidation. Call `shutdown` or `join` to observe the consumer result.
+#[must_use = "keep the handle alive until the agent finishes or is shut down"]
 pub struct AgentHandle {
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), LaserError>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<Result<(), LaserError>>>,
     ready: Option<oneshot::Receiver<()>>,
     // The background consolidation tick, aborted whenever the agent stops.
     consolidation: Option<JoinHandle<()>>,
@@ -299,17 +299,19 @@ impl AgentHandle {
     }
 
     /// Signal the agent to stop, wait for it, and surface any consumer error.
-    pub async fn shutdown(self) -> Result<(), LaserError> {
-        let _ = self.shutdown.send(());
+    pub async fn shutdown(mut self) -> Result<(), LaserError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(consolidation) = &self.consolidation {
             consolidation.abort();
         }
-        Self::join_task(self.task).await
+        Self::join_task(self.task.take().expect("agent task is retained")).await
     }
 
     /// Wait for the agent to finish (it runs until its consumer ends or errors).
-    pub async fn join(self) -> Result<(), LaserError> {
-        let result = Self::join_task(self.task).await;
+    pub async fn join(mut self) -> Result<(), LaserError> {
+        let result = Self::join_task(self.task.take().expect("agent task is retained")).await;
         if let Some(consolidation) = &self.consolidation {
             consolidation.abort();
         }
@@ -318,7 +320,9 @@ impl AgentHandle {
 
     /// Abort the agent's task immediately, without waiting.
     pub fn abort(&self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         if let Some(consolidation) = &self.consolidation {
             consolidation.abort();
         }
@@ -329,5 +333,66 @@ impl AgentHandle {
             Ok(result) => result,
             Err(join) => Err(LaserError::HandlerConfig(join.to_string())),
         }
+    }
+}
+
+impl Drop for AgentHandle {
+    fn drop(&mut self) {
+        if let Some(consolidation) = &self.consolidation {
+            consolidation.abort();
+        }
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SignalDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for SignalDrop {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_running_agent_when_its_handle_is_dropped_then_should_stop_the_worker_and_consolidation()
+     {
+        let (shutdown, stop) = oneshot::channel();
+        let (worker_done, worker_stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = stop.await;
+            let _ = worker_done.send(());
+            Ok(())
+        });
+        let (started, running) = oneshot::channel();
+        let (consolidation_done, consolidation_stopped) = oneshot::channel();
+        let consolidation = tokio::spawn(async move {
+            let _finished = SignalDrop(Some(consolidation_done));
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        let handle = AgentHandle {
+            shutdown: Some(shutdown),
+            task: Some(task),
+            ready: None,
+            consolidation: Some(consolidation),
+        };
+        running.await.expect("consolidation started");
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(2), worker_stopped)
+            .await
+            .expect("worker stopped")
+            .expect("worker reported its stop");
+        tokio::time::timeout(Duration::from_secs(2), consolidation_stopped)
+            .await
+            .expect("consolidation stopped")
+            .expect("consolidation reported its stop");
     }
 }

@@ -18,11 +18,13 @@ import {
   KvCasCommand,
   KvCasFencedCommand,
   KvCopyCommand,
+  KvExpireCommand,
   KvMoveCommand,
   KvSetCommand
 } from "../../src/wire/commands.js"
 import { type KvOutcome, type KvReply, encodeKvReply } from "../../src/wire/kv.js"
 import { MIN_LEASE_TTL_MICROS } from "../../src/wire/limits.js"
+import { encode as encodeMessagePack } from "@msgpack/msgpack"
 
 // The shortest lifetime the contract will accept, and twice it for a request the
 // store can plausibly clamp down from.
@@ -371,4 +373,46 @@ void test("given_multiple_keys_when_get_many_is_called_then_should_decode_each_b
   const values = await store.getMany([Uint8Array.of(1), Uint8Array.of(2)])
   assert.deepEqual(values, [Uint8Array.of(9), undefined])
   assert.equal(transport.calls.length, 1)
+})
+
+void test("given_a_precondition_when_send_is_called_then_should_refuse_instead_of_dropping_it", async () => {
+  const { kv: store, transport } = kv("config", [])
+  await assert.rejects(
+    store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).expectVersion(3n).send(),
+    (error: unknown) =>
+      error instanceof InvalidError && error.message.includes("call commit() instead")
+  )
+  await assert.rejects(store.set(Uint8Array.of(1)).expectAbsent().send(), InvalidError)
+  assert.equal(transport.calls.length, 0)
+})
+
+void test("given_a_ttl_when_expire_is_called_then_should_encode_now_plus_the_ttl", async () => {
+  const { kv: store, transport } = kv("config", [okFrame({ kind: "versioned", version: 2n })])
+  assert.equal(await store.expire(Uint8Array.of(1), 50n, 100n), 2n)
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    KvExpireCommand.encode({ namespace: "config", key: Uint8Array.of(1), expiresAtMicros: 150n })
+  )
+})
+
+void test("given_an_absolute_time_when_expire_at_is_called_then_should_encode_it_unchanged", async () => {
+  const { kv: store, transport } = kv("config", [okFrame({ kind: "versioned", version: 4n })])
+  assert.equal(await store.expireAt(Uint8Array.of(1), 999n), 4n)
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    KvExpireCommand.encode({ namespace: "config", key: Uint8Array.of(1), expiresAtMicros: 999n })
+  )
+})
+
+void test("given_msgpack_when_set_is_sent_then_should_encode_the_value_as_messagepack", async () => {
+  const { kv: store, transport } = kv("config", [okFrame({ kind: "written" })])
+  await store.set(Uint8Array.of(1)).msgpack({ log_level: "debug" }).send()
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    KvSetCommand.encode({
+      namespace: "config",
+      key: Uint8Array.of(1),
+      value: encodeMessagePack({ log_level: "debug" }, { useBigInt64: true })
+    })
+  )
 })

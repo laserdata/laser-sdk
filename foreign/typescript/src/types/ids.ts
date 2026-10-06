@@ -43,6 +43,11 @@ export class ConversationId {
     return crockfordEncode(this.value)
   }
 
+  /** The raw 128-bit ULID value. */
+  asU128(): bigint {
+    return this.value
+  }
+
   equals(other: ConversationId): boolean {
     return other.value === this.value
   }

@@ -1,5 +1,5 @@
 // Ops stream + topics. The control surface rides a dedicated `_agdx` ops
-// stream, separate from the customer data stream. Topic names drop the `agdx.`
+// stream, separate from the user data stream. Topic names drop the `agdx.`
 // prefix because the `_agdx` stream already namespaces them. A pinned wire
 // contract: drift breaks the managed control surface silently. `_agdx/dlq`
 // collects dead-letter capsules, each JSON capsule tagged with a `kind`

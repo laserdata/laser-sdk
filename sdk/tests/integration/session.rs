@@ -195,7 +195,7 @@ async fn given_a_custom_layout_when_turns_ride_their_own_stream_and_topic_then_s
         .create("ticket-7");
 
     session
-        .append(SessionTurnKind::Instruction, b"where is my order".to_vec())
+        .append(SessionTurnKind::Instruction, b"drain node-7".to_vec())
         .await
         .expect("appending on the custom topic should succeed");
     let turns = harness::eventually(|| async {
@@ -233,7 +233,10 @@ async fn given_a_custom_layout_when_turns_ride_their_own_stream_and_topic_then_s
     })
     .await;
     session
-        .append(SessionTurnKind::Response, b"shipped yesterday".to_vec())
+        .append(
+            SessionTurnKind::Response,
+            b"drained, 0 connections left".to_vec(),
+        )
         .await
         .expect("appending the response should succeed");
     let since = harness::eventually(|| async {

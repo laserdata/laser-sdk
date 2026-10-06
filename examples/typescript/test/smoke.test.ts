@@ -57,7 +57,7 @@ void test(
 )
 
 void test(
-  "given_the_log_primitive_when_run_then_should_publish_and_replay_both_orders",
+  "given_the_log_primitive_when_run_then_should_publish_and_replay_both_readings",
   { concurrency: false },
   async () => {
     await withLaser("log", (laser) => runLog(laser, AbortSignal.timeout(30_000)))

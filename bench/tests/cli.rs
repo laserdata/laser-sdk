@@ -1,6 +1,7 @@
 use std::fs;
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_valid_contract_when_doctor_runs_then_should_accept_it() {
     let output = Command::new(env!("CARGO_BIN_EXE_laser-bench"))

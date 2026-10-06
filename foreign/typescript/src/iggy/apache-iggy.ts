@@ -7,7 +7,6 @@ import {
   HeaderValue as IggyHeaderValueFactory,
   Partitioning,
   PollingStrategy as IggyPollingStrategy,
-  ResponseError,
   SimpleClient,
   getRawClient
 } from "apache-iggy"
@@ -57,6 +56,18 @@ export type IggyClient = SimpleClient
 export type ClientOwnership = "owned" | "borrowed"
 export type { SendMessagesConfirmation, SendMessagesResponse }
 
+/** Settings applied only when a topic is created. `maxTopicSize` is in bytes,
+ * `UNLIMITED_TOPIC_SIZE` lifts the limit, and leaving it out keeps the server
+ * default. */
+export interface TopicCreateSettings {
+  readonly messageExpiryMicros?: bigint
+  readonly maxTopicSize?: bigint
+}
+
+/** The `maxTopicSize` value that lifts the topic size limit (u64 max). */
+export const UNLIMITED_TOPIC_SIZE = 18_446_744_073_709_551_615n
+
+const TOPIC_NAME_ALREADY_EXISTS = 2013
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
 const ACCEPT_STAGE = "Iggy server to accept the connection"
 const LOGIN_STAGE = "Iggy login reply"
@@ -126,6 +137,14 @@ export interface LaserTransport {
     partitions: number,
     messageExpiryMicros: bigint
   ): Promise<void>
+  /** Creates the topic with these settings when it is absent. An existing
+   * topic is left as it is, like Rust `create_topic_if_not_exists`. */
+  createTopicIfAbsent?(
+    streamId: string,
+    topicId: string,
+    partitions: number,
+    settings: TopicCreateSettings
+  ): Promise<void>
   findTopicPartitionCount(streamId: string, topicId: string): Promise<number | undefined>
   getTopicPartitionCount(streamId: string, topicId: string): Promise<number>
   resolveStreamTopicIds?(
@@ -180,6 +199,13 @@ export interface LaserTransport {
     target: ConsumerOffsetTarget,
     partitionId: number
   ): Promise<{ readonly storedOffset: bigint; readonly currentOffset: bigint } | undefined>
+  /** Deletes the stored server offset of a consumer for one partition. */
+  deleteOffset?(
+    streamId: string,
+    topicId: string,
+    target: ConsumerTarget,
+    partitionId: number
+  ): Promise<void>
   joinConsumerGroup(streamId: string, topicId: string, name: string): Promise<void>
   syncConsumerGroup?(
     streamId: string,
@@ -414,9 +440,12 @@ function parsedHeadersToMap(
 
 /** The Iggy error code a server reply carried, through any transport wrapping. */
 export function serverErrorCode(error: unknown): number | undefined {
-  for (let current: unknown = error; current !== undefined;) {
-    if (current instanceof ResponseError) return current.errorCode
-    current = current instanceof Error ? current.cause : undefined
+  let current = error
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) return undefined
+    const code = (current as { readonly errorCode?: unknown }).errorCode
+    if (typeof code === "number") return code
+    current = "cause" in current ? (current as { readonly cause?: unknown }).cause : undefined
   }
   return undefined
 }
@@ -1149,7 +1178,15 @@ export class ApacheIggyTransport implements LaserTransport {
           })
         )
       : payload
-    const buffer = toNodeBuffer(request)
+    return this.sendManagedPreframed(code, request, options)
+  }
+
+  async sendManagedPreframed(
+    code: number,
+    payload: Uint8Array,
+    options?: { readonly retryAfterReconnect?: boolean }
+  ): Promise<Uint8Array> {
+    const buffer = toNodeBuffer(payload)
     const reply = await this.execute(
       (client) => client.sendBinaryRequest(code, buffer),
       `managed command ${String(code)} failed`,
@@ -1214,6 +1251,37 @@ export class ApacheIggyTransport implements LaserTransport {
       })
       return topic.partitionsCount
     }, `failed to ensure topic \`${topicId}\` on stream \`${streamId}\` with message expiry`)
+    this.partitionCounts.set(this.topicKey(streamId, topicId), partitionCount)
+  }
+
+  async createTopicIfAbsent(
+    streamId: string,
+    topicId: string,
+    partitions: number,
+    settings: TopicCreateSettings
+  ): Promise<void> {
+    const partitionCount = await this.execute(async (client) => {
+      const existing = await client.topic.get({ streamId, topicId })
+      if (existing !== null) return existing.partitionsCount
+      try {
+        const created = await client.topic.create({
+          streamId,
+          name: topicId,
+          partitionCount: partitions,
+          compressionAlgorithm: 1,
+          ...(settings.messageExpiryMicros === undefined
+            ? {}
+            : { messageExpiry: settings.messageExpiryMicros }),
+          ...(settings.maxTopicSize === undefined ? {} : { maxTopicSize: settings.maxTopicSize })
+        })
+        return created.partitionsCount
+      } catch (error) {
+        if (serverErrorCode(error) !== TOPIC_NAME_ALREADY_EXISTS) throw error
+        const raced = await client.topic.get({ streamId, topicId })
+        if (raced === null) throw error
+        return raced.partitionsCount
+      }
+    }, `failed to create topic \`${topicId}\` on stream \`${streamId}\``)
     this.partitionCounts.set(this.topicKey(streamId, topicId), partitionCount)
   }
 
@@ -1305,8 +1373,7 @@ export class ApacheIggyTransport implements LaserTransport {
         })
       } catch (cause) {
         const response = serverResponseError(cause)
-        const code =
-          response !== undefined && "errorCode" in response ? response.errorCode : undefined
+        const code = serverErrorCode(cause)
         const transient = code === TRANSIENT_NOT_COMMITTED || code === TRANSIENT_NOT_ACCEPTED
         const retryable =
           transient ||
@@ -1473,6 +1540,24 @@ export class ApacheIggyTransport implements LaserTransport {
           offset
         }),
       `failed to store offset for topic \`${topicId}\``
+    )
+  }
+
+  async deleteOffset(
+    streamId: string,
+    topicId: string,
+    target: ConsumerTarget,
+    partitionId: number
+  ): Promise<void> {
+    await this.execute(
+      (client) =>
+        client.offset.delete({
+          streamId,
+          topicId,
+          consumer: toIggyConsumer(target),
+          partitionId
+        }),
+      `failed to delete offset for topic \`${topicId}\``
     )
   }
 

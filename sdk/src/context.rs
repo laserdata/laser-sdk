@@ -7,6 +7,15 @@ use std::collections::{BTreeMap, HashSet};
 
 const READ_BATCH: u32 = 1000;
 
+/// The most raw records a context read examines in each partition: the newest
+/// ones, or the newest ones before a [`Checkpoint`] for a point-in-time read.
+/// The conversation filter runs after the read, so on a busy shared partition
+/// turns older than this window are not returned. Python and TypeScript use
+/// the same window.
+pub const CONTEXT_READ_WINDOW: usize = 10_000;
+
+const _: () = assert!(CONTEXT_READ_WINDOW == crate::poll::MAX_DRAIN_MESSAGES);
+
 /// One message read back from the log for context assembly.
 #[derive(Debug, Clone)]
 pub struct ContextMessage {
@@ -214,7 +223,7 @@ pub struct ContextAssembler {
     /// seeded from a snapshot passes the snapshot's resume offsets here and
     /// replays only the tail (the bounded-reads law). One map for every topic
     /// in `topics`. A [`from_checkpoint`](Self::from_checkpoint) takes
-    /// precedence for the topics it names.
+    /// precedence for the entire read, with missing entries starting at zero.
     #[builder(default)]
     from_offsets: BTreeMap<u32, u64>,
     /// Resume after a [`Checkpoint`], per topic and partition, and read to the
@@ -286,8 +295,7 @@ impl ContextAssembler {
                         };
                         // Anchor the window at the checkpoint, not at a tail that
                         // may have moved far past it.
-                        let start = from
-                            .max(end.saturating_sub(crate::poll::MAX_DRAIN_MESSAGES as u64 - 1));
+                        let start = from.max(end.saturating_sub(CONTEXT_READ_WINDOW as u64 - 1));
                         crate::poll::DrainRange::until(partition, start, end)
                     }
                     // Context selection keeps the most recent records, so a

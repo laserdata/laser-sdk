@@ -1,13 +1,13 @@
 # log - every message, written once, readable forever
 
-A topic stores records in append order under its retention policy. This example publishes typed orders and reads them by offset.
+A topic stores records in append order under its retention policy. This example publishes typed host readings and reads them by offset.
 
 ## What it shows
 
-- Ensures the `shop/orders` topic with two partitions.
-- Publishes two JSON orders with `topic.publish().json(value).send()`.
-- Opens one typed, codec-bound reader (`topic.json(codec).records(readerName)`) and drains it from offset 0 until both orders are back.
-- Run it twice and the second run replays four orders: the log keeps every record, and a fresh reader starts at offset 0. That is the primitive, not a bug.
+- Ensures the `fleet/readings` topic with two partitions.
+- Publishes two JSON readings with `topic.publish().json(value).send()`.
+- Opens one typed, codec-bound reader (`topic.json(codec).records(readerName)`) and drains it from offset 0 until both readings are back.
+- Run it twice and the second run replays four readings: the log keeps every record, and a fresh reader starts at offset 0. That is the primitive, not a bug.
 
 ## Run it
 

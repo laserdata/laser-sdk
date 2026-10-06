@@ -84,6 +84,44 @@ impl PyLaser {
         })
     }
 
+    /// Connect from the environment: `LASER_CONNECTION_STRING` (required, else
+    /// `ConfigError`) and an optional `LASER_STREAM` default stream. The timeout
+    /// and publish variables (`LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*`
+    /// family) apply as on `connect`.
+    #[staticmethod]
+    fn connect_env(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        future_into_py(py, async move {
+            let laser = Laser::connect_env().await.map_err(to_pyerr)?;
+            Ok(PyLaser::from_inner(laser))
+        })
+    }
+
+    /// Connect to a local Apache Iggy on `iggy:iggy@127.0.0.1:8090`, the Laser
+    /// Stack default.
+    #[staticmethod]
+    fn local(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        future_into_py(py, async move {
+            let laser = Laser::local().await.map_err(to_pyerr)?;
+            Ok(PyLaser::from_inner(laser))
+        })
+    }
+
+    /// Connect and pin a default `stream`, the shorthand for
+    /// `connect(connection_string, stream=stream)`.
+    #[staticmethod]
+    fn connect_with_stream(
+        py: Python<'_>,
+        connection_string: String,
+        stream: String,
+    ) -> PyResult<Bound<'_, PyAny>> {
+        future_into_py(py, async move {
+            let laser = Laser::connect_with_stream(&connection_string, &stream)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(PyLaser::from_inner(laser))
+        })
+    }
+
     /// A clone of this client pinned to a default data `stream`, sharing the one
     /// connection and producer cache. Re-scope a long-lived connection to as many
     /// streams as you like.
@@ -119,7 +157,7 @@ impl PyLaser {
     /// intended for bring-your-own backends and deterministic pre-gate tests.
     /// Omitted fields preserve the current capability set.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, sessions=None, durable_dedup=None))]
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, query_execution=None, versions=None, backends=None))]
     fn with_capabilities<'py>(
         &self,
         py: Python<'py>,
@@ -142,10 +180,14 @@ impl PyLaser {
         filters_catalog: Option<bool>,
         filters_group_policy_reads: Option<bool>,
         a2a_gateway: Option<bool>,
-        sessions: Option<bool>,
-        durable_dedup: Option<bool>,
+        query_execution: Option<(bool, bool, bool)>,
+        versions: Option<PyRef<'_, PyOpVersions>>,
+        backends: Option<Vec<PyRef<'_, PyBackendDescriptor>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let versions = versions.map(|value| OpVersions::from(&*value));
+        let backends: Option<Vec<BackendDescriptor>> =
+            backends.map(|values| values.iter().map(|value| value.inner.clone()).collect());
         future_into_py(py, async move {
             let mut capabilities = inner.capabilities().await.clone();
             if let Some(value) = managed {
@@ -155,16 +197,7 @@ impl PyLaser {
                 capabilities.query.available = value;
             }
             if let Some(value) = query_consistency {
-                capabilities.query.consistency = match value.as_str() {
-                    "eventual" => laser_sdk::query::Consistency::Eventual,
-                    "read_your_writes" => laser_sdk::query::Consistency::ReadYourWrites,
-                    "strong" => laser_sdk::query::Consistency::Strong,
-                    _ => {
-                        return Err(InvalidError::new_err(
-                            "query_consistency must be eventual, read_your_writes, or strong",
-                        ));
-                    }
-                };
+                capabilities.query.consistency = consistency_level(&value)?;
             }
             if let Some(value) = query_keyword {
                 capabilities.query.keyword = value;
@@ -222,11 +255,14 @@ impl PyLaser {
             if let Some(value) = a2a_gateway {
                 capabilities.a2a_gateway = value;
             }
-            if let Some(value) = sessions {
-                capabilities.sessions = value;
+            if let Some((paging, cancellation, status)) = query_execution {
+                capabilities = capabilities.with_query_execution(paging, cancellation, status);
             }
-            if let Some(value) = durable_dedup {
-                capabilities.durable_dedup = value;
+            if let Some(value) = versions {
+                capabilities = capabilities.with_versions(Some(value));
+            }
+            if let Some(value) = backends {
+                capabilities = capabilities.with_backends(value);
             }
             Ok(PyLaser::from_inner(inner.with_capabilities(capabilities)))
         })
@@ -378,77 +414,98 @@ impl From<laser_sdk::wire::hello::FilterAnnounce> for PyFilterAnnounce {
     }
 }
 
-/// A read-only snapshot of the premium capability set the connected
-/// infrastructure advertised. All flags are false against Apache Iggy.
+/// A read-only snapshot of the connected deployment's capabilities.
+/// Managed features depend on advertised backend support. The server can provide consumer-group reads without a plane.
 #[gen_stub_pyclass]
-#[pyclass(name = "Capabilities", frozen, get_all)]
+#[pyclass(name = "Capabilities", frozen)]
 pub struct PyCapabilities {
     /// Connected to a managed plane (the root managed switch).
+    #[pyo3(get)]
     pub managed: bool,
     /// The managed query surface is served.
+    #[pyo3(get)]
     pub query: bool,
     /// The strongest read-consistency the query surface serves
     /// (`eventual` / `read_your_writes` / `strong`).
+    #[pyo3(get)]
     pub query_consistency: String,
     /// The query surface serves lexical keyword search (`Query.text(...)`).
+    #[pyo3(get)]
     pub query_keyword: bool,
     /// Materialization destination declarations and the checkpoint lifecycle
     /// are served.
+    #[pyo3(get)]
     pub destinations: bool,
     /// The checkpoint read consistency the destination surface serves
     /// (`linearizable` / `potentially_stale`).
+    #[pyo3(get)]
     pub destinations_consistency: String,
     /// The managed key-value surface is served.
+    #[pyo3(get)]
     pub kv: bool,
     /// The key-value store serves compare-and-swap.
+    #[pyo3(get)]
     pub kv_cas: bool,
     /// The key-value store serves fenced compare-and-swap (the monotonic fence an
     /// exclusive workflow step needs for an at-most-once effect).
+    #[pyo3(get)]
     pub kv_cas_fenced: bool,
     /// The key-value store serves the revocable fenced-lease contract:
     /// holder-scoped acquire, renewal, fence-validated release, fenced
     /// compare-and-swap requiring a live lease, and the barriered read. The
     /// lease, renew, release, and `cas_fenced` calls all gate on this.
+    #[pyo3(get)]
     pub kv_fenced_leases: bool,
     /// The managed knowledge-graph surface is served.
+    #[pyo3(get)]
     pub graph: bool,
     /// Managed copy-on-write forks are served.
+    #[pyo3(get)]
     pub forks: bool,
     /// The managed run registry is served (`Laser.runs()` submit / cancel /
     /// status / list, and `registered=True` workflows).
+    #[pyo3(get)]
     pub agent_workflow: bool,
     /// The change feed is published (`Laser.watch()`).
+    #[pyo3(get)]
     pub watch: bool,
     /// The authorization control surface is served (`Laser.whoami()` and the
     /// role/binding verbs).
+    #[pyo3(get)]
     pub authz: bool,
     /// Consumer filters are served by the streaming server (group readers,
     /// previews, sample tests).
+    #[pyo3(get)]
     pub filters: bool,
     /// The group filter catalog is served, so a consumer group can carry a
     /// filter policy.
+    #[pyo3(get)]
     pub filters_catalog: bool,
     /// The streaming server resolves a consumer group's own policy, so a
     /// group consumer runs the group's filter, or none, without naming one.
+    #[pyo3(get)]
     pub filters_group_policy_reads: bool,
     /// A managed A2A gateway is available.
+    #[pyo3(get)]
     pub a2a_gateway: bool,
-    /// Platform-native session lifecycle.
-    pub sessions: bool,
-    /// Platform-side durable deduplication.
-    pub durable_dedup: bool,
     /// The per-surface operation versions the server advertised, or `None`
     /// against Apache Iggy and pre-versioned servers.
+    #[pyo3(get)]
     pub versions: Option<PyOpVersions>,
     /// The materialization backends the connected server exposes (identity
     /// only). Empty against Apache Iggy and servers that advertise none.
+    #[pyo3(get)]
     pub backends: Vec<PyBackendDescriptor>,
+    #[pyo3(get)]
     pub evaluation: Option<PyFilterAnnounce>,
+    inner: Capabilities,
 }
 
 impl From<Capabilities> for PyCapabilities {
     fn from(value: Capabilities) -> Self {
+        let inner = value.clone();
         Self {
+            inner,
             managed: value.managed,
             query: value.query.available,
             query_consistency: match value.query.consistency {
@@ -478,8 +535,6 @@ impl From<Capabilities> for PyCapabilities {
             filters_group_policy_reads: value.filters.group_policy_reads,
             evaluation: value.filters.evaluation.map(PyFilterAnnounce::from),
             a2a_gateway: value.a2a_gateway,
-            sessions: value.sessions,
-            durable_dedup: value.durable_dedup,
             versions: value.versions.map(PyOpVersions::from),
             backends: value
                 .backends
@@ -524,6 +579,18 @@ impl PyCapabilities {
         crate::convert::ser_to_py(py, &reasons)
     }
 
+    /// True when nothing beyond open streaming is available: the capability
+    /// set equals the one an original Apache Iggy server negotiates.
+    fn is_open_only(&self) -> bool {
+        self.inner.is_open_only()
+    }
+
+    /// True when the query surface serves reads at `level` (`eventual`,
+    /// `read_your_writes`, or `strong`) or stronger.
+    fn serves_consistency(&self, level: &str) -> PyResult<bool> {
+        Ok(self.inner.serves_consistency(consistency_level(level)?))
+    }
+
     fn is_ready(&self) -> bool {
         let enabled = self.enabled_backends();
         self.managed
@@ -545,6 +612,17 @@ impl PyCapabilities {
             self.kv_cas,
             self.backends.len()
         )
+    }
+}
+
+fn consistency_level(level: &str) -> PyResult<laser_sdk::query::Consistency> {
+    match level {
+        "eventual" => Ok(laser_sdk::query::Consistency::Eventual),
+        "read_your_writes" => Ok(laser_sdk::query::Consistency::ReadYourWrites),
+        "strong" => Ok(laser_sdk::query::Consistency::Strong),
+        _ => Err(InvalidError::new_err(
+            "query consistency must be eventual, read_your_writes, or strong",
+        )),
     }
 }
 
@@ -580,9 +658,55 @@ impl From<OpVersions> for PyOpVersions {
     }
 }
 
+impl From<&PyOpVersions> for OpVersions {
+    fn from(value: &PyOpVersions) -> Self {
+        serde_json::from_value(serde_json::json!({
+            "query": value.query,
+            "control": value.control,
+            "kv": value.kv,
+            "fork": value.fork,
+            "agent": value.agent,
+            "graph": value.graph,
+            "checkpoint": value.checkpoint,
+            "filter": value.filter,
+            "features": value.features,
+        }))
+        .expect("op versions decode from their own fields")
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyOpVersions {
+    /// Operation versions for `Laser.with_capabilities(versions=)`, the
+    /// bring-your-own backend and test path. Zero means not advertised.
+    #[new]
+    #[pyo3(signature = (*, query=1, control=1, kv=1, fork=1, agent=0, graph=0, checkpoint=0, filter=0, features=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        query: u32,
+        control: u32,
+        kv: u32,
+        fork: u32,
+        agent: u32,
+        graph: u32,
+        checkpoint: u32,
+        filter: u32,
+        features: u64,
+    ) -> Self {
+        Self {
+            query,
+            control,
+            kv,
+            fork,
+            agent,
+            graph,
+            checkpoint,
+            filter,
+            features,
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "OpVersions(query={}, control={}, kv={}, fork={}, agent={}, graph={}, checkpoint={}, filter={}, features={})",
@@ -651,6 +775,19 @@ impl From<BackendDescriptor> for PyBackendDescriptor {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyBackendDescriptor {
+    /// A descriptor from its wire dict (the shape `readiness` and
+    /// `materialization` use), for `Laser.with_capabilities(backends=)`.
+    #[staticmethod]
+    fn from_dict(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let inner: BackendDescriptor = crate::convert::py_to_de(value)?;
+        Ok(Self::from(inner))
+    }
+
+    /// This descriptor as its wire dict.
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::convert::ser_to_py(py, &self.inner)
+    }
+
     #[getter]
     fn readiness(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         crate::convert::ser_to_py(py, &self.inner.readiness)

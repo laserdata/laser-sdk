@@ -1,10 +1,17 @@
 import assert from "node:assert/strict"
-import { test } from "node:test"
+import { test, type TestContext } from "node:test"
+import type { Capabilities } from "../../src/client/capabilities.js"
 import { UnsupportedError } from "../../src/client/errors.js"
 import { Laser } from "../../src/client/laser.js"
 import type { LaserObserver } from "../../src/observe.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
+
+function openOnly(capabilities: Capabilities, context: TestContext): boolean {
+  if (!capabilities.managed) return true
+  context.skip("this deployment includes a managed plane")
+  return false
+}
 
 function probeObserver(onProbe: () => void): LaserObserver {
   return {
@@ -16,10 +23,11 @@ function probeObserver(onProbe: () => void): LaserObserver {
   }
 }
 
-void test("given_no_managed_plane_when_probing_capabilities_then_should_report_native_filters_not_managed", async () => {
+void test("given_no_managed_plane_when_probing_capabilities_then_should_report_native_filters_not_managed", async (context) => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const capabilities = await laser.capabilities()
+    if (!openOnly(capabilities, context)) return
     assert.equal(capabilities.managed, false)
     assert.deepEqual(capabilities.backends, [])
     assert.equal(capabilities.filters.native, true)
@@ -53,24 +61,25 @@ void test("given_a_connection_when_closed_twice_then_should_be_idempotent", asyn
 void test("given_a_default_stream_scope_when_created_then_should_share_the_probed_capabilities", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
-    await laser.capabilities()
-    const scoped = laser.withDefaultStream("orders")
-    assert.equal(scoped.defaultStream, "orders")
+    const original = await laser.capabilities()
+    const scoped = laser.withDefaultStream("fleet")
+    assert.equal(scoped.defaultStream, "fleet")
     assert.equal(laser.defaultStream, undefined)
     const scopedCapabilities = await scoped.capabilities()
-    assert.equal(scopedCapabilities.managed, false)
+    assert.deepEqual(scopedCapabilities, original)
   } finally {
     await laser.close()
   }
 })
 
-void test("given_an_unmanaged_probe_when_refreshed_then_should_probe_again_and_stay_open", async () => {
+void test("given_an_unmanaged_probe_when_refreshed_then_should_probe_again_and_stay_open", async (context) => {
   let probes = 0
   const laser = await Laser.builder()
     .connectionString(CONNECTION_STRING)
     .observer(probeObserver(() => probes++))
     .connect()
   try {
+    if (!openOnly(await laser.capabilities(), context)) return
     const refreshed = await laser.refreshCapabilities()
     assert.equal(probes, 2)
     assert.equal(refreshed.managed, false)
@@ -79,7 +88,7 @@ void test("given_an_unmanaged_probe_when_refreshed_then_should_probe_again_and_s
   }
 })
 
-void test("given_an_unmanaged_probe_when_its_ttl_elapses_then_should_reprobe_on_the_next_read", async () => {
+void test("given_an_unmanaged_probe_when_its_ttl_elapses_then_should_reprobe_on_the_next_read", async (context) => {
   // An unmanaged verdict is retried after a second, so a client that connected
   // during a backend startup race discovers readiness without reconnecting.
   let probes = 0
@@ -88,6 +97,7 @@ void test("given_an_unmanaged_probe_when_its_ttl_elapses_then_should_reprobe_on_
     .observer(probeObserver(() => probes++))
     .connect()
   try {
+    if (!openOnly(await laser.capabilities(), context)) return
     await new Promise((resolve) => setTimeout(resolve, 1_100))
     const second = await laser.capabilities()
     assert.equal(probes, 2)
@@ -97,11 +107,27 @@ void test("given_an_unmanaged_probe_when_its_ttl_elapses_then_should_reprobe_on_
   }
 })
 
-void test("given_apache_iggy_when_query_is_fetched_then_should_return_unsupported", async () => {
+void test("given_apache_iggy_when_query_is_fetched_then_should_return_unsupported", async (context) => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
-    await assert.rejects(laser.query("orders").limit(1).fetch(), UnsupportedError)
+    if (!openOnly(await laser.capabilities(), context)) return
+    await assert.rejects(laser.query("readings").limit(1).fetch(), UnsupportedError)
   } finally {
     await laser.close()
   }
+})
+
+void test("given_a_managed_plane_when_capabilities_are_refreshed_then_should_preserve_its_announced_readiness", async (context) => {
+  await using laser = await Laser.connect(CONNECTION_STRING)
+  const initial = await laser.capabilities()
+  if (!initial.managed) {
+    context.skip("this deployment has no managed plane")
+    return
+  }
+  assert.equal(initial.query.available, true)
+  assert.equal(initial.kv.available, true)
+  const refreshed = await laser.refreshCapabilities()
+  assert.equal(refreshed.managed, true)
+  assert.equal(refreshed.kv.fencedLeases, initial.kv.fencedLeases)
+  assert.equal(refreshed.hello, "answered")
 })

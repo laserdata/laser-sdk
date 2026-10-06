@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 
-import { CancelledError } from "../../src/client/errors.js"
+import { CancelledError, InvalidError, TimeoutError } from "../../src/client/errors.js"
 import type { LaserTransport } from "../../src/iggy/apache-iggy.js"
 import type { FilteredReader, MatchedPage, MatchedRecord } from "../../src/managed/filters.js"
 import { Consumer } from "../../src/stream/consumer.js"
@@ -38,8 +38,9 @@ function matchedPage(records: readonly MatchedRecord[]): MatchedPage {
   }
 }
 
-void test("given_a_group_backlog_without_matches_when_next_times_out_then_should_yield_between_bounded_rounds", async () => {
+void test("given_a_group_backlog_without_matches_when_next_times_out_then_should_yield_between_bounded_rounds", async (context) => {
   let rounds = 0
+  context.mock.method(Date, "now", () => (rounds < 3 ? 0 : 20))
   let yielded = false
   const timer = setTimeout(() => {
     yielded = true
@@ -60,12 +61,104 @@ void test("given_a_group_backlog_without_matches_when_next_times_out_then_should
     reader
   )
   try {
-    assert.equal(await consumer.nextWithin(20), null)
+    await assert.rejects(consumer.nextWithin(20), TimeoutError)
     assert.equal(yielded, true, "busy scans let timers and cancellation run")
     assert.ok(rounds > 1, "busy scans do not use the idle wait")
   } finally {
     clearTimeout(timer)
   }
+})
+
+void test("given_a_stalled_group_poll_when_next_times_out_then_should_keep_one_poll_and_deliver_its_late_record", async () => {
+  let finish: ((value: readonly [MatchedPage | undefined, boolean]) => void) | undefined
+  let rounds = 0
+  const pending = new Promise<readonly [MatchedPage | undefined, boolean]>((resolve) => {
+    finish = resolve
+  })
+  const reader = {
+    owns: () => true,
+    readRound: () => {
+      rounds += 1
+      return pending
+    },
+    close: () => Promise.resolve()
+  } as unknown as FilteredReader
+  const consumer = new Consumer(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    { autoCommit: false },
+    reader
+  )
+  await assert.rejects(consumer.nextWithin(5), TimeoutError)
+  finish?.([matchedPage([matched(0n)]), false])
+  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  assert.equal(rounds, 1, "a timed-out read resumes the same poll")
+  await consumer.shutdown()
+})
+
+void test(
+  "given_a_large_poll_timeout_when_cancelled_then_should_not_expire_at_the_node_timer_ceiling",
+  { timeout: 1000 },
+  async () => {
+    let finish: ((value: readonly [MatchedPage | undefined, boolean]) => void) | undefined
+    const pending = new Promise<readonly [MatchedPage | undefined, boolean]>((resolve) => {
+      finish = resolve
+    })
+    const reader = {
+      owns: () => true,
+      readRound: () => pending,
+      close: () => Promise.resolve()
+    } as unknown as FilteredReader
+    const consumer = new Consumer(
+      {} as LaserTransport,
+      "stream",
+      "topic",
+      { kind: "group", name: "workers" },
+      { autoCommit: false },
+      reader
+    )
+    const controller = new AbortController()
+    const waiting = consumer.nextWithin(2_147_483_648, { signal: controller.signal })
+    const cancelled = setTimeout(() => {
+      controller.abort()
+    }, 10)
+    try {
+      await assert.rejects(waiting, CancelledError)
+    } finally {
+      clearTimeout(cancelled)
+      finish?.([undefined, false])
+      await consumer.shutdown()
+    }
+  }
+)
+
+void test("given_a_stalled_group_poll_when_aborted_then_should_resume_its_late_record", async () => {
+  let finish: ((value: readonly [MatchedPage | undefined, boolean]) => void) | undefined
+  const pending = new Promise<readonly [MatchedPage | undefined, boolean]>((resolve) => {
+    finish = resolve
+  })
+  const reader = {
+    owns: () => true,
+    readRound: () => pending,
+    close: () => Promise.resolve()
+  } as unknown as FilteredReader
+  const consumer = new Consumer(
+    {} as LaserTransport,
+    "stream",
+    "topic",
+    { kind: "group", name: "workers" },
+    { autoCommit: false },
+    reader
+  )
+  const controller = new AbortController()
+  const waiting = consumer.nextWithin(100, { signal: controller.signal })
+  controller.abort()
+  await assert.rejects(waiting, CancelledError)
+  finish?.([matchedPage([matched(0n)]), false])
+  assert.equal((await consumer.nextWithin(100)).offset, 0n)
+  await consumer.shutdown()
 })
 
 void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_record_for_the_next_call", async () => {
@@ -90,7 +183,7 @@ void test("given_a_group_poll_when_aborted_before_delivery_then_should_keep_the_
   )
   await assert.rejects(consumer.nextWithin(100, { signal: controller.signal }), CancelledError)
   assert.deepEqual(handled, [])
-  assert.equal((await consumer.nextWithin(100))?.offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).offset, 0n)
   assert.deepEqual(handled, [], "delivery stays pending until the next call or shutdown")
   await consumer.shutdown()
   assert.deepEqual(handled, [0n])
@@ -113,13 +206,13 @@ void test("given_an_automatic_group_consumer_when_shutdown_with_buffered_records
     {},
     reader
   )
-  assert.equal((await consumer.nextWithin(100))?.offset, 0n)
+  assert.equal((await consumer.nextWithin(100)).offset, 0n)
   assert.deepEqual(handled, [])
-  assert.equal((await consumer.nextWithin(100))?.offset, 1n)
+  assert.equal((await consumer.nextWithin(100)).offset, 1n)
   assert.deepEqual(handled, [0n])
   await consumer.shutdown()
   assert.deepEqual(handled, [0n, 1n], "offset two was never delivered")
-  assert.equal(await consumer.nextWithin(100), null)
+  await assert.rejects(consumer.nextWithin(100), InvalidError)
 })
 
 void test("given_a_group_consumer_when_asynchronously_disposed_then_should_leave_once", async () => {
@@ -162,8 +255,8 @@ void test("given_an_explicit_start_when_polling_multiple_batches_then_should_adv
     { kind: "single", name: "reader", partitionId: 0 },
     { startFrom: { kind: "offset", value: 4n }, autoCommit: false }
   )
-  assert.equal((await consumer.nextWithin(100))?.offset, 4n)
-  assert.equal((await consumer.nextWithin(100))?.offset, 5n)
+  assert.equal((await consumer.nextWithin(100)).offset, 4n)
+  assert.equal((await consumer.nextWithin(100)).offset, 5n)
   assert.deepEqual(starts, [
     { kind: "offset", value: 4n },
     { kind: "offset", value: 5n }
@@ -189,7 +282,7 @@ void test("given_anonymous_consumers_when_polling_then_should_use_distinct_uncom
   } as unknown as LaserTransport
   for (let index = 0; index < 2; index += 1) {
     const consumer = new Consumer(transport, "stream", "topic", { kind: "single", partitionId: 0 })
-    assert.equal((await consumer.nextWithin(100))?.offset, 0n)
+    assert.equal((await consumer.nextWithin(100)).offset, 0n)
   }
   assert.notDeepEqual(seen[0]?.target, seen[1]?.target)
   assert.equal(

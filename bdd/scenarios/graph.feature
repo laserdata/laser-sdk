@@ -31,13 +31,13 @@ Feature: Knowledge graph traversal semantics
 
   Scenario: An "as of" traversal follows only edges valid at that instant
     Given an empty graph
-    When I observe "checkout" mitigated_by "replica" valid from 100
-    Then traversing from "checkout" out "mitigated_by" as of 50 does not reach "replica"
-    And traversing from "checkout" out "mitigated_by" as of 150 reaches "replica"
+    When I observe "auth" mitigated_by "replica" valid from 100
+    Then traversing from "auth" out "mitigated_by" as of 50 does not reach "replica"
+    And traversing from "auth" out "mitigated_by" as of 150 reaches "replica"
 
   Scenario: A graph element records the source it was observed in
     Given an empty graph
-    When I observe "Alice" works_at "Acme" from "orders/events/0/42"
-    And I observe "Alice" works_at "Acme" from "orders/events/0/99"
-    Then the source of node "Alice" is "orders/events/0/42"
-    And the source of edge "Alice" works_at "Acme" is "orders/events/0/99"
+    When I observe "Alice" works_at "Acme" from "readings/events/0/42"
+    And I observe "Alice" works_at "Acme" from "readings/events/0/99"
+    Then the source of node "Alice" is "readings/events/0/42"
+    And the source of edge "Alice" works_at "Acme" is "readings/events/0/99"

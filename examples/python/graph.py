@@ -1,7 +1,7 @@
 """graph (Graph primitive): the relationships your messages imply.
 
-Nodes and edges built from what flows through your log - who bought what,
-which agent said what, what depends on what. Traverse it, search it by
+Nodes and edges built from what flows through your log: which host runs
+which service, which agent said what, what depends on what. Traverse it, search it by
 meaning, and ask what was true at any point in time.
 
 What it shows:
@@ -29,9 +29,9 @@ import laser_sdk as ls
 
 EXAMPLE = "graph"
 GRAPH = "kg"
-CUSTOMER = "customer:42"
-RELATION = "purchased"
-PRODUCTS = ("product:7", "product:9")
+HOST = "host:node-7"
+RELATION = "runs"
+SERVICES = ("service:auth", "service:metrics")
 
 
 def entity_of(node: dict) -> str:
@@ -51,14 +51,14 @@ async def main() -> None:
 
         _common.phase("relate entities, then traverse from one of them")
         graph = laser.graph(GRAPH)
-        for product in PRODUCTS:
-            await graph.link(CUSTOMER, RELATION, product)
+        for service in SERVICES:
+            await graph.link(HOST, RELATION, service)
 
-        customer_id = ls.node_id("customer", "42")
-        purchases = await graph.neighbors(customer_id, direction="out", edge_type=RELATION, depth=1)
+        host_id = ls.node_id("host", "node-7")
+        services = await graph.neighbors(host_id, direction="out", edge_type=RELATION, depth=1)
 
-        print(f"  {CUSTOMER} {RELATION}:")
-        for node in purchases["nodes"]:
+        print(f"  {HOST} {RELATION}:")
+        for node in services["nodes"]:
             print(f"    {entity_of(node)}")
     finally:
         await laser.close()

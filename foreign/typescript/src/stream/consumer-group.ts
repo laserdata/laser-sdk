@@ -33,7 +33,12 @@ import type {
   FilteredStart,
   GroupFilterSpec
 } from "../wire/filter.js"
-import { Consumer, resolveConsumerOptions, type ConsumerOptions } from "./consumer.js"
+import {
+  Consumer,
+  resolveConsumerOptions,
+  type ConsumerOptions,
+  type PollFailures
+} from "./consumer.js"
 import type { PollingStrategy } from "./polling-strategy.js"
 
 /** What a consumer group needs beyond the stream transport to reach its filter policy. */
@@ -192,8 +197,11 @@ export class ConsumerGroup {
       return this[INTERNAL_NATIVE_CONSUMER](options)
     }
     const resolved = resolveConsumerOptions(options, false)
-    if (this.target.kind === "name") {
-      await this.transport.ensureConsumerGroup(this.streamName, this.topicName, this.target.name)
+    if (this.target.kind === "name" && resolved.createGroup) {
+      const groupName = this.target.name
+      await withInitRetries(resolved.initRetries, () =>
+        this.transport.ensureConsumerGroup(this.streamName, this.topicName, groupName)
+      )
     }
     const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
     const reader = await this.readerWith({ kind: "group" })
@@ -227,15 +235,36 @@ export class ConsumerGroup {
    *
    * @internal
    */
-  async [INTERNAL_NATIVE_CONSUMER](options: ConsumerOptions = {}): Promise<Consumer> {
+  async [INTERNAL_NATIVE_CONSUMER](
+    options: ConsumerOptions = {},
+    pollFailures: PollFailures = "retry"
+  ): Promise<Consumer> {
+    const resolved = resolveConsumerOptions(options, false)
     const name = this.target.kind === "name" ? this.target.name : (await this.native()).name
-    await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
+    if (resolved.autoJoinGroup) {
+      await withInitRetries(resolved.initRetries, async () => {
+        if (resolved.createGroup) {
+          await this.transport.joinConsumerGroup(this.streamName, this.topicName, name)
+          return
+        }
+        if (this.transport.joinExistingConsumerGroup === undefined) {
+          throw new UnsupportedError("this transport cannot join a group without creating it")
+        }
+        await this.transport.joinExistingConsumerGroup(this.streamName, this.topicName, name)
+      })
+    } else if (resolved.createGroup) {
+      await withInitRetries(resolved.initRetries, () =>
+        this.transport.ensureConsumerGroup(this.streamName, this.topicName, name)
+      )
+    }
     return new Consumer(
       this.transport,
       this.streamName,
       this.topicName,
       { kind: "group", name },
-      options
+      options,
+      undefined,
+      pollFailures
     )
   }
 
@@ -569,5 +598,22 @@ function filteredStart(start: PollingStrategy): FilteredStart {
       return { kind: "offset", offset: start.value }
     case "timestamp":
       return { kind: "timestamp", micros: start.value }
+  }
+}
+
+// Builds a consumer's group membership with the configured init retries: the
+// first attempt plus `retries` more, `intervalMs` apart.
+async function withInitRetries(
+  initRetries: { readonly retries: number; readonly intervalMs: number },
+  attempt: () => Promise<void>
+): Promise<void> {
+  for (let tried = 0; ; tried += 1) {
+    try {
+      await attempt()
+      return
+    } catch (error) {
+      if (tried >= initRetries.retries) throw error
+      await new Promise((resolve) => setTimeout(resolve, initRetries.intervalMs))
+    }
   }
 }

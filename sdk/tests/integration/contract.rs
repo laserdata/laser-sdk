@@ -4,20 +4,20 @@ use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentCard, CapabilityDescriptor};
 use std::time::Duration;
 
-struct Crediter;
+struct Rotator;
 
-impl AgentHandler for Crediter {
+impl AgentHandler for Rotator {
     async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        ctx.respond(Bytes::from("credited")).await
+        ctx.respond(Bytes::from("rotated")).await
     }
 }
 
-fn credit_card() -> AgentCard {
+fn rotate_card() -> AgentCard {
     AgentCard {
         name: None,
         version: None,
         capabilities: vec![CapabilityDescriptor {
-            skill_id: "apply_credit".to_owned(),
+            skill_id: "rotate_credentials".to_owned(),
             input: None,
             output: None,
             cost_class: None,
@@ -35,22 +35,22 @@ fn credit_card() -> AgentCard {
 async fn given_a_capable_target_when_a_contract_is_sent_then_should_complete_with_the_reply() {
     let laser = harness::laser().await;
     let mut worker = Agent::builder()
-        .id("crediter".parse().expect("crediter id is valid"))
+        .id("rotator".parse().expect("rotator id is valid"))
         .listen_on(AgentTopic::Commands)
         .respond_on(AgentTopic::Responses)
-        .capabilities(credit_card().capabilities)
+        .capabilities(rotate_card().capabilities)
         .ack_on_pickup(true)
-        .handler(Crediter)
+        .handler(Rotator)
         .build()
         .spawn(laser.clone());
     worker.ready().await.expect("worker joins its group");
 
     // A fixed inbox route, since Apache Iggy harness has no presence
-    // command. The branch is target-filtered to the crediter on the shared topic.
+    // command. The branch is target-filtered to the rotator on the shared topic.
     let outcome = laser
-        .contract(Router::to_capable("apply_credit", RoutePolicy::Any))
+        .contract(Router::to_capable("rotate_credentials", RoutePolicy::Any))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
-        .payload(Bytes::from("refund-42"))
+        .payload(Bytes::from("rotate-42"))
         .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
         .deadline(Duration::from_secs(10))
         .send()
@@ -59,7 +59,7 @@ async fn given_a_capable_target_when_a_contract_is_sent_then_should_complete_wit
 
     match outcome {
         Contract::Completed(reply) => {
-            assert_eq!(reply.payload, b"credited");
+            assert_eq!(reply.payload, b"rotated");
         }
         other => panic!("expected Completed, got {other:?}"),
     }
@@ -111,23 +111,23 @@ async fn given_no_pickup_when_a_contract_has_an_expiry_then_should_report_not_co
 }
 
 #[cfg(feature = "sign")]
-struct SignedCrediter;
+struct SignedRotator;
 
 #[cfg(feature = "sign")]
-impl AgentHandler for SignedCrediter {
+impl AgentHandler for SignedRotator {
     async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        ctx.respond(Bytes::from("credited")).await
+        ctx.respond(Bytes::from("rotated")).await
     }
 }
 
 #[cfg(feature = "sign")]
-struct SlowSignedCrediter;
+struct SlowSignedRotator;
 
 #[cfg(feature = "sign")]
-impl AgentHandler for SlowSignedCrediter {
+impl AgentHandler for SlowSignedRotator {
     async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        ctx.respond(Bytes::from("credited")).await
+        ctx.respond(Bytes::from("rotated")).await
     }
 }
 
@@ -141,35 +141,33 @@ async fn given_a_verifier_when_the_target_signs_its_reply_then_should_complete_o
 
     let laser = harness::laser().await;
 
-    // Enroll the honest crediter plus an unrelated key, so the contract's
+    // Enroll the honest rotator plus an unrelated key, so the contract's
     // signer binding (accept only the resolved target's principal) is exercised
     // against a registry that holds more than one key.
-    let crediter_key = SigningKey::from_bytes(&[7u8; 32]);
+    let rotator_key = SigningKey::from_bytes(&[7u8; 32]);
     let other_key = SigningKey::from_bytes(&[9u8; 32]);
     let mut registry = KeyRegistry::new();
-    registry.enroll("crediter", crediter_key.verifying_key());
+    registry.enroll("rotator", rotator_key.verifying_key());
     registry.enroll("other", other_key.verifying_key());
     let verifier = Arc::new(registry);
 
     let mut worker = Agent::builder()
-        .id("crediter".parse().expect("crediter id is valid"))
+        .id("rotator".parse().expect("rotator id is valid"))
         .listen_on(AgentTopic::Commands)
         .respond_on(AgentTopic::Responses)
-        .capabilities(credit_card().capabilities)
+        .capabilities(rotate_card().capabilities)
         .ack_on_pickup(true)
-        .signing_key(Arc::new(crediter_key))
-        .handler(SignedCrediter)
+        .signing_key(Arc::new(rotator_key))
+        .handler(SignedRotator)
         .build()
         .spawn(laser.clone());
     worker.ready().await.expect("worker joins its group");
 
     let caller = harness::verified(&laser, verifier).await;
     let outcome = caller
-        .contract(Router::to(
-            "crediter".parse().expect("crediter id is valid"),
-        ))
+        .contract(Router::to("rotator".parse().expect("rotator id is valid")))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
-        .payload(Bytes::from("refund-42"))
+        .payload(Bytes::from("rotate-42"))
         .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
         .deadline(Duration::from_secs(10))
         .send()
@@ -177,8 +175,8 @@ async fn given_a_verifier_when_the_target_signs_its_reply_then_should_complete_o
         .expect("the signed contract resolves and sends");
     match outcome {
         Contract::Completed(reply) => {
-            assert_eq!(reply.body(), b"credited");
-            assert_eq!(reply.verified_principal.as_deref(), Some("crediter"));
+            assert_eq!(reply.body(), b"rotated");
+            assert_eq!(reply.verified_principal.as_deref(), Some("rotator"));
         }
         other => panic!("expected a signed completion, got {other:?}"),
     }
@@ -193,17 +191,17 @@ async fn given_a_verified_slow_agent_when_pickup_expires_then_should_honor_its_s
     use std::sync::Arc;
 
     let laser = harness::laser().await;
-    let crediter_key = SigningKey::from_bytes(&[11u8; 32]);
+    let rotator_key = SigningKey::from_bytes(&[11u8; 32]);
     let mut registry = KeyRegistry::new();
-    registry.enroll("slow-crediter", crediter_key.verifying_key());
+    registry.enroll("slow-rotator", rotator_key.verifying_key());
 
     let mut worker = Agent::builder()
-        .id("slow-crediter".parse().expect("slow-crediter id is valid"))
+        .id("slow-rotator".parse().expect("slow-rotator id is valid"))
         .listen_on(AgentTopic::Commands)
         .respond_on(AgentTopic::Responses)
         .ack_on_pickup(true)
-        .signing_key(Arc::new(crediter_key))
-        .handler(SlowSignedCrediter)
+        .signing_key(Arc::new(rotator_key))
+        .handler(SlowSignedRotator)
         .build()
         .spawn(laser.clone());
     worker.ready().await.expect("worker joins its group");
@@ -211,10 +209,10 @@ async fn given_a_verified_slow_agent_when_pickup_expires_then_should_honor_its_s
     let caller = harness::verified(&laser, Arc::new(registry)).await;
     let outcome = caller
         .contract(Router::to(
-            "slow-crediter".parse().expect("slow-crediter id is valid"),
+            "slow-rotator".parse().expect("slow-rotator id is valid"),
         ))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
-        .payload(Bytes::from("refund-43"))
+        .payload(Bytes::from("rotate-43"))
         .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
         .expire_if_not_consumed(Duration::from_millis(100))
         .deadline(Duration::from_secs(2))
@@ -223,7 +221,7 @@ async fn given_a_verified_slow_agent_when_pickup_expires_then_should_honor_its_s
         .expect("the signed contract resolves and sends");
 
     match outcome {
-        Contract::Completed(reply) => assert_eq!(reply.body(), b"credited"),
+        Contract::Completed(reply) => assert_eq!(reply.body(), b"rotated"),
         other => panic!("expected a signed completion, got {other:?}"),
     }
     worker.shutdown().await.expect("worker shuts down");

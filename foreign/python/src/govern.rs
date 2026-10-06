@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use laser_sdk::LaserError;
 use laser_sdk::govern::{
     ActionCounters, ActionDecision, ActionGovernor, ActionKind, GovernedAction, GovernorMode,
-    PolicyEvidence, PolicyRef, QuorumGovernor, QuorumPolicy, SwappableGovernor,
+    GovernorRetention, PolicyEvidence, PolicyRef, QuorumGovernor, QuorumPolicy, SwappableGovernor,
 };
 use laser_sdk::types::ConversationId;
 use pyo3::prelude::*;
@@ -31,6 +31,31 @@ impl PyLaser {
         Ok(PyLaser::from_inner(self.inner.with_governor(
             Arc::new(PyActionGovernor { hooks: governor }),
             mode,
+        )))
+    }
+
+    /// `with_governor` with an explicit retention policy for the process-local
+    /// evidence-chain heads: at most `capacity` conversations (default 4096),
+    /// and a head idle for `idle_ttl_secs` (default 3600) may be evicted.
+    /// Eviction or a process restart starts a new local chain for that
+    /// conversation.
+    #[pyo3(signature = (governor, mode="enforce", *, capacity=4096, idle_ttl_secs=3600.0))]
+    fn with_governor_retention(
+        &self,
+        governor: Py<PyAny>,
+        mode: &str,
+        capacity: usize,
+        idle_ttl_secs: f64,
+    ) -> PyResult<PyLaser> {
+        let mode = parse_mode(mode)?;
+        let retention = GovernorRetention {
+            capacity,
+            idle_ttl: crate::convert::duration_seconds(idle_ttl_secs, "idle_ttl_secs")?,
+        };
+        Ok(PyLaser::from_inner(self.inner.with_governor_retention(
+            Arc::new(PyActionGovernor { hooks: governor }),
+            mode,
+            retention,
         )))
     }
 }
@@ -370,6 +395,12 @@ impl PyPolicyEvidence {
         Ok(Self {
             inner: PolicyEvidence::decode(&payload).map_err(to_pyerr)?,
         })
+    }
+
+    /// Encode this evidence body (named-field CBOR), the inverse of `decode`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let payload = self.inner.encode().map_err(to_pyerr)?;
+        Ok(PyBytes::new(py, &payload))
     }
 
     /// This decision's id (ULID).

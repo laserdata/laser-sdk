@@ -17,16 +17,16 @@ use tracing::info;
 //
 //   - HOT PATH    a consumer-group reader tails the raw log live while the
 //                 producer streams, folding a rolling ops ticker (events
-//                 seen, checkouts) with tick-to-read latency in mind.
+//                 seen, errors) with tick-to-read latency in mind.
 //   - ANALYTICS   LaserData Cloud materializes a queryable index and answers the
-//                 aggregates a dashboard needs (funnel, slowest routes,
+//                 aggregates a dashboard needs (mix, slowest routes,
 //                 time windows).
 //   - EXPORT      an independent reader tails the same log with a `Cursor`
 //                 plus `StateStore` checkpoint, resuming exactly where it
 //                 stopped after a restart.
 //   - SCHEMAS     on a LaserData Cloud, a registered JSON Schema guards the
 //                 index against malformed events (the binary schema-first
-//                 path lives in the order-book example's Avro tape).
+//                 path lives in the fleet-tape example's Avro tape).
 
 const TOPIC: &str = "clickstream";
 const CHECKPOINT_KEY: &str = "clickstream-export-cursor";
@@ -40,7 +40,7 @@ const EVENT_JSON_SCHEMA: &str = r#"{
     "required":["user_id","message_type","route","latency_ms","ts"],
     "properties":{
         "user_id":{"type":"string"},
-        "message_type":{"type":"string","enum":["page_view","add_to_cart","checkout"]},
+        "message_type":{"type":"string","enum":["request","retry","error"]},
         "route":{"type":"string"},
         "latency_ms":{"type":"integer","minimum":0},
         "ts":{"type":"integer","minimum":0}
@@ -56,19 +56,19 @@ const TS: &str = "ts"; // reserved field (epoch micros), drives `query.time_rang
 const COLUMNS: &[&str] = &[USER_ID, MESSAGE_TYPE, ROUTE, LATENCY_MS, TS];
 const COUNT_RESULT: &str = "count";
 
-// A whole session of traffic across many visitors, generated deterministically.
+// A whole session of traffic across many clients, generated deterministically.
 const VISITORS: &[&str] = &[
     "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "mallory",
     "oscar",
 ];
 const ROUTES: &[&str] = &[
-    "/home",
-    "/product/42",
-    "/product/7",
-    "/search",
-    "/cart",
-    "/checkout",
-    "/pricing",
+    "/healthz",
+    "/api/v1/hosts/42",
+    "/api/v1/jobs/7",
+    "/api/v1/metrics",
+    "/api/v1/hosts",
+    "/api/v1/jobs",
+    "/login",
     "/docs",
 ];
 
@@ -87,18 +87,18 @@ const LIVE_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVE_GROUP: &str = "event-analytics-live";
 const LIVE_SNAPSHOT_EVERY: usize = 1_000;
 
-// What the visitor did. An enum with `strum::Display` + serde rename, so the
+// What the request did. An enum with `strum::Display` + serde rename, so the
 // indexed value and the JSON body can never disagree.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 enum EventType {
-    PageView,
-    AddToCart,
-    Checkout,
+    Request,
+    Retry,
+    Error,
 }
 
-// One clickstream event: who, what, where, how slow, and when.
+// One request-log event: who, what, where, how slow, and when.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Event {
     user_id: String,
@@ -186,19 +186,19 @@ impl Rng {
     }
 }
 
-// A deterministic session: many visitors browsing, with page views the common case
-// and checkouts the rare one, spaced a few seconds apart from a fixed base.
+// A deterministic session: many clients calling the API, with plain requests the common case
+// and errors the rare one, spaced a few seconds apart from a fixed base.
 fn clickstream() -> Vec<Event> {
     let mut rng = Rng(0x1234_5678_9abc_def0);
     let mut ts = BASE_US;
     (0..events_total())
         .map(|_| {
             let user_id = VISITORS[rng.below(VISITORS.len() as u64) as usize].to_owned();
-            // Weight the funnel: ~70% page views, ~22% add-to-cart, ~8% checkout.
+            // Weight the mix: ~70% requests, ~22% retries, ~8% errors.
             let message_type = match rng.below(100) {
-                0..=69 => EventType::PageView,
-                70..=91 => EventType::AddToCart,
-                _ => EventType::Checkout,
+                0..=69 => EventType::Request,
+                70..=91 => EventType::Retry,
+                _ => EventType::Error,
             };
             let route = ROUTES[rng.below(ROUTES.len() as u64) as usize].to_owned();
             let latency_ms = 30 + rng.below(600) as u32;
@@ -275,7 +275,7 @@ async fn live_monitor(laser: &Laser, expected: usize) -> Result<(), LaserError> 
         .await?;
 
     let mut seen = 0usize;
-    let mut checkouts = 0usize;
+    let mut errors = 0usize;
     while seen < expected {
         let received = match tokio::time::timeout(LIVE_TIMEOUT, consumer.next()).await {
             Ok(Some(received)) => received?,
@@ -294,13 +294,13 @@ async fn live_monitor(laser: &Laser, expected: usize) -> Result<(), LaserError> 
             }
         };
         if let Ok(event) = received.json::<Event>()
-            && matches!(event.message_type, EventType::Checkout)
+            && matches!(event.message_type, EventType::Error)
         {
-            checkouts += 1;
+            errors += 1;
         }
         seen += 1;
         if seen.is_multiple_of(LIVE_SNAPSHOT_EVERY) || seen == expected {
-            info!("live ticker: {seen}/{expected} events, {checkouts} checkouts");
+            info!("live ticker: {seen}/{expected} events, {errors} errors");
         }
     }
     consumer.shutdown().await?;
@@ -355,7 +355,7 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
 
 // The analytics read model: the aggregates a dashboard asks of a clickstream.
 async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
-    // Funnel: how many events of each kind, grouped.
+    // Mix: how many events of each kind, grouped.
     let by_kind = laser
         .query(TOPIC)
         .count()
@@ -391,14 +391,14 @@ async fn run_analytics(laser: &Laser) -> Result<(), LaserError> {
         info!("  {latency:>5}ms  {route}");
     }
 
-    // Checkouts only, via the reserved `message_type` field.
-    let checkouts = laser
+    // Errors only, via the reserved `message_type` field.
+    let errors = laser
         .query(TOPIC)
-        .message_type(EventType::Checkout.to_string())
+        .message_type(EventType::Error.to_string())
         .count()
         .fetch()
         .await?;
-    info!("checkouts: {}", scalar(&checkouts));
+    info!("errors: {}", scalar(&errors));
 
     // First 5 minutes of the session, via the reserved `ts` field and a time range.
     let first_window = laser
@@ -555,8 +555,8 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
     // Well-formed: passes the schema, materializes.
     let valid = Event {
         user_id: "alice".to_owned(),
-        message_type: EventType::Checkout,
-        route: "/checkout".to_owned(),
+        message_type: EventType::Error,
+        route: "/api/v1/jobs".to_owned(),
         latency_ms: 120,
         ts: BASE_US,
     };
@@ -572,7 +572,7 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
     guarded
         .publish()
         .raw_bytes(
-            br#"{"user_id":"mallory","message_type":"checkout","route":"/checkout","latency_ms":"fast","ts":1}"#.to_vec(),
+            br#"{"user_id":"mallory","message_type":"error","route":"/api/v1/jobs","latency_ms":"fast","ts":1}"#.to_vec(),
             ContentType::Json,
         )
         .schema_id(schema_id)
@@ -605,7 +605,7 @@ async fn run_guarded_ingest(laser: &Laser) -> Result<(), LaserError> {
                 ));
             }
             info!(
-                "guarded index holds {settled} row: the valid checkout landed, the malformed event was rejected by the JSON Schema and never materialized"
+                "guarded index holds {settled} row: the valid error event landed, the malformed event was rejected by the JSON Schema and never materialized"
             );
             return Ok(());
         }

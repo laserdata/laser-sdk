@@ -27,7 +27,7 @@ import {
 
 export const EXAMPLE = "event-analytics"
 export const TOPIC = "clickstream"
-const CHECKPOINT = "clickstream-export"
+const CHECKPOINT = "clickstream-export-cursor"
 const GUARDED_TOPIC = "clickstream_guarded"
 const USER_ID = "user_id"
 const MESSAGE_TYPE = "message_type"
@@ -52,13 +52,13 @@ const VISITORS = [
   "oscar"
 ] as const
 const ROUTES = [
-  "/home",
-  "/product/42",
-  "/product/7",
-  "/search",
-  "/cart",
-  "/checkout",
-  "/pricing",
+  "/healthz",
+  "/api/v1/hosts/42",
+  "/api/v1/jobs/7",
+  "/api/v1/metrics",
+  "/api/v1/hosts",
+  "/api/v1/jobs",
+  "/login",
   "/docs"
 ] as const
 const BASE_MICROS = 1_900_000_000_000_000
@@ -68,7 +68,7 @@ const LIVE_GROUP = "event-analytics-live"
 
 export interface ClickEvent {
   readonly user_id: string
-  readonly message_type: "page_view" | "add_to_cart" | "checkout"
+  readonly message_type: "request" | "retry" | "error"
   readonly route: string
   readonly latency_ms: number
   readonly ts: number
@@ -80,7 +80,7 @@ function decodeEvent(bytes: Uint8Array): ClickEvent {
   const event = value as Partial<ClickEvent>
   if (
     typeof event.user_id !== "string" ||
-    !["page_view", "add_to_cart", "checkout"].includes(event.message_type ?? "") ||
+    !["request", "retry", "error"].includes(event.message_type ?? "") ||
     typeof event.route !== "string" ||
     !Number.isSafeInteger(event.latency_ms) ||
     !Number.isSafeInteger(event.ts)
@@ -101,7 +101,7 @@ const CLICK_EVENT_SCHEMA = JSON.stringify({
   required: ["user_id", "message_type", "route", "latency_ms", "ts"],
   properties: {
     user_id: { type: "string" },
-    message_type: { enum: ["page_view", "add_to_cart", "checkout"] },
+    message_type: { enum: ["request", "retry", "error"] },
     route: { type: "string" },
     latency_ms: { type: "integer" },
     ts: { type: "integer" }
@@ -118,7 +118,7 @@ export function clickstream(count: number): readonly ClickEvent[] {
   let timestamp = BASE_MICROS
   return Array.from({ length: count }, () => {
     const roll = rng.below(100)
-    const messageType = roll < 70 ? "page_view" : roll < 92 ? "add_to_cart" : "checkout"
+    const messageType = roll < 70 ? "request" : roll < 92 ? "retry" : "error"
     const event: ClickEvent = {
       user_id: rng.pick(VISITORS),
       message_type: messageType,
@@ -183,7 +183,7 @@ async function guardedIngest(laser: Laser, sample: ClickEvent): Promise<void> {
   const schemaId = await laser
     .schemas()
     .register({ kind: "jsonSchema", schema: CLICK_EVENT_SCHEMA })
-    .name("ClickEvent")
+    .name("clickstream_event")
     .version(1)
     .send()
   console.log(`allocated writer-schema id ${String(schemaId)} for the ClickEvent guard`)
@@ -207,7 +207,7 @@ async function guardedIngest(laser: Laser, sample: ClickEvent): Promise<void> {
     .publish()
     .rawBytes(
       new TextEncoder().encode(
-        `{"user_id":"mallory","message_type":"checkout","route":"/checkout","latency_ms":"fast","ts":1}`
+        `{"user_id":"mallory","message_type":"error","route":"/api/v1/jobs","latency_ms":"fast","ts":1}`
       ),
       ContentType.Json
     )
@@ -250,8 +250,8 @@ async function runAnalytics(laser: Laser): Promise<void> {
     ])
   ])
 
-  const checkouts = await laser.query(TOPIC).messageType("checkout").count().fetch()
-  console.log(`checkouts: ${scalar(checkouts)}`)
+  const errors = await laser.query(TOPIC).messageType("error").count().fetch()
+  console.log(`errors: ${scalar(errors)}`)
 
   const start = BigInt(BASE_MICROS)
   const firstWindow = await laser
@@ -346,19 +346,14 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const publishing = publishClickstream(laser, events)
   phase("hot path: a live reader tails the stream while the producer runs")
   let seen = 0
-  let checkouts = 0
+  let errors = 0
   while (seen < count) {
     const message = await live.nextWithin(LIVE_TIMEOUT_MS)
-    if (message === null) {
-      throw new Error(
-        `no event arrived for ${String(LIVE_TIMEOUT_MS / 1_000)}s after ${String(seen)}/${String(count)}`
-      )
-    }
     seen += 1
-    if (CLICK_EVENT_CODEC.decode(message.payload).message_type === "checkout") checkouts += 1
+    if (CLICK_EVENT_CODEC.decode(message.payload).message_type === "error") errors += 1
   }
   await publishing
-  console.log(`live fold: ${String(seen)} events, ${String(checkouts)} checkouts`)
+  console.log(`live fold: ${String(seen)} events, ${String(errors)} errors`)
 
   phase("read model: a resumable downstream reader")
   await checkpointedExport(laser)

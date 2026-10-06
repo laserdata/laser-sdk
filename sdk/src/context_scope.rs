@@ -3,8 +3,8 @@ use crate::context::{Checkpoint, ContextAssembler, ContextMessage, ContextPolicy
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::memory::{
-    ConsolidationReport, MemoryBackend, MemoryHandle, MemoryItem, MemoryScope, RecallBuilder,
-    RememberBuilder,
+    ConsolidationReport, Feedback, MemoryBackend, MemoryHandle, MemoryId, MemoryItem, MemoryScope,
+    RecallBuilder, RememberBuilder,
 };
 use crate::provenance::{AgentTopic, Provenance};
 use crate::snapshot::SnapshotStore;
@@ -226,6 +226,22 @@ impl ScopedMemory {
             .conversation(self.conversation)
             .build();
         self.handle.consolidate(&scope, max_items).await
+    }
+
+    /// Forget the item `id` in this conversation.
+    pub async fn forget(&self, id: MemoryId) -> Result<(), LaserError> {
+        self.handle.forget(&self.scope(), id).await
+    }
+
+    /// Record `feedback` on a recalled item in this conversation.
+    pub async fn improve(&self, feedback: Feedback) -> Result<MemoryId, LaserError> {
+        self.handle.improve(&self.scope(), feedback).await
+    }
+
+    fn scope(&self) -> MemoryScope {
+        MemoryScope::builder()
+            .conversation(self.conversation)
+            .build()
     }
 
     /// The underlying handle, for the cross-conversation verbs this scoped face

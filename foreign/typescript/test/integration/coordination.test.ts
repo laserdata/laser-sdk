@@ -29,7 +29,6 @@ void test("given_a_committed_group_offset_when_consumption_is_probed_then_should
     })
     try {
       const received = await consumer.nextWithin(2_000)
-      assert.ok(received !== null)
       await consumer.commit(received)
       const ids = await laser[INTERNAL_TRANSPORT]().resolveStreamTopicIds?.(
         stream,

@@ -40,6 +40,14 @@ pub trait LocalManagedKvTransport {
     /// an acquisition recovery wait and a lockstep transport cannot read a stale
     /// reply as the answer to the next request.
     async fn reset(&self);
+
+    /// Close the transport permanently when supported. The default retires its connection.
+    fn close(&self) -> impl Future<Output = ()>
+    where
+        Self: Sync,
+    {
+        async { self.reset().await }
+    }
 }
 
 /// The object-safe counterpart of [`ManagedKvTransport`], for a consumer that
@@ -73,6 +81,10 @@ pub trait DynManagedKvTransport: Send + Sync {
     /// See [`ManagedKvTransport::reset`]. The same contract holds: in-flight
     /// work must stop before this returns.
     async fn reset(&self);
+
+    async fn close(&self) {
+        self.reset().await;
+    }
 }
 
 /// A [`ManagedKvTransport`] chosen at runtime: the shape a consumer stores when
@@ -93,6 +105,10 @@ impl<T: ManagedKvTransport + Send + Sync> DynManagedKvTransport for T {
     async fn reset(&self) {
         ManagedKvTransport::reset(self).await;
     }
+
+    async fn close(&self) {
+        ManagedKvTransport::close(self).await;
+    }
 }
 
 // The other direction, so boxing a transport does not cost the typed client:
@@ -110,6 +126,10 @@ impl ManagedKvTransport for SharedKvTransport {
     async fn reset(&self) {
         DynManagedKvTransport::reset(&**self).await;
     }
+
+    async fn close(&self) {
+        DynManagedKvTransport::close(&**self).await;
+    }
 }
 
 /// A coordination transport over its own dedicated connection, built lazily
@@ -126,6 +146,7 @@ pub struct DedicatedKvTransport {
     connection_string: String,
     slot: Mutex<Option<Laser>>,
     closed: AtomicBool,
+    retirement: Mutex<()>,
 }
 
 impl DedicatedKvTransport {
@@ -135,10 +156,18 @@ impl DedicatedKvTransport {
             connection_string: connection_string.into(),
             slot: Mutex::new(None),
             closed: AtomicBool::new(false),
+            retirement: Mutex::new(()),
         }
     }
 
+    /// Close this dedicated transport. Reset retires a connection and permits later reuse.
+    pub async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        ManagedKvTransport::reset(self).await;
+    }
+
     async fn client(&self) -> Result<Laser, LaserError> {
+        let _retirement = self.retirement.lock().await;
         let mut slot = self.slot.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(crate::iggy::prelude::IggyError::ClientShutdown.into());
@@ -182,10 +211,15 @@ impl ManagedKvTransport for DedicatedKvTransport {
     }
 
     async fn reset(&self) {
+        let _retirement = self.retirement.lock().await;
         let retired = self.slot.lock().await.take();
         if let Some(laser) = retired {
             let _ = laser.client().shutdown().await;
         }
+    }
+
+    async fn close(&self) {
+        DedicatedKvTransport::close(self).await;
     }
 }
 
@@ -272,6 +306,8 @@ pub struct FencedLeaseClient<T> {
     client_id: u128,
     transport: T,
     attempt_timeout: Duration,
+    closed: AtomicBool,
+    retirement: Mutex<()>,
 }
 
 impl FencedLeaseClient<DedicatedKvTransport> {
@@ -279,11 +315,6 @@ impl FencedLeaseClient<DedicatedKvTransport> {
     /// connected lazily on first use.
     pub fn connect_dedicated(connection_string: impl Into<String>) -> Self {
         Self::new(DedicatedKvTransport::new(connection_string))
-    }
-
-    pub(crate) async fn close(&self) {
-        self.transport.closed.store(true, Ordering::Release);
-        ManagedKvTransport::reset(&self.transport).await;
     }
 }
 
@@ -294,6 +325,8 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
             client_id: u128::from(ulid::Ulid::generate()),
             transport,
             attempt_timeout: DEFAULT_ATTEMPT_TIMEOUT,
+            closed: AtomicBool::new(false),
+            retirement: Mutex::new(()),
         }
     }
 
@@ -303,6 +336,14 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
     pub fn with_attempt_timeout(mut self, timeout: Duration) -> Self {
         self.attempt_timeout = timeout;
         self
+    }
+
+    /// Close the client and retire its transport. Later executions fail before readiness or send.
+    pub async fn close(&self) {
+        let _retirement = self.retirement.lock().await;
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.transport.close().await;
+        }
     }
 
     /// Prepare a lease acquisition. Validation happens here, once, so a retry
@@ -525,6 +566,9 @@ impl<T: ManagedKvTransport + Sync> FencedLeaseClient<T> {
     }
 
     async fn ready_with_timeout(&self, timeout: Duration) -> Result<(), LaserError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(crate::iggy::prelude::IggyError::ClientShutdown.into());
+        }
         match tokio::time::timeout(timeout, self.transport.ready()).await {
             Err(_elapsed) => {
                 self.transport.reset().await;

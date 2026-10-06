@@ -1448,7 +1448,10 @@ mod tests {
     #[test]
     fn given_path_builders_when_rendered_then_should_match_the_router() {
         assert_eq!(CAPABILITIES_PATH, "/agdx/capabilities");
-        assert_eq!(projection_path("order.v1"), "/agdx/projections/order.v1");
+        assert_eq!(
+            projection_path("reading.v1"),
+            "/agdx/projections/reading.v1"
+        );
         assert_eq!(schema_path(7), "/agdx/schemas/7");
         assert_eq!(schema_decode_path(7), "/agdx/schemas/7/decode");
         assert_eq!(kv_namespace_path("sessions"), "/agdx/kv/sessions");
@@ -1598,10 +1601,10 @@ mod tests {
 
     #[test]
     fn given_a_typed_error_when_made_into_a_body_then_should_carry_code_and_message() {
-        let body = ErrorBody::from(&QueryError::IndexNotFound("orders".to_owned()));
+        let body = ErrorBody::from(&QueryError::IndexNotFound("readings".to_owned()));
         assert_eq!(body.code, ResultCode::NotFound);
         assert_eq!(body.http_status(), 404);
-        assert!(body.message.contains("orders"));
+        assert!(body.message.contains("readings"));
         // Round-trips as JSON, the form the HTTP surface serves it in.
         let json = serde_json::to_string(&body).expect("serializes");
         let back: ErrorBody = serde_json::from_str(&json).expect("deserializes");
@@ -1637,21 +1640,21 @@ mod tests {
     #[test]
     fn given_list_filters_when_url_encoded_then_field_names_match_the_param_consts() {
         let projections = ProjectionListQuery {
-            name_contains: Some("order".to_owned()),
-            id_prefix: Some("order.".to_owned()),
+            name_contains: Some("reading".to_owned()),
+            id_prefix: Some("reading.".to_owned()),
             ..Default::default()
         };
         let encoded = serde_urlencoded::to_string(&projections).expect("encodes");
-        assert_eq!(encoded, "name_contains=order&id_prefix=order.");
+        assert_eq!(encoded, "name_contains=reading&id_prefix=reading.");
         assert!(encoded.contains(&format!("{PARAM_NAME_CONTAINS}=")));
         assert!(encoded.contains(&format!("{PARAM_ID_PREFIX}=")));
 
         let schemas = SchemaListQuery {
-            name_contains: Some("Order".to_owned()),
+            name_contains: Some("Reading".to_owned()),
         };
         assert_eq!(
             serde_urlencoded::to_string(&schemas).expect("encodes"),
-            "name_contains=Order"
+            "name_contains=Reading"
         );
     }
 }

@@ -154,7 +154,7 @@ async fn main() -> Result<(), LaserError> {
             )
             .request_input(
                 AgentTopic::Responses,
-                b"approve a $500 refund?".to_vec(),
+                b"approve draining node-7?".to_vec(),
                 Duration::from_secs(15),
             )
             .await?;

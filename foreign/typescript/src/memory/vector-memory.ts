@@ -81,6 +81,8 @@ export class VectorMemory implements Memory {
 
   async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
     const limit = query.limit ?? 50
+    if (!Number.isSafeInteger(limit) || limit < 0)
+      throw new InvalidError("memory recall limit must be a non-negative safe integer")
     const strategy = query.strategy ?? RecallStrategy.Auto
     const text = query.semantic
     const wantsSemantic =
@@ -103,26 +105,43 @@ export class VectorMemory implements Memory {
         .map((entry) => copyItem(entry.item))
     }
 
-    return matched
-      .map((entry) => {
-        const semantic =
-          queryEmbedding === undefined ? undefined : cosine(queryEmbedding, entry.embedding)
-        const keyword =
-          queryTokens === undefined ? undefined : keywordScore(queryTokens, entry.item.payload)
-        const score = entry.feedback + (semantic ?? 0) + (keyword ?? 0)
-        const signals: RecallSignal[] = []
-        if (semantic !== undefined)
-          signals.push({ strategy: RecallStrategy.Semantic, rank: 0, score: semantic })
-        if (keyword !== undefined)
-          signals.push({ strategy: RecallStrategy.Keyword, rank: 0, score: keyword })
-        if (entry.feedback !== 0) {
-          signals.push({ strategy: RecallStrategy.Auto, rank: 0, score: entry.feedback })
-        }
-        return { entry, score, signals }
-      })
+    const scored = matched.map((entry) => {
+      const semantic =
+        queryEmbedding === undefined ? undefined : cosine(queryEmbedding, entry.embedding)
+      const keyword =
+        queryTokens === undefined ? undefined : keywordScore(queryTokens, entry.item.payload)
+      const score = entry.feedback + (semantic ?? 0) + (keyword ?? 0)
+      const signals: RecallSignal[] = []
+      if (semantic !== undefined)
+        signals.push({ strategy: RecallStrategy.Semantic, rank: 0, score: semantic })
+      if (keyword !== undefined)
+        signals.push({ strategy: RecallStrategy.Keyword, rank: 0, score: keyword })
+      if (entry.feedback !== 0) {
+        signals.push({ strategy: RecallStrategy.Auto, rank: 0, score: entry.feedback })
+      }
+      return { entry, score, signals }
+    })
+    const ranks = new Map<RecallStrategy, Map<string, number>>()
+    for (const strategy of [RecallStrategy.Semantic, RecallStrategy.Keyword, RecallStrategy.Auto]) {
+      const active = scored
+        .flatMap(({ entry, signals }) => {
+          const signal = signals.find((candidate) => candidate.strategy === strategy)
+          return signal === undefined ? [] : [{ id: entry.id.toString(), score: signal.score ?? 0 }]
+        })
+        .sort((left, right) => right.score - left.score)
+      ranks.set(strategy, new Map(active.map(({ id }, rank) => [id, rank])))
+    }
+    return scored
       .sort((left, right) => right.score - left.score)
       .slice(0, limit)
-      .map(({ entry, score, signals }) => ({ ...copyItem(entry.item), score, signals }))
+      .map(({ entry, score, signals }) => ({
+        ...copyItem(entry.item),
+        score,
+        signals: signals.map((signal) => ({
+          ...signal,
+          rank: ranks.get(signal.strategy)?.get(entry.id.toString()) ?? 0
+        }))
+      }))
   }
 
   async improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId> {
@@ -188,9 +207,7 @@ function matchesScope(
     (agent === undefined || stored.agent?.equals(agent) === true) &&
     (requested.conversation === undefined ||
       stored.conversation?.equals(requested.conversation) === true) &&
-    (requested.application === undefined || stored.application === requested.application) &&
-    (requested.lifetime === undefined ||
-      (stored.lifetime ?? Lifetime.Session) === requested.lifetime)
+    (requested.application === undefined || stored.application === requested.application)
   )
 }
 
@@ -206,14 +223,11 @@ function cosine(left: readonly number[], right: readonly number[]): number {
   let dot = 0
   let leftNorm = 0
   let rightNorm = 0
-  const length = Math.min(left.length, right.length)
-  for (let index = 0; index < length; index += 1) {
-    const leftValue = left[index] ?? 0
-    const rightValue = right[index] ?? 0
-    dot += leftValue * rightValue
-    leftNorm += leftValue * leftValue
-    rightNorm += rightValue * rightValue
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    dot += (left[index] ?? 0) * (right[index] ?? 0)
   }
+  for (const component of left) leftNorm += component * component
+  for (const component of right) rightNorm += component * component
   return leftNorm === 0 || rightNorm === 0 ? 0 : dot / Math.sqrt(leftNorm * rightNorm)
 }
 
@@ -233,7 +247,7 @@ function keywordScore(query: ReadonlySet<string>, payload: Uint8Array): number {
   for (const token of query) if (body.has(token)) hits += 1
   return hits / query.size
 }
-import { NoStreamError } from "../client/errors.js"
+import { InvalidError, NoStreamError } from "../client/errors.js"
 import { INTERNAL_GOVERN } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ActionKind } from "../govern.js"

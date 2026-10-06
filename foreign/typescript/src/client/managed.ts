@@ -1,6 +1,14 @@
 import type { LaserTransport } from "../iggy/apache-iggy.js"
 import type { ManagedCommand } from "../wire/commands.js"
-import { FilterExecutionError, ProtocolError } from "./errors.js"
+import {
+  CheckpointExecutionError,
+  FilterExecutionError,
+  ForkExecutionError,
+  GraphExecutionError,
+  KvExecutionError,
+  ProtocolError,
+  QueryExecutionError
+} from "./errors.js"
 import { type Capabilities, requireCapability } from "./capabilities.js"
 
 export type ManagedTransport = Pick<LaserTransport, "sendManaged">
@@ -22,10 +30,23 @@ function requireVersion<Request, Reply>(
     })
   }
   if (got !== command.version.expected) {
-    throw new ProtocolError(
-      `${command.version.surface} wire version mismatch: expected ${String(command.version.expected)}, got ${String(got)}`,
-      { commandCode: command.code }
-    )
+    const message = `${command.version.surface} wire version mismatch: expected ${String(got)}, got ${String(command.version.expected)}`
+    const detail = { kind: "version" as const, expected: got ?? 0, got: command.version.expected }
+    switch (command.version.surface) {
+      case "query":
+        throw new QueryExecutionError(message, detail)
+      case "kv":
+        throw new KvExecutionError(message, detail)
+      case "fork":
+        throw new ForkExecutionError(message, detail)
+      case "graph":
+        throw new GraphExecutionError(message, detail)
+      case "checkpoint":
+        throw new CheckpointExecutionError(message, detail)
+      case "filter":
+      case "control":
+        throw new ProtocolError(message, { commandCode: command.code })
+    }
   }
 }
 

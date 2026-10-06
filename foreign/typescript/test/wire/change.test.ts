@@ -16,7 +16,7 @@ void test("given_the_change_record_fixture_when_decoded_then_should_preserve_the
   )
   assert.deepEqual(record, {
     v: 1,
-    index: "orders_v1",
+    index: "readings_v1",
     partitionId: 3,
     fromOffset: 100n,
     toOffset: 141n,

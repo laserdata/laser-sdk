@@ -92,7 +92,7 @@ void test(
       })
       await within(topic.send(new TextEncoder().encode("before-restart")), 3_000)
       const before = await consumer.nextWithin(3_000)
-      assert.equal(new TextDecoder().decode(before?.payload), "before-restart")
+      assert.equal(new TextDecoder().decode(before.payload), "before-restart")
       await within(consumer.shutdown(), 3_000)
       consumer = undefined
 
@@ -118,7 +118,7 @@ void test(
         pollIntervalMs: 10
       })
       const after = await within(consumer.nextWithin(5_000), 6_000)
-      assert.equal(new TextDecoder().decode(after?.payload), "after-restart")
+      assert.equal(new TextDecoder().decode(after.payload), "after-restart")
     } finally {
       try {
         if (consumer !== undefined) await within(consumer.shutdown(), 500).catch(() => undefined)

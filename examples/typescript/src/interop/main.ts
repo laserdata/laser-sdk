@@ -123,7 +123,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   phase("Human-in-the-loop: request_input -> respond_input")
   const decision = await laser
     .agdx(AgentTopic.HumanInput, AgentId.new("orchestrator"), ConversationId.new())
-    .requestInput(AgentTopic.Responses, utf8("approve credit?"), 15_000)
+    .requestInput(AgentTopic.Responses, utf8("approve draining node-7?"), 15_000)
   console.log(`human decision: ${decoder.decode(decision)}`)
 }
 

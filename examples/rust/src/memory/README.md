@@ -20,7 +20,7 @@ The durable phase publishes memory records to a topic and reads the managed view
 The managed graph phase connects incident entities through typed relationships:
 
 5. Upsert services, components, teams, and incidents with `depends_on`, `mitigated_by`, `replicates`, `owns`, and `affected` relationships.
-6. Read the neighbors of `checkout`.
+6. Read the neighbors of `gateway`.
 7. Follow `depends_on` from each `Service` to its components.
 8. Follow `affected` from an incident to the entities it affected.
 9. Follow source references from graph elements to their original records.

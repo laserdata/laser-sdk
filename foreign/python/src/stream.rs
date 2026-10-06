@@ -12,7 +12,9 @@ use crate::typed::{PyTypedRecords, body_to_json};
 use iggy::prelude::IggyExpiry;
 use laser_sdk::error::LaserError;
 use laser_sdk::laser::Laser;
+use laser_sdk::typed::TypedTopic;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,6 +44,7 @@ impl PyLaser {
             stream: None,
             name,
             cls,
+            form: TopicForm::Json,
         }
     }
 }
@@ -72,6 +75,7 @@ impl PyStream {
             stream: Some(self.name.clone()),
             name,
             cls,
+            form: TopicForm::Json,
         }
     }
 
@@ -107,6 +111,36 @@ pub struct PyTopic {
     stream: Option<String>,
     name: String,
     cls: Option<Py<PyAny>>,
+    form: TopicForm,
+}
+
+// How the typed handle encodes bodies and decodes records: the JSON serde form
+// (the default), the CBOR serde form, or a registered writer schema resolved
+// and compiled once when the handle is built.
+#[derive(Clone)]
+enum TopicForm {
+    Json,
+    Cbor,
+    Schema(Box<TypedTopic<serde_json::Value>>),
+}
+
+impl TopicForm {
+    fn typed(&self, topic: laser_sdk::stream::Topic) -> TypedTopic<serde_json::Value> {
+        match self {
+            Self::Json => topic.json(),
+            Self::Cbor => topic.cbor(),
+            Self::Schema(typed) => (**typed).clone(),
+        }
+    }
+}
+
+impl PyTopic {
+    fn handle(&self) -> laser_sdk::stream::Topic {
+        match &self.stream {
+            Some(stream) => self.laser.stream(stream.clone()).topic(&*self.name),
+            None => self.laser.topic(&*self.name),
+        }
+    }
 }
 
 #[gen_stub_pymethods]
@@ -126,38 +160,172 @@ impl PyTopic {
     #[pyo3(signature = (body=None))]
     fn publish(&self, body: Option<&Bound<'_, PyAny>>) -> PyResult<PyPublish> {
         let request = PyPublish::new(self.laser.clone(), self.stream.clone(), self.name.clone());
-        match body {
-            Some(body) => Ok(request.with_json_body(body_to_json(body)?)),
-            None => Ok(request),
+        match (body, &self.form) {
+            (Some(body), TopicForm::Json) => Ok(request.with_json_body(body_to_json(body)?)),
+            (Some(body), form) => {
+                request.with_typed_body(form.typed(self.handle()), body_to_json(body)?)
+            }
+            (None, TopicForm::Json) => Ok(request),
+            (None, _) => Err(InvalidError::new_err(
+                "a CBOR or schema-bound publish requires a body",
+            )),
         }
     }
 
+    /// The typed handle in the CBOR serde form: the same contract as `cls=`
+    /// with a binary self-describing body and `agdx.ct=cbor`. `publish(body)`
+    /// encodes CBOR and `records(reader_name)` decodes it back into `cls`, or
+    /// into a plain Python object when no class is set.
+    #[pyo3(signature = (cls=None))]
+    fn cbor(&self, cls: Option<Py<PyAny>>) -> PyTopic {
+        PyTopic {
+            laser: self.laser.clone(),
+            stream: self.stream.clone(),
+            name: self.name.clone(),
+            cls: cls
+                .or_else(|| Python::attach(|py| self.cls.as_ref().map(|cls| cls.clone_ref(py)))),
+            form: TopicForm::Cbor,
+        }
+    }
+
+    /// The typed handle bound to registered writer schema `schema_id`: resolves
+    /// the definition from the managed registry and compiles it once, so every
+    /// `publish(body)` validates and encodes against it in the client and
+    /// stamps `agdx.ct` and `agdx.sid`. A body the schema rejects raises
+    /// `CodecError` before any byte leaves the process. The registry is
+    /// managed, so this needs Laser Stack or LaserData Cloud. Raises
+    /// `InvalidError` when the schema is not registered.
+    #[pyo3(signature = (schema_id, cls=None))]
+    fn schema<'py>(
+        &self,
+        py: Python<'py>,
+        schema_id: u32,
+        cls: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let stream = self.stream.clone();
+        let name = self.name.clone();
+        let cls = cls.or_else(|| self.cls.as_ref().map(|cls| cls.clone_ref(py)));
+        future_into_py(py, async move {
+            let topic = match &stream {
+                Some(stream) => laser.stream(stream.clone()).topic(&*name),
+                None => laser.topic(&*name),
+            };
+            let typed = topic
+                .schema::<serde_json::Value>(schema_id)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(PyTopic {
+                laser,
+                stream,
+                name,
+                cls,
+                form: TopicForm::Schema(Box::new(typed)),
+            })
+        })
+    }
+
     /// The typed reader over this topic under the consumer identity
-    /// `reader_name`,
-    /// decoding every record into the topic's `cls` (pass `cls=` at
-    /// `laser.topic(..)`). Own the offsets exactly like `replay()`: persist
-    /// `offsets` and resume with `from_offsets=`.
+    /// `reader_name`, decoding every record into the topic's `cls` (pass
+    /// `cls=` at `laser.topic(..)`, `cbor(..)`, or `schema(..)`). A topic
+    /// without a class yields each decoded value as a plain Python object.
+    /// Own the offsets exactly like `replay()`: persist `offsets` and resume
+    /// with `from_offsets=`.
     #[pyo3(signature = (reader_name, *, batch=None, from_offsets=None))]
     fn records(
         &self,
         reader_name: String,
         batch: Option<u32>,
         from_offsets: Option<Vec<u64>>,
-    ) -> PyResult<PyTypedRecords> {
-        let Some(cls) = &self.cls else {
-            return Err(InvalidError::new_err(
-                "records() needs a typed topic: open it with laser.topic(name, cls=YourClass)",
-            ));
-        };
-        Ok(PyTypedRecords::new(
-            self.laser.clone(),
-            self.stream.clone(),
+    ) -> PyTypedRecords {
+        PyTypedRecords::new(
+            self.form.typed(self.handle()),
             self.name.clone(),
-            Python::attach(|py| cls.clone_ref(py)),
+            Python::attach(|py| self.cls.as_ref().map(|cls| cls.clone_ref(py))),
             reader_name,
             batch,
             from_offsets.unwrap_or_default(),
-        ))
+        )
+    }
+
+    /// One raw message with explicit user `headers` (a dict of header name to
+    /// value), the zero-overhead path. `partition_key` keeps per-key order,
+    /// `None` lets the producer balance across partitions. Returns the commit
+    /// confirmations.
+    #[pyo3(signature = (payload, *, headers=None, partition_key=None))]
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        payload: &Bound<'_, PyAny>,
+        headers: Option<&Bound<'_, PyDict>>,
+        partition_key: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.handle();
+        let payload = crate::convert::payload_bytes(payload)?;
+        let headers = crate::transport::headers(headers)?;
+        future_into_py(py, async move {
+            let response = handle
+                .send(payload, headers, partition_key.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            Ok(crate::transport::PySendMessagesResponse::from(response))
+        })
+    }
+
+    /// Many raw payloads in one Iggy send, all sharing `partition_key` (or
+    /// balanced when `None`). An empty list is a cheap no-op.
+    #[pyo3(signature = (payloads, *, partition_key=None))]
+    fn batch<'py>(
+        &self,
+        py: Python<'py>,
+        payloads: Vec<Bound<'_, PyAny>>,
+        partition_key: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.handle();
+        let messages = payloads
+            .iter()
+            .map(|payload| {
+                let bytes = crate::convert::payload_bytes(payload)?;
+                iggy::prelude::IggyMessage::builder()
+                    .payload(bytes.into())
+                    .build()
+                    .map_err(|error| to_pyerr(error.into()))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        future_into_py(py, async move {
+            let response = handle
+                .batch(messages, partition_key.as_deref())
+                .await
+                .map_err(to_pyerr)?;
+            Ok(crate::transport::PySendMessagesResponse::from(response))
+        })
+    }
+
+    /// A size-and-time batching publisher over this topic: queued payloads
+    /// flush as one append when `max_records` or `max_bytes` trips, or after
+    /// `linger_ms`. `partition_key` keys every batch.
+    #[pyo3(signature = (*, max_records=None, max_bytes=None, linger_ms=None, partition_key=None))]
+    fn batching(
+        &self,
+        max_records: Option<usize>,
+        max_bytes: Option<usize>,
+        linger_ms: Option<u64>,
+        partition_key: Option<String>,
+    ) -> PyResult<crate::batching::PyBatchingProducer> {
+        let mut builder = self.handle().batching().map_err(to_pyerr)?;
+        if let Some(n) = max_records {
+            builder = builder.max_records(n);
+        }
+        if let Some(n) = max_bytes {
+            builder = builder.max_bytes(n);
+        }
+        if let Some(ms) = linger_ms {
+            builder = builder.linger(Duration::from_millis(ms));
+        }
+        if let Some(key) = partition_key {
+            builder = builder.partition_key(key);
+        }
+        Ok(crate::batching::PyBatchingProducer::new(builder))
     }
 
     /// Start a batch publish that flushes 1..N records in a single Iggy send.
@@ -168,7 +336,12 @@ impl PyTopic {
     /// Build a Laser direct producer. This is the full streaming hot path
     /// below the typed publish API: tune batching/linger/retries,
     /// topology creation, and default key or partition, then `await send(...)`.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0))]
+    /// `background=True` switches to Apache Iggy's buffered, sharded send mode
+    /// (`background_shards` workers, flushing at `batch_length` records or
+    /// after `linger_ms`). A send then returns once the record is queued, so
+    /// call `await producer.shutdown()` before exit or buffered records are
+    /// lost.
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0, background=false, background_shards=1))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
@@ -183,7 +356,14 @@ impl PyTopic {
         partitions: u32,
         message_expiry: &str,
         max_topic_size: u64,
+        background: bool,
+        background_shards: usize,
     ) -> PyResult<PyProducer> {
+        if background && background_shards == 0 {
+            return Err(InvalidError::new_err(
+                "producer background_shards must be greater than zero",
+            ));
+        }
         if batch_length == 0 {
             return Err(InvalidError::new_err(
                 "producer batch_length must be greater than zero",
@@ -215,6 +395,7 @@ impl PyTopic {
                 .parse::<IggyExpiry>()
                 .map_err(InvalidError::new_err)?,
             max_topic_size,
+            background: background.then_some(background_shards),
         };
         Ok(PyProducer::new(
             self.laser.stream(stream.clone()).topic(&*self.name),
@@ -227,7 +408,7 @@ impl PyTopic {
     /// and supports the same polling, batching, replay, retry, and commit modes
     /// as the Rust builder. Use `auto_commit="disabled"` plus
     /// `commit(message)` for commit-after-handle delivery.
-    #[pyo3(signature = (name, *, partition=0, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=1000, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    #[pyo3(signature = (name, *, partition=0, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,

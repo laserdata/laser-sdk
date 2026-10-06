@@ -24,9 +24,7 @@ pub use laser_wire::hello::{
 /// [`kv`](Self::kv), [`graph`](Self::graph), [`forks`](Self::forks),
 /// [`a2a_gateway`](Self::a2a_gateway)) are served by that plane. A surface's
 /// sub-features nest under it ([`QueryCaps::consistency`], [`KvCaps::cas`]) so a
-/// dependent feature cannot be advertised apart from the surface it refines. The
-/// platform-native features ([`sessions`](Self::sessions),
-/// [`durable_dedup`](Self::durable_dedup)) are not plane surfaces.
+/// dependent feature cannot be advertised apart from the surface it refines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Capabilities {
@@ -62,10 +60,6 @@ pub struct Capabilities {
     /// `filter()` handle: native filtered reads and, with a managed plane,
     /// the group policy catalog.
     pub filters: FilterCaps,
-    /// Platform-native session lifecycle (the infrastructure tracks a session).
-    pub sessions: bool,
-    /// Platform-side durable deduplication (survives a cold start without replay).
-    pub durable_dedup: bool,
     /// The wire op versions the server advertised in its `AGDX_HELLO` reply, or
     /// `None` against Apache Iggy and pre-versioned servers. When present, the
     /// SDK fails fast with the surface's typed `Version` error before a round-trip
@@ -211,8 +205,6 @@ impl Capabilities {
             group_policy_reads: false,
             evaluation: None,
         },
-        sessions: false,
-        durable_dedup: false,
         versions: None,
         backends: Vec::new(),
         hello: HelloOutcome::Unknown,
@@ -382,20 +374,6 @@ impl Capabilities {
             group_policy_reads: native,
             evaluation: None,
         };
-        self
-    }
-
-    /// Returns a copy with platform-native sessions.
-    #[must_use]
-    pub fn with_sessions(mut self, value: bool) -> Self {
-        self.sessions = value;
-        self
-    }
-
-    /// Returns a copy with platform-side durable dedup.
-    #[must_use]
-    pub fn with_durable_dedup(mut self, value: bool) -> Self {
-        self.durable_dedup = value;
         self
     }
 

@@ -27,7 +27,7 @@ export type TypedPollResult<T> =
   | { readonly kind: "record"; readonly record: TypedRecord<T> }
   | { readonly kind: "error"; readonly error: TypedDecodeError }
 
-interface TypedContract {
+export interface TypedContract {
   readonly contentType: ContentTypeValue
   readonly schemaId?: number
   readonly compiled?: CompiledSchema

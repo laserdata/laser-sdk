@@ -93,6 +93,11 @@ jobs:
           cache: npm
           cache-dependency-path: foreign/typescript/package-lock.json
       - run: npm ci
+      - name: Rust, Python, and TypeScript parity
+        working-directory: .
+        run: |
+          python3 -m unittest scripts/test_check_parity.py
+          python3 scripts/check-parity.py
       - run: npm run verify
       - run: npm audit --omit=dev --audit-level=high
 

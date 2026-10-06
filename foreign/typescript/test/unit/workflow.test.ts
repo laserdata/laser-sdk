@@ -108,82 +108,92 @@ void test("given_an_exclusive_namespace_when_dispatched_then_should_propagate_it
   assert.deepEqual(events, ["journal", "release"])
 })
 
-void test("given_a_slow_renewal_when_the_contract_completes_then_should_journal_while_renewal_remains_in_flight", async () => {
-  const events: string[] = []
-  let completeContract: ((value: Contract) => void) | undefined
-  let completeRenewal: (() => void) | undefined
-  let markRenewalStarted: (() => void) | undefined
-  const contractResult = new Promise<Contract>((resolve) => {
-    completeContract = resolve
-  })
-  const renewalResult = new Promise<void>((resolve) => {
-    completeRenewal = resolve
-  })
-  const renewalStarted = new Promise<void>((resolve) => {
-    markRenewalStarted = resolve
-  })
-  const contract = {
-    from: () => contract,
-    payload: () => contract,
-    inboxRoute: () => contract,
-    deadline: () => contract,
-    conversation: () => contract,
-    fence: () => contract,
-    send: () => contractResult
-  }
-  const fake = {
-    capabilities: () => Promise.resolve({ kv: { fencedLeases: true } }),
-    context: () => ({ fetch: () => Promise.resolve([]) }),
-    kv: () => ({
-      lease: () =>
-        Promise.resolve({
-          token: 41n,
-          grantedTtlMicros: 100_000n,
-          position: { topicGeneration: 1n, partition: 0, offset: 1n }
-        }),
-      renewLease: async () => {
-        events.push("renew-start")
-        markRenewalStarted?.()
-        await renewalResult
-        events.push("renew-finish")
-        return {
-          token: 41n,
-          grantedTtlMicros: 60_000_000n,
-          position: { topicGeneration: 1n, partition: 0, offset: 2n }
+void test(
+  "given_a_slow_renewal_when_the_contract_completes_then_should_journal_while_renewal_remains_in_flight",
+  { timeout: 5_000 },
+  async (context) => {
+    context.mock.method(performance, "now", () => 0)
+    const events: string[] = []
+    let completeContract: ((value: Contract) => void) | undefined
+    let completeRenewal: (() => void) | undefined
+    let markRenewalStarted: (() => void) | undefined
+    const contractResult = new Promise<Contract>((resolve) => {
+      completeContract = resolve
+    })
+    const renewalResult = new Promise<void>((resolve) => {
+      completeRenewal = resolve
+    })
+    const renewalStarted = new Promise<void>((resolve) => {
+      markRenewalStarted = resolve
+    })
+    const contract = {
+      from: () => contract,
+      payload: () => contract,
+      inboxRoute: () => contract,
+      deadline: () => contract,
+      conversation: () => contract,
+      fence: () => contract,
+      send: () => contractResult
+    }
+    const fake = {
+      capabilities: () => Promise.resolve({ kv: { fencedLeases: true } }),
+      context: () => ({ fetch: () => Promise.resolve([]) }),
+      kv: () => ({
+        lease: () =>
+          Promise.resolve({
+            token: 41n,
+            grantedTtlMicros: 100_000n,
+            position: { topicGeneration: 1n, partition: 0, offset: 1n }
+          }),
+        renewLease: async () => {
+          events.push("renew-start")
+          markRenewalStarted?.()
+          await renewalResult
+          events.push("renew-finish")
+          return {
+            token: 41n,
+            grantedTtlMicros: 60_000_000n,
+            position: { topicGeneration: 1n, partition: 0, offset: 2n }
+          }
+        },
+        release: () => {
+          events.push("release")
+          return Promise.resolve(true)
         }
-      },
-      release: () => {
-        events.push("release")
-        return Promise.resolve(true)
+      }),
+      contract: () => contract,
+      sendAgent: () => {
+        events.push("journal")
+        return Promise.resolve()
       }
-    }),
-    contract: () => contract,
-    sendAgent: () => {
-      events.push("journal")
-      return Promise.resolve()
-    }
-  } as unknown as Laser
+    } as unknown as Laser
 
-  const running = new Workflow(fake, "orchestrator")
-    .step("effect", routeTo(AgentId.new("worker")), () => new Uint8Array())
-    .exclusive()
-    .run()
-  await renewalStarted
-  assert.deepEqual(events, ["renew-start"])
-  completeContract?.({
-    kind: "completed",
-    reply: {
-      provenance: { conversationId: ConversationId.new() },
-      payload: new TextEncoder().encode("done"),
-      id: { partitionId: 0, offset: 0n }
-    }
-  })
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  assert.deepEqual(events, ["renew-start", "journal"])
-  completeRenewal?.()
-  await running
-  assert.deepEqual(events, ["renew-start", "journal", "renew-finish", "release"])
-})
+    const running = new Workflow(fake, "orchestrator")
+      .step("effect", routeTo(AgentId.new("worker")), () => new Uint8Array())
+      .exclusive()
+      .run()
+    const result = running.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error })
+    )
+    await renewalStarted
+    assert.deepEqual(events, ["renew-start"])
+    completeContract?.({
+      kind: "completed",
+      reply: {
+        provenance: { conversationId: ConversationId.new() },
+        payload: new TextEncoder().encode("done"),
+        id: { partitionId: 0, offset: 0n }
+      }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.deepEqual(events, ["renew-start", "journal"])
+    completeRenewal?.()
+    const outcome = await result
+    if (!outcome.ok) throw outcome.error
+    assert.deepEqual(events, ["renew-start", "journal", "renew-finish", "release"])
+  }
+)
 
 void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_and_use_a_fresh_holder", async () => {
   const holders: string[] = []

@@ -68,19 +68,36 @@ fn json_arg(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 impl PyLaser {
     /// An A2A bridge mapping JSON-RPC methods onto agent topics, publishing as
     /// `source`. Use it to drive an agent as an A2A task source from Python.
+    /// `capabilities` (skill ids, or capability descriptor dicts) become the
+    /// card's skills. `signing_key` signs the published task envelopes.
+    #[pyo3(signature = (source, request_topic, reply_topic, *, capabilities=None, signing_key=None))]
     fn a2a_bridge(
         &self,
         source: String,
         request_topic: String,
         reply_topic: String,
+        capabilities: Option<Vec<Bound<'_, PyAny>>>,
+        signing_key: Option<PyRef<'_, crate::sign::PySigningKey>>,
     ) -> PyResult<PyA2aBridge> {
+        let mut bridge = A2aBridge::new(
+            self.inner.clone(),
+            agent_id(&source)?,
+            static_topic(request_topic)?,
+            static_topic(reply_topic)?,
+        );
+        if let Some(capabilities) = capabilities {
+            bridge = bridge.with_capabilities(
+                capabilities
+                    .iter()
+                    .map(capability_descriptor)
+                    .collect::<PyResult<Vec<_>>>()?,
+            );
+        }
+        if let Some(key) = signing_key {
+            bridge = bridge.with_signing_key(key.inner.as_ref().clone());
+        }
         Ok(PyA2aBridge {
-            inner: Arc::new(A2aBridge::new(
-                self.inner.clone(),
-                agent_id(&source)?,
-                static_topic(request_topic)?,
-                static_topic(reply_topic)?,
-            )),
+            inner: Arc::new(bridge),
         })
     }
 
@@ -88,7 +105,9 @@ impl PyLaser {
     /// tool calls as `source`. `tools` / `resources` / `prompts` are lists of
     /// dicts (a tool is `{name, description?, input_schema}`, a prompt is
     /// `{prompt: {name, title?, description?, arguments?}, messages: [[role, text]]}`).
-    #[pyo3(signature = (source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_secs=None))]
+    /// `memory_tools=True` adds the conventional `remember` and `recall` tools.
+    /// `timeout_secs` bounds each tool call (default 30).
+    #[pyo3(signature = (source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_secs=None, memory_tools=false))]
     #[allow(clippy::too_many_arguments)]
     fn mcp_bridge(
         &self,
@@ -100,6 +119,7 @@ impl PyLaser {
         resources: Option<&Bound<'_, PyAny>>,
         prompts: Option<&Bound<'_, PyAny>>,
         timeout_secs: Option<f64>,
+        memory_tools: bool,
     ) -> PyResult<PyMcpBridge> {
         let tools: Vec<ToolSpec> = tools.map(py_to_de).transpose()?.unwrap_or_default();
         let resources: Vec<ResourceSpec> = resources.map(py_to_de).transpose()?.unwrap_or_default();
@@ -128,6 +148,9 @@ impl PyLaser {
         }
         if let Some(secs) = timeout_secs {
             bridge = bridge.with_timeout(duration_seconds(secs, "timeout_secs")?);
+        }
+        if memory_tools {
+            bridge = bridge.with_memory_tools();
         }
         Ok(PyMcpBridge {
             inner: Arc::new(bridge),
@@ -291,6 +314,17 @@ impl PyA2aBridge {
     fn card(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         ser_to_py(py, &self.inner.card())
     }
+
+    /// The Agent Card signed with `key`, so a client can verify who published
+    /// it.
+    fn signed_card(
+        &self,
+        py: Python<'_>,
+        key: PyRef<'_, crate::sign::PySigningKey>,
+    ) -> PyResult<Py<PyAny>> {
+        let card = self.inner.signed_card(&key.inner).map_err(to_pyerr)?;
+        ser_to_py(py, &card)
+    }
 }
 
 /// An MCP bridge: serve tools / resources / prompts over the log and route
@@ -353,4 +387,15 @@ impl PyMcpBridge {
             Python::attach(|py| ser_to_py(py, &result))
         })
     }
+}
+
+// A capability descriptor from a skill id string or a descriptor dict.
+fn capability_descriptor(
+    value: &Bound<'_, PyAny>,
+) -> PyResult<laser_sdk::wire::agent::CapabilityDescriptor> {
+    if let Ok(skill_id) = value.extract::<String>() {
+        return serde_json::from_value(serde_json::json!({ "skill_id": skill_id }))
+            .map_err(|e| crate::errors::CodecError::new_err(e.to_string()));
+    }
+    py_to_de(value)
 }

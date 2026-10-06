@@ -33,13 +33,13 @@ impl AgentHandler for Executor {
 #[serial_test::serial(integration)]
 async fn given_a_planner_and_executor_when_a_command_arrives_then_should_hand_off_across_topics() {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("planner".parse().expect("planner is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Planner)
         .build()
         .spawn(laser.clone());
-    Agent::builder()
+    let _agent_lifetime_2 = Agent::builder()
         .id("executor".parse().expect("executor is a valid agent id"))
         .listen_on(AgentTopic::ToolCalls)
         .respond_on(AgentTopic::Responses)

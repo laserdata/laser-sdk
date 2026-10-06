@@ -19,10 +19,13 @@ async fn main() -> Result<(), LaserError> {
         phase("append a conversation, then assemble it under a budget");
         let scope = laser.context(conversation);
         scope
-            .append(AgentTopic::Commands, "book me an aisle seat".as_bytes())
+            .append(AgentTopic::Commands, "drain node-7".as_bytes())
             .await?;
         scope
-            .append(AgentTopic::Responses, "booked, aisle 12".as_bytes())
+            .append(
+                AgentTopic::Responses,
+                "drained, 0 connections left".as_bytes(),
+            )
             .await?;
 
         // The shape of a prompt's context is a declared policy, not slicing logic

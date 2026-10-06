@@ -128,6 +128,11 @@ jobs:
         run: |
           uv run cargo run --locked --bin stub_gen
           git diff --exit-code -- laser_sdk.pyi
+      - name: Rust, Python, and TypeScript parity
+        working-directory: .
+        run: |
+          python3 -m unittest scripts/test_check_parity.py
+          python3 scripts/check-parity.py
       - name: Verify the stub is valid Python a type checker can load
         # A reserved keyword leaking into a parameter name (the `from` bug) makes
         # the whole stub unparseable, so every user silently loses typing. Parse

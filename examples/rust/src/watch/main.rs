@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 
 // The Change feed primitive: consume lightweight advancement records instead
 // of rerunning a query on a timer. Rides the same view shape as the Views
-// example (`orders_v1` over `orders`), so it also needs a managed deployment.
-const TOPIC: &str = "orders";
-const FIELDS: [&str; 3] = ["id", "total", "status"];
+// example (`readings_v1` over `readings`), so it also needs a managed deployment.
+const TOPIC: &str = "readings";
+const FIELDS: [&str; 3] = ["host", "cpu", "status"];
 const CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Order {
-    id: u32,
-    total: u32,
+struct Reading {
+    host: String,
+    cpu: u32,
     status: String,
 }
 
@@ -35,7 +35,7 @@ async fn main() -> Result<(), LaserError> {
         laser.topic(TOPIC).ensure(PARTITIONS).await?;
         // The same view shape the Views example declares, under this run's own
         // name, so this binary runs on its own with no shared state.
-        let index = index_for("orders_v1");
+        let index = index_for("readings_v1");
         ensure_view(&laser, TOPIC, &index, ContentType::Json, &FIELDS).await?;
 
         let mut feed = laser.watch().index(&index).records()?;
@@ -43,10 +43,10 @@ async fn main() -> Result<(), LaserError> {
         laser
             .topic(TOPIC)
             .publish()
-            .json(&Order {
-                id: 4,
-                total: 20,
-                status: "paid".to_owned(),
+            .json(&Reading {
+                host: "node-4".to_owned(),
+                cpu: 88,
+                status: "degraded".to_owned(),
             })?
             .send()
             .await?;

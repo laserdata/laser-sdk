@@ -24,7 +24,7 @@ These changes require explicit user authorization unless the current session alr
 - Changing `ConversationId::derive` in `sdk/src/types/ids.rs` changes derived `SessionPolicy::PerUser` identities. Keep its version policy explicit through `DERIVE_VERSION`. `AgentId::wire_id` uses the agent name directly.
 - Renaming `AgentTopic` names (`sdk/src/provenance/topic.rs`) - repoints live topics.
 - Changing `Provenance::partition_key` (currently `conversation_id`) - breaks the per-conversation ordering guarantee.
-- Changing the public signatures of `Laser`, `AgentHandler`, `Agent`, `AgentConsumer::run`, or `AgentHandle` - these are the customer-facing API.
+- Changing the public signatures of `Laser`, `AgentHandler`, `Agent`, `AgentConsumer::run`, or `AgentHandle` - these are the public API.
 - Preserve attribution fields such as `agent` and `root_conversation_id` when rebuilding `Provenance` through `spawn_subconversation` or `AgentCtx::reply_provenance`. Losing them breaks causal and cost attribution.
 - Queries use `AGDX_QUERY` through `send_raw_with_response` on LaserData Cloud or Laser Stack. There is no request-topic query path. Original Apache Iggy without a managed backend returns `LaserError::Unsupported`. The connection-time `AGDX_HELLO` probe sets `managed_host` and available capabilities, including `query.available`.
 
@@ -38,9 +38,9 @@ A `rust-v*` tag publishes both crates after the full gate. A `wire-v*` tag publi
 
 `[wire-break]` in a pull request or push description skips only tests that need the published server artifact. Server-free tests still run. Update the pin in `scripts/resolve-test-iggy-server.sh` afterward and run the full pipeline. Rust, Python, and TypeScript package release tags always run their full pipelines. The wire-only tag remains server-free.
 
-Run locally in this exact order, do not skip:
-
 GitHub Actions use readable upstream version tags. Never replace Action tags with commit hashes or add a workflow that enforces hashed Action references.
+
+Run locally in this exact order, do not skip:
 
 ```bash
 cargo fmt --all            # 1. formats, auto-applies
@@ -55,7 +55,14 @@ just deny-wire             # 9. laser-wire dependency bans (needs cargo-deny)
 just advisories            # 10. workspace vuln/unmaintained advisories (needs cargo-deny)
 just fuzz                  # 11. bounded fuzzing of the wire decode surface (nightly + cargo-fuzz)
 just bdd                   # 12. cross-SDK BDD conformance, Rust runner
+just python-docs           # 13. Python README snippets compile
+just commerce-check        # 14. neutral vocabulary in examples, docs, tests, fixtures
+just parity-check          # 15. Rust, Python, TypeScript surfaces match docs/parity.md
 ```
+
+`just parity-check` runs `scripts/check-parity.py`. It reads the public Rust methods, the Python stub, and the TypeScript API report, and fails when `docs/parity.md` is stale, when a public Rust type is neither covered nor excluded with a reason, or when a row says MISSING. After a public change in any SDK, regenerate the matrix with `python3 scripts/check-parity.py --write`. The Rust, Python, and TypeScript CI workflows run it.
+
+`just commerce-check` runs `scripts/check-commerce-words.py`. Examples, docs, tests, and fixtures use neutral systems vocabulary (hosts, readings, services, incidents). The check fails on commerce vocabulary such as orders, payments, carts, invoices, customers, or refunds. CI runs it in the `lint` job.
 
 Run `--all-features --doc` as a required gate. `clippy --all-targets` does not compile documentation examples. A default-feature `cargo test --workspace` can omit examples behind optional features such as `kv` and `query`. The doctest gate requires no Iggy server or Docker. CI runs it too.
 
@@ -75,7 +82,7 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
     topics.rs           _agdx ops stream + topic names
     limits.rs           page / KV / frame / agent-envelope / consumer-filter caps (MAX_FILTER_*, MAX_FILTERED_PAGE_*)
     content.rs          ContentType + the agdx.ct u8 dictionary
-    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES,CONSUMER_FILTERS}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
+    hello.rs            HelloReply / OpVersions (AGDX_HELLO probe body, additive `agent` field + `features` capability bitset: feature::{KV_CAS,READ_YOUR_WRITES,STRONG_CONSISTENCY,KV_CAS_FENCED,AGENT_WORKFLOW,KEYWORD_SEARCH,WATCH,AUTHZ,DESTINATIONS,KV_FENCED_LEASES,CONSUMER_FILTERS,GROUP_POLICY_READS}) + BackendAnnounce (backend->streaming-server capability announce, AGDX_BACKEND_HELLO_CODE)
     query.rs            query IR (incl. Consistency level) + QueryEnvelope/QueryReply/Row/QueryError (incl. Stale)
     result.rs           unified ResultCode space + HTTP status, From projections off every surface error
     browse.rs           registry browse requests + BrowseReply (incl. DecodeRecord)
@@ -165,11 +172,14 @@ sdk/src/
                       explicit commit-after-success, producer commit confirmations, consumer
                       offsets, and next_within(timeout) for
                       a bounded single-record wait
-  batching.rs         Topic::batching() -> BatchingProducer: the governed size-and-time batcher
+  batching.rs         Topic::batching() -> BatchingProducerBuilder, build() gives the BatchingProducer:
+                      the governed size-and-time batcher
                       (max_records / max_bytes / linger) for typed agent paths (feature = "agent")
   blob.rs             BlobStore claim-check seam (feature = "agent"): check_in externalizes a
                       payload at or over a threshold to the BodyRef capsule, no default store ships
-  context.rs          ContextAssembler + ContextPolicy (LastN, RoleFilter)
+  context.rs          ContextAssembler + ContextPolicy (LastN, RoleFilter, TokenBudget, Chain),
+                      Checkpoint, and CONTEXT_READ_WINDOW (10,000 raw records per partition,
+                      tail anchored, the window Python and TypeScript mirror)
   context_scope.rs    Laser::context(conversation) -> ContextScope (append / fetch bounded /
                       fetch_with policy / block / state), the conversation-scoped accessor,
                       .memory(ns) -> ScopedMemory bakes the conversation into recall/remember/
@@ -192,7 +202,10 @@ sdk/src/
                       publish to a memory topic -> materialized KV read view). One durable
                       backend LogMemory + in-process VectorMemory for similarity recall.
                       Handles built from Laser preserve content-addressed ids and run log
-                      and vector writes through the enrolled governor over the item body
+                      and vector writes through the enrolled governor over the item body.
+                      MemoryHandle::vector(embedder) builds a standalone vector handle with no
+                      connection. RememberBuilder and RecallBuilder take user/application, and
+                      RecallBuilder::block renders a token-budgeted prompt block
   govern.rs           ActionGovernor pre-effect policy hook (feature = "agent"): decide before
                       agent sends / AGDX verbs / typed publishes / memory writes,
                       allow|observe|block|step_up|
@@ -291,22 +304,30 @@ sdk/src/
                       never a second store
     state.rs          ConversationState::load (fold the log)
 sdk/tests/integration/  one shared Apache Iggy, one stream per test, BDD-named cases
-  support/test_iggy.rs Native Iggy process harness (test-only, not shipped)
-  query/              test-only query worker + backends (Memory, durable SQL)
+sdk/tests/support/      test_iggy.rs (native Iggy process harness, test-only, not shipped)
+                        + owned_server.rs
 foreign/python/         the Python SDK (outside the workspace): PyO3 bindings over the
                         laser-sdk crate (cdylib lib laser_sdk_py, import name laser_sdk),
                         src/ one module per area + bin/stub_gen.rs, tests/ pytest
                         (offline + native Iggy), maturin packaging. sign.rs binds
-                        SigningKey + KeyRegistry so both SDKs share signing,
+                        SigningKey + KeyRegistry so all three SDKs share signing,
                         verification, principal routing, and reply identity. transport.rs binds
                         the Laser Producer/Consumer/ConsumerMessage surface with direct batching,
-                        partitioning, group polling, auto/manual commits, and offset control.
-                        Every build uses Iggy's native VSR transport. No transport feature is exposed. See the
-                        python-bindings skill.
+                        partitioning, group polling, auto/manual commits, offset control, and
+                        next_within. batching.rs binds Topic.batching() -> BatchingProducer.
+                        registry.rs binds the agent registry (AgentRegistry, publish_card,
+                        quarantine_signed, presence, client_metadata) and Laser.agent(id) ->
+                        AgentScope. context.rs binds ContextScope (fetch_with, state,
+                        state_with, checkpoint), ScopedMemory, and the LastN / TokenBudget /
+                        RoleFilter / Chain policies. Every build uses Iggy's native VSR
+                        transport. No transport feature is exposed. See the python-bindings
+                        skill.
 foreign/typescript/     the native Node SDK: strict ESM, native wire codecs, Apache Iggy
                         transport, streaming, managed clients, agents, memory, governance,
-                        signing, bridges, package exports, and release gates. See the
-                        typescript-sdk skill.
+                        signing, bridges, package exports, and release gates.
+                        src/client/error-classify.ts holds the LaserError classifier family,
+                        src/stream/batching.ts the batching producer. See the typescript-sdk
+                        skill.
 bdd/                    cross-SDK conformance (outside the workspace): scenarios/
                         shared Gherkin (runs vs Apache Iggy, no Cloud), rust/ the cucumber-rs
                         runner (tests/) + src/query_engine.rs (the pure reference query
@@ -314,6 +335,8 @@ bdd/                    cross-SDK conformance (outside the workspace): scenarios
                         runner over Iggy-native scenarios, docker-compose for
                         the multi-language path
 scripts/run-bdd-tests.sh  driver for the per-language BDD runners
+scripts/check-commerce-words.py  the neutral-vocabulary check behind `just commerce-check`
+scripts/check-parity.py  the parity matrix generator and check behind `just parity-check`
 examples/rust/          [[example]] bins under src/<scenario>/main.rs, LlmClient seam in lib.rs
 examples/python/        one runnable script per scenario + a shared _common.py connect helper
 examples/typescript/    nine non-benchmark mirrors, one entry point + README per scenario
@@ -322,7 +345,8 @@ examples/typescript/    nine non-benchmark mirrors, one entry point + README per
                         step-for-step identical across the languages
 docs/                   tutorial.md (progressive guide), building-agents.md (scenario
                         -> SDK recipe guide), agdx.md (the AGDX spec),
-                        interop.md (A2A / MCP / AG-UI bridges)
+                        interop.md (A2A / MCP / AG-UI bridges), parity.md (the cross-SDK
+                        parity matrix)
 ```
 
 ## Repo-wide principles
@@ -359,9 +383,11 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.5.3` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.5.4` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
-Capabilities identify managed support such as durable duplicate suppression, graphs, and an A2A gateway. Memory combines query and graph operations and has no separate managed command group.
+Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
+
+Rust, Python, and TypeScript expose the same public surface. The [cross-SDK parity matrix](docs/parity.md) lists each Rust symbol with its Python and TypeScript spelling, and records every deliberate difference. The remaining differences are naming idioms and argument shapes: Python takes cards and presence as dicts, names the query predicate class `QueryFilter` and the graph start argument `start_match=`, and TypeScript uses `deadLetterTopic`, `fromIggyClient`, `aggregateAs`, microsecond `ttl(ttlMicros)` units, and `Map` offsets. Defaults agree across the three: a 30-second contract deadline, a typed `Timeout` from `next_within`, `Polling` as the default commit policy, TTL semantics for `expire` (TypeScript adds `expireAt` for an absolute time), a structured publish failure with committed and unconfirmed records, the same error classifiers, and the same context read window. The 0.5.4 parity pass also added: Python `memory_custom`, `Memory.reranker`, `Topic.cbor`, `Topic.schema`, `PublishRequest.claim_check`, producer `background` mode and `shutdown`, fork `continuous`, `Workflow.run_id`, `Capabilities.is_open_only` and `serves_consistency`, `AgdxStream` `channel`, `with_target`, `with_deadline_micros`, `content_type`, `buffered`, `flush`, `Intent.validate`, `SigningKey.sign` and the `KeyRegistry` verify family, `Session.context_with` and `Session.graph`. TypeScript producer `batchLength`, `lingerMs`, `maxTopicBytes`, `unlimitedTopicSize`, `background` with `flush` and `shutdown`, `QueryRequest.atSnapshot`, `atTimestampMicros`, `rowsTyped`, `MemoryHandle.backend`, `AgentScope.contract`, the exported capability helpers, `SwappableGovernor.current`. Rust `ScopedMemory::forget` and `improve`. `python3 scripts/check-parity.py` reports zero missing rows.
 
 The open SDK supports provenance, causality, context, memory, routing, sessions, and state. Reliable consumption supports graceful drain, `ConcurrencyPolicy::SerialPerPartition`, `AgentMiddleware`, `DeadLetterSink`, and `Agent::builder` retry, verifier, and duplicate-suppression controls. `laser_sdk::testing`, `respond_on`, and `AgentCtx` support handlers.
 
@@ -403,7 +429,7 @@ Multi-agent orchestration, all conventions over the log (client-side state machi
 - Routing: `Router::{To,Broadcast,ToCapable,AllCapable}` + `InboxRoute::{Advertised,Fixed}`, resolving to an advertised inbox, never a hard-coded shared topic.
 - `Laser::contract` reports `Contract::{Completed,Failed,NotConsumed,TimedOut}` and optional pickup `Working` status. `AgentCtx::fan_out` and `Laser::scatter` use `GatherPolicy::{RequireAll,Quorum,BestEffort}`. `AgentCtx::approval_gate` waits for a decision. A configured verifier checks reply signatures before accepting completion.
 - `Laser::workflow` runs dependency-ordered steps with `Budget`, `verify_with`, `compensate_with`, replay, and `all_capable` dispatch. `.exclusive()` uses `acquire_fence` and requires `KV_FENCED_LEASES`. Renewal stays bounded by lease expiry and workflow deadline. The lease covers verification and the completion journal write. `StepHandle::on_timeout(OnTimeout::Reassign)` can then reacquire under a new fence. The handler protects external state through its own `Kv::cas_fenced` commit.
-- Bound in Python (`Laser.contract`/`scatter`/`quarantine`, `spawn_agent` capabilities/ack_on_pickup/health, `AgentCtx.fan_out`/`approval_gate`, and the `agent_message`/`agent_ctx` handler-test seam), matched by the `orchestra` example (Rust + Python).
+- Bound in Python and TypeScript (contracts with `expire_if_not_consumed`, `reply_on`, `conversation`, `fence`, `registered`, and named-agent routing, `scatter`, quarantine, the agent registry, `Laser.agent(id)`, `spawn_agent` capabilities/ack_on_pickup/health, `AgentCtx.fan_out`/`approval_gate`, and the `agent_message`/`agent_ctx` handler-test seam), matched by the `orchestra` example in all three languages.
 
 Still planned, not present:
 
@@ -429,3 +455,5 @@ Preserve message identities and confirmed chunks across retries. Return permanen
 ## Consumer-group ownership
 
 The public resource paths are Laser → stream → topic → producer and Laser → stream → topic → consumer group → filter. Group setup can include an optional policy. Normal consumers and advanced group readers use its configured policy, or return all records when it is unbound. Applications need no filter definition in consumer code. Normal batch length limits examined source records. Advanced match and scan limits remain separate. Never fall back to an unfiltered read after a catalog or capability failure. Keep Rust, Python and TypeScript behavior and documentation in parity.
+
+The [client behavior guide](docs/client-behavior.md) covers final 0.5.4 changes. The parity gate includes multiline inherent implementations and bon-generated builder controls. Its regressions run through just parity-check. Keep operation versions at 1 during this pre-1.0 work.

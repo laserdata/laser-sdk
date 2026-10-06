@@ -3,9 +3,9 @@
 A clickstream topic with each read model the platform offers layered over it:
 
   - HOT PATH    a cursor tails the raw log live while the producer streams,
-                folding a rolling ops ticker (events seen, checkouts).
+                folding a rolling ops ticker (events seen, errors).
   - ANALYTICS   the managed plane materializes a queryable index and answers the
-                aggregates a dashboard needs (funnel, slowest routes, windows).
+                aggregates a dashboard needs (mix, slowest routes, windows).
   - EXPORT      an independent cursor tails the same log with a checkpoint,
                 resuming exactly where it stopped after a restart.
   - SCHEMAS     a registered JSON Schema guards the index against malformed
@@ -37,7 +37,7 @@ EVENT_JSON_SCHEMA = """{
     "required":["user_id","message_type","route","latency_ms","ts"],
     "properties":{
         "user_id":{"type":"string"},
-        "message_type":{"type":"string","enum":["page_view","add_to_cart","checkout"]},
+        "message_type":{"type":"string","enum":["request","retry","error"]},
         "route":{"type":"string"},
         "latency_ms":{"type":"integer","minimum":0},
         "ts":{"type":"integer","minimum":0}
@@ -70,13 +70,13 @@ VISITORS = [
     "oscar",
 ]
 ROUTES = [
-    "/home",
-    "/product/42",
-    "/product/7",
-    "/search",
-    "/cart",
-    "/checkout",
-    "/pricing",
+    "/healthz",
+    "/api/v1/hosts/42",
+    "/api/v1/jobs/7",
+    "/api/v1/metrics",
+    "/api/v1/hosts",
+    "/api/v1/jobs",
+    "/login",
     "/docs",
 ]
 
@@ -88,7 +88,7 @@ STEP_MAX_US = 30_000_000
 
 PUBLISH_CHUNK = 30
 LIVE_TIMEOUT = 15.0
-LIVE_SNAPSHOT_EVERY = 50
+LIVE_SNAPSHOT_EVERY = 1_000
 
 
 async def main() -> None:
@@ -125,8 +125,8 @@ async def main() -> None:
 
 
 def clickstream(count: int) -> list[dict]:
-    """A deterministic session: many visitors browsing, page views the common
-    case and checkouts the rare one, spaced a few seconds apart from a fixed
+    """A deterministic session: many clients calling the API, plain requests the common
+    case and errors the rare one, spaced a few seconds apart from a fixed
     base."""
     rng = _common.Rng(0x123456789ABCDEF0)
     ts = BASE_US
@@ -134,11 +134,11 @@ def clickstream(count: int) -> list[dict]:
     for _ in range(count):
         roll = rng.below(100)
         if roll <= 69:
-            kind = "page_view"
+            kind = "request"
         elif roll <= 91:
-            kind = "add_to_cart"
+            kind = "retry"
         else:
-            kind = "checkout"
+            kind = "error"
         events.append(
             {
                 USER_ID: rng.pick(VISITORS),
@@ -176,7 +176,7 @@ async def live_monitor(laser: ls.Laser, events: list[dict]) -> None:
     publisher = asyncio.create_task(publish_clickstream(laser, events))
     cursor = laser.topic(TOPIC).replay()
     seen = 0
-    checkouts = 0
+    errors = 0
     idle = 0.0
     expected = len(events)
     while seen < expected:
@@ -189,11 +189,11 @@ async def live_monitor(laser: ls.Laser, events: list[dict]) -> None:
             continue
         idle = 0.0
         for message in messages:
-            if message.json().get(MESSAGE_TYPE) == "checkout":
-                checkouts += 1
+            if message.json().get(MESSAGE_TYPE) == "error":
+                errors += 1
             seen += 1
             if seen % LIVE_SNAPSHOT_EVERY == 0 or seen == expected:
-                print(f"live ticker: {seen}/{expected} events, {checkouts} checkouts")
+                print(f"live ticker: {seen}/{expected} events, {errors} errors")
     await publisher
 
 
@@ -213,8 +213,8 @@ async def run_analytics(laser: ls.Laser) -> None:
         route = slowest.value_text(row, ROUTE) or "?"
         print(f"  {latency:>5}ms  {route}")
 
-    checkouts = await laser.query(TOPIC).message_type("checkout").count().fetch()
-    print(f"checkouts: {scalar(checkouts)}")
+    errors = await laser.query(TOPIC).message_type("error").count().fetch()
+    print(f"errors: {scalar(errors)}")
 
     first_window = (
         await laser.query(TOPIC).time_range(BASE_US, BASE_US + 5 * ONE_MINUTE_US).count().fetch()
@@ -283,8 +283,8 @@ async def run_guarded_ingest(laser: ls.Laser) -> None:
     # Well-formed: passes the schema, materializes.
     valid = {
         USER_ID: "alice",
-        MESSAGE_TYPE: "checkout",
-        ROUTE: "/checkout",
+        MESSAGE_TYPE: "error",
+        ROUTE: "/api/v1/jobs",
         LATENCY_MS: 120,
         TS: BASE_US,
     }
@@ -293,8 +293,8 @@ async def run_guarded_ingest(laser: ls.Laser) -> None:
     # fine, only the validation catches it.
     malformed = {
         USER_ID: "mallory",
-        MESSAGE_TYPE: "checkout",
-        ROUTE: "/checkout",
+        MESSAGE_TYPE: "error",
+        ROUTE: "/api/v1/jobs",
         LATENCY_MS: "fast",
         TS: 1,
     }
@@ -306,12 +306,12 @@ async def run_guarded_ingest(laser: ls.Laser) -> None:
     settled = (await laser.query(GUARDED_TOPIC).with_total().fetch()).total
     if settled == 1:
         print(
-            "guarded index holds 1 row: the valid checkout landed, the malformed event "
+            "guarded index holds 1 row: the valid error event landed, the malformed event "
             "was rejected by the JSON Schema and never materialized"
         )
     else:
         print(
-            f"guarded index holds {settled} rows: the valid checkout landed, but this server "
+            f"guarded index holds {settled} rows: the valid error event landed, but this server "
             f"does not enforce JSON-Schema validation, so the malformed event materialized too. "
             f"LaserData Cloud rejects it"
         )

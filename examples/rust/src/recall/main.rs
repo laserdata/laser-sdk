@@ -6,8 +6,8 @@ use laser_sdk::prelude::full::*;
 // full deep-dive scenario next door. The accessor is still `laser.memory(..)`.
 // `.folded()` reads the memory topic in process, so this runs with no
 // managed deployment (the default `.fetch()` reads a managed read view).
-const NAMESPACE: &str = "customer:42";
-const FACT: &str = "Prefers aisle seats, travels monthly";
+const NAMESPACE: &str = "host:node-7";
+const FACT: &str = "node-7 sits in the eu-west pool, rotates keys monthly";
 
 #[tokio::main]
 async fn main() -> Result<(), LaserError> {

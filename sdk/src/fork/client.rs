@@ -234,7 +234,7 @@ pub struct ForkPutRequest<'a> {
     fields: BTreeMap<String, String>,
     metadata: BTreeMap<String, String>,
     payload: Option<Vec<u8>>,
-    embedding: Option<String>,
+    embedding: Option<Vec<f32>>,
     tombstone: bool,
 }
 
@@ -264,9 +264,10 @@ impl<'a> ForkPutRequest<'a> {
         self
     }
 
-    /// Attach an embedding as a JSON array literal (e.g. `[0.1,0.2,...]`).
-    pub fn embedding(mut self, embedding: impl Into<String>) -> Self {
-        self.embedding = Some(embedding.into());
+    /// Attach an embedding vector. It travels as a JSON array literal, and
+    /// `send` rejects a non-finite component with `LaserError::Invalid`.
+    pub fn embedding(mut self, embedding: impl IntoIterator<Item = f32>) -> Self {
+        self.embedding = Some(embedding.into_iter().collect());
         self
     }
 
@@ -279,6 +280,11 @@ impl<'a> ForkPutRequest<'a> {
 
     /// Write the speculative row.
     pub async fn send(self) -> Result<(), LaserError> {
+        let embedding = self
+            .embedding
+            .as_deref()
+            .map(embedding_literal)
+            .transpose()?;
         let request = ForkPut {
             v: FORK_OP_VERSION,
             fork_id: self.fork_id,
@@ -290,7 +296,7 @@ impl<'a> ForkPutRequest<'a> {
             fields: self.fields,
             metadata: self.metadata,
             payload: self.payload,
-            embedding: self.embedding,
+            embedding,
             tombstone: self.tombstone,
         };
         match self
@@ -314,6 +320,15 @@ fn unexpected(op: &str, outcome: &ForkOutcome) -> LaserError {
 // side would reject, and the anti-injection charset rule lives in one place.
 fn validated_fork_id(fork_id: &str) -> Result<(), LaserError> {
     laser_wire::fork::validate_fork_id(fork_id).map_err(|error| LaserError::Invalid(error.0))
+}
+
+fn embedding_literal(embedding: &[f32]) -> Result<String, LaserError> {
+    if embedding.iter().any(|component| !component.is_finite()) {
+        return Err(LaserError::Invalid(
+            "an embedding component must be a finite number".to_owned(),
+        ));
+    }
+    serde_json::to_string(embedding).map_err(|error| LaserError::Codec(error.to_string()))
 }
 
 #[cfg(test)]
@@ -341,5 +356,17 @@ mod tests {
             LaserError::Fork(ForkError::Unsupported(_))
         ));
         assert!(unsupported.is_unsupported());
+    }
+
+    #[test]
+    fn given_an_embedding_when_encoded_then_should_be_a_json_array_and_reject_non_finite() {
+        assert_eq!(
+            embedding_literal(&[0.5, 1.0]).expect("finite components encode"),
+            "[0.5,1.0]"
+        );
+        assert!(matches!(
+            embedding_literal(&[f32::NAN]),
+            Err(LaserError::Invalid(_))
+        ));
     }
 }

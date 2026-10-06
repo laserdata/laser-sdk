@@ -13,7 +13,7 @@ void test("given_each_memory_record_variant_when_round_tripped_then_should_prese
       kind: "item",
       id: "01KWM3K3XEP3NP5TN850J17YBP",
       memoryKind: "fact",
-      body: new TextEncoder().encode("checkout is slow")
+      body: new TextEncoder().encode("auth is slow")
     },
     { kind: "forget", target: "01KWM3K3XEP3NP5TN850J17YBP" },
     { kind: "feedback", target: "01KWM3K3XEP3NP5TN850J17YBP", weight: 1.5 }

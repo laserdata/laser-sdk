@@ -99,17 +99,28 @@ impl PyLaser {
     }
 
     /// List projections, optionally narrowed by topic / name substring / id prefix.
-    #[pyo3(signature = (*, topic=None, name_contains=None, id_prefix=None))]
+    /// `topics` adds several source topics at once. `search` matches a
+    /// substring of the id or the name.
+    #[pyo3(signature = (*, topic=None, name_contains=None, id_prefix=None, topics=None, search=None))]
+    #[allow(clippy::too_many_arguments)]
     fn list_projections<'py>(
         &self,
         py: Python<'py>,
         topic: Option<String>,
         name_contains: Option<String>,
         id_prefix: Option<String>,
+        topics: Option<Vec<String>>,
+        search: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         future_into_py(py, async move {
             let mut request = laser.projections().list();
+            if let Some(topics) = topics {
+                request = request.for_topics(topics);
+            }
+            if let Some(search) = search {
+                request = request.search(search);
+            }
             if let Some(topic) = topic {
                 request = request.for_topic(topic);
             }
@@ -336,6 +347,7 @@ impl PyQueryResult {
 pub struct PyQuery {
     laser: Laser,
     query: Query,
+    max_rows: Option<usize>,
 }
 
 impl PyQuery {
@@ -352,7 +364,11 @@ impl PyQuery {
             .target(target)
             .deadline_micros(deadline_micros)
             .build();
-        Self { laser, query }
+        Self {
+            laser,
+            query,
+            max_rows: None,
+        }
     }
 
     fn and_filter(&mut self, filter: Filter) {
@@ -414,6 +430,77 @@ impl PyQuery {
     fn fork<'py>(mut slf: PyRefMut<'py, Self>, fork_id: String) -> PyRefMut<'py, Self> {
         slf.query.fork = Some(fork_id);
         slf
+    }
+
+    /// AND `filter` (a `QueryFilter`) into the query's predicate tree. The
+    /// `filter_*` helpers route through the same conjunction. Build `any` and
+    /// `negate` subtrees with `QueryFilter` and pass them here.
+    fn filter<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        filter: PyRef<'_, PyQueryFilter>,
+    ) -> PyRefMut<'py, Self> {
+        let filter = filter.inner.clone();
+        slf.and_filter(filter);
+        slf
+    }
+
+    /// Keep only aggregate groups matching `filter`. Predicate fields reference
+    /// an aggregate alias (for example `count`) or a group key, not raw row
+    /// fields.
+    fn having<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        filter: PyRef<'_, PyQueryFilter>,
+    ) -> PyRefMut<'py, Self> {
+        slf.query.having = Some(filter.inner.clone());
+        slf
+    }
+
+    /// Add an aggregate with an explicit output `alias`, to return several
+    /// aggregates of the same kind or to name the output column. `func` is
+    /// `count`, `sum`, `avg`, `min`, `max`, `count_distinct`, `stddev`, or
+    /// `percentile` (which needs `fraction`).
+    #[pyo3(signature = (func, alias, *, field=None, fraction=None))]
+    fn agg_as<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        func: &str,
+        alias: String,
+        field: Option<String>,
+        fraction: Option<f64>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let func = parse_agg_func(func)?;
+        slf.push_agg(AggCall {
+            func,
+            field,
+            arg: fraction,
+            alias,
+        });
+        Ok(slf)
+    }
+
+    /// Cap the total rows `rows()` and `rows_typed()` may return. Explicit by
+    /// design: a paged walk with no ceiling is an unbounded read.
+    fn max_rows(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
+        slf.max_rows = Some(n);
+        slf
+    }
+
+    /// This query's execution id, the identity `status` and `cancel` use.
+    #[getter]
+    fn execution_id(&self) -> String {
+        self.query.execution_id.to_string()
+    }
+
+    /// Set the execution deadline `seconds` from now (default 30 seconds).
+    fn deadline(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let wait = crate::convert::duration_seconds(seconds, "seconds")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        slf.query.deadline_micros = u64::try_from(now)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(wait.as_micros()).unwrap_or(u64::MAX));
+        Ok(slf)
     }
 
     /// Replace the absolute execution deadline in epoch microseconds.
@@ -840,6 +927,42 @@ impl PyQuery {
         })
     }
 
+    /// Walk matching rows across pages, bounded by an explicit `max_rows`, and
+    /// return them. Stops at the cap or the last page, whichever comes first.
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cap = self.row_ceiling("rows")?;
+        let laser = self.laser.clone();
+        let query = self.query.clone();
+        future_into_py(py, async move {
+            let rows = collect_bounded(&laser, query, cap)
+                .await
+                .map_err(to_pyerr)?;
+            Ok(rows.into_iter().map(PyRow::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Like `rows` but each row's JSON payload is decoded into a Python value,
+    /// under the same explicit `max_rows` ceiling. The payload is requested
+    /// automatically, and the publisher must have inlined it.
+    fn rows_typed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cap = self.row_ceiling("rows_typed")?;
+        let laser = self.laser.clone();
+        let mut query = self.query.clone();
+        query.select.payload = true;
+        future_into_py(py, async move {
+            let (fields, rows) = collect_bounded_with_fields(&laser, query, cap)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| {
+                let mut decoded = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    decoded.push(decode_one_json(py, &fields, row)?);
+                }
+                Ok(decoded.into_pyobject(py)?.unbind().into_any())
+            })
+        })
+    }
+
     /// Read the current execution state for this query identity.
     fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
@@ -864,6 +987,146 @@ impl PyQuery {
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         ser_to_py(py, &self.query)
     }
+}
+
+impl PyQuery {
+    fn row_ceiling(&self, verb: &str) -> PyResult<usize> {
+        self.max_rows.ok_or_else(|| {
+            InvalidError::new_err(format!(
+                "{verb}() needs an explicit ceiling: chain .max_rows(n) first"
+            ))
+        })
+    }
+}
+
+fn parse_agg_func(func: &str) -> PyResult<AggFunc> {
+    Ok(match func {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "avg" => AggFunc::Avg,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        "count_distinct" => AggFunc::CountDistinct,
+        "stddev" => AggFunc::StdDev,
+        "percentile" => AggFunc::Percentile,
+        other => {
+            return Err(InvalidError::new_err(format!(
+                "unknown aggregate '{other}' (expected count, sum, avg, min, max, count_distinct, stddev, or percentile)"
+            )));
+        }
+    })
+}
+
+fn parse_cmp_op(op: &str) -> PyResult<CmpOp> {
+    Ok(match op {
+        "eq" => CmpOp::Eq,
+        "ne" => CmpOp::Ne,
+        "lt" => CmpOp::Lt,
+        "lte" => CmpOp::Lte,
+        "gt" => CmpOp::Gt,
+        "gte" => CmpOp::Gte,
+        "in" => CmpOp::In,
+        "contains" => CmpOp::Contains,
+        "prefix" => CmpOp::Prefix,
+        other => {
+            return Err(InvalidError::new_err(format!(
+                "unknown comparison '{other}' (expected eq, ne, lt, lte, gt, gte, in, contains, or prefix)"
+            )));
+        }
+    })
+}
+
+/// A query predicate tree, the Python form of the query `Filter`: a
+/// comparison leaf (`pred`), a conjunction (`all`), a disjunction (`any`), or
+/// a negation (`negate`). Pass it to `QueryRequest.filter`,
+/// `QueryRequest.having`, or `Graph.query(match=..)`. Consumer filters use the
+/// separate `FilterExpr`.
+#[gen_stub_pyclass]
+#[pyclass(name = "QueryFilter", frozen)]
+pub struct PyQueryFilter {
+    pub(crate) inner: Filter,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyQueryFilter {
+    /// A single comparison leaf, `field op value`. `op` is `eq`, `ne`, `lt`,
+    /// `lte`, `gt`, `gte`, `in`, `contains`, or `prefix`.
+    #[staticmethod]
+    fn pred(field: String, op: &str, value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: Filter::pred(field, parse_cmp_op(op)?, py_to_typed_value(value)?),
+        })
+    }
+
+    /// The AND of `filters`.
+    #[staticmethod]
+    fn all(filters: Vec<PyRef<'_, PyQueryFilter>>) -> Self {
+        Self {
+            inner: Filter::all(filters.iter().map(|filter| filter.inner.clone())),
+        }
+    }
+
+    /// The OR of `filters`.
+    #[staticmethod]
+    fn any(filters: Vec<PyRef<'_, PyQueryFilter>>) -> Self {
+        Self {
+            inner: Filter::any(filters.iter().map(|filter| filter.inner.clone())),
+        }
+    }
+
+    /// The negation of `filter`.
+    #[staticmethod]
+    fn negate(filter: PyRef<'_, PyQueryFilter>) -> Self {
+        Self {
+            inner: Filter::negate(filter.inner.clone()),
+        }
+    }
+
+    /// The filter as a dict (debugging).
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        ser_to_py(py, &self.inner)
+    }
+}
+
+// Walk pages until `cap` rows or the last page, mirroring the SDK's bounded
+// `rows()` walk.
+async fn collect_bounded(
+    laser: &Laser,
+    query: Query,
+    cap: usize,
+) -> Result<Vec<Row>, laser_sdk::LaserError> {
+    Ok(collect_bounded_with_fields(laser, query, cap).await?.1)
+}
+
+async fn collect_bounded_with_fields(
+    laser: &Laser,
+    mut query: Query,
+    cap: usize,
+) -> Result<(Vec<laser_sdk::wire::schema::LogicalField>, Vec<Row>), laser_sdk::LaserError> {
+    if query.page.limit == 0 {
+        query.page.limit = 100;
+    }
+    let single_page = query.aggregate.is_some() || query.vector.is_some();
+    let mut rows = Vec::new();
+    let mut page = laser.execute_query(query.clone()).await?;
+    let fields = page.fields.clone();
+    loop {
+        let cursor = page.page.next_cursor.clone();
+        let done = single_page || page.rows.is_empty() || !page.page.has_more;
+        let room = cap.saturating_sub(rows.len());
+        rows.extend(page.rows.into_iter().take(room));
+        if done || rows.len() >= cap {
+            break;
+        }
+        let Some(cursor) = cursor else {
+            break;
+        };
+        query.page.offset = None;
+        query.page.cursor = Some(cursor);
+        page = laser.execute_query(query.clone()).await?;
+    }
+    Ok((fields, rows))
 }
 
 fn agg_call(func: AggFunc, field: Option<String>, arg: Option<f64>, alias: &str) -> AggCall {

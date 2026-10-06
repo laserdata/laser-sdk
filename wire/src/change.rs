@@ -34,7 +34,7 @@ mod tests {
     fn given_a_change_record_when_round_tripped_then_should_decode_unchanged() {
         let record = ChangeRecord {
             v: CHANGE_OP_VERSION,
-            index: "orders_v1".to_owned(),
+            index: "readings_v1".to_owned(),
             partition_id: 3,
             from_offset: 100,
             to_offset: 141,

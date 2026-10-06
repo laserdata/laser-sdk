@@ -117,7 +117,7 @@ async def main() -> None:
             conversation = ls.new_conversation_id()
             gate = laser.agdx(ls.Topics.HUMAN_INPUT, "orchestrator", conversation)
             decision = await gate.request_input(
-                ls.Topics.RESPONSES, b"approve a $500 refund?", timeout_secs=15.0
+                ls.Topics.RESPONSES, b"approve draining node-7?", timeout_secs=15.0
             )
             print(f"HITL decision: {bytes(decision).decode(errors='replace')}")
     finally:

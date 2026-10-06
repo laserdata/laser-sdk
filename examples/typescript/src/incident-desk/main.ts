@@ -34,29 +34,29 @@ import {
   utf8,
   waitForProjection
 } from "../common.js"
-import { MockLlm } from "../llm.js"
+import { defaultLlm } from "../llm.js"
 
-export const EXAMPLE = "concierge"
+export const EXAMPLE = "incident-desk"
 const TICKETS = "support_tickets"
 const PLAN = "bulk-resolve-plan"
 const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
 const fixedTools = { kind: "fixed" as const, topic: AgentTopic.ToolCalls }
 const ANGLES = ["most likely root cause", "fastest mitigation", "blast radius"] as const
 const NOTES = [
-  "checkout latency usually traces to database pool exhaustion",
-  "billing retries require an idempotency key",
-  "critical checkout incidents recover by failing over the read replica"
+  "auth latency usually traces to database pool exhaustion",
+  "config push retries require an idempotency key",
+  "critical auth incidents recover by failing over the read replica"
 ] as const
-const CREDITS = [
-  { key: "cr-1", customer: "acme", cents: 150 },
-  { key: "cr-2", customer: "globex", cents: 50 },
-  { key: "cr-3", customer: "initech", cents: 80 }
+const GRANTS = [
+  { key: "gr-1", cluster: "east-1", units: 150 },
+  { key: "gr-2", cluster: "west-2", units: 50 },
+  { key: "gr-3", cluster: "eu-1", units: 80 }
 ] as const
 
 interface Ticket {
   readonly ticket_id: string
   readonly message_type: "ticket"
-  readonly customer: string
+  readonly cluster: string
   readonly component: string
   readonly severity: string
   readonly status: "open"
@@ -69,7 +69,7 @@ function ticketValue(value: unknown): Ticket {
   if (
     typeof item.ticket_id !== "string" ||
     item.message_type !== "ticket" ||
-    typeof item.customer !== "string" ||
+    typeof item.cluster !== "string" ||
     typeof item.component !== "string" ||
     typeof item.severity !== "string" ||
     item.status !== "open" ||
@@ -133,15 +133,9 @@ async function registerTickets(laser: Laser): Promise<void> {
     kind: { kind: "row" },
     contentType: ContentType.Json,
     extraction: {
-      fields: [
-        "ticket_id",
-        "message_type",
-        "customer",
-        "component",
-        "severity",
-        "status",
-        "ts"
-      ].map((name) => ({ name, pointer: `/${name}` })),
+      fields: ["ticket_id", "message_type", "cluster", "component", "severity", "status", "ts"].map(
+        (name) => ({ name, pointer: `/${name}` })
+      ),
       inlinePayload: false
     },
     inlinePayloadDefault: false
@@ -159,13 +153,13 @@ async function registerTickets(laser: Laser): Promise<void> {
 
 function tickets(count: number): readonly Ticket[] {
   const rng = new Rng(0xc0ffee42n)
-  const customers = ["acme", "globex", "initech", "umbrella", "stark"] as const
-  const components = ["checkout", "billing", "search", "auth", "uploads"] as const
+  const clusters = ["east-1", "west-2", "eu-1", "ap-1", "lab"] as const
+  const components = ["auth", "config", "storage", "metrics", "gateway"] as const
   const severities = ["low", "medium", "high", "critical"] as const
   return Array.from({ length: count }, (_, index) => ({
     ticket_id: `ticket-${String(index).padStart(7, "0")}`,
     message_type: "ticket",
-    customer: rng.pick(customers),
+    cluster: rng.pick(clusters),
     component: rng.pick(components),
     severity: rng.pick(severities),
     status: "open",
@@ -193,10 +187,10 @@ async function ingest(laser: Laser, count: number): Promise<void> {
 async function spawnDesk(
   laser: Laser,
   memory: MemoryHandle,
-  creditNamespace: string,
+  grantNamespace: string,
   dedupNamespace: string
 ): Promise<readonly AgentHandle[]> {
-  const llm = new MockLlm()
+  const llm = defaultLlm()
   const triage = Agent.builder()
     .id(AgentId.new("triage"))
     .listenOn(AgentTopic.Commands)
@@ -254,7 +248,7 @@ async function spawnDesk(
       }
     })
     .spawn(laser)
-  const credits = laser.kv(creditNamespace)
+  const grants = laser.kv(grantNamespace)
   const resolver = Agent.builder()
     .id(AgentId.new("resolver"))
     .listenOn(AgentTopic.Commands)
@@ -262,23 +256,23 @@ async function spawnDesk(
     .deduplicator(new KvDeduplicator(laser, dedupNamespace))
     .handler({
       async handle(message, context): Promise<void> {
-        const credit = JSON.parse(decodeUtf8(message.envelope?.body ?? message.payload)) as {
-          customer: string
-          cents: number
+        const grant = JSON.parse(decodeUtf8(message.envelope?.body ?? message.payload)) as {
+          cluster: string
+          units: number
         }
-        if (credit.cents >= 100) {
+        if (grant.units >= 100) {
           const decision = await context.approvalGate(
             AgentTopic.Responses,
-            utf8(`approve ${String(credit.cents)} cents for ${credit.customer}?`),
+            utf8(`approve a ${String(grant.units)} unit capacity grant to ${grant.cluster}?`),
             15_000
           )
           if (decodeUtf8(decision) !== "approved") return
         }
-        const key = utf8(credit.customer)
-        const current = Number(decodeUtf8((await credits.get(key)) ?? utf8("0")))
-        await credits
+        const key = utf8(grant.cluster)
+        const current = Number(decodeUtf8((await grants.get(key)) ?? utf8("0")))
+        await grants
           .set(key)
-          .bytes(utf8(String(current + credit.cents)))
+          .bytes(utf8(String(current + grant.units)))
           .send()
       }
     })
@@ -310,11 +304,11 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const memory = MemoryHandle.vector(new SimpleEmbedder())
   for (const note of NOTES) await memory.remember(utf8(note)).kind(MemoryKind.Fact).send()
   const runId = ConversationId.new()
-  const creditNamespace = `concierge-credits-${runId.toString()}`
-  const dedupNamespace = `concierge-dedup-${runId.toString()}`
+  const grantNamespace = `desk-grants-${runId.toString()}`
+  const dedupNamespace = `desk-dedup-${runId.toString()}`
   phase("spawning the desk: triage, specialist, resolver, approver")
   await using agents = new AsyncResourceGroup()
-  const handles = await spawnDesk(laser, memory, creditNamespace, dedupNamespace)
+  const handles = await spawnDesk(laser, memory, grantNamespace, dedupNamespace)
   for (const handle of handles) agents.add(handle)
   phase("triaging the incident through the desk")
   const incident = ConversationId.new()
@@ -322,7 +316,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     .contract(routeTo(AgentId.new("triage")))
     .from(AgentId.new("orchestrator"))
     .conversation(incident)
-    .payload(utf8("checkout is slow for several customers"))
+    .payload(utf8("auth is slow for several clusters"))
     .inboxRoute(fixedCommands)
     .deadline(60_000)
     .send()
@@ -331,43 +325,43 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   await memory.remember(utf8(text)).kind(MemoryKind.Summary).durable().send()
   console.log(`diagnosis: ${text}`)
 
-  phase("executing remediation credits effectively once")
-  for (const credit of [...CREDITS, ...CREDITS]) {
+  phase("executing capacity grants effectively once")
+  for (const grant of [...GRANTS, ...GRANTS]) {
     await laser
       .agent(AgentId.new("orchestrator"))
-      .send(AgentTopic.Commands, utf8(JSON.stringify(credit)), {
+      .send(AgentTopic.Commands, utf8(JSON.stringify(grant)), {
         conversationId: incident,
-        idempotencyKey: credit.key,
+        idempotencyKey: grant.key,
         targetAgentId: AgentId.new("resolver")
       })
   }
   const expected = new Map([
-    ["acme", 150],
-    ["globex", 50],
-    ["initech", 80]
+    ["east-1", 150],
+    ["west-2", 50],
+    ["eu-1", 80]
   ])
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {
     const actual = await Promise.all(
       [...expected].map(
-        async ([customer, cents]) =>
+        async ([cluster, units]) =>
           [
-            customer,
-            Number(decodeUtf8((await laser.kv(creditNamespace).get(utf8(customer))) ?? utf8("0"))),
-            cents
+            cluster,
+            Number(decodeUtf8((await laser.kv(grantNamespace).get(utf8(cluster))) ?? utf8("0"))),
+            units
           ] as const
       )
     )
-    if (actual.every(([, value, cents]) => value === cents)) break
+    if (actual.every(([, value, units]) => value === units)) break
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  for (const [customer, cents] of expected) {
+  for (const [cluster, units] of expected) {
     const actual = Number(
-      decodeUtf8((await laser.kv(creditNamespace).get(utf8(customer))) ?? utf8("0"))
+      decodeUtf8((await laser.kv(grantNamespace).get(utf8(cluster))) ?? utf8("0"))
     )
-    if (actual !== cents) throw new Error(`credit total for ${customer} is ${String(actual)}`)
+    if (actual !== units) throw new Error(`grant total for ${cluster} is ${String(actual)}`)
   }
-  console.log("duplicate deliveries produced exact customer credit totals")
+  console.log("duplicate deliveries produced exact cluster grant totals")
 
   phase("speculating a bulk-resolve plan in a fork")
   const fork = laser.fork(PLAN)

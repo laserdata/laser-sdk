@@ -45,3 +45,10 @@ async def laser(iggy_endpoint):
     stream = f"t-{uuid.uuid4().hex[:12]}"
     client = await _connect_with_retry(iggy_endpoint, stream)
     return client
+
+
+@pytest_asyncio.fixture
+async def open_laser(laser):
+    if (await laser.capabilities()).managed:
+        pytest.skip("this test asserts behavior without a managed backend")
+    return laser

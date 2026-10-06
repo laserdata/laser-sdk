@@ -4,9 +4,9 @@ The change feed reports when a projected view advances. This example reads those
 
 ## What it shows
 
-- Declares the same notify-enabled view shape as `query` under this run's own `orders_v1_<token>` name, so this entry point runs on its own with no shared state.
+- Declares the same notify-enabled view shape as `query` under this run's own `readings_v1_<token>` name, so this entry point runs on its own with no shared state.
 - Opens a change feed reader with `laser.watch().index(INDEX).records()`. The per-run view starts empty, so the first change it reports is this run's own publish.
-- Publishes an order and polls for the lightweight change record, reading the batch it reports: rows landed, and the source offsets they came from.
+- Publishes a host reading and polls for the lightweight change record, reading the batch it reports: rows landed, and the source offsets they came from.
 
 ## Run it
 

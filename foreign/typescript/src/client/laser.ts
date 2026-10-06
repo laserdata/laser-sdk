@@ -80,12 +80,18 @@ import {
   CONTROL_OP_VERSION,
   QUERY_OP_VERSION
 } from "../wire/codes.js"
-import { QueryCancelCommand, QueryCommand, QueryStatusCommand } from "../wire/commands.js"
+import {
+  QueryCancelCommand,
+  QueryCommand,
+  QueryPageCommand,
+  QueryStatusCommand
+} from "../wire/commands.js"
 import { encodeControlEnvelope, type ControlCommand } from "../wire/control.js"
 import type { ForkInfo } from "../wire/fork.js"
 import { decodeBackendAnnounce } from "../wire/hello.js"
 import type { KvNamespaceInfo } from "../wire/kv.js"
 import type { Query, QueryExecutionStatus, QueryResult, QueryTarget } from "../wire/query.js"
+import type { CheckpointMutationResult, CheckpointRequestEnvelope } from "../wire/checkpoint.js"
 import type { DestinationId, QueryExecutionId } from "../wire/ids.js"
 import { AgentId, ConversationId } from "../types/ids.js"
 import { ownedBytes, type BytesLike } from "./bytes.js"
@@ -122,6 +128,7 @@ import {
   NoStreamError,
   PresenceConflictError,
   QueryExecutionError,
+  ProtocolError,
   InvalidError,
   TimeoutError,
   UnsupportedError
@@ -146,14 +153,14 @@ const LOCAL_CONNECTION_STRING = "iggy:iggy@127.0.0.1:8090"
 // The Iggy error code a server answers an unknown command with.
 const INVALID_COMMAND = 3
 
-interface LaserTopology {
+export interface LaserTopology {
   readonly opsStream: string
   readonly controlTopic: string
   readonly deadLetterTopic: string
   readonly changesTopic: string
 }
 
-interface TopologyOverrides {
+export interface TopologyOverrides {
   readonly opsStream: boolean
   readonly controlTopic: boolean
   readonly deadLetterTopic: boolean
@@ -174,7 +181,7 @@ const NO_TOPOLOGY_OVERRIDES: TopologyOverrides = {
   changesTopic: false
 }
 
-interface LaserBuildOptions {
+export interface LaserBuildOptions {
   readonly connectOptions: ConnectOptions
   readonly publishOptions: PublishOptions
   readonly connectionString?: string
@@ -638,6 +645,61 @@ export class Laser implements AsyncDisposable {
       this.verifier,
       this.configuredTopology,
       this.topologyOverrides,
+      this.configuredCapabilities,
+      this.capabilityOverride,
+      false
+    )
+  }
+
+  /** A clone whose managed operations use `opsStream` instead of the ops
+   * stream the deployment announced. The connection is shared. */
+  withOpsStream(opsStream: string): Laser {
+    return this.withTopology({ opsStream })
+  }
+
+  /** A clone whose control commands publish to `controlTopic` on the ops
+   * stream. The connection is shared. */
+  withControlTopic(controlTopic: string): Laser {
+    return this.withTopology({ controlTopic })
+  }
+
+  /** A clone whose dead-letter capsules publish to `deadLetterTopic` on the
+   * ops stream. The connection is shared. */
+  withDeadLetterTopic(deadLetterTopic: string): Laser {
+    return this.withTopology({ deadLetterTopic })
+  }
+
+  /** A clone whose change-feed records are read from `changesTopic` on the ops
+   * stream. The connection is shared. */
+  withChangesTopic(changesTopic: string): Laser {
+    return this.withTopology({ changesTopic })
+  }
+
+  private withTopology(override: Partial<LaserTopology>): Laser {
+    const topology: LaserTopology = {
+      opsStream: this.opsStream,
+      controlTopic: this.controlTopic,
+      deadLetterTopic: this.deadLetterTopic,
+      changesTopic: this.changesTopic,
+      ...override
+    }
+    const overrides: TopologyOverrides = {
+      opsStream: this.topologyOverrides.opsStream || override.opsStream !== undefined,
+      controlTopic: this.topologyOverrides.controlTopic || override.controlTopic !== undefined,
+      deadLetterTopic:
+        this.topologyOverrides.deadLetterTopic || override.deadLetterTopic !== undefined,
+      changesTopic: this.topologyOverrides.changesTopic || override.changesTopic !== undefined
+    }
+    return new Laser(
+      this.transport,
+      this.defaultStream,
+      this.capabilitiesOnce,
+      this.shared,
+      this.observer,
+      this.governor,
+      this.verifier,
+      topology,
+      overrides,
       this.configuredCapabilities,
       this.capabilityOverride,
       false
@@ -1376,6 +1438,12 @@ export class Laser implements AsyncDisposable {
     return new Destinations(this.managedTransport(), () => this.capabilities())
   }
 
+  /** Sends one checkpoint request envelope, the deep form behind every
+   * `destinations()` mutation. */
+  executeCheckpoint(request: CheckpointRequestEnvelope): Promise<CheckpointMutationResult> {
+    return this.destinations().executeCheckpoint(request)
+  }
+
   // What a consumer group needs to reach its filter policy and read through
   // the partition primaries.
   private groupContext(): GroupContext {
@@ -1532,7 +1600,10 @@ export class Laser implements AsyncDisposable {
       .send(payload, { key: new TextEncoder().encode("control") })
   }
 
-  private async executeQuery(query: Query): Promise<QueryResult> {
+  /** Executes a pre-built `Query` and returns the raw paged result. Most
+   * callers want `query(index)...fetch()` instead. Needs `laser-plane` in Laser
+   * Stack or LaserData Cloud, otherwise it fails with `UnsupportedError`. */
+  async executeQuery(query: Query): Promise<QueryResult> {
     const capabilities = await this.capabilities()
     if (query.text !== undefined && !capabilities.query.keyword) {
       throw new UnsupportedError("keyword query is not served by this deployment")
@@ -1546,14 +1617,47 @@ export class Laser implements AsyncDisposable {
       v: QUERY_OP_VERSION,
       query
     })
-    if (reply.kind === "ok") return reply.result
+    if (reply.kind === "ok") {
+      if (reply.result.context.executionId.asU128() !== query.executionId.asU128()) {
+        throw new ProtocolError("query reply execution id does not match the request")
+      }
+      return reply.result
+    }
     if (reply.error.kind === "unsupported") {
       throw new UnsupportedError(reply.error.message)
     }
     throw new QueryExecutionError(`query failed: ${reply.error.kind}`, reply.error)
   }
 
-  private async queryStatus(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
+  /** Retrieves the next cursor page of an executing query. Needs the
+   * `cursorPaging` capability. */
+  async queryPage(
+    executionId: QueryExecutionId,
+    cursor: string,
+    deadlineMicros: bigint
+  ): Promise<QueryResult> {
+    const capabilities = await this.capabilities()
+    if (!capabilities.query.cursorPaging) {
+      throw new UnsupportedError("query cursor paging is not advertised by this deployment")
+    }
+    const reply = await executeManaged(this.managedTransport(), capabilities, QueryPageCommand, {
+      v: QUERY_OP_VERSION,
+      executionId,
+      cursor,
+      deadlineMicros
+    })
+    if (reply.kind === "ok") {
+      if (reply.result.context.executionId.asU128() !== executionId.asU128()) {
+        throw new ProtocolError("query reply execution id does not match the request")
+      }
+      return reply.result
+    }
+    if (reply.error.kind === "unsupported") throw new UnsupportedError(reply.error.message)
+    throw new QueryExecutionError(`query page failed: ${reply.error.kind}`, reply.error)
+  }
+
+  /** Reads the current state of an executing or recently completed query. */
+  async queryStatus(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
     const capabilities = await this.capabilities()
     if (!capabilities.query.executionStatus) {
       throw new UnsupportedError("query execution status is not served by this deployment")
@@ -1562,11 +1666,17 @@ export class Laser implements AsyncDisposable {
       v: QUERY_OP_VERSION,
       executionId
     })
-    if (reply.kind === "ok") return reply.status
+    if (reply.kind === "ok") {
+      if (reply.status.executionId.asU128() !== executionId.asU128()) {
+        throw new ProtocolError("query status execution id does not match the request")
+      }
+      return reply.status
+    }
     throw new QueryExecutionError(`query status failed: ${reply.error.kind}`, reply.error)
   }
 
-  private async cancelQuery(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
+  /** Cancels an executing query by its unguessable identity. */
+  async cancelQuery(executionId: QueryExecutionId): Promise<QueryExecutionStatus> {
     const capabilities = await this.capabilities()
     if (!capabilities.query.cancellation) {
       throw new UnsupportedError("query cancellation is not served by this deployment")
@@ -1575,7 +1685,12 @@ export class Laser implements AsyncDisposable {
       v: QUERY_OP_VERSION,
       executionId
     })
-    if (reply.kind === "ok") return reply.status
+    if (reply.kind === "ok") {
+      if (reply.status.executionId.asU128() !== executionId.asU128()) {
+        throw new ProtocolError("query status execution id does not match the request")
+      }
+      return reply.status
+    }
     throw new QueryExecutionError(`query cancellation failed: ${reply.error.kind}`, reply.error)
   }
 

@@ -99,7 +99,7 @@ impl<'a> PublishRequest<'a> {
     /// Stamp a projection ref on `agdx.ref`. Routes the record through
     /// the matching `Projection` in the worker's catalog when the topic has a
     /// binding that allows that ref. Use `"<name>.v<version>"` shape, e.g.
-    /// `"order.v1"`, so producer and projector evolve together.
+    /// `"reading.v1"`, so producer and projector evolve together.
     pub fn projection_ref(mut self, value: impl Into<String>) -> Self {
         self.record.projection_ref = Some(value.into());
         self
@@ -120,8 +120,10 @@ impl<'a> PublishRequest<'a> {
     /// stay uniform over any caller-declared key, see [`header`](Self::header)
     /// for the exact-typed alternative one layer down.
     ///
-    /// **A record with zero `.index(...)` calls is dropped by the projector.**
-    /// Indexing is the explicit opt-in to materializing a queryable row.
+    /// An indexed field comes from this header or from the bound projection's
+    /// extraction schema, and the header wins for the same field name. A record
+    /// with no indexed fields from either source produces no row. A record
+    /// without `agdx.ref` is skipped when its binding has no default projection.
     pub fn index(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.record.index.push((key.into(), value.into()));
         self
@@ -173,13 +175,13 @@ impl<'a> PublishRequest<'a> {
     /// # use laser_sdk::prelude::*;
     /// # use laser_sdk::stream::{Json, Msgpack};
     /// # use serde::Serialize;
-    /// # #[derive(Serialize)] struct Order { id: String }
-    /// # async fn run(laser: &Laser, order: Order) -> Result<(), LaserError> {
-    /// laser.topic("orders").publish()
-    ///     .encode_with::<Json, _>(&order)?
+    /// # #[derive(Serialize)] struct Reading { host: String }
+    /// # async fn run(laser: &Laser, reading: Reading) -> Result<(), LaserError> {
+    /// laser.topic("readings").publish()
+    ///     .encode_with::<Json, _>(&reading)?
     ///     .send().await?;
-    /// laser.topic("orders").publish()
-    ///     .encode_with::<Msgpack, _>(&order)?
+    /// laser.topic("readings").publish()
+    ///     .encode_with::<Msgpack, _>(&reading)?
     ///     .send().await?;
     /// # Ok(()) }
     /// ```

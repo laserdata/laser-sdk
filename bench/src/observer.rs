@@ -154,6 +154,7 @@ mod tests {
         assert!(cost.instrumented_elapsed_ns > 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn given_linux_process_when_sampling_pilot_runs_then_should_record_counterbalanced_cost() {
         let cost = ObserverCost::process_sampling_pilot()

@@ -740,10 +740,10 @@ mod tests {
             conversation,
             source,
             correlation,
-            br#"{"ask":"plan the trip"}"#.to_vec(),
+            br#"{"ask":"plan the rollout"}"#.to_vec(),
         )
         .with_target("target-agent".parse().expect("valid agent id"))
-        .with_idempotency_key("order-123-attempt-2".parse().expect("valid key"))
+        .with_idempotency_key("job-123-attempt-2".parse().expect("valid key"))
         .with_deadline_micros(1_717_171_777_000_000)
         .with_operation(OPERATION_CHAT)
         .with_metadata("priority", "high");
@@ -766,10 +766,10 @@ mod tests {
             conversation,
             source,
             correlation,
-            br#"{"ask":"plan the trip"}"#.to_vec(),
+            br#"{"ask":"plan the rollout"}"#.to_vec(),
         )
         .with_target("target-agent".parse().expect("valid agent id"))
-        .with_idempotency_key("order-123-attempt-2".parse().expect("valid key"))
+        .with_idempotency_key("job-123-attempt-2".parse().expect("valid key"))
         .with_deadline_micros(1_717_171_777_000_000)
         .with_operation(OPERATION_CHAT)
         .with_metadata("priority", "high");

@@ -38,13 +38,13 @@ async fn given_a_message_without_provenance_when_consumed_then_should_dead_lette
 
     // A worker consumes commands (its handler never runs: the message is
     // undecodable and dead-lettered first) and a collector drains the DLQ.
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Noop)
         .build()
         .spawn(laser.clone());
-    Agent::builder()
+    let _agent_lifetime_2 = Agent::builder()
         .id("dlq-collector"
             .parse()
             .expect("collector is a valid agent id"))

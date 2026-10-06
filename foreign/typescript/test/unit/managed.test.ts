@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, managedCapabilitiesFrom } from "../../src/client/capabilities.js"
-import { ProtocolError, UnsupportedError } from "../../src/client/errors.js"
+import { KvExecutionError, UnsupportedError } from "../../src/client/errors.js"
+import { isVersionSkew } from "../../src/client/error-classify.js"
 import { executeManaged } from "../../src/client/managed.js"
 import { Destinations } from "../../src/managed/destinations.js"
 import { decodeCheckpointRequestFrame } from "../../src/wire/checkpoint.js"
@@ -84,7 +85,7 @@ void test("given_an_advertised_version_skew_when_executing_then_should_reject_be
       key: Uint8Array.of(1),
       value: Uint8Array.of(2)
     }),
-    ProtocolError
+    (error: unknown) => error instanceof KvExecutionError && isVersionSkew(error)
   )
   assert.equal(sent, false)
 })

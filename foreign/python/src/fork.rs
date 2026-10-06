@@ -42,16 +42,23 @@ pub struct PyForkHandle {
 #[pymethods]
 impl PyForkHandle {
     /// Open this fork. `severed=True` freezes a snapshot at the trunk's current
-    /// offsets. The default (continuous) keeps seeing new trunk appends. Narrow a
-    /// severed snapshot with `tables`. Returns the fork's metadata dict.
-    #[pyo3(signature = (*, severed=false, parent=None, tables=None))]
+    /// offsets. The default, `continuous=True` when stated explicitly, keeps
+    /// seeing new trunk appends. Narrow a severed snapshot with `tables`.
+    /// Returns the fork's metadata dict.
+    #[pyo3(signature = (*, severed=false, continuous=false, parent=None, tables=None))]
     fn create<'py>(
         &self,
         py: Python<'py>,
         severed: bool,
+        continuous: bool,
         parent: Option<String>,
         tables: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if severed && continuous {
+            return Err(crate::errors::InvalidError::new_err(
+                "a fork is either severed or continuous, not both",
+            ));
+        }
         let laser = self.laser.clone();
         let fork_id = self.fork_id.clone();
         future_into_py(py, async move {
@@ -59,6 +66,9 @@ impl PyForkHandle {
             let mut request = handle.create();
             if severed {
                 request = request.severed();
+            }
+            if continuous {
+                request = request.continuous();
             }
             if let Some(parent) = parent {
                 request = request.parent(parent);
@@ -207,10 +217,7 @@ impl PyForkPut {
                 request = request.payload(payload);
             }
             if let Some(embedding) = embedding {
-                // The fork put takes the embedding as a JSON array literal.
-                let literal = serde_json::to_string(&embedding)
-                    .map_err(|e| crate::errors::CodecError::new_err(e.to_string()))?;
-                request = request.embedding(literal);
+                request = request.embedding(embedding);
             }
             if tombstone {
                 request = request.tombstone();

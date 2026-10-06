@@ -42,7 +42,7 @@ async fn given_a_duplicate_and_a_poison_message_when_consumed_then_should_dedupe
     let laser = harness::laser().await;
     let handled = Arc::new(AtomicUsize::new(0));
 
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Worker {
@@ -198,7 +198,7 @@ async fn given_a_rejected_message_when_consumed_then_should_dead_letter_without_
     let laser = harness::laser().await;
     let handled = Arc::new(AtomicUsize::new(0));
 
-    Agent::builder()
+    let _agent_lifetime_2 = Agent::builder()
         .id("rejecter".parse().expect("rejecter is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Worker {
@@ -362,7 +362,7 @@ async fn given_a_message_past_its_deadline_when_consumed_then_should_dead_letter
     let laser = harness::laser().await;
     let handled = Arc::new(AtomicUsize::new(0));
 
-    Agent::builder()
+    let _agent_lifetime_3 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Worker {
@@ -417,7 +417,7 @@ async fn given_a_dead_letter_when_redriven_then_should_reinject_the_original_to_
     let laser = harness::laser().await;
     let handled = Arc::new(AtomicUsize::new(0));
 
-    Agent::builder()
+    let _agent_lifetime_4 = Agent::builder()
         .id("rejecter".parse().expect("rejecter is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Worker {

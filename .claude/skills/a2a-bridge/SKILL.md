@@ -5,7 +5,7 @@ description: The A2A JSON-RPC bridge - `sdk/src/a2a.rs`. The adapter (submit / t
 
 # A2A bridge
 
-The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios.
+The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescript/src/bridges` and share the cross-language bridge scenarios. Python binds the same bridges: `a2a_bridge(..., capabilities=, signing_key=)` with `signed_card(key)`, and `mcp_bridge(..., memory_tools=False, timeout_secs=None)`, matching Rust `with_capabilities`, `with_signing_key`, `signed_card`, `with_memory_tools`, and `with_timeout` (default 30 seconds).
 
 `a2a.rs` maps A2A requests to durable AGDX records. `a2a-bridge` enables the transport-independent `submit`, `task`, `cancel`, and `card` adapter. `a2a-http` adds the axum `router()`, `A2aMethod`, and JSON-RPC handlers. Neither feature is enabled by default. Load [laser-sdk-overview](../laser-sdk-overview/SKILL.md) first and follow [AGENTS.md](../../../AGENTS.md).
 
@@ -17,7 +17,7 @@ The TypeScript A2A, MCP, AG-UI, and hop-guard peers live under `foreign/typescri
 ## Key symbols
 
 - `TaskState` (re-exported from `laser_wire::agent`, 9 states: submitted, working, input-required, completed, canceled, failed, rejected, auth-required, unknown, plus unknown-code passthrough), `Task`, `TaskStatus`, `Artifact`.
-- `A2aMethod` (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask` - the v1.0 PascalCase spellings. V1.0's `ListTasks` is not served, the bridge is stateless over the log and an unknown method answers the standard method-not-found) - the served methods as an enum with `Display`/`FromStr` (strum). Dispatch parses `request.method` into it, never match on bare method-name string literals. `SendStreamingMessage` maps to the same publish as `SendMessage` (streaming is consumed log-natively via `Laser::reassemble_channel`, not re-emitted as SSE).
+- `A2aMethod` (`SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask` - the v1.0 PascalCase spellings. V1.0's `ListTasks` is not served, the bridge is stateless over the log and an unknown method answers the bridge's application error code `-32000`, not JSON-RPC's `-32601`) - the served methods as an enum with `Display`/`FromStr` (strum). Dispatch parses `request.method` into it, never match on bare method-name string literals. `SendStreamingMessage` maps to the same publish as `SendMessage` (streaming is consumed log-natively via `Laser::reassemble_channel`, not re-emitted as SSE).
 - `JsonRpcRequest` / `JsonRpcResponse` / `JsonRpcError` - the 2.0 envelope. `JSONRPC_VERSION` and `APP_ERROR_CODE` are named consts, not literals.
 - `AgentCard` / `AgentCardCapabilities` - the bridge's discovery doc (name = `source`, version, methods, `streaming`).
 - `A2aBridge::new(laser, source, request_topic, reply_topic)` - rides the typed AGDX verbs (`Laser::agdx`), not raw `send_agent`:

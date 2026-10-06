@@ -60,8 +60,8 @@ pub fn stream_for(example: &str) -> String {
         .unwrap_or_else(|| format!("{DEFAULT_STREAM}-{example}-rust"))
 }
 
-/// A managed index name owned by this invocation (`orders_v1` becomes
-/// `orders_v1_<token>`), so a repeat or concurrent run materializes its own
+/// A managed index name owned by this invocation (`readings_v1` becomes
+/// `readings_v1_<token>`), so a repeat or concurrent run materializes its own
 /// rows instead of counting a previous run's.
 pub fn index_for(base: &str) -> String {
     format!("{base}_{}", run_token())
@@ -218,23 +218,13 @@ fn split_host_port(authority: &str) -> (&str, Option<&str>) {
 /// Shared volume knobs every data-publishing example honors, so one run scales
 /// from ten records to millions without editing code. Each example passes its
 /// own default. The env var wins when set:
-/// `LASER_MESSAGES` (total records), `LASER_BATCH` (records per send call),
-/// `LASER_CONCURRENCY` (parallel publishers), `LASER_PAYLOAD_BYTES`
-/// (approximate body size in bytes).
+/// `LASER_MESSAGES` (total records), `LASER_BATCH` (records per send call).
 pub fn messages(default: u64) -> u64 {
     env_u64("LASER_MESSAGES", default).max(1)
 }
 
 pub fn batch(default: usize) -> usize {
     env_usize("LASER_BATCH", default).max(1)
-}
-
-pub fn concurrency(default: usize) -> usize {
-    env_usize("LASER_CONCURRENCY", default).max(1)
-}
-
-pub fn payload_bytes(default: usize) -> usize {
-    env_usize("LASER_PAYLOAD_BYTES", default)
 }
 
 pub fn env_usize(key: &str, default: usize) -> usize {
@@ -283,7 +273,7 @@ pub async fn start_projector(
 
 /// Declare `index` over `topic` on a managed deployment and wait until it answers
 /// queries, so a publish that follows flows into a live projector. The index is
-/// named separately from its source topic (`orders` produces `orders_v1`), the
+/// named separately from its source topic (`readings` produces `readings_v1`), the
 /// convention that lets a view be versioned without renaming the topic.
 pub async fn ensure_view(
     laser: &Laser,

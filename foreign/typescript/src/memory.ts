@@ -1,5 +1,6 @@
 export { LogMemory } from "./memory/log-memory.js"
 export { MemoryBackend, MemoryHandle, RecallBuilder, RememberBuilder } from "./memory/handle.js"
+export type { MemoryBackendKind } from "./memory/handle.js"
 export { MemoryTopicBuilder } from "./memory/topic.js"
 export {
   Lifetime,
@@ -12,6 +13,7 @@ export {
   toContextBlock
 } from "./memory/types.js"
 export type {
+  ConsolidateOptions,
   ConsolidationReport,
   Consolidator,
   Embedder,
@@ -21,6 +23,7 @@ export type {
   MemoryQuery,
   MemoryScope,
   RecallSignal,
-  Reranker
+  Reranker,
+  Summarizer
 } from "./memory/types.js"
 export { VectorMemory, ZeroEmbedder } from "./memory/vector-memory.js"

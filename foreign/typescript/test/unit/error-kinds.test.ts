@@ -112,10 +112,10 @@ void test("given_a_routing_error_when_constructed_then_should_carry_the_structur
 })
 
 void test("given_a_presence_conflict_when_constructed_then_should_name_both_agents", () => {
-  const error = new PresenceConflictError("triage", "billing")
+  const error = new PresenceConflictError("triage", "metrics")
   assert.equal(error.kind, "presence-conflict")
   assert.equal(error.advertised, "triage")
-  assert.equal(error.requested, "billing")
+  assert.equal(error.requested, "metrics")
 })
 
 void test("given_the_self_describing_errors_when_constructed_then_should_build_their_own_message", () => {
@@ -123,9 +123,9 @@ void test("given_the_self_describing_errors_when_constructed_then_should_build_t
   assert.equal(integrity.reference, "blob://abc")
   assert.match(integrity.message, /blob:\/\/abc/u)
 
-  const stepUp = new StepUpRequiredError("refund:approve")
-  assert.equal(stepUp.scope, "refund:approve")
-  assert.match(stepUp.message, /refund:approve/u)
+  const stepUp = new StepUpRequiredError("storage:rotate")
+  assert.equal(stepUp.scope, "storage:rotate")
+  assert.match(stepUp.message, /storage:rotate/u)
 
   const budget = new BudgetExceededError(100n, 140n)
   assert.equal(budget.ceiling, 100n)

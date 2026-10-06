@@ -218,7 +218,7 @@ mod tests {
             fork_id: "agent-run-7".to_owned(),
             parent: None,
             kind: ForkKind::Severed,
-            tables: vec!["orders".to_owned()],
+            tables: vec!["readings".to_owned()],
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: ForkCreate = decode_named(&bytes).expect("deserializes");

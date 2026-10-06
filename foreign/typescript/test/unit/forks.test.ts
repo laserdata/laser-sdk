@@ -80,7 +80,7 @@ void test("given_an_invalid_fork_id_when_create_is_sent_then_should_reject_befor
 
 void test("given_a_created_outcome_when_create_is_sent_then_should_return_the_fork_info_and_use_the_create_command", async () => {
   const { fork: handle, transport } = fork("experiment", [okFrame({ kind: "created", info: INFO })])
-  const info = await handle.create().severed().parent("baseline").tables(["orders"]).send()
+  const info = await handle.create().severed().parent("baseline").tables(["readings"]).send()
   assert.deepEqual(info, INFO)
   assert.equal(transport.calls[0]?.code, ForkCreateCommand.code)
 })
@@ -102,11 +102,11 @@ void test("given_a_deleted_outcome_when_squash_is_called_then_should_return_whet
 void test("given_a_written_outcome_when_put_row_is_sent_then_should_use_the_put_command", async () => {
   const { fork: handle, transport } = fork("experiment", [okFrame({ kind: "written" })])
   await handle
-    .putRow("orders", 0, 1n)
+    .putRow("readings", 0, 1n)
     .field("status", "resolved")
     .metadata("trace_id", "abc")
     .payload(Uint8Array.of(1))
-    .embedding("[0.1,0.2]")
+    .embedding([0.1, 0.2])
     .tombstone()
     .send()
   assert.equal(transport.calls[0]?.code, ForkPutCommand.code)

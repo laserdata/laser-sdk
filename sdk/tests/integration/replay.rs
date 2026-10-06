@@ -30,7 +30,7 @@ async fn given_consumer_group_committed_offsets_when_rebuilding_state_then_shoul
     // group's server-stored offset past the whole conversation, exactly the
     // state a restarting steady-state consumer would resume from.
     let handled = Arc::new(AtomicUsize::new(0));
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("counter".parse().expect("counter is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Counter {

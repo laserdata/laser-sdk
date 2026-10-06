@@ -119,7 +119,7 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
         startFrom: { kind: "next" }
       })
     try {
-      assert.equal(await rejoined.nextWithin(100), null)
+      await assert.rejects(rejoined.nextWithin(100), TimeoutError)
     } finally {
       await rejoined.shutdown()
     }
@@ -224,10 +224,10 @@ void test("given_periodic_memory_consolidation_when_an_agent_runs_then_should_ti
       .handler({ handle: () => Promise.resolve() })
       .consolidateEvery(10)
       .consolidator({
-        consolidate(scope): Promise<void> {
+        consolidate(scope) {
           assert.deepEqual(scope, {})
           consolidations += 1
-          return Promise.resolve()
+          return Promise.resolve({ summarized: 0, reweighted: 0, pruned: 0, derived: 0 })
         }
       })
       .spawn(laser)
@@ -573,7 +573,7 @@ void test("given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_be
         startFrom: { kind: "next" }
       })
     try {
-      assert.equal(await rejoined.nextWithin(100), null)
+      await assert.rejects(rejoined.nextWithin(100), TimeoutError)
     } finally {
       await rejoined.shutdown()
     }
@@ -628,7 +628,7 @@ void test("given_a_retryable_handler_that_never_succeeds_when_consumed_then_shou
         autoCommit: false
       })
     try {
-      assert.equal(await rejoined.nextWithin(100), null)
+      await assert.rejects(rejoined.nextWithin(100), TimeoutError)
     } finally {
       await rejoined.shutdown()
     }

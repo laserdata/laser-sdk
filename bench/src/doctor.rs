@@ -317,13 +317,6 @@ fn cpu_compatible(cpu_target: &str) -> Result<bool, BenchError> {
     if cpu_target == "arm64" {
         return Ok(architecture == "aarch64");
     }
-    if architecture != "x86_64" {
-        return Ok(false);
-    }
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").map_err(|source| BenchError::Read {
-        path: Path::new("/proc/cpuinfo").to_path_buf(),
-        source,
-    })?;
     let required: &[&str] = match cpu_target {
         "skylake" | "znver3" => &["avx2", "bmi2", "fma"],
         "icelake" => &["avx2", "avx512f", "avx512vl"],
@@ -334,6 +327,13 @@ fn cpu_compatible(cpu_target: &str) -> Result<bool, BenchError> {
             )));
         }
     };
+    if architecture != "x86_64" {
+        return Ok(false);
+    }
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").map_err(|source| BenchError::Read {
+        path: Path::new("/proc/cpuinfo").to_path_buf(),
+        source,
+    })?;
     Ok(required.iter().all(|feature| {
         cpuinfo
             .lines()

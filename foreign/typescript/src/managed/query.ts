@@ -1,4 +1,5 @@
-import { InvalidError } from "../client/errors.js"
+import { InvalidError, ProtocolError } from "../client/errors.js"
+import { saturatingAdd } from "../runtime/clock.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import type { Codec } from "../stream/codecs.js"
 import { CONVERSATION_FIELD, VECTOR_FIELD } from "../wire/headers.js"
@@ -15,6 +16,7 @@ import {
   type QueryResult,
   type QueryTarget,
   type Row,
+  type SnapshotSelector,
   type SqlDialect,
   filterAll,
   filterPred,
@@ -61,8 +63,38 @@ export class QueryRequest {
     return this
   }
 
+  /** The absolute deadline, in epoch microseconds. Defaults to 30 seconds
+   * after the request was built, like the Rust and Python SDKs. */
   deadlineMicros(value: bigint): this {
     this.queryValue = { ...this.queryValue, deadlineMicros: value }
+    return this
+  }
+
+  /** A deadline `milliseconds` from now, the relative form of
+   * `deadlineMicros`. */
+  deadline(milliseconds: number): this {
+    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+      throw new InvalidError("query deadline must be a non-negative finite number")
+    }
+    const micros = BigInt(Math.round(Math.min(milliseconds * 1000, Number.MAX_SAFE_INTEGER)))
+    return this.deadlineMicros(saturatingAdd(BigInt(Date.now()) * 1000n, micros))
+  }
+
+  /** Selects one exact Iceberg snapshot for a lakehouse query. */
+  atSnapshot(snapshotId: bigint): this {
+    return this.selectSnapshot({ kind: "snapshot_id", value: snapshotId }, "snapshot")
+  }
+
+  /** Selects the retained Iceberg snapshot current at a timestamp. */
+  atTimestampMicros(timestampMicros: bigint): this {
+    return this.selectSnapshot({ kind: "timestamp_micros", value: timestampMicros }, "timestamp")
+  }
+
+  private selectSnapshot(snapshot: SnapshotSelector, label: string): this {
+    const target = this.queryValue.target
+    if (target.kind !== "lakehouse")
+      throw new InvalidError(`${label} selection requires a lakehouse query target`)
+    this.queryValue = { ...this.queryValue, target: { ...target, snapshot } }
     return this
   }
 
@@ -285,6 +317,8 @@ export class QueryRequest {
     return this
   }
   maxRows(value: number): this {
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new InvalidError("query maxRows must be a non-negative safe integer")
     this.rowCeiling = value
     return this
   }
@@ -338,6 +372,29 @@ export class QueryRequest {
     return this.pageRows(this.rowCeiling)
   }
 
+  /** Streams up to the `maxRows` ceiling, decoding each row's original
+   * payload with `codec`. Implies `withPayload()`. */
+  rowsTyped<T>(codec: Codec<T>): AsyncIterable<T> {
+    const ceiling = this.rowCeiling
+    if (ceiling === undefined)
+      throw new InvalidError("rowsTyped() needs an explicit ceiling: call maxRows(n) first")
+    this.withPayload()
+    return this.typedRows(codec, ceiling)
+  }
+
+  private async *typedRows<T>(codec: Codec<T>, ceiling: number): AsyncGenerator<T> {
+    if (ceiling === 0) return
+    let emitted = 0
+    for await (const result of this.pages()) {
+      for (const row of result.rows) {
+        if (emitted >= ceiling) return
+        emitted += 1
+        yield decodePayload(result, row, codec)
+      }
+      if (emitted >= ceiling) return
+    }
+  }
+
   private async fetchAllWithSchemas(): Promise<
     readonly { readonly result: QueryResult; readonly row: Row }[]
   > {
@@ -360,6 +417,7 @@ export class QueryRequest {
   }
 
   private async *pageRows(ceiling = Number.POSITIVE_INFINITY): AsyncGenerator<Row> {
+    if (ceiling === 0) return
     let emitted = 0
     for await (const result of this.pages()) {
       for (const row of result.rows) {
@@ -388,7 +446,7 @@ function decodePayload<T>(result: QueryResult, row: Row, codec: Codec<T>): T {
 
 function requireResultExecution(result: QueryResult, executionId: QueryExecutionId): QueryResult {
   if (result.context.executionId.asU128() !== executionId.asU128())
-    throw new InvalidError("query reply execution id does not match the request")
+    throw new ProtocolError("query reply execution id does not match the request")
   return result
 }
 
@@ -397,6 +455,6 @@ function requireStatusExecution(
   executionId: QueryExecutionId
 ): QueryExecutionStatus {
   if (status.executionId.asU128() !== executionId.asU128())
-    throw new InvalidError("query status execution id does not match the request")
+    throw new ProtocolError("query status execution id does not match the request")
   return status
 }

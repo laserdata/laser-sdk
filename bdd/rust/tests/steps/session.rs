@@ -65,6 +65,34 @@ async fn context_is(world: &mut LaserWorld, first: String, second: String, third
     assert_eq!(labels, vec![first, second, third]);
 }
 
+#[when(regex = r#"^I publish (\d+) unrelated records to topic "([^"]+)"$"#)]
+async fn publish_unrelated(world: &mut LaserWorld, count: usize, topic: String) {
+    let topic = world.laser().topic(topic);
+    let mut batch = topic.publish_batch();
+    for index in 0..count {
+        batch = batch.add_payload(format!("unrelated-{index}").into_bytes());
+    }
+    batch
+        .send()
+        .await
+        .expect("the unrelated records should be published");
+}
+
+#[then(regex = r#"^the session context is only "([^"]+)"$"#)]
+async fn context_is_only(world: &mut LaserWorld, only: String) {
+    let session = world.session().clone();
+    let turns = eventually(async || {
+        let turns = session
+            .context()
+            .await
+            .expect("the context should assemble");
+        let labels: Vec<String> = turns.iter().map(labelled).collect();
+        (labels == [only.clone()]).then_some(labels)
+    })
+    .await;
+    assert_eq!(turns, vec![only]);
+}
+
 #[then(regex = r#"^opening the session "([^"]+)" again reaches the same conversation$"#)]
 async fn same_conversation(world: &mut LaserWorld, id: String) {
     assert_eq!(

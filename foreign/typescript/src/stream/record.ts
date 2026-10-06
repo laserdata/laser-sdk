@@ -16,7 +16,7 @@ import { MAX_INDEX_ENTRIES_PER_RECORD } from "../wire/limits.js"
 
 const encoder = new TextEncoder()
 
-interface RecordSnapshot {
+export interface RecordSnapshot {
   readonly contentType?: ContentType
   readonly projectionRef?: string
   readonly schemaId?: number

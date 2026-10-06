@@ -32,7 +32,7 @@ mod tests {
             MemoryRecord::Item {
                 id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
                 kind: "fact".to_owned(),
-                body: b"checkout is slow".to_vec(),
+                body: b"auth is slow".to_vec(),
             },
             MemoryRecord::Forget {
                 target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),

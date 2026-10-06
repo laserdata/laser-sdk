@@ -111,12 +111,12 @@ void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the
 
   const query = {
     v: QUERY_OP_VERSION,
-    query: newQuery(operationalTarget("orders"), QueryExecutionId.fromU128(1n), 10_000n)
+    query: newQuery(operationalTarget("readings"), QueryExecutionId.fromU128(1n), 10_000n)
   }
   assert.deepEqual(QueryCommand.encode(query), encodeQueryEnvelopeFrame(query))
 
-  assertFramed(GetProjectionCommand, { v: 1, id: "orders" }, encodeGetProjection)
-  assertFramed(ListProjectionsCommand, { v: 1, topics: ["orders"] }, encodeListProjections)
+  assertFramed(GetProjectionCommand, { v: 1, id: "readings" }, encodeGetProjection)
+  assertFramed(ListProjectionsCommand, { v: 1, topics: ["readings"] }, encodeListProjections)
   assertFramed(GetSchemaCommand, { v: 1, id: 7 }, encodeGetSchema)
   assertFramed(ListSchemasCommand, { v: 1 }, encodeListSchemas)
   assertFramed(
@@ -149,10 +149,10 @@ void test("given_typed_command_requests_when_encoded_then_should_delegate_to_the
     ForkPutCommand,
     {
       forkId: "draft",
-      table: "orders",
+      table: "readings",
       partitionId: 0,
       offset: 1n,
-      projectionId: "orders",
+      projectionId: "readings",
       projectionVersion: 1,
       fields: new Map(),
       metadata: new Map(),

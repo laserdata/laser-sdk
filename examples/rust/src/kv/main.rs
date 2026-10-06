@@ -9,16 +9,16 @@ use std::time::Duration;
 // The State primitive: fast keyed state next to the log (KV), with
 // git-like copy-on-write forks to try changes before keeping them. Both
 // surfaces are managed by laser-plane in Laser Stack or LaserData Cloud.
-const NAMESPACE: &str = "profiles";
-const KEY: &str = "user:42";
+const NAMESPACE: &str = "config";
+const KEY: &str = "service:auth";
 const FORK: &str = "experiment-1";
-const LEASE_KEY: &str = "lease:user:42";
+const LEASE_KEY: &str = "lease:service:auth";
 const HOLDER: &str = "worker-a";
 const LEASE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Profile {
-    plan: String,
+struct ServiceConfig {
+    log_level: String,
 }
 
 #[tokio::main]
@@ -35,14 +35,14 @@ async fn main() -> Result<(), LaserError> {
         phase("set and get keyed state");
         let kv = laser.kv(NAMESPACE);
         kv.set(KEY)
-            .json(&Profile {
-                plan: "pro".to_owned(),
+            .json(&ServiceConfig {
+                log_level: "info".to_owned(),
             })?
             .ttl(Duration::from_secs(86_400))
             .send()
             .await?;
-        let profile = kv.get_typed::<Profile>(KEY).await?;
-        println!("  {KEY} is on {}", plan_of(profile.as_ref()));
+        let config = kv.get_typed::<ServiceConfig>(KEY).await?;
+        println!("  {KEY} logs at {}", level_of(config.as_ref()));
 
         if capabilities.kv.cas {
             phase("compare-and-swap: the write lands only if nobody moved first");
@@ -51,17 +51,17 @@ async fn main() -> Result<(), LaserError> {
                 .await?
                 .ok_or_else(|| LaserError::Invalid(format!("{KEY} vanished")))?;
             kv.set(KEY)
-                .json(&Profile {
-                    plan: "enterprise".to_owned(),
+                .json(&ServiceConfig {
+                    log_level: "debug".to_owned(),
                 })?
                 .expect_version(entry.version)
                 .commit()
                 .await?;
-            let upgraded = kv.get_typed::<Profile>(KEY).await?;
+            let raised = kv.get_typed::<ServiceConfig>(KEY).await?;
             println!(
-                "  version {} accepted the upgrade, {KEY} is now on {}",
+                "  version {} accepted the change, {KEY} now logs at {}",
                 entry.version,
-                plan_of(upgraded.as_ref())
+                level_of(raised.as_ref())
             );
         }
 
@@ -78,18 +78,18 @@ async fn main() -> Result<(), LaserError> {
                 .ok_or_else(|| LaserError::Invalid(format!("{KEY} vanished")))?;
             let fenced = kv
                 .cas_fenced(KEY, NAMESPACE, LEASE_KEY, lease.token)
-                .json(&Profile {
-                    plan: "enterprise-plus".to_owned(),
+                .json(&ServiceConfig {
+                    log_level: "trace".to_owned(),
                 })?
                 .ttl(Duration::from_secs(86_400))
                 .expect_version(held.version)
                 .commit()
                 .await?;
-            let seen: Profile = serde_json::from_slice(&held.value)
+            let seen: ServiceConfig = serde_json::from_slice(&held.value)
                 .map_err(|error| LaserError::Invalid(error.to_string()))?;
             println!(
                 "  barriered read saw {}, the fenced write landed as version {fenced}",
-                plan_of(Some(&seen))
+                level_of(Some(&seen))
             );
             let renewed = kv
                 .renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL)
@@ -103,8 +103,8 @@ async fn main() -> Result<(), LaserError> {
             // already dead, so a zombie holder cannot commit through it.
             let zombie = kv
                 .cas_fenced(KEY, NAMESPACE, LEASE_KEY, lease.token)
-                .json(&Profile {
-                    plan: "zombie".to_owned(),
+                .json(&ServiceConfig {
+                    log_level: "zombie".to_owned(),
                 })?
                 .expect_version(fenced)
                 .commit()
@@ -126,7 +126,7 @@ async fn main() -> Result<(), LaserError> {
             phase("fork: a branch of the same state, promoted or thrown away");
             let table = index_for(NAMESPACE);
             laser.topic(NAMESPACE).ensure(PARTITIONS).await?;
-            ensure_view(&laser, NAMESPACE, &table, ContentType::Json, &["plan"]).await?;
+            ensure_view(&laser, NAMESPACE, &table, ContentType::Json, &["log_level"]).await?;
             let fork = laser.fork(FORK);
             fork.squash().await?;
             fork.create()
@@ -135,7 +135,7 @@ async fn main() -> Result<(), LaserError> {
                 .send()
                 .await?;
             fork.put_row(&table, 0, 0)
-                .field("plan", "enterprise-preview")
+                .field("log_level", "trace-preview")
                 .send()
                 .await?;
             let applied = fork.promote().await?;
@@ -146,6 +146,6 @@ async fn main() -> Result<(), LaserError> {
     .await
 }
 
-fn plan_of(profile: Option<&Profile>) -> &str {
-    profile.map_or("no plan", |profile| profile.plan.as_str())
+fn level_of(config: Option<&ServiceConfig>) -> &str {
+    config.map_or("no level", |config| config.log_level.as_str())
 }

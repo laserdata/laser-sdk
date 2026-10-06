@@ -36,7 +36,7 @@ impl AgentHandler for Echo {
 async fn given_a_message_send_when_the_agent_replies_then_tasks_get_should_complete() {
     let laser = harness::laser().await;
     // A worker behind the bridge: consumes the request topic, replies on responses.
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("a2a-worker"
             .parse()
             .expect("a2a-worker is a valid agent id"))
@@ -142,7 +142,7 @@ async fn given_an_agent_and_bridge_on_a_custom_stream_when_used_then_should_run_
         .await
         .expect("the scoped stream bootstraps");
 
-    Agent::builder()
+    let _agent_lifetime_2 = Agent::builder()
         .id("a2a-worker"
             .parse()
             .expect("a2a-worker is a valid agent id"))

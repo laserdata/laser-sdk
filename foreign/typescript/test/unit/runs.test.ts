@@ -171,11 +171,11 @@ void test("given_a_stream_and_topic_when_register_and_remove_source_are_called_t
     () => Promise.resolve(CAPS),
     control.publish
   )
-  await runs.registerSource("orders", "events")
-  await runs.removeSource("orders", "events")
+  await runs.registerSource("fleet", "events")
+  await runs.removeSource("fleet", "events")
   assert.deepEqual(control.calls, [
-    { kind: "registerRunSource", source: { stream: "orders", topic: "events" } },
-    { kind: "removeRunSource", source: { stream: "orders", topic: "events" } }
+    { kind: "registerRunSource", source: { stream: "fleet", topic: "events" } },
+    { kind: "removeRunSource", source: { stream: "fleet", topic: "events" } }
   ])
 })
 

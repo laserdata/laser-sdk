@@ -109,7 +109,7 @@ impl<'a> Projections<'a> {
 
     /// Drop a projection by publishing a `DropProjection` control command.
     /// LaserData Cloud stops applying it, and existing materialized rows are
-    /// left untouched. `id` is the projection ref (e.g. `"order.v1"`).
+    /// left untouched. `id` is the projection ref (e.g. `"reading.v1"`).
     pub async fn drop(&self, id: impl Into<String>) -> Result<(), LaserError> {
         self.laser
             .publish_control(ControlCommand::DropProjection(id.into()))

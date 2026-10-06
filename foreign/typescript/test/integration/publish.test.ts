@@ -11,20 +11,20 @@ import { ContentType } from "../../src/wire/content.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
-interface Order {
-  readonly id: string
+interface Reading {
+  readonly host: string
 }
 
-function decodeOrder(value: unknown): Order {
+function decodeReading(value: unknown): Reading {
   if (
     value === null ||
     typeof value !== "object" ||
-    !("id" in value) ||
-    typeof value.id !== "string"
+    !("host" in value) ||
+    typeof value.host !== "string"
   ) {
-    throw new TypeError("order requires a string id")
+    throw new TypeError("a reading requires a string host")
   }
-  return { id: value.id }
+  return { host: value.host }
 }
 
 async function freshTopic(laser: Laser, partitions = 1) {
@@ -70,12 +70,12 @@ void test("given_a_publish_request_with_a_json_body_when_sent_then_should_delive
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    await topic.publish().json({ id: "o-1" }, jsonCodec(decodeOrder)).send()
+    await topic.publish().json({ host: "node-1" }, jsonCodec(decodeReading)).send()
 
     const reply = await pollFirst(laser, topic.streamName, 0)
     assert.equal(reply.count, 1)
     assert.deepEqual(JSON.parse(reply.messages[0]?.payload.toString("utf8") ?? "null"), {
-      id: "o-1"
+      host: "node-1"
     })
   } finally {
     await laser.close()
@@ -89,13 +89,13 @@ void test("given_a_publish_request_when_the_last_body_setter_wins_then_should_se
     await topic
       .publish()
       .payload(new TextEncoder().encode("first-body"))
-      .json({ id: "second-body" }, jsonCodec(decodeOrder))
+      .json({ host: "second-body" }, jsonCodec(decodeReading))
       .send()
 
     const reply = await pollFirst(laser, topic.streamName, 0)
     assert.equal(reply.count, 1)
     assert.deepEqual(JSON.parse(reply.messages[0]?.payload.toString("utf8") ?? "null"), {
-      id: "second-body"
+      host: "second-body"
     })
   } finally {
     await laser.close()
@@ -132,21 +132,20 @@ void test("given_a_complete_record_when_published_then_should_preserve_every_con
     const topic = await freshTopic(laser)
     await topic
       .publish()
-      .rawBytes(new TextEncoder().encode('{"id":"o-7"}'), ContentType.Json)
-      .projectionRef("orders.v1")
+      .rawBytes(new TextEncoder().encode('{"host":"node-7"}'), ContentType.Json)
+      .projectionRef("reading.v1")
       .schemaId(7)
-      .index("id", "o-7")
+      .index("host_id", "node-7")
       .header("trace", "abc")
       .inlinePayload()
       .send()
 
     const message = await topic.consumer(0, { startFrom: { kind: "first" } }).nextWithin(1_000)
-    assert.ok(message !== null)
     assert.deepEqual(message.headers.get("agdx.ct"), { kind: "uint8", value: 1 })
     assert.deepEqual(message.headers.get("agdx.sid"), { kind: "uint32", value: 7 })
     assert.deepEqual(message.headers.get("agdx.inline"), { kind: "bool", value: true })
-    assert.deepEqual(message.headers.get("agdx.ref"), { kind: "string", value: "orders.v1" })
-    assert.deepEqual(message.headers.get("agdx.idx.id"), { kind: "string", value: "o-7" })
+    assert.deepEqual(message.headers.get("agdx.ref"), { kind: "string", value: "reading.v1" })
+    assert.deepEqual(message.headers.get("agdx.idx.host_id"), { kind: "string", value: "node-7" })
     assert.deepEqual(message.headers.get("trace"), { kind: "string", value: "abc" })
   } finally {
     await laser.close()
@@ -163,11 +162,11 @@ void test("given_a_heterogeneous_publish_batch_when_sent_then_should_apply_defau
       .publishBatch()
       .contentType(ContentType.Json)
       .schemaId(7)
-      .index("tenant", "shared")
+      .index("region", "shared")
       .addPayload(new TextEncoder().encode("one"))
       .addRecord(
         new TextEncoder().encode("two"),
-        new Record().contentType(ContentType.Cbor).schemaId(9).index("tenant", "override")
+        new Record().contentType(ContentType.Cbor).schemaId(9).index("region", "override")
       )
       .send()
     assert.equal(committed.confirmations.length, 1)
@@ -176,13 +175,11 @@ void test("given_a_heterogeneous_publish_batch_when_sent_then_should_apply_defau
     const consumer = topic.consumer(0, { startFrom: { kind: "first" }, batchLength: 2 })
     const first = await consumer.nextWithin(1_000)
     const second = await consumer.nextWithin(1_000)
-    assert.ok(first !== null)
-    assert.ok(second !== null)
     assert.deepEqual(first.headers.get("agdx.ct"), { kind: "uint8", value: 1 })
     assert.deepEqual(first.headers.get("agdx.sid"), { kind: "uint32", value: 7 })
     assert.deepEqual(second.headers.get("agdx.ct"), { kind: "uint8", value: 3 })
     assert.deepEqual(second.headers.get("agdx.sid"), { kind: "uint32", value: 9 })
-    assert.deepEqual(second.headers.get("agdx.idx.tenant"), {
+    assert.deepEqual(second.headers.get("agdx.idx.region"), {
       kind: "string",
       value: "override"
     })

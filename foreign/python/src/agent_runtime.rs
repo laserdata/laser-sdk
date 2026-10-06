@@ -1,7 +1,7 @@
 use crate::agent::{PyAgentMessage, PyProvenance};
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, payload_bytes};
+use crate::convert::{duration_seconds, payload_bytes, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::{PyKeyRegistry, PySigningKey};
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use laser_sdk::LaserError;
 use laser_sdk::agent::{
     AgentCtx, AgentHandler, AgentMessage, AgentMiddleware, CapabilitySelector, ConcurrencyPolicy,
     Contract, DeadLetterSink, Deduplicator, GatherPolicy, InboxRoute, ReliableConsumer,
-    RetryPolicy, RoutePolicy, Router,
+    RetryPolicy, RouteCandidate, RoutePolicy, RouteScorer, Router, SlidingWindow,
 };
 use laser_sdk::context::{Chain, ContextAssembler, ContextPolicy, LastN, RoleFilter, TokenBudget};
 use laser_sdk::laser::Laser;
@@ -19,7 +19,7 @@ use laser_sdk::types::{AgentId, ConversationId, PrincipalId};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{get_current_locals, get_runtime, into_future, scope};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -44,7 +44,7 @@ fn parse_health(health: &str) -> laser_sdk::wire::agent::Health {
 }
 
 /// A fixed inbox route to `topic` when given, else the default advertised route.
-fn inbox_route(fixed_inbox: Option<String>) -> PyResult<InboxRoute> {
+pub(crate) fn inbox_route(fixed_inbox: Option<String>) -> PyResult<InboxRoute> {
     match fixed_inbox {
         Some(topic) => Ok(InboxRoute::Fixed(static_topic(topic)?)),
         None => Ok(InboxRoute::default()),
@@ -86,8 +86,143 @@ pub(crate) fn static_topic(name: String) -> PyResult<AgentTopic<'static>> {
     Ok(AgentTopic::Custom(id))
 }
 
-/// Parse a `fan_out` policy name into a `GatherPolicy`. `quorum` is required
-/// (and only meaningful) for `"quorum"`.
+// The Python spelling of a `RoutePolicy`: the variant in snake_case, with the
+// pinned agent after a colon for `sticky`.
+pub(crate) struct RouteWord(pub(crate) RoutePolicy);
+
+impl FromStr for RouteWord {
+    type Err = PyErr;
+
+    fn from_str(word: &str) -> PyResult<Self> {
+        let policy = match word {
+            "any" => RoutePolicy::Any,
+            "cheapest" => RoutePolicy::Cheapest,
+            "fastest" => RoutePolicy::Fastest,
+            "least_loaded" => RoutePolicy::LeastLoaded,
+            other => match other.strip_prefix("sticky:") {
+                Some(agent) => RoutePolicy::Sticky(
+                    AgentId::new(agent.to_owned()).map_err(|e| to_pyerr(e.into()))?,
+                ),
+                None => {
+                    return Err(InvalidError::new_err(format!(
+                        "unknown route policy '{other}', expected any, cheapest, fastest, least_loaded, or sticky:<agent>"
+                    )));
+                }
+            },
+        };
+        Ok(Self(policy))
+    }
+}
+
+/// Parse a fan-out policy. Only `quorum` takes a quorum count.
+pub(crate) type RouteFailure = Arc<Mutex<Option<PyErr>>>;
+
+pub(crate) struct ParsedRoutePolicy {
+    pub(crate) policy: RoutePolicy,
+    pub(crate) failure: RouteFailure,
+}
+
+pub(crate) fn take_route_failure(failure: &RouteFailure) -> Option<PyErr> {
+    failure.lock().ok().and_then(|mut failure| failure.take())
+}
+
+// A route scorer is synchronous, matching the native selection seam.
+pub(crate) fn route_policy(policy: Option<&Bound<'_, PyAny>>) -> PyResult<ParsedRoutePolicy> {
+    let failure = Arc::new(Mutex::new(None));
+    let policy = match policy {
+        None => RoutePolicy::Any,
+        Some(policy) if policy.is_none() => RoutePolicy::Any,
+        Some(policy) => {
+            if let Ok(word) = policy.extract::<String>() {
+                let RouteWord(policy) = word.parse()?;
+                policy
+            } else if policy.is_callable()
+                || policy
+                    .getattr("select")
+                    .is_ok_and(|select| select.is_callable())
+            {
+                RoutePolicy::Custom(Arc::new(PyRouteScorer {
+                    callback: policy.clone().unbind(),
+                    failure: failure.clone(),
+                }))
+            } else {
+                return Err(InvalidError::new_err(
+                    "a route policy must be a built-in word, callable, or object with a synchronous select method",
+                ));
+            }
+        }
+    };
+    Ok(ParsedRoutePolicy { policy, failure })
+}
+
+struct PyRouteScorer {
+    callback: Py<PyAny>,
+    failure: RouteFailure,
+}
+
+impl RouteScorer for PyRouteScorer {
+    fn select(&self, skill_id: &str, candidates: &[RouteCandidate<'_>]) -> Option<usize> {
+        let result = Python::attach(|py| {
+            let view = pyo3::types::PyList::empty(py);
+            for candidate in candidates {
+                let row = pyo3::types::PyDict::new(py);
+                row.set_item("agent", candidate.agent.as_str())?;
+                row.set_item("card", crate::registry::card_to_py(py, candidate.card)?)?;
+                row.set_item(
+                    "capability",
+                    candidate
+                        .capability
+                        .as_ref()
+                        .map(|value| ser_to_py(py, value))
+                        .transpose()?,
+                )?;
+                view.append(row)?;
+            }
+            let callback = self.callback.bind(py);
+            let selected = if callback.hasattr("select")? {
+                callback.call_method1("select", (skill_id, view))?
+            } else {
+                callback.call1((skill_id, view))?
+            };
+            if selected.hasattr("__await__")? {
+                if selected.hasattr("close")? {
+                    selected.call_method0("close")?;
+                }
+                return Err(InvalidError::new_err(
+                    "a route scorer must return an index or None synchronously",
+                ));
+            }
+            selected.extract::<Option<usize>>().map_err(|_| {
+                InvalidError::new_err("a route scorer must return a non-negative index or None")
+            })
+        });
+        match result {
+            Ok(selected) => selected,
+            Err(error) => {
+                if let Ok(mut failure) = self.failure.lock()
+                    && failure.is_none()
+                {
+                    *failure = Some(error);
+                }
+                None
+            }
+        }
+    }
+}
+
+fn route_result<T>(result: Result<T, LaserError>, failure: &RouteFailure) -> PyResult<T> {
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(LaserError::is_no_capable_agent)
+        && let Some(error) = take_route_failure(failure)
+    {
+        return Err(error);
+    }
+    let _ = take_route_failure(failure);
+    result.map_err(to_pyerr)
+}
+
 fn parse_gather_policy(policy: &str, quorum: Option<usize>) -> PyResult<GatherPolicy> {
     match policy {
         "require_all" => Ok(GatherPolicy::RequireAll),
@@ -127,6 +262,7 @@ struct PyHandler {
     agent: Option<AgentId>,
     respond_on: Option<String>,
     signing_key: Option<Arc<laser_sdk::sign::SigningKey>>,
+    inbox_route: InboxRoute,
 }
 
 impl AgentHandler for PyHandler {
@@ -139,16 +275,16 @@ impl AgentHandler for PyHandler {
             respond_on: self.respond_on.clone(),
             message: message.clone(),
             signing_key: self.signing_key.clone(),
+            inbox_route: self.inbox_route.clone(),
         };
-        let future = Python::attach(|py| -> PyResult<_> {
-            let callback = self.callback.bind(py);
-            let coroutine = callback.call1((py_ctx, py_message))?;
-            into_future(coroutine)
+        crate::memory::call_hook_cancellable(|py| {
+            self.callback
+                .bind(py)
+                .call1((py_ctx, py_message))
+                .map(Bound::unbind)
         })
-        .map_err(|error| LaserError::Handler(format!("calling the handler: {error}")))?;
-        future
-            .await
-            .map_err(|error| LaserError::Handler(format!("the handler raised: {error}")))?;
+        .await
+        .map_err(crate::errors::from_callback_error)?;
         Ok(())
     }
 }
@@ -193,11 +329,7 @@ impl Deduplicator for PyDeduplicator {
     }
 }
 
-// A `DeadLetterSink` backed by a Python `async def on_dead_letter(message, reason,
-// attempts, published) -> None` callback. `message` is the decoded poison message
-// or `None` when the provenance itself would not decode. A callback that raises is
-// logged and swallowed: the message is already dead-lettered, so a faulty sink
-// must not crash the consumer.
+// The sink receives the complete capsule and the typed publication failure.
 struct PyDeadLetterSink {
     callback: Py<PyAny>,
 }
@@ -211,32 +343,29 @@ impl laser_sdk::agent::DeadLetterSink for PyDeadLetterSink {
         publish_result: &Result<(), LaserError>,
     ) {
         let py_message = message.cloned().map(PyAgentMessage::from_inner);
-        let reason = format!("{:?}", capsule.reason);
-        let attempts = capsule.attempts;
-        let published = publish_result.is_ok();
-        let future = Python::attach(|py| -> PyResult<_> {
-            let coroutine = self
-                .callback
+        let result = crate::memory::call_hook_cancellable(|py| {
+            let capsule = ser_to_py(py, capsule)?;
+            let publish_error = publish_result
+                .as_ref()
+                .err()
+                .map(crate::errors::to_pyerr_ref);
+            self.callback
                 .bind(py)
-                .call1((py_message, reason, attempts, published))?;
-            into_future(coroutine)
-        });
-        match future {
-            Ok(future) => {
-                if let Err(error) = future.await {
-                    log::warn!("dead-letter sink raised: {error}");
-                }
-            }
-            Err(error) => log::warn!("dead-letter sink could not be scheduled: {error}"),
+                .call1((
+                    py_message,
+                    capsule,
+                    publish_error.as_ref().map(|error| error.value(py)),
+                ))
+                .map(Bound::unbind)
+        })
+        .await;
+        if let Err(error) = result {
+            log::warn!("dead-letter sink raised: {error}");
         }
     }
 }
 
-// An `AgentMiddleware` backed by a Python object with optional `async def
-// before_handle(message) -> None` and `async def after_handle(message, ok,
-// attempt) -> None` methods. A raising `before_handle` rejects the message (it is
-// dead-lettered, mirroring the Rust seam). A raising `after_handle` is logged and
-// swallowed. Either method may be absent.
+// Optional middleware hooks receive the full attempt result.
 struct PyMiddleware {
     hooks: Py<PyAny>,
 }
@@ -245,24 +374,18 @@ struct PyMiddleware {
 impl AgentMiddleware for PyMiddleware {
     async fn before_handle(&self, message: &AgentMessage) -> Result<(), LaserError> {
         let py_message = PyAgentMessage::from_inner(message.clone());
-        let scheduled = Python::attach(|py| -> PyResult<_> {
+        crate::memory::call_hook_cancellable(|py| {
             let bound = self.hooks.bind(py);
             if !bound.hasattr("before_handle")? {
-                return Ok(None);
+                return Ok(py.None());
             }
-            let coroutine = bound.getattr("before_handle")?.call1((py_message,))?;
-            Ok(Some(into_future(coroutine)?))
-        });
-        match scheduled {
-            Ok(Some(future)) => future
-                .await
-                .map(|_| ())
-                .map_err(|error| LaserError::Handler(format!("middleware before_handle: {error}"))),
-            Ok(None) => Ok(()),
-            Err(error) => Err(LaserError::Handler(format!(
-                "middleware before_handle: {error}"
-            ))),
-        }
+            bound
+                .call_method1("before_handle", (py_message,))
+                .map(Bound::unbind)
+        })
+        .await
+        .map(|_| ())
+        .map_err(crate::errors::from_callback_error)
     }
 
     async fn after_handle(
@@ -272,25 +395,22 @@ impl AgentMiddleware for PyMiddleware {
         attempt: u32,
     ) {
         let py_message = PyAgentMessage::from_inner(message.clone());
-        let ok = result.is_ok();
-        let scheduled = Python::attach(|py| -> PyResult<_> {
+        let result = crate::memory::call_hook_cancellable(|py| {
             let bound = self.hooks.bind(py);
             if !bound.hasattr("after_handle")? {
-                return Ok(None);
+                return Ok(py.None());
             }
-            let coroutine = bound
-                .getattr("after_handle")?
-                .call1((py_message, ok, attempt))?;
-            Ok(Some(into_future(coroutine)?))
-        });
-        match scheduled {
-            Ok(Some(future)) => {
-                if let Err(error) = future.await {
-                    log::warn!("middleware after_handle raised: {error}");
-                }
-            }
-            Ok(None) => {}
-            Err(error) => log::warn!("middleware after_handle could not be scheduled: {error}"),
+            let outcome = pyo3::types::PyDict::new(py);
+            outcome.set_item("ok", result.is_ok())?;
+            let error = result.as_ref().err().map(crate::errors::to_pyerr_ref);
+            outcome.set_item("error", error.as_ref().map(|error| error.value(py)))?;
+            bound
+                .call_method1("after_handle", (py_message, outcome, attempt))
+                .map(Bound::unbind)
+        })
+        .await;
+        if let Err(error) = result {
+            log::warn!("middleware after_handle raised: {error}");
         }
     }
 }
@@ -302,32 +422,40 @@ impl PyLaser {
     /// `listen_on` and drive `handler` (an `async def handle(ctx, message)`) for
     /// each message, with at-least-once delivery, dedup, retry, and DLQ. Pass
     /// `dedup` (an `async def observe(key) -> bool`) for a custom, e.g. durable,
-    /// deduplicator. `max_partitions` runs one ordered worker lane per partition up
+    /// deduplicator, or `dedup_window` to size the default in-memory window in
+    /// keys. `max_partitions` runs one ordered worker lane per partition up
     /// to that many concurrent lanes (omit for strict serial). `shutdown_grace_ms`
     /// bounds how long a graceful stop waits for the in-flight message.
-    /// `dead_letter` (`async def on_dead_letter(message, reason, attempts,
-    /// published)`) is notified for every poison message. `middleware` is a list of
-    /// objects with optional `async def before_handle(message)` (a raise rejects
-    /// and dead-letters the message) and `async def after_handle(message, ok,
-    /// attempt)` hooks. `governor` (an object with `async def decide(action) ->
+    /// `dead_letter(message, capsule, publish_error)` receives the complete capsule dictionary and a typed SDK exception when publication fails.
+    /// `middleware` has optional `before_handle(message)` and `after_handle(message, result, attempt)` hooks.
+    /// The result dictionary contains `ok` and `error`. Hooks can return directly or through an awaitable.
+    /// `governor` (an object with `async def decide(action) ->
     /// ActionDecision`) governs everything the handler publishes, applied under
     /// `governor_mode` (`"enforce"` | `"observe"`), replacing any
     /// connection-level governor for this agent. Returns a handle to await
     /// readiness and stop it. Requires a default stream.
-    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, poll_interval_ms=None, warm_dedup=false, dedup=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", signing_key=None, verifier=None))]
+    /// `fixed_inbox` sets the handler's default fan-out route. `governor_retention=(capacity, idle_ttl_secs)` bounds evidence heads.
+    /// Capabilities accept skill names or descriptor dicts. Consolidation requires both `consolidate_every_ms` and `consolidator`.
+    /// Shutdown cancels the active asynchronous consolidation callback and stops new passes.
+    /// `agent_id=None` opens an unscoped reliable consumer and requires `consumer_group`. It cannot advertise capabilities.
+    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, poll_interval_ms=None, warm_dedup=false, dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None))]
     #[allow(clippy::too_many_arguments)]
     fn spawn_agent(
         &self,
         py: Python<'_>,
-        agent_id: String,
+        agent_id: Option<String>,
         listen_on: String,
         handler: Py<PyAny>,
         consumer_group: Option<String>,
         respond_on: Option<String>,
+        fixed_inbox: Option<String>,
         poll_interval_ms: Option<u64>,
         warm_dedup: bool,
         dedup: Option<Py<PyAny>>,
-        capabilities: Option<Vec<String>>,
+        dedup_window: Option<usize>,
+        consolidate_every_ms: Option<u64>,
+        consolidator: Option<Py<PyAny>>,
+        capabilities: Option<Vec<Bound<'_, PyAny>>>,
         ack_on_pickup: bool,
         health: Option<String>,
         max_partitions: Option<usize>,
@@ -341,34 +469,67 @@ impl PyLaser {
         retry_base_delay_ms: Option<u64>,
         governor: Option<Py<PyAny>>,
         governor_mode: &str,
+        governor_retention: Option<(usize, f64)>,
         signing_key: Option<&PySigningKey>,
         verifier: Option<&PyKeyRegistry>,
     ) -> PyResult<PyAgentHandle> {
-        let agent = AgentId::new(agent_id).map_err(|e| to_pyerr(e.into()))?;
+        let agent = agent_id
+            .map(AgentId::new)
+            .transpose()
+            .map_err(|e| to_pyerr(e.into()))?;
         // A per-agent governor re-scopes the agent's `Laser`, so everything the
         // handler publishes through its ctx is governed (mirrors the Rust
         // `Agent::builder().governor(..)`).
+        let retention = governor_retention
+            .map(|(capacity, idle_ttl_secs)| {
+                Ok::<_, PyErr>(laser_sdk::govern::GovernorRetention {
+                    capacity,
+                    idle_ttl: duration_seconds(idle_ttl_secs, "governor idle ttl")?,
+                })
+            })
+            .transpose()?;
         let laser = match governor {
-            Some(hooks) => self.inner.with_governor(
-                std::sync::Arc::new(crate::govern::PyActionGovernor { hooks }),
-                crate::govern::parse_mode(governor_mode)?,
-            ),
+            Some(hooks) => {
+                let governor = Arc::new(crate::govern::PyActionGovernor { hooks });
+                let mode = crate::govern::parse_mode(governor_mode)?;
+                match retention {
+                    Some(retention) => self
+                        .inner
+                        .with_governor_retention(governor, mode, retention),
+                    None => self.inner.with_governor(governor, mode),
+                }
+            }
             None => self.inner.clone(),
         };
-        let group = consumer_group
-            .map(laser_sdk::types::ConsumerGroupName::new)
-            .transpose()
-            .map_err(|error| to_pyerr(error.into()))?
-            .unwrap_or_else(|| laser_sdk::types::ConsumerGroupName::for_agent(&agent));
+        let route = inbox_route(fixed_inbox)?;
+        let group = match consumer_group {
+            Some(group) => laser_sdk::types::ConsumerGroupName::new(group)
+                .map_err(|error| to_pyerr(error.into()))?,
+            None => agent
+                .as_ref()
+                .map(laser_sdk::types::ConsumerGroupName::for_agent)
+                .ok_or_else(|| {
+                    InvalidError::new_err("an unscoped reliable consumer requires consumer_group")
+                })?,
+        };
         let signing_key = signing_key.map(|key| key.inner.clone());
         let py_handler = PyHandler {
             callback: handler,
-            agent: Some(agent.clone()),
+            agent: agent.clone(),
             respond_on: respond_on.clone(),
             signing_key: signing_key.clone(),
+            inbox_route: route,
         };
-        let deduplicator: Option<Box<dyn Deduplicator>> =
-            dedup.map(|callback| Box::new(PyDeduplicator { callback }) as Box<dyn Deduplicator>);
+        let deduplicator: Option<Box<dyn Deduplicator>> = match (dedup, dedup_window) {
+            (Some(_), Some(_)) => {
+                return Err(InvalidError::new_err(
+                    "pass dedup or dedup_window, not both",
+                ));
+            }
+            (Some(callback), None) => Some(Box::new(PyDeduplicator { callback })),
+            (None, Some(capacity)) => Some(Box::new(SlidingWindow::new(capacity))),
+            (None, None) => None,
+        };
         // One worker lane per partition when `max_partitions` is set (concurrent
         // across partitions, strictly ordered within one), else strict serial.
         let concurrency = match max_partitions {
@@ -405,34 +566,62 @@ impl PyLaser {
         // set. An optional `health` ("healthy"/"degraded"/"unavailable") applies to
         // every advertised skill.
         let advertised_health = health.as_deref().map(parse_health);
-        let card = capabilities
-            .filter(|skills| !skills.is_empty())
-            .map(|skills| laser_sdk::wire::agent::AgentCard {
-                name: None,
-                version: None,
-                capabilities: skills
-                    .into_iter()
-                    .map(|skill_id| laser_sdk::wire::agent::CapabilityDescriptor {
-                        skill_id,
-                        input: None,
-                        output: None,
-                        cost_class: None,
-                        latency_class: None,
-                        max_concurrency: None,
-                        health: advertised_health,
-                        load: None,
-                    })
-                    .collect(),
-                ttl_micros: None,
-            });
+        let capabilities = crate::registry::capabilities(capabilities.unwrap_or_default())?;
+        if agent.is_none() && !capabilities.is_empty() {
+            return Err(InvalidError::new_err(
+                "capability advertising requires an agent identity",
+            ));
+        }
+        let card = (!capabilities.is_empty()).then(|| laser_sdk::wire::agent::AgentCard {
+            name: None,
+            version: None,
+            capabilities: capabilities
+                .into_iter()
+                .map(|mut capability| {
+                    if advertised_health.is_some() {
+                        capability.health = advertised_health;
+                    }
+                    capability
+                })
+                .collect(),
+            ttl_micros: None,
+        });
+        if consolidate_every_ms == Some(0) {
+            return Err(InvalidError::new_err(
+                "consolidate_every_ms must be greater than zero",
+            ));
+        }
         let locals = get_current_locals(py)?;
+        let consolidation = match (consolidate_every_ms, consolidator) {
+            (Some(every), Some(callback)) => {
+                let task = get_runtime().spawn(scope(locals.clone(), async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(every));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let result = crate::memory::call_hook_cancellable(|py| {
+                            callback
+                                .bind(py)
+                                .call_method1("consolidate", (pyo3::types::PyDict::new(py),))
+                                .map(Bound::unbind)
+                        })
+                        .await;
+                        if let Err(error) = result {
+                            log::warn!("background consolidation pass failed: {error}");
+                        }
+                    }
+                }));
+                Some(task.abort_handle())
+            }
+            _ => None,
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let advertise_id = agent.clone();
         // The inbox the agent advertises is the topic it consumes on.
         let presence_inbox = listen_on.clone();
         let join = get_runtime().spawn(scope(locals, async move {
-            if let Some(card) = card {
+            if let (Some(card), Some(advertise_id)) = (card, advertise_id) {
                 if let Err(error) = laser.publish_card(advertise_id.clone(), &card).await {
                     log::warn!("failed to publish the agent capability card: {error}");
                 }
@@ -450,7 +639,7 @@ impl PyLaser {
             }
             ReliableConsumer::builder()
                 .group(group)
-                .agent(agent)
+                .maybe_agent(agent)
                 .topic(listen_on)
                 .maybe_respond_on(respond_topic)
                 .maybe_poll_interval(poll)
@@ -475,42 +664,59 @@ impl PyLaser {
             shutdown: Mutex::new(Some(shutdown_tx)),
             join: Mutex::new(Some(join)),
             ready: Mutex::new(Some(ready_rx)),
+            consolidation,
         })
     }
 
-    /// Send a directed task to one agent advertising `skill`, await its reply up to
-    /// `deadline_ms`. Returns the reply body, or `None` if it did not complete in
-    /// time. `fixed_inbox` routes to a fixed topic (a server with no presence
-    /// command). Omit it to resolve each agent's advertised inbox.
-    #[pyo3(signature = (skill, payload, *, source, deadline_ms=10_000, fixed_inbox=None, principal=None))]
+    /// Send a directed task and await its reply up to `deadline_ms` (default
+    /// 30000, the same as Rust and TypeScript). Route by capability with
+    /// `skill`, or to one named agent with `agent=` (pass `skill=None`).
+    /// `principal` requires the target's live connection to authenticate as
+    /// that principal. `fixed_inbox` routes to a fixed topic (a server with no
+    /// presence command). Omit it to resolve each agent's advertised inbox.
+    /// `expire_if_not_consumed_ms` lets an unpicked task expire, so a caller can
+    /// tell `not_consumed` from `timed_out` (the agent must emit pickup status
+    /// with `ack_on_pickup`). `reply_on`, `conversation`, `fence`, and
+    /// `registered` mirror the Rust contract builder. Returns the reply body,
+    /// or `None` for any outcome other than completed. Use `contract_report`
+    /// for the state.
+    #[pyo3(signature = (skill, payload, *, source, agent=None, deadline_ms=30_000, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, registered=false, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn contract<'py>(
         &self,
         py: Python<'py>,
-        skill: String,
+        skill: Option<String>,
         payload: Vec<u8>,
         source: String,
+        agent: Option<String>,
         deadline_ms: u64,
         fixed_inbox: Option<String>,
         principal: Option<u32>,
+        expire_if_not_consumed_ms: Option<u64>,
+        reply_on: Option<String>,
+        conversation: Option<String>,
+        fence: Option<u64>,
+        registered: bool,
+        policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let request = ContractRequest::new(
+            skill,
+            agent,
+            payload,
+            source,
+            deadline_ms,
+            fixed_inbox,
+            principal,
+            expire_if_not_consumed_ms,
+            reply_on,
+            conversation,
+            fence,
+            registered,
+            policy,
+        )?;
         let laser = self.inner.clone();
-        let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
-        let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
-            let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
-            if let Some(principal) = principal {
-                selector = selector.principal(PrincipalId::new(principal));
-            }
-            let outcome = laser
-                .contract(Router::ToCapable(selector))
-                .from(source)
-                .payload(payload)
-                .inbox_route(route)
-                .deadline(Duration::from_millis(deadline_ms))
-                .send()
-                .await
-                .map_err(to_pyerr)?;
+            let outcome = request.send(&laser).await?;
             Ok(match outcome {
                 Contract::Completed(reply) => Some(reply.body().to_vec()),
                 _ => None,
@@ -518,65 +724,54 @@ impl PyLaser {
         })
     }
 
-    /// Contract with the same routing semantics as [`contract`](Self::contract),
-    /// returning `state`, `body`, and the authenticated `verified_principal`.
-    #[pyo3(signature = (skill, payload, *, source, deadline_ms=10_000, fixed_inbox=None, principal=None))]
+    /// Contract with the same routing and options as `contract`, returning a
+    /// dict with `state` (`completed`, `failed`, `timed_out`, or
+    /// `not_consumed`), `body`, and the authenticated `verified_principal`.
+    #[pyo3(signature = (skill, payload, *, source, agent=None, deadline_ms=30_000, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, registered=false, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn contract_report<'py>(
         &self,
         py: Python<'py>,
-        skill: String,
+        skill: Option<String>,
         payload: Vec<u8>,
         source: String,
+        agent: Option<String>,
         deadline_ms: u64,
         fixed_inbox: Option<String>,
         principal: Option<u32>,
+        expire_if_not_consumed_ms: Option<u64>,
+        reply_on: Option<String>,
+        conversation: Option<String>,
+        fence: Option<u64>,
+        registered: bool,
+        policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let request = ContractRequest::new(
+            skill,
+            agent,
+            payload,
+            source,
+            deadline_ms,
+            fixed_inbox,
+            principal,
+            expire_if_not_consumed_ms,
+            reply_on,
+            conversation,
+            fence,
+            registered,
+            policy,
+        )?;
         let laser = self.inner.clone();
-        let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
-        let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
-            let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
-            if let Some(principal) = principal {
-                selector = selector.principal(PrincipalId::new(principal));
-            }
-            let outcome = laser
-                .contract(Router::ToCapable(selector))
-                .from(source)
-                .payload(payload)
-                .inbox_route(route)
-                .deadline(Duration::from_millis(deadline_ms))
-                .send()
-                .await
-                .map_err(to_pyerr)?;
-            Python::attach(|py| {
-                let dict = pyo3::types::PyDict::new(py);
-                let (state, body, verified_principal) = match outcome {
-                    Contract::Completed(reply) => (
-                        "completed",
-                        Some(reply.body().to_vec()),
-                        reply.verified_principal,
-                    ),
-                    Contract::Failed(reply) => (
-                        "failed",
-                        Some(reply.body().to_vec()),
-                        reply.verified_principal,
-                    ),
-                    Contract::TimedOut => ("timed_out", None, None),
-                    Contract::NotConsumed => ("not_consumed", None, None),
-                };
-                dict.set_item("state", state)?;
-                dict.set_item("body", body)?;
-                dict.set_item("verified_principal", verified_principal)?;
-                Ok(dict.into_any().unbind())
-            })
+            let outcome = request.send(&laser).await?;
+            Python::attach(|py| contract_to_py(py, outcome))
         })
     }
 
     /// Scatter a directed task to every agent advertising `skill`, concurrently,
     /// and return the reply body of each that completed (a verifier or diagnostic
     /// panel). Unavailable and quarantined agents are excluded.
-    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None, principal=None))]
+    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None, principal=None, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn scatter<'py>(
         &self,
@@ -587,16 +782,21 @@ impl PyLaser {
         deadline_ms: u64,
         fixed_inbox: Option<String>,
         principal: Option<u32>,
+        policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
-        let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
+        let ParsedRoutePolicy {
+            policy,
+            failure: route_failure,
+        } = route_policy(policy)?;
+        let mut selector = CapabilitySelector::new(skill, policy);
         if let Some(principal) = principal {
             selector = selector.principal(PrincipalId::new(principal));
         }
         let route = inbox_route(fixed_inbox)?;
         future_into_py(py, async move {
-            laser
+            let result = laser
                 .scatter(
                     source,
                     &selector,
@@ -604,8 +804,8 @@ impl PyLaser {
                     &route,
                     Duration::from_millis(deadline_ms),
                 )
-                .await
-                .map_err(to_pyerr)
+                .await;
+            route_result(result, &route_failure)
         })
     }
 
@@ -616,7 +816,7 @@ impl PyLaser {
     /// `"not_consumed"` / `"error"`), `body` (bytes when a reply landed, else
     /// `None`), `error` (the failure text for `"error"`, else `None`), and
     /// `verified_principal` (the authenticated signer when verification is on).
-    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None, principal=None))]
+    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None, principal=None, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn scatter_report<'py>(
         &self,
@@ -627,10 +827,15 @@ impl PyLaser {
         deadline_ms: u64,
         fixed_inbox: Option<String>,
         principal: Option<u32>,
+        policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let source = AgentId::new(source).map_err(|e| to_pyerr(e.into()))?;
-        let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
+        let ParsedRoutePolicy {
+            policy,
+            failure: route_failure,
+        } = route_policy(policy)?;
+        let mut selector = CapabilitySelector::new(skill, policy);
         if let Some(principal) = principal {
             selector = selector.principal(PrincipalId::new(principal));
         }
@@ -644,8 +849,8 @@ impl PyLaser {
                     &route,
                     Duration::from_millis(deadline_ms),
                 )
-                .await
-                .map_err(to_pyerr)?;
+                .await;
+            let report = route_result(report, &route_failure)?;
             Python::attach(|py| {
                 let entries = pyo3::types::PyList::empty(py);
                 for outcome in &report.outcomes {
@@ -732,7 +937,10 @@ impl PyLaser {
     /// `roles` keeps only messages from those agents. Otherwise the last
     /// `last_n` messages are kept (default 50). `token_budget` then trims the
     /// selection to an estimated token count. Returns the selected messages.
-    #[pyo3(signature = (conversation_id, *, topics=None, last_n=None, roles=None, token_budget=None))]
+    /// `policy` replaces the shorthand controls. Replay bounds accept per-partition offsets and per-topic checkpoints.
+    /// `across_subconversations=True` includes child conversations.
+    #[pyo3(signature = (conversation_id, *, topics=None, last_n=None, roles=None, token_budget=None, policy=None, across_subconversations=false, from_offsets=None, from_checkpoint=None, to_checkpoint=None))]
+    #[allow(clippy::too_many_arguments)]
     fn assemble_context<'py>(
         &self,
         py: Python<'py>,
@@ -741,6 +949,11 @@ impl PyLaser {
         last_n: Option<usize>,
         roles: Option<Vec<String>>,
         token_budget: Option<usize>,
+        policy: Option<&Bound<'_, PyAny>>,
+        across_subconversations: bool,
+        from_offsets: Option<BTreeMap<u32, u64>>,
+        from_checkpoint: Option<&crate::session::PyCheckpoint>,
+        to_checkpoint: Option<&crate::session::PyCheckpoint>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let conversation =
@@ -753,44 +966,55 @@ impl PyLaser {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
-        let selected: Box<dyn ContextPolicy> = match roles {
-            Some(roles) => {
+        let (policy, estimator_failure) = if let Some(policy) = policy {
+            if last_n.is_some() || roles.is_some() || token_budget.is_some() {
+                return Err(InvalidError::new_err(
+                    "policy cannot be combined with last_n, roles, or token_budget",
+                ));
+            }
+            let (policy, failure) = crate::context::context_policy(policy)?;
+            (policy, Some(failure))
+        } else {
+            let mut policies: Vec<Box<dyn ContextPolicy>> = Vec::new();
+            let has_roles = roles.is_some();
+            if let Some(roles) = roles {
                 let mut set = HashSet::new();
                 for role in roles {
                     set.insert(AgentId::new(role).map_err(|e| to_pyerr(e.into()))?);
                 }
-                Box::new(RoleFilter(set))
+                policies.push(Box::new(RoleFilter(set)));
             }
-            None => Box::new(LastN(last_n.unwrap_or(50))),
+            if let Some(count) = last_n.or_else(|| (!has_roles).then_some(50)) {
+                policies.push(Box::new(LastN(count)));
+            }
+            if let Some(budget) = token_budget {
+                policies.push(Box::new(TokenBudget::new(budget)));
+            }
+            (Box::new(Chain(policies)) as Box<dyn ContextPolicy>, None)
         };
-        let policy: Box<dyn ContextPolicy> = match token_budget {
-            Some(budget) => Box::new(Chain(vec![selected, Box::new(TokenBudget::new(budget))])),
-            None => selected,
-        };
+        let from_checkpoint = from_checkpoint.map(|checkpoint| checkpoint.inner().clone());
+        let to_checkpoint = to_checkpoint.map(|checkpoint| checkpoint.inner().clone());
         future_into_py(py, async move {
             let messages = ContextAssembler::builder()
                 .conversation_id(conversation)
                 .maybe_topics(topics)
                 .policy(policy)
+                .across_subconversations(across_subconversations)
+                .from_offsets(from_offsets.unwrap_or_default())
+                .maybe_from_checkpoint(from_checkpoint)
+                .maybe_to_checkpoint(to_checkpoint)
                 .build()
                 .assemble(&laser)
                 .await
                 .map_err(to_pyerr)?;
+            if let Some(error) =
+                estimator_failure.and_then(|slot| crate::context::take_failure(&slot))
+            {
+                return Err(error);
+            }
             Ok(messages
                 .into_iter()
-                .map(|message| {
-                    PyAgentMessage::from_inner(AgentMessage {
-                        provenance: message.provenance,
-                        payload: message.payload,
-                        id: message.id,
-                        envelope: message.envelope,
-                        // Context assembly does not thread the ct header. A
-                        // python reader resolves claim-checked bodies through
-                        // the Rust surface when it needs them.
-                        content_type: None,
-                        verified_principal: None,
-                    })
-                })
+                .map(PyAgentMessage::from_context)
                 .collect::<Vec<_>>())
         })
     }
@@ -806,6 +1030,7 @@ pub struct PyAgentCtx {
     respond_on: Option<String>,
     message: AgentMessage,
     signing_key: Option<Arc<laser_sdk::sign::SigningKey>>,
+    inbox_route: InboxRoute,
 }
 
 #[gen_stub_pymethods]
@@ -848,18 +1073,18 @@ impl PyAgentCtx {
         let signing_key = self.signing_key.clone();
         future_into_py(py, async move {
             let envelope = envelope.ok_or_else(|| {
-                to_pyerr(LaserError::Handler(
+                to_pyerr(LaserError::HandlerConfig(
                     "respond_input: the handled message is not an AGDX envelope".to_owned(),
                 ))
             })?;
             let correlation = envelope.correlation.ok_or_else(|| {
-                to_pyerr(LaserError::Handler(
+                to_pyerr(LaserError::HandlerConfig(
                     "respond_input: the request carries no correlation".to_owned(),
                 ))
             })?;
             let source = agent
                 .ok_or_else(|| {
-                    to_pyerr(LaserError::Handler(
+                    to_pyerr(LaserError::HandlerConfig(
                         "respond_input: the agent has no id".to_owned(),
                     ))
                 })?
@@ -1009,7 +1234,7 @@ impl PyAgentCtx {
     /// each `ok` entry is `{"agent": ..., "body": ...}`, each `failures` entry is
     /// `{"agent": ..., "error": ...}`. A target that resolves no inbox is a
     /// `failures` entry, never silently rerouted.
-    #[pyo3(signature = (skill, payload, *, policy="require_all", quorum=None, deadline_ms=30_000, fixed_inbox=None, principal=None))]
+    #[pyo3(signature = (skill, payload, *, policy="require_all", quorum=None, deadline_ms=30_000, fixed_inbox=None, principal=None, route_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn fan_out<'py>(
         &self,
@@ -1021,16 +1246,24 @@ impl PyAgentCtx {
         deadline_ms: u64,
         fixed_inbox: Option<String>,
         principal: Option<u32>,
+        route_policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let ParsedRoutePolicy {
+            policy: route_policy,
+            failure: route_failure,
+        } = crate::agent_runtime::route_policy(route_policy)?;
         let laser = self.laser.clone();
         let message = self.message.clone();
         let agent = self.agent.clone();
         let respond_on = self.respond_on.clone().map(static_topic).transpose()?;
-        let route = inbox_route(fixed_inbox)?;
+        let route = match fixed_inbox {
+            Some(topic) => inbox_route(Some(topic))?,
+            None => self.inbox_route.clone(),
+        };
         let payload = payload_bytes(payload)?;
         let gather_policy = parse_gather_policy(policy, quorum)?;
         future_into_py(py, async move {
-            let mut selector = CapabilitySelector::new(skill, RoutePolicy::Any);
+            let mut selector = CapabilitySelector::new(skill, route_policy);
             if let Some(principal) = principal {
                 selector = selector.principal(PrincipalId::new(principal));
             }
@@ -1042,8 +1275,8 @@ impl PyAgentCtx {
                     gather_policy,
                     Duration::from_millis(deadline_ms),
                 )
-                .await
-                .map_err(to_pyerr)?;
+                .await;
+            let gather = route_result(gather, &route_failure)?;
             Python::attach(|py| {
                 let ok = pyo3::types::PyList::empty(py);
                 for (agent, reply) in gather.ok {
@@ -1129,12 +1362,13 @@ pub fn agent_message(
 /// only reads its message needs no server at all.
 #[gen_stub_pyfunction]
 #[pyfunction]
-#[pyo3(signature = (laser, message, *, agent=None, respond_on=None, signing_key=None))]
+#[pyo3(signature = (laser, message, *, agent=None, respond_on=None, fixed_inbox=None, signing_key=None))]
 pub fn agent_ctx(
     laser: &PyLaser,
     message: &PyAgentMessage,
     agent: Option<String>,
     respond_on: Option<String>,
+    fixed_inbox: Option<String>,
     signing_key: Option<&crate::sign::PySigningKey>,
 ) -> PyResult<PyAgentCtx> {
     let agent = agent
@@ -1147,6 +1381,7 @@ pub fn agent_ctx(
         respond_on,
         message: message.inner.clone(),
         signing_key: signing_key.map(|key| key.inner.clone()),
+        inbox_route: inbox_route(fixed_inbox)?,
     })
 }
 
@@ -1158,6 +1393,7 @@ pub struct PyAgentHandle {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     join: Mutex<Option<JoinHandle<Result<(), LaserError>>>>,
     ready: Mutex<Option<oneshot::Receiver<()>>>,
+    consolidation: Option<tokio::task::AbortHandle>,
 }
 
 // Dropping the handle without `shutdown()` or `abort()` would otherwise strand
@@ -1165,6 +1401,9 @@ pub struct PyAgentHandle {
 // gone. Collection of the Python object is the last chance to stop it.
 impl Drop for PyAgentHandle {
     fn drop(&mut self) {
+        if let Some(task) = &self.consolidation {
+            task.abort();
+        }
         // Prefer the graceful signal so an in-flight handler still finishes.
         // Abort only when the signal is already spent and the task is somehow
         // still owned here, where there is nothing left to wind it down.
@@ -1198,7 +1437,9 @@ impl PyAgentHandle {
         future_into_py(py, async move {
             if let Some(receiver) = receiver {
                 receiver.await.map_err(|_| {
-                    to_pyerr(LaserError::Handler("agent stopped before ready".to_owned()))
+                    to_pyerr(LaserError::HandlerConfig(
+                        "agent stopped before ready".to_owned(),
+                    ))
                 })?;
             }
             Ok(())
@@ -1207,6 +1448,9 @@ impl PyAgentHandle {
 
     /// Signal the agent to stop, wait for it, and surface any consumer error.
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(task) = &self.consolidation {
+            task.abort();
+        }
         if let Some(sender) = self.shutdown.lock().expect("shutdown lock").take() {
             let _ = sender.send(());
         }
@@ -1215,7 +1459,7 @@ impl PyAgentHandle {
             match join {
                 Some(join) => match join.await {
                     Ok(result) => result.map_err(to_pyerr),
-                    Err(error) => Err(to_pyerr(LaserError::Handler(error.to_string()))),
+                    Err(error) => Err(to_pyerr(LaserError::HandlerConfig(error.to_string()))),
                 },
                 None => Ok(()),
             }
@@ -1224,20 +1468,28 @@ impl PyAgentHandle {
 
     /// Wait for the agent to finish (it runs until its consumer ends or errors).
     fn join<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let consolidation = self.consolidation.clone();
         let join = self.join.lock().expect("join lock").take();
         future_into_py(py, async move {
-            match join {
+            let result = match join {
                 Some(join) => match join.await {
                     Ok(result) => result.map_err(to_pyerr),
-                    Err(error) => Err(to_pyerr(LaserError::Handler(error.to_string()))),
+                    Err(error) => Err(to_pyerr(LaserError::HandlerConfig(error.to_string()))),
                 },
                 None => Ok(()),
+            };
+            if let Some(task) = consolidation {
+                task.abort();
             }
+            result
         })
     }
 
     /// Abort the agent's task immediately, without waiting.
     fn abort(&self) {
+        if let Some(task) = &self.consolidation {
+            task.abort();
+        }
         if let Some(join) = self.join.lock().expect("join lock").as_ref() {
             join.abort();
         }
@@ -1250,7 +1502,9 @@ impl PyAgentHandle {
         future_into_py(py, async move {
             if let Some(receiver) = receiver {
                 receiver.await.map_err(|_| {
-                    to_pyerr(LaserError::Handler("agent stopped before ready".to_owned()))
+                    to_pyerr(LaserError::HandlerConfig(
+                        "agent stopped before ready".to_owned(),
+                    ))
                 })?;
             }
             Ok(handle)
@@ -1267,6 +1521,9 @@ impl PyAgentHandle {
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(task) = &self.consolidation {
+            task.abort();
+        }
         if let Some(sender) = self.shutdown.lock().expect("shutdown lock").take() {
             let _ = sender.send(());
         }
@@ -1275,10 +1532,140 @@ impl PyAgentHandle {
             if let Some(join) = join {
                 match join.await {
                     Ok(result) => result.map_err(to_pyerr)?,
-                    Err(error) => return Err(to_pyerr(LaserError::Handler(error.to_string()))),
+                    Err(error) => {
+                        return Err(to_pyerr(LaserError::HandlerConfig(error.to_string())));
+                    }
                 }
             }
             Ok(false)
         })
     }
+}
+
+// One contract call's options, validated up front so a bad argument raises
+// before any await.
+pub(crate) struct ContractRequest {
+    router: Router,
+    payload: Vec<u8>,
+    source: AgentId,
+    deadline: Duration,
+    route: InboxRoute,
+    expire_if_not_consumed: Option<Duration>,
+    reply_on: Option<AgentTopic<'static>>,
+    conversation: Option<laser_sdk::types::ConversationId>,
+    fence: Option<u64>,
+    registered: bool,
+    route_failure: RouteFailure,
+}
+
+impl ContractRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        skill: Option<String>,
+        agent: Option<String>,
+        payload: Vec<u8>,
+        source: String,
+        deadline_ms: u64,
+        fixed_inbox: Option<String>,
+        principal: Option<u32>,
+        expire_if_not_consumed_ms: Option<u64>,
+        reply_on: Option<String>,
+        conversation: Option<String>,
+        fence: Option<u64>,
+        registered: bool,
+        policy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let ParsedRoutePolicy {
+            policy,
+            failure: route_failure,
+        } = route_policy(policy)?;
+        let router = match (skill, agent) {
+            (Some(skill), None) => {
+                let mut selector = CapabilitySelector::new(skill, policy);
+                if let Some(principal) = principal {
+                    selector = selector.principal(PrincipalId::new(principal));
+                }
+                Router::ToCapable(selector)
+            }
+            (None, Some(agent)) => {
+                let agent = AgentId::new(agent).map_err(|e| to_pyerr(e.into()))?;
+                match principal {
+                    Some(principal) => Router::to_principal(agent, PrincipalId::new(principal)),
+                    None => Router::to(agent),
+                }
+            }
+            _ => {
+                return Err(crate::errors::InvalidError::new_err(
+                    "pass exactly one of skill or agent=",
+                ));
+            }
+        };
+        let conversation = conversation
+            .map(|value| {
+                laser_sdk::types::ConversationId::from_str(&value).map_err(|e| to_pyerr(e.into()))
+            })
+            .transpose()?;
+        Ok(Self {
+            router,
+            payload,
+            source: AgentId::new(source).map_err(|e| to_pyerr(e.into()))?,
+            deadline: Duration::from_millis(deadline_ms),
+            route: inbox_route(fixed_inbox)?,
+            expire_if_not_consumed: expire_if_not_consumed_ms.map(Duration::from_millis),
+            reply_on: reply_on.map(static_topic).transpose()?,
+            conversation,
+            fence,
+            registered,
+            route_failure,
+        })
+    }
+
+    pub(crate) async fn send(self, laser: &Laser) -> PyResult<Contract> {
+        let mut builder = laser
+            .contract(self.router)
+            .from(self.source)
+            .payload(self.payload)
+            .inbox_route(self.route)
+            .deadline(self.deadline);
+        if let Some(expiry) = self.expire_if_not_consumed {
+            builder = builder.expire_if_not_consumed(expiry);
+        }
+        if let Some(topic) = self.reply_on {
+            builder = builder.reply_on(topic);
+        }
+        if let Some(conversation) = self.conversation {
+            builder = builder.conversation(conversation);
+        }
+        if let Some(fence) = self.fence {
+            builder = builder.fence(fence);
+        }
+        if self.registered {
+            builder = builder.registered();
+        }
+        route_result(builder.send().await, &self.route_failure)
+    }
+}
+
+// A contract outcome as the `contract_report` dict: `state`, `body`, and the
+// authenticated `verified_principal`.
+pub(crate) fn contract_to_py(py: Python<'_>, outcome: Contract) -> PyResult<Py<PyAny>> {
+    let dict = pyo3::types::PyDict::new(py);
+    let (state, body, verified_principal) = match outcome {
+        Contract::Completed(reply) => (
+            "completed",
+            Some(reply.body().to_vec()),
+            reply.verified_principal,
+        ),
+        Contract::Failed(reply) => (
+            "failed",
+            Some(reply.body().to_vec()),
+            reply.verified_principal,
+        ),
+        Contract::TimedOut => ("timed_out", None, None),
+        Contract::NotConsumed => ("not_consumed", None, None),
+    };
+    dict.set_item("state", state)?;
+    dict.set_item("body", body)?;
+    dict.set_item("verified_principal", verified_principal)?;
+    Ok(dict.into_any().unbind())
 }

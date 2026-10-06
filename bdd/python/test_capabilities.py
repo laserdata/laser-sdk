@@ -64,6 +64,29 @@ def compare_and_swap(world, key, namespace):
     world.capture(lambda: world.laser.kv(namespace).set(key).payload(b"x").expect_absent().commit())
 
 
+@when(
+    parsers.parse(
+        'I send a set of key "{key}" in namespace "{namespace}" expecting version {version:d}'
+        " without commit"
+    )
+)
+def send_set_with_precondition(world, key, namespace, version):
+    world.capture(
+        lambda: world.laser.kv(namespace).set(key).payload(b"debug").expect_version(version).send()
+    )
+
+
+@then("the call fails as invalid")
+def fails_invalid(world):
+    assert isinstance(world.error, ls.InvalidError)
+
+
+@then("the unified result code is invalid argument")
+def unified_code_invalid_argument(world):
+    assert world.error is not None
+    assert world.error.code == "InvalidArgument"
+
+
 @then("the call fails as unsupported")
 def fails_unsupported(world):
     assert isinstance(world.error, ls.UnsupportedError)

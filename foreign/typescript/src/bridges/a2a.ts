@@ -8,19 +8,26 @@ import {
   METADATA_BRIDGE_HOPS,
   OPERATION_CHAT,
   taskStateDisplay,
+  commandEnvelope,
+  withOperation,
+  type AgentId as WireAgentId,
   type AgentEnvelope,
   type CapabilityDescriptor,
   type ContentRef,
   type TaskState
 } from "../wire/agent.js"
 import { ContentType } from "../wire/content.js"
-import { CorrelationId } from "../wire/ids.js"
+import {
+  type ConversationId as WireConversationId,
+  CorrelationId,
+  type RecordId
+} from "../wire/ids.js"
 import { bridgeHopMetadata, enterBridge } from "./hops.js"
 
 export const A2A_PROTOCOL_VERSION = "1.0"
 export const A2A_JSONRPC_BINDING = "JSONRPC"
 export const A2A_APP_ERROR_CODE = -32_000
-export const SDK_VERSION = "0.5.3"
+export const SDK_VERSION = "0.5.4"
 
 export const A2aMethod = {
   MessageSend: "SendMessage",
@@ -115,6 +122,20 @@ export function contentRefMode(reference: ContentRef): string {
     [ContentType.Any]: "*/*"
   }
   return modes[reference.value]
+}
+
+/** Build the command for an A2A request. The body keeps the original JSON bytes. */
+export function commandFromMessageSend(
+  record: RecordId,
+  conversation: WireConversationId,
+  source: WireAgentId,
+  correlation: CorrelationId,
+  paramsJson: Uint8Array
+): AgentEnvelope {
+  return withOperation(
+    commandEnvelope(record, conversation, source, correlation, paramsJson.slice()),
+    OPERATION_CHAT
+  )
 }
 
 export function taskFromEnvelope(taskId: string, envelope: AgentEnvelope): A2aTask {

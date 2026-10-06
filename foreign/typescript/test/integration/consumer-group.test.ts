@@ -28,8 +28,6 @@ void test("given_a_consumer_group_when_messages_are_sent_then_should_receive_the
     try {
       const one = await consumer.nextWithin(2_000)
       const two = await consumer.nextWithin(2_000)
-      assert.ok(one !== null)
-      assert.ok(two !== null)
       assert.equal(decodeUtf8(one.payload), "one")
       assert.equal(decodeUtf8(two.payload), "two")
     } finally {
@@ -53,7 +51,6 @@ void test("given_a_group_consumer_with_manual_commit_when_rejoined_then_should_r
       autoCommit: false
     })
     const alpha = await first.nextWithin(2_000)
-    assert.ok(alpha !== null)
     assert.equal(decodeUtf8(alpha.payload), "alpha")
     await first.commit(alpha)
     await first.shutdown()
@@ -64,7 +61,6 @@ void test("given_a_group_consumer_with_manual_commit_when_rejoined_then_should_r
     })
     try {
       const beta = await rejoined.nextWithin(2_000)
-      assert.ok(beta !== null)
       assert.equal(decodeUtf8(beta.payload), "beta")
     } finally {
       await rejoined.shutdown()
@@ -86,8 +82,8 @@ void test("given_manual_group_replay_when_reading_multiple_batches_then_should_n
       batchLength: 1
     })
     try {
-      assert.equal((await consumer.nextWithin(3_000))?.offset, 0n)
-      assert.equal((await consumer.nextWithin(3_000))?.offset, 1n)
+      assert.equal((await consumer.nextWithin(3_000)).offset, 0n)
+      assert.equal((await consumer.nextWithin(3_000)).offset, 1n)
     } finally {
       await consumer.shutdown()
     }
@@ -111,7 +107,6 @@ void test("given_an_unbound_group_id_when_consumed_then_should_preserve_payloads
     })
     try {
       const record = await first.nextWithin(3_000)
-      assert.ok(record !== null)
       assert.equal(record.offset, 0n)
       assert.deepEqual(record.payload, payloads[0])
       await first.commit(record)
@@ -121,7 +116,6 @@ void test("given_an_unbound_group_id_when_consumed_then_should_preserve_payloads
     const resumed = await byId.consumer({ batchLength: 1, autoCommit: false })
     try {
       const record = await resumed.nextWithin(3_000)
-      assert.ok(record !== null)
       assert.equal(record.offset, 1n)
       assert.deepEqual(record.payload, payloads[1])
     } finally {

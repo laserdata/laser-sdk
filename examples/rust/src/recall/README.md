@@ -6,7 +6,7 @@ The `recall` example covers the focused memory API. The larger `memory` example 
 
 ## What it shows
 
-- `laser.memory("customer:42")` scopes a memory handle to a customer.
+- `laser.memory("host:node-7")` scopes a memory handle to a host.
 - Remember a fact: `.remember(payload).scope(conversation).send()`, which returns the item's id.
 - Use `.recall(conversation).recent().limit(5).folded().fetch()` to read recent facts. The larger memory example demonstrates vector similarity.
 - Use `improve(&scope, Feedback::new(id, 1.0))` to record feedback. Use `forget(&scope, id)` to record deletion. Both append records to the memory topic.

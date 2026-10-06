@@ -31,14 +31,14 @@ async function assertControlRoundTrips(
 void test("given_the_projection_control_fixture_when_decoded_then_should_preserve_extraction", async () => {
   const envelope = await assertControlRoundTrips("control_register_projection.bin")
   if (envelope.command.kind !== "registerProjection") throw new Error("wrong command")
-  assert.equal(envelope.command.projection.id, "order.v1")
+  assert.equal(envelope.command.projection.id, "reading.v1")
   assert.equal(envelope.command.projection.extraction.fields.length, 3)
 })
 
 void test("given_the_binding_control_fixtures_when_decoded_then_should_preserve_routing", async () => {
   const applied = await assertControlRoundTrips("control_apply_binding.bin")
   if (applied.command.kind !== "applyBinding") throw new Error("wrong command")
-  assert.equal(applied.command.binding.index, "orders_rows")
+  assert.equal(applied.command.binding.index, "readings_rows")
   assert.equal(applied.command.binding.retention?.kind, "timeToLive")
 
   const removed = await assertControlRoundTrips("control_remove_binding.bin")
@@ -74,6 +74,6 @@ void test("given_unknown_additive_control_values_when_decoded_then_should_degrad
 })
 
 void test("given_projection_ids_when_parsed_then_should_reject_only_the_empty_value", () => {
-  assert.equal(parseProjectionId("order.v1"), "order.v1")
+  assert.equal(parseProjectionId("reading.v1"), "reading.v1")
   assert.throws(() => parseProjectionId(""))
 })

@@ -261,52 +261,55 @@ impl PyKv {
         })
     }
 
-    /// Fenced compare-and-swap: write `value` (payload) to `key` in one backend
+    /// Fenced compare-and-swap: write a value to `key` in one backend
     /// transaction that requires a live lease at (`fence_namespace`,
     /// `fence_key`) with a fence sequence still equal to `fence_token` (both
-    /// from a prior `lease`), and the precondition. Give exactly one of
-    /// `expect_version=` (apply only if the key holds that version) or
-    /// `expect_absent=True` (create only if absent). Returns the new version. A
-    /// stale fence, or a lease that expired or was released, raises `KvError`
-    /// (`is_version_conflict()` is false). A precondition miss raises `KvError`
-    /// with `is_version_conflict()` true. The at-most-one-effective-writer gate
-    /// for an exclusive external effect.
-    #[pyo3(signature = (key, fence_namespace, fence_key, fence_token, value, *, expect_version=None, expect_absent=false, ttl_secs=None))]
+    /// from a prior `lease`), plus a precondition. Returns a `KvCasFencedRequest`
+    /// builder: chain `.bytes()`/`.json()`/`.msgpack()`, exactly one of
+    /// `.expect_version(v)` or `.expect_absent()`, optionally `.ttl()`, then
+    /// `await request.commit()`. The keyword form (`value=`, `expect_version=`,
+    /// `expect_absent=`, `ttl_secs=`) fills the same builder, and awaiting the
+    /// request commits it. Returns the new version. A stale fence, or a lease
+    /// that expired or was released, raises `KvError` (`is_version_conflict()`
+    /// is false). A precondition miss raises `KvError` with
+    /// `is_version_conflict()` true.
+    #[pyo3(signature = (key, fence_namespace, fence_key, fence_token, value=None, *, expect_version=None, expect_absent=false, ttl_secs=None))]
     #[allow(clippy::too_many_arguments)]
-    fn cas_fenced<'py>(
+    fn cas_fenced(
         &self,
-        py: Python<'py>,
         key: &Bound<'_, PyAny>,
         fence_namespace: String,
         fence_key: &Bound<'_, PyAny>,
         fence_token: u64,
-        value: &Bound<'_, PyAny>,
+        value: Option<&Bound<'_, PyAny>>,
         expect_version: Option<u64>,
         expect_absent: bool,
         ttl_secs: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let namespace = self.namespace.clone();
-        let key = payload_bytes(key)?;
-        let fence_key = payload_bytes(fence_key)?;
-        let value = payload_bytes(value)?;
-        let ttl = ttl_secs
-            .map(|seconds| duration_seconds(seconds, "ttl_secs"))
-            .transpose()?;
-        future_into_py(py, async move {
-            let mut request = laser
-                .kv(namespace)
-                .cas_fenced(key, fence_namespace, fence_key, fence_token)
-                .bytes(value);
-            if let Some(version) = expect_version {
-                request = request.expect_version(version);
-            } else if expect_absent {
-                request = request.expect_absent();
+    ) -> PyResult<PyKvCasFenced> {
+        let expect = match (expect_version, expect_absent) {
+            (Some(_), true) => {
+                return Err(InvalidError::new_err(
+                    "pass expect_version or expect_absent, not both",
+                ));
             }
-            if let Some(ttl) = ttl {
-                request = request.ttl(ttl);
-            }
-            request.commit().await.map_err(to_pyerr)
+            (Some(version), false) => Some(Expect::Version(version)),
+            (None, true) => Some(Expect::Absent),
+            (None, false) => None,
+        };
+        Ok(PyKvCasFenced {
+            laser: self.laser.clone(),
+            namespace: self.namespace.clone(),
+            key: payload_bytes(key)?,
+            fence_namespace,
+            fence_key: payload_bytes(fence_key)?,
+            fence_token,
+            body: match value {
+                Some(value) => Body::Bytes(payload_bytes(value)?),
+                None => Body::Unset,
+            },
+            ttl_secs,
+            expires_at_micros: None,
+            expect,
         })
     }
 
@@ -451,33 +454,33 @@ impl PyKv {
         })
     }
 
-    /// Copy the value at `key` to `to_key` in one backend transaction
-    /// (`to_namespace=` crosses namespaces). Returns the destination's new
-    /// version. An absent or expired source raises the typed not-found error.
-    /// The destination is overwritten, and the value moves with its remaining
-    /// expiry.
+    /// Copy the value at `key` to `to_key` in one backend transaction. Returns
+    /// a `KvCopyRequest`: chain `.into_namespace(ns)` to cross namespaces, then
+    /// `await request.send()`, or await the request directly. `to_namespace=` is
+    /// the keyword form of `into_namespace`. The result is the destination's
+    /// new version. An absent or expired source raises the typed not-found
+    /// error. The destination is overwritten, and the value moves with its
+    /// remaining expiry.
     #[pyo3(signature = (key, to_key, *, to_namespace=None))]
-    fn copy_to<'py>(
+    fn copy_to(
         &self,
-        py: Python<'py>,
         key: &Bound<'_, PyAny>,
         to_key: &Bound<'_, PyAny>,
         to_namespace: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        self.copy_or_move(py, key, to_key, to_namespace, false)
+    ) -> PyResult<PyKvCopy> {
+        self.copy_request(key, to_key, to_namespace, false)
     }
 
     /// Move the value at `key` to `to_key`: copy plus the source delete, one
-    /// backend transaction.
+    /// backend transaction. The same builder as `copy_to`.
     #[pyo3(signature = (key, to_key, *, to_namespace=None))]
-    fn move_to<'py>(
+    fn move_to(
         &self,
-        py: Python<'py>,
         key: &Bound<'_, PyAny>,
         to_key: &Bound<'_, PyAny>,
         to_namespace: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        self.copy_or_move(py, key, to_key, to_namespace, true)
+    ) -> PyResult<PyKvCopy> {
+        self.copy_request(key, to_key, to_namespace, true)
     }
 
     /// Point-read several keys in ONE round trip (the mixed-operation batch):
@@ -527,18 +530,54 @@ impl PyKv {
 }
 
 impl PyKv {
-    fn copy_or_move<'py>(
+    fn copy_request(
         &self,
-        py: Python<'py>,
         key: &Bound<'_, PyAny>,
         to_key: &Bound<'_, PyAny>,
         to_namespace: Option<String>,
         delete_source: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> PyResult<PyKvCopy> {
+        Ok(PyKvCopy {
+            laser: self.laser.clone(),
+            namespace: self.namespace.clone(),
+            key: payload_bytes(key)?,
+            to_key: payload_bytes(to_key)?,
+            to_namespace,
+            delete_source,
+        })
+    }
+}
+
+/// A copy or move between keys, built by `Kv.copy_to` / `Kv.move_to`. Await
+/// it, or call `send()`.
+#[gen_stub_pyclass]
+#[pyclass(name = "KvCopyRequest")]
+pub struct PyKvCopy {
+    laser: Laser,
+    namespace: String,
+    key: Vec<u8>,
+    to_key: Vec<u8>,
+    to_namespace: Option<String>,
+    delete_source: bool,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyKvCopy {
+    /// Write the destination in `namespace` instead of the source's namespace.
+    fn into_namespace(mut slf: PyRefMut<'_, Self>, namespace: String) -> PyRefMut<'_, Self> {
+        slf.to_namespace = Some(namespace);
+        slf
+    }
+
+    /// Run the copy or move. Returns the destination's new version.
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
-        let key = payload_bytes(key)?;
-        let to_key = payload_bytes(to_key)?;
+        let key = self.key.clone();
+        let to_key = self.to_key.clone();
+        let to_namespace = self.to_namespace.clone();
+        let delete_source = self.delete_source;
         future_into_py(py, async move {
             let kv = laser.kv(namespace);
             let mut request = if delete_source {
@@ -551,6 +590,129 @@ impl PyKv {
             }
             request.send().await.map_err(to_pyerr)
         })
+    }
+
+    fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.send(py)?.call_method0("__await__")
+    }
+}
+
+/// A fenced compare-and-swap, built by `Kv.cas_fenced`. Await it, or call
+/// `commit()`.
+#[gen_stub_pyclass]
+#[pyclass(name = "KvCasFencedRequest")]
+pub struct PyKvCasFenced {
+    laser: Laser,
+    namespace: String,
+    key: Vec<u8>,
+    fence_namespace: String,
+    fence_key: Vec<u8>,
+    fence_token: u64,
+    body: Body,
+    ttl_secs: Option<f64>,
+    expires_at_micros: Option<u64>,
+    expect: Option<Expect>,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyKvCasFenced {
+    /// Store raw bytes (str, bytes, or bytearray).
+    fn bytes<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Bytes(payload_bytes(value)?);
+        Ok(slf)
+    }
+
+    /// JSON-encode and store the value.
+    fn json<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Json(py_to_json(value)?);
+        Ok(slf)
+    }
+
+    /// MessagePack-encode and store the value.
+    fn msgpack<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Msgpack(py_to_json(value)?);
+        Ok(slf)
+    }
+
+    /// Expire the entry `seconds` from now.
+    fn ttl(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
+        slf.ttl_secs = Some(seconds);
+        slf
+    }
+
+    /// Expire the entry at an absolute epoch-microseconds timestamp.
+    fn expires_at(mut slf: PyRefMut<'_, Self>, epoch_micros: u64) -> PyRefMut<'_, Self> {
+        slf.expires_at_micros = Some(epoch_micros);
+        slf
+    }
+
+    /// Precondition: apply only if the key holds `version`.
+    fn expect_version(mut slf: PyRefMut<'_, Self>, version: u64) -> PyRefMut<'_, Self> {
+        slf.expect = Some(Expect::Version(version));
+        slf
+    }
+
+    /// Precondition: create only if the key does not exist.
+    fn expect_absent(mut slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
+        slf.expect = Some(Expect::Absent);
+        slf
+    }
+
+    /// Apply the fenced compare-and-swap. Returns the new version.
+    fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let laser = self.laser.clone();
+        let namespace = self.namespace.clone();
+        let key = self.key.clone();
+        let fence_namespace = self.fence_namespace.clone();
+        let fence_key = self.fence_key.clone();
+        let fence_token = self.fence_token;
+        let body = self.body.clone();
+        let ttl_secs = self.ttl_secs;
+        let expires_at_micros = self.expires_at_micros;
+        let expect = self.expect;
+        future_into_py(py, async move {
+            let mut request =
+                laser
+                    .kv(namespace)
+                    .cas_fenced(key, fence_namespace, fence_key, fence_token);
+            request = match body {
+                Body::Unset => {
+                    return Err(to_pyerr(laser_sdk::LaserError::Invalid(
+                        "no value set: call .bytes(), .json(), or .msgpack() before committing"
+                            .to_owned(),
+                    )));
+                }
+                Body::Bytes(payload) => request.bytes(payload),
+                Body::Json(value) => request.json(&value).map_err(to_pyerr)?,
+                Body::Msgpack(value) => request.msgpack(&value).map_err(to_pyerr)?,
+            };
+            if let Some(seconds) = ttl_secs {
+                request = request.ttl(duration_seconds(seconds, "ttl_secs")?);
+            }
+            if let Some(epoch_micros) = expires_at_micros {
+                request = request.expires_at(epoch_micros);
+            }
+            request = match expect {
+                Some(Expect::Version(version)) => request.expect_version(version),
+                Some(Expect::Absent) => request.expect_absent(),
+                None => request,
+            };
+            request.commit().await.map_err(to_pyerr)
+        })
+    }
+
+    fn __await__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.commit(py)?.call_method0("__await__")
     }
 }
 
@@ -661,6 +823,16 @@ impl PyKvSet {
         Ok(slf)
     }
 
+    /// Store raw bytes (str, bytes, or bytearray). The same as `payload`, under
+    /// the Rust and TypeScript name.
+    fn bytes<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.body = Body::Bytes(payload_bytes(value)?);
+        Ok(slf)
+    }
+
     /// JSON-encode and store the value.
     fn json<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -703,9 +875,10 @@ impl PyKvSet {
         slf
     }
 
-    /// Apply an unconditional write.
+    /// Apply an unconditional write. Raises `InvalidError` when a precondition
+    /// was set: a conditional write goes through `commit()`.
     fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (laser, namespace, key, body, ttl_secs, expires_at_micros, _) = self.snapshot();
+        let (laser, namespace, key, body, ttl_secs, expires_at_micros, expect) = self.snapshot();
         future_into_py(py, async move {
             let kv = laser.kv(namespace);
             let mut request = kv.set(&key);
@@ -716,6 +889,11 @@ impl PyKvSet {
             if let Some(epoch_micros) = expires_at_micros {
                 request = request.expires_at(epoch_micros);
             }
+            request = match expect {
+                Some(Expect::Version(version)) => request.expect_version(version),
+                Some(Expect::Absent) => request.expect_absent(),
+                None => request,
+            };
             request.send().await.map_err(to_pyerr)
         })
     }
@@ -775,7 +953,8 @@ fn apply_body(
 ) -> Result<laser_sdk::kv::KvSetRequest, laser_sdk::LaserError> {
     match body {
         Body::Unset => Err(laser_sdk::LaserError::Invalid(
-            "no value set: call .payload(), .json(), or .msgpack() before sending".to_owned(),
+            "no value set: call .payload(), .bytes(), .json(), or .msgpack() before sending"
+                .to_owned(),
         )),
         Body::Bytes(payload) => Ok(request.bytes(payload)),
         Body::Json(value) => request.json(&value),

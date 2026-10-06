@@ -6,7 +6,7 @@ promote it or throw it away.
 
 What it shows:
   - set a keyed JSON value with a TTL, then read it back typed
-  - upgrade it under compare-and-swap, so the write lands only if the version
+  - change it under compare-and-swap, so the write lands only if the version
     still matches
   - hold a revocable lease, read behind its barrier, and write under its fence,
     so a released fence is refused
@@ -19,7 +19,7 @@ Run it:
     LASER_CONNECTION_STRING=user:pwd@your-host python3 kv.py
 
 Docs: https://docs.laserdata.cloud/laser-sdk/state
-Full scenario: concierge.py (compare-and-swap ledgers and a speculative fork under load)
+Full scenario: incident_desk.py (compare-and-swap ledgers and a speculative fork under load)
 """
 
 from __future__ import annotations
@@ -31,11 +31,11 @@ import _common
 import laser_sdk as ls
 
 EXAMPLE = "kv"
-NAMESPACE = "profiles"
-KEY = "user:42"
+NAMESPACE = "config"
+KEY = "service:auth"
 TTL_SECS = 86_400
 FORK_ID = "experiment-1"
-LEASE_KEY = "lease:user:42"
+LEASE_KEY = "lease:service:auth"
 HOLDER = "worker-a"
 LEASE_TTL_SECS = 30
 
@@ -49,18 +49,18 @@ async def main() -> None:
 
         _common.phase("set and get keyed state")
         store = laser.kv(NAMESPACE)
-        await store.set(KEY).json({"plan": "pro"}).ttl(TTL_SECS).send()
-        profile = await store.get_typed(KEY)
-        print(f"  {KEY} is on {profile['plan']}")
+        await store.set(KEY).json({"log_level": "info"}).ttl(TTL_SECS).send()
+        config = await store.get_typed(KEY)
+        print(f"  {KEY} logs at {config['log_level']}")
 
         if caps.kv_cas:
             _common.phase("compare-and-swap: the write lands only if nobody moved first")
             entry = await store.get_entry(KEY)
-            await store.set(KEY).json({"plan": "enterprise"}).expect_version(entry.version).commit()
-            upgraded = await store.get_typed(KEY)
+            await store.set(KEY).json({"log_level": "debug"}).expect_version(entry.version).commit()
+            raised = await store.get_typed(KEY)
             print(
-                f"  version {entry.version} accepted the upgrade, "
-                f"{KEY} is now on {upgraded['plan']}"
+                f"  version {entry.version} accepted the change, "
+                f"{KEY} now logs at {raised['log_level']}"
             )
 
         if caps.kv_fenced_leases:
@@ -75,11 +75,11 @@ async def main() -> None:
                 NAMESPACE,
                 LEASE_KEY,
                 lease.token,
-                json.dumps({"plan": "enterprise-plus"}).encode(),
+                json.dumps({"log_level": "trace"}).encode(),
                 expect_version=held.version,
                 ttl_secs=TTL_SECS,
             )
-            seen = json.loads(held.value)["plan"]
+            seen = json.loads(held.value)["log_level"]
             print(f"  barriered read saw {seen}, the fenced write landed as version {fenced}")
             renewed = await store.renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL_SECS)
             await store.release(LEASE_KEY, HOLDER, renewed.token)
@@ -92,7 +92,7 @@ async def main() -> None:
                     NAMESPACE,
                     LEASE_KEY,
                     lease.token,
-                    json.dumps({"plan": "zombie"}).encode(),
+                    json.dumps({"log_level": "zombie"}).encode(),
                     expect_version=fenced,
                 )
             except ls.LaserError as error:
@@ -106,11 +106,11 @@ async def main() -> None:
             _common.phase("fork: a branch of the same state, promoted or thrown away")
             table = _common.index_for(NAMESPACE)
             await laser.topic(NAMESPACE).ensure(_common.PARTITIONS)
-            await _common.start_projector(laser, NAMESPACE, ["plan"], index=table)
+            await _common.start_projector(laser, NAMESPACE, ["log_level"], index=table)
             fork = laser.fork(FORK_ID)
             await fork.squash()
             await fork.create(severed=True, tables=[table])
-            await fork.put_row(table, 0, 0).field("plan", "enterprise-preview").send()
+            await fork.put_row(table, 0, 0).field("log_level", "trace-preview").send()
             applied = await fork.promote()
             print(f"  fork '{FORK_ID}' promoted, {applied} row(s) applied")
     finally:

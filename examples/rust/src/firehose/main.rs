@@ -67,13 +67,13 @@ const COUNT_RESULT: &str = "count";
 // Fixed dimension vocabularies. The run replays identically and the indexes carry
 // realistic cardinality without pulling in a random number generator crate.
 const SERVICES: &[&str] = &[
-    "checkout",
-    "catalog",
+    "config",
+    "storage",
     "search",
     "auth",
-    "payments",
-    "shipping",
-    "inventory",
+    "metrics",
+    "scheduler",
+    "worker",
     "recommend",
     "notify",
     "gateway",
@@ -89,12 +89,12 @@ const REGIONS: &[&str] = &[
 const ENVIRONMENTS: &[&str] = &["prod", "staging", "dev"];
 const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 const ROUTES: &[&str] = &[
-    "/home",
-    "/product/42",
+    "/api/v1/hosts",
+    "/api/v1/hosts/42",
     "/search",
-    "/cart",
-    "/checkout",
-    "/api/v1/orders",
+    "/api/v1/jobs",
+    "/api/v1/jobs/7",
+    "/api/v1/metrics",
     "/api/v1/users",
     "/healthz",
     "/metrics",

@@ -30,67 +30,67 @@ import {
 export const EXAMPLE = "memory"
 const GRAPH = "ops"
 const KNOWLEDGE = [
-  "checkout latency spikes are usually database connection pool exhaustion",
-  "billing double-charges trace back to retries without an idempotency key",
+  "gateway latency spikes are usually database connection pool exhaustion",
+  "duplicate config pushes trace back to retries without an idempotency key",
   "search returning stale results means the nightly index rebuild failed",
-  "checkout pages recover fastest by failing over to the read replica",
+  "gateway pages recover fastest by failing over to the read replica",
   "auth token errors after a deploy come from the rotated signing key",
-  "cart abandonment climbs when the cache eviction rate is set too aggressive",
-  "inventory drift is the message queue dropping inventory-adjustment events",
-  "recommendation gaps appear when the search index lags behind the catalog"
+  "storage read misses climb when the cache eviction rate is set too aggressive",
+  "metrics gaps are the message queue dropping sample events",
+  "recommendation gaps appear when the search index lags behind the source data"
 ] as const
 const ENTITIES = [
-  ["Service", "checkout"],
-  ["Service", "billing"],
+  ["Service", "gateway"],
+  ["Service", "config"],
   ["Service", "search"],
-  ["Service", "cart"],
+  ["Service", "storage"],
   ["Service", "auth"],
   ["Service", "recommendations"],
-  ["Service", "inventory"],
+  ["Service", "metrics"],
   ["Service", "notifications"],
-  ["Component", "orders-db"],
+  ["Component", "hosts-db"],
   ["Component", "db-pool"],
   ["Component", "read-replica"],
   ["Component", "search-index"],
   ["Component", "signing-key"],
   ["Component", "cache"],
-  ["Component", "payment-gateway"],
+  ["Component", "token-service"],
   ["Component", "message-queue"],
-  ["Team", "payments"],
+  ["Team", "identity"],
   ["Team", "search-platform"],
   ["Team", "core-platform"],
   ["Incident", "INC-101"],
   ["Incident", "INC-102"]
 ] as const
 const RELATIONSHIPS = [
-  ["checkout", "depends_on", "orders-db"],
-  ["checkout", "depends_on", "db-pool"],
-  ["checkout", "depends_on", "payment-gateway"],
-  ["checkout", "mitigated_by", "read-replica"],
-  ["billing", "depends_on", "orders-db"],
-  ["billing", "depends_on", "signing-key"],
-  ["billing", "depends_on", "payment-gateway"],
+  ["gateway", "depends_on", "hosts-db"],
+  ["gateway", "depends_on", "db-pool"],
+  ["gateway", "depends_on", "token-service"],
+  ["gateway", "mitigated_by", "read-replica"],
+  ["config", "depends_on", "hosts-db"],
+  ["config", "depends_on", "signing-key"],
+  ["config", "depends_on", "token-service"],
   ["search", "depends_on", "search-index"],
   ["search", "depends_on", "cache"],
   ["search", "mitigated_by", "cache"],
-  ["cart", "depends_on", "cache"],
-  ["cart", "depends_on", "orders-db"],
+  ["storage", "depends_on", "cache"],
+  ["storage", "depends_on", "hosts-db"],
   ["auth", "depends_on", "signing-key"],
   ["recommendations", "depends_on", "search-index"],
   ["recommendations", "depends_on", "cache"],
-  ["inventory", "depends_on", "orders-db"],
-  ["inventory", "depends_on", "message-queue"],
+  ["metrics", "depends_on", "hosts-db"],
+  ["metrics", "depends_on", "message-queue"],
   ["notifications", "depends_on", "message-queue"],
-  ["read-replica", "replicates", "orders-db"],
-  ["payments", "owns", "checkout"],
-  ["payments", "owns", "billing"],
+  ["read-replica", "replicates", "hosts-db"],
+  ["identity", "owns", "gateway"],
+  ["identity", "owns", "config"],
   ["search-platform", "owns", "search"],
   ["search-platform", "owns", "recommendations"],
   ["core-platform", "owns", "auth"],
-  ["core-platform", "owns", "cart"],
-  ["core-platform", "owns", "inventory"],
+  ["core-platform", "owns", "storage"],
+  ["core-platform", "owns", "metrics"],
   ["core-platform", "owns", "notifications"],
-  ["INC-101", "affected", "checkout"],
+  ["INC-101", "affected", "gateway"],
   ["INC-101", "affected", "db-pool"],
   ["INC-102", "affected", "search"],
   ["INC-102", "affected", "search-index"]
@@ -146,7 +146,7 @@ async function vectorPhase(conversation: ConversationId): Promise<void> {
   console.log(`remembered ${String(KNOWLEDGE.length)} facts`)
 
   phase("Recall")
-  const question = "checkout is slow during the sale"
+  const question = "gateway is slow during the rollout"
   const initial = await memory
     .recall()
     .conversation(conversation)
@@ -214,7 +214,7 @@ async function durablePhase(laser: Laser, conversation: ConversationId): Promise
 
   phase("Scope the session: messages and memory under one conversation")
   const session = laser.context(conversation)
-  await session.append(AgentTopic.Audit, utf8("incident opened: checkout slow"))
+  await session.append(AgentTopic.Audit, utf8("incident opened: gateway slow"))
   const scopedHits = await session.memory(durable).recall().limit(3).fetch()
   const trail = await session.fetch([AgentTopic.Audit], 8)
   console.log(
@@ -280,7 +280,7 @@ async function graphPhase(laser: Laser): Promise<void> {
 
   const graph = laser.graph(GRAPH)
   const nodes = [...byValue.values()]
-  const checkout = requiredNode(byValue, "checkout")
+  const gateway = requiredNode(byValue, "gateway")
   const incident = requiredNode(byValue, "INC-101")
   await graph.upsert(nodes, edges)
   const bitemporal = edges.filter((edge) => edge.validFrom !== undefined).length
@@ -290,8 +290,8 @@ async function graphPhase(laser: Laser): Promise<void> {
   )
 
   phase("Read a node's neighbors")
-  const around = await graph.neighbors(checkout.id, "out", undefined, 1)
-  printNodes("checkout's one-hop neighborhood", around.nodes)
+  const around = await graph.neighbors(gateway.id, "out", undefined, 1)
+  printNodes("gateway's one-hop neighborhood", around.nodes)
 
   phase("Traverse from a predicate")
   const dependencies = await graph
@@ -313,30 +313,30 @@ async function graphPhase(laser: Laser): Promise<void> {
   console.log(`what INC-101 affected: ${touched.join(", ")}`)
 
   phase("Trace a node back to its source")
-  const checkoutResult = around.nodes.find((node) => node.id.equals(checkout.id))
-  if (checkoutResult?.source?.kind === "kv") {
+  const gatewayResult = around.nodes.find((node) => node.id.equals(gateway.id))
+  if (gatewayResult?.source?.kind === "kv") {
     console.log(
-      `checkout's source record is ${checkoutResult.source.namespace}/${checkoutResult.source.key}`
+      `gateway's source record is ${gatewayResult.source.namespace}/${gatewayResult.source.key}`
     )
   }
 
   phase("Read the graph as of a point in time")
   const before = await laser
     .graph(GRAPH)
-    .startIds([checkout.id])
+    .startIds([gateway.id])
     .out("mitigated_by")
     .asOf(MITIGATION_SINCE_US - 1n)
     .fetch()
   const after = await laser
     .graph(GRAPH)
-    .startIds([checkout.id])
+    .startIds([gateway.id])
     .out("mitigated_by")
     .asOf(MITIGATION_SINCE_US + 1n)
     .fetch()
   const reached = (nodes: readonly GraphNode[]): number =>
-    nodes.filter((node) => !node.id.equals(checkout.id)).length
+    nodes.filter((node) => !node.id.equals(gateway.id)).length
   console.log(
-    `checkout mitigations before the rollout: ${String(reached(before.nodes))}, ` +
+    `gateway mitigations before the rollout: ${String(reached(before.nodes))}, ` +
       `after: ${String(reached(after.nodes))}`
   )
 

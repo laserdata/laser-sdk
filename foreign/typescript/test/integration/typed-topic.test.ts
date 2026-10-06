@@ -6,23 +6,23 @@ import { jsonCodec } from "../../src/stream/codecs.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
-interface Order {
-  readonly id: string
-  readonly total: number
+interface Reading {
+  readonly host: string
+  readonly cpu: number
 }
 
-function decodeOrder(value: unknown): Order {
+function decodeReading(value: unknown): Reading {
   if (
     value === null ||
     typeof value !== "object" ||
-    !("id" in value) ||
-    typeof value.id !== "string" ||
-    !("total" in value) ||
-    typeof value.total !== "number"
+    !("host" in value) ||
+    typeof value.host !== "string" ||
+    !("cpu" in value) ||
+    typeof value.cpu !== "number"
   ) {
-    throw new TypeError("order requires string id and numeric total")
+    throw new TypeError("a reading requires a string host and a numeric cpu")
   }
-  return { id: value.id, total: value.total }
+  return { host: value.host, cpu: value.cpu }
 }
 
 async function freshTopic(laser: Laser) {
@@ -37,15 +37,15 @@ void test("given_a_typed_topic_when_publishing_and_reading_records_then_should_d
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const orders = topic.json(jsonCodec(decodeOrder))
-    await orders.publish({ id: "o-1", total: 42 })
+    const readings = topic.json(jsonCodec(decodeReading))
+    await readings.publish({ host: "node-1", cpu: 42 })
 
-    const records = await orders.records("orders-one")
+    const records = await readings.records("readings-one")
     const results = await records.poll()
     assert.equal(results.length, 1)
     const [result] = results
     assert.ok(result?.kind === "record")
-    assert.deepEqual(result.record.value, { id: "o-1", total: 42 })
+    assert.deepEqual(result.record.value, { host: "node-1", cpu: 42 })
     assert.equal(result.record.partitionId, 0)
     assert.deepEqual(result.record.position, { partitionId: 0, offset: 0n })
     assert.deepEqual(result.record.headers.get("agdx.ct"), { kind: "uint8", value: 1 })
@@ -58,20 +58,20 @@ void test("given_a_typed_topic_when_publishing_a_batch_then_should_decode_every_
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const orders = topic.json(jsonCodec(decodeOrder))
-    const committed = await orders.publishBatch([
-      { id: "o-1", total: 1 },
-      { id: "o-2", total: 2 }
+    const readings = topic.json(jsonCodec(decodeReading))
+    const committed = await readings.publishBatch([
+      { host: "node-1", cpu: 1 },
+      { host: "node-2", cpu: 2 }
     ])
     assert.equal(committed.confirmations.length, 1)
     assert.equal(committed.confirmations[0]?.partitionId, 0)
 
-    const records = await orders.records("orders-batch")
+    const records = await readings.records("readings-batch")
     const results = await records.poll()
     const values = results.map((result) => (result.kind === "record" ? result.record.value : null))
     assert.deepEqual(values, [
-      { id: "o-1", total: 1 },
-      { id: "o-2", total: 2 }
+      { host: "node-1", cpu: 1 },
+      { host: "node-2", cpu: 2 }
     ])
     for (const result of results) {
       assert.ok(result.kind === "record")
@@ -86,19 +86,19 @@ void test("given_a_poison_record_among_good_ones_when_polled_then_should_report_
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
-    const orders = topic.json(jsonCodec(decodeOrder))
+    const readings = topic.json(jsonCodec(decodeReading))
 
-    await topic.send(new TextEncoder().encode(JSON.stringify({ id: "o-1", total: 1 })))
+    await topic.send(new TextEncoder().encode(JSON.stringify({ host: "node-1", cpu: 1 })))
     await topic.send(new TextEncoder().encode("not valid json"))
-    await topic.send(new TextEncoder().encode(JSON.stringify({ id: "o-3", total: 3 })))
+    await topic.send(new TextEncoder().encode(JSON.stringify({ host: "node-3", cpu: 3 })))
 
-    const records = await orders.records("orders-poison")
+    const records = await readings.records("readings-poison")
     const results = await records.poll()
     assert.equal(results.length, 3)
 
     const [first, second, third] = results
     assert.ok(first?.kind === "record")
-    assert.equal(first.record.value.id, "o-1")
+    assert.equal(first.record.value.host, "node-1")
 
     assert.ok(second?.kind === "error")
     assert.ok(second.error.position !== undefined)
@@ -106,7 +106,7 @@ void test("given_a_poison_record_among_good_ones_when_polled_then_should_report_
     assert.equal(second.error.position.offset, 1n)
 
     assert.ok(third?.kind === "record")
-    assert.equal(third.record.value.id, "o-3")
+    assert.equal(third.record.value.host, "node-3")
 
     const caughtUp = await records.poll()
     assert.deepEqual(caughtUp, [])

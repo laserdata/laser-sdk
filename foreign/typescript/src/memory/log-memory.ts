@@ -1,4 +1,4 @@
-import { NoStreamError } from "../client/errors.js"
+import { InvalidError, NoStreamError, ProtocolError } from "../client/errors.js"
 import { INTERNAL_GOVERN, INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ActionKind } from "../govern.js"
@@ -66,24 +66,51 @@ export class LogMemory implements Memory {
    * memory topic, so a large topic never folds in process. Folding is the
    * opt-in {@link LogMemory.recallFolded}, never the default, matching Rust and Python. */
   async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
-    const { conversation } = scope
-    if (conversation === undefined) return []
-    // One conversation's memory is bounded by the lens, so page through it and
-    // keep the most recent `limit`. Ids are time-ordered ULIDs, so the tail
-    // after sorting is the newest.
-    const entries = await this.laser
-      .kv(this.namespace)
-      .scan()
-      .conversation(conversation.toString())
-      .entries()
-    const agent = query.agent ?? scope.agent
-    const items = entries
-      .map((entry) => itemFromEntry(conversation, entry))
-      .filter((item): item is MemoryItem => item !== undefined)
-      .filter((item) => agent === undefined || item.provenance.agent?.equals(agent) === true)
-      .sort((left, right) => (left.id.toString() < right.id.toString() ? -1 : 1))
     const limit = query.limit ?? 50
-    return items.length > limit ? items.slice(items.length - limit) : items
+    if (!Number.isSafeInteger(limit) || limit < 0)
+      throw new InvalidError("memory recall limit must be a non-negative safe integer")
+    if (limit === 0 || (scope.stream !== undefined && scope.stream !== this.stream)) return []
+    const selected = new Map<string, MemoryItem>()
+    const agent = query.agent ?? scope.agent
+    let cursor: Uint8Array | undefined
+    for (;;) {
+      const scan = this.laser.kv(this.namespace).scan()
+      if (scope.conversation !== undefined) scan.conversation(scope.conversation.toString())
+      if (cursor !== undefined) scan.cursor(cursor)
+      const page = await scan.fetch()
+      for (const entry of page.entries) {
+        const stored = entry.scope
+        if (
+          stored === undefined ||
+          (scope.user !== undefined && stored.user !== scope.user) ||
+          (scope.application !== undefined && stored.app !== scope.application) ||
+          (agent !== undefined && stored.agent !== agent.asString())
+        )
+          continue
+        const item = itemFromEntry(scope.conversation, entry)
+        if (
+          item === undefined ||
+          (scope.conversation !== undefined &&
+            !item.provenance.conversationId.equals(scope.conversation))
+        )
+          continue
+        selected.set(item.id.toString(), item)
+        if (selected.size > limit) {
+          const oldest = [...selected.keys()].sort()[0]
+          if (oldest !== undefined) selected.delete(oldest)
+        }
+      }
+      if (page.cursor === undefined) break
+      if (
+        page.cursor.length === cursor?.length &&
+        page.cursor.every((byte, index) => byte === cursor?.[index])
+      )
+        throw new ProtocolError("memory scan cursor did not advance")
+      cursor = page.cursor
+    }
+    return [...selected.values()].sort((left, right) =>
+      left.id.asU128() > right.id.asU128() ? -1 : left.id.asU128() < right.id.asU128() ? 1 : 0
+    )
   }
 
   /** Recall by folding the memory topic in process, the opt-in path for a small
@@ -317,7 +344,10 @@ function parseKind(word: string): MemoryKind {
 
 // Rebuild a memory item from a read-view row, or `undefined` when the key is a
 // named-item key rather than a recall id, or the row carries no memory scope.
-function itemFromEntry(conversation: ConversationId, entry: KvEntry): MemoryItem | undefined {
+function itemFromEntry(
+  conversation: ConversationId | undefined,
+  entry: KvEntry
+): MemoryItem | undefined {
   const { scope } = entry
   if (scope === undefined) return undefined
   let id: MemoryId
@@ -326,13 +356,25 @@ function itemFromEntry(conversation: ConversationId, entry: KvEntry): MemoryItem
   } catch {
     return undefined
   }
-  const agent = scope.agent
+  let storedConversation: ConversationId
+  let agent: AgentId | undefined
+  try {
+    if (scope.conversation === undefined) {
+      if (conversation === undefined) return undefined
+      storedConversation = conversation
+    } else {
+      storedConversation = ConversationId.parse(scope.conversation)
+    }
+    agent = scope.agent === undefined ? undefined : AgentId.new(scope.agent)
+  } catch {
+    return undefined
+  }
   return {
     id,
     payload: entry.value.slice(),
     provenance: {
-      conversationId: conversation,
-      ...(agent === undefined ? {} : { agent: AgentId.new(agent) })
+      conversationId: storedConversation,
+      ...(agent === undefined ? {} : { agent })
     },
     kind: kindFromWord(scope.kind),
     ...(scope.source === undefined ? {} : { source: scope.source }),

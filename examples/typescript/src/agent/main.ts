@@ -27,8 +27,9 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     // The advertised capability is what makes this agent addressable by what it
     // can do rather than by the name it happens to run under.
     .capabilities([{ skillId: CAPABILITY }])
-    // Acknowledge on pickup, so a crash mid-handler is a retry rather than a
-    // silently dropped task.
+    // Emit a Working status on pickup, so a contract caller can tell the
+    // command was consumed. Redelivery after a crash comes from
+    // commit-after-success.
     .ackOnPickup()
     .handler({
       handle: (message, context) => {

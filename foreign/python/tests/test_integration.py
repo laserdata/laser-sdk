@@ -31,7 +31,242 @@ def test_signing_key_rejects_a_seed_with_the_wrong_length():
         ls.KeyRecord("agent-7", b"short")
 
 
-async def test_connect_reports_open_capabilities(laser):
+@pytest.mark.parametrize("stop", ["shutdown", "context"])
+async def test_given_periodic_consolidation_when_the_agent_stops_then_should_stop_background_passes(
+    laser, stop
+):
+    await laser.bootstrap(1)
+    passes = []
+    called = asyncio.Event()
+
+    class Consolidator:
+        async def consolidate(self, scope):
+            passes.append(scope)
+            called.set()
+
+    async def handle(context, message):
+        pass
+
+    agent = laser.spawn_agent(
+        "periodic-memory",
+        "agent.commands",
+        handle,
+        consolidate_every_ms=10,
+        consolidator=Consolidator(),
+    )
+    try:
+        if stop == "context":
+            async with agent:
+                await asyncio.wait_for(called.wait(), 2)
+        else:
+            await agent.ready()
+            await asyncio.wait_for(called.wait(), 2)
+            await agent.shutdown()
+        count = len(passes)
+    finally:
+        await agent.shutdown()
+    await asyncio.sleep(0.04)
+    assert len(passes) == count
+    assert passes[0] == {}
+
+
+async def test_given_an_active_consolidation_pass_when_shutdown_then_should_cancel_the_callback(
+    laser,
+):
+    await laser.bootstrap(1)
+    active = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class Consolidator:
+        async def consolidate(self, scope):
+            active.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    async def handle(context, message):
+        pass
+
+    agent = laser.spawn_agent(
+        "cancel-memory",
+        "agent.commands",
+        handle,
+        consolidate_every_ms=10,
+        consolidator=Consolidator(),
+    )
+    try:
+        await agent.ready()
+        await asyncio.wait_for(active.wait(), 2)
+    finally:
+        await agent.shutdown()
+    await asyncio.wait_for(cancelled.wait(), 2)
+
+
+async def test_given_join_waiting_when_the_agent_is_running_then_should_keep_consolidation_active(
+    laser,
+):
+    await laser.bootstrap(1)
+    passes = []
+
+    class Consolidator:
+        async def consolidate(self, scope):
+            passes.append(scope)
+
+    async def handle(context, message):
+        pass
+
+    agent = laser.spawn_agent(
+        "join-memory",
+        "agent.commands",
+        handle,
+        consolidate_every_ms=10,
+        consolidator=Consolidator(),
+    )
+    await agent.ready()
+    waiting = asyncio.ensure_future(agent.join())
+    try:
+        first = len(passes)
+        deadline = asyncio.get_running_loop().time() + 2
+        while len(passes) <= first:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        assert not waiting.done()
+    finally:
+        await agent.shutdown()
+        await asyncio.wait_for(waiting, 2)
+
+
+@pytest.mark.parametrize("verb", ["command", "respond", "emit", "status", "fail"])
+async def test_given_a_causal_position_when_an_agdx_verb_sends_then_should_retain_every_coordinate(
+    laser, verb
+):
+    conversation = ls.new_conversation_id()
+    correlation = ls.new_correlation_id()
+    cause = ls.new_correlation_id()
+    producer = laser.agdx("agent.audit", "worker", conversation)
+    options = {"cause": cause, "cause_at": (10, 20, 3, 42), "metadata": {"host": "node-7"}}
+    if verb == "emit":
+        await producer.emit(b"event", **options)
+    elif verb == "status":
+        await producer.status("task", correlation=correlation, task_state="working", **options)
+    elif verb == "fail":
+        await producer.fail(
+            correlation, {"code": 6, "message": "refused", "retryable": False}, **options
+        )
+    else:
+        await getattr(producer, verb)(correlation, b"body", **options)
+    records = await laser.assemble_context(conversation, topics=["agent.audit"])
+    assert len(records) == 1
+    envelope = records[0].envelope
+    assert envelope["cause"] == cause
+    assert envelope["cause_at"] == b"".join(
+        value.to_bytes(width, "big") for value, width in [(10, 4), (20, 4), (3, 4), (42, 8)]
+    )
+
+
+@pytest.mark.parametrize("verb", ["command", "respond", "emit", "status", "fail"])
+async def test_given_cause_at_without_cause_when_sending_then_should_refuse_before_publish(
+    laser, verb
+):
+    producer = laser.agdx("agent.audit", "worker", ls.new_conversation_id())
+    options = {"cause_at": (10, 20, 3, 42)}
+    with pytest.raises(ls.InvalidError, match="cause_at requires cause"):
+        if verb == "emit":
+            producer.emit(b"event", **options)
+        elif verb == "status":
+            producer.status("card", **options)
+        elif verb == "fail":
+            producer.fail(ls.new_correlation_id(), {"code": 6}, **options)
+        else:
+            getattr(producer, verb)(ls.new_correlation_id(), b"body", **options)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "invalid",
+        "config",
+        "blocked",
+        "permission",
+        "ambiguous",
+        "transient",
+        "memory_invalid",
+        "memory_ambiguous",
+    ],
+)
+async def test_given_a_python_handler_failure_when_consuming_then_should_preserve_its_retry_class(
+    laser, failure
+):
+    await laser.bootstrap(1)
+    calls = []
+    dead_lettered = asyncio.Event()
+    attempts = []
+
+    class MemoryHooks:
+        async def remember(self, scope, payload):
+            if failure == "memory_invalid":
+                raise ls.InvalidError("memory write refused")
+            error = ls.LaserError("memory write outcome unknown")
+            error.ambiguous_mutation = True
+            error.retryable = False
+            raise error
+
+        async def recall(self, scope, query):
+            return []
+
+        async def improve(self, scope, feedback):
+            return ls.new_conversation_id()
+
+        async def forget(self, scope, target):
+            pass
+
+    memory = laser.memory_custom(MemoryHooks())
+
+    async def handle(context, message):
+        calls.append(message.payload)
+        if failure.startswith("memory_"):
+            await memory.remember(b"effect")
+            return
+        if failure == "ambiguous":
+            error = ls.LaserError("mutation result unknown")
+            error.ambiguous_mutation = True
+            error.retryable = False
+            raise error
+        errors = {
+            "invalid": ls.InvalidError,
+            "config": ls.ConfigError,
+            "blocked": ls.PolicyBlockedError,
+            "permission": PermissionError,
+            "transient": RuntimeError,
+        }
+        raise errors[failure]("handler failed")
+
+    async def dead_letter(message, capsule, publish_error):
+        assert publish_error is None
+        attempts.append(capsule["attempts"])
+        dead_lettered.set()
+
+    agent = laser.spawn_agent(
+        "retry-class",
+        "agent.commands",
+        handle,
+        dead_letter=dead_letter,
+        retry_max_attempts=3,
+        retry_base_delay_ms=1,
+    )
+    try:
+        await agent.ready()
+        await laser.send_agent("agent.commands", b"effect", ls.Provenance())
+        await asyncio.wait_for(dead_lettered.wait(), 5)
+        assert len(calls) == (3 if failure == "transient" else 1)
+        assert attempts == [len(calls)]
+    finally:
+        await agent.shutdown()
+
+
+async def test_connect_reports_open_capabilities(open_laser):
+    laser = open_laser
     caps = await laser.capabilities()
     # Without a managed plane nothing managed is advertised.
     assert caps.query is False
@@ -50,23 +285,24 @@ async def test_connect_reports_open_capabilities(laser):
 
 
 async def test_capability_override_survives_refresh(laser):
+    original = await laser.capabilities()
     scoped = await laser.with_capabilities(query=True, query_consistency="read_your_writes")
 
     refreshed = await scoped.refresh_capabilities()
 
-    assert refreshed.managed is False
+    assert refreshed.managed == original.managed
     assert refreshed.query is True
     assert refreshed.query_consistency == "read_your_writes"
 
 
 async def test_topic_ensure_then_publish_single(laser):
-    await laser.topic("orders").ensure(partitions=2)
+    await laser.topic("readings").ensure(partitions=2)
     await (
-        laser.topic("orders")
+        laser.topic("readings")
         .publish()
-        .index("customer_id", "alice")
+        .index("host_id", "node-7")
         .inline_payload()
-        .json({"id": "o-1", "amount": 129})
+        .json({"host": "node-7", "cpu": 82})
         .send()
     )
 
@@ -211,22 +447,24 @@ async def test_given_laser_streaming_when_consumed_then_should_preserve_delivery
         await resumed.shutdown()
 
 
-async def test_query_against_raw_iggy_is_unsupported(laser):
+async def test_query_against_raw_iggy_is_unsupported(open_laser):
+    laser = open_laser
     with pytest.raises(ls.UnsupportedError) as caught:
-        await laser.query("orders").where_eq("customer_id", "alice").fetch()
+        await laser.query("readings").where_eq("host_id", "node-7").fetch()
     assert caught.value.unsupported is True
 
 
-async def test_query_values_accept_the_full_typed_input_surface(laser):
+async def test_query_values_accept_the_full_typed_input_surface(open_laser):
+    laser = open_laser
     request = (
-        laser.query("orders")
+        laser.query("readings")
         .where_eq("flag", True)
         .where_eq("count", 7)
         .where_eq("ratio", 1.5)
         .where_eq("name", "alice")
         .where_eq("payload", b"\x00\xff")
-        .where_eq("order_id", uuid.UUID("00112233-4455-6677-8899-aabbccddeeff"))
-        .where_eq("price", decimal.Decimal("123.45"))
+        .where_eq("reading_id", uuid.UUID("00112233-4455-6677-8899-aabbccddeeff"))
+        .where_eq("load", decimal.Decimal("123.45"))
         .where_eq("day", datetime.date(2026, 8, 13))
         .where_eq("at", datetime.time(23, 59, 59, 999999))
         .where_eq("created", datetime.datetime(2026, 8, 13, 12, 0, 0))
@@ -240,28 +478,31 @@ async def test_query_values_accept_the_full_typed_input_surface(laser):
 
 
 async def test_query_values_reject_non_canonical_typed_input(laser):
-    request = laser.query("orders")
+    request = laser.query("readings")
     with pytest.raises(ls.InvalidError):
-        request.where_eq("price", decimal.Decimal("NaN"))
+        request.where_eq("load", decimal.Decimal("NaN"))
     with pytest.raises(ls.InvalidError):
-        request.where_eq("price", decimal.Decimal(10) ** 40)
+        request.where_eq("load", decimal.Decimal(10) ** 40)
     with pytest.raises(ls.InvalidError):
         request.where_eq("at", datetime.time(1, 2, 3, tzinfo=datetime.timezone.utc))
     with pytest.raises(ls.InvalidError):
         request.where_eq("value", {"nested": 1})
 
 
-async def test_kv_against_raw_iggy_is_unsupported(laser):
+async def test_kv_against_raw_iggy_is_unsupported(open_laser):
+    laser = open_laser
     with pytest.raises(ls.UnsupportedError):
         await laser.kv("sessions").get("user:1")
 
 
-async def test_fork_against_raw_iggy_is_unsupported(laser):
+async def test_fork_against_raw_iggy_is_unsupported(open_laser):
+    laser = open_laser
     with pytest.raises(ls.UnsupportedError):
         await laser.fork("exp-1").create()
 
 
-async def test_runs_against_raw_iggy_are_unsupported(laser):
+async def test_runs_against_raw_iggy_are_unsupported(open_laser):
+    laser = open_laser
     runs = laser.runs()
     with pytest.raises(ls.UnsupportedError):
         await runs.submit("planner", b"task")
@@ -287,11 +528,12 @@ async def test_workflow_builder_error_fails_before_dispatch(laser):
     workflow = laser.workflow("broken-workflow", fixed_inbox="agent.commands")
     workflow.step("broken", to="worker", build=broken_builder)
 
-    with pytest.raises(ls.ConfigError, match="workflow step builder failed"):
+    with pytest.raises(ls.LaserError, match="cannot build task"):
         await workflow.run()
 
 
-async def test_graph_against_raw_iggy_is_unsupported(laser):
+async def test_graph_against_raw_iggy_is_unsupported(open_laser):
+    laser = open_laser
     alice = ls.graph_node("Person", "Alice")
     acme = ls.graph_node("Company", "Acme")
     edge = ls.graph_edge(alice, "works_at", acme)
@@ -399,18 +641,18 @@ async def test_given_a_conversation_when_fetched_under_a_token_budget_then_shoul
     ctx = laser.context(conversation)
     topics = [ls.Topics.COMMANDS, ls.Topics.RESPONSES]
 
-    await ctx.append(ls.Topics.COMMANDS, b"book me an aisle seat")
-    await ctx.append(ls.Topics.RESPONSES, b"booked, aisle 12")
+    await ctx.append(ls.Topics.COMMANDS, b"drain node-7")
+    await ctx.append(ls.Topics.RESPONSES, b"drained, 0 connections left")
 
     generous = await ctx.fetch(topics=topics, last_n=20, token_budget=4_000)
     assert len(generous) == 2
 
     # One token holds neither turn, so the budget keeps only the newest.
     starved = await ctx.fetch(topics=topics, last_n=20, token_budget=1)
-    assert [m.payload for m in starved] == [b"booked, aisle 12"]
+    assert [m.payload for m in starved] == [b"drained, 0 connections left"]
 
     block = await ctx.block(topics=topics, last_n=20, token_budget=4_000)
-    assert "aisle 12" in block
+    assert "0 connections left" in block
 
 
 async def test_reader_reads_back_published_messages(laser):
@@ -531,7 +773,7 @@ async def test_native_durable_intent_records_round_trip_through_the_log(laser):
     intent = ls.Intent(
         conversation=conversation,
         proposer="planner",
-        body=b"reserve inventory",
+        body=b"rotate the storage credentials",
         eligible_voters=["safety"],
         policy=ls.IntentPolicy.all(),
         policy_version=7,
@@ -560,7 +802,7 @@ async def test_native_durable_intent_records_round_trip_through_the_log(laser):
         .records("native-intents-second-reader")
         .next()
     ).value
-    assert bytes(decoded_intent.body) == b"reserve inventory"
+    assert bytes(decoded_intent.body) == b"rotate the storage credentials"
     assert decoded_intent.digest == intent.digest
 
     decoded_decision = (
@@ -882,7 +1124,7 @@ async def test_log_memory_remembers_and_recalls_on_open_iggy(laser):
     conversation = ls.new_conversation_id()
     memory = laser.memory("notes")
     await memory.remember("the database pool was exhausted", conversation=conversation)
-    await memory.remember("checkout latency spiked at noon", conversation=conversation)
+    await memory.remember("auth latency spiked at noon", conversation=conversation)
 
     # Recall folds the topic in process (the opt-in path), since Apache Iggy
     # serves no key-value read view for the default recall to read.
@@ -894,7 +1136,7 @@ async def test_log_memory_remembers_and_recalls_on_open_iggy(laser):
         await asyncio.sleep(0.25)
     assert recalled is not None and len(recalled) == 2
     bodies = {item.text for item in recalled}
-    assert "checkout latency spiked at noon" in bodies
+    assert "auth latency spiked at noon" in bodies
     # A different conversation recalls nothing.
     assert await memory.recall(conversation=ls.new_conversation_id(), folded=True) == []
 
@@ -902,7 +1144,7 @@ async def test_log_memory_remembers_and_recalls_on_open_iggy(laser):
 async def test_vector_memory_ranks_by_semantic_similarity(laser):
     # In-process semantic memory: a deterministic bag-of-words embedder, so recall
     # ranks by overlap with the query. No server round-trip, but built off a Laser.
-    vocabulary = ["database", "pool", "checkout", "latency", "billing", "refund", "noon", "spike"]
+    vocabulary = ["database", "pool", "auth", "latency", "storage", "rotation", "noon", "spike"]
 
     async def embed(text: str) -> list[float]:
         words = set(text.lower().split())
@@ -911,15 +1153,15 @@ async def test_vector_memory_ranks_by_semantic_similarity(laser):
     memory = laser.vector_memory(embed)
     conversation = ls.new_conversation_id()
     await memory.remember("database pool exhaustion", conversation=conversation)
-    await memory.remember("billing refund double charge", conversation=conversation)
-    await memory.remember("checkout latency spike at noon", conversation=conversation)
+    await memory.remember("storage rotation retried twice", conversation=conversation)
+    await memory.remember("auth latency spike at noon", conversation=conversation)
 
-    top = await memory.recall(conversation=conversation, semantic="checkout latency", limit=1)
+    top = await memory.recall(conversation=conversation, semantic="auth latency", limit=1)
     assert len(top) == 1
-    assert top[0].text == "checkout latency spike at noon"
+    assert top[0].text == "auth latency spike at noon"
 
-    refund = await memory.recall(conversation=conversation, semantic="refund", limit=1)
-    assert refund[0].text == "billing refund double charge"
+    rotation = await memory.recall(conversation=conversation, semantic="rotation", limit=1)
+    assert rotation[0].text == "storage rotation retried twice"
 
 
 async def test_governor_blocks_a_vector_memory_write(laser):
@@ -941,7 +1183,7 @@ async def test_governor_blocks_a_vector_memory_write(laser):
     conversation = ls.new_conversation_id()
     with pytest.raises(ls.PolicyBlockedError):
         await memory.remember(
-            "customer prefers blue [skew:fabricate_memory]",
+            "node-7 prefers eu-west [skew:fabricate_memory]",
             conversation=conversation,
         )
     assert await memory.recall(conversation=conversation) == []
@@ -955,8 +1197,8 @@ async def test_vector_memory_improve_promotes_a_recalled_item(laser):
 
     memory = laser.vector_memory(embed)
     conversation = ls.new_conversation_id()
-    await memory.remember("the cat sat", conversation=conversation)
     dog = await memory.remember("the dog ran", conversation=conversation)
+    await memory.remember("the cat sat", conversation=conversation)
 
     before = await memory.recall(conversation=conversation, limit=2)
     assert before[0].text == "the cat sat"
@@ -994,7 +1236,8 @@ async def test_agent_message_and_agent_ctx_build_without_a_live_consumer(laser):
     assert handled == [b"hello"]
 
 
-async def test_fan_out_gathers_every_capable_agents_reply(laser, iggy_endpoint):
+@pytest.mark.parametrize("route_at_spawn", [False, True])
+async def test_fan_out_gathers_every_capable_agents_reply(laser, iggy_endpoint, route_at_spawn):
     await laser.bootstrap(partitions=2)
 
     def make_worker(name):
@@ -1016,7 +1259,9 @@ async def test_fan_out_gathers_every_capable_agents_reply(laser, iggy_endpoint):
             "agent.commands",
             make_worker(name),
             respond_on="agent.responses",
-            capabilities=["diagnose"],
+            capabilities=[
+                {"skill_id": "diagnose", "cost_class": 2, "latency_class": 1, "load": 10}
+            ],
             poll_interval_ms=10,
         )
         await agent.ready()
@@ -1029,7 +1274,7 @@ async def test_fan_out_gathers_every_capable_agents_reply(laser, iggy_endpoint):
             "diagnose",
             b"scan",
             deadline_ms=10_000,
-            fixed_inbox="agent.commands",
+            fixed_inbox=None if route_at_spawn else "agent.commands",
         )
 
     orchestrator = laser.spawn_agent(
@@ -1037,6 +1282,7 @@ async def test_fan_out_gathers_every_capable_agents_reply(laser, iggy_endpoint):
         "agent.tool_calls",
         orchestrate,
         respond_on="agent.responses",
+        fixed_inbox="agent.commands" if route_at_spawn else None,
         poll_interval_ms=10,
     )
     try:
@@ -1361,11 +1607,17 @@ async def test_given_pending_reads_when_inspected_then_should_allow_cancel_and_s
         await asyncio.wait_for(consumer.last_consumed_offset(0), timeout=1)
         await asyncio.wait_for(consumer.commit(initial), timeout=1)
         await producer.send(b"first")
-        delivered = await asyncio.wait_for(first, timeout=10)
+        done, _ = await asyncio.wait(
+            {first, second}, timeout=10, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert len(done) == 1
+        completed = done.pop()
+        delivered = completed.result()
         assert delivered.payload == b"first"
         await asyncio.wait_for(consumer.last_stored_offset(0), timeout=1)
-        second.cancel()
-        await asyncio.gather(second, return_exceptions=True)
+        remaining = second if completed is first else first
+        remaining.cancel()
+        await asyncio.gather(remaining, return_exceptions=True)
         await producer.send(b"second")
         delivered = await asyncio.wait_for(consumer.next(), timeout=10)
         assert delivered.payload == b"second"
@@ -1377,3 +1629,319 @@ async def test_given_pending_reads_when_inspected_then_should_allow_cancel_and_s
         second.cancel()
         await asyncio.gather(first, second, return_exceptions=True)
         await consumer.shutdown()
+
+
+async def test_kv_send_refuses_a_precondition(laser):
+    request = laser.kv("config").set("service:auth").json({"log_level": "debug"}).expect_absent()
+    with pytest.raises(ls.InvalidError):
+        await request.send()
+
+
+async def test_next_within_raises_timeout_when_nothing_arrives(laser):
+    topic = laser.topic("quiet")
+    await topic.ensure(partitions=1)
+    consumer = topic.consumer("quiet-reader")
+    try:
+        with pytest.raises(ls.TimeoutError):
+            await consumer.next_within(0.5)
+    finally:
+        await consumer.shutdown()
+
+
+async def test_watch_is_unsupported_when_opened_on_raw_iggy(open_laser):
+    laser = open_laser
+    with pytest.raises(ls.UnsupportedError):
+        laser.watch(index="readings_v1")
+
+
+async def test_topic_send_batch_and_batching_publish_raw_payloads(laser):
+    topic = laser.topic("raw")
+    await topic.ensure(partitions=1)
+    sent = await topic.send(b"one", headers={"kind": "metric"}, partition_key="node-7")
+    assert isinstance(sent, ls.SendMessagesResponse)
+    await topic.batch([b"two", b"three"], partition_key="node-7")
+    batching = topic.batching(max_records=2, linger_ms=50)
+    await batching.send(b"four")
+    await batching.send(b"five")
+    await batching.close()
+    cursor = topic.replay()
+    payloads = []
+    for _ in range(40):
+        payloads.extend(bytes(message.payload) for message in await cursor.poll())
+        if len(payloads) >= 5:
+            break
+        await asyncio.sleep(0.25)
+    assert payloads == [b"one", b"two", b"three", b"four", b"five"]
+
+
+async def test_context_defaults_topics_and_folds_to_a_checkpoint(laser):
+    await laser.bootstrap(partitions=1)
+    ctx = laser.context(ls.new_conversation_id())
+    await ctx.append(ls.Topics.COMMANDS, b"drain node-7")
+    await ctx.append(ls.Topics.RESPONSES, b"drained, 0 connections left")
+
+    history = []
+    for _ in range(40):
+        history = await ctx.fetch()
+        if len(history) == 2:
+            break
+        await asyncio.sleep(0.25)
+    assert [m.payload for m in history] == [b"drain node-7", b"drained, 0 connections left"]
+
+    newest = await ctx.fetch_with(
+        [ls.Topics.COMMANDS, ls.Topics.RESPONSES], ls.Chain([ls.LastN(5), ls.TokenBudget(1)])
+    )
+    assert [m.payload for m in newest] == [b"drained, 0 connections left"]
+
+    checkpoint = await ctx.checkpoint()
+    await ctx.append(ls.Topics.COMMANDS, b"restore node-7")
+    count = await ctx.state(
+        [ls.Topics.COMMANDS, ls.Topics.RESPONSES], 0, lambda total, _: total + 1, at=checkpoint
+    )
+    assert count == 2
+
+
+async def test_background_producer_flushes_on_shutdown_and_then_refuses_sends(laser):
+    topic = laser.topic("background-readings")
+    await topic.ensure(partitions=1)
+    producer = topic.producer(partition=0, background=True, background_shards=1, linger_ms=5)
+    for index in range(5):
+        await producer.send(f"reading-{index}".encode())
+    await producer.shutdown()
+    with pytest.raises(ls.InvalidError):
+        await producer.send(b"late")
+
+    cursor = topic.replay()
+    seen = []
+    for _ in range(50):
+        seen.extend(await cursor.poll())
+        if len(seen) >= 5:
+            break
+        await asyncio.sleep(0.1)
+    assert [bytes(message.payload) for message in seen] == [
+        f"reading-{index}".encode() for index in range(5)
+    ]
+
+
+async def test_cbor_typed_topic_round_trips_a_dataclass(laser):
+    from dataclasses import dataclass
+
+    @dataclass
+    class Reading:
+        host: str
+        cpu: int
+
+    topic = laser.topic("cbor-readings").cbor(Reading)
+    await laser.topic("cbor-readings").ensure(partitions=1)
+    await topic.publish(Reading("node-7", 82)).send()
+    reader = topic.records("cbor-reader")
+    record = None
+    for _ in range(50):
+        record = await reader.next()
+        if record is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert record is not None
+    assert record.value == Reading("node-7", 82)
+
+
+async def test_custom_memory_backend_receives_every_verb(laser):
+    class ListMemory:
+        def __init__(self):
+            self.items = []
+
+        async def remember(self, scope, payload):
+            item_id = ls.new_conversation_id()
+            self.items.append(
+                {"id": item_id, "payload": payload, "conversation": scope["conversation"]}
+            )
+            return item_id
+
+        def recall(self, scope, query):
+            return [item for item in self.items if item["conversation"] == scope["conversation"]][
+                : query["limit"]
+            ]
+
+        async def improve(self, scope, feedback):
+            return feedback["target"]
+
+        async def forget(self, scope, item_id):
+            self.items = [item for item in self.items if item["id"] != item_id]
+
+    backend = ListMemory()
+    memory = laser.memory_custom(backend)
+    conversation = ls.new_conversation_id()
+    assert memory.backend_name == "custom"
+    item_id = await memory.remember("auth is slow", conversation=conversation)
+    items = await memory.recall(conversation=conversation)
+    assert [item.text for item in items] == ["auth is slow"]
+    assert items[0].id == item_id
+    await memory.forget(item_id, conversation=conversation)
+    assert await memory.recall(conversation=conversation) == []
+
+
+async def test_capabilities_report_open_only_and_take_injected_versions(laser):
+    caps = await laser.capabilities()
+    assert caps.is_open_only() in (True, False)
+    assert caps.serves_consistency("eventual") is True
+    with pytest.raises(ls.InvalidError):
+        caps.serves_consistency("sometimes")
+    scoped = await laser.with_capabilities(
+        query=True,
+        query_execution=(True, True, True),
+        versions=ls.OpVersions(query=3),
+    )
+    injected = await scoped.capabilities()
+    assert injected.versions is not None
+    assert injected.versions.query == 3
+    assert injected.is_open_only() is False
+
+
+async def test_agdx_stream_buffers_until_flush(laser):
+    await laser.bootstrap(partitions=1)
+    conversation = ls.new_conversation_id()
+    agdx = laser.agdx("agent.responses", "worker", conversation)
+    stream = agdx.stream(ls.new_correlation_id(), "chat")
+    stream.buffered(8, 60_000).content_type("json").with_deadline_micros(5_000_000).with_target(
+        "reader"
+    )
+    assert stream.channel
+    await stream.write(b'{"token": "auth"}')
+    await stream.flush()
+    await stream.finish()
+    with pytest.raises(ls.LaserError):
+        stream.buffered(1, 1)
+
+
+async def test_session_context_with_takes_a_policy_and_reaches_the_graph(laser):
+    await laser.bootstrap(partitions=1)
+    session = laser.sessions().start()
+    await session.append("instruction", b"drain node-7")
+    await session.append("response", b"drained, 0 connections left")
+    turns = []
+    for _ in range(100):
+        turns = await session.context_with(ls.LastN(1))
+        if turns:
+            break
+        await asyncio.sleep(0.05)
+    assert [turn.text() for turn in turns] == ["drained, 0 connections left"]
+    assert session.graph("kg") is not None
+
+
+async def test_fork_create_refuses_severed_and_continuous_together(laser):
+    with pytest.raises(ls.InvalidError):
+        await laser.fork("readings-plan").create(severed=True, continuous=True)
+
+
+async def test_given_concurrent_first_sends_when_batching_then_should_initialize_once(laser):
+    topic = laser.topic("concurrent-batches")
+    await topic.ensure(partitions=1)
+    producer = topic.batching(max_records=100, linger_ms=60_000)
+    await asyncio.gather(*(producer.send(str(i).encode()) for i in range(20)))
+    await producer.close()
+    with pytest.raises(ls.InvalidError):
+        await producer.send(b"closed")
+    cursor = topic.replay()
+    messages = []
+    for _ in range(50):
+        messages.extend(await cursor.poll())
+        if len(messages) == 20:
+            break
+        await asyncio.sleep(0.05)
+    assert sorted(int(message.payload) for message in messages) == list(range(20))
+
+
+async def test_given_an_unused_batcher_when_closed_then_should_refuse_initialization(laser):
+    producer = laser.topic("closed-batches").batching()
+    await producer.close()
+    await producer.close()
+    with pytest.raises(ls.InvalidError):
+        await producer.send(b"closed")
+    with pytest.raises(ls.InvalidError):
+        await producer.flush()
+
+
+async def test_given_a_cbor_handle_when_published_without_a_body_then_should_refuse(laser):
+    with pytest.raises(ls.InvalidError, match="requires a body"):
+        laser.topic("readings").cbor().publish()
+
+
+async def test_given_an_agent_scope_when_contract_options_are_set_then_should_retain_identity(
+    laser,
+):
+    await laser.bootstrap(1)
+    conversation = ls.new_conversation_id()
+    seen = []
+
+    async def handle(context, message):
+        seen.append((message.conversation_id, message.provenance.fence_token))
+        await context.respond(b"done")
+
+    agent = laser.spawn_agent(
+        "scoped-worker", "agent.commands", handle, respond_on="agent.responses"
+    )
+    try:
+        await agent.ready()
+        result = await laser.agent("scoped-caller").contract(
+            "scoped-worker",
+            b"work",
+            fixed_inbox="agent.commands",
+            conversation=conversation,
+            fence=7,
+            reply_on="agent.responses",
+            deadline_ms=2_000,
+        )
+        assert result["state"] == "completed"
+        assert result["body"] == b"done"
+        assert seen == [(conversation, 7)]
+    finally:
+        await agent.shutdown()
+
+
+@pytest.mark.parametrize("placement", ["namespace", "explicit_stream"])
+async def test_given_scoped_log_memory_when_feedback_and_forget_run_then_should_keep_scope(
+    laser, placement
+):
+    await laser.bootstrap(1)
+    if placement == "namespace":
+        left = laser.memory("left")
+        right = laser.memory("right")
+    else:
+        stream = f"memory-{uuid.uuid4().hex[:12]}"
+        await laser.with_stream(stream).bootstrap(1)
+        left = laser.memory_on_topic("agent.audit", stream=stream)
+        right = laser.memory_on_topic("agent.audit")
+    scope = {
+        "conversation": ls.new_conversation_id(),
+        "agent": "notetaker",
+        "user": "reader",
+        "application": "diagnostics",
+    }
+    left_id = await left.remember("left", **scope)
+    right_id = await right.remember("right", **scope)
+    await left.improve(left_id, 4.0, **scope)
+    for _ in range(40):
+        improved = await left.recall(folded=True, **scope)
+        if len(improved) == 1 and improved[0].score == 4.0:
+            break
+        await asyncio.sleep(0.05)
+    assert len(improved) == 1
+    assert improved[0].id == left_id
+    assert improved[0].score == 4.0
+    assert await left.recall(folded=True, **{**scope, "user": "another-reader"}) == []
+    assert await left.recall(folded=True, **{**scope, "application": "another-app"}) == []
+    await left.forget(left_id, **scope)
+    for _ in range(40):
+        remaining = await left.recall(folded=True, **scope)
+        if not remaining:
+            break
+        await asyncio.sleep(0.05)
+    assert remaining == []
+    for _ in range(40):
+        untouched = await right.recall(folded=True, **scope)
+        if len(untouched) == 1:
+            break
+        await asyncio.sleep(0.05)
+    assert len(untouched) == 1
+    assert untouched[0].id == right_id
+    assert untouched[0].score is None

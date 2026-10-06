@@ -5,6 +5,7 @@ from pytest_bdd import parsers, scenarios, then, when
 
 SCENARIOS = Path(__file__).parent.parent / "scenarios"
 scenarios(str(SCENARIOS / "session.feature"))
+scenarios(str(SCENARIOS / "context_window.feature"))
 
 
 def _eventually(read, description):
@@ -49,6 +50,23 @@ def context_is(world, first, second, third):
 
     turns = _eventually(read, "the session context")
     assert [_labelled(turn) for turn in turns] == [first, second, third]
+
+
+@when(parsers.parse('I publish {count:d} unrelated records to topic "{topic}"'))
+def publish_unrelated(world, count, topic):
+    batch = world.laser.topic(topic).publish_batch()
+    for index in range(count):
+        batch = batch.add_payload(f"unrelated-{index}".encode())
+    world.run(lambda: batch.send())
+
+
+@then(parsers.parse('the session context is only "{only}"'))
+def context_is_only(world, only):
+    def read():
+        labels = [_labelled(turn) for turn in world.run(lambda: world.session.context())]
+        return labels if labels == [only] else None
+
+    assert _eventually(read, "the session context") == [only]
 
 
 @then(parsers.parse('opening the session "{session_id}" again reaches the same conversation'))

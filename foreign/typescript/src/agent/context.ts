@@ -2,7 +2,8 @@ import {
   HandlerConfigError,
   HandlerError,
   InvalidError,
-  type LaserError
+  type LaserError,
+  NoRespondTopicError
 } from "../client/errors.js"
 import type { BytesLike } from "../client/bytes.js"
 import type { Laser } from "../client/laser.js"
@@ -161,7 +162,7 @@ export class AgentContext {
   async respond(payload: BytesLike): Promise<void> {
     const topic = this.respondOn
     if (topic === undefined) {
-      throw new HandlerConfigError("respond() requires the agent to configure respondOn")
+      throw new NoRespondTopicError("respond() requires the agent to configure respondOn")
     }
     const sender = this.message.provenance.agent
     const envelope = this.message.envelope
@@ -251,7 +252,7 @@ export class AgentContext {
     }
     const replyTopic = this.respondOn
     if (replyTopic === undefined) {
-      throw new HandlerConfigError("fanOut() requires the agent to configure respondOn")
+      throw new NoRespondTopicError("fanOut() requires the agent to configure respondOn")
     }
     const registry = await this.laser.agentRegistry()
     const nowMicros = this.nowMicros()

@@ -2,19 +2,19 @@ use crate::agent::PyAgentMessage;
 use crate::agent_runtime::static_topic;
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::context::{PyContextScope, PyScopedMemory, bounded_policy};
+use crate::context::{
+    PyContextScope, PyScopedMemory, bounded_policy, context_policy, take_failure,
+};
 use crate::convert::payload_bytes;
 use crate::errors::to_pyerr;
 use crate::memory::{Backend, PyMemory};
 use laser_sdk::agent::{Session, SessionConfig, SessionTurn, SessionTurnKind, Sessions};
 use laser_sdk::context::Checkpoint;
-use laser_sdk::memory::LogMemory;
 use laser_sdk::types::ConversationId;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
 
 #[gen_stub_pymethods]
 #[pymethods]
@@ -68,6 +68,18 @@ pub struct PySessions {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PySessions {
+    /// The default topic a turn `kind` is recorded on.
+    #[staticmethod]
+    fn turn_topic(kind: &str) -> PyResult<String> {
+        Ok(turn_kind(kind)?.topic().topic_string())
+    }
+
+    /// The turn kind recorded on `topic` by default, or None for any other topic.
+    #[staticmethod]
+    fn turn_kind(topic: &str) -> Option<String> {
+        SessionTurnKind::for_topic(topic).map(|kind| kind.to_string())
+    }
+
     /// The durable session named `id`. The conversation derives from `id`, so
     /// the same id always reaches the same history, and nothing is created on
     /// the server until a turn is appended.
@@ -171,19 +183,58 @@ impl PySession {
         })
     }
 
+    /// The context under an explicit policy: `LastN`, `TokenBudget`,
+    /// `RoleFilter`, or a `Chain` of them, the same values
+    /// `ContextScope.fetch_with` takes.
+    fn context_with<'py>(
+        &self,
+        py: Python<'py>,
+        policy: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.inner.clone();
+        let (policy, failure) = context_policy(policy)?;
+        future_into_py(py, async move {
+            let turns = session.context_with(policy).await.map_err(to_pyerr)?;
+            if let Some(error) = take_failure(&failure) {
+                return Err(error);
+            }
+            Ok(turns
+                .into_iter()
+                .map(PySessionTurn::from)
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// The knowledge graph `name`, the same graph `laser.graph(name)` returns.
+    /// It is shared across conversations, so the session does not narrow it.
+    fn graph(&self, name: String) -> crate::graph::PyGraph {
+        crate::graph::PyGraph::new(self.inner.scope().laser().clone(), name)
+    }
+
     /// This session's memory, scoped to the conversation: `memory` defaults to
     /// `laser.memory(<configured namespace>)`, or pass any handle from
-    /// `laser.memory`/`memory_on_topic`/`memory_topic`/`vector_memory`.
+    /// `laser.memory`/`memory_on_topic`/`memory_topic`/`memory_with`/`vector_memory`.
     #[pyo3(signature = (memory=None))]
     fn memory(&self, memory: Option<&PyMemory>) -> PyScopedMemory {
         let backend = match memory {
             Some(memory) => memory.backend(),
-            None => Backend::Log(Arc::new(LogMemory::in_namespace(
-                self.inner.scope().laser().clone(),
-                self.inner.config().memory_namespace_name().to_owned(),
-            ))),
+            None => Backend::new(
+                self.inner
+                    .scope()
+                    .laser()
+                    .memory(self.inner.config().memory_namespace_name()),
+            ),
         };
         PyScopedMemory::new(backend, self.inner.conversation())
+    }
+
+    /// This session's memory in an explicit `namespace`, scoped to the
+    /// conversation.
+    fn memory_in(&self, namespace: String) -> PyScopedMemory {
+        PyScopedMemory::new(
+            Backend::new(self.inner.scope().laser().memory(namespace)),
+            self.inner.conversation(),
+        )
     }
 
     /// Where this session's topics end right now. Persist it with
@@ -345,12 +396,28 @@ pub struct PyCheckpoint {
     inner: Checkpoint,
 }
 
+impl PyCheckpoint {
+    pub(crate) fn new(inner: Checkpoint) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn inner(&self) -> &Checkpoint {
+        &self.inner
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCheckpoint {
     /// True when no topic was checkpointed.
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// The checkpointed offsets of `topic` as a dict partition -> offset, or
+    /// None when the topic was not checkpointed.
+    fn topic_offsets(&self, topic: &str) -> Option<std::collections::BTreeMap<u32, u64>> {
+        self.inner.topic_offsets(topic).cloned()
     }
 
     /// This checkpoint as JSON.

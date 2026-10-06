@@ -26,7 +26,7 @@ Acknowledge only completed contiguous work under the delivered group/source iden
 
 A reused name or offset is not proof of the same history. Catalog freshness uses primary history verification and durable configuration receipts. Group bindings remain immutable per used incarnation. New draft revisions do not activate themselves. Use separate groups for A/B policies.
 
-Rust defines behavior. Python and TypeScript must implement equivalent limits, errors, setup outcomes, commit timing and lifecycle. Public changes update exports, stubs, API reports and tests together. Keep operation versions at 1.
+Rust defines behavior. Python and TypeScript must implement equivalent limits, errors, setup outcomes, commit timing and lifecycle. Public changes update exports, stubs, API reports and tests together, then regenerate `docs/parity.md` with `python3 scripts/check-parity.py --write` and run `just parity-check`. Keep operation versions at 1.
 
 ## Validation and documentation
 

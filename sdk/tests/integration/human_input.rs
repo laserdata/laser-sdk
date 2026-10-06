@@ -61,7 +61,7 @@ fn orchestrator(laser: &Laser) -> laser_sdk::agent::Agdx {
 #[serial_test::serial(integration)]
 async fn given_an_approver_when_requesting_input_then_should_resume_with_the_decision() {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::HumanInput)
         .handler(Approver)
@@ -71,7 +71,7 @@ async fn given_an_approver_when_requesting_input_then_should_resume_with_the_dec
     let decision = orchestrator(&laser)
         .request_input(
             AgentTopic::Responses,
-            Bytes::from_static(b"approve a $500 credit?"),
+            Bytes::from_static(b"approve draining node-7?"),
             Duration::from_secs(10),
         )
         .await
@@ -84,7 +84,7 @@ async fn given_an_approver_when_requesting_input_then_should_resume_with_the_dec
 #[serial_test::serial(integration)]
 async fn given_a_rejecter_when_requesting_input_then_should_surface_a_rejected_error() {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_2 = Agent::builder()
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::HumanInput)
         .handler(Rejecter)
@@ -94,7 +94,7 @@ async fn given_a_rejecter_when_requesting_input_then_should_surface_a_rejected_e
     let result = orchestrator(&laser)
         .request_input(
             AgentTopic::Responses,
-            Bytes::from_static(b"approve a $500 credit?"),
+            Bytes::from_static(b"approve draining node-7?"),
             Duration::from_secs(10),
         )
         .await;
@@ -114,7 +114,7 @@ impl AgentHandler for Gatekeeper {
         let decision = ctx
             .approval_gate(
                 AgentTopic::Responses,
-                Bytes::from_static(b"approve a $500 credit?"),
+                Bytes::from_static(b"approve draining node-7?"),
                 Duration::from_secs(10),
             )
             .await?;
@@ -126,7 +126,7 @@ impl AgentHandler for Gatekeeper {
 #[serial_test::serial(integration)]
 async fn given_a_handler_gating_on_a_human_when_approved_then_should_resume_with_the_decision() {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_3 = Agent::builder()
         .id("approver".parse().expect("approver is a valid agent id"))
         .listen_on(AgentTopic::HumanInput)
         .handler(Approver)

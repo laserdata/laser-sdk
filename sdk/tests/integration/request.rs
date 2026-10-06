@@ -19,7 +19,7 @@ impl AgentHandler for ToolRunner {
 #[serial_test::serial(integration)]
 async fn given_a_tool_runner_when_requesting_then_should_await_the_correlated_reply() {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("tool".parse().expect("tool is a valid agent id"))
         .listen_on(AgentTopic::ToolCalls)
         .handler(ToolRunner)

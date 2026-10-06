@@ -1,5 +1,6 @@
 import { UnsupportedError } from "./errors.js"
-import { Feature, opVersionsHasFeature } from "../wire/hello.js"
+import type { FilterCodec } from "../wire/filter.js"
+import { Feature, filterAnnounceEvaluates, opVersionsHasFeature } from "../wire/hello.js"
 import type {
   BackendAnnounce,
   BackendDescriptor,
@@ -73,8 +74,6 @@ export interface Capabilities {
   readonly watch: boolean
   readonly authz: boolean
   readonly filters: FilterCapabilities
-  readonly sessions: boolean
-  readonly durableDedup: boolean
   readonly versions?: OpVersions
   readonly backends: readonly BackendDescriptor[]
   readonly topology?: WireTopology
@@ -116,8 +115,6 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   watch: false,
   authz: false,
   filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false }),
-  sessions: false,
-  durableDedup: false,
   backends: Object.freeze([]),
   hello: "unknown"
 })
@@ -246,8 +243,6 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
         ? { evaluation: announced.filters.evaluation ?? configured.filters.evaluation }
         : {})
     },
-    sessions: configured.sessions || announced.sessions,
-    durableDedup: configured.durableDedup || announced.durableDedup,
     ...(announced.versions !== undefined
       ? { versions: announced.versions }
       : configured.versions !== undefined
@@ -261,6 +256,57 @@ export function mergeCapabilities(configured: Capabilities, announced: Capabilit
         : {}),
     hello: announced.hello === "unknown" ? configured.hello : announced.hello
   }
+}
+
+/** True when the connected infrastructure advertised nothing beyond the open
+ * SDK, field for field equal to `OPEN_CAPABILITIES`, like Rust
+ * `Capabilities::is_open_only`. */
+export function isOpenOnly(capabilities: Capabilities): boolean {
+  const open = OPEN_CAPABILITIES
+  const { query, destinations, kv, filters } = capabilities
+  return (
+    capabilities.managed === open.managed &&
+    query.available === open.query.available &&
+    query.consistency === open.query.consistency &&
+    query.keyword === open.query.keyword &&
+    query.cursorPaging === open.query.cursorPaging &&
+    query.cancellation === open.query.cancellation &&
+    query.executionStatus === open.query.executionStatus &&
+    destinations.available === open.destinations.available &&
+    destinations.checkpointVersion === open.destinations.checkpointVersion &&
+    kv.available === open.kv.available &&
+    kv.cas === open.kv.cas &&
+    kv.casFenced === open.kv.casFenced &&
+    kv.fencedLeases === open.kv.fencedLeases &&
+    capabilities.graph === open.graph &&
+    capabilities.forks === open.forks &&
+    capabilities.a2aGateway === open.a2aGateway &&
+    capabilities.agentWorkflow === open.agentWorkflow &&
+    capabilities.watch === open.watch &&
+    capabilities.authz === open.authz &&
+    filters.native === open.filters.native &&
+    filters.catalog === open.filters.catalog &&
+    filters.groupPolicyReads === open.filters.groupPolicyReads &&
+    filters.evaluation === undefined &&
+    capabilities.versions === undefined &&
+    capabilities.backends.length === 0 &&
+    capabilities.topology === undefined &&
+    capabilities.hello === open.hello
+  )
+}
+
+/** Whether the server evaluates a filter built for `evaluatorVersion` with
+ * `codec` exactly as this build does, like Rust `FilterCaps::evaluates`. A
+ * server that announced no evaluation contract accepts every filter. */
+export function filterCapsEvaluates(
+  filters: FilterCapabilities,
+  evaluatorVersion: number,
+  codec: FilterCodec
+): boolean {
+  return (
+    filters.evaluation === undefined ||
+    filterAnnounceEvaluates(filters.evaluation, evaluatorVersion, codec)
+  )
 }
 
 export function servesConsistency(capabilities: Capabilities, level: Consistency): boolean {

@@ -32,14 +32,14 @@ import laser_sdk as ls
 
 # What the assistant knows. Each line becomes one remembered fact.
 KNOWLEDGE = [
-    "checkout latency spikes are usually database connection pool exhaustion",
-    "billing double-charges trace back to retries without an idempotency key",
+    "gateway latency spikes are usually database connection pool exhaustion",
+    "duplicate config pushes trace back to retries without an idempotency key",
     "search returning stale results means the nightly index rebuild failed",
-    "checkout pages recover fastest by failing over to the read replica",
+    "gateway pages recover fastest by failing over to the read replica",
     "auth token errors after a deploy come from the rotated signing key",
-    "cart abandonment climbs when the cache eviction rate is set too aggressive",
-    "inventory drift is the message queue dropping inventory-adjustment events",
-    "recommendation gaps appear when the search index lags behind the catalog",
+    "storage read misses climb when the cache eviction rate is set too aggressive",
+    "metrics gaps are the message queue dropping sample events",
+    "recommendation gaps appear when the search index lags behind the source data",
 ]
 
 # Bag-of-words embedding width for the model seam below.
@@ -94,7 +94,7 @@ async def run_memory(conversation) -> None:
     print(f"remembered {len(KNOWLEDGE)} facts")
 
     _common.phase("Recall")
-    question = "checkout is slow during the sale"
+    question = "gateway is slow during the rollout"
     hits = await memory.recall(semantic=question, limit=3, conversation=conversation)
     print_hits(f"recall for {question!r}:", hits)
 
@@ -138,7 +138,7 @@ async def run_durable(laser, conversation) -> None:
     # cross-conversation on purpose.
     _common.phase("Scope the session: messages and memory under one conversation")
     session = laser.context(conversation)
-    await session.append("audit", b"incident opened: checkout slow")
+    await session.append("audit", b"incident opened: gateway slow")
     scoped_hits = await session.memory(laser.memory_on_topic("incidents")).recall(limit=3)
     trail = await session.fetch(topics=["audit"], last_n=8)
     print(
@@ -155,23 +155,23 @@ async def run_graph(laser) -> None:
     # services is one node, which is what makes this a graph and not a pile of pairs.
     _common.phase("Build the knowledge graph")
     entities = [
-        ("Service", "checkout"),
-        ("Service", "billing"),
+        ("Service", "gateway"),
+        ("Service", "config"),
         ("Service", "search"),
-        ("Service", "cart"),
+        ("Service", "storage"),
         ("Service", "auth"),
         ("Service", "recommendations"),
-        ("Service", "inventory"),
+        ("Service", "metrics"),
         ("Service", "notifications"),
-        ("Component", "orders-db"),
+        ("Component", "hosts-db"),
         ("Component", "db-pool"),
         ("Component", "read-replica"),
         ("Component", "search-index"),
         ("Component", "signing-key"),
         ("Component", "cache"),
-        ("Component", "payment-gateway"),
+        ("Component", "token-service"),
         ("Component", "message-queue"),
-        ("Team", "payments"),
+        ("Team", "identity"),
         ("Team", "search-platform"),
         ("Team", "core-platform"),
         ("Incident", "INC-101"),
@@ -188,34 +188,34 @@ async def run_graph(laser) -> None:
         await registry.set(value).json({"kind": kind, "value": value}).send()
         node["source"] = {"kind": "kv", "namespace": "topology", "key": value}
     relationships = [
-        ("checkout", "depends_on", "orders-db"),
-        ("checkout", "depends_on", "db-pool"),
-        ("checkout", "depends_on", "payment-gateway"),
-        ("checkout", "mitigated_by", "read-replica"),
-        ("billing", "depends_on", "orders-db"),
-        ("billing", "depends_on", "signing-key"),
-        ("billing", "depends_on", "payment-gateway"),
+        ("gateway", "depends_on", "hosts-db"),
+        ("gateway", "depends_on", "db-pool"),
+        ("gateway", "depends_on", "token-service"),
+        ("gateway", "mitigated_by", "read-replica"),
+        ("config", "depends_on", "hosts-db"),
+        ("config", "depends_on", "signing-key"),
+        ("config", "depends_on", "token-service"),
         ("search", "depends_on", "search-index"),
         ("search", "depends_on", "cache"),
         ("search", "mitigated_by", "cache"),
-        ("cart", "depends_on", "cache"),
-        ("cart", "depends_on", "orders-db"),
+        ("storage", "depends_on", "cache"),
+        ("storage", "depends_on", "hosts-db"),
         ("auth", "depends_on", "signing-key"),
         ("recommendations", "depends_on", "search-index"),
         ("recommendations", "depends_on", "cache"),
-        ("inventory", "depends_on", "orders-db"),
-        ("inventory", "depends_on", "message-queue"),
+        ("metrics", "depends_on", "hosts-db"),
+        ("metrics", "depends_on", "message-queue"),
         ("notifications", "depends_on", "message-queue"),
-        ("read-replica", "replicates", "orders-db"),
-        ("payments", "owns", "checkout"),
-        ("payments", "owns", "billing"),
+        ("read-replica", "replicates", "hosts-db"),
+        ("identity", "owns", "gateway"),
+        ("identity", "owns", "config"),
         ("search-platform", "owns", "search"),
         ("search-platform", "owns", "recommendations"),
         ("core-platform", "owns", "auth"),
-        ("core-platform", "owns", "cart"),
-        ("core-platform", "owns", "inventory"),
+        ("core-platform", "owns", "storage"),
+        ("core-platform", "owns", "metrics"),
         ("core-platform", "owns", "notifications"),
-        ("INC-101", "affected", "checkout"),
+        ("INC-101", "affected", "gateway"),
         ("INC-101", "affected", "db-pool"),
         ("INC-102", "affected", "search"),
         ("INC-102", "affected", "search-index"),
@@ -267,8 +267,8 @@ async def run_graph(laser) -> None:
     print(f"registered and upserted {len(nodes)} nodes, {len(edges)} edges in the {GRAPH!r} graph")
 
     _common.phase("Read a node's neighbors")
-    around = await graph.neighbors(by_value["checkout"]["id"], direction="out", depth=1)
-    print_nodes("checkout's one-hop neighborhood", around["nodes"])
+    around = await graph.neighbors(by_value["gateway"]["id"], direction="out", depth=1)
+    print_nodes("gateway's one-hop neighborhood", around["nodes"])
 
     _common.phase("Traverse from a predicate")
     dependencies = await graph.query(match_label="Service", hops=[("depends_on", "out")], limit=100)
@@ -285,22 +285,22 @@ async def run_graph(laser) -> None:
     print(f"what INC-101 affected: {', '.join(touched)}")
 
     _common.phase("Trace a node back to its source")
-    checkout_id = by_value["checkout"]["id"]
-    checkout_node = next((n for n in around["nodes"] if n["id"] == checkout_id), None)
-    source = (checkout_node or {}).get("source")
+    gateway_id = by_value["gateway"]["id"]
+    gateway_node = next((n for n in around["nodes"] if n["id"] == gateway_id), None)
+    source = (gateway_node or {}).get("source")
     if source and source.get("kind") == "kv":
-        print(f"checkout's source record is {source['namespace']}/{source['key']}")
+        print(f"gateway's source record is {source['namespace']}/{source['key']}")
 
     _common.phase("Read the graph as of a point in time")
     before = await graph.query(
-        start_ids=[checkout_id], hops=[("mitigated_by", "out")], as_of=MITIGATION_SINCE_US - 1
+        start_ids=[gateway_id], hops=[("mitigated_by", "out")], as_of=MITIGATION_SINCE_US - 1
     )
     after = await graph.query(
-        start_ids=[checkout_id], hops=[("mitigated_by", "out")], as_of=MITIGATION_SINCE_US + 1
+        start_ids=[gateway_id], hops=[("mitigated_by", "out")], as_of=MITIGATION_SINCE_US + 1
     )
-    n_before = sum(1 for node in before["nodes"] if node["id"] != checkout_id)
-    n_after = sum(1 for node in after["nodes"] if node["id"] != checkout_id)
-    print(f"checkout mitigations before the rollout: {n_before}, after: {n_after}")
+    n_before = sum(1 for node in before["nodes"] if node["id"] != gateway_id)
+    n_after = sum(1 for node in after["nodes"] if node["id"] != gateway_id)
+    print(f"gateway mitigations before the rollout: {n_before}, after: {n_after}")
 
     _common.phase("Return whole paths")
     paths = await graph.query(start_ids=[incident_id], hops=[("affected", "out")], returns="paths")
@@ -315,7 +315,7 @@ def _token_hash(text: str) -> int:
 
 
 # A deterministic bag-of-words embedder, the model seam an app fills (a real
-# deployment calls an embedding model here). Async because the SDK awaits it.
+# deployment calls an embedding model here).
 def embed(text: str) -> list[float]:
     vector = [0.0] * DIMS
     for token in text.lower().split():

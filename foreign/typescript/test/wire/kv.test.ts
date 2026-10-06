@@ -227,7 +227,7 @@ void test("given_the_kv_reply_namespaces_fixture_when_decoded_then_should_carry_
   const reply = await assertKvReplyRoundTrips("kv_reply_namespaces.bin")
   if (reply.kind !== "ok" || reply.outcome.kind !== "namespaces") throw new Error("wrong shape")
   assert.deepEqual(reply.outcome.namespaces, [
-    { namespace: "concierge_sessions", entries: 12 },
+    { namespace: "desk_sessions", entries: 12 },
     { namespace: "sessions", entries: 3 }
   ])
 })

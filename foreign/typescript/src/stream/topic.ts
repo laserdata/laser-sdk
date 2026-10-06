@@ -5,7 +5,7 @@ import type {
   SendMessagesResponse
 } from "../iggy/apache-iggy.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
-import { InvalidError, UnsupportedError } from "../client/errors.js"
+import { InvalidError, PublishFailedError, UnsupportedError } from "../client/errors.js"
 import { CompiledSchema } from "../schema-codecs.js"
 import type { SchemaDef } from "../wire/control.js"
 import { ContentType } from "../wire/content.js"
@@ -19,6 +19,7 @@ import { ConsumerGroup, type GroupContext } from "./consumer-group.js"
 import { Consumer, type ConsumerOptions } from "./consumer.js"
 import { Cursor, type CursorOptions } from "./cursor.js"
 import { Producer, type ProducerOptions } from "./producer.js"
+import { BatchingProducerBuilder } from "./batching.js"
 import { BatchPublishRequest, PublishRequest } from "./publish.js"
 import type { Routing } from "./routing.js"
 import { TypedTopic } from "./typed-topic.js"
@@ -120,21 +121,25 @@ export class Topic {
     }
     if (headers.size > 0) {
       return this.observed("publish", { records: 1 }, () =>
-        this.transport.sendMessageWithHeaders(
-          this.streamName,
-          this.name,
-          bytes,
-          headers,
-          options.key ??
-            (options.provenance !== undefined && options.partition === undefined
-              ? provenancePartitionKey(options.provenance)
-              : undefined),
-          options.partition
+        this.published([{ payload: bytes, headers }], () =>
+          this.transport.sendMessageWithHeaders(
+            this.streamName,
+            this.name,
+            bytes,
+            headers,
+            options.key ??
+              (options.provenance !== undefined && options.partition === undefined
+                ? provenancePartitionKey(options.provenance)
+                : undefined),
+            options.partition
+          )
         )
       )
     } else {
       return this.observed("publish", { records: 1 }, () =>
-        this.transport.sendMessages(this.streamName, this.name, [bytes], routing)
+        this.published([{ payload: bytes, headers }], () =>
+          this.transport.sendMessages(this.streamName, this.name, [bytes], routing)
+        )
       )
     }
   }
@@ -168,21 +173,27 @@ export class Topic {
         headers.set(key, value)
     }
     if (headers.size > 0) {
+      const records = bytesList.map((payload) => ({ payload, headers }))
       return this.observed("publish_batch", { records: bytesList.length }, () =>
-        this.transport.sendMessagesWithHeaders(
-          this.streamName,
-          this.name,
-          bytesList.map((payload) => ({ payload, headers })),
-          options.key ??
-            (options.provenance !== undefined && options.partition === undefined
-              ? provenancePartitionKey(options.provenance)
-              : undefined),
-          options.partition
+        this.published(records, () =>
+          this.transport.sendMessagesWithHeaders(
+            this.streamName,
+            this.name,
+            records,
+            options.key ??
+              (options.provenance !== undefined && options.partition === undefined
+                ? provenancePartitionKey(options.provenance)
+                : undefined),
+            options.partition
+          )
         )
       )
     } else {
       return this.observed("publish_batch", { records: bytesList.length }, () =>
-        this.transport.sendMessages(this.streamName, this.name, bytesList, routing)
+        this.published(
+          bytesList.map((payload) => ({ payload, headers })),
+          () => this.transport.sendMessages(this.streamName, this.name, bytesList, routing)
+        )
       )
     }
   }
@@ -206,14 +217,27 @@ export class Topic {
       })
     }
     return this.observed("publish_batch", { records: governed.length }, () =>
-      this.transport.sendMessagesWithHeaders(
-        this.streamName,
-        this.name,
-        governed,
-        options.key,
-        options.partition
+      this.published(governed, () =>
+        this.transport.sendMessagesWithHeaders(
+          this.streamName,
+          this.name,
+          governed,
+          options.key,
+          options.partition
+        )
       )
     )
+  }
+
+  // Preserve confirmations and message IDs from a transport failure.
+  private published(
+    records: readonly MessageWithHeaders[],
+    effect: () => Promise<SendMessagesResponse>
+  ): Promise<SendMessagesResponse> {
+    return effect().catch((error: unknown) => {
+      if (error instanceof PublishFailedError) throw error
+      throw new PublishFailedError(this.streamName, this.name, [], records, error)
+    })
   }
 
   private observed<T>(
@@ -236,6 +260,14 @@ export class Topic {
 
   producer(options?: ProducerOptions): Producer {
     return new Producer(this.transport, this.streamName, this.name, options)
+  }
+
+  /** A size-and-time batching publisher over this topic. Each flushed batch is
+   * one append under the handle's partition key, or balanced without one. */
+  batching(): BatchingProducerBuilder {
+    return new BatchingProducerBuilder((records, partitionKey) =>
+      this.sendRecords(records, partitionKey === undefined ? {} : { key: partitionKey })
+    )
   }
 
   consumer(partitionId: number, options?: ConsumerOptions): Consumer

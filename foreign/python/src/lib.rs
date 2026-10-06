@@ -2,12 +2,14 @@ mod agdx;
 mod agent;
 mod agent_runtime;
 mod async_bridge;
+mod batching;
 mod blob;
 mod chunks;
 mod client;
 mod consumer_group;
 mod context;
 mod convert;
+mod coordination;
 mod crash_context;
 mod destinations;
 mod errors;
@@ -19,10 +21,13 @@ mod intent;
 mod interop;
 mod kv;
 mod memory;
+mod memory_handler;
+mod parity_helpers;
 mod publish;
 mod query;
 mod rbac;
 mod reader;
+mod registry;
 mod runs;
 mod schema;
 mod session;
@@ -47,6 +52,10 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     // instead of on stderr. Best effort: a second import must not fail the module.
     let _ = pyo3_log::try_init();
     errors::register(py, module)?;
+    module.add(
+        "CONTEXT_READ_WINDOW",
+        ::laser_sdk::context::CONTEXT_READ_WINDOW,
+    )?;
     module.add_class::<client::PyLaser>()?;
     module.add_class::<client::PyCapabilities>()?;
     module.add_class::<client::PyOpVersions>()?;
@@ -61,9 +70,18 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<query::PyQuery>()?;
     module.add_class::<query::PyRow>()?;
     module.add_class::<query::PyQueryResult>()?;
+    module.add_class::<query::PyQueryFilter>()?;
+    module.add_class::<memory::PyConsolidationReport>()?;
+    module.add_class::<context::PyLastN>()?;
+    module.add_class::<context::PyTokenBudget>()?;
+    module.add_class::<context::PyRoleFilter>()?;
+    module.add_class::<context::PyChain>()?;
     module.add_class::<destinations::PyDestinations>()?;
     module.add_class::<kv::PyKv>()?;
     module.add_class::<kv::PyLease>()?;
+    module.add_class::<coordination::PyDedicatedKvTransport>()?;
+    module.add_class::<coordination::PyFencedLeaseClient>()?;
+    module.add_class::<coordination::PyPreparedMutation>()?;
     module.add_class::<kv::PyMutationPosition>()?;
     module.add_class::<kv::PyKvEntry>()?;
     module.add_class::<kv::PyKvPage>()?;
@@ -72,6 +90,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<watch::PyWatchReader>()?;
     module.add_class::<watch::PyChangeRecord>()?;
     module.add_class::<kv::PyKvSet>()?;
+    module.add_class::<kv::PyKvCopy>()?;
+    module.add_class::<kv::PyKvCasFenced>()?;
     module.add_class::<kv::PyKvScan>()?;
     module.add_class::<kv::PyKvDeleteMany>()?;
     module.add_class::<consumer_group::PyConsumerGroup>()?;
@@ -111,6 +131,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<transport::PyConsumerMessage>()?;
     module.add_class::<chunks::PyChunkAssembler>()?;
     module.add_class::<snapshot::PySnapshotStore>()?;
+    module.add_class::<parity_helpers::PySystemClock>()?;
+    module.add_class::<parity_helpers::PyTestClock>()?;
     module.add_class::<govern::PyGovernedAction>()?;
     module.add_class::<govern::PyActionDecision>()?;
     module.add_class::<govern::PyPolicyEvidence>()?;
@@ -131,12 +153,16 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<session::PySessionTurn>()?;
     module.add_class::<session::PyCheckpoint>()?;
     module.add_class::<memory::PyMemory>()?;
+    module.add_class::<memory_handler::PyMemoryHandler>()?;
     module.add_class::<memory::PyMemoryItem>()?;
     module.add_class::<graph::PyGraph>()?;
     module.add_class::<state_store::PyInMemoryStore>()?;
     module.add_class::<state_store::PyFileStore>()?;
     module.add_class::<interop::PyA2aBridge>()?;
     module.add_class::<interop::PyMcpBridge>()?;
+    module.add_class::<registry::PyAgentRegistry>()?;
+    module.add_class::<batching::PyBatchingProducer>()?;
+    module.add_class::<registry::PyAgentScope>()?;
     module.add_function(wrap_pyfunction!(agent::new_conversation_id, module)?)?;
     module.add_function(wrap_pyfunction!(agent::new_correlation_id, module)?)?;
     module.add_function(wrap_pyfunction!(agent::derive_conversation_id, module)?)?;
@@ -152,6 +178,34 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(intent::decide, module)?)?;
     module.add_function(wrap_pyfunction!(agent_runtime::agent_message, module)?)?;
     module.add_function(wrap_pyfunction!(agent_runtime::agent_ctx, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::sign_card_value, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::verify_card, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::verify_delegation, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::encode_snapshot, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::decode_snapshot, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::resume_offsets, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::fuse_reciprocal_rank,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::command_from_message_send,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::task_from_envelope,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::tool_call_from_request,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::tool_result_from_envelope,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::check_in, module)?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::resolve_body, module)?)?;
     Ok(())
 }
 

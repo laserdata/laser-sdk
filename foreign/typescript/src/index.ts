@@ -30,9 +30,39 @@ export {
   PolicyBlockedError,
   StepUpRequiredError,
   PolicyDeferredError,
+  BudgetExceededError,
+  RoutingError,
+  PublishFailedError,
+  FenceViolationError,
+  QuarantinedError,
+  NoRespondTopicError,
+  CheckpointExecutionError,
+  publishCause,
   assertNever
 } from "./client/errors.js"
-export type { LaserErrorKind } from "./client/errors.js"
+export type { LaserErrorKind, RoutingErrorReason } from "./client/errors.js"
+export {
+  code,
+  filterReason,
+  iggyErrorCode,
+  isAmbiguousMutation,
+  isBudgetExceeded,
+  isFenceViolation,
+  isLeaseLost,
+  isNoCapableAgent,
+  isNotFound,
+  isNotLeader,
+  isPermissionDenied,
+  isQuarantined,
+  isStale,
+  isStreamOrTopicNotFound,
+  isUnavailable,
+  isUnsupported,
+  isVersionConflict,
+  isVersionSkew
+} from "./client/error-classify.js"
+export { decodeUtf8, utf8 } from "./client/bytes.js"
+export type { BytesLike } from "./client/bytes.js"
 export {
   ActionDecision,
   ActionKind,
@@ -81,6 +111,17 @@ export type {
   SendMessagesResponse
 } from "./iggy/apache-iggy.js"
 export type { Capabilities, CapabilitySurface, FilterCapabilities } from "./client/capabilities.js"
+export {
+  backend,
+  enabledBackends,
+  filterCapsEvaluates,
+  isOpenOnly,
+  isReady,
+  OPEN_CAPABILITIES,
+  readinessReasons,
+  servesConsistency,
+  unreadyBackends
+} from "./client/capabilities.js"
 export { QueryRequest } from "./managed/query.js"
 export { Destinations } from "./managed/destinations.js"
 export type { QueryResult, Row, Filter, Consistency, QueryTarget } from "./wire/query.js"
@@ -116,6 +157,17 @@ export {
   KvCopyRequest
 } from "./managed/kv.js"
 export type { Lease } from "./managed/kv.js"
+export {
+  DedicatedKvTransport,
+  FencedLeaseClient,
+  DEFAULT_ATTEMPT_TIMEOUT_MS
+} from "./managed/coordination.js"
+export type {
+  ManagedKvTransport,
+  PreparedMutation,
+  AmbiguousMutationRecovery
+} from "./managed/coordination.js"
+export type { KvGet, KvLease, KvLeaseRenew, KvRelease, KvCasFenced } from "./wire/kv.js"
 export type { MutationPosition } from "./wire/mutation.js"
 export type {
   KvEntry,
@@ -272,7 +324,13 @@ export type {
   GraphError
 } from "./wire/graph.js"
 export { AgentTopic } from "./provenance/agent-topic.js"
-export { AgentRegistry, ClientMetadataRequest } from "./agent/registry.js"
+export {
+  AgentRegistry,
+  cardAvailableFor,
+  cardIsFresh,
+  cardServes,
+  ClientMetadataRequest
+} from "./agent/registry.js"
 export type {
   AgentPresenceInput,
   ClientMetadataPage,
@@ -292,6 +350,7 @@ export {
 export type { AgentContextOptions, Gather, GatherPolicy } from "./agent/context.js"
 export { AgentScope } from "./agent/scope.js"
 export {
+  CONTEXT_READ_WINDOW,
   Checkpoint,
   ContextAssembler,
   ContextAssemblerBuilder,
@@ -322,6 +381,8 @@ export type { StateStore } from "./state-store.js"
 export {
   DEFAULT_SNAPSHOT_NAMESPACE,
   DEFAULT_SNAPSHOT_TOPIC,
+  decodeSnapshot,
+  encodeSnapshot,
   KvSnapshotStore,
   TopicSnapshotStore
 } from "./snapshot.js"
@@ -345,18 +406,22 @@ export {
   toContextBlock
 } from "./memory.js"
 export type {
+  ConsolidateOptions,
   ConsolidationReport,
   Consolidator,
   Embedder,
   Feedback,
   Memory,
+  MemoryBackendKind,
   MemoryItem,
   MemoryQuery,
   MemoryScope,
   RecallSignal,
-  Reranker
+  Reranker,
+  Summarizer
 } from "./memory.js"
 export { Agent, AgentBuilder, AgentHandle } from "./agent/builder.js"
+export { MemoryHandler } from "./agent/memory-handler.js"
 export type { AgentConsolidator } from "./agent/builder.js"
 export { ContractBuilder, ScatterReport } from "./agent/contract.js"
 export type { Contract, ScatterOutcome } from "./agent/contract.js"
@@ -382,6 +447,7 @@ export {
   A2aBridge,
   A2aMethod,
   SDK_VERSION,
+  commandFromMessageSend,
   contentRefMode,
   taskFromEnvelope,
   taskToJson
@@ -399,6 +465,7 @@ export {
   MCP_DEFAULT_PROTOCOL_VERSION,
   McpBridge,
   McpMethod,
+  toolCallFromRequest,
   toolResultFromEnvelope
 } from "./bridges/mcp.js"
 export type {
@@ -520,9 +587,11 @@ export {
   provenancePartitionKey
 } from "./provenance/provenance.js"
 export type { Provenance, LlmUsage } from "./provenance/provenance.js"
-export type { IggyHeaderValue } from "./iggy/apache-iggy.js"
+export type { IggyHeaderValue, TopicCreateSettings } from "./iggy/apache-iggy.js"
+export { UNLIMITED_TOPIC_SIZE } from "./iggy/apache-iggy.js"
 export { HeaderValue } from "./stream/header-value.js"
 export { Record, recordHeaders } from "./stream/record.js"
+export type { RecordSnapshot } from "./stream/record.js"
 export { BatchPublishRequest, PublishRequest } from "./stream/publish.js"
 export { conversationFor } from "./provenance/session-policy.js"
 export type { SessionPolicy } from "./provenance/session-policy.js"
@@ -543,7 +612,12 @@ export { Stream } from "./stream/stream.js"
 export { Topic } from "./stream/topic.js"
 export type { TopicEnsureOptions } from "./stream/topic.js"
 export { Consumer } from "./stream/consumer.js"
-export type { ConsumedMessage, ConsumerOptions } from "./stream/consumer.js"
+export type {
+  CommitPolicy,
+  ConsumedMessage,
+  ConsumerMessage,
+  ConsumerOptions
+} from "./stream/consumer.js"
 export { ConsumerGroup, GroupFilter } from "./stream/consumer-group.js"
 export type {
   ConsumerGroupInfo,
@@ -552,7 +626,20 @@ export type {
 } from "./stream/consumer-group.js"
 export type { PollingStrategy } from "./stream/polling-strategy.js"
 export { Producer } from "./stream/producer.js"
-export type { ProducerMessage, ProducerOptions, ProducerSendOptions } from "./stream/producer.js"
+export {
+  BatchingProducer,
+  BatchingProducerBuilder,
+  DEFAULT_LINGER_MS,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_RECORDS,
+  MIN_LINGER_MS
+} from "./stream/batching.js"
+export type {
+  ProducerBackgroundOptions,
+  ProducerMessage,
+  ProducerOptions,
+  ProducerSendOptions
+} from "./stream/producer.js"
 export { Cursor } from "./stream/cursor.js"
 export type { CursorOptions } from "./stream/cursor.js"
 export type { Codec, ValueDecoder } from "./stream/codecs.js"
@@ -561,3 +648,83 @@ export { CompiledSchema } from "./schema-codecs.js"
 export type { CompiledSchemaKind } from "./schema-codecs.js"
 export { TypedTopic, TypedRecords } from "./stream/typed-topic.js"
 export type { TypedRecord, TypedTopicKind, TypedPollResult } from "./stream/typed-topic.js"
+export type { GovernorRetention } from "./govern.js"
+export type { AgentDefinition } from "./agent/builder.js"
+export type {
+  FenceEntry,
+  FenceSweepState,
+  ReceivedAgentMessage,
+  ReliableConsumerControl
+} from "./agent/reliable-consumer.js"
+export type { RegistryCache } from "./agent/registry.js"
+export type { ContextAssemblerOptions } from "./context.js"
+export type { LaserBuildOptions, LaserTopology, TopologyOverrides } from "./client/laser.js"
+export type {
+  DestinationCapabilities,
+  HelloOutcome,
+  KvCapabilities,
+  QueryCapabilities
+} from "./client/capabilities.js"
+export type { ManagedTransport } from "./client/managed.js"
+export type { QueryExecutor, QueryStatusExecutor } from "./managed/query.js"
+export type { ForkBackend } from "./managed/forks.js"
+export type { GraphBackend } from "./managed/graph.js"
+export type { KvBackend } from "./managed/kv.js"
+export type { BrowseBackend, PublishControl } from "./managed/projections.js"
+export type { RunsBackend } from "./managed/runs.js"
+export type { BatchSink } from "./stream/batching.js"
+export type { RawSendOptions } from "./stream/topic.js"
+export type { Routing } from "./stream/routing.js"
+export type {
+  ConsumerOffsetTarget,
+  ConsumerTarget,
+  CoordinatorConnection,
+  LaserTransport,
+  MessageWithHeaders,
+  NodeConnection,
+  PolledMessage
+} from "./iggy/apache-iggy.js"
+export type { ArrowIpcMessageMetadata } from "./wire/arrow.js"
+export type {
+  AgentEnvelope,
+  AgentDeadLetter,
+  ContentRef,
+  Signature,
+  SignatureContext
+} from "./wire/agent.js"
+export type {
+  BackendDescriptor,
+  BackendReadinessReason,
+  FilterAnnounce,
+  OpVersions
+} from "./wire/hello.js"
+export type { WireTopology } from "./wire/topology.js"
+export type { LogPosition, WireId } from "./wire/ids.js"
+export type { ResultCode } from "./wire/result.js"
+export type { GraphAttr, SourceRef } from "./wire/graph.js"
+export type { GroupFilterSpec } from "./wire/filter.js"
+export type {
+  Query,
+  QueryContext,
+  QueryExecutionStatus,
+  SnapshotSelector,
+  AggFunc,
+  SqlDialect,
+  Predicate,
+  Page
+} from "./wire/query.js"
+export type { FieldValue, DecimalValue, MapEntry } from "./wire/schema.js"
+export type { FieldType } from "./wire/control.js"
+export type {
+  CheckpointError,
+  CheckpointRequestEnvelope,
+  SupervisorActorAssertion
+} from "./wire/checkpoint.js"
+export type { FoldSnapshot } from "./wire/snapshot.js"
+export type { MemoryRowScope } from "./wire/kv.js"
+export type { ConnectOptions } from "./client/connect-options.js"
+export type { PublishOptions } from "./client/publish-options.js"
+export type { GroupContext } from "./stream/consumer-group.js"
+export type { GovernPublish, ResolveSchema, ObserveEffect } from "./stream/topic.js"
+export type { RegistryView } from "./agent/router.js"
+export type { TypedContract } from "./stream/typed-topic.js"

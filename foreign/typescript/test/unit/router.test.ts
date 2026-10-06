@@ -113,15 +113,15 @@ void test("given_a_principal_bound_selector_when_filtering_then_should_drop_fore
 })
 
 void test("given_a_principal_bound_route_when_reading_required_identity_then_should_return_principal", () => {
-  const router = routeToPrincipal(AgentId.new("billing"), PrincipalId.new(42))
+  const router = routeToPrincipal(AgentId.new("metrics"), PrincipalId.new(42))
   assert.equal(requiredPrincipal(router)?.get(), 42)
 })
 
 void test("given_direct_and_broadcast_routes_when_resolved_then_should_return_explicit_targets", () => {
   const empty = registry([])
   assert.deepEqual(
-    resolveTargets(routeTo(AgentId.new("billing")), empty, 0n).map((agent) => agent.asString()),
-    ["billing"]
+    resolveTargets(routeTo(AgentId.new("metrics")), empty, 0n).map((agent) => agent.asString()),
+    ["metrics"]
   )
   assert.deepEqual(resolveTargets(routeBroadcast(), empty, 0n), [])
 })
@@ -153,9 +153,9 @@ void test("given_no_capable_agent_when_resolving_then_should_fail_without_broadc
 })
 
 void test("given_principal_bound_routes_when_identity_differs_then_should_report_the_actual_identity", () => {
-  const candidate = card("billing", 1, undefined, undefined)
-  const view = registry([candidate], { billing: 9 })
-  const direct = routeToPrincipal(AgentId.new("billing"), PrincipalId.new(7))
+  const candidate = card("metrics", 1, undefined, undefined)
+  const view = registry([candidate], { metrics: 9 })
+  const direct = routeToPrincipal(AgentId.new("metrics"), PrincipalId.new(7))
   const capable = {
     kind: "toCapable",
     selector: capabilitySelector("diagnose", { kind: "any" }, PrincipalId.new(7))
@@ -209,20 +209,20 @@ void test("given_a_custom_scorer_when_selected_then_should_rank_over_the_same_ca
 })
 
 void test("given_a_fixed_inbox_route_when_resolved_then_should_use_that_topic_ignoring_presence", () => {
-  const agent = AgentId.new("billing")
+  const agent = AgentId.new("metrics")
   const route = { kind: "fixed", topic: AgentTopic.Commands } as const
   assert.equal(resolveInboxRoute(route, agent, "some.other.topic"), "agent.commands")
 })
 
 void test("given_an_advertised_route_when_an_inbox_is_present_then_should_resolve_to_it", () => {
-  const agent = AgentId.new("billing")
+  const agent = AgentId.new("metrics")
   assert.equal(
-    resolveInboxRoute(ADVERTISED_INBOX_ROUTE, agent, "billing.work.2026"),
-    "billing.work.2026"
+    resolveInboxRoute(ADVERTISED_INBOX_ROUTE, agent, "metrics.work.2026"),
+    "metrics.work.2026"
   )
 })
 
 void test("given_an_advertised_route_when_no_inbox_then_should_error_without_a_fallback", () => {
-  const agent = AgentId.new("billing")
+  const agent = AgentId.new("metrics")
   assert.throws(() => resolveInboxRoute(ADVERTISED_INBOX_ROUTE, agent, undefined), RoutingError)
 })

@@ -203,7 +203,7 @@ impl GraphHandle<'_> {
         decode_graph_reply(&payload)
     }
 
-    /// Relate two entities in one call: `link("customer:42", "opened",
+    /// Relate two entities in one call: `link("operator:42", "opened",
     /// "ticket:7")` upserts both content-addressed entity nodes and the typed
     /// edge between them. Sugar over [`upsert`](Self::upsert), so re-linking
     /// the same triple converges on the same nodes and edge. The entity ids

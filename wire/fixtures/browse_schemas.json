@@ -4,7 +4,7 @@
       "id": 7,
       "source": {
         "kind": "avro",
-        "schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[]}"
+        "schema": "{\"type\":\"record\",\"name\":\"Reading\",\"fields\":[]}"
       }
     },
     "dropped": false
@@ -20,7 +20,7 @@
           2,
           255
         ],
-        "message_type": "shop.Order"
+        "message_type": "fleet.Reading"
       }
     },
     "dropped": true
@@ -30,9 +30,9 @@
       "id": 9,
       "source": {
         "kind": "json_schema",
-        "schema": "{\"type\":\"object\",\"required\":[\"customer\"]}"
+        "schema": "{\"type\":\"object\",\"required\":[\"host\"]}"
       },
-      "name": "order-events",
+      "name": "reading-events",
       "version": 2
     },
     "dropped": false

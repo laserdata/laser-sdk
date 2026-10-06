@@ -55,7 +55,7 @@ function coercePartition(value: unknown, context: string): number {
 }
 
 function coerceOffset(value: unknown, context: string): bigint {
-  if (typeof value === "bigint" && value >= 0n) return value
+  if (typeof value === "bigint" && value >= 0n && value <= 0xffff_ffff_ffff_ffffn) return value
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value)
   throw new CodecError(`offset in ${context}.as_of must fit u64`, context, "as_of")
 }

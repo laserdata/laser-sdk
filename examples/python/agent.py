@@ -52,8 +52,9 @@ async def main() -> None:
             # The advertised capability is what makes this agent addressable by what
             # it can do rather than by the name it happens to run under.
             capabilities=[CAPABILITY],
-            # Acknowledge on pickup, so a crash mid-handler is a retry rather than a
-            # silently dropped task.
+            # Emit a Working status on pickup, so a contract caller can tell the
+            # command was consumed. Redelivery after a crash comes from
+            # commit-after-success.
             ack_on_pickup=True,
         )
         await triage.ready()

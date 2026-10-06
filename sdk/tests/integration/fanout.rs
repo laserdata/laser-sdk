@@ -21,7 +21,7 @@ impl AgentHandler for Worker {
 async fn given_fanned_out_subconversations_when_aggregating_then_should_collect_every_result_at_the_root()
  {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .respond_on(AgentTopic::Responses)

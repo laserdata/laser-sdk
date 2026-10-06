@@ -338,7 +338,6 @@ void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record
       const delivered: bigint[] = []
       for (let index = 0; index < 3; index += 1) {
         const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-        assert.ok(message !== null)
         delivered.push(message.offset)
         await consumer.commit(message)
       }
@@ -375,7 +374,6 @@ void test("given_a_group_with_a_filter_when_consumed_then_should_deliver_only_ma
       const delivered: bigint[] = []
       for (let index = 0; index < 2; index += 1) {
         const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-        assert.ok(message !== null)
         delivered.push(message.offset)
         await consumer.commit(message)
       }
@@ -530,7 +528,6 @@ void test(
         const seen = new Set<number>()
         for (let index = 0; index < 9; index += 1) {
           const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-          assert.ok(message !== null)
           assert.equal(message.offset, 0n)
           seen.add(message.partitionId)
           await consumer.commit(message)

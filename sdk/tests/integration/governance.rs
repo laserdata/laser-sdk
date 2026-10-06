@@ -107,7 +107,7 @@ async fn given_a_modifying_governor_when_the_purpose_matches_then_should_publish
 
     governed
         .agdx(AgentTopic::LlmIo, source, conversation.into())
-        .emit(b"customer pii here".to_vec())
+        .emit(b"operator notes here".to_vec())
         .with_metadata(METADATA_PURPOSE, "marketing")
         .send()
         .await
@@ -156,7 +156,7 @@ async fn given_a_step_up_governor_when_a_request_runs_then_should_surface_the_sc
         )
         .await
         .expect_err("the request pauses on a step-up");
-    assert!(matches!(&error, LaserError::StepUpRequired(scope) if scope == "payments:approve"));
+    assert!(matches!(&error, LaserError::StepUpRequired(scope) if scope == "storage:rotate"));
 
     let evidence = eventually(|| async {
         let all = audit_evidence(&laser).await;
@@ -165,7 +165,7 @@ async fn given_a_step_up_governor_when_a_request_runs_then_should_surface_the_sc
     .await;
     assert_eq!(evidence.outcome, "step_up");
     assert_eq!(evidence.kind, "request");
-    assert_eq!(evidence.approved_scope.as_deref(), Some("payments:approve"));
+    assert_eq!(evidence.approved_scope.as_deref(), Some("storage:rotate"));
 }
 
 #[tokio::test]
@@ -178,7 +178,7 @@ async fn given_an_enforcing_governor_when_vector_memory_is_blocked_then_should_n
         .embedder(IdentityEmbedder);
 
     let error = memory
-        .remember(b"customer prefers blue [skew:fabricate_memory]".to_vec())
+        .remember(b"node-7 prefers eu-west [skew:fabricate_memory]".to_vec())
         .scope(conversation)
         .send()
         .await
@@ -349,7 +349,7 @@ impl ActionGovernor for BlockFabricatedMemory {
 impl ActionGovernor for StepUpRequests {
     async fn decide(&self, action: &GovernedAction<'_>) -> Result<ActionDecision, LaserError> {
         if action.kind == ActionKind::Request {
-            return Ok(ActionDecision::step_up("payments:approve"));
+            return Ok(ActionDecision::step_up("storage:rotate"));
         }
         Ok(ActionDecision::allow())
     }

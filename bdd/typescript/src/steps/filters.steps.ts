@@ -186,7 +186,6 @@ When(
     try {
       for (let index = 0; index < 3; index += 1) {
         const record = await consumer.nextWithin(READ_TIMEOUT_MS)
-        assert.ok(record !== null)
         delivered.push(record.payload)
         await consumer.commit(record)
       }
@@ -222,7 +221,6 @@ When(
     try {
       for (const _ of FEED) {
         const record = await consumer.nextWithin(READ_TIMEOUT_MS)
-        assert.ok(record !== null)
         delivered.push(record.payload)
         await consumer.commit(record)
       }
@@ -318,7 +316,6 @@ When(
     })
     try {
       const record = await consumer.nextWithin(READ_TIMEOUT_MS)
-      assert.ok(record !== null)
       assert.equal(record.offset, 100n)
       assert.equal((await consumer.storedOffset(0))?.storedOffset, 99n)
       await consumer.commit(record)

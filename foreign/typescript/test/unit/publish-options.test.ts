@@ -57,6 +57,22 @@ void test("given_a_transient_publish_failure_when_retried_then_should_keep_ids_p
   assert.deepEqual(response.confirmations, [confirmation])
 })
 
+void test("given_a_wrapped_server_reply_when_retried_then_should_read_its_exact_transient_code", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    if (attempts === 1)
+      return Promise.reject(new Error("wrapped reply", { cause: { errorCode: 58 } }))
+    return Promise.resolve({ confirmations: [] })
+  })
+  await client.sendMessages("stream", "topic", [new Uint8Array([1])], {
+    kind: "partition",
+    partition: 0
+  })
+  assert.equal(attempts, 2)
+  await client.close()
+})
+
 void test("given_a_long_outage_when_retries_exhaust_then_should_reject_and_allow_a_later_send", async () => {
   let attempts = 0
   let offline = true

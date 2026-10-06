@@ -36,7 +36,7 @@ void test("given_the_agent_command_fixture_when_decoded_then_should_validate_and
   assert.equal(envelope.kind, "command")
   assert.equal(envelope.source, "source-agent")
   assert.equal(envelope.target, "target-agent")
-  assert.equal(envelope.idempotencyKey, "order-123-attempt-2")
+  assert.equal(envelope.idempotencyKey, "job-123-attempt-2")
   assert.equal(envelope.deadlineMicros, 1_717_171_777_000_000n)
   assert.equal(envelope.operation, "chat")
   assert.deepEqual(envelope.metadata?.get("priority"), { kind: "string", value: "high" })

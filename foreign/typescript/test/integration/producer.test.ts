@@ -18,6 +18,26 @@ async function freshTopic(laser: Laser, partitions = 1) {
   return topic
 }
 
+void test("given_concurrent_first_publishes_when_provisioning_one_topic_then_should_deliver_every_record", async () => {
+  await using laser = await Laser.connect(CONNECTION_STRING)
+  const streamName = `laser-ts-test-${randomUUID()}`
+  await laser.stream(streamName).ensure()
+  const topic = laser.stream(streamName).topic("events")
+  const producers = Array.from({ length: 8 }, () => topic.producer({ createStream: false }))
+  try {
+    await Promise.all(producers.map((producer, index) => producer.send(utf8(String(index)))))
+    const consumer = topic.consumer(0, { startFrom: { kind: "first" }, autoCommit: false })
+    const seen = new Set<string>()
+    for (let remaining = producers.length; remaining > 0; remaining -= 1) {
+      seen.add(decodeUtf8((await consumer.nextWithin(1_000)).payload))
+    }
+    assert.equal(seen.size, producers.length)
+    await consumer.shutdown()
+  } finally {
+    await Promise.all(producers.map((producer) => producer.shutdown()))
+  }
+})
+
 void test("given_a_direct_producer_when_send_resolves_then_should_make_the_record_visible", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
@@ -26,7 +46,6 @@ void test("given_a_direct_producer_when_send_resolves_then_should_make_the_recor
     await producer.send(utf8("direct"))
 
     const message = await topic.consumer(0, { startFrom: { kind: "first" } }).nextWithin(1_000)
-    assert.ok(message !== null)
     assert.equal(decodeUtf8(message.payload), "direct")
     await producer.shutdown()
   } finally {
@@ -46,8 +65,6 @@ void test("given_a_direct_producer_when_a_batch_is_sent_then_should_use_one_orde
     const consumer = topic.consumer(0, { startFrom: { kind: "first" }, batchLength: 2 })
     const first = await consumer.nextWithin(1_000)
     const second = await consumer.nextWithin(1_000)
-    assert.ok(first !== null)
-    assert.ok(second !== null)
     assert.deepEqual([decodeUtf8(first.payload), decodeUtf8(second.payload)], ["x", "y"])
     await producer.shutdown()
   } finally {
@@ -66,7 +83,6 @@ void test("given_a_structured_keyed_message_when_sent_then_should_preserve_binar
     )
 
     const message = await topic.consumer(0, { startFrom: { kind: "first" } }).nextWithin(1_000)
-    assert.ok(message !== null)
     assert.equal(decodeUtf8(message.payload), "typed")
     assert.deepEqual(message.headers.get("type"), { kind: "uint16", value: 7 })
     await producer.shutdown()

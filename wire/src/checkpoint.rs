@@ -2007,11 +2007,11 @@ mod tests {
             id: DestinationId::from_u128(10),
             generation: 1,
             definition_revision: 1,
-            name: "orders-lakehouse".to_owned(),
-            source: SourceScope::new("shop", "orders"),
+            name: "readings-lakehouse".to_owned(),
+            source: SourceScope::new("fleet", "readings"),
             recreated_partition_policy: RecreatedPartitionPolicy::Reject,
             projection: ProjectionRef {
-                id: crate::control::ProjectionId::new("order.v1"),
+                id: crate::control::ProjectionId::new("reading.v1"),
                 version: 1,
             },
             schema: LogicalSchemaRef {
@@ -2024,8 +2024,8 @@ mod tests {
                 generation: 2,
             },
             table: PhysicalTable {
-                namespace: vec!["shop".to_owned()],
-                table: "orders".to_owned(),
+                namespace: vec!["fleet".to_owned()],
+                table: "readings".to_owned(),
                 expected_table_uuid: None,
             },
             file_format: FileFormat::Parquet,
@@ -2039,7 +2039,7 @@ mod tests {
 
     fn table_requirements() -> PreparedTableRequirements {
         let table_uuid = UuidValue::new([14; 16]);
-        let base_metadata_identity = "warehouse/shop/orders/metadata/00001.json".to_owned();
+        let base_metadata_identity = "warehouse/fleet/readings/metadata/00001.json".to_owned();
         PreparedTableRequirements {
             table_uuid: table_uuid.clone(),
             base_metadata_identity: base_metadata_identity.clone(),

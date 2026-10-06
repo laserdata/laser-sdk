@@ -11,10 +11,7 @@ use std::str::FromStr;
 /// A record to publish: payload plus indexed fields and metadata (built via the publish builder).
 #[derive(Clone, Debug, Default, bon::Builder)]
 pub struct Record {
-    // Indexable scalars stamped under `agdx.idx.<k>`. Accumulated by the builder's
-    // `index(k, v)` method rather than set as one vector. At least one entry
-    // here is required for a projector to materialize the record. A record
-    // with zero indexed fields is treated as "don't index me" and dropped.
+    // Explicit indexed fields override schema extraction. A record produces no row only when both sources provide no indexed fields.
     #[builder(field)]
     pub index: Vec<(String, String)>,
     // Ride-along headers stamped verbatim so the projector can store them in a
@@ -38,7 +35,7 @@ pub struct Record {
     /// stamps it (distinct from "unset").
     pub content_type: Option<ContentType>,
     // Projection selector for the materialization LaserData Cloud performs. Opaque string like
-    // `"order.v1"`. When set, the projector looks it up in the binding's
+    // `"reading.v1"`. When set, the projector looks it up in the binding's
     // `allowed_projections` and applies the matching `Projection` extraction
     // rules. When unset, the binding's default projection (or the explicit
     // `agdx.idx.*` header path) applies.
@@ -203,8 +200,8 @@ mod tests {
         let record = Record::builder()
             .content_type(ContentType::Json)
             .schema_id(7)
-            .index("order_id", "123")
-            .index("customer_id", "abc")
+            .index("job_id", "123")
+            .index("host_id", "abc")
             .build();
         let headers: BTreeMap<HeaderKey, HeaderValue> =
             (&record).try_into().expect("the record lowers to headers");
@@ -225,14 +222,14 @@ mod tests {
         assert_eq!(schema_id.as_uint32().expect("u32 typed value"), 7);
         let as_str =
             |key: &str| get(key).map(|value| value.as_str().expect("utf-8 value").to_owned());
-        assert_eq!(as_str("agdx.idx.order_id").as_deref(), Some("123"));
-        assert_eq!(as_str("agdx.idx.customer_id").as_deref(), Some("abc"));
+        assert_eq!(as_str("agdx.idx.job_id").as_deref(), Some("123"));
+        assert_eq!(as_str("agdx.idx.host_id").as_deref(), Some("abc"));
         assert_eq!(get(INLINE_PAYLOAD), None, "off by default");
     }
 
     #[test]
     fn given_a_record_without_content_type_when_lowered_then_should_omit_the_header() {
-        let record = Record::builder().index("order_id", "123").build();
+        let record = Record::builder().index("host_id", "123").build();
         let headers: BTreeMap<HeaderKey, HeaderValue> =
             (&record).try_into().expect("the record lowers to headers");
         let key = HeaderKey::from_str(CONTENT_TYPE).expect("the key is valid");
@@ -245,9 +242,9 @@ mod tests {
     #[test]
     fn given_inline_payload_and_metadata_when_lowered_then_should_emit_both() {
         let record = Record::builder()
-            .index("order_id", "123")
+            .index("host_id", "123")
             .metadata("trace_id", "abc")
-            .metadata("agdx.actor", "checkout")
+            .metadata("agdx.actor", "metrics")
             .inline_payload()
             .build();
         let headers: BTreeMap<HeaderKey, HeaderValue> =
@@ -263,7 +260,7 @@ mod tests {
                 .map(|value| value.as_str().expect("the value is utf-8").to_owned())
         };
         assert_eq!(get("trace_id").as_deref(), Some("abc"));
-        assert_eq!(get("agdx.actor").as_deref(), Some("checkout"));
+        assert_eq!(get("agdx.actor").as_deref(), Some("metrics"));
     }
 
     #[test]
@@ -287,7 +284,7 @@ mod tests {
 
     #[test]
     fn given_a_record_with_an_empty_index_value_when_lowered_then_should_error() {
-        let record = Record::builder().index("order_id", "").build();
+        let record = Record::builder().index("host_id", "").build();
         let result: Result<BTreeMap<HeaderKey, HeaderValue>, _> = (&record).try_into();
         assert!(matches!(result, Err(LaserError::Invalid(_))));
     }

@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn given_a_principal_bound_route_when_reading_required_identity_then_should_return_principal() {
         let route = Router::to_principal(
-            "billing".parse().expect("billing is a valid agent id"),
+            "metrics".parse().expect("metrics is a valid agent id"),
             PrincipalId::new(42),
         );
 
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn given_a_fixed_inbox_route_when_resolved_then_should_use_that_topic_ignoring_presence() {
-        let agent: AgentId = "billing".parse().unwrap();
+        let agent: AgentId = "metrics".parse().unwrap();
         let route = InboxRoute::Fixed(AgentTopic::Commands);
         // Fixed ignores the advertised inbox entirely.
         let id = route.resolve(&agent, Some("some.other.topic")).unwrap();
@@ -549,19 +549,19 @@ mod tests {
 
     #[test]
     fn given_an_advertised_route_when_an_inbox_is_present_then_should_resolve_to_it() {
-        let agent: AgentId = "billing".parse().unwrap();
+        let agent: AgentId = "metrics".parse().unwrap();
         let id = InboxRoute::Advertised
-            .resolve(&agent, Some("billing.work.2026"))
+            .resolve(&agent, Some("metrics.work.2026"))
             .unwrap();
-        assert_eq!(id.to_string(), "billing.work.2026");
+        assert_eq!(id.to_string(), "metrics.work.2026");
     }
 
     #[test]
     fn given_an_advertised_route_when_no_inbox_then_should_error_without_a_fallback() {
-        let agent: AgentId = "billing".parse().unwrap();
+        let agent: AgentId = "metrics".parse().unwrap();
         let error = InboxRoute::Advertised.resolve(&agent, None).unwrap_err();
         assert!(
-            matches!(error, LaserError::NoInbox { agent } if agent == "billing"),
+            matches!(error, LaserError::NoInbox { agent } if agent == "metrics"),
             "advertised route with no inbox must fail loud, never fall back to a shared topic",
         );
     }

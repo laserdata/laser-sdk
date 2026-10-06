@@ -101,6 +101,47 @@ async fn compare_and_swap(world: &mut LaserWorld, key: String, namespace: String
     world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
 
+#[when(
+    regex = r#"^I send a set of key "([^"]+)" in namespace "([^"]+)" expecting version (\d+) without commit$"#
+)]
+async fn send_set_with_precondition(
+    world: &mut LaserWorld,
+    key: String,
+    namespace: String,
+    version: u64,
+) {
+    let result = world
+        .laser()
+        .kv(&namespace)
+        .set(&key)
+        .bytes(b"debug")
+        .expect_version(version)
+        .send()
+        .await;
+    world.last_code = result.as_ref().err().map(|error| error.code());
+    world.last_result = Some(result.map_err(|error| format!("{error:?}")));
+}
+
+#[then("the call fails as invalid")]
+async fn fails_invalid(world: &mut LaserWorld) {
+    match world.last_result.as_ref().expect("a call was attempted") {
+        Err(error) => assert!(
+            error.contains("Invalid"),
+            "expected an Invalid error, got: {error}"
+        ),
+        Ok(()) => panic!("expected the call to fail as invalid"),
+    }
+}
+
+#[then("the unified result code is invalid argument")]
+async fn result_code_invalid_argument(world: &mut LaserWorld) {
+    assert_eq!(
+        world.last_code,
+        Some(ResultCode::InvalidArgument),
+        "the failure should classify as InvalidArgument in the unified result space"
+    );
+}
+
 #[then("the call fails as unsupported")]
 async fn fails_unsupported(world: &mut LaserWorld) {
     match world

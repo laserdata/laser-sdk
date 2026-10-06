@@ -21,4 +21,4 @@ just up && cargo run --example context
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/context
-- Full system built on this primitive: [`concierge`](../concierge/README.md)
+- Full system built on this primitive: [`incident-desk`](../incident-desk/README.md)

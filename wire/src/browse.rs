@@ -137,18 +137,18 @@ mod tests {
     #[test]
     fn given_a_browse_reply_when_round_tripped_then_should_preserve_projection_details() {
         let info = ProjectionInfo {
-            projection: Projection::builder("order.v1")
-                .name("order")
+            projection: Projection::builder("reading.v1")
+                .name("reading")
                 .version(1)
                 .content_type(ContentType::Json)
-                .fields(["order_id", "amount"])
+                .fields(["reading_id", "cpu"])
                 .build(),
             bindings: vec![
                 ProjectionBinding::builder()
-                    .source("shop", "orders")
-                    .allow("order.v1")
-                    .default_projection("order.v1")
-                    .index("orders_rows")
+                    .source("fleet", "readings")
+                    .allow("reading.v1")
+                    .default_projection("reading.v1")
+                    .index("readings_rows")
                     .build(),
             ],
         };
@@ -159,9 +159,9 @@ mod tests {
             panic!("expected an Ok(Projections) browse reply");
         };
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].projection.id.as_str(), "order.v1");
+        assert_eq!(list[0].projection.id.as_str(), "reading.v1");
         assert_eq!(list[0].projection.extraction.fields.len(), 2);
-        assert_eq!(list[0].bindings[0].index, "orders_rows");
+        assert_eq!(list[0].bindings[0].index, "readings_rows");
     }
 
     #[test]

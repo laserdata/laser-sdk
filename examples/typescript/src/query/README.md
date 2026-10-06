@@ -1,12 +1,12 @@
 # query - queries that already ran
 
-A projector turns topic records into a queryable view. This example waits for projection, then reads orders that match a filter.
+A projector turns topic records into a queryable view. This example waits for projection, then reads host readings that match a filter.
 
 ## What it shows
 
-- Declares this run's `orders_v1_<token>` view over the `orders` topic (`ensureView` with `indexFor`), so repeat and concurrent runs never count each other's rows, bound to an embedded managed table. Naming the index apart from its source topic is what lets a view be versioned without renaming the topic.
-- Publishes three orders with a `status` field and waits for the projector to materialize them.
-- Queries the maintained view with `laser.query(INDEX).whereEq("status", "paid").limit(10).fetch()` and reads the matching rows. `whereEq` matches an indexed key, the cheap path a projection's key columns answer directly, and `filterEq` and its siblings cover the rest.
+- Declares this run's `readings_v1_<token>` view over the `readings` topic (`ensureView` with `indexFor`), so repeat and concurrent runs never count each other's rows, bound to an embedded managed table. Naming the index apart from its source topic is what lets a view be versioned without renaming the topic.
+- Publishes three host readings with a `status` field and waits for the projector to materialize them.
+- Queries the maintained view with `laser.query(INDEX).whereEq("status", "degraded").limit(10).fetch()` and reads the matching rows. `whereEq` matches an indexed key, the cheap path a projection's key columns answer directly, and `filterEq` and its siblings cover the rest.
 
 ## Run it
 
@@ -25,4 +25,4 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:query
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/views
-- Full system built on this primitive: [`order-book`](../order-book) - the same projection pattern powering a live order book and materialized trade tape.
+- Full system built on this primitive: [`fleet-tape`](../fleet-tape) - the same projection pattern powering a live fleet view and materialized reading tape.

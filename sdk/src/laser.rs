@@ -28,7 +28,7 @@ pub use laser_wire::headers::{
 pub const OPS_STREAM_DEFAULT: &str = "_agdx";
 
 // Producers are cached per (stream, topic): the ops query path publishes to the
-// `_agdx` stream while data rides the customer stream, so the cache key must carry
+// `_agdx` stream while data rides the data stream, so the cache key must carry
 // the stream too or the two would collide on a shared topic name.
 type ProducerKey = (String, String);
 type ProducerCell = Arc<OnceCell<Arc<IggyProducer>>>;

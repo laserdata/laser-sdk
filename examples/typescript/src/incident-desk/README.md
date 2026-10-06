@@ -1,6 +1,6 @@
-# concierge - an AI support desk on the log
+# incident-desk - an AI incident desk on the log
 
-This example runs a support desk whose agents coordinate through the log. It combines tickets, queries, memory, credits, approval, and a proposed change in a fork.
+This example runs an incident desk for a host fleet whose agents coordinate through the log. It combines tickets, queries, memory, capacity grants, approval, and a proposed change in a fork.
 
 ## What it does
 
@@ -9,8 +9,8 @@ This example runs a support desk whose agents coordinate through the log. It com
 3. Seeds an in-process vector memory with prior resolutions.
 4. Starts four long-running agents: triage, specialist, resolver, and approver.
 5. Fans three deadline-bounded specialist questions from triage, then synthesizes the findings through the example-owned LLM seam.
-6. Applies remediation credits through a KV-backed deduplicator even though every credit command is sent twice.
-7. Routes large credits through a correlated human approval gate before the resolver changes state.
+6. Applies capacity grants through a KV-backed deduplicator even though every grant command is sent twice.
+7. Routes grants of 100 units or more through a correlated human approval gate before the resolver changes state.
 8. Stores the diagnosis as durable memory under the incident conversation.
 9. Writes a speculative bulk-resolution row into the `bulk-resolve-plan` fork and optionally promotes it.
 10. Rebuilds the incident from agent command, response, tool, and result topics through `ConversationState`.
@@ -22,24 +22,24 @@ The example requires query, KV compare-and-swap, and forks for the full desk. On
 Run `npm run setup` once, then run from `examples/typescript`:
 
 ```sh
-npm run example:concierge
+npm run example:incident-desk
 ```
 
 Run the complete desk on Laser Stack or LaserData Cloud.
 
 ```sh
 LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
-  npm run example:concierge
+  npm run example:incident-desk
 ```
 
 Scale ticket ingestion or apply the speculative plan.
 
 ```sh
 LASER_MESSAGES=200000 LASER_BATCH=1000 \
-  npm run example:concierge
+  npm run example:incident-desk
 
 LASER_APPLY_PLAN=1 \
-  npm run example:concierge
+  npm run example:incident-desk
 ```
 
 Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to replace the deterministic `MockLlm` without changing any agent, routing, memory, or transport code.
@@ -47,7 +47,7 @@ Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to replace the deterministic `MockLl
 ## Where to look (LaserData Cloud)
 
 - Query: the `support_tickets` world model, including payload selection for the original ticket JSON.
-- KV: `concierge-credits-<run>` balances and `concierge-dedup-<run>` idempotency keys. The run ID is printed in the namespace.
+- KV: `desk-grants-<run>` quotas and `desk-dedup-<run>` idempotency keys. The run ID is printed in the namespace.
 - Forks: `bulk-resolve-plan`, left open unless `LASER_APPLY_PLAN=1`.
 - Conversations: commands, specialist calls, approvals, responses, and the replayed incident audit trail.
 - Memory: the diagnosis remembered under the incident conversation.
@@ -57,7 +57,7 @@ Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to replace the deterministic `MockLl
 - `Agent.builder()` defines identity, inbox, reply topic, handler, deduplication, and poll behavior without hiding the underlying Iggy topics.
 - `publishBatch().inlinePayload()` preserves each ticket body for query payload selection without duplicating indexed values in headers.
 - `context.request()` carries causality into specialist sub-conversations and bounds every branch with a deadline.
-- The KV deduplicator uses `expectAbsent().commit()` so at-least-once delivery does not duplicate the credit effect.
+- The KV deduplicator uses `expectAbsent().commit()` so at-least-once delivery does not duplicate the grant effect.
 - `approvalGate()` composes human input from ordinary correlated AGDX commands and responses.
 - `laser.fork(id)` isolates a what-if row until the caller promotes it.
 - `ConversationState.load()` proves the incident can be rebuilt from the durable log alone.

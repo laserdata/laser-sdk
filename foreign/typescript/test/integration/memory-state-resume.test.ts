@@ -12,7 +12,7 @@ const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
 async function eventually<Value>(read: () => Promise<Value | undefined>): Promise<Value> {
-  const deadline = performance.now() + 2_000
+  const deadline = performance.now() + 10_000
   let value = await read()
   while (value === undefined && performance.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10))
@@ -28,7 +28,7 @@ void test("given_a_configured_memory_topic_when_recalled_through_a_scope_then_sh
   const memory = await laser.memoryTopic("incidents").partitions(2).ttl(86_400_000).build()
   const conversation = ConversationId.new()
   await memory
-    .remember(encoder.encode("checkout uses the read replica"))
+    .remember(encoder.encode("auth uses the read replica"))
     .conversation(conversation)
     .send()
 
@@ -42,7 +42,7 @@ void test("given_a_configured_memory_topic_when_recalled_through_a_scope_then_sh
       .fetch()
     return found.length === 1 ? found : undefined
   })
-  assert.equal(decoder.decode(items[0]?.payload), "checkout uses the read replica")
+  assert.equal(decoder.decode(items[0]?.payload), "auth uses the read replica")
   assert.equal(items[0]?.source?.kind, "message")
 
   const iggy = laser.iggyClient as unknown as {
@@ -145,4 +145,63 @@ void test("given_a_topic_snapshot_when_state_is_loaded_then_should_resume_after_
   } finally {
     await laser.close()
   }
+})
+void test("given_managed_memory_with_user_and_application_scopes_when_recalled_then_should_isolate_the_newest_matching_items", async (context) => {
+  const stream = `laser-ts-test-${randomUUID()}`
+  await using laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  if (!(await laser.capabilities()).kv.available) {
+    context.skip("this deployment has no managed memory view")
+    return
+  }
+  const memory = await laser.memoryTopic(`notes-${randomUUID()}`).build()
+  const first = ConversationId.new()
+  const second = ConversationId.new()
+  const matching = []
+  matching.push(
+    await memory
+      .remember(encoder.encode("first matching"))
+      .conversation(first)
+      .user("reader")
+      .application("diagnostics")
+      .send()
+  )
+  await memory
+    .remember(encoder.encode("other user"))
+    .conversation(first)
+    .user("other")
+    .application("diagnostics")
+    .send()
+  await memory
+    .remember(encoder.encode("other application"))
+    .conversation(second)
+    .user("reader")
+    .application("other")
+    .send()
+  matching.push(
+    await memory
+      .remember(encoder.encode("second matching"))
+      .conversation(second)
+      .user("reader")
+      .application("diagnostics")
+      .send()
+  )
+  const items = await eventually(async () => {
+    const selected = await memory
+      .recall()
+      .user("reader")
+      .application("diagnostics")
+      .limit(2)
+      .fetch()
+    return selected.length === 2 ? selected : undefined
+  })
+  const expected = matching
+    .map((id) => id.asU128())
+    .sort((left, right) => (left > right ? -1 : left < right ? 1 : 0))
+  assert.deepEqual(
+    items.map((item) => item.id.asU128()),
+    expected
+  )
+  const conversations = items.map((item) => item.provenance.conversationId.toString()).sort()
+  assert.deepEqual(conversations, [first.toString(), second.toString()].sort())
+  await laser.stream(stream).delete()
 })

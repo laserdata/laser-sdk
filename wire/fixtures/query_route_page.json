@@ -4,7 +4,7 @@
       "id": "0000000000000000000000009E",
       "generation": 2,
       "definition_revision": 8,
-      "name": "orders-history",
+      "name": "readings-history",
       "target": {
         "kind": "lakehouse",
         "destination_id": "0000000000000000000000009C",

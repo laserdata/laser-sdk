@@ -19,7 +19,7 @@ use tracing::{info, warn};
 // user. By default the roles are bound to a dedicated `governance-demo` user
 // the example creates on first run. Never the caller: the role set includes
 // deny-wins grants, and binding those to the session user would poison every
-// later run against the same broker.
+// later run against the same server.
 
 const EXAMPLE: &str = "governance";
 const TARGET_USER_ENV: &str = "LASER_GOVERNANCE_USER_ID";

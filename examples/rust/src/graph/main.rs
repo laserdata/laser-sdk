@@ -4,8 +4,8 @@ use laser_sdk::prelude::full::*;
 // The Graph primitive: nodes and edges built from what your messages mention,
 // traversable and time-aware. Managed by laser-plane.
 const GRAPH: &str = "kg";
-const CUSTOMER: &str = "customer:42";
-const RELATION: &str = "purchased";
+const HOST: &str = "host:node-7";
+const RELATION: &str = "runs";
 
 #[tokio::main]
 async fn main() -> Result<(), LaserError> {
@@ -20,20 +20,20 @@ async fn main() -> Result<(), LaserError> {
         phase("relate entities, then traverse from one of them");
         // `link` upserts both content-addressed entity nodes and the typed edge
         // between them, so re-linking the same triple converges instead of growing.
-        for product in ["product:7", "product:9"] {
-            laser.graph(GRAPH).link(CUSTOMER, RELATION, product).await?;
+        for service in ["service:auth", "service:metrics"] {
+            laser.graph(GRAPH).link(HOST, RELATION, service).await?;
         }
 
         // The same id `link` derived, rebuilt locally: a node is addressed by its
         // content, never by a server-assigned key.
-        let customer = GraphNode::entity("customer", "42").id;
-        let purchases = laser
+        let host = GraphNode::entity("host", "node-7").id;
+        let services = laser
             .graph(GRAPH)
-            .neighbors(customer, EdgeDir::Out, Some(RELATION.to_owned()), 1)
+            .neighbors(host, EdgeDir::Out, Some(RELATION.to_owned()), 1)
             .await?;
 
-        println!("  {CUSTOMER} {RELATION}:");
-        for node in &purchases.nodes {
+        println!("  {HOST} {RELATION}:");
+        for node in &services.nodes {
             println!("    {}", entity_of(node));
         }
         Ok(())

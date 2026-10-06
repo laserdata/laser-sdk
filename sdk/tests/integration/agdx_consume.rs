@@ -96,7 +96,7 @@ async fn given_an_agdx_command_when_consumed_then_the_handler_should_see_the_dec
     let laser = harness::laser().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
 
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
         .listen_on(AgentTopic::Commands)
         .handler(Capture { seen: seen.clone() })
@@ -107,7 +107,7 @@ async fn given_an_agdx_command_when_consumed_then_the_handler_should_see_the_dec
     // foreign payload byte-identical in the body with `agdx.ct = json`.
     let conversation = ConversationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_0009);
     let correlation = CorrelationId::from_u128(0x0190_3c1f_aa00_0000_0000_0000_0000_000a);
-    let params = br#"{"ask":"plan the trip"}"#.to_vec();
+    let params = br#"{"ask":"plan the rollout"}"#.to_vec();
     laser
         .agdx(
             AgentTopic::Commands,

@@ -102,7 +102,7 @@ fn provenance_headers(criterion: &mut Criterion) {
         .deadline(laser_sdk::iggy::prelude::IggyTimestamp::from(
             1_717_171_777_000_000_u64,
         ))
-        .idempotency_key("order-123-attempt-2".to_owned())
+        .idempotency_key("job-123-attempt-2".to_owned())
         .correlation_id("request-42".to_owned())
         .fence_token(u64::MAX)
         .build();
@@ -306,7 +306,7 @@ fn message_construction(criterion: &mut Criterion) {
 // A CDC change record the size of a Frostline fleet event, about 600 bytes.
 const CHANGE_RECORD: &str = r#"{"run_id":"9b80689e","event_id":4210771,"window_id":84,"sequence":1052692,"logical_time":4210771000,"kind":"change","truck_id":"FR-0442","region":"north","cargo":"pharma","type":"fleet.truck.v1.updated","change":{"op":"update","changed":["temperature_band","temperature_deci_c"],"before":{"temperature_band":"safe","temperature_deci_c":52,"battery_pct":81,"unit_state":"running","trip_status":"en_route","region":"north","cargo":"pharma","declared_weight_tonnes":"12.50"},"after":{"temperature_band":"unsafe","temperature_deci_c":122,"battery_pct":80,"unit_state":"fault","trip_status":"en_route","region":"north","cargo":"pharma","declared_weight_tonnes":"12.50"}},"telemetry":null,"checkpoint":null}"#;
 
-// Cost of one evaluation per predicate kind, the numbers docs quote for choosing a filter.
+// Cost of one evaluation per predicate kind.
 fn filter_evaluation(criterion: &mut Criterion) {
     let headers = [
         HeaderRef {

@@ -40,12 +40,12 @@ Feature: Agentic memory recall semantics
 
   Scenario: Keyword recall surfaces the exact-term match first
     Given an empty semantic memory
-    When I remember the fact "the invoice INV-77 was disputed"
+    When I remember the fact "the job JOB-77 was retried"
     And I remember the fact "a routine turn with nothing notable"
-    Then keyword recall for "INV-77" returns "the invoice INV-77 was disputed" first
+    Then keyword recall for "JOB-77" returns "the job JOB-77 was retried" first
 
   Scenario: Hybrid recall fuses the semantic and keyword signals
     Given an empty semantic memory
-    When I remember the fact "checkout latency traces to the database pool"
+    When I remember the fact "auth latency traces to the database pool"
     And I remember the fact "a routine turn with nothing notable"
-    Then hybrid recall for "checkout latency" returns "checkout latency traces to the database pool" first
+    Then hybrid recall for "auth latency" returns "auth latency traces to the database pool" first

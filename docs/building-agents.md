@@ -13,11 +13,11 @@ All append, consume, reliable-agent, AGDX, cursor, and folded log-memory code ru
 | Append a message to a topic | a topic | `laser.stream("support").topic("triage.classified").publish().json(&c)?.send().await?` |
 | Read from an offset, resumably | a `Cursor` | `laser.stream("support").topic("triage.actions").replay()?` then `poll` / `from_offsets` |
 | Run an agent on a topic | `Agent::builder` | `.listen_on(AgentTopic::Commands).respond_on(..).handler(H).build().spawn(laser)` |
-| Ask an agent and await the reply | the agent accessor | `laser.agent("caller").ask(req, reply, body, &prov, timeout).await?`, or `ctx.request(..)` inside a handler |
+| Ask an agent and await the reply | the agent accessor | `laser.agent("caller".parse()?).ask(req, reply, body, &prov, timeout).await?`, or `ctx.request(..)` inside a handler |
 | Stream a large result in chunks | `AgdxStream` | `laser.agdx(..).stream(corr, "context").buffered(64, linger)` then `finish` |
 | Send a large body by reference | a claim-check | `.claim_check(&store, threshold)` on the publish, `resolve_body(&store)` on read |
 | Make an external effect happen once | a KV compare-and-swap | `laser.kv("effects").set(key).bytes(b).expect_absent().commit().await?` |
-| Look up structured facts | the query surface | `laser.query("orders").where_eq(..).fetch_typed::<Order>().await?`, or `.raw_sql(..)` |
+| Look up structured facts | the query surface | `laser.query("readings").where_eq(..).fetch_typed::<Reading>().await?`, or `.raw_sql(SqlDialect::DataFusion, ..)` |
 | Reason over how things connect | the graph | `laser.graph("services").neighbors(node, EdgeDir::Out, None, 2).await?` |
 | Remember and recall | memory | `laser.memory("support").remember(fact).scope(c).dedup().send().await?` / `.recall(c).semantic(q).fetch()`, a vector handle built from a governed `Laser` applies the same pre-write policy locally |
 | Keep named working state | memory named items | `laser.memory("session").set("plan", json).await?` / `.fetch("plan")` |
@@ -77,7 +77,7 @@ End-to-end enforcement lives in Iggy fork and LaserData managed plane. In this r
 
 ## The scenario: a support-triage desk
 
-Four agents process a ticket until it is resolved or needs a human decision. They exchange records through topics. The [`concierge`](../examples/rust/src/concierge/README.md) example uses this pattern.
+Four agents process a ticket until it is resolved or needs a human decision. They exchange records through topics. The [`incident-desk`](../examples/rust/src/incident-desk/README.md) example uses this pattern.
 
 Classifier reads inbound tickets, classifies them, and appends the result.
 
@@ -94,29 +94,29 @@ let mut classifier = Agent::builder()
 The retriever reads the classification and queries relevant facts. It uses the structured query API or read-only SQL for a join. It returns context as chunk records.
 
 ```rust
-let orders = laser
-    .query("orders")
-    .where_eq("customer_id", customer)
+let readings = laser
+    .query("readings")
+    .where_eq("host_id", host)
     .order_desc("ts")
     .limit(20)
-    .fetch_typed::<Order>()
+    .fetch_typed::<Reading>()
     .await?;
 // A read-only join the IR does not express:
-let prior = laser.query("tickets").raw_sql("SELECT ... JOIN ...").fetch().await?;
+let prior = laser.query("tickets").raw_sql(SqlDialect::DataFusion, "SELECT ... JOIN ...").fetch().await?;
 ```
 
-The resolver records an idempotency key and publishes a refund request. A repeated request can detect the stored key. These are separate operations, so this example does not guarantee exactly-once external effects across crashes. An `ActionGovernor` can also govern the final publication.
+The resolver records an idempotency key and publishes a capacity grant. A repeated request can detect the stored key. These are separate operations, so this example does not guarantee exactly-once external effects across crashes. An `ActionGovernor` can also govern the final publication.
 
 ```rust
 match laser
     .kv("effects")
-    .set(format!("refund:{order_id}"))
+    .set(format!("grant:{ticket_id}"))
     .bytes(proposal)
     .expect_absent()
     .commit()
     .await
 {
-    Ok(_) => issue_refund().await?,          // first time: apply the effect
+    Ok(_) => apply_grant().await?,           // first time: apply the effect
     Err(e) if e.is_version_conflict() => {}  // already proposed: skip, do not duplicate
     Err(e) => return Err(e),
 }
@@ -132,14 +132,14 @@ let decision = ctx
 
 `ConversationState::load` rebuilds the ticket conversation from retained records. Operators can inspect the recorded inputs and replies.
 
-## The product journeys, mapped
+## The operator journeys, mapped
 
 The following examples map support tasks to SDK calls.
 
 `set` records a memory change on the topic. The deployment applies it to the read view. Other topic consumers can read the same record.
 
 ```rust
-laser.memory("profiles").set("customer:123", subscription_json).await?;
+laser.memory("profiles").set("host:node-7", config_json).await?;
 ```
 
 A recorded `set` preserves the preference change in log history. Read retained records to inspect the writer, time, and later changes.

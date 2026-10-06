@@ -356,42 +356,42 @@ mod tests {
     use serde::Deserialize;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Order {
-        customer: String,
-        amount: i64,
+    struct Reading {
+        host: String,
+        cpu: i64,
     }
 
-    fn order() -> Order {
-        Order {
-            customer: "alice".to_owned(),
-            amount: 42,
+    fn reading() -> Reading {
+        Reading {
+            host: "node-7".to_owned(),
+            cpu: 42,
         }
     }
 
     #[test]
     fn given_the_json_form_when_encoded_then_should_round_trip_with_the_json_tag() {
         let form = Form::Json;
-        let (payload, content_type, schema_id) = form.encode(&order()).expect("body encodes");
+        let (payload, content_type, schema_id) = form.encode(&reading()).expect("body encodes");
         assert_eq!(content_type, ContentType::Json);
         assert_eq!(schema_id, None);
-        let back: Order = form.decode(&payload).expect("payload decodes");
-        assert_eq!(back, order());
+        let back: Reading = form.decode(&payload).expect("payload decodes");
+        assert_eq!(back, reading());
     }
 
     #[test]
     fn given_the_cbor_form_when_encoded_then_should_round_trip_with_the_cbor_tag() {
         let form = Form::Cbor;
-        let (payload, content_type, schema_id) = form.encode(&order()).expect("body encodes");
+        let (payload, content_type, schema_id) = form.encode(&reading()).expect("body encodes");
         assert_eq!(content_type, ContentType::Cbor);
         assert_eq!(schema_id, None);
-        let back: Order = form.decode(&payload).expect("payload decodes");
-        assert_eq!(back, order());
+        let back: Reading = form.decode(&payload).expect("payload decodes");
+        assert_eq!(back, reading());
     }
 
     #[test]
     fn given_a_wrong_payload_when_decoded_then_should_fail_as_codec() {
         let form = Form::Json;
-        let result: Result<Order, _> = form.decode(b"not json");
+        let result: Result<Reading, _> = form.decode(b"not json");
         assert!(matches!(result, Err(LaserError::Codec(_))));
     }
 
@@ -401,11 +401,11 @@ mod tests {
         use crate::query::{SchemaDef, SchemaSource};
         use crate::schema_codecs::CompiledSchema;
 
-        const ORDER_AVRO: &str = r#"{
-            "type":"record","name":"Order",
+        const READING_AVRO: &str = r#"{
+            "type":"record","name":"Reading",
             "fields":[
-                {"name":"customer","type":"string"},
-                {"name":"amount","type":"long"}
+                {"name":"host","type":"string"},
+                {"name":"cpu","type":"long"}
             ]
         }"#;
 
@@ -423,13 +423,13 @@ mod tests {
         #[test]
         fn given_an_avro_schema_when_encoded_then_should_round_trip_stamping_the_id() {
             let form = schema_form(SchemaSource::Avro {
-                schema: ORDER_AVRO.to_owned(),
+                schema: READING_AVRO.to_owned(),
             });
-            let (payload, content_type, schema_id) = form.encode(&order()).expect("body encodes");
+            let (payload, content_type, schema_id) = form.encode(&reading()).expect("body encodes");
             assert_eq!(content_type, ContentType::Avro);
             assert_eq!(schema_id, Some(7));
-            let back: Order = form.decode(&payload).expect("datum decodes");
-            assert_eq!(back, order());
+            let back: Reading = form.decode(&payload).expect("datum decodes");
+            assert_eq!(back, reading());
         }
 
         #[test]
@@ -437,24 +437,24 @@ mod tests {
             let form = schema_form(SchemaSource::JsonSchema {
                 schema: r#"{
                     "type":"object",
-                    "required":["customer","amount"],
-                    "properties":{"amount":{"type":"integer","minimum":100}}
+                    "required":["host","cpu"],
+                    "properties":{"cpu":{"type":"integer","minimum":100}}
                 }"#
                 .to_owned(),
             });
-            assert!(matches!(form.encode(&order()), Err(LaserError::Codec(_))));
+            assert!(matches!(form.encode(&reading()), Err(LaserError::Codec(_))));
         }
 
         #[test]
         fn given_a_json_schema_when_the_body_passes_then_should_stamp_json_plus_id() {
             let form = schema_form(SchemaSource::JsonSchema {
-                schema: r#"{"type":"object","required":["customer","amount"]}"#.to_owned(),
+                schema: r#"{"type":"object","required":["host","cpu"]}"#.to_owned(),
             });
-            let (payload, content_type, schema_id) = form.encode(&order()).expect("body encodes");
+            let (payload, content_type, schema_id) = form.encode(&reading()).expect("body encodes");
             assert_eq!(content_type, ContentType::Json);
             assert_eq!(schema_id, Some(7));
-            let back: Order = form.decode(&payload).expect("payload decodes");
-            assert_eq!(back, order());
+            let back: Reading = form.decode(&payload).expect("payload decodes");
+            assert_eq!(back, reading());
         }
     }
 

@@ -9,8 +9,9 @@ import {
 } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
 import { executeBatch } from "./batch.js"
+import { saturatingAdd } from "../runtime/clock.js"
 import type { Codec } from "../stream/codecs.js"
-import { jsonCodec } from "../stream/codecs.js"
+import { jsonCodec, messagePackCodec } from "../stream/codecs.js"
 import type { BatchItem } from "../wire/batch.js"
 import {
   KvCasCommand,
@@ -226,8 +227,27 @@ export class Kv {
     throw unexpected("exists", outcome)
   }
 
-  /** Changes an entry expiry without rewriting its value. */
-  async expire(key: Uint8Array, expiresAtMicros?: bigint): Promise<bigint> {
+  /** Expires an entry `ttlMicros` from now without rewriting its value, or
+   * clears its expiry when `ttlMicros` is omitted. Returns the new version.
+   * Pass `nowMicros` for deterministic tests. */
+  async expire(
+    key: Uint8Array,
+    ttlMicros?: bigint,
+    nowMicros: bigint = BigInt(Date.now()) * 1000n
+  ): Promise<bigint> {
+    if (ttlMicros !== undefined && ttlMicros < 0n) {
+      throw new InvalidError("expire ttlMicros must be non-negative")
+    }
+    return this.expireAt(
+      key,
+      ttlMicros === undefined ? undefined : saturatingAdd(nowMicros, ttlMicros)
+    )
+  }
+
+  /** Sets an entry's absolute expiry (epoch microseconds) without rewriting
+   * its value, or clears it when `expiresAtMicros` is omitted. Returns the new
+   * version. */
+  async expireAt(key: Uint8Array, expiresAtMicros?: bigint): Promise<bigint> {
     const capabilities = await this.getCapabilities()
     const outcome = await executeKv(this.backend, capabilities, this.namespace, KvExpireCommand, {
       namespace: this.namespace,
@@ -428,6 +448,13 @@ export class KvSetRequest {
     )
   }
 
+  msgpack(value: unknown): this {
+    return this.encodeWith(
+      messagePackCodec((decoded) => decoded),
+      value
+    )
+  }
+
   expiresAt(epochMicros: bigint): this {
     this.expiresAtMicros = epochMicros
     return this
@@ -435,7 +462,7 @@ export class KvSetRequest {
 
   /** Expires the entry after `ttlMicros`. Pass `nowMicros` for deterministic tests. */
   ttl(ttlMicros: bigint, nowMicros: bigint = BigInt(Date.now()) * 1000n): this {
-    return this.expiresAt(nowMicros + ttlMicros)
+    return this.expiresAt(saturatingAdd(nowMicros, ttlMicros))
   }
 
   expectVersion(version: bigint): this {
@@ -448,7 +475,13 @@ export class KvSetRequest {
     return this
   }
 
+  /** Writes the value unconditionally. A precondition belongs to `commit()`,
+   * so a request with `expectVersion(..)` or `expectAbsent()` set is refused
+   * rather than silently written without it. */
   async send(): Promise<void> {
+    if (this.expect !== undefined) {
+      throw new InvalidError("a precondition was set: call commit() instead of send()")
+    }
     validatedValue(this.value)
     const capabilities = await this.getCapabilities()
     const outcome = await executeKv(this.backend, capabilities, this.namespace, KvSetCommand, {
@@ -518,6 +551,13 @@ export class KvCasFencedRequest {
     )
   }
 
+  msgpack(value: unknown): this {
+    return this.encodeWith(
+      messagePackCodec((decoded) => decoded),
+      value
+    )
+  }
+
   expiresAt(epochMicros: bigint): this {
     this.expiresAtMicros = epochMicros
     return this
@@ -525,7 +565,7 @@ export class KvCasFencedRequest {
 
   /** Expires the entry after `ttlMicros`. Pass `nowMicros` for deterministic tests. */
   ttl(ttlMicros: bigint, nowMicros: bigint = BigInt(Date.now()) * 1000n): this {
-    return this.expiresAt(nowMicros + ttlMicros)
+    return this.expiresAt(saturatingAdd(nowMicros, ttlMicros))
   }
 
   expectVersion(version: bigint): this {

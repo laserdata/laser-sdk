@@ -81,7 +81,7 @@ void test("given_agent_id_strings_when_parsed_then_should_accept_printable_and_r
 })
 
 void test("given_an_idempotency_key_when_parsed_then_should_reject_empty_and_oversized", () => {
-  assert.equal(parseIdempotencyKey("order-123-attempt-2"), "order-123-attempt-2")
+  assert.equal(parseIdempotencyKey("job-123-attempt-2"), "job-123-attempt-2")
   assert.throws(() => parseIdempotencyKey(""), /must not be empty/)
   assert.throws(() => parseIdempotencyKey("x".repeat(65)), /exceeds cap/)
   assert.throws(() => parseIdempotencyKey("é".repeat(33)), /66B, exceeds cap/)
@@ -119,20 +119,20 @@ void test("given_the_agent_card_fixture_when_decoded_then_should_re_encode_byte_
   const bytes = await readFixture("agent_card.bin")
   const map = expectMap(decodeOne(bytes, "agent_card.bin"), "agent_card.bin")
   const card = decodeAgentCard(map, "agent_card.bin")
-  assert.equal(card.name, "trip-planner")
+  assert.equal(card.name, "rollout-planner")
   assert.equal(card.version, "1.4.2")
   assert.equal(card.ttlMicros, 30_000_000n)
   assert.equal(card.capabilities.length, 2)
 
-  const [chat, searchFlights] = card.capabilities
+  const [chat, planRollout] = card.capabilities
   assert.ok(chat !== undefined)
-  assert.ok(searchFlights !== undefined)
+  assert.ok(planRollout !== undefined)
   assert.equal(chat.skillId, "chat")
   assert.deepEqual(chat.input, { kind: "contentType", value: "json" })
   assert.deepEqual(chat.health, { kind: "known", name: "Healthy" })
-  assert.equal(searchFlights.skillId, "search_flights")
-  assert.deepEqual(searchFlights.input, { kind: "schemaId", value: "order.v1" })
-  assert.deepEqual(searchFlights.health, { kind: "known", name: "Degraded" })
+  assert.equal(planRollout.skillId, "plan_rollout")
+  assert.deepEqual(planRollout.input, { kind: "schemaId", value: "reading.v1" })
+  assert.deepEqual(planRollout.health, { kind: "known", name: "Degraded" })
 
   const reencoded = encodeNamed(encodeAgentCard(card))
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
@@ -142,7 +142,7 @@ void test("given_the_agent_presence_fixture_when_decoded_then_should_re_encode_b
   const presence = await roundTrip("agent_presence.bin", decodeAgentPresence, encodeAgentPresence)
   assert.equal(presence.v, 1)
   assert.equal(presence.agent, "source-agent")
-  assert.equal(presence.inbox, "trip-planner.work")
+  assert.equal(presence.inbox, "rollout-planner.work")
 })
 
 void test("given_the_agent_body_ref_fixture_when_decoded_then_should_re_encode_byte_identically", async () => {

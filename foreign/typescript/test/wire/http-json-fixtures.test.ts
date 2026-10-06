@@ -96,7 +96,7 @@ void test("given_http_json_views_when_decoded_then_should_preserve_typed_fields"
   assert.ok(row !== undefined)
   assert.deepEqual(row.values, [
     { kind: "long", value: 42n },
-    { kind: "string", value: "alice" }
+    { kind: "string", value: "node-7" }
   ])
 
   const page = decodeKvPageJson(await fixture("kv_page_view.json"))
@@ -106,7 +106,7 @@ void test("given_http_json_views_when_decoded_then_should_preserve_typed_fields"
   assert.deepEqual(error.code, { kind: "known", name: "Conflict" })
 
   const destinations = decodeDestinationPageJson(await fixture("destination_page.json"))
-  assert.equal(destinations.destinations[0]?.destination.name, "orders-lakehouse")
+  assert.equal(destinations.destinations[0]?.destination.name, "readings-lakehouse")
   assert.equal(destinations.consistency, "linearizable")
 
   const files = decodeTableFilePageJson(await fixture("table_file_page.json"))

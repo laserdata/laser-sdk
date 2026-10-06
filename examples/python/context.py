@@ -14,7 +14,7 @@ Run it:
     python3 context.py
 
 Docs: https://docs.laserdata.cloud/laser-sdk/context
-Full scenario: concierge.py (an incident rebuilt from its own conversation as the audit trail)
+Full scenario: incident_desk.py (an incident rebuilt from its own conversation as the audit trail)
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ async def main() -> None:
 
         _common.phase("append a conversation, then assemble it under a budget")
         ctx = laser.context(conversation)
-        await ctx.append(ls.Topics.COMMANDS, b"book me an aisle seat")
-        await ctx.append(ls.Topics.RESPONSES, b"booked, aisle 12")
+        await ctx.append(ls.Topics.COMMANDS, b"drain node-7")
+        await ctx.append(ls.Topics.RESPONSES, b"drained, 0 connections left")
 
         # The shape of a prompt's context is a declared bound, not slicing logic
         # spread through the application: cap the turns, then fit the budget.

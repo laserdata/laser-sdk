@@ -729,8 +729,16 @@ impl KvSetRequest {
         }
     }
 
-    /// Apply the write.
+    /// Apply the unconditional write. Returns `LaserError::Invalid` when a
+    /// precondition was set with [`expect_version`](Self::expect_version) or
+    /// [`expect_absent`](Self::expect_absent): finish those with
+    /// [`commit`](Self::commit), so a precondition is never dropped.
     pub async fn send(self) -> Result<(), LaserError> {
+        if self.expect.is_some() {
+            return Err(LaserError::Invalid(
+                "a precondition was set: call commit() instead of send()".to_owned(),
+            ));
+        }
         let key = validated_key(&self.key)?;
         validated_value(&self.value)?;
         let request = KvSet {
@@ -1204,6 +1212,24 @@ mod tests {
             kv.release("key", "holder", 0).await,
             Err(LaserError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn given_a_precondition_when_sending_then_should_reject_before_transport() {
+        for request in [
+            fenced_laser()
+                .kv("state")
+                .set("key")
+                .bytes(b"value")
+                .expect_absent(),
+            fenced_laser()
+                .kv("state")
+                .set("key")
+                .bytes(b"value")
+                .expect_version(3),
+        ] {
+            assert!(matches!(request.send().await, Err(LaserError::Invalid(_))));
+        }
     }
 
     #[tokio::test]

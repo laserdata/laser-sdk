@@ -12,15 +12,20 @@ __all__ = [
     "AgentCtx",
     "AgentHandle",
     "AgentMessage",
+    "AgentRegistry",
+    "AgentScope",
     "AuthzEvent",
     "AuthzHistoryPage",
     "BackendDescriptor",
     "BatchPublishRequest",
+    "BatchingProducer",
     "Capabilities",
+    "Chain",
     "ChangeRecord",
     "Checkpoint",
     "ChunkAssembler",
     "CompiledSchema",
+    "ConsolidationReport",
     "Consumer",
     "ConsumerFilter",
     "ConsumerGroup",
@@ -29,7 +34,9 @@ __all__ = [
     "CrashContext",
     "Cursor",
     "Decision",
+    "DedicatedKvTransport",
     "Destinations",
+    "FencedLeaseClient",
     "FileStore",
     "FilterAnnounce",
     "FilterExpr",
@@ -46,6 +53,8 @@ __all__ = [
     "KeyRecord",
     "KeyRegistry",
     "Kv",
+    "KvCasFencedRequest",
+    "KvCopyRequest",
     "KvDeleteManyRequest",
     "KvEntry",
     "KvKeyRegistry",
@@ -53,24 +62,29 @@ __all__ = [
     "KvScanRequest",
     "KvSetRequest",
     "Laser",
+    "LastN",
     "Lease",
     "MatchedPage",
     "MatchedRecord",
     "McpBridge",
     "Memory",
+    "MemoryHandler",
     "MemoryItem",
     "Message",
     "MutationPosition",
     "OpVersions",
     "PolicyEvidence",
+    "PreparedMutation",
     "Producer",
     "Provenance",
     "PublishRequest",
+    "QueryFilter",
     "QueryRequest",
     "QueryResult",
     "QuorumGovernor",
     "QuorumPolicy",
     "Role",
+    "RoleFilter",
     "Row",
     "RunBudget",
     "RunInfo",
@@ -87,6 +101,9 @@ __all__ = [
     "Stream",
     "SwappableGovernor",
     "SwarmActivity",
+    "SystemClock",
+    "TestClock",
+    "TokenBudget",
     "Topic",
     "Topics",
     "TypedRecord",
@@ -99,17 +116,30 @@ __all__ = [
     "agent_event_is_understood",
     "agent_message",
     "authorize_edge",
+    "check_in",
+    "command_from_message_send",
     "decide",
+    "decode_snapshot",
     "delegated_allow",
     "derive_conversation_id",
     "edge_id",
+    "encode_snapshot",
     "enter_bridge",
+    "fuse_reciprocal_rank",
     "grants_allow",
     "graph_edge",
     "graph_node",
     "new_conversation_id",
     "new_correlation_id",
     "node_id",
+    "resolve_body",
+    "resume_offsets",
+    "sign_card_value",
+    "task_from_envelope",
+    "tool_call_from_request",
+    "tool_result_from_envelope",
+    "verify_card",
+    "verify_delegation",
 ]
 
 @typing.final
@@ -134,6 +164,11 @@ class A2aBridge:
     def card(self) -> typing.Any:
         r"""
         The bridge's A2A Agent Card, for discovery.
+        """
+    def signed_card(self, key: SigningKey) -> typing.Any:
+        r"""
+        The Agent Card signed with `key`, so a client can verify who published
+        it.
         """
 
 @typing.final
@@ -193,25 +228,28 @@ class Agdx:
     r"""
     The typed AGDX producer over one topic and conversation.
     """
-    def command(self, correlation: builtins.str, body: typing.Any, *, operation: typing.Optional[builtins.str] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None) -> typing.Any:
+    def command(self, correlation: builtins.str, body: typing.Any, *, operation: typing.Optional[builtins.str] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None, cause: typing.Optional[builtins.str] = None, cause_at: typing.Optional[tuple[builtins.int, builtins.int, builtins.int, builtins.int]] = None, deadline_micros: typing.Optional[builtins.int] = None, idempotency_key: typing.Optional[builtins.str] = None, metadata: typing.Optional[dict] = None, tool: typing.Optional[builtins.str] = None, usage: typing.Optional[typing.Any] = None, claim_check: typing.Optional[tuple[typing.Any, builtins.int]] = None) -> typing.Any:
         r"""
         Publish a `command` (expects a reply or effect under `correlation`).
-        Returns the minted record id.
+        Returns the minted record id. `cause_at` is `(stream_id, topic_id, partition_id, offset)` and requires `cause`.
+        `cause`, `deadline_micros`,
+        `idempotency_key`, `metadata`, `tool`, and `usage` refine the envelope.
+        `claim_check=(store, threshold_bytes)` externalizes a large body.
         """
-    def respond(self, correlation: builtins.str, body: typing.Any, *, operation: typing.Optional[builtins.str] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None) -> typing.Any:
+    def respond(self, correlation: builtins.str, body: typing.Any, *, operation: typing.Optional[builtins.str] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None, cause: typing.Optional[builtins.str] = None, cause_at: typing.Optional[tuple[builtins.int, builtins.int, builtins.int, builtins.int]] = None, deadline_micros: typing.Optional[builtins.int] = None, idempotency_key: typing.Optional[builtins.str] = None, metadata: typing.Optional[dict] = None, tool: typing.Optional[builtins.str] = None, usage: typing.Optional[typing.Any] = None, claim_check: typing.Optional[tuple[typing.Any, builtins.int]] = None) -> typing.Any:
         r"""
         Publish a `response` (the paired answer to a command, same `correlation`).
         """
-    def emit(self, body: typing.Any, *, operation: typing.Optional[builtins.str] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None) -> typing.Any:
+    def emit(self, body: typing.Any, *, operation: typing.Optional[builtins.str] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None, cause: typing.Optional[builtins.str] = None, cause_at: typing.Optional[tuple[builtins.int, builtins.int, builtins.int, builtins.int]] = None, deadline_micros: typing.Optional[builtins.int] = None, idempotency_key: typing.Optional[builtins.str] = None, metadata: typing.Optional[dict] = None, tool: typing.Optional[builtins.str] = None, usage: typing.Optional[typing.Any] = None, claim_check: typing.Optional[tuple[typing.Any, builtins.int]] = None) -> typing.Any:
         r"""
         Publish an `event` (expects nothing back).
         """
-    def status(self, operation: builtins.str, *, correlation: typing.Optional[builtins.str] = None, task_state: typing.Optional[builtins.str] = None, body: typing.Optional[typing.Any] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None, last: builtins.bool = False) -> typing.Any:
+    def status(self, operation: builtins.str, *, correlation: typing.Optional[builtins.str] = None, task_state: typing.Optional[builtins.str] = None, body: typing.Optional[typing.Any] = None, content_type: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None, last: builtins.bool = False, cause: typing.Optional[builtins.str] = None, cause_at: typing.Optional[tuple[builtins.int, builtins.int, builtins.int, builtins.int]] = None, deadline_micros: typing.Optional[builtins.int] = None, idempotency_key: typing.Optional[builtins.str] = None, metadata: typing.Optional[dict] = None, tool: typing.Optional[builtins.str] = None, usage: typing.Optional[typing.Any] = None, claim_check: typing.Optional[tuple[typing.Any, builtins.int]] = None) -> typing.Any:
         r"""
         Publish a `status` signal. Task status updates require both
         `correlation` and `task_state`. Set `last` for a terminal update.
         """
-    def fail(self, correlation: builtins.str, error: typing.Any, *, target: typing.Optional[builtins.str] = None) -> typing.Any:
+    def fail(self, correlation: builtins.str, error: typing.Any, *, target: typing.Optional[builtins.str] = None, cause: typing.Optional[builtins.str] = None, cause_at: typing.Optional[tuple[builtins.int, builtins.int, builtins.int, builtins.int]] = None, deadline_micros: typing.Optional[builtins.int] = None, idempotency_key: typing.Optional[builtins.str] = None, metadata: typing.Optional[dict] = None, tool: typing.Optional[builtins.str] = None, usage: typing.Optional[typing.Any] = None, claim_check: typing.Optional[tuple[typing.Any, builtins.int]] = None) -> typing.Any:
         r"""
         Publish a structured `error` terminal for `correlation`.
         """
@@ -237,6 +275,38 @@ class AgdxStream:
     A chunk-stream writer: `write` each chunk, then one terminal (`finish` or
     `fail`). The opening chunk carries the purpose.
     """
+    @property
+    def channel(self) -> builtins.str:
+        r"""
+        The stream's channel id.
+        """
+    def with_deadline_micros(self, deadline_micros: builtins.int) -> AgdxStream:
+        r"""
+        Declare the reader-local abandonment bound. It rides the opening chunk,
+        so set it before the first write.
+        """
+    def with_target(self, target: builtins.str) -> AgdxStream:
+        r"""
+        Narrow delivery to one agent within the shared topic.
+        """
+    def content_type(self, content_type: builtins.str) -> AgdxStream:
+        r"""
+        Declare the chunk bodies' codec (`agdx.ct`, for example 'json' or
+        'cbor'). Defaults to raw.
+        """
+    def buffered(self, max_chunks: builtins.int, linger_ms: builtins.int) -> AgdxStream:
+        r"""
+        Buffer writes and append them as one batch when `max_chunks` fill or
+        `linger_ms` has passed since the first buffered chunk, whichever comes
+        first. The linger is checked at write, so a stalled producer holds its
+        buffered chunks until the next `write`, an explicit `flush`, or the
+        terminal, which always flushes.
+        """
+    def flush(self) -> typing.Any:
+        r"""
+        Append everything buffered as one batch. A no-op when unbuffered or
+        empty.
+        """
     def write(self, body: typing.Any) -> typing.Any:
         r"""
         Publish the next chunk (str, bytes, or bytearray).
@@ -322,7 +392,7 @@ class AgentCtx:
         r"""
         Send a request and await its correlated reply (see Laser.request).
         """
-    def fan_out(self, skill: builtins.str, payload: typing.Any, *, policy: builtins.str = 'require_all', quorum: typing.Optional[builtins.int] = None, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None) -> typing.Any:
+    def fan_out(self, skill: builtins.str, payload: typing.Any, *, policy: builtins.str = 'require_all', quorum: typing.Optional[builtins.int] = None, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, route_policy: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
         Fan out a task to every agent advertising `skill`, gathering replies under
         `policy` within `deadline_ms`. `policy` is `"require_all"` (default, wait
@@ -443,6 +513,110 @@ class AgentMessage:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class AgentRegistry:
+    r"""
+    The agent card registry read model. Build it with `Laser.agent_registry`.
+    Cards, quarantine facts, and live presence live in a per-stream cache that
+    every registry on the connection shares.
+    """
+    @staticmethod
+    def card_is_fresh(card: dict, now_micros: builtins.int) -> builtins.bool:
+        r"""
+        True when the registered `card` dict is within its time to live at
+        `now_micros`. A card without a time to live is always fresh.
+        """
+    @staticmethod
+    def card_serves(card: dict, skill: builtins.str) -> builtins.bool:
+        r"""
+        True when the registered `card` dict advertises `skill`.
+        """
+    @staticmethod
+    def card_available_for(card: dict, skill: builtins.str) -> builtins.bool:
+        r"""
+        True when the registered `card` dict advertises `skill` and reports it
+        available.
+        """
+    def refresh(self, now_micros: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Fold new registry records. `now_micros` defaults to the current time.
+        Returns the number of records folded.
+        """
+    def refresh_presence(self) -> typing.Any:
+        r"""
+        Page the live connection table for advertised presence, reusing a read
+        younger than the presence ttl. Returns the number of presences folded.
+        """
+    def agents(self) -> builtins.list[typing.Any]:
+        r"""
+        Every folded card, as `{"agent", "card", "observed_at_micros"}` dicts.
+        """
+    def lookup(self, agent: builtins.str) -> typing.Optional[typing.Any]:
+        r"""
+        The folded card for `agent`, or `None`.
+        """
+    def resolve(self, skill_id: builtins.str, now_micros: typing.Optional[builtins.int] = None) -> builtins.list[typing.Any]:
+        r"""
+        The fresh, unquarantined cards advertising `skill_id` at `now_micros`
+        (default now).
+        """
+    def is_quarantined(self, agent: builtins.str) -> builtins.bool:
+        r"""
+        Whether an operator quarantined `agent`.
+        """
+    def inbox_for(self, agent: builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        The inbox topic `agent` advertised through presence, or `None`.
+        """
+    def inbox_for_principal(self, agent: builtins.str, principal: builtins.int) -> typing.Optional[builtins.str]:
+        r"""
+        The inbox `agent` advertised, only when its connection authenticated as
+        `principal`.
+        """
+    def principal_for(self, agent: builtins.str) -> typing.Optional[builtins.int]:
+        r"""
+        The authenticated principal behind `agent`'s presence, or `None`.
+        """
+
+@typing.final
+class AgentScope:
+    r"""
+    One agent identity over the fabric. Build it with `Laser.agent(id)`.
+    """
+    @property
+    def id(self) -> builtins.str:
+        r"""
+        This agent's id.
+        """
+    def send(self, topic: builtins.str, payload: typing.Any, provenance: Provenance) -> typing.Any:
+        r"""
+        Append `payload` to an agent `topic` as this agent. The provenance gains
+        this id as its agent, and the partition is keyed by conversation.
+        """
+    def ask(self, request_topic: builtins.str, reply_topic: builtins.str, payload: typing.Any, provenance: Provenance, *, timeout_secs: builtins.float = 30.0) -> typing.Any:
+        r"""
+        Request and reply as this agent: publish to `request_topic` and await
+        the correlated reply on `reply_topic` up to `timeout_secs`.
+        """
+    def contract(self, agent: typing.Optional[builtins.str], payload: typing.Sequence[builtins.int], *, deadline_ms: builtins.int = 30000, skill: typing.Optional[builtins.str] = None, policy: typing.Optional[typing.Any] = None, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, expire_if_not_consumed_ms: typing.Optional[builtins.int] = None, reply_on: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, fence: typing.Optional[builtins.int] = None, registered: builtins.bool = False) -> typing.Any:
+        r"""
+        Open a directed contract from this agent to one named `agent`, awaiting
+        the reply up to `deadline_ms` (default 30000). Returns a dict with
+        `state` and `body`, the shape `Laser.contract_report` returns. Use
+        `Laser.contract` for capability routing. Pass `agent=None` with `skill`
+        to route by capability under the route `policy` word.
+        """
+    def publish_card(self, card: typing.Any) -> typing.Any:
+        r"""
+        Publish this agent's capability card (a dict mirroring `AgentCard`).
+        """
+    def advertise(self, listen_on: builtins.str, capabilities: typing.Sequence[typing.Any]) -> typing.Any:
+        r"""
+        Advertise `capabilities` (skill ids or descriptor dicts) the way a
+        spawning agent does: a durable card plus, where the server serves
+        presence, this agent's live inbox at `listen_on`.
+        """
+
+@typing.final
 class AuthzEvent:
     r"""
     One authorization history event.
@@ -511,6 +685,16 @@ class BackendDescriptor:
     def maintenance(self) -> typing.Any: ...
     @property
     def limits(self) -> typing.Any: ...
+    @staticmethod
+    def from_dict(value: typing.Any) -> BackendDescriptor:
+        r"""
+        A descriptor from its wire dict (the shape `readiness` and
+        `materialization` use), for `Laser.with_capabilities(backends=)`.
+        """
+    def to_dict(self) -> typing.Any:
+        r"""
+        This descriptor as its wire dict.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -543,22 +727,31 @@ class BatchPublishRequest:
         r"""
         Pin every record in the batch to one partition by key.
         """
-    def add_json(self, value: typing.Any) -> BatchPublishRequest:
+    def add_json(self, value: typing.Any, *, projection_ref: typing.Optional[builtins.str] = None) -> BatchPublishRequest:
         r"""
-        Append one JSON-encoded record.
+        Append one JSON-encoded record. `projection_ref` overrides the batch
+        default for this record.
         """
-    def add_msgpack(self, value: typing.Any) -> BatchPublishRequest:
+    def add_msgpack(self, value: typing.Any, *, projection_ref: typing.Optional[builtins.str] = None) -> BatchPublishRequest:
         r"""
-        Append one MessagePack-encoded record.
+        Append one MessagePack-encoded record. `projection_ref` overrides the batch
+        default for this record.
         """
-    def add_payload(self, value: typing.Any) -> BatchPublishRequest:
+    def add_payload(self, value: typing.Any, *, projection_ref: typing.Optional[builtins.str] = None) -> BatchPublishRequest:
         r"""
-        Append one raw-bytes record.
+        Append one raw-bytes record. `projection_ref` overrides the batch
+        default for this record.
         """
-    def add_raw_bytes(self, value: typing.Any, content_type: builtins.str) -> BatchPublishRequest:
+    def add_raw_bytes(self, value: typing.Any, content_type: builtins.str, *, projection_ref: typing.Optional[builtins.str] = None) -> BatchPublishRequest:
         r"""
         Append one already-encoded record plus its content type (e.g. "avro",
         "protobuf", "cbor"). Use it for bodies you encoded with another library.
+        `projection_ref` overrides the batch default for this record.
+        """
+    def add_record(self, payload: typing.Any, *, content_type: typing.Optional[builtins.str] = None, index: typing.Optional[typing.Mapping[builtins.str, builtins.str]] = None, headers: typing.Optional[typing.Mapping[builtins.str, builtins.str]] = None, projection_ref: typing.Optional[builtins.str] = None, schema_id: typing.Optional[builtins.int] = None, inline_payload: builtins.bool = False, logical_schema_fingerprint: typing.Optional[typing.Any] = None) -> BatchPublishRequest:
+        r"""
+        Append one raw-bytes record with complete per-record metadata. Batch defaults do not carry over.
+        `logical_schema_fingerprint` accepts 32 bytes and is valid only with the Arrow content type.
         """
     def add_arrow_ipc(self, value: typing.Any, metadata: typing.Any) -> BatchPublishRequest:
         r"""
@@ -589,10 +782,31 @@ class BatchPublishRequest:
         """
 
 @typing.final
+class BatchingProducer:
+    r"""
+    A size-and-time batching publisher, built by `Topic.batching`. `send`
+    queues a payload and flushes inline when a size bound trips, `flush` sends
+    what is queued, and `close` flushes and stops the linger timer.
+    """
+    def send(self, payload: typing.Any, *, headers: typing.Optional[dict] = None) -> typing.Any:
+        r"""
+        Queue `payload` with optional `headers`. Flushes inline when a size
+        bound trips, so backpressure lands on the sender.
+        """
+    def flush(self) -> typing.Any:
+        r"""
+        Flush everything queued as one batch append. A no-op on an empty queue.
+        """
+    def close(self) -> typing.Any:
+        r"""
+        Flush and stop the linger timer. Later sends raise `InvalidError`.
+        """
+
+@typing.final
 class Capabilities:
     r"""
-    A read-only snapshot of the premium capability set the connected
-    infrastructure advertised. All flags are false against Apache Iggy.
+    A read-only snapshot of the connected deployment's capabilities.
+    Managed features depend on advertised backend support. The server can provide consumer-group reads without a plane.
     """
     @property
     def managed(self) -> builtins.bool:
@@ -702,16 +916,6 @@ class Capabilities:
         A managed A2A gateway is available.
         """
     @property
-    def sessions(self) -> builtins.bool:
-        r"""
-        Platform-native session lifecycle.
-        """
-    @property
-    def durable_dedup(self) -> builtins.bool:
-        r"""
-        Platform-side durable deduplication.
-        """
-    @property
     def versions(self) -> typing.Optional[OpVersions]:
         r"""
         The per-surface operation versions the server advertised, or `None`
@@ -729,8 +933,26 @@ class Capabilities:
     def enabled_backends(self) -> builtins.list[BackendDescriptor]: ...
     def unready_backends(self) -> builtins.list[BackendDescriptor]: ...
     def readiness_reasons(self, resource_id: builtins.str) -> typing.Any: ...
+    def is_open_only(self) -> builtins.bool:
+        r"""
+        True when nothing beyond open streaming is available: the capability
+        set equals the one an original Apache Iggy server negotiates.
+        """
+    def serves_consistency(self, level: builtins.str) -> builtins.bool:
+        r"""
+        True when the query surface serves reads at `level` (`eventual`,
+        `read_your_writes`, or `strong`) or stronger.
+        """
     def is_ready(self) -> builtins.bool: ...
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class Chain:
+    r"""
+    Context policy: apply `policies` in sequence, each one over the output of
+    the one before, for example `Chain([LastN(20), TokenBudget(4000)])`.
+    """
+    def __new__(cls, policies: typing.Sequence[typing.Any]) -> Chain: ...
 
 @typing.final
 class ChangeRecord:
@@ -775,6 +997,11 @@ class Checkpoint:
     def is_empty(self) -> builtins.bool:
         r"""
         True when no topic was checkpointed.
+        """
+    def topic_offsets(self, topic: builtins.str) -> typing.Optional[builtins.dict[builtins.int, builtins.int]]:
+        r"""
+        The checkpointed offsets of `topic` as a dict partition -> offset, or
+        None when the topic was not checkpointed.
         """
     def to_json(self) -> builtins.str:
         r"""
@@ -879,6 +1106,34 @@ class CompiledSchema:
         """
 
 @typing.final
+class ConsolidationReport:
+    r"""
+    What one consolidation pass changed. All counts are best effort and
+    advisory.
+    """
+    @property
+    def summarized(self) -> builtins.int:
+        r"""
+        Items folded into durable summaries.
+        """
+    @property
+    def reweighted(self) -> builtins.int:
+        r"""
+        Items whose recall weight was adjusted from feedback.
+        """
+    @property
+    def pruned(self) -> builtins.int:
+        r"""
+        Stale items pruned.
+        """
+    @property
+    def derived(self) -> builtins.int:
+        r"""
+        New facts or edges derived.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Consumer:
     r"""
     A Laser partition or consumer-group reader. It is an async iterator and
@@ -902,6 +1157,12 @@ class Consumer:
     def next(self) -> typing.Any:
         r"""
         Wait for the next message. Returns `None` after shutdown.
+        """
+    def next_within(self, wait_secs: builtins.float) -> typing.Any:
+        r"""
+        Wait at most `wait_secs` for the next message. Raises `TimeoutError` when
+        none arrives in time and `InvalidError` when the consumer has shut down,
+        matching the Rust `next_within`.
         """
     def store_offset(self, offset: builtins.int, *, partition: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
@@ -1065,7 +1326,7 @@ class ConsumerGroup:
         The group's filter policy: configure it, inspect it, draft and pause
         revisions, release it, preview and sample-test it.
         """
-    def consumer(self, *, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 1000, commit_every: typing.Optional[builtins.int] = None, auto_join_group: builtins.bool = True, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer(self, *, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 0, commit_every: typing.Optional[builtins.int] = None, auto_join_group: builtins.bool = True, create_group: builtins.bool = True, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
         r"""
         Build a live, load-balanced consumer of this group with server-backed
         offsets. On a server that resolves group policies the consumer runs
@@ -1164,26 +1425,52 @@ class ContextScope:
         """
     def fetch(self, *, topics: typing.Optional[typing.Sequence[builtins.str]] = None, last_n: typing.Optional[builtins.int] = None, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
-        Read this conversation's history from `topics`, bounded to the last
-        `last_n` messages (default 50). The bound is required by construction:
-        an unbounded read of a long conversation is a replay nobody asked for.
-        `token_budget` trims the selected messages to an estimated token count,
-        applied after `last_n`, so the read is bounded by turns and by prompt
-        size at once.
+        Read this conversation's history from `topics` (default `agent.commands`
+        and `agent.responses`), bounded to the last `last_n` messages (default
+        50). `token_budget` trims the selected messages to an estimated token
+        count, applied after `last_n`, so the read is bounded by turns and by
+        prompt size at once. Use `fetch_with` for an explicit policy.
+        """
+    def fetch_with(self, topics: typing.Sequence[builtins.str], policy: typing.Any) -> typing.Any:
+        r"""
+        Read this conversation's history from `topics` under an explicit policy:
+        `LastN`, `TokenBudget`, `RoleFilter`, or a `Chain` of them.
         """
     def block(self, *, topics: typing.Optional[typing.Sequence[builtins.str]] = None, last_n: typing.Optional[builtins.int] = None, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         The last `last_n` messages rendered as one newline-joined text block,
-        the prompt-ready form. `token_budget` trims that block to an estimated
-        token count, applied after `last_n`.
+        the prompt-ready form. `topics` defaults to `agent.commands` and
+        `agent.responses`. `token_budget` trims the block to an estimated token
+        count, applied after `last_n`.
         """
-    def memory(self, memory: Memory) -> ScopedMemory:
+    def state(self, topics: typing.Sequence[builtins.str], initial: typing.Any, fold: typing.Any, *, last_n: typing.Optional[builtins.int] = None, from_offsets: typing.Optional[typing.Mapping[builtins.int, builtins.int]] = None, from_checkpoint: typing.Optional[Checkpoint] = None, at: typing.Optional[Checkpoint] = None, full: builtins.bool = False) -> typing.Any:
         r"""
-        Scope `memory` (any handle from `laser.memory`/`memory_on_topic`/
-        `memory_topic`/`vector_memory`) to this conversation: the returned view's
-        `recall` and `remember` bake the conversation in, so the session's
-        messages and its memory share one scope. Durable facts and the graph
-        stay cross-conversation and are reached through the unscoped handle.
+        Rebuild state by folding this conversation's messages on `topics` with
+        `fold(state, message) -> state`, starting from `initial`. Name exactly
+        one bound: `last_n` messages, `from_offsets` (one per-partition map
+        shared by every topic), `from_checkpoint` (resume after a checkpoint),
+        `at` (stop at a checkpoint), or `full=True` (the whole partition).
+        """
+    def state_with(self, store: typing.Any, topics: typing.Sequence[builtins.str], initial: typing.Any, fold: typing.Any) -> typing.Any:
+        r"""
+        The same fold seeded through a snapshot store: the newest snapshot's
+        state (JSON-decoded) plus a replay of only the messages after it. A
+        conversation with no snapshot folds fully from `initial`. Accepts a native `SnapshotStore` or an object with synchronous or async `latest(conversation)` and `save(snapshot)` methods.
+        """
+    def checkpoint(self, topics: typing.Optional[typing.Sequence[builtins.str]] = None) -> typing.Any:
+        r"""
+        The current tail of `topics` (default `agent.commands` and
+        `agent.responses`) as a `Checkpoint`: fold up to it with `state(at=..)`
+        or resume after it with `state(from_checkpoint=..)`. Offsets are per
+        topic partition, not per conversation.
+        """
+    def memory(self, memory: typing.Any) -> ScopedMemory:
+        r"""
+        Scope memory to this conversation. Pass a namespace (`str`, the same
+        handle `laser.memory(namespace)` returns) or any `Memory` handle from
+        `laser.memory`, `memory_on_topic`, `memory_topic`, `memory_with`, or
+        `vector_memory`. The returned view's `recall` and `remember` bake the
+        conversation in. Read across conversations through the unscoped handle.
         """
     def graph(self, name: builtins.str) -> Graph:
         r"""
@@ -1299,6 +1586,19 @@ class Decision:
     def __laser_from_json__(value: typing.Any) -> Decision: ...
 
 @typing.final
+class DedicatedKvTransport:
+    def __new__(cls, connection_string: builtins.str) -> DedicatedKvTransport: ...
+    def ready(self) -> typing.Any: ...
+    def send(self, code: builtins.int, frame: typing.Any) -> typing.Any: ...
+    def reset(self) -> typing.Any: ...
+    def close(self) -> typing.Any:
+        r"""
+        Close this transport permanently. `reset` permits later reuse.
+        """
+    def __aenter__(self) -> typing.Any: ...
+    def __aexit__(self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any) -> typing.Any: ...
+
+@typing.final
 class Destinations:
     def mutate(self, expected_global_state_revision: builtins.int, mutation: typing.Any, *, supervisor_assertion: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
@@ -1346,6 +1646,31 @@ class Destinations:
         r"""
         List explicit query routes using a bounded page.
         """
+
+@typing.final
+class FencedLeaseClient:
+    def __new__(cls, transport: typing.Any) -> FencedLeaseClient:
+        r"""
+        The transport supplies send(code, frame) and reset(). Reset must stop all in-flight work before it returns.
+        """
+    @staticmethod
+    def connect_dedicated(connection_string: builtins.str) -> FencedLeaseClient: ...
+    def with_attempt_timeout(self, seconds: builtins.float) -> FencedLeaseClient: ...
+    def prepare_acquire(self, request: typing.Any) -> PreparedMutation: ...
+    def prepare_renew(self, request: typing.Any) -> PreparedMutation: ...
+    def prepare_release(self, request: typing.Any) -> PreparedMutation: ...
+    def prepare_cas_fenced(self, request: typing.Any) -> PreparedMutation: ...
+    def acquire(self, operation: PreparedMutation) -> typing.Any: ...
+    def renew(self, operation: PreparedMutation) -> typing.Any: ...
+    def release(self, operation: PreparedMutation) -> typing.Any: ...
+    def cas_fenced(self, operation: PreparedMutation) -> typing.Any: ...
+    def get(self, request: typing.Any) -> typing.Any: ...
+    def close(self) -> typing.Any:
+        r"""
+        Close this client and retire its transport. Later calls fail before sending.
+        """
+    def __aenter__(self) -> typing.Any: ...
+    def __aexit__(self, _exc_type: typing.Any, _exc_value: typing.Any, _traceback: typing.Any) -> typing.Any: ...
 
 @typing.final
 class FileStore:
@@ -1529,11 +1854,12 @@ class ForkHandle:
     """
     @property
     def fork_id(self) -> builtins.str: ...
-    def create(self, *, severed: builtins.bool = False, parent: typing.Optional[builtins.str] = None, tables: typing.Optional[typing.Sequence[builtins.str]] = None) -> typing.Any:
+    def create(self, *, severed: builtins.bool = False, continuous: builtins.bool = False, parent: typing.Optional[builtins.str] = None, tables: typing.Optional[typing.Sequence[builtins.str]] = None) -> typing.Any:
         r"""
         Open this fork. `severed=True` freezes a snapshot at the trunk's current
-        offsets. The default (continuous) keeps seeing new trunk appends. Narrow a
-        severed snapshot with `tables`. Returns the fork's metadata dict.
+        offsets. The default, `continuous=True` when stated explicitly, keeps
+        seeing new trunk appends. Narrow a severed snapshot with `tables`.
+        Returns the fork's metadata dict.
         """
     def promote(self) -> typing.Any:
         r"""
@@ -1743,11 +2069,13 @@ class Graph:
         `edge_type` (any type when `None`), following the same hop `depth` times.
         Returns a `{"nodes": [...], "edges": [...]}` dict.
         """
-    def query(self, *, start_ids: typing.Optional[typing.Sequence[builtins.str]] = None, match_label: typing.Optional[builtins.str] = None, nearest: typing.Optional[tuple[typing.Sequence[builtins.float], builtins.int]] = None, hops: typing.Optional[typing.Sequence[tuple[builtins.str, builtins.str]]] = None, returns: builtins.str = 'nodes', limit: builtins.int = 0, as_of: typing.Optional[builtins.int] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
+    def query(self, *, start_ids: typing.Optional[typing.Sequence[builtins.str]] = None, start_match: typing.Optional[QueryFilter] = None, match_label: typing.Optional[builtins.str] = None, nearest: typing.Optional[tuple[typing.Sequence[builtins.float], builtins.int]] = None, hops: typing.Optional[typing.Sequence[tuple[builtins.str, builtins.str]]] = None, returns: builtins.str = 'nodes', limit: builtins.int = 0, as_of: typing.Optional[builtins.int] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         Run a traversal. Start from explicit node `start_ids`, from every node
-        whose label equals `match_label`, or from the `nearest` nodes to an
-        embedding (a `(embedding, k)` pair). `hops` is a list of `(edge_type,
+        matching `start_match` (any `QueryFilter` predicate over node fields),
+        from every node whose label equals `match_label` (shorthand for
+        `start_match=QueryFilter.pred("label", "eq", label)`), or from the
+        `nearest` nodes to an embedding (a `(embedding, k)` pair). `hops` is a list of `(edge_type,
         direction)` tuples, one per step. `returns` is `"nodes"`, `"edges"`,
         `"triplets"`, or `"paths"`. `as_of` (epoch micros) follows only edges
         valid at that instant.
@@ -1902,6 +2230,13 @@ class Intent:
         Build time, epoch micros.
         """
     def __new__(cls, conversation: builtins.str, proposer: builtins.str, body: typing.Sequence[builtins.int], eligible_voters: typing.Sequence[builtins.str], policy: IntentPolicy, policy_version: builtins.int, deadline_micros: builtins.int, mandatory_voters: typing.Optional[typing.Sequence[builtins.str]] = None) -> Intent: ...
+    def validate(self) -> None:
+        r"""
+        Check the intent's invariants again: non-empty unique eligible voters,
+        unique mandatory voters that are all eligible, a reachable threshold, a
+        deadline after the build time, and a digest that matches the body.
+        Raises `InvalidError` naming the first violation.
+        """
     def __laser_json__(self) -> typing.Any: ...
     @staticmethod
     def __laser_from_json__(value: typing.Any) -> Intent: ...
@@ -1964,6 +2299,29 @@ class KeyRegistry:
         r"""
         Enroll a public operator verifying key for privileged control facts.
         """
+    def enroll_record(self, record: KeyRecord) -> None:
+        r"""
+        Enroll a `KeyRecord` with its kind and lifecycle. A later enroll under
+        the same key id replaces it.
+        """
+    def verify(self, envelope: typing.Any) -> builtins.str:
+        r"""
+        Verify the envelope's signature and return the enrolled principal.
+        Raises on an unsigned envelope, an unknown or revoked key, or a failed
+        check. Ignores the validity window. `verify_at` checks it.
+        """
+    def verify_at(self, envelope: typing.Any, at_micros: builtins.int) -> typing.Any:
+        r"""
+        Verify as of `at_micros` and return `{"principal", "kind"}`. Raises
+        also when the key is outside its validity window at that time.
+        """
+    def verify_observed_at(self, envelope: typing.Any, at_micros: builtins.int, *, content_type: typing.Optional[builtins.str] = None, agent_version: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Verify a log-resident envelope against the interpretation headers
+        observed on its record (`content_type`, `agent_version`) and the record
+        timestamp `at_micros`. A signed context that differs from the observed
+        headers is rejected before the cryptographic check.
+        """
 
 @typing.final
 class Kv:
@@ -1997,18 +2355,20 @@ class Kv:
         `ttl` / `expires_at` / `expect_*`, then `await .send()` (or `.commit()`
         for a compare-and-swap).
         """
-    def cas_fenced(self, key: typing.Any, fence_namespace: builtins.str, fence_key: typing.Any, fence_token: builtins.int, value: typing.Any, *, expect_version: typing.Optional[builtins.int] = None, expect_absent: builtins.bool = False, ttl_secs: typing.Optional[builtins.float] = None) -> typing.Any:
+    def cas_fenced(self, key: typing.Any, fence_namespace: builtins.str, fence_key: typing.Any, fence_token: builtins.int, value: typing.Optional[typing.Any] = None, *, expect_version: typing.Optional[builtins.int] = None, expect_absent: builtins.bool = False, ttl_secs: typing.Optional[builtins.float] = None) -> KvCasFencedRequest:
         r"""
-        Fenced compare-and-swap: write `value` (payload) to `key` in one backend
+        Fenced compare-and-swap: write a value to `key` in one backend
         transaction that requires a live lease at (`fence_namespace`,
         `fence_key`) with a fence sequence still equal to `fence_token` (both
-        from a prior `lease`), and the precondition. Give exactly one of
-        `expect_version=` (apply only if the key holds that version) or
-        `expect_absent=True` (create only if absent). Returns the new version. A
-        stale fence, or a lease that expired or was released, raises `KvError`
-        (`is_version_conflict()` is false). A precondition miss raises `KvError`
-        with `is_version_conflict()` true. The at-most-one-effective-writer gate
-        for an exclusive external effect.
+        from a prior `lease`), plus a precondition. Returns a `KvCasFencedRequest`
+        builder: chain `.bytes()`/`.json()`/`.msgpack()`, exactly one of
+        `.expect_version(v)` or `.expect_absent()`, optionally `.ttl()`, then
+        `await request.commit()`. The keyword form (`value=`, `expect_version=`,
+        `expect_absent=`, `ttl_secs=`) fills the same builder, and awaiting the
+        request commits it. Returns the new version. A stale fence, or a lease
+        that expired or was released, raises `KvError` (`is_version_conflict()`
+        is false). A precondition miss raises `KvError` with
+        `is_version_conflict()` true.
         """
     def delete(self, key: typing.Any) -> typing.Any:
         r"""
@@ -2056,18 +2416,20 @@ class Kv:
         Release a held lease early, presenting the same `holder` and its
         `token`. Returns `True` when a held lease was released.
         """
-    def copy_to(self, key: typing.Any, to_key: typing.Any, *, to_namespace: typing.Optional[builtins.str] = None) -> typing.Any:
+    def copy_to(self, key: typing.Any, to_key: typing.Any, *, to_namespace: typing.Optional[builtins.str] = None) -> KvCopyRequest:
         r"""
-        Copy the value at `key` to `to_key` in one backend transaction
-        (`to_namespace=` crosses namespaces). Returns the destination's new
-        version. An absent or expired source raises the typed not-found error.
-        The destination is overwritten, and the value moves with its remaining
-        expiry.
+        Copy the value at `key` to `to_key` in one backend transaction. Returns
+        a `KvCopyRequest`: chain `.into_namespace(ns)` to cross namespaces, then
+        `await request.send()`, or await the request directly. `to_namespace=` is
+        the keyword form of `into_namespace`. The result is the destination's
+        new version. An absent or expired source raises the typed not-found
+        error. The destination is overwritten, and the value moves with its
+        remaining expiry.
         """
-    def move_to(self, key: typing.Any, to_key: typing.Any, *, to_namespace: typing.Optional[builtins.str] = None) -> typing.Any:
+    def move_to(self, key: typing.Any, to_key: typing.Any, *, to_namespace: typing.Optional[builtins.str] = None) -> KvCopyRequest:
         r"""
         Move the value at `key` to `to_key`: copy plus the source delete, one
-        backend transaction.
+        backend transaction. The same builder as `copy_to`.
         """
     def get_many(self, keys: typing.Sequence[typing.Any]) -> typing.Any:
         r"""
@@ -2083,6 +2445,62 @@ class Kv:
         r"""
         Start a scan over this namespace.
         """
+
+@typing.final
+class KvCasFencedRequest:
+    r"""
+    A fenced compare-and-swap, built by `Kv.cas_fenced`. Await it, or call
+    `commit()`.
+    """
+    def bytes(self, value: typing.Any) -> KvCasFencedRequest:
+        r"""
+        Store raw bytes (str, bytes, or bytearray).
+        """
+    def json(self, value: typing.Any) -> KvCasFencedRequest:
+        r"""
+        JSON-encode and store the value.
+        """
+    def msgpack(self, value: typing.Any) -> KvCasFencedRequest:
+        r"""
+        MessagePack-encode and store the value.
+        """
+    def ttl(self, seconds: builtins.float) -> KvCasFencedRequest:
+        r"""
+        Expire the entry `seconds` from now.
+        """
+    def expires_at(self, epoch_micros: builtins.int) -> KvCasFencedRequest:
+        r"""
+        Expire the entry at an absolute epoch-microseconds timestamp.
+        """
+    def expect_version(self, version: builtins.int) -> KvCasFencedRequest:
+        r"""
+        Precondition: apply only if the key holds `version`.
+        """
+    def expect_absent(self) -> KvCasFencedRequest:
+        r"""
+        Precondition: create only if the key does not exist.
+        """
+    def commit(self) -> typing.Any:
+        r"""
+        Apply the fenced compare-and-swap. Returns the new version.
+        """
+    def __await__(self) -> typing.Any: ...
+
+@typing.final
+class KvCopyRequest:
+    r"""
+    A copy or move between keys, built by `Kv.copy_to` / `Kv.move_to`. Await
+    it, or call `send()`.
+    """
+    def into_namespace(self, namespace: builtins.str) -> KvCopyRequest:
+        r"""
+        Write the destination in `namespace` instead of the source's namespace.
+        """
+    def send(self) -> typing.Any:
+        r"""
+        Run the copy or move. Returns the destination's new version.
+        """
+    def __await__(self) -> typing.Any: ...
 
 @typing.final
 class KvDeleteManyRequest:
@@ -2185,6 +2603,11 @@ class KvSetRequest:
         r"""
         Store raw bytes (str, bytes, or bytearray).
         """
+    def bytes(self, value: typing.Any) -> KvSetRequest:
+        r"""
+        Store raw bytes (str, bytes, or bytearray). The same as `payload`, under
+        the Rust and TypeScript name.
+        """
     def json(self, value: typing.Any) -> KvSetRequest:
         r"""
         JSON-encode and store the value.
@@ -2211,7 +2634,8 @@ class KvSetRequest:
         """
     def send(self) -> typing.Any:
         r"""
-        Apply an unconditional write.
+        Apply an unconditional write. Raises `InvalidError` when a precondition
+        was set: a conditional write goes through `commit()`.
         """
     def commit(self) -> typing.Any:
         r"""
@@ -2255,9 +2679,8 @@ class Laser:
         r"""
         A typed Agent Data Exchange Protocol producer publishing as `source`
         within `conversation_id` on `topic`. Every send is a validated AGDX
-        envelope (`command` / `respond` / `emit` / `stream`). A `signing_key`
-        signs every envelope this producer publishes, so a verifying receiver
-        accepts them as `signing_key`'s enrolled principal.
+        envelope. A `signing_key` signs `command`, `respond`, `emit`, `status`, and `fail` sends.
+        Chunk streams and `request_input` use the Rust unsigned helpers.
         """
     def bootstrap(self, partitions: builtins.int) -> typing.Any:
         r"""
@@ -2292,44 +2715,57 @@ class Laser:
         `attempts` an int, `detail` an optional string, and `payload` the
         poison message's raw bytes.
         """
-    def spawn_agent(self, agent_id: builtins.str, listen_on: builtins.str, handler: typing.Any, *, consumer_group: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, poll_interval_ms: typing.Optional[builtins.int] = None, warm_dedup: builtins.bool = False, dedup: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[builtins.str]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None, max_partitions: typing.Optional[builtins.int] = None, max_queued_records: typing.Optional[builtins.int] = None, max_queued_bytes: typing.Optional[builtins.int] = None, understood_features: builtins.int = 0, shutdown_grace_ms: typing.Optional[builtins.int] = None, dead_letter: typing.Optional[typing.Any] = None, middleware: typing.Optional[typing.Sequence[typing.Any]] = None, retry_max_attempts: typing.Optional[builtins.int] = None, retry_base_delay_ms: typing.Optional[builtins.int] = None, governor: typing.Optional[typing.Any] = None, governor_mode: builtins.str = 'enforce', signing_key: typing.Optional[SigningKey] = None, verifier: typing.Optional[KeyRegistry] = None) -> AgentHandle:
+    def spawn_agent(self, agent_id: typing.Optional[builtins.str], listen_on: builtins.str, handler: typing.Any, *, consumer_group: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, fixed_inbox: typing.Optional[builtins.str] = None, poll_interval_ms: typing.Optional[builtins.int] = None, warm_dedup: builtins.bool = False, dedup: typing.Optional[typing.Any] = None, dedup_window: typing.Optional[builtins.int] = None, consolidate_every_ms: typing.Optional[builtins.int] = None, consolidator: typing.Optional[typing.Any] = None, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, ack_on_pickup: builtins.bool = False, health: typing.Optional[builtins.str] = None, max_partitions: typing.Optional[builtins.int] = None, max_queued_records: typing.Optional[builtins.int] = None, max_queued_bytes: typing.Optional[builtins.int] = None, understood_features: builtins.int = 0, shutdown_grace_ms: typing.Optional[builtins.int] = None, dead_letter: typing.Optional[typing.Any] = None, middleware: typing.Optional[typing.Sequence[typing.Any]] = None, retry_max_attempts: typing.Optional[builtins.int] = None, retry_base_delay_ms: typing.Optional[builtins.int] = None, governor: typing.Optional[typing.Any] = None, governor_mode: builtins.str = 'enforce', governor_retention: typing.Optional[tuple[builtins.int, builtins.float]] = None, signing_key: typing.Optional[SigningKey] = None, verifier: typing.Optional[KeyRegistry] = None) -> AgentHandle:
         r"""
         Spawn an agent: join `consumer_group` (default `agent_id`) over
         `listen_on` and drive `handler` (an `async def handle(ctx, message)`) for
         each message, with at-least-once delivery, dedup, retry, and DLQ. Pass
         `dedup` (an `async def observe(key) -> bool`) for a custom, e.g. durable,
-        deduplicator. `max_partitions` runs one ordered worker lane per partition up
+        deduplicator, or `dedup_window` to size the default in-memory window in
+        keys. `max_partitions` runs one ordered worker lane per partition up
         to that many concurrent lanes (omit for strict serial). `shutdown_grace_ms`
         bounds how long a graceful stop waits for the in-flight message.
-        `dead_letter` (`async def on_dead_letter(message, reason, attempts,
-        published)`) is notified for every poison message. `middleware` is a list of
-        objects with optional `async def before_handle(message)` (a raise rejects
-        and dead-letters the message) and `async def after_handle(message, ok,
-        attempt)` hooks. `governor` (an object with `async def decide(action) ->
+        `dead_letter(message, capsule, publish_error)` receives the complete capsule dictionary and a typed SDK exception when publication fails.
+        `middleware` has optional `before_handle(message)` and `after_handle(message, result, attempt)` hooks.
+        The result dictionary contains `ok` and `error`. Hooks can return directly or through an awaitable.
+        `governor` (an object with `async def decide(action) ->
         ActionDecision`) governs everything the handler publishes, applied under
         `governor_mode` (`"enforce"` | `"observe"`), replacing any
         connection-level governor for this agent. Returns a handle to await
         readiness and stop it. Requires a default stream.
+        `fixed_inbox` sets the handler's default fan-out route. `governor_retention=(capacity, idle_ttl_secs)` bounds evidence heads.
+        Capabilities accept skill names or descriptor dicts. Consolidation requires both `consolidate_every_ms` and `consolidator`.
+        Shutdown cancels the active asynchronous consolidation callback and stops new passes.
+        `agent_id=None` opens an unscoped reliable consumer and requires `consumer_group`. It cannot advertise capabilities.
         """
-    def contract(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 10000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None) -> typing.Any:
+    def contract(self, skill: typing.Optional[builtins.str], payload: typing.Sequence[builtins.int], *, source: builtins.str, agent: typing.Optional[builtins.str] = None, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, expire_if_not_consumed_ms: typing.Optional[builtins.int] = None, reply_on: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, fence: typing.Optional[builtins.int] = None, registered: builtins.bool = False, policy: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
-        Send a directed task to one agent advertising `skill`, await its reply up to
-        `deadline_ms`. Returns the reply body, or `None` if it did not complete in
-        time. `fixed_inbox` routes to a fixed topic (a server with no presence
-        command). Omit it to resolve each agent's advertised inbox.
+        Send a directed task and await its reply up to `deadline_ms` (default
+        30000, the same as Rust and TypeScript). Route by capability with
+        `skill`, or to one named agent with `agent=` (pass `skill=None`).
+        `principal` requires the target's live connection to authenticate as
+        that principal. `fixed_inbox` routes to a fixed topic (a server with no
+        presence command). Omit it to resolve each agent's advertised inbox.
+        `expire_if_not_consumed_ms` lets an unpicked task expire, so a caller can
+        tell `not_consumed` from `timed_out` (the agent must emit pickup status
+        with `ack_on_pickup`). `reply_on`, `conversation`, `fence`, and
+        `registered` mirror the Rust contract builder. Returns the reply body,
+        or `None` for any outcome other than completed. Use `contract_report`
+        for the state.
         """
-    def contract_report(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 10000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None) -> typing.Any:
+    def contract_report(self, skill: typing.Optional[builtins.str], payload: typing.Sequence[builtins.int], *, source: builtins.str, agent: typing.Optional[builtins.str] = None, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, expire_if_not_consumed_ms: typing.Optional[builtins.int] = None, reply_on: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, fence: typing.Optional[builtins.int] = None, registered: builtins.bool = False, policy: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
-        Contract with the same routing semantics as [`contract`](Self::contract),
-        returning `state`, `body`, and the authenticated `verified_principal`.
+        Contract with the same routing and options as `contract`, returning a
+        dict with `state` (`completed`, `failed`, `timed_out`, or
+        `not_consumed`), `body`, and the authenticated `verified_principal`.
         """
-    def scatter(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None) -> typing.Any:
+    def scatter(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, policy: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
         Scatter a directed task to every agent advertising `skill`, concurrently,
         and return the reply body of each that completed (a verifier or diagnostic
         panel). Unavailable and quarantined agents are excluded.
         """
-    def scatter_report(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None) -> typing.Any:
+    def scatter_report(self, skill: builtins.str, payload: typing.Sequence[builtins.int], *, source: builtins.str, deadline_ms: builtins.int = 30000, fixed_inbox: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, policy: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
         Scatter like [`scatter`](Self::scatter), but return every contracted
         agent's terminal outcome, not only the completed replies, so an all-failed
@@ -2358,18 +2794,40 @@ class Laser:
         dispatches as. `fixed_inbox` routes every step to a fixed topic (a
         server with no presence command). Omit it to resolve advertised inboxes.
         """
-    def assemble_context(self, conversation_id: builtins.str, *, topics: typing.Optional[typing.Sequence[builtins.str]] = None, last_n: typing.Optional[builtins.int] = None, roles: typing.Optional[typing.Sequence[builtins.str]] = None, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
+    def assemble_context(self, conversation_id: builtins.str, *, topics: typing.Optional[typing.Sequence[builtins.str]] = None, last_n: typing.Optional[builtins.int] = None, roles: typing.Optional[typing.Sequence[builtins.str]] = None, token_budget: typing.Optional[builtins.int] = None, policy: typing.Optional[typing.Any] = None, across_subconversations: builtins.bool = False, from_offsets: typing.Optional[typing.Mapping[builtins.int, builtins.int]] = None, from_checkpoint: typing.Optional[Checkpoint] = None, to_checkpoint: typing.Optional[Checkpoint] = None) -> typing.Any:
         r"""
         Replay a conversation's history off the log: read `topics` (default the
         command and response topics), order by timestamp, and apply a policy.
         `roles` keeps only messages from those agents. Otherwise the last
         `last_n` messages are kept (default 50). `token_budget` then trims the
         selection to an estimated token count. Returns the selected messages.
+        `policy` replaces the shorthand controls. Replay bounds accept per-partition offsets and per-topic checkpoints.
+        `across_subconversations=True` includes child conversations.
         """
     @staticmethod
     def connect(connection_string: builtins.str, *, stream: typing.Optional[builtins.str] = None, ops_stream: typing.Optional[builtins.str] = None, control_topic: typing.Optional[builtins.str] = None, dlq_topic: typing.Optional[builtins.str] = None, changes_topic: typing.Optional[builtins.str] = None, verifier: typing.Optional[KeyRegistry] = None, connect_timeout_ms: typing.Optional[builtins.int] = None, publish_timeout_ms: typing.Optional[builtins.int] = None, publish_max_retries: typing.Optional[builtins.int] = None, publish_retry_backoff_ms: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Connect with a bare `user:password@host:port` endpoint. Pinning `stream` only enables the default-stream shortcuts. Connecting gives up after `connect_timeout_ms`, default 30000 or `LASER_CONNECT_TIMEOUT_MS`, with a `TimeoutError` naming whether the server never accepted the connection or never answered the login.
+        """
+    @staticmethod
+    def connect_env() -> typing.Any:
+        r"""
+        Connect from the environment: `LASER_CONNECTION_STRING` (required, else
+        `ConfigError`) and an optional `LASER_STREAM` default stream. The timeout
+        and publish variables (`LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*`
+        family) apply as on `connect`.
+        """
+    @staticmethod
+    def local() -> typing.Any:
+        r"""
+        Connect to a local Apache Iggy on `iggy:iggy@127.0.0.1:8090`, the Laser
+        Stack default.
+        """
+    @staticmethod
+    def connect_with_stream(connection_string: builtins.str, stream: builtins.str) -> typing.Any:
+        r"""
+        Connect and pin a default `stream`, the shorthand for
+        `connect(connection_string, stream=stream)`.
         """
     def with_stream(self, stream: builtins.str) -> Laser:
         r"""
@@ -2397,7 +2855,7 @@ class Laser:
         A clone whose change-feed records publish to `changes_topic` on the ops
         stream instead of the default `changes`.
         """
-    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, filters: typing.Optional[builtins.bool] = None, filters_catalog: typing.Optional[builtins.bool] = None, filters_group_policy_reads: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, sessions: typing.Optional[builtins.bool] = None, durable_dedup: typing.Optional[builtins.bool] = None) -> typing.Any:
+    def with_capabilities(self, *, managed: typing.Optional[builtins.bool] = None, query: typing.Optional[builtins.bool] = None, query_consistency: typing.Optional[builtins.str] = None, query_keyword: typing.Optional[builtins.bool] = None, destinations: typing.Optional[builtins.bool] = None, destinations_consistency: typing.Optional[builtins.str] = None, kv: typing.Optional[builtins.bool] = None, kv_cas: typing.Optional[builtins.bool] = None, kv_cas_fenced: typing.Optional[builtins.bool] = None, kv_fenced_leases: typing.Optional[builtins.bool] = None, graph: typing.Optional[builtins.bool] = None, forks: typing.Optional[builtins.bool] = None, agent_workflow: typing.Optional[builtins.bool] = None, watch: typing.Optional[builtins.bool] = None, authz: typing.Optional[builtins.bool] = None, filters: typing.Optional[builtins.bool] = None, filters_catalog: typing.Optional[builtins.bool] = None, filters_group_policy_reads: typing.Optional[builtins.bool] = None, a2a_gateway: typing.Optional[builtins.bool] = None, query_execution: typing.Optional[tuple[builtins.bool, builtins.bool, builtins.bool]] = None, versions: typing.Optional[OpVersions] = None, backends: typing.Optional[typing.Sequence[BackendDescriptor]] = None) -> typing.Any:
         r"""
         Return a clone with selected negotiated capabilities overridden. This is
         intended for bring-your-own backends and deterministic pre-gate tests.
@@ -2471,6 +2929,14 @@ class Laser:
         evidence chain are fresh. Agents spawned from the governed handle
         inherit it.
         """
+    def with_governor_retention(self, governor: typing.Any, mode: builtins.str = 'enforce', *, capacity: builtins.int = 4096, idle_ttl_secs: builtins.float = 3600.0) -> Laser:
+        r"""
+        `with_governor` with an explicit retention policy for the process-local
+        evidence-chain heads: at most `capacity` conversations (default 4096),
+        and a head idle for `idle_ttl_secs` (default 3600) may be evicted.
+        Eviction or a process restart starts a new local chain for that
+        conversation.
+        """
     def graph(self, name: builtins.str) -> Graph:
         r"""
         A handle to the knowledge-graph surface `name`. A managed feature: against
@@ -2489,17 +2955,21 @@ class Laser:
         Drop the graph projection registered under `id`. Materialized nodes and
         edges are left untouched.
         """
-    def a2a_bridge(self, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str) -> A2aBridge:
+    def a2a_bridge(self, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str, *, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, signing_key: typing.Optional[SigningKey] = None) -> A2aBridge:
         r"""
         An A2A bridge mapping JSON-RPC methods onto agent topics, publishing as
         `source`. Use it to drive an agent as an A2A task source from Python.
+        `capabilities` (skill ids, or capability descriptor dicts) become the
+        card's skills. `signing_key` signs the published task envelopes.
         """
-    def mcp_bridge(self, source: builtins.str, tool_topic: builtins.str, reply_topic: builtins.str, server_name: builtins.str, *, tools: typing.Optional[typing.Any] = None, resources: typing.Optional[typing.Any] = None, prompts: typing.Optional[typing.Any] = None, timeout_secs: typing.Optional[builtins.float] = None) -> McpBridge:
+    def mcp_bridge(self, source: builtins.str, tool_topic: builtins.str, reply_topic: builtins.str, server_name: builtins.str, *, tools: typing.Optional[typing.Any] = None, resources: typing.Optional[typing.Any] = None, prompts: typing.Optional[typing.Any] = None, timeout_secs: typing.Optional[builtins.float] = None, memory_tools: builtins.bool = False) -> McpBridge:
         r"""
         An MCP bridge serving tools / resources / prompts over the log, publishing
         tool calls as `source`. `tools` / `resources` / `prompts` are lists of
         dicts (a tool is `{name, description?, input_schema}`, a prompt is
         `{prompt: {name, title?, description?, arguments?}, messages: [[role, text]]}`).
+        `memory_tools=True` adds the conventional `remember` and `recall` tools.
+        `timeout_secs` bounds each tool call (default 30).
         """
     def publish_state_snapshot(self, topic: builtins.str, source: builtins.str, conversation_id: builtins.str, state: typing.Any) -> typing.Any:
         r"""
@@ -2530,13 +3000,23 @@ class Laser:
         """
     def memory(self, namespace: builtins.str) -> Memory:
         r"""
-        Agent memory in `namespace`: `remember` publishes to the memory topic (the
-        durable audit), `forget` appends a tombstone, `recall` folds it back (most
-        recent first, `semantic` ignored). One model: a deployment materializes
-        the topic into the versioned key-value read view. `namespace` prefixes the
-        named-item altitude's keys (`set`/`fetch`). For an isolated per-topic
-        memory stream use `memory_on_topic` or `memory_topic`. Works on raw Apache
-        Iggy. Reuse the handle: each `recall` folds only what is new.
+        Agent memory in `namespace`: `remember` publishes to the memory topic
+        (the durable audit), `forget` appends a tombstone, and a deployment
+        materializes the topic into the versioned key-value read view. Default
+        `recall` and `fetch` read that managed view, so they need Laser Stack or
+        LaserData Cloud and raise `UnsupportedError` otherwise. `recall(folded=True)`
+        and `fetch_folded` rebuild memory from the topic in process and work on
+        plain Apache Iggy. `namespace` prefixes the named-item keys (`set`,
+        `fetch`). For an isolated per-topic memory stream use `memory_on_topic`
+        or `memory_topic`. Reuse the handle: each folded recall reads only what
+        is new.
+        """
+    def memory_with(self, namespace: builtins.str, backend: builtins.str = 'auto', *, embedder: typing.Optional[typing.Any] = None) -> Memory:
+        r"""
+        Memory in `namespace` on an explicit backend: `auto` and `log` are the
+        durable stream model `memory` uses, `vector` is the governed in-process
+        similarity index and needs `embedder` (a callable returning
+        `list[float]`, directly or through an awaitable).
         """
     def memory_on_topic(self, topic: builtins.str, *, stream: typing.Optional[builtins.str] = None) -> Memory:
         r"""
@@ -2551,10 +3031,22 @@ class Laser:
         stream message-expiry. `ttl_secs` defaults to thirty days. Pass `0` to
         keep the history until topic retention rotates it out.
         """
+    def memory_custom(self, backend: typing.Any) -> Memory:
+        r"""
+        Memory on your own durable backend: `backend` is an object with
+        `remember(scope, payload) -> id`, `recall(scope, query) -> items`,
+        `improve(scope, feedback) -> id`, and `forget(scope, id)`, each returning
+        directly or through an awaitable. Scopes, queries, and feedback arrive as
+        dicts. `recall` returns `MemoryItem` objects or dicts with `payload` and
+        optional `id`, `kind`, `score`, `conversation`. The backend owns its own
+        scoping and id minting. Named items (`set`, `fetch`) raise
+        `UnsupportedError` on it.
+        """
     def vector_memory(self, embedder: typing.Any) -> Memory:
         r"""
-        In-process semantic memory. The embedder returns `list[float]` directly
-        or through an awaitable. Semantic recall ranks by cosine similarity.
+        Governed in-process semantic memory. The embedder returns `list[float]`
+        directly or through an awaitable. Semantic recall ranks by cosine
+        similarity. The same as `memory_with(namespace, "vector", embedder=..)`.
         """
     def query(self, index: builtins.str) -> QueryRequest:
         r"""
@@ -2585,9 +3077,11 @@ class Laser:
         r"""
         Read one projection's details by id, or `None` when no projection has it.
         """
-    def list_projections(self, *, topic: typing.Optional[builtins.str] = None, name_contains: typing.Optional[builtins.str] = None, id_prefix: typing.Optional[builtins.str] = None) -> typing.Any:
+    def list_projections(self, *, topic: typing.Optional[builtins.str] = None, name_contains: typing.Optional[builtins.str] = None, id_prefix: typing.Optional[builtins.str] = None, topics: typing.Optional[typing.Sequence[builtins.str]] = None, search: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         List projections, optionally narrowed by topic / name substring / id prefix.
+        `topics` adds several source topics at once. `search` matches a
+        substring of the id or the name.
         """
     def apply_binding(self, binding: typing.Any) -> typing.Any:
         r"""
@@ -2659,6 +3153,90 @@ class Laser:
         r"""
         Read authorization history for one user's role bindings.
         """
+    def agent_registry(self) -> AgentRegistry:
+        r"""
+        A read model over the agent card registry topic. It shares a per-stream
+        cache, so `refresh` folds only what is new and every registry opened
+        later on this connection sees the folded state.
+        """
+    def publish_card(self, source: builtins.str, card: typing.Any) -> typing.Any:
+        r"""
+        Publish `source`'s capability card (a dict mirroring `AgentCard`:
+        `name`, `version`, `capabilities`, `ttl_micros`, ...) to the registry
+        topic, so capability routing can resolve `source`. Re-publish on an
+        interval shorter than the card's `ttl_micros`.
+        """
+    def quarantine_signed(self, operator: builtins.str, agent: builtins.str, key: SigningKey) -> typing.Any:
+        r"""
+        Quarantine `agent` with a fact signed by the operator's `key`, so a
+        registry that enrolls the matching verifying key folds it.
+        """
+    def unquarantine_signed(self, operator: builtins.str, agent: builtins.str, key: SigningKey) -> typing.Any:
+        r"""
+        Lift a quarantine with a fact signed by the operator's `key`.
+        """
+    def advertise_presence(self, presence: typing.Any) -> typing.Any:
+        r"""
+        Advertise this connection's live presence (a dict mirroring
+        `AgentPresence`: `v`, `agent`, `inbox`, ...), so a registry can route
+        work to its inbox. Served by the LaserData Iggy fork.
+        """
+    def clear_presence(self) -> typing.Any:
+        r"""
+        Withdraw this connection's advertised presence. Disconnecting clears it
+        too.
+        """
+    def client_metadata(self, *, metadata_only: builtins.bool = False, principal: typing.Optional[builtins.int] = None, limit: typing.Optional[builtins.int] = None, after: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        One page of live connections and their advertised metadata, as a dict
+        `{"clients": [...], "next_cursor": int | None}`. Pass `next_cursor` back
+        as `after` for the next page. `metadata_only` keeps connections that
+        advertised metadata, and `principal` narrows to one authenticated user.
+        """
+    def agent(self, id: builtins.str) -> AgentScope:
+        r"""
+        The agent accessor: every verb on the returned scope acts as the agent
+        `id` (sends carry it as the source, the card and presence advertise it).
+        """
+    def reassemble_channel(self, conversation: builtins.str, topic: builtins.str, channel: builtins.str) -> typing.Any:
+        r"""
+        Reassemble a chunk stream from the log: read `conversation` on `topic`,
+        take the chunk envelopes for `channel` in sequence order, and replay
+        them into ordered events (the same dicts `ChunkAssembler` returns).
+        """
+    def consumed(self, position: tuple[builtins.int, builtins.int, builtins.int, builtins.int], *, group: typing.Optional[builtins.str] = None, consumer: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Whether a consumer has committed past a log position. Name the consumer
+        with exactly one of `group` or `consumer`. `position` is
+        `(stream_id, topic_id, partition_id, offset)`. Returns
+        `{"consumed": True, "committed": int, "head": int}` or
+        `{"consumed": False, "behind_by": int}`.
+        """
+    def execute_query(self, query: typing.Any) -> typing.Any:
+        r"""
+        Execute a raw query (a dict mirroring the wire `Query`) and return one
+        result page. `query(..)` builds the same request fluently.
+        """
+    def query_page(self, execution_id: builtins.str, cursor: builtins.str, deadline_micros: builtins.int) -> typing.Any:
+        r"""
+        Fetch the page after `cursor` for an execution already started.
+        `deadline_micros` is the absolute deadline in epoch microseconds.
+        """
+    def execute_checkpoint(self, request: typing.Any) -> typing.Any:
+        r"""
+        Execute one raw checkpoint request (a dict mirroring the wire
+        `CheckpointRequestEnvelope`) and return the mutation result as a dict.
+        `Destinations.mutate` builds the common public mutation for you. Needs the
+        destinations capability, otherwise raises `UnsupportedError`.
+        """
+    def cancel_query(self, execution_id: builtins.str) -> typing.Any:
+        r"""
+        Request cancellation of a query execution and return its observed state.
+        """
+    def query_status(self, execution_id: builtins.str) -> typing.Any:
+        r"""
+        Read the current state of a query execution.
+        """
     def runs(self) -> Runs:
         r"""
         A handle to the managed run registry: submit a run to an agent or
@@ -2679,18 +3257,11 @@ class Laser:
         """
     def kv_snapshot_store(self, namespace: typing.Optional[builtins.str] = None) -> SnapshotStore:
         r"""
-        A fold-snapshot store in the managed key-value store (one key per
-        conversation in `namespace`, default `agent.snapshots`), so a long
-        conversation resumes from its last checkpoint instead of replaying every
-        record. Managed: against Apache Iggy the calls raise `UnsupportedError`
-        - use `topic_snapshot_store` there.
+        A snapshot store in the managed key-value view. The namespace defaults to `agent.snapshots`. Apache Iggy raises `UnsupportedError` on its verbs.
         """
     def topic_snapshot_store(self, topic: typing.Optional[builtins.str] = None) -> SnapshotStore:
         r"""
-        A fold-snapshot store as records on a dedicated snapshots `topic` (default
-        `agent.snapshots`), partitioned by conversation. Log-native: works on raw
-        Apache Iggy. `latest` walks the topic backward to the newest checkpoint, so
-        keep the topic on retention.
+        A snapshot store on a dedicated topic, default `agent.snapshots`. Works on Apache Iggy. `latest` scans backward from the tail, so keep the topic on retention.
         """
     def stream(self, name: builtins.str) -> Stream:
         r"""
@@ -2713,9 +3284,17 @@ class Laser:
         instead of sleep-and-retry. Narrow to one materialized index with `index=`,
         resume from persisted `offsets` with `from_offsets=`. Each record is a
         wakeup, not the rows: read the rows with `query()`. Requires the `watch`
-        capability, and each `poll()` fails with `UnsupportedError` when the
-        deployment does not publish the feed.
+        capability: opening the reader raises `UnsupportedError` when the
+        deployment does not publish the feed, as Rust and TypeScript fail when
+        they open the records reader.
         """
+
+@typing.final
+class LastN:
+    r"""
+    Context policy: keep the most recent `n` messages.
+    """
+    def __new__(cls, n: builtins.int) -> LastN: ...
 
 @typing.final
 class Lease:
@@ -2838,16 +3417,46 @@ class Memory:
     r"""
     Agent memory: `remember` a payload, `recall` the most relevant items, and
     `forget` one by id. The backend decides how recall ranks: the vector backend
-    scores by semantic similarity to a query, the log and managed backends return
-    the most recent. Scope every call to an agent and/or a conversation. Build
-    standalone vector memory with `Memory.vector(embedder)`, or create a
-    governed or durable handle from `Laser`.
+    scores by semantic similarity to a query, the durable log backend reads the
+    managed key-value view (or folds the topic with `folded=True`). Scope every
+    call to an agent, a conversation, a user, or an application. Build standalone
+    vector memory with `Memory.vector(embedder)`, or create a governed or
+    durable handle from `Laser`.
     """
+    @property
+    def backend_name(self) -> builtins.str:
+        r"""
+        The backend this handle resolved to: `log`, `vector`, or `custom`.
+        """
+    @staticmethod
+    def to_context_block(items: typing.Sequence[MemoryItem], token_budget: typing.Optional[builtins.int] = None) -> builtins.str:
+        r"""
+        Render these exact recalled items with the Rust token budget and omission marker.
+        """
     @staticmethod
     def vector(embedder: typing.Any) -> Memory:
         r"""
-        Standalone in-process semantic memory. The embedder returns a
-        `list[float]` directly or through an awaitable.
+        Standalone in-process semantic memory, with no connection and no
+        governance. The embedder returns a `list[float]` directly or through an
+        awaitable. For a governed handle use `Laser.vector_memory`.
+        """
+    @staticmethod
+    def content_id(kind: builtins.str, body: typing.Any, *, stream: typing.Optional[builtins.str] = None, agent: typing.Optional[builtins.str] = None) -> builtins.str:
+        r"""
+        The content-derived memory id of `body` stored as `kind` under the
+        owner `stream` and `agent`. The same inputs always give the same id.
+        """
+    @staticmethod
+    def kind_class(kind: builtins.str) -> builtins.str:
+        r"""
+        The memory class of `kind`: `episodic`, `semantic`, or `procedural`.
+        """
+    def reranker(self, reranker: typing.Any) -> Memory:
+        r"""
+        This handle with a rerank second stage: `reranker(query, items)` returns
+        the candidates reordered (and may drop or rescore them), directly or
+        through an awaitable. Recall runs the backend's retrieval, then the
+        reranker when the query carries `semantic` text. Writes are unchanged.
         """
     def set(self, key: builtins.str, payload: typing.Any) -> typing.Any:
         r"""
@@ -2857,7 +3466,8 @@ class Memory:
         """
     def fetch(self, key: builtins.str) -> typing.Any:
         r"""
-        Point-read the named item written by `set`, or `None`.
+        Point-read the named item written by `set`, or `None`. Reads the managed
+        key-value view.
         """
     def fetch_folded(self, key: builtins.str) -> typing.Any:
         r"""
@@ -2873,27 +3483,60 @@ class Memory:
         r"""
         Delete the named item. Idempotent: removing an absent key is fine.
         """
-    def remember(self, payload: typing.Any, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
+    def remember(self, payload: typing.Any, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, kind: builtins.str = 'fact', durable: builtins.bool = False, dedup: builtins.bool = False) -> typing.Any:
         r"""
-        Remember `payload` (`str`, `bytes`, or `bytearray`) under the given scope.
-        Returns the new item's id (a time-ordered ULID string).
+        Remember `payload` (`str`, `bytes`, or `bytearray`). Returns the new
+        item's id (a ULID string). `kind` is `fact` (default), `message`,
+        `summary`, `entity`, `feedback`, or `procedure`. `durable=True` sets the
+        scope lifetime for custom backends. Built-ins do not persist or filter
+        that value. Omit `conversation` on recall to read across conversations.
+        `dedup=True` derives the id from the durable scope (stream and agent),
+        the kind, and the body, so remembering the same body twice stores it once.
         """
-    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None, folded: builtins.bool = False) -> typing.Any:
+    def append(self, memory_id: builtins.str, payload: typing.Any, *, kind: builtins.str = 'fact', agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False) -> typing.Any:
         r"""
-        Recall up to `limit` items under the scope. Pass `semantic` text to rank by
-        similarity (the vector backend embeds and scores it, the others ignore it
-        and return the most recent).
+        Append with an explicit ID and kind. Built-ins preserve both. A custom backend uses its optional `append` callback, or falls back to `remember` when absent.
         """
-    def improve(self, memory_id: builtins.str, weight: builtins.float, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
+    def recall(self, *, limit: builtins.int = 50, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None, folded: builtins.bool = False, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Recall up to `limit` items under the scope. Pass `semantic` text to rank
+        by similarity, or a `strategy` (`auto`, `recent`, `semantic`, `keyword`,
+        `graph`, `temporal`, `hybrid`) with the query text in `semantic`. The
+        log backend reads the managed key-value view by default. `folded=True`
+        rebuilds memory from the topic in process instead.
+        """
+    def context(self, conversation: builtins.str, *, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        The one-call context altitude: recall `conversation`'s most relevant
+        items and render them as one prompt-ready block under an optional
+        `token_budget` (estimated at about 4 bytes per token). At the budget the
+        remaining items are dropped and an omission marker is appended.
+        """
+    def consolidate(self, max_items: builtins.int, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, summarizer: typing.Optional[typing.Any] = None, prune_summarized: builtins.bool = False, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False) -> typing.Any:
+        r"""
+        One consolidation pass over at most 10,000 scoped items. Keeps the newest `max_items` and prunes the rest.
+        `summarizer(bodies: list[bytes])` returns a body directly or through an awaitable. The pass folds `message` items into one `summary` with a durable scope and the same conversation.
+        `prune_summarized` removes the included messages. Built-in recall ignores lifetime. Custom callbacks receive it.
+        """
+    def improve(self, memory_id: builtins.str, weight: builtins.float, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False, note: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         Record feedback on a recalled item, the signal a ranking backend folds
         into future recall. `weight` is positive to promote, negative to demote.
         Returns the feedback record's id.
         """
-    def forget(self, memory_id: builtins.str, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None) -> typing.Any:
+    def forget(self, memory_id: builtins.str, *, agent: typing.Optional[builtins.str] = None, conversation: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False) -> typing.Any:
         r"""
         Forget the item with id `memory_id` (a ULID string) under the scope.
         """
+
+@typing.final
+class MemoryHandler:
+    def __new__(cls, handler: typing.Any, memory: Memory) -> MemoryHandler: ...
+    def auto_remember(self, kind: builtins.str) -> MemoryHandler:
+        r"""
+        Remember successful messages under their conversation. Memory failures do not repeat the handler.
+        """
+    def __call__(self, context: typing.Any, message: AgentMessage) -> typing.Any: ...
 
 @typing.final
 class MemoryItem:
@@ -2998,6 +3641,11 @@ class OpVersions:
     def filter(self) -> builtins.int: ...
     @property
     def features(self) -> builtins.int: ...
+    def __new__(cls, *, query: builtins.int = 1, control: builtins.int = 1, kv: builtins.int = 1, fork: builtins.int = 1, agent: builtins.int = 0, graph: builtins.int = 0, checkpoint: builtins.int = 0, filter: builtins.int = 0, features: builtins.int = 0) -> OpVersions:
+        r"""
+        Operation versions for `Laser.with_capabilities(versions=)`, the
+        bring-your-own backend and test path. Zero means not advertised.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -3116,6 +3764,17 @@ class PolicyEvidence:
         r"""
         Decode an evidence body (named-field CBOR).
         """
+    def encode(self) -> bytes:
+        r"""
+        Encode this evidence body (named-field CBOR), the inverse of `decode`.
+        """
+
+@typing.final
+class PreparedMutation:
+    @property
+    def operation_id(self) -> builtins.int: ...
+    @property
+    def ambiguous_recovery(self) -> typing.Any: ...
 
 @typing.final
 class Producer:
@@ -3143,6 +3802,14 @@ class Producer:
         `(payload, headers)`. All records share the optional key or partition,
         matching Iggy's `send_with_partitioning` contract.
         """
+    def shutdown(self) -> typing.Any:
+        r"""
+        Flush buffered `background`-mode messages and stop the worker. A direct
+        producer has nothing to flush, so this only closes it. Await every
+        in-flight `send` first: shutdown needs the last live handle, and a send
+        still running makes it raise `InvalidError`. Later sends raise
+        `InvalidError`.
+        """
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -3168,12 +3835,14 @@ class Provenance:
     @property
     def correlation_id(self) -> typing.Optional[builtins.str]: ...
     @property
+    def fence_token(self) -> typing.Optional[builtins.int]: ...
+    @property
     def input_tokens(self) -> typing.Optional[builtins.int]: ...
     @property
     def output_tokens(self) -> typing.Optional[builtins.int]: ...
     @property
     def cost_usd(self) -> typing.Optional[builtins.float]: ...
-    def __new__(cls, *, conversation_id: typing.Optional[builtins.str] = None, causal_parent: typing.Optional[builtins.str] = None, parent_conversation_id: typing.Optional[builtins.str] = None, root_conversation_id: typing.Optional[builtins.str] = None, agent: typing.Optional[builtins.str] = None, target_agent_id: typing.Optional[builtins.str] = None, idempotency_key: typing.Optional[builtins.str] = None, correlation_id: typing.Optional[builtins.str] = None, deadline_micros: typing.Optional[builtins.int] = None, input_tokens: typing.Optional[builtins.int] = None, output_tokens: typing.Optional[builtins.int] = None, cost_usd: typing.Optional[builtins.float] = None) -> Provenance: ...
+    def __new__(cls, *, conversation_id: typing.Optional[builtins.str] = None, causal_parent: typing.Optional[builtins.str] = None, parent_conversation_id: typing.Optional[builtins.str] = None, root_conversation_id: typing.Optional[builtins.str] = None, agent: typing.Optional[builtins.str] = None, target_agent_id: typing.Optional[builtins.str] = None, idempotency_key: typing.Optional[builtins.str] = None, correlation_id: typing.Optional[builtins.str] = None, deadline_micros: typing.Optional[builtins.int] = None, fence_token: typing.Optional[builtins.int] = None, input_tokens: typing.Optional[builtins.int] = None, output_tokens: typing.Optional[builtins.int] = None, cost_usd: typing.Optional[builtins.float] = None) -> Provenance: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
@@ -3197,7 +3866,7 @@ class PublishRequest:
         """
     def projection_ref(self, value: builtins.str) -> PublishRequest:
         r"""
-        Route the record through a projection by ref (e.g. "order.v1").
+        Route the record through a projection by ref (e.g. "reading.v1").
         """
     def schema_id(self, value: builtins.int) -> PublishRequest:
         r"""
@@ -3241,9 +3910,53 @@ class PublishRequest:
         `CompiledSchema.compile(..)` and reuse it. Encoding fails client-side
         (`CodecError`) when the value does not match the schema.
         """
+    def claim_check(self, store: typing.Any, threshold_bytes: builtins.int) -> PublishRequest:
+        r"""
+        Claim-check the payload when it exceeds `threshold_bytes` at send time:
+        the bytes go to `store` (an object with `async def put(data: bytes) ->
+        str` and `async def get(reference: str) -> bytes`), and the log carries
+        the digest-bearing `BodyRef` capsule with content type `ref` instead.
+        Under the threshold the record is unchanged. Readers resolve the body
+        with the same store, which checks the digest before returning it.
+        """
     def send(self) -> typing.Any:
         r"""
         Publish the record.
+        """
+
+@typing.final
+class QueryFilter:
+    r"""
+    A query predicate tree, the Python form of the query `Filter`: a
+    comparison leaf (`pred`), a conjunction (`all`), a disjunction (`any`), or
+    a negation (`negate`). Pass it to `QueryRequest.filter`,
+    `QueryRequest.having`, or `Graph.query(match=..)`. Consumer filters use the
+    separate `FilterExpr`.
+    """
+    @staticmethod
+    def pred(field: builtins.str, op: builtins.str, value: typing.Any) -> QueryFilter:
+        r"""
+        A single comparison leaf, `field op value`. `op` is `eq`, `ne`, `lt`,
+        `lte`, `gt`, `gte`, `in`, `contains`, or `prefix`.
+        """
+    @staticmethod
+    def all(filters: typing.Sequence[QueryFilter]) -> QueryFilter:
+        r"""
+        The AND of `filters`.
+        """
+    @staticmethod
+    def any(filters: typing.Sequence[QueryFilter]) -> QueryFilter:
+        r"""
+        The OR of `filters`.
+        """
+    @staticmethod
+    def negate(filter: QueryFilter) -> QueryFilter:
+        r"""
+        The negation of `filter`.
+        """
+    def to_dict(self) -> typing.Any:
+        r"""
+        The filter as a dict (debugging).
         """
 
 @typing.final
@@ -3252,6 +3965,11 @@ class QueryRequest:
     Fluent query builder over a materialized index. Mutates an owned `Query` and
     executes it through the managed query command at a terminal.
     """
+    @property
+    def execution_id(self) -> builtins.str:
+        r"""
+        This query's execution id, the identity `status` and `cancel` use.
+        """
     def where_eq(self, field: builtins.str, value: typing.Any) -> QueryRequest:
         r"""
         Exact-match on an indexed field (point lookup).
@@ -3266,6 +3984,34 @@ class QueryRequest:
     def fork(self, fork_id: builtins.str) -> QueryRequest:
         r"""
         Resolve against a fork's copy-on-write view instead of the trunk.
+        """
+    def filter(self, filter: QueryFilter) -> QueryRequest:
+        r"""
+        AND `filter` (a `QueryFilter`) into the query's predicate tree. The
+        `filter_*` helpers route through the same conjunction. Build `any` and
+        `negate` subtrees with `QueryFilter` and pass them here.
+        """
+    def having(self, filter: QueryFilter) -> QueryRequest:
+        r"""
+        Keep only aggregate groups matching `filter`. Predicate fields reference
+        an aggregate alias (for example `count`) or a group key, not raw row
+        fields.
+        """
+    def agg_as(self, func: builtins.str, alias: builtins.str, *, field: typing.Optional[builtins.str] = None, fraction: typing.Optional[builtins.float] = None) -> QueryRequest:
+        r"""
+        Add an aggregate with an explicit output `alias`, to return several
+        aggregates of the same kind or to name the output column. `func` is
+        `count`, `sum`, `avg`, `min`, `max`, `count_distinct`, `stddev`, or
+        `percentile` (which needs `fraction`).
+        """
+    def max_rows(self, n: builtins.int) -> QueryRequest:
+        r"""
+        Cap the total rows `rows()` and `rows_typed()` may return. Explicit by
+        design: a paged walk with no ceiling is an unbounded read.
+        """
+    def deadline(self, seconds: builtins.float) -> QueryRequest:
+        r"""
+        Set the execution deadline `seconds` from now (default 30 seconds).
         """
     def deadline_micros(self, value: builtins.int) -> QueryRequest:
         r"""
@@ -3380,6 +4126,17 @@ class QueryRequest:
     def fetch_one(self) -> typing.Any:
         r"""
         Run the query capped at one row, decoding its JSON payload, or `None`.
+        """
+    def rows(self) -> typing.Any:
+        r"""
+        Walk matching rows across pages, bounded by an explicit `max_rows`, and
+        return them. Stops at the cap or the last page, whichever comes first.
+        """
+    def rows_typed(self) -> typing.Any:
+        r"""
+        Like `rows` but each row's JSON payload is decoded into a Python value,
+        under the same explicit `max_rows` ceiling. The payload is requested
+        automatically, and the publisher must have inlined it.
         """
     def status(self) -> typing.Any:
         r"""
@@ -3500,6 +4257,13 @@ class Role:
     def name(self) -> builtins.str: ...
     @property
     def grants(self) -> builtins.list[Grant]: ...
+
+@typing.final
+class RoleFilter:
+    r"""
+    Context policy: keep only messages from the given agents.
+    """
+    def __new__(cls, agents: typing.Sequence[builtins.str]) -> RoleFilter: ...
 
 @typing.final
 class Row:
@@ -3647,28 +4411,60 @@ class Runs:
 class ScopedMemory:
     r"""
     One conversation's memory: recall and remember with the conversation already
-    applied. Build it with `ContextScope.memory`.
+    applied. Build it with `ContextScope.memory` or `Session.memory`.
     """
+    @property
+    def handle(self) -> Memory:
+        r"""
+        The underlying handle, for the cross-conversation verbs this scoped
+        view does not narrow.
+        """
     @property
     def conversation(self) -> builtins.str:
         r"""
         This scoped memory's conversation id.
         """
-    def recall(self, *, limit: builtins.int = 50, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None) -> typing.Any:
+    def recall(self, *, limit: builtins.int = 50, semantic: typing.Optional[builtins.str] = None, strategy: typing.Optional[builtins.str] = None, agent: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, folded: builtins.bool = False, stream: typing.Optional[builtins.str] = None, durable: builtins.bool = False, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
         r"""
         Recall up to `limit` items within this conversation. Pass `semantic`
-        text to rank by similarity (backends that embed), or a `strategy`.
+        text to rank by similarity (backends that embed), or a `strategy`
+        (`auto`, `recent`, `semantic`, `keyword`, `graph`, `temporal`,
+        `hybrid`) with the query text in `semantic`. Default recall reads the
+        managed key-value view. `folded=True` rebuilds memory from the topic in
+        process instead.
         """
-    def remember(self, payload: typing.Any) -> typing.Any:
+    def remember(self, payload: typing.Any, *, agent: typing.Optional[builtins.str] = None, stream: typing.Optional[builtins.str] = None, user: typing.Optional[builtins.str] = None, application: typing.Optional[builtins.str] = None, kind: builtins.str = 'fact', durable: builtins.bool = False, dedup: builtins.bool = False) -> typing.Any:
         r"""
-        Remember `payload` (str, bytes, or bytearray) in this conversation's
-        session scope. Returns the new item's id.
+        Remember `payload` (str, bytes, or bytearray) in this conversation.
+        Returns the new item's id. `kind`, `durable`, and `dedup` behave as on
+        `Memory.remember`.
         """
-    def search(self, query: builtins.str, *, limit: builtins.int = 50) -> typing.Any:
+    def search(self, query: builtins.str, *, limit: builtins.int = 50, folded: builtins.bool = False) -> typing.Any:
         r"""
         Keyword recall for `query` within this conversation, up to `limit`
-        items. Needs no embedder, so it works on the default log-backed memory.
-        Use `recall(semantic=..)` for semantic or hybrid recall.
+        items. It needs no embedder. Default recall reads the managed key-value
+        view, and `folded=True` folds the topic in process.
+        """
+    def block(self, token_budget: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        The one-call context altitude: recall this conversation's most relevant
+        items rendered as one prompt-ready block under an optional
+        `token_budget`.
+        """
+    def consolidate(self, max_items: builtins.int, *, summarizer: typing.Optional[typing.Any] = None, prune_summarized: builtins.bool = False) -> typing.Any:
+        r"""
+        One consolidation pass over this conversation, keeping the newest
+        `max_items` and pruning the rest. `summarizer` and `prune_summarized`
+        work as on `Memory.consolidate`.
+        """
+    def improve(self, memory_id: builtins.str, weight: builtins.float) -> typing.Any:
+        r"""
+        Record feedback on a recalled item in this conversation. `weight` is
+        positive to promote, negative to demote. Returns the feedback record's id.
+        """
+    def forget(self, memory_id: builtins.str) -> typing.Any:
+        r"""
+        Forget the item `memory_id` in this conversation.
         """
 
 @typing.final
@@ -3723,11 +4519,27 @@ class Session:
         topics, trimmed to `token_budget` estimated tokens. Both default to the
         factory's configured bounds (50 turns, 4000 tokens unless changed).
         """
+    def context_with(self, policy: typing.Any) -> typing.Any:
+        r"""
+        The context under an explicit policy: `LastN`, `TokenBudget`,
+        `RoleFilter`, or a `Chain` of them, the same values
+        `ContextScope.fetch_with` takes.
+        """
+    def graph(self, name: builtins.str) -> Graph:
+        r"""
+        The knowledge graph `name`, the same graph `laser.graph(name)` returns.
+        It is shared across conversations, so the session does not narrow it.
+        """
     def memory(self, memory: typing.Optional[Memory] = None) -> ScopedMemory:
         r"""
         This session's memory, scoped to the conversation: `memory` defaults to
         `laser.memory(<configured namespace>)`, or pass any handle from
-        `laser.memory`/`memory_on_topic`/`memory_topic`/`vector_memory`.
+        `laser.memory`/`memory_on_topic`/`memory_topic`/`memory_with`/`vector_memory`.
+        """
+    def memory_in(self, namespace: builtins.str) -> ScopedMemory:
+        r"""
+        This session's memory in an explicit `namespace`, scoped to the
+        conversation.
         """
     def checkpoint(self) -> typing.Any:
         r"""
@@ -3788,6 +4600,16 @@ class Sessions:
     r"""
     The session factory. Build it with `Laser.sessions`.
     """
+    @staticmethod
+    def turn_topic(kind: builtins.str) -> builtins.str:
+        r"""
+        The default topic a turn `kind` is recorded on.
+        """
+    @staticmethod
+    def turn_kind(topic: builtins.str) -> typing.Optional[builtins.str]:
+        r"""
+        The turn kind recorded on `topic` by default, or None for any other topic.
+        """
     def create(self, id: builtins.str) -> Session:
         r"""
         The durable session named `id`. The conversation derives from `id`, so
@@ -3821,23 +4643,33 @@ class SigningKey:
         The 32-byte public verifying key safe to share with a registry operator.
         """
     def __new__(cls, secret: typing.Sequence[builtins.int]) -> SigningKey: ...
+    def sign(self, envelope: typing.Any) -> typing.Any:
+        r"""
+        Sign `envelope` (the envelope bytes or dict) and return the detached
+        signature dict (`scheme`, `key_id`, `bytes`). The preimage covers the
+        envelope alone.
+        """
+    def sign_with_context(self, envelope: typing.Any, *, content_type: typing.Optional[builtins.str] = None, agent_version: typing.Optional[builtins.int] = None) -> typing.Any:
+        r"""
+        Sign `envelope` binding the interpretation context into the preimage:
+        `content_type` (the `agdx.ct` codec, for example 'cbor') and
+        `agent_version` (the `agdx.av` wire version). A verifier must observe the
+        same headers, so an intermediary cannot flip the codec or version.
+        """
 
 @typing.final
 class SnapshotStore:
     r"""
-    A fold-snapshot store: `save` a checkpoint, `latest` the newest for a
-    conversation. Build with `Laser.kv_snapshot_store` / `topic_snapshot_store`.
+    A fold snapshot store. Build a native store from `Laser`, or wrap a custom backend with `SnapshotStore(backend)`. Its `latest(conversation)` and `save(snapshot)` callbacks can return directly or through an awaitable.
     """
+    def __new__(cls, backend: typing.Any) -> SnapshotStore: ...
     def latest(self, conversation: builtins.str) -> typing.Any:
         r"""
-        The newest snapshot for `conversation` as a dict `{"conversation": str,
-        "as_of": {partition: offset}, "state": bytes}`, or `None` when it has never
-        been snapshotted.
+        The newest snapshot as `{"conversation": str, "as_of": {partition: offset}, "state": bytes}`, or `None`. The offsets are inclusive.
         """
     def save(self, conversation: builtins.str, as_of: typing.Mapping[builtins.int, builtins.int], state: typing.Sequence[builtins.int]) -> typing.Any:
         r"""
-        Persist a checkpoint for `conversation`: `as_of` is the per-partition last
-        folded offset (inclusive), `state` the opaque folded bytes (any codec).
+        Save opaque folded bytes for `conversation`. `as_of` maps each partition to the last folded offset, inclusive. Custom callbacks receive the complete snapshot dict.
         """
 
 @typing.final
@@ -3927,6 +4759,34 @@ class SwarmActivity:
         """
 
 @typing.final
+class SystemClock:
+    r"""
+    The current time in epoch microseconds from the native Rust clock.
+    """
+    def __new__(cls) -> SystemClock: ...
+    def now_micros(self) -> builtins.int: ...
+
+@typing.final
+class TestClock:
+    r"""
+    A shared test clock with native unsigned 64-bit time and wrapping advance.
+    """
+    def __new__(cls, start_micros: builtins.int = 0) -> TestClock: ...
+    def now_micros(self) -> builtins.int: ...
+    def advance(self, by_micros: builtins.int) -> None: ...
+    def set(self, now_micros: builtins.int) -> None: ...
+
+@typing.final
+class TokenBudget:
+    r"""
+    Context policy: keep the newest messages that fit in `max_tokens`
+    estimated tokens, and always at least one. The default estimate is one
+    token for each 4 bytes of payload. `estimator(message) -> int` replaces it,
+    for example with a real tokenizer.
+    """
+    def __new__(cls, max_tokens: builtins.int, estimator: typing.Optional[typing.Any] = None) -> TokenBudget: ...
+
+@typing.final
 class Topic:
     r"""
     One topic: where records live. Publish to it, replay it, ensure it. Build
@@ -3945,25 +4805,66 @@ class Topic:
         model, or any JSON-shaped value is encoded as JSON with `agdx.ct`
         stamped, and the builder is ready to `.send()`.
         """
+    def cbor(self, cls: typing.Optional[typing.Any] = None) -> Topic:
+        r"""
+        The typed handle in the CBOR serde form: the same contract as `cls=`
+        with a binary self-describing body and `agdx.ct=cbor`. `publish(body)`
+        encodes CBOR and `records(reader_name)` decodes it back into `cls`, or
+        into a plain Python object when no class is set.
+        """
+    def schema(self, schema_id: builtins.int, cls: typing.Optional[typing.Any] = None) -> typing.Any:
+        r"""
+        The typed handle bound to registered writer schema `schema_id`: resolves
+        the definition from the managed registry and compiles it once, so every
+        `publish(body)` validates and encodes against it in the client and
+        stamps `agdx.ct` and `agdx.sid`. A body the schema rejects raises
+        `CodecError` before any byte leaves the process. The registry is
+        managed, so this needs Laser Stack or LaserData Cloud. Raises
+        `InvalidError` when the schema is not registered.
+        """
     def records(self, reader_name: builtins.str, *, batch: typing.Optional[builtins.int] = None, from_offsets: typing.Optional[typing.Sequence[builtins.int]] = None) -> TypedRecords:
         r"""
         The typed reader over this topic under the consumer identity
-        `reader_name`,
-        decoding every record into the topic's `cls` (pass `cls=` at
-        `laser.topic(..)`). Own the offsets exactly like `replay()`: persist
-        `offsets` and resume with `from_offsets=`.
+        `reader_name`, decoding every record into the topic's `cls` (pass
+        `cls=` at `laser.topic(..)`, `cbor(..)`, or `schema(..)`). A topic
+        without a class yields each decoded value as a plain Python object.
+        Own the offsets exactly like `replay()`: persist `offsets` and resume
+        with `from_offsets=`.
+        """
+    def send(self, payload: typing.Any, *, headers: typing.Optional[dict] = None, partition_key: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        One raw message with explicit user `headers` (a dict of header name to
+        value), the zero-overhead path. `partition_key` keeps per-key order,
+        `None` lets the producer balance across partitions. Returns the commit
+        confirmations.
+        """
+    def batch(self, payloads: typing.Sequence[typing.Any], *, partition_key: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Many raw payloads in one Iggy send, all sharing `partition_key` (or
+        balanced when `None`). An empty list is a cheap no-op.
+        """
+    def batching(self, *, max_records: typing.Optional[builtins.int] = None, max_bytes: typing.Optional[builtins.int] = None, linger_ms: typing.Optional[builtins.int] = None, partition_key: typing.Optional[builtins.str] = None) -> BatchingProducer:
+        r"""
+        A size-and-time batching publisher over this topic: queued payloads
+        flush as one append when `max_records` or `max_bytes` trips, or after
+        `linger_ms`. `partition_key` keys every batch.
         """
     def publish_batch(self) -> BatchPublishRequest:
         r"""
         Start a batch publish that flushes 1..N records in a single Iggy send.
         """
-    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.int = 0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, message_expiry: builtins.str = 'server_default', max_topic_size: builtins.int = 0) -> Producer:
+    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.int = 0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, message_expiry: builtins.str = 'server_default', max_topic_size: builtins.int = 0, background: builtins.bool = False, background_shards: builtins.int = 1) -> Producer:
         r"""
         Build a Laser direct producer. This is the full streaming hot path
         below the typed publish API: tune batching/linger/retries,
         topology creation, and default key or partition, then `await send(...)`.
+        `background=True` switches to Apache Iggy's buffered, sharded send mode
+        (`background_shards` workers, flushing at `batch_length` records or
+        after `linger_ms`). A send then returns once the record is queued, so
+        call `await producer.shutdown()` before exit or buffered records are
+        lost.
         """
-    def consumer(self, name: builtins.str, *, partition: builtins.int = 0, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 1000, commit_every: typing.Optional[builtins.int] = None, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
+    def consumer(self, name: builtins.str, *, partition: builtins.int = 0, batch_length: builtins.int = 1000, poll_interval_ms: typing.Optional[builtins.int] = None, polling: builtins.str = 'next', offset: typing.Optional[builtins.int] = None, timestamp_micros: typing.Optional[builtins.int] = None, auto_commit: builtins.str = 'polling', commit_interval_ms: builtins.int = 0, commit_every: typing.Optional[builtins.int] = None, polling_retry_interval_ms: builtins.int = 1000, init_retries: typing.Optional[builtins.int] = None, init_retry_interval_ms: builtins.int = 1000, allow_replay: builtins.bool = False) -> Consumer:
         r"""
         Build a Laser reader for one partition. It is an async iterator
         and supports the same polling, batching, replay, retry, and commit modes
@@ -4025,7 +4926,8 @@ class TypedRecord:
     @property
     def value(self) -> typing.Any:
         r"""
-        The payload decoded into the topic's `cls`.
+        The payload decoded into the topic's `cls`, or the plain decoded value
+        when the topic has none.
         """
     @property
     def position(self) -> builtins.str:
@@ -4043,10 +4945,11 @@ class TypedRecord:
 class TypedRecords:
     r"""
     The typed reader over one topic: each `await .next()` yields the next
-    record decoded into the topic's `cls`, `None` when caught up. A record that
-    does not decode raises `TypedDecodeError` naming its log position and the
-    reader moves past it. Build with `Topic.records(reader_name)` on a topic
-    opened with `cls=`.
+    record decoded into the topic's `cls`, `None` when caught up. A topic
+    opened without `cls=` yields the decoded value as a plain Python object. A
+    record that does not decode raises `TypedDecodeError` naming its log
+    position and the reader moves past it. Build with
+    `Topic.records(reader_name)`.
     """
     @property
     def offsets(self) -> builtins.list[builtins.int]:
@@ -4117,6 +5020,11 @@ class WatchReader:
         r"""
         The next offset to read on each partition. Persist this to resume later.
         """
+    def from_offsets(self, offsets: typing.Sequence[builtins.int]) -> WatchReader:
+        r"""
+        Resume from persisted per-partition `offsets` (the value `offsets`
+        returned earlier). Returns the same reader.
+        """
     def poll(self) -> typing.Any:
         r"""
         Drain the change records that landed since the last poll, filtered to the
@@ -4126,8 +5034,7 @@ class WatchReader:
         r"""
         `async for record in reader` drains what landed since the last poll, one
         record per step, and stops (raises `StopAsyncIteration`) when caught up. A
-        fresh `async for` later resumes from the same offsets. Each `poll` fails
-        with `UnsupportedError` when the deployment does not publish the feed.
+        fresh `async for` later resumes from the same offsets.
         """
     def __anext__(self) -> typing.Any: ...
 
@@ -4146,7 +5053,7 @@ class Workflow:
     r"""
     A journalled directed-acyclic workflow over the coordination primitives, the
     Python view of the Rust engine. Declare steps with [`step`](Self::step), set a
-    [`budget`](Self::budget), then `await wf.run(source=...)`. Each step is a
+    [`budget`](Self::budget), then `await wf.run()`. Each step is a
     directed task to its target, ordered by its declared dependencies, with an
     optional verifier panel, exclusivity (a fenced at-most-once effect), an
     on-timeout policy, and a compensation (the saga rollback).
@@ -4161,17 +5068,24 @@ class Workflow:
         `agent_workflow` capability, else `run()` raises `UnsupportedError`
         before any publish.
         """
+    def run_id(self, run_id: builtins.str) -> None:
+        r"""
+        Resume an earlier run: the engine replays that run's journal and skips
+        the steps already recorded complete, re-dispatching only the unfinished
+        ones. Omit it to start a fresh run with its own id.
+        """
     def budget(self, *, tokens: typing.Optional[builtins.int] = None, wall_clock_ms: typing.Optional[builtins.int] = None, invocations: typing.Optional[builtins.int] = None) -> None:
         r"""
         Cap the workflow's spend. Any dimension left `None` is unbounded. The token
         ceiling counts only the usage an AGDX reply carries, so it is advisory.
         """
-    def step(self, label: builtins.str, *, build: typing.Any, to: typing.Optional[builtins.str] = None, to_capable: typing.Optional[builtins.str] = None, all_capable: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, after: typing.Optional[typing.Sequence[builtins.str]] = None, verify: typing.Optional[typing.Any] = None, exclusive: builtins.bool = False, fence_namespace: typing.Optional[builtins.str] = None, on_timeout: builtins.str = 'fail', compensate: typing.Optional[typing.Any] = None) -> None:
+    def step(self, label: builtins.str, *, build: typing.Any, to: typing.Optional[builtins.str] = None, to_capable: typing.Optional[builtins.str] = None, all_capable: typing.Optional[builtins.str] = None, principal: typing.Optional[builtins.int] = None, after: typing.Optional[typing.Sequence[builtins.str]] = None, verify: typing.Optional[typing.Any] = None, exclusive: builtins.bool = False, fence_namespace: typing.Optional[builtins.str] = None, on_timeout: builtins.str = 'fail', compensate: typing.Optional[typing.Any] = None, policy: typing.Optional[typing.Any] = None) -> None:
         r"""
         Add a step. Exactly one target is required: `to` (a named agent),
         `to_capable` (one agent advertising a skill), or `all_capable` (scatter to
         every agent advertising a skill and fold the replies, a verifier panel).
-        `build(outputs) -> bytes` forms the task from the prior outputs. `after`
+        `build(outputs) -> bytes` forms the task from the prior outputs. Build, verify, and compensate callbacks can return directly or through an awaitable. Objects with `build` or `verify` methods also work. Callback exceptions retain their SDK error class.
+        `after`
         declares the dependencies that order the step. `verify(output) -> bool`
         gates completion. `exclusive` claims a fenced lease (needs the managed
         plane). `fence_namespace` also makes the step exclusive and aligns the
@@ -4189,7 +5103,7 @@ class Workflow:
         raises.
         """
 
-def agent_ctx(laser: Laser, message: AgentMessage, *, agent: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, signing_key: typing.Optional[SigningKey] = None) -> AgentCtx:
+def agent_ctx(laser: Laser, message: AgentMessage, *, agent: typing.Optional[builtins.str] = None, respond_on: typing.Optional[builtins.str] = None, fixed_inbox: typing.Optional[builtins.str] = None, signing_key: typing.Optional[SigningKey] = None) -> AgentCtx:
     r"""
     Build an `AgentCtx` for a handler unit test, over a caller-owned `laser` and
     `message`, so a test can call `await handle(ctx, message)` directly without
@@ -4222,6 +5136,16 @@ def authorize_edge(audience: typing.Sequence[builtins.str], scopes: typing.Seque
     reject, nothing to step up to). The transport decodes the token, this decides.
     """
 
+def check_in(store: typing.Any, threshold_bytes: builtins.int, payload: typing.Any) -> typing.Any:
+    r"""
+    Claim-check payloads at or above the threshold through an async blob store.
+    """
+
+def command_from_message_send(record: builtins.str, conversation: builtins.str, source: builtins.str, correlation: builtins.str, params_json: typing.Any) -> typing.Any:
+    r"""
+    Construct an A2A command and keep the original params bytes unchanged.
+    """
+
 def decide(intent: Intent, votes: typing.Sequence[Vote], now_micros: builtins.int) -> typing.Optional[Decision]:
     r"""
     Fold `votes` against `intent` and decide, or return `None` when the
@@ -4229,6 +5153,11 @@ def decide(intent: Intent, votes: typing.Sequence[Vote], now_micros: builtins.in
     deadline. Deterministic: the same intent, vote set, and `now_micros` (once
     past the deadline) always reach the same `Decision`, so a crashed decider
     replays to the identical outcome.
+    """
+
+def decode_snapshot(payload: typing.Any) -> typing.Any:
+    r"""
+    Decode snapshot storage bytes to a dict with conversation, as_of, and state.
     """
 
 def delegated_allow(agent_grants: typing.Sequence[Grant], user_grants: typing.Sequence[Grant], feature: builtins.str, action: builtins.str, resource: typing.Optional[builtins.str] = None) -> builtins.bool:
@@ -4248,9 +5177,19 @@ def edge_id(from_id: builtins.str, edge_type: builtins.str, to_id: builtins.str)
     The content-addressed id for the edge `edge_type` from `from_id` to `to_id`.
     """
 
+def encode_snapshot(snapshot: typing.Any) -> bytes:
+    r"""
+    Encode a snapshot dict as the native named-field CBOR storage bytes.
+    """
+
 def enter_bridge(bridge: builtins.str, previous: typing.Sequence[builtins.str]) -> builtins.list[builtins.str]:
     r"""
     Append a bridge id to `bridge_hops`, rejecting a repeated hop.
+    """
+
+def fuse_reciprocal_rank(signals: typing.Sequence[typing.Sequence[MemoryItem]], limit: builtins.int) -> builtins.list[MemoryItem]:
+    r"""
+    Fuse ranked signals by native reciprocal rank, preserving each item's attribution.
     """
 
 def grants_allow(grants: typing.Sequence[Grant], feature: builtins.str, action: builtins.str, resource: typing.Optional[builtins.str] = None) -> builtins.bool:
@@ -4283,8 +5222,50 @@ def node_id(label: builtins.str, value: builtins.str) -> builtins.str:
     graph shared across languages converges on one node.
     """
 
+def resolve_body(store: typing.Any, payload: typing.Any) -> typing.Any:
+    r"""
+    Resolve a body-reference capsule and verify its native size and digest checks.
+    """
+
+def resume_offsets(snapshot: typing.Any) -> builtins.dict[builtins.int, builtins.int]:
+    r"""
+    Return one past each last folded offset, saturating at the native u64 ceiling.
+    """
+
+def sign_card_value(key: SigningKey, card: typing.Any) -> typing.Any:
+    r"""
+    Sign an A2A card value with the native detached JWS format.
+    """
+
+def task_from_envelope(task_id: builtins.str, envelope: typing.Any) -> typing.Any:
+    r"""
+    Render an AGDX envelope as the native A2A task view.
+    """
+
+def tool_call_from_request(record: builtins.str, conversation: builtins.str, source: builtins.str, correlation: builtins.str, tool_name: builtins.str, params_json: typing.Any) -> typing.Any:
+    r"""
+    Construct an MCP tool command and keep the original params bytes unchanged.
+    """
+
+def tool_result_from_envelope(envelope: typing.Any) -> typing.Any:
+    r"""
+    Render an AGDX envelope as the native MCP content and error view.
+    """
+
+def verify_card(card: typing.Any, signature: typing.Any, verifying_key: typing.Sequence[builtins.int]) -> None:
+    r"""
+    Verify a detached A2A card signature against a 32-byte public key.
+    """
+
+def verify_delegation(registry: KeyRegistry, envelope: typing.Any) -> typing.Optional[tuple[builtins.str, builtins.str]]:
+    r"""
+    Verify the signer and return its signed delegated user, or None.
+    """
+
 
 import asyncio
+
+CONTEXT_READ_WINDOW: builtins.int
 
 class LaserError(Exception):
     code: builtins.str
@@ -4308,6 +5289,8 @@ class LaserError(Exception):
     unconfirmed_count: builtins.int | None
 
 class ConfigError(LaserError): ...
+class NoStreamError(ConfigError): ...
+class NoRespondTopicError(ConfigError): ...
 class TimeoutError(LaserError, builtins.TimeoutError): ...
 class QueryError(LaserError): ...
 class KvError(LaserError): ...
@@ -4319,6 +5302,9 @@ class FilterError(LaserError):
     fault_reason: builtins.str | None
     partition_id: builtins.int | None
     offset: builtins.int | None
+    group_id: builtins.int | None
+    group_name: builtins.str | None
+    identity: builtins.dict[builtins.str, builtins.int] | None
 class SignatureError(LaserError): ...
 class UnsupportedError(LaserError): ...
 class InvalidError(LaserError, builtins.ValueError): ...

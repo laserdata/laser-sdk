@@ -68,7 +68,7 @@ void test("given_open_capabilities_when_records_is_called_then_should_reject_bef
 })
 
 void test("given_watch_capability_when_records_is_called_then_should_open_the_injected_cursor", async () => {
-  const transport = fakeTransport([[polled(changeRecordPayload("orders", 0n, 1n), 0n)]])
+  const transport = fakeTransport([[polled(changeRecordPayload("readings_v1", 0n, 1n), 0n)]])
   const cursor = new Cursor(transport, "ops", "changes", [0])
   const watch = new Watch(
     () => Promise.resolve(CAPS),
@@ -77,26 +77,26 @@ void test("given_watch_capability_when_records_is_called_then_should_open_the_in
   const reader = await watch.records()
   const batch = await reader.poll()
   assert.equal(batch.length, 1)
-  assert.equal(batch[0]?.index, "orders")
+  assert.equal(batch[0]?.index, "readings_v1")
 })
 
 void test("given_an_index_filter_when_polled_then_should_keep_only_matching_records", async () => {
   const transport = fakeTransport([
     [
-      polled(changeRecordPayload("orders", 0n, 1n), 0n),
-      polled(changeRecordPayload("customers", 0n, 1n), 1n)
+      polled(changeRecordPayload("readings_v1", 0n, 1n), 0n),
+      polled(changeRecordPayload("hosts_v1", 0n, 1n), 1n)
     ]
   ])
   const cursor = new Cursor(transport, "ops", "changes", [0])
   const watch = new Watch(
     () => Promise.resolve(CAPS),
     () => Promise.resolve(cursor)
-  ).index("orders")
+  ).index("readings_v1")
   const reader = await watch.records()
   const batch = await reader.poll()
   assert.deepEqual(
     batch.map((record) => record.index),
-    ["orders"]
+    ["readings_v1"]
   )
 })
 
@@ -113,8 +113,8 @@ void test("given_an_undecodable_payload_when_polled_then_should_skip_it", async 
 
 void test("given_multiple_pages_when_streamed_then_should_yield_records_and_stop_once_caught_up", async () => {
   const transport = fakeTransport([
-    [polled(changeRecordPayload("orders", 0n, 1n), 0n)],
-    [polled(changeRecordPayload("orders", 1n, 2n), 1n)],
+    [polled(changeRecordPayload("readings_v1", 0n, 1n), 0n)],
+    [polled(changeRecordPayload("readings_v1", 1n, 2n), 1n)],
     []
   ])
   const cursor = new Cursor(transport, "ops", "changes", [0])

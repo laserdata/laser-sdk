@@ -31,8 +31,8 @@ import _common
 import laser_sdk as ls
 
 EXAMPLE = "recall"
-NAMESPACE = "customer:42"
-FACT = "Prefers aisle seats, travels monthly"
+NAMESPACE = "host:node-7"
+FACT = "node-7 sits in the eu-west pool, rotates keys monthly"
 
 
 async def main() -> None:

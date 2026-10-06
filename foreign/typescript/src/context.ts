@@ -7,12 +7,17 @@ import type { AgentEnvelope } from "./wire/agent.js"
 
 const READ_BATCH = 1_000
 
-// Ceiling on the records one assembly holds in memory per topic. A conversation
-// topic grows without bound, and this read is reachable from bridge requests, so
-// the window keeps the most recent records rather than materializing the whole
-// history. Selection policies want the newest records, so the oldest are the
-// ones dropped.
-const MAX_CONTEXT_RECORDS = 10_000
+/**
+ * The most raw records one context read examines in each partition, the same
+ * window the Rust and Python SDKs use. An open read takes the newest records
+ * before the current tail, and a point-in-time read the newest records before
+ * the checkpoint, then keeps the ones of the conversation. Turns older than the
+ * window on a busy shared partition are outside the read, so a long
+ * conversation saves state with a checkpoint and replays from it.
+ */
+export const CONTEXT_READ_WINDOW = 10_000
+
+const WINDOW = BigInt(CONTEXT_READ_WINDOW)
 
 export interface ContextMessage {
   readonly id: MessageId
@@ -159,7 +164,7 @@ export class TokenBudget implements ContextPolicy {
   }
 }
 
-interface ContextAssemblerOptions {
+export interface ContextAssemblerOptions {
   readonly conversation: ConversationId
   readonly acrossSubconversations: boolean
   readonly topics: readonly string[]
@@ -194,8 +199,8 @@ export class ContextAssemblerBuilder {
     return this
   }
 
-  /** One offset map shared by every topic. `fromCheckpoint` takes precedence
-   * for the topics it names. */
+  /** One offset map shared by every topic. If `fromCheckpoint` is set, it
+   * replaces this map for every topic. Missing checkpoint positions start at zero. */
   fromOffsets(offsets: ReadonlyMap<number, bigint>): this {
     this.offsets = new Map(offsets)
     return this
@@ -239,20 +244,32 @@ export class ContextAssembler {
         const collected: (ContextMessage & { readonly topicIndex: number })[] = []
         // A topic nobody has written yet has no history, same as in Rust.
         if ((await laser.topic(topic).partitionCount()) === undefined) return collected
-        const cursor = await laser.topic(topic).replay({ batchSize: READ_BATCH })
-        const resume = this.options.fromCheckpoint?.topicOffsets(topic)
-        cursor.fromOffsets(resume ?? this.options.fromOffsets)
+        const handle = laser.topic(topic)
+        const cursor = await handle.replay({ batchSize: READ_BATCH })
+        const partitions = [...cursor.offsets.keys()]
+        const resume = this.options.fromCheckpoint
+        const from = (partition: number): bigint =>
+          resume === undefined
+            ? (this.options.fromOffsets.get(partition) ?? 0n)
+            : (resume.topicOffsets(topic)?.get(partition) ?? 0n)
+        // A checkpoint holds the next offset to write, so a point-in-time read
+        // ends before it, and a partition it does not name existed only after
+        // it and reads as empty. An open read ends at the tail seen now.
         const stop = this.options.toCheckpoint
-        if (stop !== undefined) {
-          // A checkpoint holds the next offset to write, so a partition it does
-          // not name existed only after it and reads as empty.
-          const ends = stop.topicOffsets(topic) ?? new Map<number, bigint>()
-          cursor.until(
-            new Map(
-              [...cursor.offsets.keys()].map((partition) => [partition, ends.get(partition) ?? 0n])
-            )
-          )
+        const ends =
+          stop === undefined
+            ? await handle.tailOffsets()
+            : (stop.topicOffsets(topic) ?? new Map<number, bigint>())
+        const starts = new Map<number, bigint>()
+        const bounds = new Map<number, bigint>()
+        for (const partition of partitions) {
+          const end = ends.get(partition) ?? 0n
+          const windowStart = end > WINDOW ? end - WINDOW : 0n
+          const start = from(partition)
+          starts.set(partition, start > windowStart ? start : windowStart)
+          bounds.set(partition, end)
         }
+        cursor.fromOffsets(starts).until(bounds)
         for (;;) {
           const records = await cursor.poll()
           if (records.length === 0) break
@@ -270,7 +287,6 @@ export class ContextAssembler {
               topic,
               topicIndex
             })
-            if (collected.length > MAX_CONTEXT_RECORDS) collected.shift()
           }
         }
         return collected

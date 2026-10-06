@@ -762,9 +762,9 @@ mod tests {
                     format: TimestampFormat::EpochMillis,
                 },
             ),
-            FilterExpr::pred_as("amount", CmpOp::Gt, "12.50", Coerce::Number),
+            FilterExpr::pred_as("cpu", CmpOp::Gt, "12.50", Coerce::Number),
             FilterExpr::pred_as(
-                "amount",
+                "cpu",
                 CmpOp::In,
                 TypedValue::List(vec!["1".into(), 2_i64.into()]),
                 Coerce::Number,
@@ -784,9 +784,9 @@ mod tests {
                     format: TimestampFormat::Rfc3339,
                 },
             ),
-            FilterExpr::pred_as("amount", CmpOp::Gt, "1e5", Coerce::Number),
-            FilterExpr::pred_as("amount", CmpOp::Contains, "1", Coerce::Number),
-            FilterExpr::pred_as("amount", CmpOp::Gt, 1.5, Coerce::Number),
+            FilterExpr::pred_as("cpu", CmpOp::Gt, "1e5", Coerce::Number),
+            FilterExpr::pred_as("cpu", CmpOp::Contains, "1", Coerce::Number),
+            FilterExpr::pred_as("cpu", CmpOp::Gt, 1.5, Coerce::Number),
         ];
         for expr in invalid {
             assert!(

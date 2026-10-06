@@ -112,12 +112,12 @@ def demonstrate_edge_auth() -> None:
     authorized, challenge = ls.authorize_edge(
         ["mcp.laserdata"], ["tool:read"], "mcp.laserdata", "tool:write"
     )
-    print(f"edge write authorized: {authorized}, challenge={challenge}")
+    print(f"edge write step-up challenge: {challenge}")
 
     authorized, challenge = ls.authorize_edge(
         ["other.server"], ["tool:write"], "mcp.laserdata", "tool:write"
     )
-    print(f"foreign audience authorized: {authorized}, challenge={challenge}")
+    print(f"foreign audience rejected: {not authorized}")
 
 
 async def submit_budgeted_run(laser) -> None:

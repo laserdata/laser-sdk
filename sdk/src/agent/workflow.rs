@@ -1103,12 +1103,12 @@ mod tests {
     #[test]
     fn given_a_linear_chain_when_ordered_then_should_follow_the_dependencies() {
         let steps = vec![
-            step("credit", &["diagnose"]),
+            step("rollback", &["diagnose"]),
             step("triage", &[]),
             step("diagnose", &["triage"]),
         ];
         let order = topological_order(&steps).expect("a chain is acyclic");
-        assert_eq!(labels(&steps, &order), ["triage", "diagnose", "credit"]);
+        assert_eq!(labels(&steps, &order), ["triage", "diagnose", "rollback"]);
     }
 
     #[test]

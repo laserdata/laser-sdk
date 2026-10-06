@@ -26,9 +26,9 @@ class TokenEmbedder implements Embedder {
   embed(text: string): Promise<readonly number[]> {
     const lower = text.toLowerCase()
     return Promise.resolve([
-      lower.includes("checkout") ? 1 : 0,
+      lower.includes("auth") ? 1 : 0,
       lower.includes("latency") ? 1 : 0,
-      lower.includes("invoice") ? 1 : 0
+      lower.includes("job") ? 1 : 0
     ])
   }
 }
@@ -129,19 +129,19 @@ void test("given_a_tombstone_when_recalling_then_should_remove_the_target", asyn
 
 void test("given_semantic_memory_when_keyword_and_hybrid_recall_run_then_should_rank_matches", async () => {
   const handle = MemoryHandle.vector(new TokenEmbedder())
-  await handle.remember(encoder.encode("the invoice INV-77 was disputed")).send()
+  await handle.remember(encoder.encode("the job JOB-77 was retried")).send()
   await handle.remember(encoder.encode("a routine turn with nothing notable")).send()
   assert.equal(
     bodies(await handle.recall().keyword("INV-77").fetch())[0],
-    "the invoice INV-77 was disputed"
+    "the job JOB-77 was retried"
   )
 
   const semantic = MemoryHandle.vector(new TokenEmbedder())
-  await semantic.remember(encoder.encode("checkout latency traces to the database pool")).send()
+  await semantic.remember(encoder.encode("auth latency traces to the database pool")).send()
   await semantic.remember(encoder.encode("a routine turn with nothing notable")).send()
   assert.equal(
-    bodies(await semantic.recall().hybrid("checkout latency").fetch())[0],
-    "checkout latency traces to the database pool"
+    bodies(await semantic.recall().hybrid("auth latency").fetch())[0],
+    "auth latency traces to the database pool"
   )
 })
 
@@ -167,7 +167,7 @@ void test("given_optional_scope_dimensions_when_unset_then_should_widen_recall",
     bodies(
       await memory.recall({ lifetime: Lifetime.Durable }, { strategy: RecallStrategy.Recent })
     ),
-    ["second"]
+    ["second", "first"]
   )
 })
 
@@ -213,10 +213,16 @@ void test("given_ranked_signals_when_fused_then_should_reward_agreement", () => 
 })
 
 void test("given_more_items_than_the_limit_when_consolidated_then_should_forget_the_oldest", async () => {
-  const handle = MemoryHandle.vector()
-  await handle.remember(encoder.encode("first")).send()
-  await handle.remember(encoder.encode("second")).send()
-  await handle.remember(encoder.encode("third")).send()
-  assert.deepEqual(await handle.consolidate({}, 2), { scanned: 3, kept: 2, forgotten: 1 })
+  const store = new VectorMemory()
+  await store.append({}, MemoryId.fromU128(1n), MemoryKind.Fact, encoder.encode("first"))
+  await store.append({}, MemoryId.fromU128(2n), MemoryKind.Fact, encoder.encode("second"))
+  await store.append({}, MemoryId.fromU128(3n), MemoryKind.Fact, encoder.encode("third"))
+  const handle = new MemoryHandle(store)
+  assert.deepEqual(await handle.consolidate({}, 2), {
+    summarized: 0,
+    reweighted: 0,
+    pruned: 1,
+    derived: 0
+  })
   assert.deepEqual(bodies(await handle.recall().fetch()), ["third", "second"])
 })

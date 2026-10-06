@@ -143,6 +143,12 @@ export interface Feedback {
 }
 
 export interface Memory {
+  append?(
+    scope: MemoryScope,
+    id: MemoryId,
+    kind: MemoryKind,
+    payload: Uint8Array
+  ): Promise<MemoryId>
   remember(scope: MemoryScope, payload: Uint8Array): Promise<MemoryId>
   recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>
   improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId>
@@ -157,14 +163,34 @@ export interface Reranker {
   rerank(query: string, items: readonly MemoryItem[]): Promise<readonly MemoryItem[]>
 }
 
+/** Folds a batch of session bodies into one durable summary body. A model
+ * client, a template, or a hosted summarize API lives in application code. */
+export interface Summarizer {
+  summarize(bodies: readonly Uint8Array[]): Promise<Uint8Array>
+}
+
+/** The optional passes of one consolidation run. */
+export interface ConsolidateOptions {
+  /** Adds the summarize pass: the `message` items in the scope are folded
+   * through this into one durable summary per pass. */
+  readonly summarizer?: Summarizer
+  /** Forgets the items a summarize pass folded, so the summary replaces them. */
+  readonly pruneSummarized?: boolean
+}
+
 export interface ConsolidationReport {
-  readonly scanned: number
-  readonly kept: number
-  readonly forgotten: number
+  /** Items folded into durable summaries. */
+  readonly summarized: number
+  /** Items whose recall weights changed through feedback. */
+  readonly reweighted: number
+  /** Items successfully pruned. */
+  readonly pruned: number
+  /** New facts or graph edges derived. */
+  readonly derived: number
 }
 
 export interface Consolidator {
-  consolidate(memory: Memory, scope: MemoryScope): Promise<ConsolidationReport>
+  consolidate(scope: MemoryScope, signal?: AbortSignal): Promise<ConsolidationReport>
 }
 
 export function toContextBlock(items: readonly MemoryItem[], tokenBudget?: number): string {

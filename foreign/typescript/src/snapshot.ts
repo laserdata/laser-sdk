@@ -13,6 +13,17 @@ export interface SnapshotStore {
   save(snapshot: FoldSnapshot): Promise<void>
 }
 
+/** Encode a fold snapshot to the named-field CBOR bytes used by Rust. */
+export function encodeSnapshot(snapshot: FoldSnapshot): Uint8Array {
+  return encodeNamed(encodeFoldSnapshot(snapshot))
+}
+
+/** Decode a fold snapshot from its stored bytes. */
+export function decodeSnapshot(payload: Uint8Array): FoldSnapshot {
+  const context = "fold snapshot"
+  return decodeFoldSnapshot(expectMap(decodeOne(payload, context), context), context)
+}
+
 function sameConversation(left: ConversationId, right: SdkConversationId): boolean {
   return left.toString() === right.toString()
 }

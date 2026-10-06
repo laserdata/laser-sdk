@@ -10,20 +10,20 @@ import {
 } from "../common.js"
 
 export const EXAMPLE = "query"
-const TOPIC = "orders"
-const INDEX = indexFor("orders_v1")
-const FIELDS = ["id", "total", "status"]
+const TOPIC = "readings"
+const INDEX = indexFor("readings_v1")
+const FIELDS = ["host", "cpu", "status"]
 
-interface Order {
-  readonly id: number
-  readonly total: number
+interface Reading {
+  readonly host: string
+  readonly cpu: number
   readonly status: string
 }
 
-const ORDERS: readonly Order[] = [
-  { id: 1, total: 99, status: "paid" },
-  { id: 2, total: 42, status: "pending" },
-  { id: 3, total: 15, status: "paid" }
+const READINGS: readonly Reading[] = [
+  { host: "node-1", cpu: 42, status: "ok" },
+  { host: "node-2", cpu: 91, status: "degraded" },
+  { host: "node-3", cpu: 17, status: "ok" }
 ]
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
@@ -32,26 +32,26 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   phase("keep a queryable view of a topic, then query it")
   await laser.topic(TOPIC).ensure(PARTITIONS)
-  // Declare this run's `orders_v1_<token>` view over `orders`. From here the
+  // Declare this run's `readings_v1_<token>` view over `readings`. From here the
   // view maintains itself: every record published to the topic lands in the
   // table, and the per-run name means the counts below are this run's alone.
   await ensureView(laser, TOPIC, INDEX, FIELDS)
 
-  for (const order of ORDERS) {
-    await laser.topic(TOPIC).publish().json(order).send()
+  for (const reading of READINGS) {
+    await laser.topic(TOPIC).publish().json(reading).send()
   }
-  await waitForProjection(laser, INDEX, ORDERS.length)
+  await waitForProjection(laser, INDEX, READINGS.length)
 
   // `whereEq` matches an indexed key, the cheap path a projection's key columns
   // answer directly. `filterEq` and its siblings cover the rest.
-  const paid = await laser.query(INDEX).whereEq("status", "paid").limit(10).fetch()
+  const degraded = await laser.query(INDEX).whereEq("status", "degraded").limit(10).fetch()
 
-  console.log(`  ${String(paid.rows.length)} of ${String(ORDERS.length)} orders are paid`)
-  for (const row of paid.rows) {
-    const id = queryResultValue(paid, row, "id")
-    const total = queryResultValue(paid, row, "total")
+  console.log(`  ${String(degraded.rows.length)} of ${String(READINGS.length)} hosts are degraded`)
+  for (const row of degraded.rows) {
+    const host = queryResultValue(degraded, row, "host")
+    const cpu = queryResultValue(degraded, row, "cpu")
     console.log(
-      `    order #${id === undefined ? "?" : typedValueDiagnosticText(id)} total ${total === undefined ? "?" : typedValueDiagnosticText(total)}`
+      `    host ${host === undefined ? "?" : typedValueDiagnosticText(host)} cpu ${cpu === undefined ? "?" : typedValueDiagnosticText(cpu)}`
     )
   }
 }

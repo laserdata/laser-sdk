@@ -1,5 +1,6 @@
 import {
   ContentType,
+  decodeUtf8,
   Laser,
   parseProjectionId,
   type Capabilities,
@@ -64,8 +65,8 @@ export function streamFor(example: string, env: NodeJS.ProcessEnv = process.env)
 }
 
 /**
- * A managed index name owned by this invocation (`orders_v1` becomes
- * `orders_v1_<token>`), so a repeat or concurrent run materializes its own
+ * A managed index name owned by this invocation (`readings_v1` becomes
+ * `readings_v1_<token>`), so a repeat or concurrent run materializes its own
  * rows instead of counting a previous run's.
  */
 export function indexFor(base: string): string {
@@ -150,15 +151,6 @@ export function batchSize(fallback: number, env: NodeJS.ProcessEnv = process.env
   return Math.max(1, envInteger("LASER_BATCH", fallback, env))
 }
 
-export function concurrency(fallback: number, env: NodeJS.ProcessEnv = process.env): number {
-  return Math.max(1, envInteger("LASER_CONCURRENCY", fallback, env))
-}
-
-export function payloadBytes(fallback: number, env: NodeJS.ProcessEnv = process.env): number {
-  const value = envInteger("LASER_PAYLOAD_BYTES", fallback, env)
-  return value >= 0 ? value : fallback
-}
-
 export function envInteger(
   name: string,
   fallback: number,
@@ -207,8 +199,7 @@ export class Rng {
   }
 }
 
-export const utf8 = (value: string): Uint8Array => new TextEncoder().encode(value)
-export const decodeUtf8 = (value: Uint8Array): string => new TextDecoder().decode(value)
+export { decodeUtf8, utf8 } from "@laserdata/laser-sdk"
 
 export function printHits(label: string, hits: readonly MemoryItem[]): void {
   console.log(label)
@@ -265,7 +256,7 @@ export const PROJECTION_POLL_MS = 150
 /**
  * Declares `index` over `topic` on a managed deployment and waits until it answers
  * queries, so a publish that follows flows into a live projector. The index is
- * named separately from its source topic (`orders` produces `orders_v1`), the
+ * named separately from its source topic (`readings` produces `readings_v1`), the
  * convention that lets a view be versioned without renaming the topic.
  * Index-only, so each record's own inline-payload choice decides inlining, and
  * notify-enabled, so a reader can await the view's advance instead of

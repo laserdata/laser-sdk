@@ -2,8 +2,8 @@ import { ConversationId, type Laser } from "@laserdata/laser-sdk"
 import { PARTITIONS, decodeUtf8, phase, runExample, utf8 } from "../common.js"
 
 export const EXAMPLE = "recall"
-const NAMESPACE = "customer:42"
-const FACT = "Prefers aisle seats, travels monthly"
+const NAMESPACE = "host:node-7"
+const FACT = "node-7 sits in the eu-west pool, rotates keys monthly"
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   // Memory records ride the well-known agent topics, created once here.

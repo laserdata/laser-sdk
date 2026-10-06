@@ -32,9 +32,9 @@ use tracing::info;
 // every branch is target-filtered to its agent on the shared commands topic. A
 // managed deployment advertises per-agent inboxes and uses the default
 // `InboxRoute::Advertised` with no example change. Presence advertisement is the
-// one capability-gated piece: it lights up the console's presence panel against the
-// Iggy and is a harmless no-op against Iggy (the registry,
-// contracts, and workflow panels work on both).
+// one capability-gated piece: a managed deployment records it, and it is a
+// no-op against Apache Iggy (the registry, contracts, and workflows work on
+// both).
 //
 //   cargo run --release --example orchestra
 
@@ -43,7 +43,7 @@ const CLASSIFY: &str = "classify";
 const DIAGNOSE: &str = "diagnose";
 const REMEDIATE: &str = "remediate";
 const SLOW_TASK: &str = "slow-task";
-const INCIDENT: &str = "checkout API latency spike";
+const INCIDENT: &str = "auth API latency spike";
 const ORCHESTRATOR: &str = "orchestrator";
 
 #[tokio::main]

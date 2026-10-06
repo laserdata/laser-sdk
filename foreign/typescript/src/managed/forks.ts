@@ -1,5 +1,5 @@
 import type { Capabilities } from "../client/capabilities.js"
-import { ForkExecutionError } from "../client/errors.js"
+import { ForkExecutionError, InvalidError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
 import {
   ForkCreateCommand,
@@ -194,9 +194,14 @@ export class ForkPutRequest {
     return this
   }
 
-  /** Attaches an embedding encoded as a JSON array. */
-  embedding(embedding: string): this {
-    this.forkEmbedding = embedding
+  /** Attaches an embedding vector. It travels as a JSON array literal, and a
+   * non-finite component is rejected. */
+  embedding(embedding: Iterable<number>): this {
+    const components = [...embedding]
+    if (!components.every((component) => Number.isFinite(component))) {
+      throw new InvalidError("embedding components must be finite numbers")
+    }
+    this.forkEmbedding = JSON.stringify(components)
     return this
   }
 

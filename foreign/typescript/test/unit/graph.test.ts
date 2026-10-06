@@ -77,7 +77,7 @@ void test("given_open_capabilities_when_fetch_is_called_then_should_reject_befor
 })
 
 void test("given_a_neighbors_call_when_run_then_should_use_the_neighbors_command", async () => {
-  const alice = graphNodeEntity("customer", "alice")
+  const alice = graphNodeEntity("host", "node-7")
   const { graph: handle, transport } = graph("kg", [okFrame(EMPTY_RESULT)])
   const result = await handle.neighbors(alice.id, "out", "opened", 1)
   assert.deepEqual(result, EMPTY_RESULT)
@@ -86,12 +86,12 @@ void test("given_a_neighbors_call_when_run_then_should_use_the_neighbors_command
 
 void test("given_a_link_call_when_run_then_should_upsert_both_nodes_and_the_edge", async () => {
   const { graph: handle, transport } = graph("kg", [okFrame(EMPTY_RESULT)])
-  await handle.link("customer:alice", "opened", "ticket:7")
+  await handle.link("host:node-7", "opened", "ticket:7")
   assert.equal(transport.calls[0]?.code, GraphUpsertCommand.code)
 })
 
 void test("given_a_stale_edge_when_relink_is_called_then_should_supersede_it_and_link_the_new_target", async () => {
-  const alice = graphNodeEntity("customer", "alice")
+  const alice = graphNodeEntity("host", "node-7")
   const ticket7 = graphNodeEntity("ticket", "7")
   const staleEdge: GraphEdge = graphEdgeRelate(alice, "opened", ticket7)
   const alreadyClosedEdge: GraphEdge = {
@@ -104,7 +104,7 @@ void test("given_a_stale_edge_when_relink_is_called_then_should_supersede_it_and
     okFrame(EMPTY_RESULT),
     okFrame(EMPTY_RESULT)
   ])
-  const closed = await handle.relink("customer:alice", "opened", "ticket:9")
+  const closed = await handle.relink("host:node-7", "opened", "ticket:9")
   assert.equal(closed, 1)
   assert.equal(transport.calls.length, 3)
   assert.equal(transport.calls[0]?.code, GraphNeighborsCommand.code)
@@ -113,18 +113,18 @@ void test("given_a_stale_edge_when_relink_is_called_then_should_supersede_it_and
 })
 
 void test("given_an_already_matching_edge_when_relink_is_called_then_should_not_supersede_it", async () => {
-  const alice = graphNodeEntity("customer", "alice")
+  const alice = graphNodeEntity("host", "node-7")
   const ticket7 = graphNodeEntity("ticket", "7")
   const matchingEdge: GraphEdge = graphEdgeRelate(alice, "opened", ticket7)
   const liveResult: GraphResult = { nodes: [], edges: [matchingEdge], paths: [] }
   const { graph: handle } = graph("kg", [okFrame(liveResult), okFrame(EMPTY_RESULT)])
-  const closed = await handle.relink("customer:alice", "opened", "ticket:7")
+  const closed = await handle.relink("host:node-7", "opened", "ticket:7")
   assert.equal(closed, 0)
 })
 
 void test("given_an_unlink_call_when_run_then_should_upsert_a_closed_edge", async () => {
   const { graph: handle, transport } = graph("kg", [okFrame(EMPTY_RESULT)])
-  await handle.unlink("customer:alice", "opened", "ticket:7")
+  await handle.unlink("host:node-7", "opened", "ticket:7")
   assert.equal(transport.calls[0]?.code, GraphUpsertCommand.code)
 })
 

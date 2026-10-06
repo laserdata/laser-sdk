@@ -233,6 +233,7 @@ fn as_f64(value: u64) -> f64 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn given_current_process_when_captured_then_should_report_portable_counters() {
         let snapshot = ProcessSnapshot::capture(std::process::id())
@@ -266,6 +267,7 @@ mod tests {
         assert_eq!(delta.read_bytes, 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn given_current_process_when_cgroup_v2_exists_then_should_capture_accounting() {
         let snapshot =

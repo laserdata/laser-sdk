@@ -59,13 +59,13 @@ FIELDS = [
 ]
 
 SERVICES = [
-    "checkout",
-    "catalog",
+    "config",
+    "storage",
     "search",
     "auth",
-    "payments",
-    "shipping",
-    "inventory",
+    "metrics",
+    "scheduler",
+    "worker",
     "recommend",
     "notify",
     "gateway",
@@ -74,12 +74,12 @@ REGIONS = ["us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-south-1", 
 ENVIRONMENTS = ["prod", "staging", "dev"]
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 ROUTES = [
-    "/home",
-    "/product/42",
+    "/api/v1/hosts",
+    "/api/v1/hosts/42",
     "/search",
-    "/cart",
-    "/checkout",
-    "/api/v1/orders",
+    "/api/v1/jobs",
+    "/api/v1/jobs/7",
+    "/api/v1/metrics",
     "/api/v1/users",
     "/healthz",
     "/metrics",

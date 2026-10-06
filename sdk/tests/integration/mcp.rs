@@ -38,7 +38,7 @@ impl AgentHandler for Tool {
 #[serial_test::serial(integration)]
 async fn given_a_tools_call_when_the_tool_replies_then_should_render_the_mcp_result() {
     let laser = harness::laser().await;
-    Agent::builder()
+    let _agent_lifetime_1 = Agent::builder()
         .id("tool-worker"
             .parse()
             .expect("tool-worker is a valid agent id"))

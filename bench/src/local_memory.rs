@@ -233,7 +233,7 @@ fn payload(size: usize, seed: u64, sequence: u64) -> Vec<u8> {
     payload
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

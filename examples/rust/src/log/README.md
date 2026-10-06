@@ -1,14 +1,14 @@
 # log - the Log primitive
 
-A topic stores records in append order under its retention policy. This example publishes typed orders and reads them by offset.
+A topic stores records in append order under its retention policy. This example publishes typed host readings and reads them by offset.
 
 ## What it shows
 
 - Connect once with `laser_examples::laser(..)`.
-- Create a topic (`laser.stream("shop").topic("orders")`) with `ensure(2)`.
-- Publish two JSON messages (`topic.publish().json(&order)?.send()`).
-- Read them back through one typed handle (`topic.json::<Order>().records(..)`), draining from offset 0 until caught up.
-- Run it twice against the same retained topic to read four orders on the second run. Each new reader starts at offset 0.
+- Create a topic (`laser.stream("fleet").topic("readings")`) with `ensure(2)`.
+- Publish two JSON messages (`topic.publish().json(&reading)?.send()`).
+- Read them back through one typed handle (`topic.json::<Reading>().records(..)`), draining from offset 0 until caught up.
+- Run it twice against the same retained topic to read four readings on the second run. Each new reader starts at offset 0.
 
 ## Run it
 

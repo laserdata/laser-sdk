@@ -24,7 +24,7 @@ pub const IDX_PREFIX: &str = "agdx.idx.";
 /// scalars and metadata while Iggy keeps the original body in the log.
 pub const INLINE_PAYLOAD: &str = "agdx.inline";
 /// Header key: which projection a record routes to. Opaque string by design
-/// (a name + version like `"order.v1"`), deliberately distinct from `agdx.sid`,
+/// (a name + version like `"reading.v1"`), deliberately distinct from `agdx.sid`,
 /// which selects a codec's writer schema rather than a materialization rule.
 pub const PROJECTION_REF: &str = "agdx.ref";
 /// Header key for the generic request/reply correlation id. Short on purpose

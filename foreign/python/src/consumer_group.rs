@@ -107,7 +107,7 @@ impl PyConsumerGroup {
     /// as the Rust builder. Use `auto_commit="disabled"` plus
     /// `commit(message)` for commit-after-handle delivery. `batch_length`
     /// also bounds the source records one partition poll examines.
-    #[pyo3(signature = (*, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=1000, commit_every=None, auto_join_group=true, create_group=true, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
+    #[pyo3(signature = (*, batch_length=1000, poll_interval_ms=None, polling="next", offset=None, timestamp_micros=None, auto_commit="polling", commit_interval_ms=0, commit_every=None, auto_join_group=true, create_group=true, polling_retry_interval_ms=1000, init_retries=None, init_retry_interval_ms=1000, allow_replay=false))]
     #[allow(clippy::too_many_arguments)]
     fn consumer(
         &self,

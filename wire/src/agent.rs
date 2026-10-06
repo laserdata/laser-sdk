@@ -328,7 +328,7 @@ impl<'de> Deserialize<'de> for LogPosition {
 /// A producer-supplied business idempotency key: non-empty, at most 64 bytes.
 ///
 /// A readable string by design, often a natural business key like
-/// `order-123-attempt-2`, so consoles and dead-letter capsules stay debuggable.
+/// `job-123-attempt-2`, so consoles and dead-letter capsules stay debuggable.
 /// The reliable consumer's dedup store hashes it internally.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -2037,7 +2037,7 @@ mod tests {
 
     #[test]
     fn given_an_idempotency_key_when_validated_then_should_enforce_the_cap() {
-        assert!("order-123-attempt-2".parse::<IdempotencyKey>().is_ok());
+        assert!("job-123-attempt-2".parse::<IdempotencyKey>().is_ok());
         assert!("".parse::<IdempotencyKey>().is_err());
         assert!("x".repeat(65).parse::<IdempotencyKey>().is_err());
     }
@@ -2282,7 +2282,7 @@ mod tests {
     #[test]
     fn given_an_agent_card_when_validated_then_should_enforce_the_caps() {
         let card = AgentCard {
-            name: Some("trip-planner".to_owned()),
+            name: Some("rollout-planner".to_owned()),
             version: Some("1.4.2".to_owned()),
             capabilities: vec![
                 CapabilityDescriptor {
@@ -2295,7 +2295,7 @@ mod tests {
                     health: Some(Health::Healthy),
                     load: Some(250),
                 },
-                descriptor("search_flights"),
+                descriptor("plan_rollout"),
             ],
             ttl_micros: Some(30_000_000),
         };
@@ -2481,11 +2481,11 @@ mod wire_tests {
         )
         .with_target("target-agent".parse().expect("valid agent id"))
         .with_cause(RecordId::from_u128(6), Some(LogPosition::new(1, 2, 3, 44)))
-        .with_idempotency_key("order-1".parse().expect("valid key"))
+        .with_idempotency_key("job-1".parse().expect("valid key"))
         .with_deadline_micros(1_700_000_000_000_000)
         .with_operation("chat")
         .with_tool("search")
-        .with_metadata("customer_tier", "gold");
+        .with_metadata("pool", "eu-west");
         let bytes = encode_named(&envelope).expect("encodes");
         let back: AgentEnvelope = decode_named(&bytes).expect("decodes");
         assert_eq!(back, envelope);

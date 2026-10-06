@@ -21,8 +21,8 @@ import {
 
 void test("query envelope round trips the breaking target and typed-value contract", () => {
   const query = {
-    ...newQuery(operationalTarget("orders"), QueryExecutionId.fromU128(1n), 10_000n),
-    byKey: [{ field: "tenant", value: { kind: "string" as const, value: "acme" } }],
+    ...newQuery(operationalTarget("readings"), QueryExecutionId.fromU128(1n), 10_000n),
+    byKey: [{ field: "region", value: { kind: "string" as const, value: "eu-west" } }],
     page: { limit: 20, offset: 40n, wantTotal: true }
   }
   validateQuery(query)
@@ -39,7 +39,7 @@ void test("typed result rows are positional and preserve non-string values", () 
   const executionId = QueryExecutionId.fromU128(2n)
   const result: QueryResult = {
     fields: [
-      { id: 1, name: "amount", required: true, fieldType: { kind: "long" } },
+      { id: 1, name: "cpu", required: true, fieldType: { kind: "long" } },
       { id: 2, name: "payload", required: true, fieldType: { kind: "binary" } }
     ],
     rows: [
@@ -56,7 +56,7 @@ void test("typed result rows are positional and preserve non-string values", () 
       engine: { name: "datafusion", version: "50" },
       resolvedTarget: {
         kind: "operational",
-        index: "orders",
+        index: "readings",
         backendResourceId: BackendResourceId.fromU128(3n),
         backendGeneration: 1n,
         runtimeConfigurationRevision: 1n
@@ -72,7 +72,7 @@ void test("typed result rows are positional and preserve non-string values", () 
   }
   const row = result.rows[0]
   assert.ok(row !== undefined)
-  assert.deepEqual(queryResultValue(result, row, "amount"), {
+  assert.deepEqual(queryResultValue(result, row, "cpu"), {
     kind: "long",
     value: 42n
   })
@@ -81,8 +81,8 @@ void test("typed result rows are positional and preserve non-string values", () 
 
 void test("query validation rejects ambiguous requests and malformed replies", () => {
   const query = {
-    ...newQuery(operationalTarget("orders"), QueryExecutionId.fromU128(1n), 10_000n),
-    rawSql: { dialect: "data_fusion" as const, sql: "SELECT * FROM orders", params: [] },
+    ...newQuery(operationalTarget("readings"), QueryExecutionId.fromU128(1n), 10_000n),
+    rawSql: { dialect: "data_fusion" as const, sql: "SELECT * FROM readings", params: [] },
     select: { fields: ["id"], payload: false }
   }
   assert.throws(() => {
@@ -99,7 +99,7 @@ void test("query validation rejects ambiguous requests and malformed replies", (
       engine: { name: "embedded", version: "1" },
       resolvedTarget: {
         kind: "operational",
-        index: "orders",
+        index: "readings",
         backendResourceId: BackendResourceId.fromU128(3n),
         backendGeneration: 1n,
         runtimeConfigurationRevision: 1n
@@ -133,10 +133,10 @@ void test("query validation rejects ambiguous requests and malformed replies", (
 })
 
 void test("consistency and page helpers do not fabricate stronger reads or totals", () => {
-  assert.equal(consistencyGateCheck(100n, 100n, "read_your_writes", "orders"), undefined)
-  assert.deepEqual(consistencyGateCheck(41n, 57n, "strong", "orders"), {
+  assert.equal(consistencyGateCheck(100n, 100n, "read_your_writes", "readings"), undefined)
+  assert.deepEqual(consistencyGateCheck(41n, 57n, "strong", "readings"), {
     kind: "stale",
-    what: "orders",
+    what: "readings",
     applied: 41n,
     required: 57n
   })

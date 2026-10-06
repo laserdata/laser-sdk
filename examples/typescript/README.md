@@ -1,6 +1,6 @@
 # LaserData -Laser SDK examples - TypeScript
 
-The TypeScript examples mirror the Rust and Python catalog: nine tiny primitive examples plus the nine non-benchmark deep-dive scenarios. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
+The TypeScript examples cover the Rust and Python catalog: nine tiny primitive examples plus the nine non-benchmark deep-dive scenarios. The deep-dive scenarios are shorter than their Rust counterparts and exercise the same primitives. Each example uses the public `@laserdata/laser-sdk` package, the shared connection helper in `src/common.ts`, deterministic input, bounded waits, and the same managed capability gates as the other languages.
 
 Run the commands below from `examples/typescript`.
 
@@ -55,15 +55,13 @@ Set `LASER_STREAM` to the stream provisioned for the deployment. The helper uses
 | `LASER_USERNAME`, `LASER_PASSWORD` | Username and password used with `LASER_SERVER` |
 | `LASER_TLS_CERT` | CA file that enables TLS for any host or overrides the embedded LaserData CA |
 | `LASER_NO_TLS=1` | Disables automatic TLS |
-| `LASER_STREAM` | Overrides the per-invocation `laser-<example>-<token>` stream |
+| `LASER_STREAM` | Overrides the per-example `laser-<example>-typescript` stream |
 | `LASER_MESSAGES` | Record count for examples that publish a configurable workload |
 | `LASER_BATCH` | Records per batch |
-| `LASER_CONCURRENCY` | Parallel publisher count where supported |
-| `LASER_PAYLOAD_BYTES` | Approximate payload size where supported |
-| `LASER_APPLY_PLAN=1` | Promotes the concierge fork instead of leaving it open for inspection |
+| `LASER_APPLY_PLAN=1` | Promotes the incident-desk fork instead of leaving it open for inspection |
 | `LASER_NON_INTERACTIVE=1` | Runs orchestra without waiting for Enter between phases |
 | `LASER_GOVERNANCE_USER_ID` | User whose role bindings the governance example manages |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Select a real LLM for concierge or interop instead of the deterministic mock |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Select a real LLM for incident-desk or interop instead of the deterministic mock |
 
 The firehose also accepts `LASER_FIREHOSE_MESSAGES`, `LASER_FIREHOSE_ORGS`, `LASER_FIREHOSE_CONCURRENCY`, `LASER_FIREHOSE_PAYLOAD_BYTES`, `LASER_FIREHOSE_BATCH`, `LASER_FIREHOSE_PARTITIONS`, `LASER_FIREHOSE_REGISTER`, and `LASER_FIREHOSE_QUERY`.
 
@@ -74,9 +72,9 @@ One tiny, single-primitive example each, most under 100 lines including imports.
 | Example | Primitive | What it shows | Needs Cloud? | Docs |
 | --- | --- | --- | --- | --- |
 | [`log`](src/log/README.md) | Log | Ensure a topic, publish two JSON records, replay them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.cloud/laser-sdk/log) |
-| [`query`](src/query/README.md) | Views | Declare a view over a topic, publish orders, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
+| [`query`](src/query/README.md) | Views | Declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
 | [`watch`](src/watch/README.md) | Change feed | React to an advancement record instead of re-querying blind | yes | [`/laser-sdk/change-feed`](https://docs.laserdata.cloud/laser-sdk/change-feed) |
-| [`kv`](src/kv/README.md) | State | Set/get keyed JSON with a TTL, upgrade it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
+| [`kv`](src/kv/README.md) | State | Set/get keyed JSON with a TTL, change it under compare-and-swap, write under a revocable lease's fence behind a barriered read, write and promote a fork row | yes | [`/laser-sdk/state`](https://docs.laserdata.cloud/laser-sdk/state) |
 | [`cdc`](src/cdc/README.md) | Consumer filters | Read four safe-mode events out of a 240-record feed of typed records, sample-test and preview filters, route binary alerts on a header, then save filters and bind a consumer group (bindings need plane) | no | [`/laser-sdk/consumer-filters`](https://docs.laserdata.cloud/laser-sdk/consumer-filters) |
 | [`graph`](src/graph/README.md) | Graph | Link entities and traverse one relation out of a node | yes | [`/laser-sdk/graph`](https://docs.laserdata.cloud/laser-sdk/graph) |
 | [`recall`](src/recall/README.md) | Memory | All four durable verbs: remember, recall recent, improve, forget | no | [`/laser-sdk/memory`](https://docs.laserdata.cloud/laser-sdk/memory) |
@@ -89,9 +87,9 @@ One tiny, single-primitive example each, most under 100 lines including imports.
 | --- | --- | --- |
 | [`native-streaming`](src/native-streaming/README.md) | Generic | Direct producer retries, exact typed headers, keyed routing, batch sends, live consumer groups, automatic commits, and explicit commit after successful handling |
 | [`event-analytics`](src/event-analytics/README.md) | Generic | A deterministic clickstream, live tailing, checkpointed replay, inline materialized payloads, dashboard aggregates, windows, and registered-schema rejection |
-| [`order-book`](src/order-book/README.md) | Generic | Separate hot feed and durable tape, exact live and managed VWAP, inline query payloads, typed replay audit, and schema-first Avro publishing |
+| [`fleet-tape`](src/fleet-tape/README.md) | Generic | Separate hot feed and durable tape, exact live and managed sample-weighted mean CPU, inline query payloads, typed replay audit, and schema-first Avro publishing |
 | [`firehose`](src/firehose/README.md) | Generic | Bounded concurrent publishing across organization topics, configurable payload pressure, managed index registration, throughput reporting, and sample queries |
-| [`concierge`](src/concierge/README.md) | Agentic | Ticket ingestion, semantic memory, a four-agent support desk, durable approval, KV-backed deduplication, speculative fork planning, and conversation replay |
+| [`incident-desk`](src/incident-desk/README.md) | Agentic | Ticket ingestion, semantic memory, a four-agent incident desk, durable approval, KV-backed deduplication, speculative fork planning, and conversation replay |
 | [`memory`](src/memory/README.md) | Agentic | Vector and durable memory, provenance records, incident blast radius, valid-time graph reads, and traced paths |
 | [`interop`](src/interop/README.md) | Agentic | One agent reached through A2A, MCP, AG-UI, and human approval while correlation remains on the durable log |
 | [`orchestra`](src/orchestra/README.md) | Agentic | Discovery, directed contracts, capability fan-out, journalled workflows, quarantine, recovery, and deadline rerouting |

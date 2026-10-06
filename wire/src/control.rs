@@ -7,7 +7,7 @@ use std::str::FromStr;
 /// One indexed scalar: the index key `name` and the RFC-6901 JSON `pointer` into
 /// the payload it is extracted from.
 ///
-/// **Why declared-once extraction exists.** Stamping `agdx.idx.customer_id=alice`
+/// **Why declared-once extraction exists.** Stamping `agdx.idx.host_id=node-7`
 /// on every Iggy message duplicates the field name on the wire and couples the
 /// producer to projection details. With a schema declared once on the
 /// projector, producers just push the payload (single or batched) and the
@@ -108,9 +108,9 @@ pub struct IndexSchemaBuilder {
 
 impl IndexSchemaBuilder {
     /// Index the JSON value at the root-level field `name`. The index key and
-    /// the JSON path are the same in the common case, so `field("customer")`
-    /// expands to "extract `/customer` from the payload and store it under
-    /// the index key `customer`". For nested or renamed extraction use
+    /// the JSON path are the same in the common case, so `field("host")`
+    /// expands to "extract `/host` from the payload and store it under
+    /// the index key `host`". For nested or renamed extraction use
     /// [`field_at`](Self::field_at).
     pub fn field(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
@@ -122,8 +122,8 @@ impl IndexSchemaBuilder {
     /// Index the JSON value at `pointer` (RFC-6901) under the index key
     /// `name`. Use when the index column name differs from the payload field,
     /// or when the value lives in a nested structure -
-    /// `field_at("amount_cents", "/amount/value")` indexes `amount.value` as
-    /// `amount_cents`.
+    /// `field_at("cpu_pct", "/cpu/value")` indexes `cpu.value` as
+    /// `cpu_pct`.
     pub fn field_at(mut self, name: impl Into<String>, pointer: impl Into<String>) -> Self {
         self.schema.fields.push(IndexField::new(name, pointer));
         self
@@ -151,7 +151,7 @@ impl IndexSchemaBuilder {
 
 /// Opaque projection identifier. Stable string the producer stamps on the
 /// wire via the `agdx.ref` header and the worker keys its catalog by.
-/// Recommended shape: `"<name>.v<version>"`, e.g. `"order.v1"`. Distinct from
+/// Recommended shape: `"<name>.v<version>"`, e.g. `"reading.v1"`. Distinct from
 /// `schema_id`, which selects a codec's writer schema rather than a
 /// materialization rule.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -327,11 +327,11 @@ pub struct EdgeExtract {
 pub struct Projection {
     /// Stable id used on the wire as `agdx.ref`.
     pub id: ProjectionId,
-    /// Human-readable name (e.g. `"order"`). Distinct from `id` so the same
+    /// Human-readable name (e.g. `"reading"`). Distinct from `id` so the same
     /// logical projection can rename without breaking the wire ref.
     pub name: String,
     /// Schema-evolution version. Bump on incompatible changes. The wire id
-    /// usually encodes this (`order.v2`).
+    /// usually encodes this (`reading.v2`).
     pub version: u32,
     /// What this projection materializes: rows (default) or a graph.
     #[serde(default, skip_serializing_if = "ProjectionKind::is_row")]
@@ -777,7 +777,7 @@ pub enum SchemaSource {
     /// An Avro writer schema as its canonical JSON text.
     Avro { schema: String },
     /// A Protobuf `FileDescriptorSet` (one or more compiled `.proto` files)
-    /// plus the fully-qualified message type to decode, e.g. `"shop.Order"`.
+    /// plus the fully-qualified message type to decode, e.g. `"fleet.Reading"`.
     Protobuf {
         #[serde(with = "crate::encoding::bin_bytes")]
         descriptor_set: Vec<u8>,
@@ -797,7 +797,7 @@ pub enum SchemaSource {
     Unknown,
 }
 
-/// One control command on the control topic. The customer SDK (or any tool
+/// One control command on the control topic. The client SDK (or any tool
 /// driving LaserData Cloud) publishes these to register projections,
 /// bindings, and schemas.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -871,11 +871,11 @@ mod tests {
     #[test]
     fn given_an_explicit_operational_index_when_built_then_should_keep_one_index() {
         let binding = ProjectionBinding::builder()
-            .source("shop", "orders")
-            .allow("order.v1")
-            .index("orders_rows")
+            .source("fleet", "readings")
+            .allow("reading.v1")
+            .index("readings_rows")
             .build();
-        assert_eq!(binding.index, "orders_rows");
+        assert_eq!(binding.index, "readings_rows");
         assert_eq!(binding.backend, None);
     }
 
@@ -886,7 +886,7 @@ mod tests {
             generation: 3,
         };
         let binding = ProjectionBinding::builder()
-            .source("shop", "orders")
+            .source("fleet", "readings")
             .backend(backend.clone())
             .build();
         assert_eq!(binding.backend, Some(backend));
@@ -895,17 +895,17 @@ mod tests {
     #[test]
     fn given_no_operational_index_when_built_then_should_use_the_topic_name() {
         let binding = ProjectionBinding::builder()
-            .source("shop", "orders")
-            .allow("order.v1")
+            .source("fleet", "readings")
+            .allow("reading.v1")
             .build();
-        assert_eq!(binding.index, "orders");
+        assert_eq!(binding.index, "readings");
     }
 
     #[test]
     fn given_no_retention_when_built_then_should_default_to_none() {
         let binding = ProjectionBinding::builder()
-            .source("shop", "orders")
-            .index("orders_rows")
+            .source("fleet", "readings")
+            .index("readings_rows")
             .build();
         assert_eq!(binding.retention, None);
     }
@@ -954,11 +954,11 @@ mod tests {
     fn given_an_empty_projection_id_when_parsed_then_should_error() {
         assert!("".parse::<ProjectionId>().is_err());
         assert_eq!(
-            "order.v1"
+            "reading.v1"
                 .parse::<ProjectionId>()
                 .expect("non-empty id parses")
                 .as_str(),
-            "order.v1"
+            "reading.v1"
         );
     }
 }
@@ -973,10 +973,10 @@ mod wire_tests {
     #[test]
     fn given_an_apply_binding_when_round_tripped_then_should_preserve_index_and_version() {
         let binding = ProjectionBinding::builder()
-            .source("shop", "orders")
-            .allow("order.v1")
-            .default_projection("order.v1")
-            .index("orders_rows")
+            .source("fleet", "readings")
+            .allow("reading.v1")
+            .default_projection("reading.v1")
+            .index("readings_rows")
             .build();
         let envelope = ControlEnvelope {
             v: CONTROL_OP_VERSION,
@@ -989,7 +989,7 @@ mod wire_tests {
         let ControlCommand::ApplyBinding(decoded) = back.command else {
             panic!("expected ApplyBinding");
         };
-        assert_eq!(decoded.index, "orders_rows");
+        assert_eq!(decoded.index, "readings_rows");
         assert_eq!(decoded.backend, None);
         // Retention left unset stays unset across the wire (inherits LaserData Cloud
         // default), and is omitted from the encoding entirely.
@@ -1004,7 +1004,7 @@ mod wire_tests {
             command: ControlCommand::RegisterSchema(SchemaDef {
                 id: 11,
                 source: SchemaSource::Avro {
-                    schema: r#"{"type":"record","name":"Order","fields":[]}"#.to_owned(),
+                    schema: r#"{"type":"record","name":"Reading","fields":[]}"#.to_owned(),
                 },
                 name: None,
                 version: None,
@@ -1023,7 +1023,7 @@ mod wire_tests {
     fn given_a_protobuf_schema_source_when_round_tripped_then_should_preserve_bytes() {
         let source = SchemaSource::Protobuf {
             descriptor_set: vec![10, 20, 30],
-            message_type: "shop.Order".to_owned(),
+            message_type: "fleet.Reading".to_owned(),
         };
         let bytes = encode_named(&source).expect("serializes");
         let back: SchemaSource = decode_named(&bytes).expect("deserializes");
@@ -1045,7 +1045,7 @@ mod wire_tests {
             RetentionPolicy::MaxRows { rows: 10_000 },
         ] {
             let binding = ProjectionBinding::builder()
-                .source("shop", "telemetry")
+                .source("fleet", "telemetry")
                 .allow("telemetry.v1")
                 .index("telemetry_rows")
                 .retention(policy)
@@ -1070,7 +1070,7 @@ mod schema_tests {
             source: SchemaSource::Avro {
                 schema: "{}".to_owned(),
             },
-            name: Some("orders".to_owned()),
+            name: Some("readings".to_owned()),
             version: Some(2),
         };
         let bytes = encode_named(&def).expect("serializes");

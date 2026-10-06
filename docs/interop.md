@@ -2,31 +2,31 @@
 
 AGDX is the SDK message format for agents on the log. A2A, MCP, and AG-UI adapters expose external interfaces over these records. Fields shared with AGDX map to envelope fields. Other data stays in the body with `agdx.ct = json` and returns unchanged.
 
-Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. They use log records through the Iggy transport. This guide describes their use. The [AGDX data exchange model](agdx.md) defines the underlying contract.
+Select the optional `a2a-bridge`, `mcp-bridge`, and `agui` features as needed. Add `a2a-http` or `mcp-http` for the ready-made axum `router()`. They use log records through the Iggy transport. This guide describes their use. The [AGDX data exchange model](agdx.md) defines the underlying contract.
 
 ## Streams, topics, and RBAC
 
 A bridge or agent uses the stream selected by its `Laser` handle. `laser.with_default_stream(name)` selects another default while sharing the connection. Each stream can contain several topics:
 
 ```rust
-let orders = laser.with_default_stream("orders-agents");
-let billing = laser.with_default_stream("billing-agents");
+let ops = laser.with_default_stream("ops-agents");
+let metrics = laser.with_default_stream("metrics-agents");
 
-// An A2A gateway on the orders stream.
+// An A2A gateway on the ops stream.
 A2aBridge::new(
-    orders.clone(),
-    "orders-gateway".parse()?,
+    ops.clone(),
+    "ops-gateway".parse()?,
     AgentTopic::Commands,
     AgentTopic::Responses,
 );
 
-// An agent on the billing stream, sharing the one connection.
+// An agent on the metrics stream, sharing the one connection.
 Agent::builder()
     .id("collector".parse()?)
     .listen_on(AgentTopic::Commands)
     .handler(handler)
     .build()
-    .spawn(billing.clone());
+    .spawn(metrics.clone());
 ```
 
 `AgentTopic` variants name the standard `agent.*` topics. `AgentTopic::Custom(&id)` accepts another Iggy topic name. Deployments can use their own topic layout.
@@ -42,7 +42,7 @@ Clients read streamed records by offset. After a disconnect, they can resume fro
 
 `A2aBridge` serves A2A JSON-RPC and the v1.0 card at `/.well-known/agent-card.json`. The card uses `supportedInterfaces` for endpoint and protocol information instead of top-level `protocolVersion` and `url`. With `sign`, `A2aBridge::signed_card` adds a detached JWS over the canonical card. This uses RFC 8785, RFC 7515, and Ed25519. Use `sign::verify_card` to check it.
 
-A2A v1.0 uses PascalCase operation names. The stateless bridge does not serve `ListTasks`. Unknown methods return the standard JSON-RPC error.
+A2A v1.0 uses PascalCase operation names. The stateless bridge does not serve `ListTasks`. Unknown methods, including `ListTasks`, return the bridge's application error code `-32000`.
 
 | A2A method | Mapping |
 | --- | --- |
@@ -103,7 +103,7 @@ let app = mcp.router();
 
 AG-UI provides interfaces for frontends. The SDK supports state synchronization and event rendering through the log:
 
-- Use `publish_state_snapshot` and `publish_state_delta` for full state and RFC 6902 patches. They produce `state_snapshot` and `state_delta` events. `reconstruct_state` applies a snapshot and subsequent deltas through the selected offset.
+- Use `publish_state_snapshot` and `publish_state_delta` for full state and RFC 6902 patches. They produce `state_snapshot` and `state_delta` events. `reconstruct_state` takes the latest snapshot and applies every later delta.
 - Use `agui_events` to convert chat, reasoning, tool, task, state, and error records into AG-UI events. The mappings include `TEXT_MESSAGE_*`, `REASONING_MESSAGE_*`, `TOOL_CALL_START`, `ARGS`, `END`, `TOOL_CALL_RESULT`, `RUN_STARTED`, `RUN_FINISHED`, `STATE_*`, and `RUN_ERROR`.
 
 ```rust
@@ -160,7 +160,7 @@ The mapping onto AGDX:
 // Pause for a human decision, resume with their answer.
 let decision = laser
     .agdx(AgentTopic::HumanInput, "orchestrator".parse()?, conversation.into())
-    .request_input(AgentTopic::Responses, b"approve a $500 credit?".to_vec(), Duration::from_secs(300))
+    .request_input(AgentTopic::Responses, b"approve draining node-7?".to_vec(), Duration::from_secs(300))
     .await?;
 
 // The approver agent's handler resolves the interrupt it is handling:

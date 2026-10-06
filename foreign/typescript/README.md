@@ -4,7 +4,7 @@ This package provides the native TypeScript Laser SDK for Apache Iggy. [LaserDat
 
 This prerelease targets Node 22.14 or later. Bun, Deno, and browsers are not supported because the Apache Iggy transport uses Node TCP and TLS APIs.
 
-> The current release is `0.5.3`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.5.4`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 **Filter before the network.** Consumer filters select records on the server so each reader receives only its matching subset of a topic and its partitions. The shared CDC example delivers **4 of 240 records** and saves **98.5% of payload transfer**. It preserves original payloads and offsets, supports exact-width typed headers, and acknowledges only completed work. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) and the [three-language examples](https://github.com/laserdata/laser-sdk/tree/main/examples).
 
@@ -24,13 +24,13 @@ import { Laser } from "@laserdata/laser-sdk"
 await using laser = await Laser.connect(
   process.env.LASER_CONNECTION_STRING ?? "iggy:iggy@127.0.0.1:8090"
 )
-const topic = laser.stream("commerce").topic("orders")
+const topic = laser.stream("fleet").topic("readings")
 await topic.ensure(4)
-const committed = await topic.publish().json({ id: "order-1", total: 42 }).send()
+const committed = await topic.publish().json({ host: "node-7", cpu: 82 }).send()
 console.log(committed.confirmations)
 
 const records = await (await topic.replay()).poll()
-console.log(`read ${records.length} order(s)`)
+console.log(`read ${records.length} reading(s)`)
 ```
 
 Use a `user:password@host:port` connection string. The SDK supplies the Apache Iggy TCP scheme. Select a stream with `laser.stream(name)` and a topic with `.topic(name)`. `Laser.connectWithStream()` selects a default for the shorter `laser.topic(name)` form. It does not restrict stream access.
@@ -47,9 +47,10 @@ The TypeScript SDK uses Iggy's native VSR transport for owned and injected clien
 
 - raw, JSON, CBOR, MessagePack, Avro, Protobuf, and JSON Schema records
 - exact headers, metadata, indexes, projection and schema IDs, inline payload, claim-check, routing keys, explicit partitions, and heterogeneous batches
-- direct producers with bounded retry and explicit batching
+- direct producers with bounded retry, explicit batching, and stream and topic creation on the first send (`createStream`, `createTopic`, `partitions`)
+- a size-and-time batching publisher through `topic.batching()`
 - standalone and consumer-group readers with first, last, next, offset, or timestamp starts
-- automatic or explicit offset commits, replay, cancellation, and bounded `nextWithin()` waits
+- the ten Rust commit policies through `commitPolicy` (`autoCommit` is the `polling` or `disabled` shorthand), explicit `commit`, `storeOffset`, `deleteOffset`, and `lastStoredOffset`, replay, cancellation, and bounded `nextWithin()` waits that fail with `TimeoutError`
 
 Delivery is at least once, so records can repeat. Ordering applies within each selected partition. Make external effects idempotent, which means safe to repeat. For operations that require a lease holder token, use fenced managed coordination.
 
@@ -62,26 +63,28 @@ TypeScript types do not exist at runtime. A typed topic therefore takes a codec 
 ```ts
 import { jsonCodec } from "@laserdata/laser-sdk"
 
-interface Order {
-  readonly id: string
-  readonly total: number
+interface Reading {
+  readonly host: string
+  readonly cpu: number
 }
 
-const orderCodec = jsonCodec<Order>((value) => {
-  if (typeof value !== "object" || value === null) throw new TypeError("order must be an object")
-  const order = value as Record<string, unknown>
-  if (typeof order.id !== "string" || typeof order.total !== "number") {
-    throw new TypeError("order fields are invalid")
+const readingCodec = jsonCodec<Reading>((value) => {
+  if (typeof value !== "object" || value === null)
+    throw new TypeError("a reading must be an object")
+  const reading = value as Record<string, unknown>
+  if (typeof reading.host !== "string" || typeof reading.cpu !== "number") {
+    throw new TypeError("reading fields are invalid")
   }
-  return { id: order.id, total: order.total }
+  return { host: reading.host, cpu: reading.cpu }
 })
 
-const orders = laser.stream("commerce").topic("orders").json(orderCodec)
-await orders.publish({ id: "order-1", total: 42 })
+const readings = laser.stream("fleet").topic("readings").json(readingCodec)
+await readings.publish({ host: "node-7", cpu: 82 })
 
-const reader = await orders.records("orders-export")
-const record = await reader.nextWithin(1_000)
-console.log(record?.value)
+const reader = await readings.records("readings-export")
+for await (const item of reader.stream()) {
+  if (item.kind === "record") console.log(item.record.value)
+}
 ```
 
 Registered Avro, Protobuf, and JSON Schema topics compile their writer schema once. They reject invalid values before sending and attach the schema ID. Reads decode through the same schema.
@@ -93,31 +96,35 @@ LaserData Cloud and Laser Stack report their capabilities at connection time and
 The root client provides queries, projections, schemas, key-value state, forks, graphs, access roles, runs, change feeds, and managed batches. Query calls use managed commands. They do not use a request topic. Reference data from the Rust implementation defines the expected AGDX encoding for each client.
 
 ```ts
-import { graphNodeEntity, queryResultValue, typedValueDiagnosticText } from "@laserdata/laser-sdk"
+import {
+  graphNodeEntity,
+  queryResultValue,
+  typedValueDiagnosticText,
+  utf8
+} from "@laserdata/laser-sdk"
 
-const paid = await laser.query("orders_v1").whereEq("status", "paid").limit(20).fetch()
-for (const row of paid.rows) {
-  const total = queryResultValue(paid, row, "total")
-  console.log(total === undefined ? "missing" : typedValueDiagnosticText(total))
+const degraded = await laser.query("readings_v1").whereEq("status", "degraded").limit(20).fetch()
+for (const row of degraded.rows) {
+  const cpu = queryResultValue(degraded, row, "cpu")
+  console.log(cpu === undefined ? "missing" : typedValueDiagnosticText(cpu))
 }
 
-const key = new TextEncoder().encode("user:42")
-const session = { cart: ["sku-1"] }
-await laser.kv("sessions").set(key).json(session).ttl(300_000_000n).send()
-const stored = await laser.kv("sessions").get(key)
+const key = utf8("service:auth")
+await laser.kv("config").set(key).json({ log_level: "debug" }).ttl(300_000_000n).send()
+const stored = await laser.kv("config").get(key)
 
-const checkout = graphNodeEntity("Service", "checkout")
-const nearby = await laser.graph("ops").neighbors(checkout.id, "out", undefined, 2)
+const auth = graphNodeEntity("Service", "auth")
+const nearby = await laser.graph("ops").neighbors(auth.id, "out", undefined, 2)
 ```
 
 `result.fields` defines the ordered result schema. Each `row.values` entry matches the field at the same position. Tagged values preserve numeric widths, decimal precision, timestamps, UUIDs, bytes, nested values, and nullability. Use `queryResultValue()` to select a field by name. Use `typedValueDiagnosticText()` for stable display text.
 
 The first page can use an offset. Later pages use the `nextCursor` supplied by the server. `hasMore` is true exactly when that cursor is present. `fetchAll()` follows these cursors. Each page contains at most 1000 rows.
 
-A query has a stable execution identity and absolute deadline. `status()` and `cancel()` use dedicated managed commands and fail locally when the deployment does not advertise those capabilities:
+A query has a stable execution identity and an absolute deadline, 30 seconds after the request was built unless you set `deadlineMicros(epochMicros)` or the relative `deadline(milliseconds)`. `status()` and `cancel()` use dedicated managed commands and fail locally when the deployment does not advertise those capabilities. `laser.executeQuery(query)`, `queryPage(executionId, cursor, deadlineMicros)`, `queryStatus(executionId)`, and `cancelQuery(executionId)` are the lower-level forms:
 
 ```ts
-const request = laser.query("orders_v1").filterGte("total", 100).deadlineMicros(deadlineMicros)
+const request = laser.query("readings_v1").filterGte("cpu", 90).deadline(10_000)
 const page = await request.fetch()
 const status = await request.status()
 if (status.state === "running") await request.cancel()
@@ -129,7 +136,7 @@ Lakehouse queries name one destination generation and can select a retained snap
 const historical = await laser
   .queryLakehouse(destinationId, destinationGeneration)
   .atSnapshot(snapshotId)
-  .filterEq("customer_id", "alice")
+  .filterEq("host_id", "node-7")
   .limit(100)
   .fetch()
 
@@ -143,7 +150,7 @@ Use `laser.destinations()` for destination declarations and explicit query route
 ```ts
 const destinations = laser.destinations()
 const page = await destinations.list("linearizable", {}, undefined, 50)
-const routes = await destinations.queryRoutes("potentially_stale", "orders", undefined, 50)
+const routes = await destinations.queryRoutes("potentially_stale", "readings", undefined, 50)
 const current = await destinations.get(destinationId, "linearizable")
 ```
 
@@ -175,10 +182,10 @@ Durable memory can use the default audit topic through `laser.memory(namespace)`
 ```ts
 const incidents = await laser.memoryTopic("incidents").partitions(4).ttl(86_400_000).build()
 
-await incidents.remember(new TextEncoder().encode("checkout uses the read replica")).send()
+await incidents.remember(utf8("auth uses the read replica")).send()
 ```
 
-TypeScript duration inputs use milliseconds. `noExpiry()` keeps the raw memory history until ordinary topic retention removes it.
+Memory topic and consumer duration inputs use milliseconds. KV `ttl`, `expire`, and `expireAt` take microsecond `bigint` values. `noExpiry()` keeps the raw memory history until ordinary topic retention removes it.
 
 **Filter before the network.** Configure a consumer group's policy once. Its ordinary consumers and page readers then receive the selected records with their original payloads, headers and offsets. The shared CDC feed delivers **4 of 240 records**, saving **98.5% of payload transfer**. An unbound group receives all records without payload decoding.
 
@@ -197,11 +204,9 @@ await group.create({ filter: safeMode }) // Run once during setup.
 // Every consumer instance needs only the group name or the returned group ID.
 const consumer = await group.consumer({ batchLength: 100, autoCommit: false })
 try {
-  const record = await consumer.nextWithin(15_000)
-  if (record !== null) {
-    console.log(record.partitionId, record.offset, record.payload)
-    await consumer.commit(record)
-  }
+  const record = await consumer.nextWithin(15_000) // TimeoutError when nothing matched in time
+  console.log(record.partitionId, record.offset, record.json())
+  await consumer.commit(record)
 } finally {
   await consumer.shutdown()
 }
@@ -249,6 +254,8 @@ Waiting operations accept `AbortSignal` or an explicit timeout where their contr
 
 SDK failures extend `LaserError` and carry a stable `kind`. Separate subclasses identify configuration, timeout, cancellation, unknown mutation outcomes, unsupported operations, encoding, transport, policy, and signature failures. Catch a specific subclass when it needs different recovery. Otherwise, report the base error and its cause.
 
+A failed publish throws `PublishFailedError` with the `stream`, `topic`, the `committed` confirmations, and the `unconfirmed` records. `publishCause()` reaches the original failure. The classifiers mirror the Rust `LaserError` methods and answer through any publish wrapping: `isPermissionDenied`, `isUnsupported`, `isNotFound`, `isUnavailable`, `isNotLeader`, `isStale`, `isVersionSkew`, `isVersionConflict`, `isAmbiguousMutation`, `isStreamOrTopicNotFound`, `isNoCapableAgent`, `isLeaseLost`, `isFenceViolation`, `isBudgetExceeded`, `isQuarantined`, `filterReason`, and `code`, which returns the unified result code. `utf8(text)` and `decodeUtf8(bytes)` convert payloads.
+
 `Laser.connect*()` owns its Apache Iggy client. `Laser.builder()` can own or borrow an injected client. `Laser`, `Producer`, `Consumer`, and `AgentHandle` support `await using`. Their `close()` and `shutdown()` methods are safe to repeat. `close()` on any `Laser` view ends the shared connection for every view. Disposing a scoped view with `await using` leaves the root connection open.
 
 ## Package exports
@@ -258,7 +265,7 @@ SDK failures extend `LaserError` and carry a stable `kind`. Separate subclasses 
 - `@laserdata/laser-sdk/testing` provides clocks, stores, fake transports, factories, observers, and bounded eventually checks
 - `@laserdata/laser-sdk/opentelemetry` adapts the observer seam to OpenTelemetry
 
-`laser.iggyClient()` is the Apache Iggy escape hatch for native administrative or transport operations that Laser does not wrap.
+`laser.iggyClient` (a property) is the Apache Iggy escape hatch for native administrative or transport operations that Laser does not wrap.
 
 ## Examples and verification
 
@@ -296,3 +303,23 @@ See [publish recovery and outage handling](../../docs/publish-recovery.md).
 For an application checkpoint inside a filtered page, call `reader.ackThrough(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ackPage` when the whole page is complete. Regex predicates reject an enabled TypeScript local guard instead of silently skipping verification.
 
 Consumer-filter patterns use the server's bounded Rust regex engine. TypeScript validates structure and lets the server decide regex syntax. A local `CompiledFilter` refuses regex predicates, because only the server's engine defines their meaning. A filter permits four compiled glob or regex predicates, with a 256 KiB program budget each. Local guards reject regex filters explicitly. Guards verify unevaluated records under the server's reported decoder bounds and the applicable pass policy.
+
+## 0.5.4 additions
+
+These match the Rust and Python surfaces:
+
+- Producer options `batchLength`, `lingerMs`, `maxTopicBytes`, `unlimitedTopicSize`, and `background`. In background mode a send returns once queued, `flush()` drains the queue, and `shutdown()` flushes before closing.
+- `QueryRequest.atSnapshot(id)`, `atTimestampMicros(ts)`, and `rowsTyped(codec)`.
+- `MemoryHandle.backend`, `AgentScope.contract(router)`, and `SwappableGovernor.current()`.
+- Capability helpers `isOpenOnly`, `servesConsistency`, `isReady`, `readinessReasons`, `enabledBackends`, and `unreadyBackends`.
+- `AgdxSend.claimCheck(store, thresholdBytes)` moves a body at or over the threshold to the blob store before signing.
+- `ConversationId.asU128()` returns the raw 128-bit ULID value.
+- `MemoryHandle.consolidate` and `ScopedMemory.consolidate` take `{ summarizer, pruneSummarized }` to fold `message` items into one summary and to forget the folded items.
+- `filterCapsEvaluates(filters, evaluatorVersion, codec)` tells whether the server evaluates a filter exactly as this build does.
+- `KeyRecord.keyId()` returns the 8-byte identifier of the record's public key.
+- `MemoryHandler` wraps an agent handler, and `autoRemember(kind)` remembers each handled message under its conversation.
+- `cardIsFresh`, `cardServes`, and `cardAvailableFor` check the freshness, the skills, and the advertised health of a registered card.
+
+Batching producers serialize flushes. A failed timer flush never stops the timer. Its failure is kept until `flush()` or `close()` reports it, after that call has drained the queue. `send()` reports only the failure of its own inline flush. Several kept failures arrive as one publish failure that lists the records of every failed batch. Inspect a publish failure before retrying because some records can already be committed.
+
+ConsolidationReport uses summarized, reweighted, pruned, and derived. The old scanned, kept, and forgotten aliases are removed. Consolidators own their memory and receive a scope. Coordination clients expose terminal close and asynchronous disposal. ManagedKvTransport.close is optional, with reset as its default. See [client behavior and migration](../../docs/client-behavior.md).

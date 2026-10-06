@@ -341,11 +341,11 @@ mod tests {
             id: DestinationId::from_u128(1),
             generation: 1,
             definition_revision: 1,
-            name: "orders-lakehouse".to_owned(),
-            source: SourceScope::new("shop", "orders"),
+            name: "readings-lakehouse".to_owned(),
+            source: SourceScope::new("fleet", "readings"),
             recreated_partition_policy: RecreatedPartitionPolicy::Reject,
             projection: ProjectionRef {
-                id: ProjectionId::new("order.v1"),
+                id: ProjectionId::new("reading.v1"),
                 version: 1,
             },
             schema: LogicalSchemaRef {
@@ -358,8 +358,8 @@ mod tests {
                 generation: 2,
             },
             table: PhysicalTable {
-                namespace: vec!["shop".to_owned()],
-                table: "orders".to_owned(),
+                namespace: vec!["fleet".to_owned()],
+                table: "readings".to_owned(),
                 expected_table_uuid: None,
             },
             file_format: FileFormat::Parquet,
@@ -404,7 +404,7 @@ mod tests {
             id: QueryRouteId::from_u128(5),
             generation: 1,
             definition_revision: 1,
-            name: "orders".to_owned(),
+            name: "readings".to_owned(),
             target: QueryRouteTarget::Lakehouse {
                 destination_id: destination().id,
                 destination_generation: 1,

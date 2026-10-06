@@ -172,7 +172,7 @@ A projection defines the indexed fields. Stamping `.index("user_id", "alice")` o
 - Couple producers to projector details.
 - Allow producers to provide inconsistent field definitions.
 
-The producer supplies data, and the projection defines extraction.
+The producer supplies data, and the projection defines extraction. An explicit `.index(..)` header wins over a value the projection schema extracts for the same field. A record with no indexed fields from headers or the schema produces no row.
 
 > _Niche scenario, the producer needs to surface a queryable field on a payload the projector cannot decode (opaque binary, custom framing). For those, the projection can declare a header-source field and the producer stamps it via `.header("trace_id", id)` as ride-along metadata. Same "schema lives on the projector side" principle, header instead of JSON pointer. Not used in the rest of the tutorial._
 
@@ -360,7 +360,7 @@ Consumer finds past incidents similar to a new one:
 
 ```rust
 let nearest: Vec<Incident> = laser.query("incidents")
-    .where_eq("service", "payments")
+    .where_eq("service", "storage")
     .nearest(query_embedding, 5)
     .fetch_typed().await?;
 ```
@@ -449,14 +449,14 @@ Registration is synchronous and `laser-plane` allocates the id:
 ```rust
 let schema_id = laser
     .schemas()
-    .register(SchemaSource::Avro { schema: ORDER_AVRO_SCHEMA.to_owned() })
+    .register(SchemaSource::Avro { schema: READING_AVRO_SCHEMA.to_owned() })
     .send()
     .await?;
 ```
 
 `laser-plane` compiles the schema, allocates a free ID, appends the control record durably, and returns the ID. Apply that ID through `agdx.sid`. The record applies asynchronously, so read the registry before publishing with a new ID. `laser.schemas().drop(id)` records asynchronous removal.
 
-`SchemaSource` supports `Avro { schema }`, `Protobuf { descriptor_set, message_type }`, and `JsonSchema { schema }`. Avro uses schema JSON. Protobuf uses a compiled `FileDescriptorSet` and fully qualified message type. The [`order-book`](../examples/rust/src/order-book/README.md) and [`event-analytics`](../examples/rust/src/event-analytics/README.md) examples demonstrate Avro and JSON Schema.
+`SchemaSource` supports `Avro { schema }`, `Protobuf { descriptor_set, message_type }`, and `JsonSchema { schema }`. Avro uses schema JSON. Protobuf uses a compiled `FileDescriptorSet` and fully qualified message type. The [`fleet-tape`](../examples/rust/src/fleet-tape/README.md) and [`event-analytics`](../examples/rust/src/event-analytics/README.md) examples demonstrate Avro and JSON Schema.
 
 Schema IDs are permanent. Register a new ID for a changed definition instead of replacing an existing one. Dropped IDs remain reserved, and earlier records retain decoding support. Registering the same definition through the raw control topic can restore it. A different definition under that ID is rejected and dead-lettered.
 
@@ -474,7 +474,7 @@ A stream groups topics in Apache Iggy. A connection can address several streams,
 
 ```rust
 let laser = Laser::connect("iggy:iggy@127.0.0.1:8090").await?;
-laser.stream("checkout").topic("inferences").publish() /* ... */;
+laser.stream("gateway").topic("inferences").publish() /* ... */;
 laser.stream("search").topic("inferences").publish() /* ... */;
 ```
 
@@ -552,7 +552,7 @@ impl AgentHandler for Coordinator {
     {
         // Enrich a request from several sources at once, each in its own
         // sub-conversation linked back to the root.
-        for source in ["crm", "billing", "support"] {
+        for source in ["logs", "metrics", "traces"] {
             let child = ctx.spawn_subconversation();  // fresh conversation_id, links to root
             ctx.send(AgentTopic::Commands, source.as_bytes().to_vec(), &child).await?;
         }
@@ -561,7 +561,7 @@ impl AgentHandler for Coordinator {
 }
 ```
 
-Each sub-conversation gets its own partition (= total order within that branch) and carries `parent_conversation_id` + `root_conversation_id` so a downstream context assembler can walk the whole tree. The `concierge` example's triage fan-out shows the full loop, including aggregating the replies at the root.
+Each sub-conversation gets its own partition (= total order within that branch) and carries `parent_conversation_id` + `root_conversation_id` so a downstream context assembler can walk the whole tree. The `incident-desk` example's triage fan-out shows the full loop, including aggregating the replies at the root.
 
 ### Memory, semantic recall
 
@@ -588,16 +588,17 @@ Managed models can retain the source conversation from `gen_ai.conversation.id`.
 
 Streaming, agents, provenance, duplicate suppression, `Cursor`, `StateStore`, and locally folded memory run on Apache Iggy. Queries, projections, KV, and forks require a managed backend. Without it, calls return `LaserError::Unsupported`.
 
-Capabilities group support under `managed`, `query`, `kv`, `graph`, `forks`, `sessions`, `durable_dedup`, and `a2a_gateway`. Query includes `available`, `projections`, `schemas`, and `consistency`. KV includes `available` and `cas`. Memory combines query and graph capabilities rather than defining another group:
+Capabilities group support under `managed`, `query`, `kv`, `graph`, `forks`, `filters`, and `a2a_gateway`. Query includes `available`, `consistency`, `keyword`, `cursor_paging`, `cancellation`, and `execution_status`. KV includes `available` and `cas`. Memory combines query and graph capabilities rather than defining another group:
 
 | concern | open SDK (this crate, Apache Iggy) | managed runtime (LaserData Cloud or Laser Stack) |
 | --- | --- | --- |
 | transport | one Iggy connection, publish + batch API | same connection, same wire. Adds capability negotiation at login + the query API |
 | query / projections | not available, returns `LaserError::Unsupported` | picks up `Projection` + `ProjectionBinding` configuration and materializes read models served off the log |
-| reliable consumption | `ReliableConsumer` with in-memory dedup + DLQ | infrastructure-side durable dedup primitives surfaced through `Capabilities::durable_dedup` |
-| memory | `Laser::memory(ns)` runs here: remember publishes to the memory topic, recall folds the log. In-process `VectorMemory<E>` (cosine recall, bring your own `Embedder`) needs no server either | the same `Laser::memory(ns)` - a deployment materializes the topic into a versioned key-value read view for fast recall. Memory itself has no capability flag |
-| sessions / forks | not available, returns `LaserError::Unsupported` | infrastructure-native session start + fork-from primitives, surfaced through `Capabilities::sessions` + `Capabilities::forks` |
-| A2A | `A2aBridge` axum route customers self-host | managed A2A gateway with auth, streaming, persisted task store, agent-card metadata, surfaced through `Capabilities::a2a_gateway` |
+| reliable consumption | `ReliableConsumer` with in-memory dedup + DLQ | the same `ReliableConsumer`. Effects that must happen once use a KV compare-and-swap or a fenced write |
+| memory | `Laser::memory(ns)` runs here: remember publishes to the memory topic, and folded recall (`recall().folded()`, Python `recall(folded=True)`) rebuilds memory from the log in process. In-process `VectorMemory<E>` (cosine recall, bring your own `Embedder`) needs no server either | the same `Laser::memory(ns)` - a deployment materializes the topic into a versioned key-value read view for fast recall. Memory itself has no capability flag |
+| sessions | `Laser::sessions` runs here: typed turns, context, checkpoints, and replay over the agent topics | the same `Laser::sessions`. Session memory recall reads the managed key-value view |
+| forks | not available, returns `LaserError::Unsupported` | copy-on-write branches of the read model, surfaced through `Capabilities::forks` |
+| A2A | `A2aBridge` axum route you self-host | managed A2A gateway with auth, streaming, persisted task store, agent-card metadata, surfaced through `Capabilities::a2a_gateway` |
 
 Applications use the same imports for Apache Iggy, Laser Stack, and LaserData Cloud. Capability discovery identifies available operations. Managed calls return typed `Unsupported` errors when the server cannot serve them.
 
@@ -606,9 +607,9 @@ Applications use the same imports for Apache Iggy, Laser Stack, and LaserData Cl
 The agentic demos under `examples/rust/src/` (run from `examples/rust` with Apache Iggy up via `just up`):
 
 ```sh
-cargo run --example concierge   # the AI support desk: triage fan-out + LLM synthesis,
-                                # semantic recall, effectively-once credits behind a
-                                # durable approval, speculative fork, log-replayed audit
+cargo run --example incident-desk  # the incident desk: triage fan-out + LLM synthesis,
+                                   # semantic recall, effectively-once capacity grants behind
+                                   # a durable approval, speculative fork, log-replayed audit
 ```
 
 The general-purpose counterpart (`event-analytics`) lives, with per-example READMEs, in [`examples/rust/README.md`](../examples/rust/README.md).
@@ -649,7 +650,7 @@ let worker = Agent::builder()
 let outcome = laser
     .contract(Router::to_capable("diagnose", RoutePolicy::Any))
     .from("orchestrator".parse()?)
-    .payload(b"checkout API latency spike".to_vec())
+    .payload(b"auth API latency spike".to_vec())
     .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))  // a managed deployment uses the default Advertised
     .deadline(Duration::from_secs(10))
     .send()
@@ -692,7 +693,7 @@ laser.unquarantine("operator".parse()?, &"diag-alpha".parse()?).await?;
 
 Registry-topic permissions control publication. With `sign`, use `quarantine_signed` and `unquarantine_signed` for signed facts. A registry configured through `LaserBuilder::verifier(keys)` accepts those facts only with a valid operator signature. This adds a check above native topic permissions.
 
-The `orchestra` example runs all of this end to end (a directed contract, a scatter panel, health exclusion, and quarantine), in both Rust (`cargo run --example orchestra`) and Python (`python orchestra.py`).
+The `orchestra` example runs all of this end to end (a directed contract, a scatter panel, health exclusion, and quarantine), in Rust (`cargo run --example orchestra`), Python (`python orchestra.py`), and TypeScript (`npm run example:orchestra`).
 
 ---
 
@@ -755,7 +756,7 @@ Queries, projections, KV, and forks require Laser Stack or LaserData Cloud. A ma
 | ships in this workspace | runs in Laser Stack or LaserData Cloud |
 | --- | --- |
 | the `laser-wire` contract crate (codes, envelopes, dictionaries, caps, the agent envelope, the golden fixture corpus) | the same crate, consumed as the one typed source of truth |
-| publish / batch / query API | one Iggy connection, customer-facing |
+| publish / batch / query API | one Iggy connection, public |
 | `Projection` + `ProjectionBinding` types | resolved from the cloud's deployment snapshots |
 | query DSL + request/reply envelope | served from the `_agdx` internal stream |
 | managed KV client (`kv` feature, `Laser::kv`) + registry browse (projections via `projections().get` / `projections().list`, writer schemas via `schemas().get` / `schemas().list`) | the `AGDX_KV_*` / `AGDX_*_PROJECTION` / `AGDX_*_SCHEMA` managed commands, served by Laser Stack or LaserData Cloud |

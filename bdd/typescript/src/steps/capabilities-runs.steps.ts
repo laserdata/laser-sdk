@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { Given, Then, When } from "@cucumber/cucumber"
+import { InvalidError, code } from "@laserdata/laser-sdk"
 import type { LaserWorld } from "../world.js"
 
 When("I read the negotiated capabilities", async function (this: LaserWorld) {
@@ -55,6 +56,28 @@ When(
     )
   }
 )
+
+When(
+  /^I send a set of key "([^"]+)" in namespace "([^"]+)" expecting version (\d+) without commit$/,
+  async function (this: LaserWorld, key: string, namespace: string, version: string) {
+    await this.capture(() =>
+      this.requireLaser()
+        .kv(namespace)
+        .set(new TextEncoder().encode(key))
+        .bytes(new TextEncoder().encode("debug"))
+        .expectVersion(BigInt(version))
+        .send()
+    )
+  }
+)
+
+Then("the call fails as invalid", function (this: LaserWorld) {
+  assert.ok(this.error instanceof InvalidError)
+})
+
+Then("the unified result code is invalid argument", function (this: LaserWorld) {
+  assert.deepEqual(code(this.error), { kind: "known", name: "InvalidArgument" })
+})
 
 Then("the run registry is unavailable", async function (this: LaserWorld) {
   assert.equal((await this.requireLaser().capabilities()).agentWorkflow, false)

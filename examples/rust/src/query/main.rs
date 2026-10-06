@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 // The Views primitive: a projection watches a topic and keeps an
 // always-current, queryable table. This needs a managed deployment. Apache
 // Iggy without a managed backend prints how to point at one and exits.
-const TOPIC: &str = "orders";
-const FIELDS: [&str; 3] = ["id", "total", "status"];
+const TOPIC: &str = "readings";
+const FIELDS: [&str; 3] = ["host", "cpu", "status"];
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Order {
-    id: u32,
-    total: u32,
+struct Reading {
+    host: String,
+    cpu: u32,
     status: String,
 }
 
@@ -30,33 +30,40 @@ async fn main() -> Result<(), LaserError> {
 
         phase("keep a queryable view of a topic, then query it");
         laser.topic(TOPIC).ensure(PARTITIONS).await?;
-        // Declare this run's `orders_v1_<token>` view over `orders`. From here the
+        // Declare this run's `readings_v1_<token>` view over `readings`. From here the
         // view maintains itself: every record published to the topic lands in the
         // table, and the per-run name means the counts below are this run's alone.
-        let index = index_for("orders_v1");
+        let index = index_for("readings_v1");
         ensure_view(&laser, TOPIC, &index, ContentType::Json, &FIELDS).await?;
 
-        let orders = sample_orders();
-        for order in &orders {
-            laser.topic(TOPIC).publish().json(order)?.send().await?;
+        let readings = sample_readings();
+        for reading in &readings {
+            laser.topic(TOPIC).publish().json(reading)?.send().await?;
         }
-        wait_for_rows(&laser, &index, orders.len() as u64).await?;
+        wait_for_rows(&laser, &index, readings.len() as u64).await?;
 
         // `where_eq` matches an indexed key, the cheap path a projection's key
         // columns answer directly. `filter_eq` and its siblings cover the rest.
-        let paid = laser
+        let degraded = laser
             .query(&index)
-            .where_eq("status", "paid")
+            .where_eq("status", "degraded")
             .limit(10)
             .fetch()
             .await?;
 
-        println!("  {} of {} orders are paid", paid.rows.len(), orders.len());
-        for row in &paid.rows {
+        println!(
+            "  {} of {} hosts are degraded",
+            degraded.rows.len(),
+            readings.len()
+        );
+        for row in &degraded.rows {
             println!(
-                "    order #{} total {}",
-                paid.value_text(row, "id").unwrap_or_else(|| "?".to_owned()),
-                paid.value_text(row, "total")
+                "    host {} cpu {}",
+                degraded
+                    .value_text(row, "host")
+                    .unwrap_or_else(|| "?".to_owned()),
+                degraded
+                    .value_text(row, "cpu")
                     .unwrap_or_else(|| "?".to_owned())
             );
         }
@@ -65,13 +72,17 @@ async fn main() -> Result<(), LaserError> {
     .await
 }
 
-fn sample_orders() -> Vec<Order> {
-    [(1, 99, "paid"), (2, 42, "pending"), (3, 15, "paid")]
-        .into_iter()
-        .map(|(id, total, status)| Order {
-            id,
-            total,
-            status: status.to_owned(),
-        })
-        .collect()
+fn sample_readings() -> Vec<Reading> {
+    [
+        ("node-1", 42, "ok"),
+        ("node-2", 91, "degraded"),
+        ("node-3", 17, "ok"),
+    ]
+    .into_iter()
+    .map(|(host, cpu, status)| Reading {
+        host: host.to_owned(),
+        cpu,
+        status: status.to_owned(),
+    })
+    .collect()
 }

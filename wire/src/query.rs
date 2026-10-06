@@ -1566,17 +1566,17 @@ mod tests {
         // Eventual always passes, regardless of lag.
         assert!(
             ConsistencyGate::new(0, 100)
-                .check(Consistency::Eventual, "orders")
+                .check(Consistency::Eventual, "readings")
                 .is_ok()
         );
         // A non-Eventual level passes only once caught up.
         assert!(
             ConsistencyGate::new(100, 100)
-                .check(Consistency::ReadYourWrites, "orders")
+                .check(Consistency::ReadYourWrites, "readings")
                 .is_ok()
         );
         let stale = ConsistencyGate::new(41, 57)
-            .check(Consistency::Strong, "orders")
+            .check(Consistency::Strong, "readings")
             .expect_err("a lagging projector must fail, never downgrade");
         assert!(matches!(
             stale,
@@ -1613,7 +1613,7 @@ mod serde_tests {
     fn query() -> Query {
         Query {
             execution_id: QueryExecutionId::from_u128(1),
-            target: QueryTarget::operational("orders"),
+            target: QueryTarget::operational("readings"),
             deadline_micros: 1_000_000,
             by_key: Vec::new(),
             message_type: None,
@@ -1652,8 +1652,8 @@ mod serde_tests {
     #[test]
     fn given_a_query_when_round_tripped_through_the_envelope_then_should_be_unchanged() {
         let mut query = query();
-        query.by_key = vec![KeyMatch::new("customer_id", "abc")];
-        query.filter = Some(Filter::pred("status", CmpOp::Eq, "paid"));
+        query.by_key = vec![KeyMatch::new("host_id", "abc")];
+        query.filter = Some(Filter::pred("status", CmpOp::Eq, "degraded"));
         query.order = vec![Sort {
             field: "ts".to_owned(),
             dir: Dir::Desc,
@@ -1664,13 +1664,13 @@ mod serde_tests {
         let json = serde_json::to_string(&request).expect("the request serializes");
         let back: QueryEnvelope = serde_json::from_str(&json).expect("the request deserializes");
         assert_eq!(back.v, QUERY_OP_VERSION);
-        assert_eq!(back.query.target, QueryTarget::operational("orders"));
+        assert_eq!(back.query.target, QueryTarget::operational("readings"));
         assert_eq!(back.query.page.limit, 20);
-        assert_eq!(back.query.by_key, vec![KeyMatch::new("customer_id", "abc")]);
+        assert_eq!(back.query.by_key, vec![KeyMatch::new("host_id", "abc")]);
         let Some(Filter::Pred(predicate)) = &back.query.filter else {
             panic!("expected a single predicate filter");
         };
-        assert_eq!(predicate.value, TypedValue::String("paid".to_owned()));
+        assert_eq!(predicate.value, TypedValue::String("degraded".to_owned()));
         assert_eq!(back.query.order[0].dir, Dir::Desc);
     }
 
@@ -1701,7 +1701,7 @@ mod serde_tests {
     #[test]
     fn given_a_stale_reply_when_round_tripped_then_should_preserve_the_offsets() {
         let reply = QueryReply::Err(QueryError::Stale {
-            what: "orders".to_owned(),
+            what: "readings".to_owned(),
             applied: 41,
             required: 57,
         });
@@ -1715,7 +1715,7 @@ mod serde_tests {
         else {
             panic!("expected a Stale error");
         };
-        assert_eq!((what.as_str(), applied, required), ("orders", 41, 57));
+        assert_eq!((what.as_str(), applied, required), ("readings", 41, 57));
     }
 
     #[test]
@@ -1739,7 +1739,7 @@ mod serde_tests {
         let reply = QueryReply::Ok(Box::new(QueryResult {
             fields: vec![LogicalField {
                 id: 1,
-                name: "order_id".to_owned(),
+                name: "reading_id".to_owned(),
                 required: true,
                 field_type: crate::schema::LogicalType::String,
                 doc: None,
@@ -1763,7 +1763,7 @@ mod serde_tests {
                     dialect: Some(SqlDialect::DataFusion),
                 },
                 resolved_target: ResolvedQueryTarget::Operational {
-                    index: "orders".to_owned(),
+                    index: "readings".to_owned(),
                     backend_resource_id: BackendResourceId::from_u128(2),
                     backend_generation: 1,
                     runtime_configuration_revision: 1,

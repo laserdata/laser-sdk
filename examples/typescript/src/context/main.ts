@@ -19,8 +19,8 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   phase("append a conversation, then assemble it under a budget")
   const ctx = laser.context(conversation)
-  await ctx.append(AgentTopic.Commands, utf8("book me an aisle seat"))
-  await ctx.append(AgentTopic.Responses, utf8("booked, aisle 12"))
+  await ctx.append(AgentTopic.Commands, utf8("drain node-7"))
+  await ctx.append(AgentTopic.Responses, utf8("drained, 0 connections left"))
 
   // The shape of a prompt's context is a declared policy, not slicing logic
   // spread through the application: cap the turns, then fit the budget.

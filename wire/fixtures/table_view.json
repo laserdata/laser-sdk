@@ -20,10 +20,10 @@
   "destination_id": "0000000000000000000000009C",
   "destination_generation": 2,
   "namespace": [
-    "shop",
+    "fleet",
     "analytics"
   ],
-  "table": "orders",
+  "table": "readings",
   "current_snapshot_id": 42,
   "current_schema_id": 3,
   "current_partition_spec_id": 1,

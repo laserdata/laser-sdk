@@ -41,8 +41,9 @@ async fn main() -> Result<(), LaserError> {
                 skill_id: CAPABILITY.to_owned(),
                 ..Default::default()
             }])
-            // Acknowledge on pickup, so a crash mid-handler is a retry rather than
-            // a silently dropped task.
+            // Emit a Working status on pickup, so a contract caller can tell the
+            // command was consumed. Redelivery after a crash comes from
+            // commit-after-success.
             .ack_on_pickup(true)
             .handler(Triage)
             .build()

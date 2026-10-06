@@ -313,23 +313,23 @@ mod tests {
 
     #[test]
     fn given_each_kind_when_matching_event_types_then_should_follow_its_rule() {
-        let value = "billing.invoice.v1.created";
+        let value = "metrics.cpu.v1.reported";
         assert!(matcher(TextMatch::Equals, value, false).matches(value));
-        assert!(matcher(TextMatch::Prefix, "billing.", false).matches(value));
-        assert!(matcher(TextMatch::Suffix, ".created", false).matches(value));
+        assert!(matcher(TextMatch::Prefix, "metrics.", false).matches(value));
+        assert!(matcher(TextMatch::Suffix, ".reported", false).matches(value));
         assert!(matcher(TextMatch::Contains, ".v1.", false).matches(value));
-        assert!(matcher(TextMatch::Glob, "billing.*.v?.created", false).matches(value));
-        assert!(matcher(TextMatch::Regex, r"^billing\.[a-z]+\.v[0-9]+\.", false).matches(value));
+        assert!(matcher(TextMatch::Glob, "metrics.*.v?.reported", false).matches(value));
+        assert!(matcher(TextMatch::Regex, r"^metrics\.[a-z]+\.v[0-9]+\.", false).matches(value));
         assert!(!matcher(TextMatch::Suffix, ".deleted", false).matches(value));
-        assert!(!matcher(TextMatch::Glob, "billing.*", false).matches("shipping.billing.x"));
+        assert!(!matcher(TextMatch::Glob, "metrics.*", false).matches("storage.metrics.x"));
     }
 
     #[test]
     fn given_case_insensitive_matching_when_the_case_differs_then_should_still_match() {
         assert!(matcher(TextMatch::Equals, "Safe", true).matches("SAFE"));
-        assert!(matcher(TextMatch::Contains, "INVOICE", true).matches("billing.invoice.v1"));
-        assert!(matcher(TextMatch::Glob, "BILLING.*", true).matches("billing.x"));
-        assert!(matcher(TextMatch::Regex, "^billing", true).matches("BILLING.x"));
+        assert!(matcher(TextMatch::Contains, "CPU", true).matches("metrics.cpu.v1"));
+        assert!(matcher(TextMatch::Glob, "METRICS.*", true).matches("metrics.x"));
+        assert!(matcher(TextMatch::Regex, "^metrics", true).matches("METRICS.x"));
         assert!(!matcher(TextMatch::Equals, "Safe", false).matches("SAFE"));
     }
 

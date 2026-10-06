@@ -39,10 +39,10 @@ function canonicalCommand() {
     conversation,
     parseAgentId("source-agent"),
     correlation,
-    new TextEncoder().encode('{"ask":"plan the trip"}')
+    new TextEncoder().encode('{"ask":"plan the rollout"}')
   )
   envelope = withTarget(envelope, parseAgentId("target-agent"))
-  envelope = withIdempotencyKey(envelope, parseIdempotencyKey("order-123-attempt-2"))
+  envelope = withIdempotencyKey(envelope, parseIdempotencyKey("job-123-attempt-2"))
   envelope = withDeadlineMicros(envelope, 1_717_171_777_000_000n)
   envelope = withOperation(envelope, "chat")
   return withMetadata(envelope, "priority", { kind: "string", value: "high" })

@@ -4,7 +4,7 @@ This example records, retrieves, improves, and forgets memory items. Log-based m
 
 ## What it shows
 
-- `laser.memory("customer:42")` scopes a memory handle to a customer, connected the same as every other example.
+- `laser.memory("host:node-7")` scopes a memory handle to a host, connected the same as every other example.
 - Remembers one fact under a conversation scope with `memory.remember(payload).conversation(id).send()`, which returns the item's id.
 - Recalls the newest facts with `memory.recall().conversation(id).recent().limit(5).folded().fetch()`. The full memory scenario shows true similarity ranking with the vector backend.
 - Reinforces then retires the same item with `improve` and `forget`. Both are records on the memory topic, so the store stays an auditable history rather than a mutable cell.

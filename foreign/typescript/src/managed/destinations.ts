@@ -1,5 +1,5 @@
 import type { Capabilities } from "../client/capabilities.js"
-import { QueryExecutionError } from "../client/errors.js"
+import { CheckpointExecutionError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import { CHECKPOINT_OP_VERSION } from "../wire/codes.js"
@@ -44,19 +44,9 @@ export class Destinations {
     private readonly capabilities: () => Promise<Capabilities>
   ) {}
 
-  async mutate(
-    expectedGlobalStateRevision: bigint,
-    mutation: PublicCheckpointMutation,
-    supervisorAssertion?: SupervisorActorAssertion
-  ): Promise<CheckpointMutationResult> {
-    const request: CheckpointRequestEnvelope = {
-      v: CHECKPOINT_OP_VERSION,
-      requestId:
-        supervisorAssertion?.claims.requestId ?? CheckpointRequestId.fromU128(mintUlidValue()),
-      expectedGlobalStateRevision,
-      mutation,
-      ...(supervisorAssertion === undefined ? {} : { supervisorAssertion })
-    }
+  /** Sends one checkpoint request envelope, the deep form behind every
+   * mutation helper. Mirrors the Rust `Laser::execute_checkpoint`. */
+  async executeCheckpoint(request: CheckpointRequestEnvelope): Promise<CheckpointMutationResult> {
     const reply = await executeManaged(
       this.transport,
       await this.capabilities(),
@@ -64,7 +54,35 @@ export class Destinations {
       request
     )
     if (reply.kind === "ok") return reply.result
-    throw new QueryExecutionError(`checkpoint mutation failed: ${reply.error.kind}`, reply.error)
+    throw new CheckpointExecutionError(
+      `checkpoint mutation failed: ${reply.error.kind}`,
+      reply.error
+    )
+  }
+
+  async mutate(
+    expectedGlobalStateRevision: bigint,
+    mutation: PublicCheckpointMutation,
+    supervisorAssertion?: SupervisorActorAssertion
+  ): Promise<CheckpointMutationResult> {
+    return this.executeCheckpoint({
+      v: CHECKPOINT_OP_VERSION,
+      requestId:
+        supervisorAssertion?.claims.requestId ?? CheckpointRequestId.fromU128(mintUlidValue()),
+      expectedGlobalStateRevision,
+      mutation,
+      ...(supervisorAssertion === undefined ? {} : { supervisorAssertion })
+    })
+  }
+
+  /** A mutation carried under a supervisor actor assertion. The request id is
+   * the one the assertion's claims name. */
+  mutateWithSupervisorAssertion(
+    expectedGlobalStateRevision: bigint,
+    mutation: PublicCheckpointMutation,
+    supervisorAssertion: SupervisorActorAssertion
+  ): Promise<CheckpointMutationResult> {
+    return this.mutate(expectedGlobalStateRevision, mutation, supervisorAssertion)
   }
 
   register(
@@ -362,9 +380,12 @@ export class Destinations {
     )
     if (reply.kind === "destination") return reply.destination
     if (reply.kind === "err") {
-      throw new QueryExecutionError(`destination read failed: ${reply.error.kind}`, reply.error)
+      throw new CheckpointExecutionError(
+        `destination read failed: ${reply.error.kind}`,
+        reply.error
+      )
     }
-    throw new QueryExecutionError("destination read returned an unexpected reply", {})
+    throw new ProtocolError("destination read returned an unexpected reply")
   }
 
   async list(
@@ -387,9 +408,12 @@ export class Destinations {
     )
     if (reply.kind === "destinations") return reply.page
     if (reply.kind === "err") {
-      throw new QueryExecutionError(`destination list failed: ${reply.error.kind}`, reply.error)
+      throw new CheckpointExecutionError(
+        `destination list failed: ${reply.error.kind}`,
+        reply.error
+      )
     }
-    throw new QueryExecutionError("destination list returned an unexpected reply", {})
+    throw new ProtocolError("destination list returned an unexpected reply")
   }
 
   async queryRoutes(
@@ -412,8 +436,11 @@ export class Destinations {
     )
     if (reply.kind === "query_routes") return reply.page
     if (reply.kind === "err") {
-      throw new QueryExecutionError(`query route list failed: ${reply.error.kind}`, reply.error)
+      throw new CheckpointExecutionError(
+        `query route list failed: ${reply.error.kind}`,
+        reply.error
+      )
     }
-    throw new QueryExecutionError("query route list returned an unexpected reply", {})
+    throw new ProtocolError("query route list returned an unexpected reply")
   }
 }

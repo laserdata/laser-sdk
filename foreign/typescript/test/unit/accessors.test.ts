@@ -16,24 +16,24 @@ function fakeClient(): IggyClient {
 }
 
 async function laserWithStream(): Promise<Laser> {
-  return Laser.fromIggyClient(fakeClient(), { defaultStream: "shop" })
+  return Laser.fromIggyClient(fakeClient(), { defaultStream: "fleet" })
 }
 
 void test("given_a_connected_client_when_reaching_the_log_then_should_address_streams_and_topics", async () => {
   await using laser = await laserWithStream()
 
-  assert.equal(laser.defaultStream, "shop")
+  assert.equal(laser.defaultStream, "fleet")
   assert.equal(laser.stream("audit").name, "audit")
   assert.equal(laser.stream("audit").topic("events").name, "events")
-  assert.equal(laser.topic("orders").name, "orders")
-  assert.equal(laser.stream("shop").topic("orders").streamName, "shop")
+  assert.equal(laser.topic("readings").name, "readings")
+  assert.equal(laser.stream("fleet").topic("readings").streamName, "fleet")
 })
 
 void test("given_no_default_stream_when_using_the_shortcut_then_should_reject_with_no_stream", async () => {
   await using laser = await Laser.fromIggyClient(fakeClient())
 
   assert.equal(laser.defaultStream, undefined)
-  assert.throws(() => laser.topic("orders"), NoStreamError)
+  assert.throws(() => laser.topic("readings"), NoStreamError)
 })
 
 void test("given_a_connected_client_when_reaching_the_managed_surfaces_then_should_build_every_handle", async () => {
@@ -42,16 +42,16 @@ void test("given_a_connected_client_when_reaching_the_managed_surfaces_then_shou
   assert.equal(laser.kv("profiles").namespace, "profiles")
   assert.equal(laser.fork("experiment-1").forkId, "experiment-1")
   assert.ok(laser.graph("kg"))
-  assert.deepEqual(laser.query("orders_v1").intoQuery().target, {
+  assert.deepEqual(laser.query("readings_v1").intoQuery().target, {
     kind: "operational",
-    index: "orders_v1"
+    index: "readings_v1"
   })
   assert.ok(laser.projections())
   assert.ok(laser.bindings())
   assert.ok(laser.schemas())
   assert.ok(laser.runs())
   assert.ok(laser.watch())
-  assert.ok(laser.watch().index("orders_v1"))
+  assert.ok(laser.watch().index("readings_v1"))
 })
 
 void test("given_a_connected_client_when_reaching_the_fabric_then_should_scope_by_identity", async () => {
@@ -60,15 +60,15 @@ void test("given_a_connected_client_when_reaching_the_fabric_then_should_scope_b
 
   assert.equal(laser.context(conversation).conversation, conversation)
   assert.ok(laser.agent(AgentId.new("triage")))
-  assert.ok(laser.workflow("refund"))
+  assert.ok(laser.workflow("rollback"))
   assert.ok(laser.clientMetadata())
 })
 
 void test("given_a_connected_client_when_reaching_memory_then_should_build_each_backend_form", async () => {
   await using laser = await laserWithStream()
 
-  assert.equal(laser.memory("customer:42").logBackend()?.namespace, "customer:42")
-  assert.equal(laser.memory("customer:42").logBackend()?.topic, AgentTopic.Audit)
+  assert.equal(laser.memory("host:node-7").logBackend()?.namespace, "host:node-7")
+  assert.equal(laser.memory("host:node-7").logBackend()?.topic, AgentTopic.Audit)
   assert.equal(laser.memoryOnTopic("incidents").logBackend()?.topic, "incidents")
   assert.equal(laser.memoryOnTopic("incidents", "ops").logBackend()?.stream, "ops")
 
@@ -81,7 +81,7 @@ void test("given_a_scoped_view_when_derived_then_should_keep_the_connection_and_
 
   const scoped = laser.withDefaultStream("audit")
   assert.equal(scoped.defaultStream, "audit")
-  assert.equal(laser.defaultStream, "shop")
+  assert.equal(laser.defaultStream, "fleet")
   assert.equal(scoped.topic("events").streamName, "audit")
 })
 

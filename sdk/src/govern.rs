@@ -1065,12 +1065,12 @@ mod tests {
         let step_up = apply(
             GovernorMode::Enforce,
             Verdict::StepUp {
-                scope: "payments:approve".to_owned(),
+                scope: "storage:rotate".to_owned(),
             },
         );
         assert_eq!(step_up.outcome, "step_up");
         assert!(
-            matches!(step_up.denial, Some(LaserError::StepUpRequired(scope)) if scope == "payments:approve")
+            matches!(step_up.denial, Some(LaserError::StepUpRequired(scope)) if scope == "storage:rotate")
         );
 
         let defer = apply(GovernorMode::Enforce, Verdict::Defer);
@@ -1370,7 +1370,7 @@ mod tests {
             .voter(
                 "reviewer",
                 voter(Verdict::StepUp {
-                    scope: "payments:approve".to_owned(),
+                    scope: "storage:rotate".to_owned(),
                 }),
                 false,
             )
@@ -1409,7 +1409,7 @@ mod tests {
             .voter(
                 "safety",
                 voter(Verdict::StepUp {
-                    scope: "payments:approve".to_owned(),
+                    scope: "storage:rotate".to_owned(),
                 }),
                 true,
             )

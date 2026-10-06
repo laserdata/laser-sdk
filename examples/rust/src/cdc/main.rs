@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 // desk only wants satellites entering safe mode or leaving the fleet. The
 // desk's consumer group owns that filter: the server evaluates it next to the
 // data, so the desk receives a handful of records out of hundreds, and
-// everything else never leaves the broker.
+// everything else never leaves the server.
 const TOPIC: &str = "fleet_changes";
 const ALERTS: &str = "fleet_alerts";
 const PARTITIONS: u32 = 3;
@@ -112,7 +112,7 @@ async fn main() -> Result<(), LaserError> {
         consumer.shutdown().await?;
         let delivered_bytes = consumed?;
         println!(
-            "  delivered {} of {} records, {delivered_bytes} of {published_bytes} payload bytes: {:.1}% stayed on the broker",
+            "  delivered {} of {} records, {delivered_bytes} of {published_bytes} payload bytes: {:.1}% stayed on the server",
             feed.strict_matches,
             feed.records.len(),
             100.0 * (published_bytes - delivered_bytes) as f64 / published_bytes.max(1) as f64
@@ -222,8 +222,7 @@ async fn route_alerts(laser: &Laser, stream: &str) -> Result<(), LaserError> {
 }
 
 // Draft a stricter revision on the desk's own filter, run the variant in its
-// own group, pause and resume it, then release and delete both policies,
-// also when a step fails.
+// own group, pause and resume it, then release and delete both policies.
 async fn manage_revisions(
     laser: &Laser,
     desk: &ConsumerGroup,

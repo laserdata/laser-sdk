@@ -25,12 +25,12 @@ impl Laser {
     /// ```no_run
     /// # use laser_sdk::prelude::*;
     /// # use serde::Deserialize;
-    /// # #[derive(Deserialize)] struct Order { customer: String, amount: i64 }
+    /// # #[derive(Deserialize)] struct Reading { host: String, cpu: i64 }
     /// # async fn run(laser: &Laser) -> Result<(), LaserError> {
-    /// let alice: Vec<Order> = laser.query("orders")
-    ///     .where_eq("customer_id", "alice")
-    ///     .filter_gte("total", 100)
-    ///     .order_desc("total")
+    /// let hot: Vec<Reading> = laser.query("readings")
+    ///     .where_eq("host_id", "node-7")
+    ///     .filter_gte("cpu", 90)
+    ///     .order_desc("cpu")
     ///     .limit(10)
     ///     .with_payload()
     ///     .fetch_typed().await?;
@@ -447,6 +447,14 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
+    /// Resume from an opaque cursor that the server returned in a previous
+    /// page. Replaces any [`offset`](Self::offset).
+    pub fn cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.query.page.cursor = Some(cursor.into());
+        self.query.page.offset = None;
+        self
+    }
+
     /// Skip the first `n` matching rows.
     pub fn offset(mut self, n: usize) -> Self {
         self.query.page.offset = Some(n as u64);
@@ -728,9 +736,9 @@ impl<'a> QueryRequest<'a> {
     /// # use laser_sdk::prelude::*;
     /// # use laser_sdk::stream::Msgpack;
     /// # use serde::Deserialize;
-    /// # #[derive(Deserialize)] struct Order { id: String }
+    /// # #[derive(Deserialize)] struct Reading { host: String }
     /// # async fn run(laser: &Laser) -> Result<(), LaserError> {
-    /// let orders: Vec<Order> = laser.query("orders").fetch_typed_with::<Msgpack, _>().await?;
+    /// let readings: Vec<Reading> = laser.query("readings").fetch_typed_with::<Msgpack, _>().await?;
     /// # Ok(()) }
     /// ```
     pub async fn fetch_typed_with<C, T>(mut self) -> Result<Vec<T>, LaserError>
@@ -805,7 +813,7 @@ impl<'a> QueryRequest<'a> {
     /// ```no_run
     /// # use laser_sdk::prelude::*;
     /// # async fn run(laser: &Laser) -> Result<(), LaserError> {
-    /// let mut rows = laser.query("orders").where_eq("status", "paid").max_rows(1_000).rows()?;
+    /// let mut rows = laser.query("readings").where_eq("status", "degraded").max_rows(1_000).rows()?;
     /// while let Some(row) = rows.next().await? {
     ///     let _ = row;
     /// }
@@ -1077,5 +1085,25 @@ impl<T: DeserializeOwned> TypedQueryRows<'_, T> {
             self.remaining -= 1;
         }
         Ok(row)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_a_cursor_when_set_then_should_replace_the_offset() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default());
+        let query = laser
+            .query("readings")
+            .offset(20)
+            .cursor("c-2")
+            .into_query();
+        assert_eq!(query.page.cursor.as_deref(), Some("c-2"));
+        assert_eq!(query.page.offset, None);
+        let query = laser.query("readings").cursor("c-2").offset(5).into_query();
+        assert_eq!(query.page.cursor, None);
+        assert_eq!(query.page.offset, Some(5));
     }
 }

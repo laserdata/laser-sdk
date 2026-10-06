@@ -4,7 +4,9 @@ import type { Laser } from "../client/laser.js"
 import type { Provenance } from "../provenance/provenance.js"
 import type { AgentId } from "../types/ids.js"
 import type { AgentCard, CapabilityDescriptor } from "../wire/agent.js"
+import type { ContractBuilder } from "./contract.js"
 import type { AgentMessage } from "./reliable-consumer.js"
+import type { Router } from "./router.js"
 
 export class AgentScope {
   constructor(
@@ -32,6 +34,12 @@ export class AgentScope {
       timeoutMs,
       signal
     )
+  }
+
+  /** A deadline-bound contract sent as this agent: `laser.contract(router)`
+   * with `.from(id)` already applied. */
+  contract(router: Router): ContractBuilder {
+    return this.laser.contract(router).from(this.id)
   }
 
   publishCard(card: AgentCard): Promise<void> {

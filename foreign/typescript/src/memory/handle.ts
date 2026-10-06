@@ -1,3 +1,4 @@
+import { InvalidError, UnsupportedError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import type { AgentId, ConversationId } from "../types/ids.js"
 import { LogMemory } from "./log-memory.js"
@@ -9,6 +10,7 @@ import {
   toContextBlock,
   type Embedder,
   type Feedback,
+  type ConsolidateOptions,
   type ConsolidationReport,
   type Memory,
   type MemoryItem,
@@ -22,7 +24,14 @@ export const MemoryBackend = { Auto: "auto", Log: "log", Vector: "vector" } as c
 export type MemoryBackend = (typeof MemoryBackend)[keyof typeof MemoryBackend]
 
 export class MemoryHandle implements Memory {
-  constructor(private readonly backend: Memory) {}
+  constructor(private readonly store: Memory) {}
+
+  /** Which backend this handle resolved to: `log` for the durable stream
+   * model, `vector` for the in-process similarity index, `custom` for a
+   * caller-supplied backend. A reranked handle reports its inner backend. */
+  get backend(): MemoryBackendKind {
+    return backendKindOf(this.store)
+  }
 
   static log(laser: Laser, namespace: string): MemoryHandle {
     return new MemoryHandle(new LogMemory(laser, namespace))
@@ -42,7 +51,14 @@ export class MemoryHandle implements Memory {
   }
 
   static custom(memory: Memory): MemoryHandle {
-    return new MemoryHandle(memory)
+    const append = memory.append?.bind(memory)
+    return new MemoryHandle({
+      ...(append === undefined ? {} : { append }),
+      remember: (scope, payload) => memory.remember(scope, payload),
+      recall: (scope, query) => memory.recall(scope, query),
+      improve: (scope, feedback) => memory.improve(scope, feedback),
+      forget: (scope, id) => memory.forget(scope, id)
+    })
   }
 
   remember(payload: Uint8Array): RememberBuilder
@@ -52,51 +68,136 @@ export class MemoryHandle implements Memory {
     payload?: Uint8Array
   ): RememberBuilder | Promise<MemoryId> {
     if (scopeOrPayload instanceof Uint8Array) return new RememberBuilder(this, scopeOrPayload)
-    return this.backend.remember(scopeOrPayload, required(payload))
+    return this.store.remember(scopeOrPayload, required(payload))
   }
 
   recall(): RecallBuilder
   recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]>
   recall(scope?: MemoryScope, query?: MemoryQuery): RecallBuilder | Promise<readonly MemoryItem[]> {
     if (scope === undefined) return new RecallBuilder(this)
-    return this.backend.recall(scope, query ?? {})
+    return this.store.recall(scope, query ?? {})
   }
 
   /** Recall by folding the memory topic in process instead of reading the
    * managed view. The log backend folds, the vector backend is already in
    * process, and a reranked backend folds its inner backend then reranks. */
   recallFolded(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
-    return recallFoldedOn(this.backend, scope, query)
+    return recallFoldedOn(this.store, scope, query)
   }
 
   improve(scope: MemoryScope, feedback: Feedback): Promise<MemoryId> {
-    return this.backend.improve(scope, feedback)
+    return this.store.improve(scope, feedback)
   }
 
   forget(scope: MemoryScope, id: MemoryId): Promise<void> {
-    return this.backend.forget(scope, id)
+    return this.store.forget(scope, id)
   }
 
   async context(scope: MemoryScope, query: MemoryQuery = {}): Promise<string> {
-    return toContextBlock(await this.backend.recall(scope, query), query.tokenBudget)
+    return toContextBlock(await this.store.recall(scope, query), query.tokenBudget)
   }
 
-  async consolidate(scope: MemoryScope, maxItems: number): Promise<ConsolidationReport> {
-    const items = await this.backend.recall(scope, {
-      limit: 10_000,
-      strategy: RecallStrategy.Recent
-    })
-    const stale = items.slice(Math.max(0, maxItems))
-    for (const item of stale) await this.backend.forget(scope, item.id)
-    return { scanned: items.length, kept: items.length - stale.length, forgotten: stale.length }
+  /** One consolidation pass over `scope`: keeps the newest `maxItems` and
+   * forgets the rest. With a `summarizer`, the `message` items are first folded
+   * into one durable summary, and `pruneSummarized` forgets the folded items. */
+  async consolidate(
+    scope: MemoryScope,
+    maxItems: number,
+    options: ConsolidateOptions = {}
+  ): Promise<ConsolidationReport> {
+    if (!Number.isSafeInteger(maxItems) || maxItems < 0)
+      throw new InvalidError("consolidation maxItems must be a non-negative safe integer")
+    const items = await this.store.recall(scope, { limit: 10_000 })
+    let remaining = items
+    let summarized = 0
+    let pruned = 0
+    if (options.summarizer !== undefined) {
+      const sessions = items.filter((item) => item.kind === MemoryKind.Message)
+      if (sessions.length > 0) {
+        const summary = await options.summarizer.summarize(
+          sessions.map((item) => item.payload.slice())
+        )
+        await appendOn(
+          this.store,
+          { ...scope, lifetime: Lifetime.Durable },
+          MemoryId.new(),
+          MemoryKind.Summary,
+          summary
+        )
+        summarized = sessions.length
+        if (options.pruneSummarized === true) {
+          for (const item of sessions) {
+            try {
+              await this.store.forget(scope, item.id)
+              pruned += 1
+            } catch {
+              // Failed forgets stay outside the successful prune count.
+            }
+          }
+          remaining = items.filter((item) => item.kind !== MemoryKind.Message)
+        }
+      }
+    }
+    const oldestFirst = [...remaining].sort((left, right) =>
+      left.id.asU128() < right.id.asU128() ? -1 : left.id.asU128() > right.id.asU128() ? 1 : 0
+    )
+    for (const item of oldestFirst.slice(0, Math.max(0, oldestFirst.length - maxItems))) {
+      try {
+        await this.store.forget(scope, item.id)
+        pruned += 1
+      } catch {
+        // Failed forgets stay outside the successful prune count.
+      }
+    }
+    return { summarized, reweighted: 0, pruned, derived: 0 }
   }
 
   reranker(reranker: Reranker): MemoryHandle {
-    return new MemoryHandle(new RerankedMemory(this.backend, reranker))
+    return new MemoryHandle(new RerankedMemory(this.store, reranker))
   }
 
   logBackend(): LogMemory | undefined {
-    return this.backend instanceof LogMemory ? this.backend : undefined
+    return namedMemoryOf(this.store)
+  }
+
+  /** Writes named point state under your own `key`. Every write is a durable
+   * event on the memory topic. Only the log-backed handle has a key space, so
+   * the vector handle refuses with `UnsupportedError`. */
+  set(key: string, payload: Uint8Array): Promise<void> {
+    return this.namedMemory("set").set(key, payload)
+  }
+
+  /** Point-reads the named item written by `set`, from the managed key-value
+   * view, or `undefined`. */
+  fetch(key: string): Promise<Uint8Array | undefined> {
+    return this.namedMemory("fetch").fetch(key)
+  }
+
+  /** Point-reads the named item by folding the memory topic in process. */
+  fetchFolded(key: string): Promise<Uint8Array | undefined> {
+    return this.namedMemory("fetchFolded").fetchFolded(key)
+  }
+
+  /** Merge-patches the named item (RFC 7386 over a JSON value): fields in
+   * `patch` overwrite, `null` removes. */
+  update(key: string, patch: Uint8Array): Promise<void> {
+    return this.namedMemory("update").update(key, patch)
+  }
+
+  /** Deletes the named item. Removing an absent key is fine. */
+  remove(key: string): Promise<void> {
+    return this.namedMemory("remove").remove(key)
+  }
+
+  private namedMemory(verb: string): LogMemory {
+    const memory = namedMemoryOf(this.store)
+    if (memory === undefined) {
+      throw new UnsupportedError(
+        `${verb}(key) is the named-item altitude and needs the durable memory handle`,
+        { cause: { surface: "memory" } }
+      )
+    }
+    return memory
   }
 
   append(
@@ -105,10 +206,7 @@ export class MemoryHandle implements Memory {
     kind: MemoryKind,
     payload: Uint8Array
   ): Promise<MemoryId> {
-    if (this.backend instanceof VectorMemory || this.backend instanceof LogMemory) {
-      return this.backend.append(scope, id, kind, payload)
-    }
-    return this.backend.remember(scope, payload)
+    return appendOn(this.store, scope, id, kind, payload)
   }
 }
 
@@ -268,9 +366,36 @@ async function recallFoldedOn(
   return backend.recall(scope, query)
 }
 
+function appendOn(
+  memory: Memory,
+  scope: MemoryScope,
+  id: MemoryId,
+  kind: MemoryKind,
+  payload: Uint8Array
+): Promise<MemoryId> {
+  if (memory instanceof VectorMemory || memory instanceof LogMemory)
+    return memory.append(scope, id, kind, payload)
+  if (memory instanceof RerankedMemory) return appendOn(memory.inner, scope, id, kind, payload)
+  return memory.append?.(scope, id, kind, payload) ?? memory.remember(scope, payload)
+}
+
+function namedMemoryOf(memory: Memory): LogMemory | undefined {
+  if (memory instanceof LogMemory) return memory
+  return memory instanceof RerankedMemory ? namedMemoryOf(memory.inner) : undefined
+}
+
+export type MemoryBackendKind = "log" | "vector" | "custom"
+
+function backendKindOf(memory: Memory): MemoryBackendKind {
+  if (memory instanceof LogMemory) return "log"
+  if (memory instanceof VectorMemory) return "vector"
+  if (memory instanceof RerankedMemory) return backendKindOf(memory.inner)
+  return "custom"
+}
+
 class RerankedMemory implements Memory {
   constructor(
-    private readonly inner: Memory,
+    readonly inner: Memory,
     private readonly reranker: Reranker
   ) {}
 

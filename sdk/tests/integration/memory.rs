@@ -102,13 +102,13 @@ async fn given_named_point_state_when_set_then_should_ride_the_stream_and_read_b
     let laser = harness::laser().await;
     let memory = laser.memory("profiles");
     memory
-        .set("customer:123", br#"{"tier":"pro"}"#.to_vec())
+        .set("host:123", br#"{"log_level":"info"}"#.to_vec())
         .await
         .expect("set should publish");
     memory
         .update(
-            "customer:123",
-            br#"{"tier":"enterprise","region":"eu"}"#.to_vec(),
+            "host:123",
+            br#"{"log_level":"debug","region":"eu"}"#.to_vec(),
         )
         .await
         .expect("update should merge and publish");
@@ -119,23 +119,23 @@ async fn given_named_point_state_when_set_then_should_ride_the_stream_and_read_b
     let reader = laser.memory("profiles");
     let value = harness::eventually(|| async {
         let payload = reader
-            .fetch_folded("customer:123")
+            .fetch_folded("host:123")
             .await
             .expect("fetch should succeed")?;
         let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-        (json["tier"] == "enterprise").then_some(json)
+        (json["log_level"] == "debug").then_some(json)
     })
     .await;
-    assert_eq!(value["tier"], "enterprise");
+    assert_eq!(value["log_level"], "debug");
     assert_eq!(value["region"], "eu");
 
     memory
-        .remove("customer:123")
+        .remove("host:123")
         .await
         .expect("remove should publish a tombstone");
     harness::eventually(|| async {
         reader
-            .fetch_folded("customer:123")
+            .fetch_folded("host:123")
             .await
             .expect("fetch should succeed")
             .is_none()
@@ -186,4 +186,63 @@ async fn given_two_streams_when_recalling_then_should_isolate_at_the_stream_boun
     .await;
     assert_eq!(globex_items.len(), 1);
     assert_eq!(globex_items[0].payload.as_slice(), b"globex secret");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_shared_topic_namespaces_when_feedback_and_forget_run_then_should_keep_their_scope() {
+    let laser = harness::laser().await;
+    let left = LogMemory::in_namespace(laser.clone(), "left");
+    let right = LogMemory::in_namespace(laser.clone(), "right");
+    let scope = MemoryScope::builder()
+        .conversation(ConversationId::new())
+        .agent("notetaker".parse().expect("a valid agent id"))
+        .user("reader".to_owned())
+        .app("diagnostics".to_owned())
+        .build();
+    let left_id = left
+        .remember(&scope, b"left".to_vec())
+        .await
+        .expect("remember left");
+    let right_id = right
+        .remember(&scope, b"right".to_vec())
+        .await
+        .expect("remember right");
+    left.improve(&scope, Feedback::new(left_id, 4.0))
+        .await
+        .expect("improve left");
+
+    let reader = LogMemory::in_namespace(laser.clone(), "left");
+    let improved = harness::eventually(|| async {
+        let items = reader
+            .recall_folded(&scope, &MemoryQuery::builder().build())
+            .await
+            .expect("recall left");
+        (items.len() == 1 && items[0].score == Some(4.0)).then_some(items)
+    })
+    .await;
+    assert_eq!(improved[0].id, left_id);
+
+    left.forget(&scope, left_id).await.expect("forget left");
+    harness::eventually(|| async {
+        reader
+            .recall_folded(&scope, &MemoryQuery::builder().build())
+            .await
+            .expect("recall after forget")
+            .is_empty()
+            .then_some(())
+    })
+    .await;
+
+    let right_reader = LogMemory::in_namespace(laser, "right");
+    let untouched = harness::eventually(|| async {
+        let items = right_reader
+            .recall_folded(&scope, &MemoryQuery::builder().build())
+            .await
+            .expect("recall right");
+        (items.len() == 1).then_some(items)
+    })
+    .await;
+    assert_eq!(untouched[0].id, right_id);
+    assert_eq!(untouched[0].score, None);
 }

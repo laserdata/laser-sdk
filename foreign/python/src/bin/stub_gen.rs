@@ -2,8 +2,9 @@ use pyo3_stub_gen::Result;
 use std::fs;
 use std::path::Path;
 
-// The exception hierarchy is declared with `create_exception!`, which the stub
-// gatherer does not see, so append it to the generated stub. Keeping it here (not
+// The exception hierarchy is declared with `create_exception!`, and the
+// `CONTEXT_READ_WINDOW` constant with `module.add`, which the stub gatherer
+// does not see, so append them to the generated stub. Keeping it here (not
 // hand-edited into the .pyi) means the file regenerates reproducibly.
 // `TimeoutError` and `CancelledError` carry a second base each (the runtime
 // synthesizes them with `type(...)`): `builtins.TimeoutError` and
@@ -13,6 +14,8 @@ use std::path::Path;
 // registration, so `except ValueError` catches it too.
 const EXCEPTIONS: &str = "
 import asyncio
+
+CONTEXT_READ_WINDOW: builtins.int
 
 class LaserError(Exception):
     code: builtins.str
@@ -36,6 +39,8 @@ class LaserError(Exception):
     unconfirmed_count: builtins.int | None
 
 class ConfigError(LaserError): ...
+class NoStreamError(ConfigError): ...
+class NoRespondTopicError(ConfigError): ...
 class TimeoutError(LaserError, builtins.TimeoutError): ...
 class QueryError(LaserError): ...
 class KvError(LaserError): ...
@@ -47,6 +52,9 @@ class FilterError(LaserError):
     fault_reason: builtins.str | None
     partition_id: builtins.int | None
     offset: builtins.int | None
+    group_id: builtins.int | None
+    group_name: builtins.str | None
+    identity: builtins.dict[builtins.str, builtins.int] | None
 class SignatureError(LaserError): ...
 class UnsupportedError(LaserError): ...
 class InvalidError(LaserError, builtins.ValueError): ...

@@ -23,7 +23,6 @@ async function receive(
   let seen = 0
   while (seen < expected && !signal.aborted) {
     const message = await consumer.nextWithin(5_000, { signal })
-    if (message === null) throw new Error(`timed out after ${String(seen)} messages`)
     if (manualCommit) await consumer.commit(message)
     seen += 1
     if (seen === 1 || seen === expected || seen % 100 === 0) {

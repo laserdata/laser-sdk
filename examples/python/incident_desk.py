@@ -1,6 +1,6 @@
-"""concierge (agentic): an AI support desk operating a live incident, end to end.
+"""incident-desk (agentic): an AI incident desk operating a live incident, end to end.
 
-The full-AGDX showcase, the Python peer of the Rust `concierge`. One realistic
+The full-AGDX showcase, the Python peer of the Rust `incident-desk`. One realistic
 story, each platform feature doing the job it exists for:
 
   1. WORLD       a ticket firehose bulk-ingests into a queryable index (the
@@ -11,7 +11,7 @@ story, each platform feature doing the job it exists for:
   3. THE DESK    four agents on the agent topics: triage queries the index as a
                  tool and fans one diagnostic angle per specialist call under a
                  deadline, the specialist answers each angle from recalled
-                 memory plus the LLM, the resolver applies remediation credits
+                 memory plus the LLM, the resolver applies capacity grants
                  effectively once (KV-deduplicated, large ones behind a durable
                  approval), and the approver stands in for the human at the gate.
   4. SPECULATION the diagnosis proposes bulk-resolving the matching backlog. The
@@ -25,16 +25,16 @@ story, each platform feature doing the job it exists for:
 The LLM seam is `default_llm()`: a deterministic mock by default, real Claude
 when ANTHROPIC_API_KEY is set. Scale the world with the shared volume knobs:
 
-    python3 concierge.py
-    LASER_MESSAGES=200000 LASER_BATCH=1000 python3 concierge.py
+    python3 incident_desk.py
+    LASER_MESSAGES=200000 LASER_BATCH=1000 python3 incident_desk.py
 
 Ticket ingest streams onto the log anywhere, and semantic memory is in-process
-(needs no server). The query index, key-value credits, and forks are LaserData
+(needs no server). The query index, key-value grants, and forks are LaserData
 Cloud features: on Apache Iggy the desk phase prints how to point at a
 deployment and skips, so the run stays green.
 Point it at a deployment to run the whole desk live:
 
-    LASER_CONNECTION_STRING=user:pwd@your-host python3 concierge.py
+    LASER_CONNECTION_STRING=user:pwd@your-host python3 incident_desk.py
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import urllib.request
 import _common
 import laser_sdk as ls
 
-EXAMPLE = "concierge"
+EXAMPLE = "incident-desk"
 
 TICKETS_TOPIC = "support_tickets"
 TRIAGE_FORK = "bulk-resolve-plan"
@@ -59,39 +59,39 @@ TOOL_TIMEOUT = 60.0
 DESK_TIMEOUT = 150.0
 APPROVAL_TIMEOUT = 60.0
 # A rate-limited deployment (a free-tier plan's bandwidth cap, say) can take
-# minutes to settle a handful of KV writes. LASER_CONCIERGE_CREDIT_TIMEOUT_SECS
+# minutes to settle a handful of KV writes. LASER_DESK_GRANT_TIMEOUT_SECS
 # overrides the default for a deployment slower than even this margin.
-CREDIT_DEADLINE_DEFAULT_SECS = 180
+GRANT_DEADLINE_DEFAULT_SECS = 180
 # Dedup keys self-expire, long enough to outlive a redelivery.
 DEDUP_TTL = 3600.0
-# Credits at or above this hold for a durable approval first.
-APPROVAL_CENTS = 100
+# Grants at or above this many capacity units hold for a durable approval first.
+APPROVAL_UNITS = 100
 
-CUSTOMERS = ["acme", "globex", "initech", "umbrella", "stark"]
-COMPONENTS = ["checkout", "billing", "search", "auth", "uploads"]
+CLUSTERS = ["east-1", "west-2", "eu-1", "ap-1", "lab"]
+COMPONENTS = ["auth", "config", "storage", "metrics", "gateway"]
 SEVERITIES = ["low", "medium", "high", "critical"]
 
 # What the desk has learned resolving past incidents, recalled semantically when
 # a similar one arrives.
 RESOLUTION_NOTES = [
-    "checkout latency spikes are usually database connection pool exhaustion",
-    "billing double-charges trace back to retries without an idempotency key",
-    "search returning stale results means the nightly index rebuild failed",
+    "auth latency spikes are usually database connection pool exhaustion",
+    "duplicate config pushes trace back to retries without an idempotency key",
+    "metrics returning stale results means the nightly index rebuild failed",
     "auth token errors after a deploy come from the rotated signing key",
-    "upload failures over 10 MB are the proxy body-size limit, not the bucket",
-    "critical checkout pages resolve fastest by failing over the read replica",
+    "storage write failures over 10 MB are the proxy body-size limit, not the bucket",
+    "critical auth pages resolve fastest by failing over the read replica",
 ]
 
-INCIDENT = "checkout is slow for several customers"
+INCIDENT = "auth is slow for several clusters"
 
 # The diagnostic angles triage fans out, one specialist call each.
 ANGLES = ["most likely root cause", "fastest mitigation", "blast radius to check"]
 
-# (idempotency key, customer, credit cents) the diagnosis remediates with. The
+# (idempotency key, cluster, capacity units) the diagnosis remediates with. The
 # list is sent twice to prove the resolver is effectively once: the redelivery
-# must not double-credit anyone.
-CREDITS = [("cr-1", "acme", 150), ("cr-2", "globex", 50), ("cr-3", "initech", 80)]
-CREDIT_TOTALS = {"acme": 150, "globex": 50, "initech": 80}
+# must not grant any cluster twice.
+GRANTS = [("gr-1", "east-1", 150), ("gr-2", "west-2", 50), ("gr-3", "eu-1", 80)]
+GRANT_TOTALS = {"east-1": 150, "west-2": 50, "eu-1": 80}
 
 
 # The deterministic bag-of-words embedder: hash tokens into buckets and
@@ -194,13 +194,13 @@ def make_triage(llm, index: str):
     # synthesizes the findings into a diagnosis with the LLM. The diagnosis and
     # findings ride back on the conversation, durable on the log.
     async def triage(ctx, message):
-        # The resolver shares the Commands topic. Credits are its traffic, free
+        # The resolver shares the Commands topic. Grants are its traffic, free
         # text is ours. Never fail on foreign messages.
         try:
             payload = message.json()
         except ls.CodecError:
             payload = None
-        if isinstance(payload, dict) and "customer" in payload and "cents" in payload:
+        if isinstance(payload, dict) and "cluster" in payload and "units" in payload:
             return
         incident = bytes(message.payload).decode("utf-8", "replace")
 
@@ -211,12 +211,12 @@ def make_triage(llm, index: str):
             .query(index)
             .filter_eq("severity", "critical")
             .filter_eq("status", "open")
-            .filter_eq("component", "checkout")
+            .filter_eq("component", "auth")
             .count()
             .fetch()
         )
         open_criticals = _scalar(blast)
-        print(f"  triage: {open_criticals} open critical checkout tickets")
+        print(f"  triage: {open_criticals} open critical auth tickets")
 
         # Tool 2: the specialist, one deadline-bounded call per angle, each on
         # its own correlation conversation so the replies never cross.
@@ -243,7 +243,7 @@ def make_triage(llm, index: str):
 
         prompt = (
             f"Diagnose this incident and recommend one mitigation.\nIncident: {incident}\n"
-            f"Open critical checkout tickets: {open_criticals}\nFindings:\n" + "\n".join(findings)
+            f"Open critical auth tickets: {open_criticals}\nFindings:\n" + "\n".join(findings)
         )
         diagnosis = await llm.complete(prompt)
         await ctx.respond(json.dumps({"diagnosis": diagnosis, "findings": findings}).encode())
@@ -270,28 +270,28 @@ def make_specialist(llm, semantic):
     return specialist
 
 
-def make_resolver(credits_namespace: str):
-    # Applies a remediation credit to a customer's balance in KV. The effect is a
+def make_resolver(grants_namespace: str):
+    # Applies a capacity grant to a cluster's quota in KV. The effect is a
     # read-modify-write, which is exactly why the dedup gate in front of it
-    # matters. Credits at or above the threshold hold for a durable approval.
+    # matters. Grants at or above the threshold hold for a durable approval.
     async def resolver(ctx, message):
         # Triage shares the Commands topic. Free text is its traffic.
         try:
-            credit = message.json()
+            grant = message.json()
         except ls.CodecError:
             return
-        if not (isinstance(credit, dict) and "customer" in credit and "cents" in credit):
+        if not (isinstance(grant, dict) and "cluster" in grant and "units" in grant):
             return
         key = message.idempotency_key or "?"
-        if credit["cents"] >= APPROVAL_CENTS:
-            print(f"  resolver: large credit {key}, requesting approval")
-            if not await _approved(ctx, credit):
-                print(f"  resolver: credit {key} declined")
+        if grant["units"] >= APPROVAL_UNITS:
+            print(f"  resolver: large grant {key}, requesting approval")
+            if not await _approved(ctx, grant):
+                print(f"  resolver: grant {key} declined")
                 return
-        store = ctx.laser().kv(credits_namespace)
-        balance = await _read_u64(store, credit["customer"]) + credit["cents"]
-        await store.set(credit["customer"]).payload(str(balance)).send()
-        print(f"  resolver: applied {key}, {credit['customer']} balance now {balance}")
+        store = ctx.laser().kv(grants_namespace)
+        quota = await _read_u64(store, grant["cluster"]) + grant["units"]
+        await store.set(grant["cluster"]).payload(str(quota)).send()
+        print(f"  resolver: applied {key}, {grant['cluster']} quota now {quota}")
 
     return resolver
 
@@ -300,18 +300,18 @@ def make_resolver(credits_namespace: str):
 # agent keeps the run deterministic. The approval is durable: it rides the log
 # like everything else and survives a restart.
 async def approver(ctx, message):
-    print("  approver: approved a held credit")
+    print("  approver: approved a held grant")
     await ctx.respond(b"approved")
 
 
-# Hold a large credit for approval: ask on the human-input topic and block on the
+# Hold a large grant for approval: ask on the human-input topic and block on the
 # decision. Returns whether to apply it.
-async def _approved(ctx, credit) -> bool:
+async def _approved(ctx, grant) -> bool:
     request = ls.Provenance(conversation_id=ls.new_conversation_id(), agent="resolver")
     decision = await ctx.request(
         ls.Topics.HUMAN_INPUT,
         ls.Topics.RESPONSES,
-        f"approve a {credit['cents']} cent credit to {credit['customer']}?".encode(),
+        f"approve a {grant['units']} unit capacity grant to {grant['cluster']}?".encode(),
         request,
         timeout_secs=APPROVAL_TIMEOUT,
     )
@@ -360,7 +360,7 @@ async def ingest_tickets(laser, total: int, chunk: int) -> None:
                 {
                     "ticket_id": f"t-{published + index:08}",
                     "message_type": "ticket_opened",
-                    "customer": rng.pick(CUSTOMERS),
+                    "cluster": rng.pick(CLUSTERS),
                     "component": rng.pick(COMPONENTS),
                     "severity": rng.pick(SEVERITIES),
                     "status": "open" if rng.below(100) < 80 else "resolved",
@@ -399,16 +399,16 @@ async def seed_memory(semantic) -> None:
 async def remember_resolution(semantic, diagnosis: str) -> None:
     # Close the memory loop: what this incident taught the desk becomes a note
     # the next incident recalls.
-    await semantic.remember(f"checkout slowdowns: {diagnosis}")
+    await semantic.remember(f"auth slowdowns: {diagnosis}")
     print("  remembered the resolution for the next incident")
 
 
-async def send_credits(laser, conversation: str, credits) -> None:
-    for key, customer, cents in credits:
+async def send_grants(laser, conversation: str, grants) -> None:
+    for key, cluster, units in grants:
         provenance = ls.Provenance(conversation_id=conversation, idempotency_key=key)
         await laser.send_agent(
             ls.Topics.COMMANDS,
-            json.dumps({"customer": customer, "cents": cents}).encode(),
+            json.dumps({"cluster": cluster, "units": units}).encode(),
             provenance,
         )
 
@@ -419,12 +419,12 @@ async def coordination_demo(laser) -> None:
     # space that classifies any outcome. Where a backend does not serve one, the
     # error's classifier flags say why and we log it rather than failing, the
     # exact branch a real client uses to adapt, never a silent fallback.
-    ledger = laser.kv("concierge_ledger")
-    account = "acct:demo"
+    ledger = laser.kv("desk_quota_ledger")
+    account = "pool:demo"
 
     try:
         version = await ledger.set(account).payload(b"0").expect_absent().commit()
-        print(f"  seeded the credit ledger at version {version} (compare-and-swap)")
+        print(f"  seeded the quota ledger at version {version} (compare-and-swap)")
     except ls.LaserError as error:
         if getattr(error, "version_conflict", False):
             print("  ledger already seeded by a concurrent writer")
@@ -432,23 +432,20 @@ async def coordination_demo(laser) -> None:
             print(f"  code={error.code} {error}: compare-and-swap not served here, skipping")
             return
 
-    # A read-modify-CAS loop: the race-safe way two agents apply credits to the
-    # same balance. On a version conflict, re-read and retry, anything else is a
+    # A read-modify-CAS loop: the race-safe way two agents apply grants to the
+    # same quota. On a version conflict, re-read and retry, anything else is a
     # real error. Bounded retries, and exhausting them is a failure we surface.
     applied = False
     for attempt in range(5):
         entry = await ledger.get_entry(account)
         if entry is None:
             raise ls.InvalidError("ledger entry vanished after it was seeded")
-        balance = int(bytes(entry.value).decode())
+        quota = int(bytes(entry.value).decode())
         try:
             version = await (
-                ledger.set(account)
-                .payload(str(balance + 25))
-                .expect_version(entry.version)
-                .commit()
+                ledger.set(account).payload(str(quota + 25)).expect_version(entry.version).commit()
             )
-            print(f"  applied a credit via compare-and-swap, balance {balance + 25}")
+            print(f"  applied a grant via compare-and-swap, quota {quota + 25}")
             applied = True
             break
         except ls.LaserError as error:
@@ -457,7 +454,7 @@ async def coordination_demo(laser) -> None:
                 continue
             raise
     if not applied:
-        raise ls.InvalidError("credit not applied after 5 compare-and-swap attempts")
+        raise ls.InvalidError("grant not applied after 5 compare-and-swap attempts")
 
     # A read-your-writes query: read at a level that waits for the projector to
     # catch up instead of racing it. A stale outcome is retryable and distinct
@@ -474,19 +471,19 @@ async def coordination_demo(laser) -> None:
 
 async def speculative_bulk_resolve(laser) -> None:
     # What-if remediation without touching the trunk: fork the read model, mark
-    # the open critical checkout tickets resolved in the overlay, compare the
+    # the open critical auth tickets resolved in the overlay, compare the
     # backlogs, then log the verdict. The fork stays open by default so it shows
     # up in LaserData Cloud. Set LASER_APPLY_PLAN=1 to act on the verdict.
     criticals = await (
         laser.query(TICKETS_TOPIC)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
-        .filter_eq("component", "checkout")
+        .filter_eq("component", "auth")
         .limit(10)
         .fetch()
     )
     if not criticals.rows:
-        print("  no open critical checkout tickets to plan against")
+        print("  no open critical auth tickets to plan against")
         return
 
     fork = laser.fork(TRIAGE_FORK)
@@ -512,7 +509,7 @@ async def speculative_bulk_resolve(laser) -> None:
         .fork(TRIAGE_FORK)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
-        .filter_eq("component", "checkout")
+        .filter_eq("component", "auth")
         .count()
         .fetch()
     )
@@ -564,7 +561,7 @@ async def main() -> None:
         await laser.topic(TICKETS_TOPIC).ensure(partitions=_common.PARTITIONS)
 
         caps = await laser.capabilities()
-        if not _common.managed_gate(caps.query, "the agentic concierge desk", EXAMPLE):
+        if not _common.managed_gate(caps.query, "the agentic incident desk", EXAMPLE):
             return
         # Register before publishing a single ticket, so no event is missed by a
         # projector that starts afterwards.
@@ -572,7 +569,7 @@ async def main() -> None:
         await _common.start_projector(
             laser,
             TICKETS_TOPIC,
-            ["ticket_id", "message_type", "customer", "component", "severity", "status", "ts"],
+            ["ticket_id", "message_type", "cluster", "component", "severity", "status", "ts"],
         )
 
         total = _common.messages(2_000)
@@ -592,8 +589,8 @@ async def main() -> None:
         llm = default_llm()
         # Run-scoped namespaces so reruns never read each other's state.
         run = ls.new_conversation_id()
-        dedup_namespace = f"concierge-dedup-{run}"
-        credits_namespace = f"concierge-credits-{run}"
+        dedup_namespace = f"desk-dedup-{run}"
+        grants_namespace = f"desk-grants-{run}"
         triage = laser.spawn_agent(
             "triage",
             ls.Topics.COMMANDS,
@@ -618,7 +615,7 @@ async def main() -> None:
         resolver = laser.spawn_agent(
             "resolver",
             ls.Topics.COMMANDS,
-            make_resolver(credits_namespace),
+            make_resolver(grants_namespace),
             poll_interval_ms=10,
             dedup=make_kv_deduplicator(laser, dedup_namespace, DEDUP_TTL),
         )
@@ -640,34 +637,34 @@ async def main() -> None:
             diagnosed = reply.json()
             print(f"  diagnosis: {diagnosed['diagnosis']}")
 
-            _common.phase("executing remediation credits effectively once")
-            # Send the credit list twice. The KV deduplicator keyed on each credit's
+            _common.phase("executing capacity grants effectively once")
+            # Send the grant list twice. The KV deduplicator keyed on each grant's
             # idempotency key makes the redelivery a no-op, so the totals stay exact.
-            await send_credits(laser, incident, CREDITS)
-            await send_credits(laser, incident, CREDITS)
-            credit_timeout = _common.env_int(
-                "LASER_CONCIERGE_CREDIT_TIMEOUT_SECS", CREDIT_DEADLINE_DEFAULT_SECS
+            await send_grants(laser, incident, GRANTS)
+            await send_grants(laser, incident, GRANTS)
+            grant_timeout = _common.env_int(
+                "LASER_DESK_GRANT_TIMEOUT_SECS", GRANT_DEADLINE_DEFAULT_SECS
             )
-            deadline = time.monotonic() + credit_timeout
-            store = laser.kv(credits_namespace)
+            deadline = time.monotonic() + grant_timeout
+            store = laser.kv(grants_namespace)
             while time.monotonic() < deadline:
                 # A list comprehension, not a generator: each `await` is evaluated
                 # here, where `all` then sees plain bools (an async generator is not
                 # iterable by `all`).
                 applied = [
-                    await _read_u64(store, customer) >= total_cents
-                    for customer, total_cents in CREDIT_TOTALS.items()
+                    await _read_u64(store, cluster) >= total_units
+                    for cluster, total_units in GRANT_TOTALS.items()
                 ]
                 if all(applied):
                     break
                 await asyncio.sleep(0.25)
-            for customer, expected in CREDIT_TOTALS.items():
-                actual = await _read_u64(store, customer)
+            for cluster, expected in GRANT_TOTALS.items():
+                actual = await _read_u64(store, cluster)
                 if actual != expected:
                     raise ls.InvalidError(
-                        f"credits were not effectively once: {customer}={actual}, want {expected}"
+                        f"grants were not effectively once: {cluster}={actual}, want {expected}"
                     )
-            print(f"  credits applied exactly once despite the redelivery ({credits_namespace})")
+            print(f"  grants applied exactly once despite the redelivery ({grants_namespace})")
 
             _common.phase("optimistic concurrency, read-your-writes, and the unified result space")
             await coordination_demo(laser)
@@ -693,7 +690,7 @@ async def main() -> None:
         _common.phase("done")
         print(
             f"  inspect the run in LaserData Cloud: index '{TICKETS_TOPIC}', "
-            f"KV namespaces '{credits_namespace}' and '{dedup_namespace}'"
+            f"KV namespaces '{grants_namespace}' and '{dedup_namespace}'"
         )
     finally:
         await laser.close()

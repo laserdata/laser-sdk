@@ -9,7 +9,7 @@ The example uses one incident-knowledge domain across three related surfaces.
 Vector memory runs in process and demonstrates the four memory verbs over a deterministic 64-dimensional embedder.
 
 1. Remember stores the same eight operational facts as the Rust and Python examples under one new conversation.
-2. Recall returns the three closest facts for `checkout is slow during the sale`.
+2. Recall returns the three closest facts for `gateway is slow during the rollout`.
 3. Improve upvotes the read-replica fact that resolved the incident and asserts that it ranks first.
 4. Forget removes the superseded search-index note and asserts that recall no longer returns it.
 
@@ -25,10 +25,10 @@ Knowledge graph runs when the deployment advertises graph and KV support.
 9. Registers the `ops` graph projection.
 10. Writes every entity to the `topology` key-value namespace and attaches that source record to its graph node.
 11. Upserts content-addressed services, components, teams, incidents, and their typed relationships.
-12. Reads the one-hop neighborhood around `checkout`.
+12. Reads the one-hop neighborhood around `gateway`.
 13. Starts from every `Service`, follows `depends_on`, and prints the shared component layer.
 14. Follows `affected` from `INC-101` to calculate its blast radius.
-15. Traces `checkout` back to its source key-value record.
+15. Traces `gateway` back to its source key-value record.
 16. Reads the `mitigated_by` relationship before and after its valid-time boundary.
 17. Returns whole paths from the incident to each affected entity.
 
@@ -59,7 +59,7 @@ Connection failures return the original SDK error. A successful connection witho
 - Conversations: the incident audit message and its conversation-scoped memory lens.
 - Key-value: the `topology` namespace that gives every graph entity a live source record.
 - Graph explorer: the `ops` graph, including eight services, eight components, three teams, and two incidents.
-- Graph traversal: `checkout` neighbors, shared service dependencies, the `INC-101` blast radius, valid-time mitigations, and traced paths.
+- Graph traversal: `gateway` neighbors, shared service dependencies, the `INC-101` blast radius, valid-time mitigations, and traced paths.
 
 ## Highlights
 

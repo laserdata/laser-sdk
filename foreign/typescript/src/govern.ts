@@ -394,14 +394,23 @@ export class QuorumGovernor implements ActionGovernor {
 }
 
 export class SwappableGovernor implements ActionGovernor {
-  constructor(private current: ActionGovernor) {}
+  constructor(private active: ActionGovernor) {}
 
-  swap(governor: ActionGovernor): void {
-    this.current = governor
+  /** Replaces the active policy and returns the one just replaced. A decision
+   * already in flight finishes under the policy it read. */
+  swap(governor: ActionGovernor): ActionGovernor {
+    const previous = this.active
+    this.active = governor
+    return previous
+  }
+
+  /** The currently active policy. */
+  current(): ActionGovernor {
+    return this.active
   }
 
   decide(action: GovernedAction): Promise<ActionDecision> {
-    return this.current.decide(action)
+    return this.active.decide(action)
   }
 }
 

@@ -4,7 +4,7 @@ import { ConsumerGroupName, type AgentId } from "../types/ids.js"
 import type { ActionGovernor, GovernorMode, GovernorRetention } from "../govern.js"
 import type { KeyRegistry, SigningKey } from "../signing.js"
 import type { CapabilityDescriptor } from "../wire/agent.js"
-import type { MemoryScope } from "../memory/types.js"
+import type { Consolidator } from "../memory/types.js"
 import {
   ReliableConsumer,
   type AgentHandler,
@@ -16,7 +16,7 @@ import {
 } from "./reliable-consumer.js"
 import type { InboxRoute } from "./router.js"
 
-interface AgentDefinition {
+export interface AgentDefinition {
   readonly id: AgentId
   readonly consumerGroup?: ConsumerGroupName
   readonly listenOn: string
@@ -46,9 +46,7 @@ interface AgentDefinition {
   readonly consolidator?: AgentConsolidator
 }
 
-export interface AgentConsolidator {
-  consolidate(scope: MemoryScope): Promise<unknown>
-}
+export type AgentConsolidator = Consolidator
 
 type RunOutcome = { readonly kind: "ok" } | { readonly kind: "error"; readonly error: unknown }
 
@@ -76,7 +74,10 @@ export class AgentHandle implements AsyncDisposable {
     })
     this.resolveReady = resolveReady as () => void
     this.rejectReady = rejectReady as (error: unknown) => void
-    this.task = this.run(definition, laser)
+    void this.readyPromise.catch(() => undefined)
+    this.task = this.run(definition, laser).finally(() => {
+      this.consolidationController.abort("agent stopped")
+    })
     this.consolidationTask =
       definition.consolidateEveryMs !== undefined && definition.consolidator !== undefined
         ? this.runConsolidation(
@@ -105,6 +106,7 @@ export class AgentHandle implements AsyncDisposable {
     if (timer !== undefined) clearTimeout(timer)
     if (outcome === "timeout") {
       this.hardStopped = true
+      this.hardStopController.abort("agent shutdown drain")
       throw new TimeoutError("agent shutdown drain")
     }
     if (outcome.kind === "error") throw outcome.error
@@ -136,10 +138,19 @@ export class AgentHandle implements AsyncDisposable {
     signal: AbortSignal
   ): Promise<void> {
     while (!signal.aborted) {
+      let onAbort: (() => void) | undefined
+      const stopped = new Promise<void>((resolve) => {
+        onAbort = () => {
+          resolve()
+        }
+        signal.addEventListener("abort", onAbort, { once: true })
+      })
       try {
-        await consolidator.consolidate({})
+        await Promise.race([consolidator.consolidate({}, signal), stopped])
       } catch {
-        // Consolidation is best effort and must not stop message handling.
+        // Consolidation failures do not stop message handling.
+      } finally {
+        if (onAbort !== undefined) signal.removeEventListener("abort", onAbort)
       }
       await this.waitForConsolidationInterval(everyMs, signal)
     }
@@ -177,6 +188,7 @@ export class AgentHandle implements AsyncDisposable {
         group: definition.consumerGroup ?? ConsumerGroupName.forAgent(definition.id),
         topic: definition.listenOn,
         agent: definition.id,
+        shutdownGraceMs: definition.shutdownGraceMs,
         ...(definition.respondOn !== undefined ? { respondOn: definition.respondOn } : {}),
         ...(definition.inboxRoute !== undefined ? { inboxRoute: definition.inboxRoute } : {}),
         ...(definition.pollIntervalMs !== undefined

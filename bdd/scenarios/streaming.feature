@@ -20,6 +20,6 @@ Feature: Streaming core
 
   Scenario: Publish to several topics on one connection
     When I bootstrap the stream with 2 partitions
-    And I publish a JSON event to topic "orders"
-    And I publish a JSON event to topic "shipments"
+    And I publish a JSON event to topic "readings"
+    And I publish a JSON event to topic "alerts"
     Then the publish succeeds

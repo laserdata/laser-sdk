@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn given_a_custom_topic_when_converted_then_should_carry_its_identifier() {
-        let id = Identifier::named("agent.billing").expect("the topic name is a valid identifier");
+        let id = Identifier::named("agent.metrics").expect("the topic name is a valid identifier");
         let topic = AgentTopic::Custom(&id);
         assert_eq!(topic.name(), None);
         assert_eq!(topic.as_identifier(), id);

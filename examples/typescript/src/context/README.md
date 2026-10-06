@@ -21,4 +21,4 @@ npm run example:context
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/context
-- Full system built on this primitive: [`concierge`](../concierge) - conversation context assembled alongside keyed state and forks.
+- Full system built on this primitive: [`incident-desk`](../incident-desk) - conversation context assembled alongside keyed state and forks.

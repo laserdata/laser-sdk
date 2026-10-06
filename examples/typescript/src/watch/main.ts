@@ -10,9 +10,9 @@ import {
 } from "../common.js"
 
 export const EXAMPLE = "watch"
-const TOPIC = "orders"
-const INDEX = indexFor("orders_v1")
-const FIELDS = ["id", "total", "status"]
+const TOPIC = "readings"
+const INDEX = indexFor("readings_v1")
+const FIELDS = ["host", "cpu", "status"]
 const CHANGE_TIMEOUT_MS = 10_000
 const POLL_INTERVAL_MS = 200
 
@@ -33,7 +33,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
 
   const feed = await laser.watch().index(INDEX).records()
 
-  await laser.topic(TOPIC).publish().json({ id: 4, total: 20, status: "paid" }).send()
+  await laser.topic(TOPIC).publish().json({ host: "node-4", cpu: 88, status: "degraded" }).send()
 
   const deadline = Date.now() + CHANGE_TIMEOUT_MS
   let changes: readonly ChangeRecord[] = []

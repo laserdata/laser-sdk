@@ -64,6 +64,7 @@ fn build_provenance(
     idempotency_key: Option<String>,
     correlation_id: Option<String>,
     deadline_micros: Option<u64>,
+    fence_token: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cost_usd: Option<f64>,
@@ -110,6 +111,7 @@ fn build_provenance(
         .maybe_idempotency_key(idempotency_key)
         .maybe_correlation_id(correlation_id)
         .maybe_deadline(deadline_micros.map(IggyTimestamp::from))
+        .maybe_fence_token(fence_token)
         .maybe_usage(usage)
         .build())
 }
@@ -138,6 +140,7 @@ impl PyProvenance {
         idempotency_key=None,
         correlation_id=None,
         deadline_micros=None,
+        fence_token=None,
         input_tokens=None,
         output_tokens=None,
         cost_usd=None
@@ -153,6 +156,7 @@ impl PyProvenance {
         idempotency_key: Option<String>,
         correlation_id: Option<String>,
         deadline_micros: Option<u64>,
+        fence_token: Option<u64>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
@@ -168,6 +172,7 @@ impl PyProvenance {
                 idempotency_key,
                 correlation_id,
                 deadline_micros,
+                fence_token,
                 input_tokens,
                 output_tokens,
                 cost_usd,
@@ -216,6 +221,11 @@ impl PyProvenance {
     #[getter]
     fn correlation_id(&self) -> Option<String> {
         self.inner.correlation_id.clone()
+    }
+
+    #[getter]
+    fn fence_token(&self) -> Option<u64> {
+        self.inner.fence_token
     }
 
     #[getter]

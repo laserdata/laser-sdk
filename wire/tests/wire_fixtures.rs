@@ -418,16 +418,16 @@ fn given_fixture_directory_when_compared_to_embedded_corpus_then_should_match_ex
 
 fn canonical_projection() -> Projection {
     Projection {
-        id: ProjectionId::new("order.v1"),
-        name: "order".to_owned(),
+        id: ProjectionId::new("reading.v1"),
+        name: "reading".to_owned(),
         version: 1,
         kind: ProjectionKind::Row,
         content_type: ContentType::Json,
         extraction: IndexSchema {
             fields: vec![
-                IndexField::new("order_id", "/order_id"),
-                IndexField::new("customer", "/customer/id"),
-                IndexField::typed("amount", "/amount", FieldType::Int),
+                IndexField::new("reading_id", "/reading_id"),
+                IndexField::new("host", "/host/id"),
+                IndexField::typed("cpu", "/cpu", FieldType::Int),
             ],
             vector_field: Some("/embedding".to_owned()),
             inline_payload: true,
@@ -439,14 +439,14 @@ fn canonical_projection() -> Projection {
 
 fn canonical_binding() -> ProjectionBinding {
     ProjectionBinding {
-        source: SourceSelector::new("shop", "orders"),
-        allowed_projections: vec![ProjectionId::new("order.v1")],
-        default_projection: Some(ProjectionId::new("order.v1")),
+        source: SourceSelector::new("fleet", "readings"),
+        allowed_projections: vec![ProjectionId::new("reading.v1")],
+        default_projection: Some(ProjectionId::new("reading.v1")),
         backend: Some(BackendBinding {
             resource_id: BackendResourceId::from_u128(4),
             generation: 2,
         }),
-        index: "orders_rows".to_owned(),
+        index: "readings_rows".to_owned(),
         notify: false,
         retention: Some(RetentionPolicy::TimeToLive {
             ttl_micros: 3_600_000_000,
@@ -458,7 +458,7 @@ fn canonical_avro_schema() -> SchemaDef {
     SchemaDef {
         id: 7,
         source: SchemaSource::Avro {
-            schema: r#"{"type":"record","name":"Order","fields":[]}"#.to_owned(),
+            schema: r#"{"type":"record","name":"Reading","fields":[]}"#.to_owned(),
         },
         name: None,
         version: None,
@@ -470,7 +470,7 @@ fn canonical_protobuf_schema() -> SchemaDef {
         id: 3,
         source: SchemaSource::Protobuf {
             descriptor_set: vec![0, 1, 2, 255],
-            message_type: "shop.Order".to_owned(),
+            message_type: "fleet.Reading".to_owned(),
         },
         name: None,
         version: None,
@@ -481,9 +481,9 @@ fn canonical_json_schema() -> SchemaDef {
     SchemaDef {
         id: 9,
         source: SchemaSource::JsonSchema {
-            schema: r#"{"type":"object","required":["customer"]}"#.to_owned(),
+            schema: r#"{"type":"object","required":["host"]}"#.to_owned(),
         },
-        name: Some("order-events".to_owned()),
+        name: Some("reading-events".to_owned()),
         version: Some(2),
     }
 }
@@ -495,10 +495,10 @@ fn canonical_logical_schema() -> LogicalSchema {
         vec![
             LogicalField {
                 id: 1,
-                name: "order_id".to_owned(),
+                name: "reading_id".to_owned(),
                 required: true,
                 field_type: LogicalType::Uuid,
-                doc: Some("Stable order identity".to_owned()),
+                doc: Some("Stable reading identity".to_owned()),
             },
             LogicalField {
                 id: 2,
@@ -510,7 +510,7 @@ fn canonical_logical_schema() -> LogicalSchema {
                     element: Box::new(LogicalType::Struct {
                         fields: vec![LogicalField {
                             id: 4,
-                            name: "amount".to_owned(),
+                            name: "cpu".to_owned(),
                             required: true,
                             field_type: LogicalType::Decimal {
                                 precision: 18,
@@ -542,11 +542,11 @@ fn canonical_destination() -> MaterializationDestination {
         id: DestinationId::from_u128(300),
         generation: 2,
         definition_revision: 7,
-        name: "orders-lakehouse".to_owned(),
-        source: SourceScope::new("shop", "orders"),
+        name: "readings-lakehouse".to_owned(),
+        source: SourceScope::new("fleet", "readings"),
         recreated_partition_policy: RecreatedPartitionPolicy::Reject,
         projection: ProjectionRef {
-            id: ProjectionId::new("order.v1"),
+            id: ProjectionId::new("reading.v1"),
             version: 3,
         },
         schema: canonical_logical_schema().schema,
@@ -555,8 +555,8 @@ fn canonical_destination() -> MaterializationDestination {
             generation: 5,
         },
         table: PhysicalTable {
-            namespace: vec!["shop".to_owned(), "analytics".to_owned()],
-            table: "orders".to_owned(),
+            namespace: vec!["fleet".to_owned(), "analytics".to_owned()],
+            table: "readings".to_owned(),
             expected_table_uuid: Some(UuidValue::new([9; 16])),
         },
         file_format: FileFormat::Parquet,
@@ -696,7 +696,7 @@ fn canonical_query_route() -> QueryRoute {
         id: QueryRouteId::from_u128(302),
         generation: 2,
         definition_revision: 8,
-        name: "orders-history".to_owned(),
+        name: "readings-history".to_owned(),
         target: QueryRouteTarget::Lakehouse {
             destination_id: DestinationId::from_u128(300),
             destination_generation: 2,
@@ -730,13 +730,13 @@ fn base_query(index: &str, execution_id: u128) -> Query {
 
 fn canonical_query() -> Query {
     Query {
-        by_key: vec![KeyMatch::new("customer_id", "alice")],
-        message_type: Some("order_created".to_owned()),
+        by_key: vec![KeyMatch::new("host_id", "node-7")],
+        message_type: Some("reading_reported".to_owned()),
         time_range: Some((1_000, 2_000)),
         filter: Some(Filter::all([
-            Filter::pred("status", CmpOp::Eq, "paid"),
+            Filter::pred("status", CmpOp::Eq, "degraded"),
             Filter::any([
-                Filter::pred("amount", CmpOp::Gte, 100i64),
+                Filter::pred("cpu", CmpOp::Gte, 100i64),
                 Filter::negate(Filter::pred("region", CmpOp::Eq, "eu")),
             ]),
         ])),
@@ -766,7 +766,7 @@ fn canonical_query() -> Query {
         fork: Some("agent-run-7".to_owned()),
         raw_sql: None,
         consistency: Consistency::Eventual,
-        ..base_query("orders", 1)
+        ..base_query("readings", 1)
     }
 }
 
@@ -811,7 +811,7 @@ fn canonical_raw_sql_query() -> Query {
         },
         raw_sql: Some(RawSql {
             dialect: SqlDialect::DataFusion,
-            sql: "SELECT customer, amount FROM orders_rows WHERE amount > ? LIMIT ?".to_owned(),
+            sql: "SELECT host, cpu FROM readings_rows WHERE cpu > ? LIMIT ?".to_owned(),
             params: vec![
                 TypedValue::Long(100),
                 TypedValue::Long(i64::MAX),
@@ -822,7 +822,7 @@ fn canonical_raw_sql_query() -> Query {
                 TypedValue::List(vec![TypedValue::Long(1), TypedValue::Long(2)]),
             ],
         }),
-        ..base_query("orders", 3)
+        ..base_query("readings", 3)
     }
 }
 
@@ -831,21 +831,24 @@ fn canonical_query_result() -> QueryResult {
         fields: vec![
             LogicalField {
                 id: 1,
-                name: "amount".to_owned(),
+                name: "cpu".to_owned(),
                 required: true,
                 field_type: LogicalType::Long,
                 doc: None,
             },
             LogicalField {
                 id: 2,
-                name: "customer".to_owned(),
+                name: "host".to_owned(),
                 required: true,
                 field_type: LogicalType::String,
                 doc: None,
             },
         ],
         rows: vec![Row {
-            values: vec![TypedValue::Long(42), TypedValue::String("alice".to_owned())],
+            values: vec![
+                TypedValue::Long(42),
+                TypedValue::String("node-7".to_owned()),
+            ],
             score: Some(0.25),
         }],
         page: Page {
@@ -863,7 +866,7 @@ fn canonical_query_result() -> QueryResult {
                 dialect: Some(SqlDialect::DataFusion),
             },
             resolved_target: ResolvedQueryTarget::Operational {
-                index: "orders".to_owned(),
+                index: "readings".to_owned(),
                 backend_resource_id: BackendResourceId::from_u128(10),
                 backend_generation: 4,
                 runtime_configuration_revision: 9,
@@ -962,7 +965,7 @@ fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "query_target_discriminants.bin",
         &vec![
-            QueryTarget::operational("orders"),
+            QueryTarget::operational("readings"),
             QueryTarget::Lakehouse {
                 destination_id,
                 destination_generation: 2,
@@ -988,7 +991,7 @@ fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
         &vec![
             QueryError::Unsupported("feature".to_owned()),
             QueryError::Unauthorized("query".to_owned()),
-            QueryError::IndexNotFound("orders".to_owned()),
+            QueryError::IndexNotFound("readings".to_owned()),
             QueryError::ForkNotFound("run-7".to_owned()),
             QueryError::Backend("planning failed".to_owned()),
             QueryError::Unavailable("runtime restarting".to_owned()),
@@ -1002,7 +1005,7 @@ fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
                 got: QUERY_OP_VERSION + 1,
             },
             QueryError::Stale {
-                what: "orders".to_owned(),
+                what: "readings".to_owned(),
                 applied: 40,
                 required: 41,
             },
@@ -1049,7 +1052,7 @@ fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
         "query_envelope_read_your_writes.bin",
         &QueryEnvelope::new(Query {
             consistency: Consistency::ReadYourWrites,
-            ..base_query("orders", 4)
+            ..base_query("readings", 4)
         }),
     );
     assert_frame(
@@ -1057,15 +1060,15 @@ fn given_query_frames_when_encoded_then_should_match_golden_fixtures() {
         &QueryEnvelope::new(Query {
             text: Some(TextQuery {
                 field: Some("summary".to_owned()),
-                query: "refund dispute".to_owned(),
+                query: "rollout incident".to_owned(),
             }),
-            ..base_query("orders", 5)
+            ..base_query("readings", 5)
         }),
     );
     assert_frame(
         "query_reply_err_stale.bin",
         &QueryReply::Err(QueryError::Stale {
-            what: "orders".to_owned(),
+            what: "readings".to_owned(),
             applied: 41,
             required: 57,
         }),
@@ -1422,8 +1425,8 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "control_remove_binding.bin",
         &envelope(ControlCommand::RemoveBinding {
-            source: SourceSelector::new("shop", "orders"),
-            projection_ref: Some("order.v1".to_owned()),
+            source: SourceSelector::new("fleet", "readings"),
+            projection_ref: Some("reading.v1".to_owned()),
         }),
     );
     assert_frame(
@@ -1461,7 +1464,7 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
         &RegisterSchema {
             v: QUERY_OP_VERSION,
             source: SchemaSource::Avro {
-                schema: r#"{"type":"record","name":"Order","fields":[]}"#.to_owned(),
+                schema: r#"{"type":"record","name":"Reading","fields":[]}"#.to_owned(),
             },
             name: Some("fills".to_owned()),
             version: Some(1),
@@ -1510,7 +1513,7 @@ fn given_browse_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "browse_reply_decoded.bin",
         &BrowseReply::Ok(BrowseOutcome::Decoded(Some(serde_json::json!({
-            "customer": "alice",
+            "host": "node-7",
             "total": 42
         })))),
     );
@@ -1623,12 +1626,12 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvCasFenced {
             v: KV_LEASE_OP_VERSION,
             namespace: "effects".to_owned(),
-            key: b"apply-credit:order-7".to_vec(),
+            key: b"apply-grant:job-7".to_vec(),
             value: b"done".to_vec(),
             expires_at_micros: None,
             expect: CasExpect::Absent,
             fence_namespace: "coordination".to_owned(),
-            fence_key: b"task:order-7".to_vec(),
+            fence_key: b"task:job-7".to_vec(),
             fence_token: 3,
         },
     );
@@ -1637,7 +1640,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvLease {
             v: KV_LEASE_OP_VERSION,
             namespace: "coordination".to_owned(),
-            key: b"task:order-7".to_vec(),
+            key: b"task:job-7".to_vec(),
             lease_ttl_micros: 30_000_000,
             holder_id: "worker-1".to_owned(),
             subject_user_id: Some(42),
@@ -1648,7 +1651,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvLeaseRenew {
             v: KV_LEASE_OP_VERSION,
             namespace: "coordination".to_owned(),
-            key: b"task:order-7".to_vec(),
+            key: b"task:job-7".to_vec(),
             holder_id: "worker-1".to_owned(),
             subject_user_id: None,
             lease_token: 3,
@@ -1660,7 +1663,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         &KvRelease {
             v: KV_LEASE_OP_VERSION,
             namespace: "coordination".to_owned(),
-            key: b"task:order-7".to_vec(),
+            key: b"task:job-7".to_vec(),
             lease_token: 3,
             holder_id: "worker-1".to_owned(),
         },
@@ -1746,7 +1749,7 @@ fn given_kv_frames_when_encoded_then_should_match_golden_fixtures() {
         "kv_reply_namespaces.bin",
         &KvReply::Ok(KvOutcome::Namespaces(vec![
             KvNamespaceInfo {
-                namespace: "concierge_sessions".to_owned(),
+                namespace: "desk_sessions".to_owned(),
                 entries: 12,
             },
             KvNamespaceInfo {
@@ -1794,7 +1797,7 @@ fn given_fork_frames_when_encoded_then_should_match_golden_fixtures() {
             fork_id: "agent-run-7".to_owned(),
             parent: Some("trunk".to_owned()),
             kind: ForkKind::Severed,
-            tables: vec!["orders_rows".to_owned()],
+            tables: vec!["readings_rows".to_owned()],
         },
     );
     assert_frame(
@@ -1802,12 +1805,12 @@ fn given_fork_frames_when_encoded_then_should_match_golden_fixtures() {
         &ForkPut {
             v: FORK_OP_VERSION,
             fork_id: "agent-run-7".to_owned(),
-            table: "orders_rows".to_owned(),
+            table: "readings_rows".to_owned(),
             partition_id: 2,
             offset: 1_000,
-            projection_id: "order.v1".to_owned(),
+            projection_id: "reading.v1".to_owned(),
             projection_version: 1,
-            fields: BTreeMap::from([("amount".to_owned(), "999".to_owned())]),
+            fields: BTreeMap::from([("cpu".to_owned(), "999".to_owned())]),
             metadata: BTreeMap::from([("note".to_owned(), "speculative".to_owned())]),
             payload: Some(b"body".to_vec()),
             embedding: Some("[0.1,0.2]".to_owned()),
@@ -2047,7 +2050,7 @@ fn given_a_change_record_when_encoded_then_should_match_the_golden_fixture() {
         "change_record.bin",
         &ChangeRecord {
             v: CHANGE_OP_VERSION,
-            index: "orders_v1".to_owned(),
+            index: "readings_v1".to_owned(),
             partition_id: 3,
             from_offset: 100,
             to_offset: 141,
@@ -2409,8 +2412,8 @@ fn given_http_json_shapes_when_encoded_then_should_match_golden_fixtures() {
             table_uuid: UuidValue::new([9; 16]),
             destination_id: DestinationId::from_u128(300),
             destination_generation: 2,
-            namespace: vec!["shop".to_owned(), "analytics".to_owned()],
-            table: "orders".to_owned(),
+            namespace: vec!["fleet".to_owned(), "analytics".to_owned()],
+            table: "readings".to_owned(),
             current_snapshot_id: 42,
             current_schema_id: 3,
             current_partition_spec_id: 1,
@@ -2551,10 +2554,10 @@ mod agent_fixtures {
             conversation(),
             source(),
             correlation(),
-            br#"{"ask":"plan the trip"}"#.to_vec(),
+            br#"{"ask":"plan the rollout"}"#.to_vec(),
         )
         .with_target(target())
-        .with_idempotency_key("order-123-attempt-2".parse().expect("valid key"))
+        .with_idempotency_key("job-123-attempt-2".parse().expect("valid key"))
         .with_deadline_micros(1_717_171_777_000_000)
         .with_operation(OPERATION_CHAT)
         .with_metadata("priority", "high");
@@ -2596,7 +2599,7 @@ mod agent_fixtures {
             record(),
             conversation(),
             source(),
-            br#"{"observed":"user paid"}"#.to_vec(),
+            br#"{"observed":"job finished"}"#.to_vec(),
         );
         validate(&event).expect("canonical event validates");
         assert_frame("agent_event.bin", &event);
@@ -2722,7 +2725,7 @@ mod agent_fixtures {
 
         // The pinned minimal card body (status, operation = card).
         let agent_card = AgentCard {
-            name: Some("trip-planner".to_owned()),
+            name: Some("rollout-planner".to_owned()),
             version: Some("1.4.2".to_owned()),
             capabilities: vec![
                 CapabilityDescriptor {
@@ -2736,8 +2739,8 @@ mod agent_fixtures {
                     load: Some(250),
                 },
                 CapabilityDescriptor {
-                    skill_id: "search_flights".to_owned(),
-                    input: Some(ContentRef::SchemaId("order.v1".to_owned())),
+                    skill_id: "plan_rollout".to_owned(),
+                    input: Some(ContentRef::SchemaId("reading.v1".to_owned())),
                     output: None,
                     cost_class: None,
                     latency_class: None,
@@ -2754,7 +2757,7 @@ mod agent_fixtures {
         // The live presence body an agent advertises in its connection metadata:
         // the link from a connection to its card plus the inbox topic routing
         // resolves to. Pinned so the discovery convention cannot drift.
-        let agent_presence = AgentPresence::new(source()).with_inbox("trip-planner.work");
+        let agent_presence = AgentPresence::new(source()).with_inbox("rollout-planner.work");
         agent_presence
             .validate()
             .expect("canonical presence validates");

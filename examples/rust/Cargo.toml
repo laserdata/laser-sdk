@@ -6,7 +6,7 @@ publish = false
 version.workspace = true
 
 [features]
-# Run the agentic example against a real model: `cargo run --example concierge
+# Run the agentic example against a real model: `cargo run --example incident-desk
 # --features llm-anthropic` (ANTHROPIC_API_KEY) or `--features llm-openai`
 # (OPENAI_API_KEY). Off by default so CI and docs stay deterministic on MockLlm.
 llm-anthropic = ["dep:reqwest"]
@@ -71,16 +71,16 @@ name = "native-streaming"
 path = "src/native-streaming/main.rs"
 
 [[example]]
-name = "order-book"
-path = "src/order-book/main.rs"
+name = "fleet-tape"
+path = "src/fleet-tape/main.rs"
 
 [[example]]
 name = "firehose"
 path = "src/firehose/main.rs"
 
 [[example]]
-name = "concierge"
-path = "src/concierge/main.rs"
+name = "incident-desk"
+path = "src/incident-desk/main.rs"
 
 [[example]]
 name = "memory"

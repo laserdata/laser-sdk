@@ -1,6 +1,6 @@
 // The Rust reference runner for the cross-SDK BDD scenarios. It loads the
 // shared Gherkin under `bdd/scenarios/` and runs every scenario against a real
-// Apache Iggy. Set `LASER_BDD_ADDR=host:port` to use an existing server, and
+// Apache Iggy. Set `LASER_BDD_URL` to a connection string or `LASER_BDD_ADDR=host:port` to use an existing server, and
 // `LASER_BDD_PLANE=1` when that server has a managed plane, which skips the
 // `@no_plane` scenarios.
 

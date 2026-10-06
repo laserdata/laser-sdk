@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-// THE agentic example: an AI support desk operating a live incident, end to
+// THE agentic example: an AI incident desk operating a live incident, end to
 // end, with every agent coordinating only through the log. One realistic
 // story, each platform feature doing the job it exists for:
 //
@@ -28,7 +28,7 @@ use tracing::{info, warn};
 //                    specialist (ToolCalls -> ToolResults) answers each
 //                               angle from recalled memory plus the LLM
 //                    resolver   (Commands, KV-deduplicated) executes
-//                               remediation credits effectively once, large
+//                               capacity grants effectively once, large
 //                               ones gated behind a durable approval
 //                    approver   (HumanInput -> Responses) stands in for the
 //                               human behind that gate
@@ -49,10 +49,10 @@ use tracing::{info, warn};
 // volume knobs:
 //
 //   # quick: 2k tickets
-//   cargo run --release --example concierge
+//   cargo run --release --example incident-desk
 //
 //   # heavy: a million tickets, bigger batches
-//   LASER_MESSAGES=1000000 LASER_BATCH=1000 cargo run --release --example concierge
+//   LASER_MESSAGES=1000000 LASER_BATCH=1000 cargo run --release --example incident-desk
 //
 // The desk's queryable world model, KV, approvals, and forks are LaserData
 // Cloud features. On an open server the example prints how to point at a
@@ -70,31 +70,31 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const DESK_TIMEOUT: Duration = Duration::from_secs(150);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 // A rate-limited deployment (a free-tier plan's bandwidth cap, say) can take
-// minutes to settle a handful of KV writes. LASER_CONCIERGE_CREDIT_TIMEOUT_SECS
+// minutes to settle a handful of KV writes. LASER_DESK_GRANT_TIMEOUT_SECS
 // overrides the default for a deployment slower than even this margin.
-const CREDIT_DEADLINE_DEFAULT_SECS: u64 = 180;
-const CREDIT_POLL: Duration = Duration::from_millis(250);
+const GRANT_DEADLINE_DEFAULT_SECS: u64 = 180;
+const GRANT_POLL: Duration = Duration::from_millis(250);
 // Dedup keys self-expire, long enough to outlive a redelivery.
 const DEDUP_TTL: Duration = Duration::from_secs(3600);
-// Credits at or above this hold for a durable approval first.
-const APPROVAL_CENTS: u64 = 100;
+// Grants at or above this many capacity units hold for a durable approval first.
+const APPROVAL_UNITS: u64 = 100;
 
-const CUSTOMERS: &[&str] = &["acme", "globex", "initech", "umbrella", "stark"];
-const COMPONENTS: &[&str] = &["checkout", "billing", "search", "auth", "uploads"];
+const CLUSTERS: &[&str] = &["east-1", "west-2", "eu-1", "ap-1", "lab"];
+const COMPONENTS: &[&str] = &["auth", "config", "storage", "metrics", "gateway"];
 const SEVERITIES: &[&str] = &["low", "medium", "high", "critical"];
 
 // What the desk has learned resolving past incidents, recalled semantically
 // when a similar one arrives.
 const RESOLUTION_NOTES: &[&str] = &[
-    "checkout latency spikes are usually database connection pool exhaustion",
-    "billing double-charges trace back to retries without an idempotency key",
-    "search returning stale results means the nightly index rebuild failed",
+    "auth latency spikes are usually database connection pool exhaustion",
+    "duplicate config pushes trace back to retries without an idempotency key",
+    "metrics returning stale results means the nightly index rebuild failed",
     "auth token errors after a deploy come from the rotated signing key",
-    "upload failures over 10 MB are the proxy body-size limit, not the bucket",
-    "critical checkout pages resolve fastest by failing over the read replica",
+    "storage write failures over 10 MB are the proxy body-size limit, not the bucket",
+    "critical auth pages resolve fastest by failing over the read replica",
 ];
 
-const INCIDENT: &str = "checkout is slow for several customers";
+const INCIDENT: &str = "auth is slow for several clusters";
 
 // The diagnostic angles triage fans out, one specialist call each.
 const ANGLES: &[&str] = &[
@@ -103,21 +103,21 @@ const ANGLES: &[&str] = &[
     "blast radius to check",
 ];
 
-// (idempotency key, customer, credit cents) the diagnosis remediates with.
+// (idempotency key, cluster, capacity units) the diagnosis remediates with.
 // The list is sent twice to prove the resolver is effectively once: the
-// redelivery must not double-credit anyone.
-const CREDITS: &[(&str, &str, u64)] = &[
-    ("cr-1", "acme", 150),
-    ("cr-2", "globex", 50),
-    ("cr-3", "initech", 80),
+// redelivery must not grant any cluster twice.
+const GRANTS: &[(&str, &str, u64)] = &[
+    ("gr-1", "east-1", 150),
+    ("gr-2", "west-2", 50),
+    ("gr-3", "eu-1", 80),
 ];
-const CREDIT_TOTALS: &[(&str, u64)] = &[("acme", 150), ("globex", 50), ("initech", 80)];
+const GRANT_TOTALS: &[(&str, u64)] = &[("east-1", 150), ("west-2", 50), ("eu-1", 80)];
 
 #[derive(Serialize)]
 struct Ticket {
     ticket_id: String,
     message_type: String,
-    customer: String,
+    cluster: String,
     component: String,
     severity: String,
     status: String,
@@ -125,9 +125,9 @@ struct Ticket {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Credit {
-    customer: String,
-    cents: u64,
+struct Grant {
+    cluster: String,
+    units: u64,
 }
 
 // One incident step appended to the conversation by an agent. Folding these
@@ -151,12 +151,12 @@ impl IncidentLog {
 async fn main() -> Result<(), LaserError> {
     init_tracing();
     phase("warming up");
-    let laser = laser(&stream_for("concierge"), Capabilities::OPEN).await?;
-    fresh_run(&laser, &stream_for("concierge"), async {
+    let laser = laser(&stream_for("incident-desk"), Capabilities::OPEN).await?;
+    fresh_run(&laser, &stream_for("incident-desk"), async {
         laser.bootstrap(PARTITIONS).await?;
         laser.topic(TICKETS_TOPIC).ensure(PARTITIONS).await?;
         let capabilities = laser.capabilities().await;
-        if !managed_feature_ready(capabilities.managed, "the agentic desk", "concierge") {
+        if !managed_feature_ready(capabilities.managed, "the agentic desk", "incident-desk") {
             return Ok(());
         }
         let _projector = start_projector(
@@ -166,7 +166,7 @@ async fn main() -> Result<(), LaserError> {
             &[
                 "ticket_id",
                 "message_type",
-                "customer",
+                "cluster",
                 "component",
                 "severity",
                 "status",
@@ -219,13 +219,13 @@ async fn main() -> Result<(), LaserError> {
             .spawn(laser.clone());
         // Run-scoped namespaces so reruns never read each other's state.
         let run = ConversationId::new();
-        let dedup_namespace = format!("concierge-dedup-{run}");
-        let credits_namespace = format!("concierge-credits-{run}");
+        let dedup_namespace = format!("desk-dedup-{run}");
+        let grants_namespace = format!("desk-grants-{run}");
         let mut resolver = Agent::builder()
             .id("resolver".parse()?)
             .listen_on(AgentTopic::Commands)
             .handler(Resolver {
-                credits: credits_namespace.clone(),
+                grants: grants_namespace.clone(),
             })
             .deduplicator(Box::new(KvDeduplicator {
                 laser: laser.clone(),
@@ -258,23 +258,23 @@ async fn main() -> Result<(), LaserError> {
         .map_err(|error| LaserError::Codec(error.to_string()))?;
         info!("diagnosis: {}", diagnosed.diagnosis);
 
-        phase("executing remediation credits effectively once");
-        // Send the credit list twice. The KV deduplicator keyed on each credit's
+        phase("executing capacity grants effectively once");
+        // Send the grant list twice. The KV deduplicator keyed on each grant's
         // idempotency key makes the redelivery a no-op, so the totals stay exact.
-        send_credits(&laser, incident, CREDITS).await?;
-        send_credits(&laser, incident, CREDITS).await?;
-        wait_for_credits(&laser, &credits_namespace, CREDIT_TOTALS).await?;
-        for &(customer, expected) in CREDIT_TOTALS {
-            let actual = read_u64(&laser.kv(&credits_namespace), customer).await?;
+        send_grants(&laser, incident, GRANTS).await?;
+        send_grants(&laser, incident, GRANTS).await?;
+        wait_for_grants(&laser, &grants_namespace, GRANT_TOTALS).await?;
+        for &(cluster, expected) in GRANT_TOTALS {
+            let actual = read_u64(&laser.kv(&grants_namespace), cluster).await?;
             if actual != expected {
                 return Err(LaserError::Invalid(format!(
-                    "credits were not effectively once: {customer}={actual}, want {expected}"
+                    "grants were not effectively once: {cluster}={actual}, want {expected}"
                 )));
             }
         }
         info!(
-            "credits applied exactly once despite the redelivery, inspect them in LaserData Cloud under \
-             KV namespace {credits_namespace}"
+            "grants applied exactly once despite the redelivery, inspect them in LaserData Cloud under \
+             KV namespace {grants_namespace}"
         );
 
         phase("optimistic concurrency, read-your-writes, and the unified result space");
@@ -304,7 +304,7 @@ async fn main() -> Result<(), LaserError> {
         phase("done");
         info!(
             "inspect the run in LaserData Cloud: index `{TICKETS_TOPIC}`, \
-             KV namespaces `{credits_namespace}` and `{dedup_namespace}`"
+             KV namespaces `{grants_namespace}` and `{dedup_namespace}`"
         );
         Ok(())
     })
@@ -353,7 +353,7 @@ async fn ingest_tickets(laser: &Laser, total: u64, chunk: usize) -> Result<(), L
             let ticket = Ticket {
                 ticket_id: format!("t-{ticket_number:08}"),
                 message_type: "ticket_opened".to_owned(),
-                customer: CUSTOMERS[rng.below(CUSTOMERS.len() as u64) as usize].to_owned(),
+                cluster: CLUSTERS[rng.below(CLUSTERS.len() as u64) as usize].to_owned(),
                 component: COMPONENTS[rng.below(COMPONENTS.len() as u64) as usize].to_owned(),
                 severity: SEVERITIES[rng.below(SEVERITIES.len() as u64) as usize].to_owned(),
                 status: if rng.below(100) < 80 {
@@ -496,9 +496,9 @@ struct Triage {
 
 impl AgentHandler for Triage {
     async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        // The resolver shares the Commands topic. Credits are its traffic,
+        // The resolver shares the Commands topic. Grants are its traffic,
         // free text is ours. Never fail on foreign messages.
-        if serde_json::from_slice::<Credit>(&message.payload).is_ok() {
+        if serde_json::from_slice::<Grant>(&message.payload).is_ok() {
             return Ok(());
         }
         let incident = String::from_utf8_lossy(&message.payload).into_owned();
@@ -511,7 +511,7 @@ impl AgentHandler for Triage {
                 .query(&self.index)
                 .filter_eq("severity", "critical")
                 .filter_eq("status", "open")
-                .filter_eq("component", "checkout")
+                .filter_eq("component", "auth")
                 .count()
                 .fetch()
                 .await?,
@@ -553,7 +553,7 @@ impl AgentHandler for Triage {
 
         let prompt = format!(
             "Diagnose this incident and recommend one mitigation.\nIncident: {incident}\n\
-             Open critical checkout tickets: {open_criticals}\nFindings:\n{}",
+             Open critical auth tickets: {open_criticals}\nFindings:\n{}",
             findings.join("\n"),
         );
         let diagnosis = self.llm.complete(&prompt).await;
@@ -616,65 +616,65 @@ struct Approver;
 
 impl AgentHandler for Approver {
     async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        info!(agent = "approver", "approved a held credit");
+        info!(agent = "approver", "approved a held grant");
         ctx.respond(b"approved".to_vec()).await
     }
 }
 
-// Applies a remediation credit to a customer's balance in KV. The effect is
-// a read-modify-write, which is exactly why the dedup gate in front of it
-// matters. Credits at or above the threshold hold for a durable approval.
+// Applies a capacity grant to a cluster's quota in KV. The effect is a
+// read-modify-write, which is exactly why the dedup gate in front of it
+// matters. Grants at or above the threshold hold for a durable approval.
 struct Resolver {
-    credits: String,
+    grants: String,
 }
 
 impl AgentHandler for Resolver {
     async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
         // Triage shares the Commands topic. Free text is its traffic.
-        let Ok(credit) = serde_json::from_slice::<Credit>(&message.payload) else {
+        let Ok(grant) = serde_json::from_slice::<Grant>(&message.payload) else {
             return Ok(());
         };
         let key = message.provenance.idempotency_key.as_deref().unwrap_or("?");
-        if credit.cents >= APPROVAL_CENTS {
+        if grant.units >= APPROVAL_UNITS {
             info!(
                 key,
-                customer = credit.customer,
-                cents = credit.cents,
-                "large credit, requesting approval"
+                cluster = grant.cluster,
+                units = grant.units,
+                "large grant, requesting approval"
             );
-            if !approved(ctx, &credit).await? {
-                warn!(key, customer = credit.customer, "credit declined");
+            if !approved(ctx, &grant).await? {
+                warn!(key, cluster = grant.cluster, "grant declined");
                 return Ok(());
             }
         }
-        let store = ctx.laser().kv(&self.credits);
-        let balance = read_u64(&store, &credit.customer).await? + credit.cents;
+        let store = ctx.laser().kv(&self.grants);
+        let quota = read_u64(&store, &grant.cluster).await? + grant.units;
         store
-            .set(&credit.customer)
-            .bytes(balance.to_string())
+            .set(&grant.cluster)
+            .bytes(quota.to_string())
             .send()
             .await?;
         info!(
             key,
-            customer = credit.customer,
-            cents = credit.cents,
-            balance,
-            "applied credit"
+            cluster = grant.cluster,
+            units = grant.units,
+            quota,
+            "applied grant"
         );
         Ok(())
     }
 }
 
-// Hold a large credit for approval: ask on the human-input topic and block
+// Hold a large grant for approval: ask on the human-input topic and block
 // on the decision. Returns whether to apply it.
-async fn approved(ctx: &AgentCtx<'_>, credit: &Credit) -> Result<bool, LaserError> {
+async fn approved(ctx: &AgentCtx<'_>, grant: &Grant) -> Result<bool, LaserError> {
     let request = Provenance::builder()
         .conversation_id(ConversationId::new())
         .agent("resolver".parse()?)
         .build();
     let prompt = format!(
-        "approve a {} cent credit to {}?",
-        credit.cents, credit.customer
+        "approve a {} unit capacity grant to {}?",
+        grant.units, grant.cluster
     );
     let decision = ctx
         .request(
@@ -705,7 +705,7 @@ impl Deduplicator for KvDeduplicator {
         let store = self.laser.kv(&self.namespace);
         match store.get(key).await {
             Ok(Some(_)) => {
-                info!(key, "duplicate credit, skipping (dedup)");
+                info!(key, "duplicate grant, skipping (dedup)");
                 false
             }
             Ok(None) => {
@@ -723,15 +723,15 @@ impl Deduplicator for KvDeduplicator {
     }
 }
 
-async fn send_credits(
+async fn send_grants(
     laser: &Laser,
     conversation: ConversationId,
-    credits: &[(&str, &str, u64)],
+    grants: &[(&str, &str, u64)],
 ) -> Result<(), LaserError> {
-    for &(key, customer, cents) in credits {
-        let credit = Credit {
-            customer: customer.to_owned(),
-            cents,
+    for &(key, cluster, units) in grants {
+        let grant = Grant {
+            cluster: cluster.to_owned(),
+            units,
         };
         let provenance = Provenance::builder()
             .conversation_id(conversation)
@@ -741,8 +741,7 @@ async fn send_credits(
             .agent("orchestrator".parse()?)
             .send(
                 AgentTopic::Commands,
-                serde_json::to_vec(&credit)
-                    .map_err(|error| LaserError::Codec(error.to_string()))?,
+                serde_json::to_vec(&grant).map_err(|error| LaserError::Codec(error.to_string()))?,
                 &provenance,
             )
             .await?;
@@ -750,22 +749,22 @@ async fn send_credits(
     Ok(())
 }
 
-async fn wait_for_credits(
+async fn wait_for_grants(
     laser: &Laser,
     namespace: &str,
     targets: &[(&str, u64)],
 ) -> Result<(), LaserError> {
     let store = laser.kv(namespace);
     let timeout = Duration::from_secs(laser_examples::env_u64(
-        "LASER_CONCIERGE_CREDIT_TIMEOUT_SECS",
-        CREDIT_DEADLINE_DEFAULT_SECS,
+        "LASER_DESK_GRANT_TIMEOUT_SECS",
+        GRANT_DEADLINE_DEFAULT_SECS,
     ));
     let deadline = Instant::now() + timeout;
     loop {
         let mut pending = Vec::new();
-        for &(customer, target) in targets {
-            if read_u64(&store, customer).await? < target {
-                pending.push(customer);
+        for &(cluster, target) in targets {
+            if read_u64(&store, cluster).await? < target {
+                pending.push(cluster);
             }
         }
         if pending.is_empty() {
@@ -773,11 +772,11 @@ async fn wait_for_credits(
         }
         if Instant::now() >= deadline {
             return Err(LaserError::Invalid(format!(
-                "timed out applying credits, still short on: {}",
+                "timed out applying grants, still short on: {}",
                 pending.join(", ")
             )));
         }
-        tokio::time::sleep(CREDIT_POLL).await;
+        tokio::time::sleep(GRANT_POLL).await;
     }
 }
 
@@ -797,10 +796,10 @@ async fn read_u64(store: &Kv, key: &str) -> Result<u64, LaserError> {
 // outcome and we log it rather than failing, the exact branch a real client
 // uses to adapt to a deployment's capabilities, never a silent fallback.
 async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
-    let ledger = laser.kv("concierge_ledger");
-    let account = "acct:demo";
+    let ledger = laser.kv("desk_quota_ledger");
+    let account = "pool:demo";
 
-    // Seed the balance create-if-absent: the compare-and-swap refuses if a
+    // Seed the quota create-if-absent: the compare-and-swap refuses if a
     // racing writer already created it. `Committed { version }` hands back the
     // new version to chain the next conditional write without a re-read.
     match ledger
@@ -810,7 +809,7 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
         .commit()
         .await
     {
-        Ok(version) => info!(version, "seeded the credit ledger (compare-and-swap)"),
+        Ok(version) => info!(version, "seeded the quota ledger (compare-and-swap)"),
         Err(error) if error.is_version_conflict() => {
             info!("ledger already seeded by a concurrent writer")
         }
@@ -820,8 +819,8 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
         }
     }
 
-    // A read-modify-CAS loop: the race-safe way two agents apply credits to the
-    // same balance. On a version conflict we re-read and retry, and anything else is
+    // A read-modify-CAS loop: the race-safe way two agents apply grants to the
+    // same quota. On a version conflict we re-read and retry, and anything else is
     // a real error. This is the compare-and-swap primitive doing the job a bare get-then-set
     // cannot (a lost update under contention). Bounded retries, and exhausting
     // them is a failure we surface, never a silently dropped write.
@@ -833,13 +832,11 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
         let entry = ledger.get_entry(account).await?.ok_or_else(|| {
             LaserError::Invalid("ledger entry vanished after it was seeded".to_owned())
         })?;
-        let balance: u64 = std::str::from_utf8(&entry.value)
+        let quota: u64 = std::str::from_utf8(&entry.value)
             .ok()
             .and_then(|text| text.parse().ok())
-            .ok_or_else(|| {
-                LaserError::Invalid("ledger value is not a base-10 balance".to_owned())
-            })?;
-        let next = balance + 25;
+            .ok_or_else(|| LaserError::Invalid("ledger value is not a base-10 quota".to_owned()))?;
+        let next = quota + 25;
         match ledger
             .set(account)
             .bytes(next.to_string())
@@ -849,8 +846,8 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
         {
             Ok(version) => {
                 info!(
-                    balance = next,
-                    version, "applied a credit via compare-and-swap"
+                    quota = next,
+                    version, "applied a grant via compare-and-swap"
                 );
                 applied = true;
                 break;
@@ -866,7 +863,7 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
     }
     if !applied {
         return Err(LaserError::Invalid(format!(
-            "credit not applied after {MAX_CAS_ATTEMPTS} compare-and-swap attempts"
+            "grant not applied after {MAX_CAS_ATTEMPTS} compare-and-swap attempts"
         )));
     }
 
@@ -897,7 +894,7 @@ async fn coordination_demo(laser: &Laser) -> Result<(), LaserError> {
 }
 
 // What-if remediation without touching the trunk: fork the read model, mark
-// the open critical checkout tickets resolved in the overlay, compare the
+// the open critical auth tickets resolved in the overlay, compare the
 // backlogs, then log the verdict. The fork stays open by default so it shows
 // up in LaserData Cloud. Set LASER_APPLY_PLAN=1 to act on the verdict instead:
 // promote when the plan clears the backlog, squash when it does not.
@@ -906,12 +903,12 @@ async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
         .query(TICKETS_TOPIC)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
-        .filter_eq("component", "checkout")
+        .filter_eq("component", "auth")
         .limit(10)
         .fetch()
         .await?;
     if criticals.rows.is_empty() {
-        info!("no open critical checkout tickets to plan against");
+        info!("no open critical auth tickets to plan against");
         return Ok(());
     }
 
@@ -939,7 +936,7 @@ async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
         .fork(TRIAGE_FORK)
         .filter_eq("severity", "critical")
         .filter_eq("status", "open")
-        .filter_eq("component", "checkout")
+        .filter_eq("component", "auth")
         .count()
         .fetch()
         .await?;
@@ -947,7 +944,7 @@ async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
 
     if !env_bool("LASER_APPLY_PLAN", false) {
         info!(
-            "plan staged in fork `{TRIAGE_FORK}` (clears the critical checkout backlog: \
+            "plan staged in fork `{TRIAGE_FORK}` (clears the critical auth backlog: \
              {cleared}), left open so LaserData Cloud shows it. Apply the verdict with \
              LASER_APPLY_PLAN=1"
         );
@@ -955,7 +952,7 @@ async fn speculative_bulk_resolve(laser: &Laser) -> Result<(), LaserError> {
     }
     if cleared {
         let applied = fork.promote().await?;
-        info!("plan clears the critical checkout backlog, promoted {applied} row(s) to the trunk");
+        info!("plan clears the critical auth backlog, promoted {applied} row(s) to the trunk");
     } else {
         fork.squash().await?;
         info!("plan does not clear the backlog, squashed `{TRIAGE_FORK}`, the trunk never changed");
@@ -969,7 +966,7 @@ async fn remember_resolution(
     memory: &VectorMemory<HashEmbedder>,
     diagnosis: &str,
 ) -> Result<(), LaserError> {
-    let note = format!("checkout slowdowns: {diagnosis}");
+    let note = format!("auth slowdowns: {diagnosis}");
     Memory::remember(memory, &MemoryScope::default(), note.into_bytes()).await?;
     info!("remembered the resolution for the next incident");
     Ok(())

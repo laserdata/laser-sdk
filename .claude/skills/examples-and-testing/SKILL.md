@@ -17,12 +17,12 @@ Examples demonstrate SDK behavior, and integration tests make assertions about i
 ## Examples (`examples/rust/`)
 
 - One crate, `[[example]]` bins under `src/<scenario>/main.rs`, run with `cargo run --example <name>` against `just up`.
-- Use `laser_examples::laser(&stream_for("<example>"), caps)` from `src/lib.rs`. It resolves credentials and creates `Laser::builder().connection_string(...)`. `stream_for(example)` uses `LASER_STREAM` or creates `laser-<example>-<token>` from `run_token()`. `index_for(base)` applies the same run suffix to indexes. Keep unrelated examples in separate streams.
+- Use `laser_examples::laser(&stream_for("<example>"), caps)` from `src/lib.rs`. It resolves credentials and creates `Laser::builder().connection_string(...)`. `stream_for(example)` uses `LASER_STREAM` or `laser-<example>-rust`. `index_for(base)` appends the per-invocation `run_token()` to indexes. Keep unrelated examples in separate streams.
 
 The default server is `iggy:iggy@127.0.0.1:8090`. Accept `LASER_CONNECTION_STRING`, or `LASER_SERVER` with `LASER_TOKEN` or `LASER_USERNAME` and `LASER_PASSWORD`. Credentials can use `user:pwd@host` or `<token>@host`.
 
 The SDK selects TLS and uses `sdk/certs/laserdata.crt` for LaserData hosts. `LASER_TLS_CERT` selects an explicit CA, and `LASER_NO_TLS=1` disables automatic TLS. Do not add certificates, TLS selection, or fixed endpoints to examples.
-- Use `laser_examples::start_projector(laser, topic, content_type, fields)` or `laser_examples::ensure_view(laser, topic, index, content_type, fields)`. A separate view name lets `orders` feed `orders_v1`. `laser_examples::wait_for_rows(laser, index, expected)` waits for rows and uses the change feed when available. Python uses `wait_for_projection`, and TypeScript uses `waitForProjection` and `ensureView`.
+- Use `laser_examples::start_projector(laser, topic, content_type, fields)` or `laser_examples::ensure_view(laser, topic, index, content_type, fields)`. A separate view name lets `readings` feed `readings_v1`. `laser_examples::wait_for_rows(laser, index, expected)` waits for rows and uses the change feed when available. Python uses `wait_for_projection`, and TypeScript uses `waitForProjection` and `ensureView`.
 
 The helpers call `laser.projections().register(..)` and `laser.bindings().apply(..)`, then let `laser-plane` process records. The returned `Projector.shutdown()` performs no work. Original Apache Iggy returns `LaserError::Unsupported` for managed registration and queries. Use names such as `api_calls` that match `[A-Za-z0-9_]` for managed indexes.
 - `src/lib.rs` defines `LlmClient` with asynchronous `complete`. `MockLlm` is deterministic and requires no key. `AnthropicLlm` uses `llm-anthropic`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_MODEL`. `OpenAiLlm` uses `llm-openai`, `OPENAI_API_KEY`, and `OPENAI_MODEL`. `default_llm()` prefers a configured Anthropic client, then OpenAI, then the mock. Keep model calls in application and example code.
@@ -31,9 +31,9 @@ The helpers call `laser.projections().register(..)` and `laser.bindings().apply(
 - Maintain the following nine larger examples:
   - `native-streaming` sends a keyed record and 1000 records in batches through Laser APIs. Separate groups demonstrate automatic and explicit commits. Python uses `examples/python/native_streaming.py`.
   - `event-analytics` combines a live `consumer_group`, `CommitPolicy::Polling`, queries, and a `Cursor` with `StateStore`. Queries cover `count`, `group_by`, `order_desc`, `message_type`, `ts`, and `time_range`. `start_projector` supplies managed projection.
-  - `order-book` sends fills through a Laser `Producer` and live consumer group. It calculates a book, queries the tape, and demonstrates schema-based Avro publication. Managed steps use `query`, `schema-codecs`, and `add_avro`.
+  - `fleet-tape` sends host readings through a Laser `Producer` and live consumer group. It folds a live per-host aggregate, queries the readings tape, and demonstrates schema-based Avro publication. Managed steps use `query`, `schema-codecs`, and `add_avro`.
   - `firehose` generates records across organizations under `LASER_FIREHOSE_MESSAGES`, `LASER_FIREHOSE_ORGS`, `LASER_FIREHOSE_CONCURRENCY`, and `LASER_FIREHOSE_PAYLOAD_BYTES`. Bound these controls before running load tests.
-  - `concierge` combines tickets, `VectorMemory`, an `Embedder`, agents, credits, approval, and a proposed change in a fork. Triage uses `ctx.request`, and the resolver demonstrates a KV-backed `Deduplicator`. `LASER_APPLY_PLAN=1` enables the fork decision. `ConversationState::load` reconstructs the recorded incident. Managed phases require the relevant capabilities.
+  - `incident-desk` combines tickets, `VectorMemory`, an `Embedder`, agents, capacity grants, approval, and a proposed change in a fork. Triage uses `ctx.request`, and the resolver demonstrates a KV-backed `Deduplicator`. `LASER_APPLY_PLAN=1` enables the fork decision. `ConversationState::load` reconstructs the recorded incident. Managed phases require the relevant capabilities.
   - `interop` exposes the same worker through `A2aBridge`, `McpBridge`, and AG-UI. It also uses `Agdx::request_input` and `AgentCtx::respond_input`. Rust integration peers are `a2a.rs`, `mcp.rs`, `agui.rs`, and `human_input.rs`.
   - `memory` demonstrates local vector recall, durable memory, context scoping, and graph relationships. It skips unavailable managed phases. Python uses `examples/python/memory.py`.
   - `orchestra` demonstrates discovery, contracts, fan-out, workflows, quarantine, reinstatement, and timeout recovery. `InboxRoute::Fixed` supports the open server. Python uses `examples/python/orchestra.py` with the same phases.
@@ -62,9 +62,10 @@ The helpers call `laser.projections().register(..)` and `laser.bindings().apply(
 ## Rules specific to this area
 
 - Test names are BDD (`given_..._when_..._then_should_...`), assertions use `.expect("message")`, never bare `.unwrap()`.
+- Run `just commerce-check` after changing example names, data, or prose.
 - Add an example for a new scenario and a regression test for behavior that it must preserve. Include relevant timeout, dead-letter, shutdown, or isolation failures.
 - To exercise a raw/edge wire case (for example, a header-less message), publish via Iggy producer directly (`iggy` is an sdk dev-dependency) rather than through `send_agent`, which always stamps provenance.
-- `native-streaming`, `order-book`, and `event-analytics` use the Laser `Topic::producer` and `Topic::consumer_group` surface with direct batching, keyed routing, live async delivery, consumer groups, and commit policies. Rust, Python, and TypeScript use Iggy's native VSR transport.
+- `native-streaming`, `fleet-tape`, and `event-analytics` use the Laser `Topic::producer` and `Topic::consumer_group` surface with direct batching, keyed routing, live async delivery, consumer groups, and commit policies. Rust, Python, and TypeScript use Iggy's native VSR transport.
 
 ## Review smells
 

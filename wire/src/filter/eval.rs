@@ -1311,17 +1311,17 @@ mod tests {
     fn given_an_indexed_array_path_when_decoding_then_should_retain_only_the_requested_field_and_validate_the_rest()
      {
         let mut paths = PathTrie::default();
-        paths.insert(&FieldPath::parse("items[1].sku").expect("path"));
+        paths.insert(&FieldPath::parse("items[1].id").expect("path"));
         let value = decode_json_paths(
-            br#"{"items":[{"other":"unused"},{"sku":"chosen","unused":[1,2,3]},{"sku":"unread"}]}"#,
+            br#"{"items":[{"other":"unused"},{"id":"chosen","unused":[1,2,3]},{"id":"unread"}]}"#,
             &DecodeLimits::default(),
             &paths,
         )
         .expect("decoded");
-        assert_eq!(value, serde_json::json!({"items":[null,{"sku":"chosen"}]}));
+        assert_eq!(value, serde_json::json!({"items":[null,{"id":"chosen"}]}));
         assert_eq!(
             decode_json_paths(
-                br#"{"items":[{"bad":"\ud800"},{"sku":"chosen"}]}"#,
+                br#"{"items":[{"bad":"\ud800"},{"id":"chosen"}]}"#,
                 &DecodeLimits::default(),
                 &paths
             ),
@@ -1474,21 +1474,21 @@ mod tests {
             CompiledFilter::compile(&millis).is_err(),
             "an epoch literal must be an integer"
         );
-        let amount = ConsumerFilter::json(FilterExpr::pred_as(
-            "amount",
+        let cpu = ConsumerFilter::json(FilterExpr::pred_as(
+            "cpu",
             CmpOp::Gt,
             "9007199254740992",
             Coerce::Number,
         ));
         assert_eq!(
-            verdict(&amount, r#"{"amount":"9007199254740993"}"#),
+            verdict(&cpu, r#"{"cpu":"9007199254740993"}"#),
             Verdict::Selected
         );
         assert_eq!(
-            verdict(&amount, r#"{"amount":"9007199254740992.0"}"#),
+            verdict(&cpu, r#"{"cpu":"9007199254740992.0"}"#),
             Verdict::Rejected
         );
-        assert_eq!(verdict(&amount, r#"{"amount":"abc"}"#), Verdict::Rejected);
+        assert_eq!(verdict(&cpu, r#"{"cpu":"abc"}"#), Verdict::Rejected);
     }
 
     #[test]
@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn given_a_record_declared_in_another_codec_when_a_json_filter_reads_it_then_should_reject_without_decoding()
      {
-        let filter = ConsumerFilter::json(FilterExpr::pred("type", CmpOp::Eq, "billing"));
+        let filter = ConsumerFilter::json(FilterExpr::pred("type", CmpOp::Eq, "metrics"));
         let protobuf = content_type(u64::from(ContentType::Protobuf.code()));
         assert_eq!(
             decided(&filter, b"\x08\x01", &[protobuf]),
@@ -1645,15 +1645,15 @@ mod tests {
         );
         let json = content_type(u64::from(ContentType::Json.code()));
         assert_eq!(
-            decided(&filter, br#"{"type":"billing"}"#, &[json]),
+            decided(&filter, br#"{"type":"metrics"}"#, &[json]),
             (Verdict::Selected, None)
         );
         assert_eq!(
-            decided(&filter, br#"{"type":"billing"}"#, &[content_type(255)]),
+            decided(&filter, br#"{"type":"metrics"}"#, &[content_type(255)]),
             (Verdict::Selected, None)
         );
         assert_eq!(
-            decided(&filter, br#"{"type":"billing"}"#, &[content_type(200)]),
+            decided(&filter, br#"{"type":"metrics"}"#, &[content_type(200)]),
             (Verdict::Selected, None)
         );
         assert_eq!(
@@ -1704,28 +1704,28 @@ mod tests {
     fn given_text_predicates_on_a_mixed_log_when_evaluated_then_should_select_the_subdomain() {
         let filter = ConsumerFilter::json(FilterExpr::any([
             FilterExpr::text("type", TextMatch::Contains, ".v1."),
-            FilterExpr::text("type", TextMatch::Glob, "SHIPPING.*").case_insensitive(),
+            FilterExpr::text("type", TextMatch::Glob, "ALERTS.*").case_insensitive(),
         ]));
         assert_eq!(
-            verdict(&filter, r#"{"type":"billing.invoice.v1.created"}"#),
+            verdict(&filter, r#"{"type":"metrics.cpu.v1.reported"}"#),
             Verdict::Selected
         );
         assert_eq!(
-            verdict(&filter, r#"{"type":"shipping.parcel.v2.sent"}"#),
+            verdict(&filter, r#"{"type":"alerts.disk.v2.raised"}"#),
             Verdict::Selected
         );
         assert_eq!(
-            verdict(&filter, r#"{"type":"billing.invoice.v2.created"}"#),
+            verdict(&filter, r#"{"type":"metrics.cpu.v2.reported"}"#),
             Verdict::Rejected
         );
         let headers = ConsumerFilter::headers_only(FilterExpr::header_text(
             "event.type",
             TextMatch::Regex,
-            r"^billing\.[a-z]+\.v1\.",
+            r"^metrics\.[a-z]+\.v1\.",
         ));
         let typed = [HeaderRef {
             key: "event.type",
-            value: HeaderValueRef::String("billing.invoice.v1.created"),
+            value: HeaderValueRef::String("metrics.cpu.v1.reported"),
         }];
         assert_eq!(
             decided(&headers, b"\xff\xfe anything", &typed),

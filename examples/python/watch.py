@@ -5,11 +5,11 @@ The feed rides the connection you already have.
 
 What it shows:
   - declare the same view shape query.py reads under this run's own
-    "orders_v1_<token>" name, notify-enabled so the deployment publishes to
+    "readings_v1_<token>" name, notify-enabled so the deployment publishes to
     the change feed on every materialized batch
   - open a change-feed reader (`laser.watch(index=...)`, a flat call, not a
     builder)
-  - publish an order and react to the change record instead of re-querying blind
+  - publish a host reading and react to the change record instead of re-querying blind
 
 Watch rides the managed change feed: it needs Laser Stack or LaserData Cloud
 and skips on Apache Iggy without a managed backend.
@@ -29,9 +29,9 @@ import time
 import _common
 
 EXAMPLE = "watch"
-TOPIC = "orders"
-INDEX = _common.index_for("orders_v1")
-FIELDS = ["id", "total", "status"]
+TOPIC = "readings"
+INDEX = _common.index_for("readings_v1")
+FIELDS = ["host", "cpu", "status"]
 CHANGE_TIMEOUT = 10.0
 POLL_INTERVAL = 0.2
 
@@ -51,7 +51,7 @@ async def main() -> None:
 
         feed = laser.watch(index=INDEX)
 
-        await laser.topic(TOPIC).publish({"id": 4, "total": 20, "status": "paid"}).send()
+        await laser.topic(TOPIC).publish({"host": "node-4", "cpu": 88, "status": "degraded"}).send()
 
         deadline = time.monotonic() + CHANGE_TIMEOUT
         while not (changes := await feed.poll()):

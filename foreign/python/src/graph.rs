@@ -498,18 +498,21 @@ impl PyGraph {
     }
 
     /// Run a traversal. Start from explicit node `start_ids`, from every node
-    /// whose label equals `match_label`, or from the `nearest` nodes to an
-    /// embedding (a `(embedding, k)` pair). `hops` is a list of `(edge_type,
+    /// matching `start_match` (any `QueryFilter` predicate over node fields),
+    /// from every node whose label equals `match_label` (shorthand for
+    /// `start_match=QueryFilter.pred("label", "eq", label)`), or from the
+    /// `nearest` nodes to an embedding (a `(embedding, k)` pair). `hops` is a list of `(edge_type,
     /// direction)` tuples, one per step. `returns` is `"nodes"`, `"edges"`,
     /// `"triplets"`, or `"paths"`. `as_of` (epoch micros) follows only edges
     /// valid at that instant.
     /// Returns a `{"nodes": [...], "edges": [...], "paths": [...]}` dict.
-    #[pyo3(signature = (*, start_ids=None, match_label=None, nearest=None, hops=None, returns="nodes", limit=0, as_of=None, conversation=None))]
+    #[pyo3(signature = (*, start_ids=None, start_match=None, match_label=None, nearest=None, hops=None, returns="nodes", limit=0, as_of=None, conversation=None))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
         py: Python<'py>,
         start_ids: Option<Vec<String>>,
+        start_match: Option<PyRef<'_, crate::query::PyQueryFilter>>,
         match_label: Option<String>,
         nearest: Option<(Vec<f32>, usize)>,
         hops: Option<Vec<(String, String)>>,
@@ -520,6 +523,7 @@ impl PyGraph {
     ) -> PyResult<Bound<'py, PyAny>> {
         if [
             start_ids.is_some(),
+            start_match.is_some(),
             match_label.is_some(),
             nearest.is_some(),
         ]
@@ -529,7 +533,7 @@ impl PyGraph {
             != 1
         {
             return Err(InvalidError::new_err(
-                "pass exactly one of 'start_ids', 'match_label', or 'nearest'",
+                "pass exactly one of 'start_ids', 'start_match', 'match_label', or 'nearest'",
             ));
         }
         let ids = match start_ids {
@@ -546,6 +550,9 @@ impl PyGraph {
             .map(|(edge_type, direction)| Ok((edge_type, parse_dir(&direction)?)))
             .collect::<PyResult<Vec<_>>>()?;
         let returns = returns.to_owned();
+        let start_match = start_match
+            .map(|filter| filter.inner.clone())
+            .or_else(|| match_label.map(|label| Filter::pred("label", CmpOp::Eq, label)));
         let conversation = parse_conversation(conversation)?;
         let laser = self.laser.clone();
         let name = self.name.clone();
@@ -557,11 +564,7 @@ impl PyGraph {
             handle = match (ids, nearest) {
                 (Some(ids), _) => handle.start_ids(ids),
                 (_, Some((embedding, k))) => handle.start_nearest(embedding, k),
-                _ => handle.start_match(Filter::pred(
-                    "label",
-                    CmpOp::Eq,
-                    match_label.unwrap_or_default(),
-                )),
+                _ => handle.start_match(start_match.unwrap_or_else(|| Filter::all([]))),
             };
             for (edge_type, dir) in parsed_hops {
                 handle = match dir {

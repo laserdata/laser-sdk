@@ -46,6 +46,26 @@ Then(
   }
 )
 
+When(
+  /^I publish (\d+) unrelated records to topic "([^"]+)"$/,
+  async function (this: LaserWorld, count: string, topic: string) {
+    const batch = this.requireLaser().topic(topic).publishBatch()
+    for (let index = 0; index < Number(count); index += 1) {
+      batch.addPayload(encoder.encode(`unrelated-${String(index)}`))
+    }
+    await batch.send()
+  }
+)
+
+Then(/^the session context is only "([^"]+)"$/, async function (this: LaserWorld, only: string) {
+  const session = this.requireSession()
+  const labels = await eventual(async () => {
+    const labels = (await session.context()).map(labelled)
+    return labels.length === 1 && labels[0] === only ? labels : undefined
+  }, "the session context", 10_000)
+  assert.deepEqual(labels, [only])
+})
+
 Then(
   /^opening the session "([^"]+)" again reaches the same conversation$/,
   function (this: LaserWorld, id: string) {

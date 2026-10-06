@@ -1,7 +1,7 @@
 use crate::async_bridge::future_into_py;
 use crate::convert::{json_to_py, py_to_json};
 use crate::errors::{TypedDecodeError, to_pyerr};
-use laser_sdk::laser::Laser;
+use laser_sdk::typed::TypedTopic;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -10,17 +10,17 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// The typed reader over one topic: each `await .next()` yields the next
-/// record decoded into the topic's `cls`, `None` when caught up. A record that
-/// does not decode raises `TypedDecodeError` naming its log position and the
-/// reader moves past it. Build with `Topic.records(reader_name)` on a topic
-/// opened with `cls=`.
+/// record decoded into the topic's `cls`, `None` when caught up. A topic
+/// opened without `cls=` yields the decoded value as a plain Python object. A
+/// record that does not decode raises `TypedDecodeError` naming its log
+/// position and the reader moves past it. Build with
+/// `Topic.records(reader_name)`.
 #[gen_stub_pyclass]
 #[pyclass(name = "TypedRecords")]
 pub struct PyTypedRecords {
-    laser: Laser,
-    stream: Option<String>,
+    typed: TypedTopic<serde_json::Value>,
     topic: String,
-    cls: Py<PyAny>,
+    cls: Option<Py<PyAny>>,
     reader_name: String,
     batch: Option<u32>,
     // Shared with the 'static poll futures: the advanced offsets write back so
@@ -38,17 +38,15 @@ struct Entry {
 impl PyTypedRecords {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        laser: Laser,
-        stream: Option<String>,
+        typed: TypedTopic<serde_json::Value>,
         topic: String,
-        cls: Py<PyAny>,
+        cls: Option<Py<PyAny>>,
         reader_name: String,
         batch: Option<u32>,
         from_offsets: Vec<u64>,
     ) -> Self {
         Self {
-            laser,
-            stream,
+            typed,
             topic,
             cls,
             reader_name,
@@ -76,10 +74,8 @@ impl PyTypedRecords {
     /// two `next()` on the same reader concurrently would re-poll the same
     /// offset window and surface records twice.
     fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let stream = self.stream.clone();
-        let topic = self.topic.clone();
-        let cls = self.cls.clone_ref(py);
+        let typed = self.typed.clone();
+        let cls = self.cls.as_ref().map(|cls| cls.clone_ref(py));
         let reader_name = self.reader_name.clone();
         let batch = self.batch;
         let offsets = self.offsets.clone();
@@ -88,11 +84,6 @@ impl PyTypedRecords {
             let empty = buffered.lock().expect("buffer lock").is_empty();
             if empty {
                 let saved = offsets.lock().expect("offsets lock").clone();
-                let handle = match &stream {
-                    Some(stream) => laser.stream(stream.clone()).topic(&*topic),
-                    None => laser.topic(&*topic),
-                };
-                let typed = handle.json::<serde_json::Value>();
                 let mut records = typed
                     .records(&reader_name)
                     .map_err(to_pyerr)?
@@ -106,7 +97,7 @@ impl PyTypedRecords {
                     let mut buffer = buffered.lock().expect("buffer lock");
                     for item in polled {
                         buffer.push_back(match item {
-                            Ok(record) => decode_entry(py, &cls, record),
+                            Ok(record) => decode_entry(py, cls.as_ref(), record),
                             Err(error) => Err(TypedDecodeError::new_err(error.to_string())),
                         });
                     }
@@ -134,10 +125,8 @@ impl PyTypedRecords {
     }
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let laser = self.laser.clone();
-        let stream = self.stream.clone();
-        let topic = self.topic.clone();
-        let cls = self.cls.clone_ref(py);
+        let typed = self.typed.clone();
+        let cls = self.cls.as_ref().map(|cls| cls.clone_ref(py));
         let reader_name = self.reader_name.clone();
         let batch = self.batch;
         let offsets = self.offsets.clone();
@@ -146,11 +135,6 @@ impl PyTypedRecords {
             let empty = buffered.lock().expect("buffer lock").is_empty();
             if empty {
                 let saved = offsets.lock().expect("offsets lock").clone();
-                let handle = match &stream {
-                    Some(stream) => laser.stream(stream.clone()).topic(&*topic),
-                    None => laser.topic(&*topic),
-                };
-                let typed = handle.json::<serde_json::Value>();
                 let mut records = typed
                     .records(&reader_name)
                     .map_err(to_pyerr)?
@@ -164,7 +148,7 @@ impl PyTypedRecords {
                     let mut buffer = buffered.lock().expect("buffer lock");
                     for item in polled {
                         buffer.push_back(match item {
-                            Ok(record) => decode_entry(py, &cls, record),
+                            Ok(record) => decode_entry(py, cls.as_ref(), record),
                             Err(error) => Err(TypedDecodeError::new_err(error.to_string())),
                         });
                     }
@@ -196,7 +180,8 @@ impl PyTypedRecords {
 #[gen_stub_pyclass]
 #[pyclass(name = "TypedRecord", frozen)]
 pub struct PyTypedRecord {
-    /// The payload decoded into the topic's `cls`.
+    /// The payload decoded into the topic's `cls`, or the plain decoded value
+    /// when the topic has none.
     #[pyo3(get)]
     pub value: Py<PyAny>,
     /// The record's log position, from its own message header.
@@ -239,16 +224,20 @@ pub(crate) fn body_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value
 
 // A polled record into a buffer entry: JSON value to Python object to a `cls`
 // instance (an SDK native record's `__laser_from_json__`, pydantic
-// `model_validate`, or `cls(**fields)` for a dataclass or plain class). A body
-// the class refuses becomes the
-// position-carrying typed error, exactly like a payload that was never JSON.
+// `model_validate`, or `cls(**fields)` for a dataclass or plain class). With
+// no class the Python object is the value. A body the class refuses becomes
+// the position-carrying typed error, exactly like a payload that was never
+// JSON.
 fn decode_entry(
     py: Python<'_>,
-    cls: &Py<PyAny>,
+    cls: Option<&Py<PyAny>>,
     record: laser_sdk::typed::TypedRecord<serde_json::Value>,
 ) -> Result<Entry, PyErr> {
     let position = record.position.to_string();
     let value = json_to_py(py, &record.value).and_then(|obj| {
+        let Some(cls) = cls else {
+            return Ok(obj);
+        };
         let cls = cls.bind(py);
         if cls.hasattr("__laser_from_json__")? {
             return Ok(cls.call_method1("__laser_from_json__", (obj,))?.unbind());

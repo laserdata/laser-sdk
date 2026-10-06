@@ -37,7 +37,7 @@ async fn enable_destination(
 #[when(regex = r#"^I record a retention gap from required offset (\d+) to retained offset (\d+)$"#)]
 async fn record_gap(world: &mut LaserWorld, required: u64, retained: u64) {
     world.data_stack_error = model(world)
-        .record_retention_gap("orders-lakehouse", required, retained)
+        .record_retention_gap("readings-lakehouse", required, retained)
         .err();
 }
 
@@ -46,7 +46,7 @@ async fn record_gap(world: &mut LaserWorld, required: u64, retained: u64) {
 )]
 async fn accept_gap(world: &mut LaserWorld, next_offset: u64, checkpoint_revision: u64) {
     world.data_stack_error = model(world)
-        .accept_retention_gap("orders-lakehouse", next_offset, checkpoint_revision)
+        .accept_retention_gap("readings-lakehouse", next_offset, checkpoint_revision)
         .err();
 }
 

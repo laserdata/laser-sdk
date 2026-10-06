@@ -1,23 +1,23 @@
 [
   {
     "projection": {
-      "id": "order.v1",
-      "name": "order",
+      "id": "reading.v1",
+      "name": "reading",
       "version": 1,
       "content_type": "json",
       "extraction": {
         "fields": [
           {
-            "name": "order_id",
-            "pointer": "/order_id"
+            "name": "reading_id",
+            "pointer": "/reading_id"
           },
           {
-            "name": "customer",
-            "pointer": "/customer/id"
+            "name": "host",
+            "pointer": "/host/id"
           },
           {
-            "name": "amount",
-            "pointer": "/amount",
+            "name": "cpu",
+            "pointer": "/cpu",
             "field_type": "int"
           }
         ],
@@ -29,18 +29,18 @@
     "bindings": [
       {
         "source": {
-          "stream": "shop",
-          "topic": "orders"
+          "stream": "fleet",
+          "topic": "readings"
         },
         "allowed_projections": [
-          "order.v1"
+          "reading.v1"
         ],
-        "default_projection": "order.v1",
+        "default_projection": "reading.v1",
         "backend": {
           "resource_id": "00000000000000000000000004",
           "generation": 2
         },
-        "index": "orders_rows",
+        "index": "readings_rows",
         "retention": {
           "kind": "time_to_live",
           "ttl_micros": 3600000000

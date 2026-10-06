@@ -100,7 +100,7 @@ async fn given_a_context_scope_when_appending_and_recalling_then_should_bind_one
 
     let scoped = session.memory("ctx-scope-it");
     scoped
-        .remember(Bytes::from_static(b"checkout is slow"))
+        .remember(Bytes::from_static(b"auth is slow"))
         .send()
         .await
         .expect("remember in the scoped memory");
@@ -125,9 +125,7 @@ async fn given_a_context_scope_when_appending_and_recalling_then_should_bind_one
         "the scoped recall matches the unscoped recall under the same conversation"
     );
     assert!(
-        via_scope
-            .iter()
-            .any(|item| item.payload == b"checkout is slow"),
+        via_scope.iter().any(|item| item.payload == b"auth is slow"),
         "the remembered fact recalls within the scope"
     );
 }

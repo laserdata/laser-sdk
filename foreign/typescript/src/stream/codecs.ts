@@ -64,11 +64,43 @@ export function cborCodec<T>(decodeValue: ValueDecoder<T>): Codec<T> {
   }
 }
 
+function messagePackValue(value: unknown, depth = 0): unknown {
+  if (depth > 100) throw new TypeError("MessagePack value exceeds the maximum depth")
+  if (typeof value === "bigint") {
+    if (value < -(1n << 63n) || value > (1n << 64n) - 1n)
+      throw new RangeError("MessagePack integers must fit in signed or unsigned 64 bits")
+    return value >= -0x8000_0000n && value <= 0xffff_ffffn ? Number(value) : value
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    return value < -0x8000_0000 || value > 0xffff_ffff ? BigInt(value) : value
+  }
+  if (Array.isArray(value)) return value.map((nested) => messagePackValue(nested, depth + 1))
+  if (value instanceof Map) {
+    const entries = [...value.entries()] as readonly [unknown, unknown][]
+    if (!entries.every(([key]) => typeof key === "string"))
+      throw new TypeError("MessagePack object keys must be strings")
+    return Object.fromEntries(
+      entries.map(([key, nested]) => [key, messagePackValue(nested, depth + 1)])
+    )
+  }
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    !ArrayBuffer.isView(value) &&
+    !(value instanceof Date)
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, messagePackValue(nested, depth + 1)])
+    )
+  }
+  return value
+}
+
 export function messagePackCodec<T>(decodeValue: ValueDecoder<T>): Codec<T> {
   return {
     encode(value): Uint8Array {
       try {
-        return encodeMessagePack(value, { useBigInt64: true })
+        return encodeMessagePack(messagePackValue(value), { useBigInt64: true })
       } catch (cause) {
         throw new CodecError("value does not encode as MessagePack", "msgpack", "encode", {
           cause

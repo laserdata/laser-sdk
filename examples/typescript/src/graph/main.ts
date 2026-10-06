@@ -3,9 +3,9 @@ import { graphNodeValue, managedGate, phase, runExample } from "../common.js"
 
 export const EXAMPLE = "graph"
 const GRAPH = "kg"
-const CUSTOMER = "customer:42"
-const RELATION = "purchased"
-const PRODUCTS = ["product:7", "product:9"]
+const HOST = "host:node-7"
+const RELATION = "runs"
+const SERVICES = ["service:auth", "service:metrics"]
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const capabilities = await laser.capabilities()
@@ -15,17 +15,17 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   phase("relate entities, then traverse from one of them")
   // `link` upserts both content-addressed entity nodes and the typed edge
   // between them, so re-linking the same triple converges instead of growing.
-  for (const product of PRODUCTS) {
-    await graph.link(CUSTOMER, RELATION, product)
+  for (const service of SERVICES) {
+    await graph.link(HOST, RELATION, service)
   }
 
   // The same id `link` derived, rebuilt locally: a node is addressed by its
   // content, never by a server-assigned key.
-  const customer = graphNodeEntity("customer", "42")
-  const purchases = await graph.neighbors(customer.id, "out", RELATION, 1)
+  const host = graphNodeEntity("host", "node-7")
+  const services = await graph.neighbors(host.id, "out", RELATION, 1)
 
-  console.log(`  ${CUSTOMER} ${RELATION}:`)
-  for (const node of purchases.nodes) {
+  console.log(`  ${HOST} ${RELATION}:`)
+  for (const node of services.nodes) {
     console.log(`    ${node.labels[0] ?? "entity"}:${graphNodeValue(node)}`)
   }
 }

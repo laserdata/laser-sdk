@@ -4,7 +4,7 @@ import { test } from "node:test"
 import { setTimeout as delay } from "node:timers/promises"
 import { Consumer, PollingStrategy } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
-import { CancelledError } from "../../src/client/errors.js"
+import { CancelledError, TimeoutError } from "../../src/client/errors.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -32,9 +32,6 @@ void test("given_several_sent_messages_when_consumed_with_next_within_then_shoul
     const second = await consumer.nextWithin(2_000)
     const third = await consumer.nextWithin(2_000)
 
-    assert.ok(first !== null)
-    assert.ok(second !== null)
-    assert.ok(third !== null)
     assert.equal(decodeUtf8(first.payload), "first")
     assert.equal(decodeUtf8(second.payload), "second")
     assert.equal(decodeUtf8(third.payload), "third")
@@ -45,13 +42,12 @@ void test("given_several_sent_messages_when_consumed_with_next_within_then_shoul
   }
 })
 
-void test("given_no_messages_when_polling_with_next_within_then_should_return_null_on_timeout", async () => {
+void test("given_no_messages_when_polling_with_next_within_then_should_fail_with_a_timeout", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
     const consumer = topic.consumer(0, { startFrom: { kind: "first" }, pollIntervalMs: 50 })
-    const message = await consumer.nextWithin(200)
-    assert.equal(message, null)
+    await assert.rejects(consumer.nextWithin(200), TimeoutError)
   } finally {
     await laser.close()
   }
@@ -69,7 +65,6 @@ void test("given_manual_commit_when_the_consumer_is_recreated_then_should_resume
       autoCommit: false
     })
     const one = await first.nextWithin(2_000)
-    assert.ok(one !== null)
     assert.equal(decodeUtf8(one.payload), "one")
     await first.commit(one)
     await first.shutdown()
@@ -79,7 +74,6 @@ void test("given_manual_commit_when_the_consumer_is_recreated_then_should_resume
       autoCommit: false
     })
     const two = await resumed.nextWithin(2_000)
-    assert.ok(two !== null)
     assert.equal(decodeUtf8(two.payload), "two")
   } finally {
     await laser.close()
@@ -117,7 +111,6 @@ void test("given_a_named_consumer_when_committed_then_should_report_local_and_se
       autoCommit: false
     })
     const message = await consumer.nextWithin(1_000)
-    assert.ok(message !== null)
     assert.equal(consumer.lastConsumedOffset(0), message.offset)
     await consumer.commit(message)
     const offset = await consumer.storedOffset(0)
@@ -167,16 +160,15 @@ void test("given_a_fresh_consumer_when_reading_next_then_should_start_at_zero", 
     await topic.send(utf8("one"))
     const options = { autoCommit: false, batchLength: 1 }
     const first = topic.consumer("fresh", 0, options)
-    assert.equal((await first.nextWithin(2_000))?.offset, 0n)
+    assert.equal((await first.nextWithin(2_000)).offset, 0n)
     await first.shutdown()
     const retried = topic.consumer("fresh", 0, options)
     const zero = await retried.nextWithin(2_000)
-    assert.ok(zero !== null)
     assert.equal(zero.offset, 0n)
     await retried.commit(zero)
     await retried.shutdown()
     const resumed = topic.consumer("fresh", 0, options)
-    assert.equal((await resumed.nextWithin(2_000))?.offset, 1n)
+    assert.equal((await resumed.nextWithin(2_000)).offset, 1n)
     await resumed.shutdown()
   } finally {
     await laser.close()
@@ -189,11 +181,11 @@ void test("given_default_polling_when_shutdown_after_offset_zero_then_should_res
     const topic = await freshTopic(laser)
     for (const value of ["zero", "one", "two", "three"]) await topic.send(utf8(value))
     const first = topic.consumer("partial", 0, { batchLength: 4 })
-    assert.equal((await first.nextWithin(2_000))?.offset, 0n)
+    assert.equal((await first.nextWithin(2_000)).offset, 0n)
     assert.equal(first.lastConsumedOffset(0), 0n)
     await first.shutdown()
     const resumed = topic.consumer("partial", 0, { batchLength: 4 })
-    assert.equal((await resumed.nextWithin(2_000))?.offset, 1n)
+    assert.equal((await resumed.nextWithin(2_000)).offset, 1n)
     await resumed.shutdown()
   } finally {
     await laser.close()
@@ -227,7 +219,6 @@ void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_a
       const before = await open()
       for (let expected = 0n; expected < 3n; expected++) {
         const record = await before.nextWithin(2_000)
-        assert.ok(record !== null)
         assert.equal(record.offset, expected)
         if (options.autoCommit === false) await before.commit(record)
       }
@@ -255,7 +246,6 @@ void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_a
       const after = await open()
       try {
         const record = await after.nextWithin(2_000)
-        assert.ok(record !== null, `group ${String(group)}, options ${JSON.stringify(options)}`)
         assert.equal(record.offset, 0n)
         assert.equal(decodeUtf8(record.payload), "safe-mode-0")
       } finally {

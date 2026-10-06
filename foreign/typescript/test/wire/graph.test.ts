@@ -57,13 +57,13 @@ void test("given_two_nodes_when_related_then_should_content_address_the_edge", (
 
 void test("given_an_edge_validity_window_when_checked_then_should_hold_only_inside_it", () => {
   const alice = graphNodeEntity("User", "alice")
-  const pro = graphNodeEntity("Plan", "pro")
-  const edge = { ...graphEdgeRelate(alice, "on_plan", pro), validFrom: 100n, validTo: 200n }
+  const pool = graphNodeEntity("Pool", "eu-west")
+  const edge = { ...graphEdgeRelate(alice, "in_pool", pool), validFrom: 100n, validTo: 200n }
   assert.equal(graphEdgeValidAt(edge, 99n), false)
   assert.equal(graphEdgeValidAt(edge, 100n), true)
   assert.equal(graphEdgeValidAt(edge, 150n), true)
   assert.equal(graphEdgeValidAt(edge, 200n), false)
-  const open = graphEdgeRelate(alice, "on_plan", pro)
+  const open = graphEdgeRelate(alice, "in_pool", pool)
   assert.equal(graphEdgeValidAt(open, 0n) && graphEdgeValidAt(open, (1n << 64n) - 1n), true)
 })
 

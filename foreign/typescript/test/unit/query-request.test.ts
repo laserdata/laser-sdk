@@ -19,7 +19,7 @@ function result(query: Query, cursor?: string): QueryResult {
       engine: { name: "embedded", version: "1" },
       resolvedTarget: {
         kind: "operational",
-        index: "orders",
+        index: "readings",
         backendResourceId: BackendResourceId.fromU128(1n),
         backendGeneration: 1n,
         runtimeConfigurationRevision: 1n
@@ -37,13 +37,13 @@ function result(query: Query, cursor?: string): QueryResult {
 
 void test("query builder freezes target, paging, typed predicates, SQL dialect, and deadline", async () => {
   let observed: Query | undefined
-  const request = new QueryRequest("orders", (query) => {
+  const request = new QueryRequest("readings", (query) => {
     observed = query
     return Promise.resolve(result(query))
   })
     .executionId(QueryExecutionId.fromU128(9n))
     .deadlineMicros(100n)
-    .whereEq("tenant", "acme")
+    .whereEq("region", "eu-west")
     .filterGte("amount", { kind: "long", value: 42n })
     .limit(20)
     .offset(40n)
@@ -60,7 +60,7 @@ void test("query builder freezes target, paging, typed predicates, SQL dialect, 
 
 void test("row iteration follows the opaque server cursor and honors its ceiling", async () => {
   const seen: Query[] = []
-  const request = new QueryRequest("orders", (query) => {
+  const request = new QueryRequest("readings", (query) => {
     seen.push(query)
     return Promise.resolve(result(query, seen.length === 1 ? "next" : undefined))
   }).maxRows(2)
@@ -73,7 +73,7 @@ void test("row iteration follows the opaque server cursor and honors its ceiling
 })
 
 void test("raw SQL carries an explicit dialect and typed parameters", () => {
-  const query = new QueryRequest("orders", (value) => Promise.resolve(result(value)))
+  const query = new QueryRequest("readings", (value) => Promise.resolve(result(value)))
     .rawSql("SELECT 1 WHERE amount > ?", [{ kind: "long", value: 10n }], "data_fusion")
     .intoQuery()
   assert.ok(query.rawSql !== undefined)
@@ -85,7 +85,7 @@ void test("query replies and status remain bound to the requested execution iden
   const executionId = QueryExecutionId.fromU128(9n)
   const wrongExecutionId = QueryExecutionId.fromU128(10n)
   const request = new QueryRequest(
-    "orders",
+    "readings",
     (query) =>
       Promise.resolve({
         ...result(query),

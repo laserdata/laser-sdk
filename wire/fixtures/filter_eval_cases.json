@@ -2264,7 +2264,7 @@
         "expr": {
           "pred_as": {
             "pred": {
-              "field": "amount",
+              "field": "cpu",
               "op": "gt",
               "value": {
                 "kind": "string",
@@ -2279,7 +2279,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"amount\":\"9007199254740993\"}",
+      "payload": "{\"cpu\":\"9007199254740993\"}",
       "expected": "selected"
     },
     {
@@ -2290,7 +2290,7 @@
         "expr": {
           "pred_as": {
             "pred": {
-              "field": "amount",
+              "field": "cpu",
               "op": "eq",
               "value": {
                 "kind": "string",
@@ -2305,7 +2305,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"amount\":\"12.50\"}",
+      "payload": "{\"cpu\":\"12.50\"}",
       "expected": "selected"
     },
     {
@@ -2316,7 +2316,7 @@
         "expr": {
           "pred_as": {
             "pred": {
-              "field": "amount",
+              "field": "cpu",
               "op": "eq",
               "value": {
                 "kind": "long",
@@ -2331,7 +2331,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"amount\":12}",
+      "payload": "{\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2342,7 +2342,7 @@
         "expr": {
           "pred_as": {
             "pred": {
-              "field": "amount",
+              "field": "cpu",
               "op": "eq",
               "value": {
                 "kind": "long",
@@ -2357,7 +2357,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"amount\":\"twelve\"}",
+      "payload": "{\"cpu\":\"twelve\"}",
       "expected": "rejected"
     },
     {
@@ -2368,7 +2368,7 @@
         "expr": {
           "pred_as": {
             "pred": {
-              "field": "amount",
+              "field": "cpu",
               "op": "in",
               "value": {
                 "kind": "list",
@@ -2392,7 +2392,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"amount\":\"2\"}",
+      "payload": "{\"cpu\":\"2\"}",
       "expected": "selected"
     },
     {
@@ -2854,13 +2854,13 @@
           "text": {
             "field": "type",
             "kind": "equals",
-            "pattern": "billing.invoice.v1.created"
+            "pattern": "metrics.cpu.v1.reported"
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2872,13 +2872,13 @@
           "text": {
             "field": "type",
             "kind": "prefix",
-            "pattern": "billing."
+            "pattern": "metrics."
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2890,13 +2890,13 @@
           "text": {
             "field": "type",
             "kind": "suffix",
-            "pattern": ".created"
+            "pattern": ".reported"
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2914,7 +2914,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "rejected"
     },
     {
@@ -2932,7 +2932,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2944,13 +2944,13 @@
           "text": {
             "field": "type",
             "kind": "glob",
-            "pattern": "billing.*.v?.created"
+            "pattern": "metrics.*.v?.reported"
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2962,13 +2962,13 @@
           "text": {
             "field": "type",
             "kind": "glob",
-            "pattern": "invoice.*"
+            "pattern": "cpu.*"
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "rejected"
     },
     {
@@ -2980,13 +2980,13 @@
           "text": {
             "field": "type",
             "kind": "regex",
-            "pattern": "^billing\\.[a-z]+\\.v[0-9]+\\."
+            "pattern": "^metrics\\.[a-z]+\\.v[0-9]+\\."
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -2998,14 +2998,14 @@
           "text": {
             "field": "type",
             "kind": "equals",
-            "pattern": "BILLING.INVOICE.V1.CREATED",
+            "pattern": "METRICS.CPU.V1.REPORTED",
             "case_insensitive": true
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -3017,14 +3017,14 @@
           "text": {
             "field": "type",
             "kind": "glob",
-            "pattern": "BILLING.*",
+            "pattern": "METRICS.*",
             "case_insensitive": true
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "selected"
     },
     {
@@ -3034,7 +3034,7 @@
         "evaluator_version": 1,
         "expr": {
           "text": {
-            "field": "amount",
+            "field": "cpu",
             "kind": "prefix",
             "pattern": "1"
           }
@@ -3042,7 +3042,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "rejected",
       "fault": "type_mismatch"
     },
@@ -3053,7 +3053,7 @@
         "evaluator_version": 1,
         "expr": {
           "text": {
-            "field": "amount",
+            "field": "cpu",
             "kind": "prefix",
             "pattern": "1"
           }
@@ -3062,7 +3062,7 @@
         "fault_policy": "stop",
         "mismatch_policy": "pass"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "fault"
     },
     {
@@ -3072,7 +3072,7 @@
         "evaluator_version": 1,
         "expr": {
           "pred": {
-            "field": "amount",
+            "field": "cpu",
             "op": "eq",
             "value": {
               "kind": "string",
@@ -3083,7 +3083,7 @@
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "rejected",
       "fault": "type_mismatch"
     },
@@ -3094,7 +3094,7 @@
         "evaluator_version": 1,
         "expr": {
           "pred": {
-            "field": "amount",
+            "field": "cpu",
             "op": "eq",
             "value": {
               "kind": "string",
@@ -3106,7 +3106,7 @@
         "fault_policy": "stop",
         "mismatch_policy": "pass"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "fault"
     },
     {
@@ -3128,7 +3128,7 @@
         "fault_policy": "stop",
         "mismatch_policy": "pass"
       },
-      "payload": "{\"type\":\"billing.invoice.v1.created\",\"amount\":12}",
+      "payload": "{\"type\":\"metrics.cpu.v1.reported\",\"cpu\":12}",
       "expected": "rejected"
     },
     {
@@ -3153,7 +3153,7 @@
           "key": "event.type",
           "value": {
             "kind": "string",
-            "value": "billing.invoice.v1.created"
+            "value": "metrics.cpu.v1.reported"
           }
         }
       ]
@@ -3169,7 +3169,7 @@
             "op": "eq",
             "value": {
               "kind": "string",
-              "value": "billing"
+              "value": "metrics"
             }
           }
         },
@@ -3200,7 +3200,7 @@
             "op": "eq",
             "value": {
               "kind": "string",
-              "value": "billing"
+              "value": "metrics"
             }
           }
         },
@@ -3231,14 +3231,14 @@
             "op": "eq",
             "value": {
               "kind": "string",
-              "value": "billing"
+              "value": "metrics"
             }
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing\"}",
+      "payload": "{\"type\":\"metrics\"}",
       "expected": "selected",
       "headers": [
         {
@@ -3261,14 +3261,14 @@
             "op": "eq",
             "value": {
               "kind": "string",
-              "value": "billing"
+              "value": "metrics"
             }
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing\"}",
+      "payload": "{\"type\":\"metrics\"}",
       "expected": "selected",
       "headers": [
         {
@@ -3289,7 +3289,7 @@
           "header_text": {
             "field": "event.type",
             "kind": "prefix",
-            "pattern": "billing."
+            "pattern": "metrics."
           }
         },
         "codec": "headers_only",
@@ -3338,7 +3338,7 @@
             "op": "eq",
             "value": {
               "kind": "string",
-              "value": "billing"
+              "value": "metrics"
             }
           }
         },
@@ -3403,14 +3403,14 @@
           "text": {
             "field": "type",
             "kind": "regex",
-            "pattern": "^BILLING",
+            "pattern": "^METRICS",
             "case_insensitive": true
           }
         },
         "codec": "json",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing.invoice\"}",
+      "payload": "{\"type\":\"metrics.cpu\"}",
       "expected": "selected"
     },
     {
@@ -3424,14 +3424,14 @@
             "op": "eq",
             "value": {
               "kind": "string",
-              "value": "billing"
+              "value": "metrics"
             }
           }
         },
         "codec": "cbor",
         "fault_policy": "stop"
       },
-      "payload": "{\"type\":\"billing\"}",
+      "payload": "{\"type\":\"metrics\"}",
       "expected": "rejected",
       "headers": [
         {

@@ -764,7 +764,7 @@ mod tests {
         assert!(over.validate().is_err());
         let ok = TextQuery {
             field: None,
-            query: "checkout is slow".to_owned(),
+            query: "auth is slow".to_owned(),
         };
         assert!(ok.validate().is_ok());
     }
@@ -796,7 +796,7 @@ mod tests {
         let ok = MemoryRecord::Item {
             id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
             kind: "fact".to_owned(),
-            body: b"checkout is slow".to_vec(),
+            body: b"auth is slow".to_vec(),
         };
         assert!(ok.validate().is_ok());
         assert!(

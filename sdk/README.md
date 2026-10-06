@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.5.3" # typed streaming plus provenance
+laser-sdk = "0.5.4" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.5.3", features = ["agent", "managed"] }
+laser-sdk = { version = "0.5.4", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -124,15 +124,15 @@ Query results carry one ordered logical field schema and positional tagged value
 
 ```rust,ignore
 let result = laser
-    .query("orders_v1")
-    .where_eq("customer_id", "alice")
-    .filter_gte("total", 100_i64)
+    .query("readings_v1")
+    .where_eq("host_id", "node-7")
+    .filter_gte("cpu", 90_i64)
     .limit(100)
     .fetch()
     .await?;
 
 for row in &result.rows {
-    println!("{}", result.value_text(row, "total").unwrap_or_default());
+    println!("{}", result.value_text(row, "cpu").unwrap_or_default());
 }
 ```
 
@@ -144,7 +144,7 @@ Lakehouse queries name one destination generation and can select a retained snap
 let historical = laser
     .query_lakehouse(destination_id, destination_generation)
     .at_snapshot(snapshot_id)?
-    .filter_eq("customer_id", "alice")
+    .filter_eq("host_id", "node-7")
     .limit(100)
     .fetch()
     .await?;
@@ -204,19 +204,19 @@ A typed handle binds a topic to one body type. The serde forms encode published 
 ```rust
 # use laser_sdk::prelude::*;
 # use serde::{Deserialize, Serialize};
-# #[derive(Serialize, Deserialize)] struct Order { customer: String, amount: i64 }
-# async fn run(laser: Laser, order: Order) -> Result<(), LaserError> {
-let orders = laser.stream("commerce").topic("orders").json::<Order>(); // or .cbor::<Order>()
-orders.publish(&order)?.send().await?;              // stamps agdx.ct, builder verbs still chain
+# #[derive(Serialize, Deserialize)] struct Reading { host: String, cpu: u8 }
+# async fn run(laser: Laser, reading: Reading) -> Result<(), LaserError> {
+let readings = laser.stream("fleet").topic("readings").json::<Reading>(); // or .cbor::<Reading>()
+readings.publish(&reading)?.send().await?;              // stamps agdx.ct, builder verbs still chain
 
-let mut records = orders.records("billing")?;       // named cursor, not consumer-group delivery
+let mut records = readings.records("metrics-export")?;  // named cursor, not consumer-group delivery
 while let Some(next) = records.next().await {
-    let order: Order = next?.value;
+    let reading: Reading = next?.value;
 }
 # Ok(()) }
 ```
 
-`laser.stream("commerce").topic("orders").schema::<Order>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by `laser-plane`. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication.
+`laser.stream("fleet").topic("readings").schema::<Reading>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by `laser-plane`. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication.
 
 The `records` reader reports `TypedDecodeError { position, source }` for a record that does not decode, then continues. An `Agent` handler can decode through the same API. Its existing dead-letter policy handles invalid records.
 
@@ -235,7 +235,7 @@ let deadline = (SystemTime::now() + Duration::from_secs(30))
 let intent = Intent::builder()
     .conversation(ConversationId::new())
     .proposer("planner".parse()?)
-    .body(b"reserve inventory".to_vec())
+    .body(b"rotate the storage credentials".to_vec())
     .eligible_voters(vec!["safety".parse()?])
     .policy(IntentPolicy::All)
     .policy_version(7)
@@ -253,7 +253,7 @@ if let Some(decision) = decide(&intent, &[vote], now)? {
 # Ok(()) }
 ```
 
-`Intent`, `Vote`, and `Decision` are SDK record conventions, not AGDX envelope types. Invalid configuration fails before publish, and deserialized intents are validated again before voting or folding. A voter name is still a record claim. Use signed principals or topic ACL isolation when authorship must be trusted.
+`Intent`, `Vote`, and `Decision` are SDK record conventions, not AGDX envelope types. Intent builders reject invalid configuration. Call validate before publishing a modified or independently decoded intent. Voting and folding validate the intent again. A voter name is still a record claim. Use signed principals or topic ACL isolation when authorship must be trusted.
 
 ## Addressing
 
@@ -271,7 +271,7 @@ One connection can advertise one agent. A second advertisement receives `LaserEr
 | `laser.watch()` | the change feed | consume advancement records instead of re-querying blind |
 | `topic.consumer_group(name).filter()` | one group's server-side policy | configure, inspect and draft revisions, pause/resume, release, delete, preview and sample-test |
 | `laser.kv(namespace)` | managed point state | get/set/delete/scan, compare-and-swap, leases |
-| `laser.fork(id)` | a copy-on-write branch | speculative writes, overlay queries, promote or squash |
+| `laser.fork(id)` | a copy-on-write branch | speculative writes (row embeddings are typed `f32` vectors), overlay queries, promote or squash |
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |
 | `laser.memory(scope)` | agentic memory | remember / recall / improve / forget |
 | `laser.context(conversation)` | one conversation's working record | append, bounded fetch, prompt block, state folds |
@@ -310,11 +310,12 @@ Use `topic.send(..)` for raw publication. Use `publish()` and `publish_batch()` 
 - `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
 - `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
-- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent().commit()`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
+- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent()`, then `.commit()`. `.send()` is unconditional and refuses a builder that carries a precondition with `LaserError::Invalid`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
 - `streaming` includes consumer-group policies, group-aware consumers, explicit acknowledgment readers and group filter administration. The supporting server selects matching records for a bound group and returns all records for an unbound group. Configuration needs a ready catalog. `filters` adds only the local evaluator and the advanced reader's optional `local_guard` check. A reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset.
 - capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
 - `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)
 - `mcp-bridge`, MCP JSON-RPC bridge (initialize, tools, resources, prompts) mapping tool calls onto AGDX
+- `a2a-http` / `mcp-http`, the ready-made axum `router()` for each bridge
 - `agui`, AG-UI state sync and event rendering over the log
 - `sign` provides Ed25519 signing and verification. `Agent::builder().signing_key(..)` signs pickup and terminal replies, including `respond_input`. `Agent::builder().verifier(..)` rejects unsigned or invalid records before handling. `LaserBuilder::verifier(..)` applies the same requirement to correlated reply waits.
 
@@ -409,3 +410,5 @@ Group consumers acknowledge through the fenced group contract. Automatic policie
 **Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
 
 For an application checkpoint inside a filtered page, call `reader.ack_through(record)` after persisting the checkpoint and processing all preceding records on that partition. Later records in the same page stay pending. Use `ack_page` when the whole page is complete.
+
+The [0.5.4 client behavior guide](../docs/client-behavior.md) documents prepared coordination, owned agent lifetimes, memory reports, and the matching Python and TypeScript APIs.

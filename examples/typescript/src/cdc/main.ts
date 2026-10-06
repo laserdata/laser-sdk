@@ -17,7 +17,7 @@ import { decodeUtf8, managedGate, phase, runExample, runToken, utf8 } from "../c
 // desk only wants satellites entering safe mode or leaving the fleet. The
 // desk's consumer group owns that filter: the server evaluates it next to the
 // data, so the desk receives a handful of records out of hundreds, and
-// everything else never leaves the broker.
+// everything else never leaves the server.
 export const EXAMPLE = "cdc"
 const TOPIC = "fleet_changes"
 const ALERTS = "fleet_alerts"
@@ -121,7 +121,6 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   try {
     for (let handled = 0; handled < feed.strictMatches; handled += 1) {
       const message = await consumer.nextWithin(READ_TIMEOUT_MS)
-      if (message === null) throw new Error("the next matching record did not arrive")
       const change = JSON.parse(decodeUtf8(message.payload)) as FleetChange
       console.log(
         `  partition ${String(message.partitionId)} offset ${message.offset.toString()}: ${describe(change)}`
@@ -133,7 +132,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
     await consumer.shutdown()
   }
   console.log(
-    `  delivered ${String(feed.strictMatches)} of ${String(feed.records.length)} records, ${String(deliveredBytes)} of ${String(publishedBytes)} payload bytes: ${((100 * (publishedBytes - deliveredBytes)) / publishedBytes).toFixed(1)}% stayed on the broker`
+    `  delivered ${String(feed.strictMatches)} of ${String(feed.records.length)} records, ${String(deliveredBytes)} of ${String(publishedBytes)} payload bytes: ${((100 * (publishedBytes - deliveredBytes)) / publishedBytes).toFixed(1)}% stayed on the server`
   )
 
   phase("page the matches again with the group reader and its own scan budget")

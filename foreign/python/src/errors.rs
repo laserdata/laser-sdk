@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyException, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::sync::OnceLockExt;
 use pyo3::types::{PyDict, PyTuple, PyType};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 create_exception!(
     laser_sdk,
@@ -24,6 +24,19 @@ create_exception!(
     ConfigError,
     LaserError,
     "Invalid client configuration, or a convenience call needed a default stream and none was set."
+);
+create_exception!(
+    laser_sdk,
+    NoStreamError,
+    ConfigError,
+    "A convenience call needed a default stream and none was set. Connect with \
+     `stream=` or call `with_stream`."
+);
+create_exception!(
+    laser_sdk,
+    NoRespondTopicError,
+    ConfigError,
+    "An agent reply was attempted without a configured respond topic."
 );
 create_exception!(
     laser_sdk,
@@ -205,33 +218,113 @@ fn cancelled_error(py: Python<'_>) -> &Bound<'_, PyType> {
 // Map the SDK's one error type onto the typed Python exception hierarchy, then
 // attach the classifier results as instance attributes so Python callers branch
 // on `err.retryable` / `err.unsupported` without re-deriving them.
+// A filter failure that is not a group setup failure names no group.
+fn no_group(value: &Bound<'_, pyo3::exceptions::PyBaseException>) {
+    let none = value.py().None();
+    let _ = value.setattr("group_id", &none);
+    let _ = value.setattr("group_name", &none);
+    let _ = value.setattr("identity", &none);
+}
+
+#[pyclass]
+struct NativeError {
+    inner: Mutex<Option<SdkError>>,
+}
+
+// Keep SDK errors intact when Python callbacks return them to Rust.
+pub(crate) fn from_callback_error(error: PyErr) -> SdkError {
+    Python::attach(|py| {
+        let value = error.value(py);
+        if let Ok(native) = value.getattr("_native_error").and_then(|value| {
+            value
+                .extract::<PyRef<'_, NativeError>>()
+                .map_err(Into::into)
+        }) && let Some(error) = native.inner.lock().expect("native error lock").take()
+        {
+            return error;
+        }
+        let flag = |name: &str| {
+            value
+                .getattr(name)
+                .and_then(|value| value.extract::<bool>())
+                .unwrap_or(false)
+        };
+        let message = error.to_string();
+        if flag("ambiguous_mutation") {
+            SdkError::AmbiguousMutation(message)
+        } else if flag("permission_denied")
+            || error.is_instance_of::<pyo3::exceptions::PyPermissionError>(py)
+        {
+            SdkError::Iggy(IggyError::Unauthorized)
+        } else if error.is_instance_of::<NoStreamError>(py) {
+            SdkError::NoStream
+        } else if error.is_instance_of::<NoRespondTopicError>(py) {
+            SdkError::NoRespondTopic
+        } else if error.is_instance_of::<ConfigError>(py)
+            || error.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+        {
+            SdkError::HandlerConfig(message)
+        } else if flag("unsupported") || error.is_instance_of::<UnsupportedError>(py) {
+            SdkError::unsupported("handler", message)
+        } else if error.is_instance_of::<InvalidError>(py) {
+            SdkError::Invalid(message)
+        } else if error.is_instance_of::<CodecError>(py) {
+            SdkError::Codec(message)
+        } else if error.is_instance_of::<ProtocolError>(py) {
+            SdkError::Protocol(message)
+        } else if error.is_instance_of::<PolicyBlockedError>(py) {
+            SdkError::PolicyBlocked(message)
+        } else if error.is_instance_of::<StepUpRequiredError>(py) {
+            SdkError::StepUpRequired(message)
+        } else if value
+            .getattr("retryable")
+            .and_then(|value| value.extract::<bool>())
+            .ok()
+            == Some(false)
+        {
+            SdkError::Rejected(message)
+        } else {
+            SdkError::Handler(message)
+        }
+    })
+}
+
 pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
-    // A publish failure raises as its cause, with the target in the message
-    // and the batch outcome attached.
+    let pyerr = to_pyerr_ref(&err);
+    Python::attach(|py| {
+        if let Ok(native) = Py::new(
+            py,
+            NativeError {
+                inner: Mutex::new(Some(err)),
+            },
+        ) {
+            let _ = pyerr.value(py).setattr("_native_error", native);
+        }
+    });
+    pyerr
+}
+
+// Observer hooks receive the same exception class and fields without taking the native result.
+pub(crate) fn to_pyerr_ref(err: &SdkError) -> PyErr {
     if let SdkError::PublishFailed(failure) = err {
-        let message = failure.to_string();
-        let laser_sdk::error::PublishFailure {
-            source,
-            committed,
-            unconfirmed,
-            ..
-        } = *failure;
-        let error = to_pyerr(source);
+        let error = to_pyerr_ref(&failure.source);
         Python::attach(|py| {
             let value = error.value(py);
-            let committed = committed
-                .into_iter()
+            let committed = failure
+                .committed
+                .iter()
+                .cloned()
                 .map(PySendMessagesConfirmation::from)
                 .collect::<Vec<_>>();
-            let _ = value.setattr("args", (message,));
+            let _ = value.setattr("args", (failure.to_string(),));
             let _ = value.setattr("committed", committed);
-            let _ = value.setattr("unconfirmed_count", unconfirmed.len());
+            let _ = value.setattr("unconfirmed_count", failure.unconfirmed.len());
         });
         return error;
     }
     // Apache Iggy prints a failed send as "Producer send failed" alone, so the
     // message names its target and cause, and the cause classifies it.
-    let message = match &err {
+    let message = match err {
         SdkError::Iggy(IggyError::ProducerSendFailed {
             cause,
             stream_name,
@@ -258,7 +351,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
     let quarantined = err.is_quarantined();
     let not_leader = err.is_not_leader();
 
-    let pyerr = match &err {
+    let pyerr = match err {
         SdkError::Query(_) => QueryError::new_err(message),
         SdkError::Kv(_) => KvError::new_err(message),
         SdkError::Fork(_) => ForkError::new_err(message),
@@ -278,10 +371,9 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         }
         SdkError::Codec(_) => CodecError::new_err(message),
         SdkError::Protocol(_) => ProtocolError::new_err(message),
-        SdkError::Config(_)
-        | SdkError::HandlerConfig(_)
-        | SdkError::NoStream
-        | SdkError::NoRespondTopic => ConfigError::new_err(message),
+        SdkError::NoStream => NoStreamError::new_err(message),
+        SdkError::NoRespondTopic => NoRespondTopicError::new_err(message),
+        SdkError::Config(_) | SdkError::HandlerConfig(_) => ConfigError::new_err(message),
         SdkError::Iggy(_) => TransportError::new_err(message),
         SdkError::BudgetExceeded { .. } => BudgetExceededError::new_err(message),
         SdkError::PolicyBlocked(_) => PolicyBlockedError::new_err(message),
@@ -314,7 +406,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
         let _ = value.setattr("not_leader", not_leader);
         let _ = value.setattr("committed", Vec::<PySendMessagesConfirmation>::new());
         let _ = value.setattr("unconfirmed_count", py.None());
-        match &err {
+        match err {
             // A background producer's send fails with Apache Iggy's own report
             // of what committed and what did not.
             SdkError::Iggy(IggyError::ProducerSendFailed {
@@ -333,6 +425,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
                 let _ = value.setattr("fault_reason", py.None());
                 let _ = value.setattr("partition_id", py.None());
                 let _ = value.setattr("offset", py.None());
+                no_group(value);
             }
             SdkError::FilterFault {
                 partition_id,
@@ -343,6 +436,7 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
                 let _ = value.setattr("fault_reason", reason.to_string());
                 let _ = value.setattr("partition_id", partition_id);
                 let _ = value.setattr("offset", offset);
+                no_group(value);
             }
             SdkError::FilterOversizedRecord {
                 partition_id,
@@ -352,11 +446,15 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
                 let _ = value.setattr("fault_reason", py.None());
                 let _ = value.setattr("partition_id", partition_id);
                 let _ = value.setattr("offset", offset);
+                no_group(value);
             }
             // The group exists, its filter was not configured. `reason` is
             // the catalog's refusal when there is one.
             SdkError::ConsumerGroupSetup {
-                group_id, source, ..
+                group_id,
+                name,
+                identity,
+                source,
             } => {
                 let reason = source
                     .filter_reason()
@@ -366,6 +464,10 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
                 let _ = value.setattr("partition_id", py.None());
                 let _ = value.setattr("offset", py.None());
                 let _ = value.setattr("group_id", group_id);
+                let _ = value.setattr("group_name", name);
+                if let Ok(identity) = crate::convert::ser_to_py(py, identity) {
+                    let _ = value.setattr("identity", identity);
+                }
             }
             _ => {}
         }
@@ -378,6 +480,8 @@ pub(crate) fn to_pyerr(err: SdkError) -> PyErr {
 pub(crate) fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("LaserError", py.get_type::<LaserError>())?;
     module.add("ConfigError", py.get_type::<ConfigError>())?;
+    module.add("NoStreamError", py.get_type::<NoStreamError>())?;
+    module.add("NoRespondTopicError", py.get_type::<NoRespondTopicError>())?;
     module.add("TimeoutError", timeout_error(py).clone())?;
     module.add("QueryError", py.get_type::<QueryError>())?;
     module.add("KvError", py.get_type::<KvError>())?;

@@ -12,7 +12,13 @@ import type { SnapshotStore } from "./snapshot.js"
 import type { BytesLike } from "./client/bytes.js"
 import type { ConversationId } from "./types/ids.js"
 import type { MemoryHandle } from "./memory/handle.js"
-import type { Feedback, MemoryId, MemoryItem } from "./memory/types.js"
+import type {
+  ConsolidateOptions,
+  ConsolidationReport,
+  Feedback,
+  MemoryId,
+  MemoryItem
+} from "./memory/types.js"
 
 export class ContextScope {
   constructor(
@@ -95,9 +101,11 @@ export class ContextScope {
 }
 
 export class ScopedMemory {
+  /** `handle` is the underlying memory, for the cross-conversation verbs this
+   * scoped face does not narrow. */
   constructor(
-    private readonly handle: MemoryHandle,
-    private readonly conversation: ConversationId
+    readonly handle: MemoryHandle,
+    readonly conversation: ConversationId
   ) {}
 
   remember(payload: Uint8Array) {
@@ -115,11 +123,24 @@ export class ScopedMemory {
     return (limit === undefined ? recall : recall.limit(limit)).fetch()
   }
 
+  /** This conversation's recalled items as one prompt-ready block, trimmed to
+   * `tokenBudget` estimated tokens when given. */
   context(tokenBudget?: number): Promise<string> {
     return this.handle.context(
       { conversation: this.conversation },
       tokenBudget === undefined ? {} : { tokenBudget }
     )
+  }
+
+  /** The same block as `context`, under the name the Rust and Python SDKs use. */
+  block(tokenBudget?: number): Promise<string> {
+    return this.context(tokenBudget)
+  }
+
+  /** One consolidation pass over this conversation, keeping the newest
+   * `maxItems`. `options` adds the summarize pass. */
+  consolidate(maxItems: number, options?: ConsolidateOptions): Promise<ConsolidationReport> {
+    return this.handle.consolidate({ conversation: this.conversation }, maxItems, options)
   }
 
   forget(id: MemoryId): Promise<void> {

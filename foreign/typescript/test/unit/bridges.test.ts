@@ -58,8 +58,8 @@ void test("given_edge_claims_when_authorized_then_should_distinguish_rejection_f
 void test("given_a2a_capabilities_and_replies_when_projected_then_should_use_protocol_spellings", () => {
   assert.equal(contentRefMode({ kind: "contentType", value: ContentType.Json }), "application/json")
   assert.equal(
-    contentRefMode({ kind: "schemaId", value: "orders.v1" }),
-    "application/x-agdx-schema;id=orders.v1"
+    contentRefMode({ kind: "schemaId", value: "readings.v1" }),
+    "application/x-agdx-schema;id=readings.v1"
   )
   const envelope = responseEnvelope(
     RecordId.fromU128(1n),

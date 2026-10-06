@@ -336,12 +336,12 @@ mod tests {
     #[test]
     fn given_surface_errors_when_classified_then_should_map_to_the_shared_code() {
         assert_eq!(
-            ResultCode::from(&QueryError::IndexNotFound("orders".to_owned())),
+            ResultCode::from(&QueryError::IndexNotFound("readings".to_owned())),
             ResultCode::NotFound
         );
         assert_eq!(
             ResultCode::from(&QueryError::Stale {
-                what: "orders".to_owned(),
+                what: "readings".to_owned(),
                 applied: 4,
                 required: 9,
             }),

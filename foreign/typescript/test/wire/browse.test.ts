@@ -35,8 +35,8 @@ void test("given_the_projection_browse_fixture_when_decoded_then_should_preserve
   assert.ok(projection !== undefined)
   const [binding] = projection.bindings
   assert.ok(binding !== undefined)
-  assert.equal(projection.projection.id, "order.v1")
-  assert.equal(binding.index, "orders_rows")
+  assert.equal(projection.projection.id, "reading.v1")
+  assert.equal(binding.index, "readings_rows")
 })
 
 void test("given_the_schema_browse_fixture_when_decoded_then_should_preserve_lifecycle", async () => {

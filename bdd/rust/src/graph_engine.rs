@@ -232,19 +232,19 @@ mod tests {
     fn given_an_element_re_observed_when_sourced_then_node_is_first_writer_and_edge_is_last_writer()
     {
         let mut graph = GraphEngine::new();
-        for source in ["orders/events/0/42", "orders/events/0/99"] {
+        for source in ["readings/events/0/42", "readings/events/0/99"] {
             let from = graph.upsert_node_with_source("Alice", source);
             let to = graph.upsert_node_with_source("Acme", source);
             graph.add_edge_with_source(from, "works_at", to, source);
         }
         assert_eq!(
             graph.node_source("Alice"),
-            Some("orders/events/0/42"),
+            Some("readings/events/0/42"),
             "a re-observed node keeps its first source"
         );
         assert_eq!(
             graph.edge_source("Alice", "works_at", "Acme"),
-            Some("orders/events/0/99"),
+            Some("readings/events/0/99"),
             "a re-observed edge keeps its latest source"
         );
     }
@@ -252,16 +252,16 @@ mod tests {
     #[test]
     fn given_a_valid_from_edge_when_read_as_of_then_should_appear_only_after_the_window_opens() {
         let mut graph = GraphEngine::new();
-        let from = graph.upsert_node("checkout");
+        let from = graph.upsert_node("auth");
         let to = graph.upsert_node("replica");
         graph.add_edge_valid(from, "mitigated_by", to, Some(100), None);
         let hops = [("mitigated_by".to_owned(), Dir::Out)];
         assert!(
-            graph.traverse_as_of("checkout", &hops, Some(50)).is_empty(),
+            graph.traverse_as_of("auth", &hops, Some(50)).is_empty(),
             "before the window opens the edge is invisible"
         );
         assert_eq!(
-            graph.traverse_as_of("checkout", &hops, Some(150)),
+            graph.traverse_as_of("auth", &hops, Some(150)),
             vec!["replica"],
             "after the window opens the edge is followed"
         );

@@ -376,7 +376,7 @@ async fn given_managed_query_without_keyword_when_text_searching_then_should_ref
         .with_capabilities(Capabilities::OPEN.with_query(true));
     let error = laser
         .query("events")
-        .text("refund dispute")
+        .text("rollout incident")
         .fetch()
         .await
         .expect_err("an unadvertised text search must be refused locally");

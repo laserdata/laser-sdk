@@ -20,7 +20,7 @@ import {
 } from "../common.js"
 
 export const EXAMPLE = "firehose"
-const SERVICES = ["api", "billing", "catalog", "worker"] as const
+const SERVICES = ["api", "storage", "metrics", "worker"] as const
 const REGIONS = ["us-east", "us-west", "eu-central"] as const
 
 interface Telemetry {

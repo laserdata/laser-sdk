@@ -1274,7 +1274,7 @@ mod tests {
         let client = HttpClient::new(CannedTransport {
             response: HttpResponse::new(404, body),
         });
-        let info = block_on(client.get_projection("order.v1")).expect("404 maps to None");
+        let info = block_on(client.get_projection("reading.v1")).expect("404 maps to None");
         assert!(info.is_none());
     }
 
@@ -1294,7 +1294,7 @@ mod tests {
         let client = HttpClient::new(CannedTransport {
             response: HttpResponse::new(204, Vec::new()),
         });
-        block_on(client.drop_projection("order.v1")).expect("a 204 is a success");
+        block_on(client.drop_projection("reading.v1")).expect("a 204 is a success");
     }
 
     #[test]

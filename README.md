@@ -123,25 +123,25 @@ The Rust form follows:
 use std::time::Duration;
 
 let laser = Laser::connect("iggy:iggy@127.0.0.1").await?;
-let orders = laser.stream("app").topic("orders");
+let readings = laser.stream("fleet").topic("readings");
 let audit = laser.stream("audit").topic("events");
 
 // Log: streams group topics, topics carry your records.
-orders.ensure(4).await?;
+readings.ensure(4).await?;
 audit.ensure(4).await?;
-orders.publish().json(&order)?.send().await?;
+readings.publish().json(&reading)?.send().await?;
 audit.publish().json(&event)?.send().await?;
-let mut replay = orders.replay()?;
+let mut replay = readings.replay()?;
 
 // Views: declared projections answer queries, the graph answers traversals.
 let rows = laser
-    .query("orders_v1")
-    .where_eq("status", "paid")
+    .query("readings_v1")
+    .where_eq("status", "degraded")
     .limit(10)
     .fetch()
     .await?;
 let nearby = laser.graph("kg").neighbors(node, EdgeDir::Out, None, 2).await?;
-let mut feed = laser.watch().index("orders_v1").records()?; // await-then-query
+let mut feed = laser.watch().index("readings_v1").records()?; // await-then-query
 
 // State: point reads and writes, optimistic concurrency, branches.
 laser
@@ -159,7 +159,7 @@ let reply = laser.agent(id).ask(commands, replies, task, &prov, timeout).await?;
 // Context: one task streams its messages, keeps its memory, resolves its deps.
 let ctx = laser.context(conversation);
 ctx.append(AgentTopic::Audit, b"step done").await?;
-let facts = ctx.memory("support").recall().semantic("refund disputes").fetch().await?;
+let facts = ctx.memory("support").recall().semantic("rollout incidents").fetch().await?;
 let deps = ctx.graph("services").neighbors(node, EdgeDir::Out, None, 2).await?;
 
 // Session: the same conversation as typed turns, context, memory, and replay.
@@ -172,7 +172,7 @@ let checkpoint = session.checkpoint().await?; // serializable, persist it anywhe
 let later = session.replay(checkpoint, Vec::new(), |mut acc, turn| { acc.push(turn.text()); acc }).await?;
 
 laser.memory("notes").set("current-plan", plan_json).await?; // named point state, an event on the memory topic
-let run = laser.workflow("refund").registered().step(/* .. */).run().await?;
+let run = laser.workflow("rollback").registered().step(/* .. */).run().await?;
 let page = laser.runs().list().state(AgentRunState::Running).fetch().await?;
 ```
 
@@ -180,17 +180,17 @@ The Python form follows:
 
 ```python
 laser = await ls.Laser.connect("iggy:iggy@127.0.0.1")
-orders = laser.stream("app").topic("orders")
+readings = laser.stream("fleet").topic("readings")
 audit = laser.stream("audit").topic("events")
 
 # Log
-await orders.publish().json(order).send()
+await readings.publish().json(reading).send()
 await audit.publish().json(event).send()
 
 # Views + graph + change feed
-rows = await laser.query("orders_v1").where_eq("status", "paid").limit(10).fetch()
+rows = await laser.query("readings_v1").where_eq("status", "degraded").limit(10).fetch()
 nearby = await laser.graph("kg").neighbors(node, direction="out", depth=2)
-feed = laser.watch(index="orders_v1")
+feed = laser.watch(index="readings_v1")
 
 # State
 await laser.kv("sessions").set("user:42").json(session).ttl(300).send()
@@ -198,7 +198,7 @@ await laser.kv("sessions").set("user:42").json(session).ttl(300).send()
 # Fabric: one task streams its messages, keeps its memory, resolves its deps
 ctx = laser.context(conversation)
 await ctx.append("audit", b"step done")
-facts = await ctx.memory(laser.memory()).recall(semantic="refund disputes")
+facts = await ctx.memory(laser.memory("support")).recall(semantic="rollout incidents")
 turns = await ctx.fetch(last_n=20, token_budget=4_000)
 deps = await ctx.graph("services").neighbors(node, direction="out", depth=2)
 
@@ -210,28 +210,28 @@ turns = await session.context()
 facts = await session.memory().search("login bug")
 checkpoint = await session.checkpoint()
 later = await session.turns_since(checkpoint)
-run = await laser.runs().submit("refund", task)
+run = await laser.runs().submit("rollback", task)
 ```
 
 The TypeScript form uses camelCase method names:
 
 ```ts
 const laser = await Laser.connect("iggy:iggy@127.0.0.1")
-const orders = laser.stream("app").topic("orders")
+const readings = laser.stream("fleet").topic("readings")
 const audit = laser.stream("audit").topic("events")
 
 // Log
-await orders.publish().json(order).send()
+await readings.publish().json(reading).send()
 await audit.publish().json(event).send()
 
 // Views + graph + change feed
 const rows = await laser
-  .query("orders_v1")
-  .whereEq("status", "paid")
+  .query("readings_v1")
+  .whereEq("status", "degraded")
   .limit(10)
   .fetch()
 const nearby = await laser.graph("kg").neighbors(node, "out", undefined, 2)
-const feed = await laser.watch().index("orders_v1").records()
+const feed = await laser.watch().index("readings_v1").records()
 
 // State
 await laser.kv("sessions").set(key).json(session).ttl(300_000_000n).send()
@@ -243,7 +243,7 @@ await ctx.append("audit", new TextEncoder().encode("step done"))
 const facts = await ctx
   .memory("support")
   .recall()
-  .semantic("refund disputes")
+  .semantic("rollout incidents")
   .fetch()
 
 // Session: the same conversation as typed turns, context, memory, and replay
@@ -254,7 +254,7 @@ const turns = await session.context()
 const hits = await session.memory().search("login bug")
 const checkpoint = await session.checkpoint()
 const later = await session.turnsSince(checkpoint)
-const run = await laser.runs().submit("refund", task)
+const run = await laser.runs().submit("rollback", task)
 ```
 
 ### Streaming contract
@@ -301,17 +301,17 @@ Agent routing, contracts, fan-out, and workflows run as client-side state machin
 
 - **Streaming and managed operations share one client, Iggy transport, and record metadata.**
 - **Read models can rebuild from retained records.** A new projection, index, or agent can read earlier records by offset.
-- `laser.stream("commerce").topic("orders").json::<Order>()` publishes and replays `Order` values. A schema-bound handle checks each value against its registered schema before sending. Decode failures include the record position. Producers and consumers support batches.
+- `laser.stream("fleet").topic("readings").json::<Reading>()` publishes and replays `Reading` values. A schema-bound handle checks each value against its registered schema before sending. Decode failures include the record position. Producers and consumers support batches.
 - Streaming, the agent runtime, log-based memory, and open coordination run on Apache Iggy. Managed operations use capabilities reported by LaserData Cloud or Laser Stack.
 - A fence is an increasing token that identifies a lease holder. An `.exclusive_in(namespace)` step and `kv(namespace).cas_fenced(..)` use the same fence sequence. **The protected state rejects writes from a replaced holder.**
-- Rust defines the reference behavior. Python calls that implementation. TypeScript uses the same encoded test data and **shared behavior scenarios**.
+- Rust defines the reference behavior. Python calls that implementation. TypeScript uses the same encoded test data and **shared behavior scenarios**. The [cross-SDK parity matrix](docs/parity.md) maps every public Rust symbol to its Python and TypeScript spelling.
 
 ## Open core, managed surface
 
 | Deployment | Available surfaces |
 | --- | --- |
 | Apache Iggy | Streaming, provenance, AGDX, the agent runtime, log-backed memory, contracts, and workflows |
-| Laser Stack | Everything above, plus consumer filters, query, projections, KV, forks, graph, durable memory, the run registry, durable dedup, and fenced leases |
+| Laser Stack | Everything above, plus consumer filters, query, projections, KV, forks, graph, durable memory, the run registry, and fenced leases |
 | LaserData Cloud | The complete SDK surface with managed deployment and UI services |
 
 Capability negotiation runs during connection setup. A managed call against Apache Iggy without a managed backend returns `LaserError::Unsupported`. The underlying client remains available through `topic.iggy_producer()`, `topic.iggy_consumer(..)`, and `laser.client()`.
@@ -347,7 +347,7 @@ Connections to `*.laserdata.cloud` and `*.laserdata.com` automatically use the p
 | [`laser-sdk`](sdk/README.md) (`sdk/`) | the client and agent runtime, re-exporting the wire crate as `laser_sdk::wire`. |
 | [`foreign/python`](foreign/python/README.md) | the Python SDK, PyO3 bindings over the Rust crate. |
 | [`foreign/typescript`](foreign/typescript/README.md) | the native TypeScript SDK over Apache Iggy. |
-| [`examples`](examples/README.md) | Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, an order book, load generation, support agents, memory, interoperability, `orchestra`, and governance. |
+| [`examples`](examples/README.md) | Nine focused examples cover `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, `context`, and `agent` in Rust, Python, and TypeScript. Nine larger examples cover streaming, event analytics, a fleet telemetry tape (`fleet-tape`), load generation, an incident desk (`incident-desk`), memory, interoperability, `orchestra`, and governance. |
 
 ## Benchmarks
 
@@ -375,7 +375,9 @@ just lint    # fmt + sort + machete + clippy -D warnings
 just test    # workspace unit tests
 just test-it # integration tests against Apache Iggy
 just bdd     # cross-SDK BDD conformance (needs Docker)
-just ci      # the full gate (lint, test, wasm, deny, advisories, fixtures)
+just parity-check   # Rust, Python, and TypeScript surfaces match docs/parity.md
+just commerce-check # examples, docs, and tests use neutral vocabulary
+just ci      # the full gate (lint, tests, integration, python-docs, vocabulary, parity, wasm, deny, advisories, fuzz, bdd)
 ```
 
 Feature profiles select Laser capabilities:
@@ -405,7 +407,7 @@ See [connect timeout and cleanup](docs/connect-timeout.md).
 
 Direct producers inherit the connection retry configuration. Python `retries=None` and `retry_interval_ms=None` preserve those defaults. Set `retries=0` to disable resends. Producer initialization also uses the publish timeout and retry budget.
 
-Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle.
+Publish attempts default to 60 seconds with three retries. Retry delays start at 250 milliseconds, double after each failure, and stop increasing at 30 seconds. Configure these values through the client builder or connect arguments. The corresponding environment variables are `LASER_PUBLISH_TIMEOUT_MS`, `LASER_PUBLISH_MAX_RETRIES`, and `LASER_PUBLISH_RETRY_BACKOFF_MS`. Explicit configuration overrides these variables. Exhausted retries return an error for the application to handle. That error reports the committed and unconfirmed records in all three SDKs: Rust `LaserError::PublishFailed`, Python `committed` and `unconfirmed_count` on the raised exception, and TypeScript `PublishFailedError`.
 
 See [publish recovery and outage handling](docs/publish-recovery.md).
 
@@ -420,3 +422,5 @@ See [producer statistics](docs/producer-statistics.md).
 **Provision a filtered group once, then consume by its ID.** The filter API supports create-and-bind setup, numeric group selection, and revision pause/resume. Use separate groups for A/B revisions so their offsets remain independent. A fresh consumer using `Next` starts at the first retained record. Native consumers can commit a polled batch before delivery under the polling policy. Group-aware automatic commits advance only the delivered prefix on the next read or shutdown. Disable auto-commit and commit after successful processing when that matters. Filtered readers use explicit acknowledgments, and keep at most 1024 unacknowledged record-bearing pages per partition by default, set with `max_unacked_pages` in Rust and Python and `maxUnackedPages` in TypeScript, so a reader that never acknowledges stops at that bound instead of growing without limit. Unnamed TypeScript consumers have isolated identities and default to no automatic commit. Use a stable name to resume durable progress. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters).
 
 **Filter fields inside JSON, CBOR, Avro, and Protobuf payloads on the server.** Avro and Protobuf use registered writer schemas, immutable schema IDs in the filter, and the `agdx.sid` header on each record. **Headers-only filters work with any payload format.** Filtering preserves original bytes and offsets. See the [Consumer Filters guide](https://docs.laserdata.cloud/laser-sdk/consumer-filters) for codec profiles and examples.
+
+The [0.5.4 client behavior guide](docs/client-behavior.md) covers prepared coordination, memory summaries, callback cancellation, and migration from the earlier defaults.

@@ -119,6 +119,11 @@ export class KeyRecord {
     )
   }
 
+  /** The 8-byte identifier derived from this record's public key. */
+  keyId(): Uint8Array {
+    return sha256(this.verifyingKey).slice(0, KEY_ID_BYTES)
+  }
+
   revoke(): KeyRecord {
     return new KeyRecord(
       this.principal,

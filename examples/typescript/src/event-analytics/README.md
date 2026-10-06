@@ -4,7 +4,7 @@ This example publishes clickstream events and reads them through a live consumer
 
 ## What it does
 
-1. Hot path. A consumer-group reader tails `clickstream` from the log's tail while the publisher writes, folding event and checkout counts with server-committed offsets, so a re-run never re-reads old events. A bounded wait prevents a stalled run from hanging.
+1. Hot path. A consumer-group reader tails `clickstream` from the log's tail while the publisher writes, folding event and error counts with server-committed offsets, so a re-run never re-reads old events. A bounded wait prevents a stalled run from hanging.
 2. Resumable export. An independent typed cursor persists every partition's next offset in a `StateStore`. A new cursor restores that checkpoint and reads only the remaining records. The first poll plus the resumed tail must cover every record on the topic exactly once.
 3. If query support is available, register the `clickstream.v1` projection and its binding. Wait for projected records, then run the analytics queries.
 4. Validated ingest. A managed deployment allocates a JSON Schema ID and the example polls the registry until the asynchronous apply lands. The typed topic accepts one valid event and rejects a malformed event locally. A second malformed event rides the raw path past the client, the deployment rejects it server-side, and exactly one row materializes in `clickstream_guarded`.

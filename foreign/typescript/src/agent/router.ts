@@ -172,7 +172,7 @@ export function selectRoute(
   return chosen?.agent
 }
 
-type RegistryView = Pick<AgentRegistry, "principalFor" | "resolve">
+export type RegistryView = Pick<AgentRegistry, "principalFor" | "resolve">
 
 function principalMismatch(
   registry: RegistryView,

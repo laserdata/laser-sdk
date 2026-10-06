@@ -2,8 +2,8 @@ use crate::async_bridge::{Undelivered, future_into_py, future_into_py_returning}
 use crate::convert::payload_bytes;
 use crate::errors::{InvalidError, to_pyerr};
 use iggy::prelude::{
-    HeaderKey, HeaderKind, HeaderValue, IggyExpiry, NonZeroIggyDuration,
-    SendMessagesConfirmationResponse, SendMessagesResponse,
+    BackgroundConfig, HeaderKey, HeaderKind, HeaderValue, IggyDuration, IggyExpiry,
+    NonZeroIggyDuration, SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use laser_sdk::error::LaserError;
 use laser_sdk::stream::{
@@ -21,7 +21,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, OnceCell, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 pub(crate) fn transport_error(error: impl Into<LaserError>) -> PyErr {
     to_pyerr(error.into())
@@ -402,7 +402,9 @@ pub(crate) fn header_value(value: &Bound<'_, PyAny>) -> PyResult<HeaderValue> {
     ))
 }
 
-fn headers(values: Option<&Bound<'_, PyDict>>) -> PyResult<BTreeMap<HeaderKey, HeaderValue>> {
+pub(crate) fn headers(
+    values: Option<&Bound<'_, PyDict>>,
+) -> PyResult<BTreeMap<HeaderKey, HeaderValue>> {
     let Some(values) = values else {
         return Ok(BTreeMap::new());
     };
@@ -461,6 +463,7 @@ pub(crate) struct ProducerSettings {
     pub partitions: u32,
     pub expiry: IggyExpiry,
     pub max_topic_size: u64,
+    pub background: Option<usize>,
 }
 
 impl ProducerSettings {
@@ -484,6 +487,16 @@ impl ProducerSettings {
             IggyExpiry::NeverExpire => builder.never_expire(),
             IggyExpiry::ExpireDuration(expiry) => builder.expire_after(expiry.get_duration()),
         };
+        let builder = match self.background {
+            Some(shards) => builder.background(
+                BackgroundConfig::builder()
+                    .num_shards(shards)
+                    .batch_length(self.batch_length as usize)
+                    .linger_time(IggyDuration::from(self.linger))
+                    .build(),
+            ),
+            None => builder,
+        };
         builder.build().await
     }
 }
@@ -498,9 +511,15 @@ impl ProducerSettings {
 pub struct PyProducer {
     topic: Topic,
     settings: ProducerSettings,
-    producer: Arc<OnceCell<Producer>>,
+    producer: Arc<Mutex<ProducerState>>,
     stream: String,
     name: String,
+}
+
+enum ProducerState {
+    Pending,
+    Ready(Box<Producer>),
+    Closed,
 }
 
 impl PyProducer {
@@ -509,7 +528,7 @@ impl PyProducer {
             name: topic.name().to_owned(),
             topic,
             settings,
-            producer: Arc::new(OnceCell::new()),
+            producer: Arc::new(Mutex::new(ProducerState::Pending)),
             stream,
         }
     }
@@ -519,10 +538,18 @@ impl PyProducer {
         let topic = self.topic.clone();
         let settings = self.settings.clone();
         async move {
-            cell.get_or_try_init(|| settings.build(topic))
-                .await
-                .cloned()
-                .map_err(to_pyerr)
+            let mut state = cell.lock().await;
+            match &*state {
+                ProducerState::Ready(producer) => Ok((**producer).clone()),
+                ProducerState::Closed => Err(InvalidError::new_err(
+                    "the producer is shut down, build a new one with Topic.producer",
+                )),
+                ProducerState::Pending => {
+                    let producer = settings.build(topic).await.map_err(to_pyerr)?;
+                    *state = ProducerState::Ready(Box::new(producer.clone()));
+                    Ok(producer)
+                }
+            }
         }
     }
 }
@@ -586,6 +613,22 @@ impl PyProducer {
                 .await
                 .map(PySendMessagesResponse::from)
                 .map_err(to_pyerr)
+        })
+    }
+
+    /// Flush buffered `background`-mode messages and stop the worker. A direct
+    /// producer has nothing to flush, so this only closes it. Await every
+    /// in-flight `send` first: shutdown needs the last live handle, and a send
+    /// still running makes it raise `InvalidError`. Later sends raise
+    /// `InvalidError`.
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let cell = self.producer.clone();
+        future_into_py(py, async move {
+            let mut state = cell.lock().await;
+            match std::mem::replace(&mut *state, ProducerState::Closed) {
+                ProducerState::Ready(producer) => producer.shutdown().await.map_err(to_pyerr),
+                ProducerState::Pending | ProducerState::Closed => Ok(()),
+            }
         })
     }
 
@@ -979,6 +1022,36 @@ impl PyConsumer {
                 shutdown,
                 Arc::clone(&self.returned),
             ),
+            give_back_delivery(Arc::clone(&self.returned)),
+        )
+    }
+
+    /// Wait at most `wait_secs` for the next message. Raises `TimeoutError` when
+    /// none arrives in time and `InvalidError` when the consumer has shut down,
+    /// matching the Rust `next_within`.
+    fn next_within<'py>(&self, py: Python<'py>, wait_secs: f64) -> PyResult<Bound<'py, PyAny>> {
+        let wait = crate::convert::duration_seconds(wait_secs, "wait_secs")?;
+        let receive = Self::receive(
+            self.state.clone(),
+            Arc::clone(&self.receiving),
+            Arc::clone(&self.changed),
+            self.shutdown.clone(),
+            Arc::clone(&self.returned),
+        );
+        future_into_py_returning(
+            py,
+            async move {
+                match tokio::time::timeout(wait, receive).await {
+                    Ok(Ok(Some(message))) => Ok(message),
+                    Ok(Ok(None)) => Err(to_pyerr(LaserError::Invalid(
+                        "the live consumer stream ended".to_owned(),
+                    ))),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(to_pyerr(LaserError::Timeout(
+                        "the live consumer to yield a record",
+                    ))),
+                }
+            },
             give_back_delivery(Arc::clone(&self.returned)),
         )
     }

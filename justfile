@@ -43,6 +43,15 @@ test-doc:
 python-docs:
   python3 -m unittest foreign/python/tests/test_readme_snippets.py
 
+# examples, docs, tests, and fixtures use neutral systems vocabulary
+commerce-check:
+  python3 scripts/check-commerce-words.py
+
+# Rust, Python, and TypeScript public surfaces match docs/parity.md with no MISSING row
+parity-check:
+  python3 -m unittest scripts/test_check_parity.py
+  python3 scripts/check-parity.py
+
 # integration tests against the released VSR-only Iggy fork
 test-it:
   cargo test -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
@@ -129,6 +138,8 @@ ci:
   just test-it
   cargo test --workspace --all-features --doc
   just python-docs
+  just commerce-check
+  just parity-check
   just wasm
   just deny-wire
   just advisories

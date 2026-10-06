@@ -44,7 +44,7 @@ impl ExecutionLock {
                             path.display()
                         ))
                     })?;
-                    if Path::new("/proc").join(pid.to_string()).exists() {
+                    if process_is_running(pid) {
                         return Err(BenchError::Invalid(format!(
                             "another benchmark campaign is running with PID {pid}"
                         )));
@@ -66,6 +66,20 @@ impl ExecutionLock {
             "benchmark execution lock changed while it was being acquired".to_owned(),
         ))
     }
+}
+
+// Signal 0 probes the process without delivering a signal. EPERM means it exists under another user.
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 impl Drop for ExecutionLock {

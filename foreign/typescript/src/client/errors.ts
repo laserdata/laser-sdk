@@ -1,3 +1,5 @@
+import type { MessageWithHeaders, SendMessagesConfirmation } from "../iggy/apache-iggy.js"
+import type { CheckpointError } from "../wire/checkpoint.js"
 import type {
   FaultReason,
   FilterError,
@@ -36,6 +38,11 @@ export type LaserErrorKind =
   | "policy-blocked"
   | "step-up-required"
   | "policy-deferred"
+  | "publish-failed"
+  | "fence-violation"
+  | "quarantined"
+  | "no-respond-topic"
+  | "checkpoint"
 
 export class LaserError extends Error {
   readonly kind: LaserErrorKind
@@ -373,6 +380,79 @@ export class BudgetExceededError extends LaserError {
   }
 }
 
+/**
+ * A publish that gave up. `committed` lists the ranges confirmed before the
+ * failure, never replay them. `unconfirmed` lists the records left without a
+ * confirmation. `cause` is the original failure, and `publishCause()` reaches
+ * it through any nesting, so every classifier answers for it.
+ */
+export class PublishFailedError extends LaserError {
+  constructor(
+    readonly stream: string,
+    readonly topic: string,
+    readonly committed: readonly SendMessagesConfirmation[],
+    readonly unconfirmed: readonly MessageWithHeaders[],
+    cause: unknown
+  ) {
+    super(
+      `publish failed to ${stream}/${topic}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      "publish-failed",
+      { cause }
+    )
+  }
+
+  /** The original failure under any publish wrapping. */
+  publishCause(): unknown {
+    return publishCause(this)
+  }
+}
+
+/** The original failure under any `PublishFailedError` wrapping. */
+export function publishCause(error: unknown): unknown {
+  let current = error
+  while (current instanceof PublishFailedError) current = current.cause
+  return current
+}
+
+/** A fenced write lost the fence: the held token is below the live sequence,
+ * so a newer holder owns the task. Never retryable by the loser. */
+export class FenceViolationError extends LaserError {
+  constructor(
+    readonly stale: bigint,
+    readonly current: bigint
+  ) {
+    super(
+      `fence violation: held ${stale.toString()}, current ${current.toString()}`,
+      "fence-violation"
+    )
+  }
+}
+
+/** The agent was quarantined and may not act. Not retryable. */
+export class QuarantinedError extends LaserError {
+  constructor(readonly agent: string) {
+    super(`quarantined: ${agent}`, "quarantined")
+  }
+}
+
+/** The agent was built without a `respondOn` topic. Not retryable. */
+export class NoRespondTopicError extends LaserError {
+  constructor(message = "the agent has no respondOn topic configured") {
+    super(message, "no-respond-topic")
+  }
+}
+
+/** Iggy answered a destination or checkpoint operation with a typed failure. */
+export class CheckpointExecutionError extends LaserError {
+  constructor(
+    message: string,
+    readonly detail: CheckpointError,
+    options?: { cause?: unknown }
+  ) {
+    super(message, "checkpoint", options)
+  }
+}
+
 export function assertNever(value: never): never {
   throw new InvalidError("unreachable variant", { value })
 }
@@ -394,6 +474,8 @@ export function publicErrorMessage(error: unknown): string {
     rejected: "forbidden",
     "policy-blocked": "forbidden",
     signature: "unauthenticated",
+    quarantined: "forbidden",
+    "fence-violation": "conflict",
     "step-up-required": "step-up authorization required"
   }
   return publicByKind[error.kind] ?? "internal error"

@@ -8,9 +8,20 @@ import {
 import { INTERNAL_REPLY_HUB } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ConversationId, type AgentId } from "../types/ids.js"
-import { AgentKind, METADATA_BRIDGE_HOPS, type AgentEnvelope } from "../wire/agent.js"
+import {
+  AgentKind,
+  METADATA_BRIDGE_HOPS,
+  commandEnvelope,
+  withTool,
+  type AgentId as WireAgentId,
+  type AgentEnvelope
+} from "../wire/agent.js"
 import { ContentType } from "../wire/content.js"
-import { CorrelationId } from "../wire/ids.js"
+import {
+  type ConversationId as WireConversationId,
+  CorrelationId,
+  type RecordId
+} from "../wire/ids.js"
 import { SDK_VERSION, type JsonRpcResponse } from "./a2a.js"
 import { bridgeHopMetadata, enterBridge } from "./hops.js"
 
@@ -91,6 +102,21 @@ function jsonBytes(value: unknown): Uint8Array {
   } catch (cause) {
     throw new CodecError("MCP params are not JSON serializable", "mcp", "json", { cause })
   }
+}
+
+/** Build the command for an MCP tool call. The body keeps the original JSON bytes. */
+export function toolCallFromRequest(
+  record: RecordId,
+  conversation: WireConversationId,
+  source: WireAgentId,
+  correlation: CorrelationId,
+  toolName: string,
+  paramsJson: Uint8Array
+): AgentEnvelope {
+  return withTool(
+    commandEnvelope(record, conversation, source, correlation, paramsJson.slice()),
+    toolName
+  )
 }
 
 export function toolResultFromEnvelope(envelope: AgentEnvelope): McpToolResult {

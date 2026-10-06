@@ -76,7 +76,7 @@ impl PyChunkAssembler {
 }
 
 // The event list as a Python list of dicts.
-fn events_to_py(py: Python<'_>, events: Vec<StreamEvent>) -> PyResult<Bound<'_, PyAny>> {
+pub(crate) fn events_to_py(py: Python<'_>, events: Vec<StreamEvent>) -> PyResult<Bound<'_, PyAny>> {
     let list = PyList::empty(py);
     for event in events {
         list.append(event_to_py(py, event)?)?;

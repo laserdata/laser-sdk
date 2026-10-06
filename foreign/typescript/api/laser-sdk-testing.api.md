@@ -4,6 +4,7 @@
 
 ```ts
 
+import type { SendMessagesConfirmation } from 'apache-iggy';
 import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
 
