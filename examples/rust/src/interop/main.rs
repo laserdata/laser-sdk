@@ -13,7 +13,6 @@ use laser_sdk::wire::agent::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), LaserError> {
@@ -21,50 +20,45 @@ async fn main() -> Result<(), LaserError> {
     phase("connecting");
     let laser = laser(&stream_for("interop"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("interop"), async {
-        laser.bootstrap(PARTITIONS).await?;
+        laser
+            .bootstrap(
+                PARTITIONS,
+                laser_sdk::agent::TopicRetention::expire_after(Duration::from_secs(86_400)),
+            )
+            .await?;
         let llm = default_llm();
 
-        // One worker reachable through A2A (on Commands -> Responses) and another
-        // through MCP (on ToolCalls -> ToolResults). Same handler, same model.
-        let a2a_worker = Agent::builder()
-            .id("assistant".parse()?)
-            .listen_on(AgentTopic::Commands)
-            .handler(Worker {
-                llm: llm.clone(),
-                source: "assistant".parse()?,
-                reply_topic: AgentTopic::Responses,
-            })
+        // Three responders share `agent.sessions`. Each bridge call and the
+        // input request name the agent they are for, so only that agent takes
+        // them as work.
+        let assistant = spawn_worker(&laser, "assistant", llm.clone()).await?;
+        let tool_runner = spawn_worker(&laser, "tool-runner", llm.clone()).await?;
+        let mut approver = Agent::builder()
+            .id("approver".parse()?)
+            .listen_on(AgentTopic::Sessions)
+            .handler(Approver)
             .build()
             .spawn(laser.clone());
-        let mcp_worker = Agent::builder()
-            .id("tool-runner".parse()?)
-            .listen_on(AgentTopic::ToolCalls)
-            .handler(Worker {
-                llm: llm.clone(),
-                source: "tool-runner".parse()?,
-                reply_topic: AgentTopic::ToolResults,
-            })
-            .build()
-            .spawn(laser.clone());
+        approver.ready().await?;
 
         // A2A: SendMessage publishes the task, the worker answers, GetTask completes.
         phase("A2A: SendMessage -> GetTask");
         let a2a = A2aBridge::new(
             laser.clone(),
-            "a2a-gateway".parse()?,
-            AgentTopic::Commands,
-            AgentTopic::Responses,
+            "a2a-gateway".parse::<laser_sdk::types::AgentId>()?,
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
         );
         let params =
             br#"{"message":{"role":"user","parts":[{"kind":"text","text":"summarize the incident"}]}}"#
                 .to_vec();
-        let task = a2a.submit(params).await?;
+        let task = a2a.submit_to("assistant".parse::<laser_sdk::types::AgentId>()?, params).await?;
         let completed = poll_until(Duration::from_secs(15), || async {
             let task = a2a.task(&task.id).await?;
             Ok((task.status.state == TaskState::Completed).then_some(task))
         })
         .await?;
-        info!(
+        println!(
             "A2A task {} -> {}: {}",
             completed.id,
             completed.status.state,
@@ -75,33 +69,36 @@ async fn main() -> Result<(), LaserError> {
                 .unwrap_or("(no artifact)")
         );
 
-        // MCP: tools/call reaches the same worker and renders the answer as a tool result.
+        // MCP: tools/call reaches a worker and renders the answer as a tool result.
         phase("MCP: initialize / tools/list / tools/call");
         let mcp = McpBridge::new(
             laser.clone(),
-            "mcp-gateway".parse()?,
-            AgentTopic::ToolCalls,
-            AgentTopic::ToolResults,
+            "mcp-gateway".parse::<laser_sdk::types::AgentId>()?,
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
             "laser-mcp",
         )
         .with_tool(
             "ask",
             Some("ask the assistant a question".to_owned()),
             serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
-        )
+        )?
         .with_timeout(Duration::from_secs(15));
-        info!(
-            "MCP tools/list: {}",
-            serde_json::to_string(&mcp.list_tools())
-                .map_err(|error| LaserError::Codec(error.to_string()))?
-        );
+        let tools = mcp.list_tools();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        println!("MCP tools/list: [{}]", names.join(", "));
         let call = serde_json::to_vec(&serde_json::json!({
             "name": "ask",
             "arguments": {"q": "what is the Agent Data Exchange Protocol?"}
         }))
         .map_err(|error| LaserError::Codec(error.to_string()))?;
-        let result = mcp.call_tool("ask", call).await?;
-        info!(
+        let result = mcp.call_tool_to("tool-runner".parse::<laser_sdk::types::AgentId>()?, "ask", call).await?;
+        println!(
             "MCP tools/call -> isError={}, content: {}",
             result.is_error,
             result
@@ -117,8 +114,8 @@ async fn main() -> Result<(), LaserError> {
         let answer = llm.complete("give a one-line status update").await;
         let mut chat = laser
             .agdx(
-                AgentTopic::LlmIo,
-                "assistant".parse()?,
+                AgentTopic::Sessions,
+                "assistant".parse::<laser_sdk::types::AgentId>()?,
                 WireConversationId::from(conversation),
             )
             .stream(
@@ -129,43 +126,54 @@ async fn main() -> Result<(), LaserError> {
             chat.write(token.as_bytes().to_vec()).await?;
         }
         chat.finish("stop", None).await?;
-        for event in laser.agui_events(conversation, AgentTopic::LlmIo).await? {
-            info!(
-                "AG-UI event: {}",
-                serde_json::to_string(&event).map_err(|error| LaserError::Codec(error.to_string()))?
-            );
-        }
+        let events = laser.agui_events(conversation, AgentTopic::Sessions).await?;
+        println!("AG-UI rendered {} event(s) from the chat stream", events.len());
 
         // Human-in-the-loop: the orchestrator pauses for a human decision, the
         // approver resolves the interrupt it is handling. Built on AGDX
         // command/response, so it rides the same log as everything above.
         phase("Human-in-the-loop: request_input -> respond_input");
-        let approver = Agent::builder()
-            .id("approver".parse()?)
-            .listen_on(AgentTopic::HumanInput)
-            .handler(Approver)
-            .build()
-            .spawn(laser.clone());
         let decision = laser
             .agdx(
-                AgentTopic::HumanInput,
-                "orchestrator".parse()?,
+                AgentTopic::Sessions,
+                "orchestrator".parse::<laser_sdk::types::AgentId>()?,
                 WireConversationId::from(ConversationId::new()),
             )
-            .request_input(
-                AgentTopic::Responses,
+            .request_input_from(
+                "approver".parse::<laser_sdk::types::AgentId>()?,
+                AgentTopic::Sessions,
                 b"approve draining node-7?".to_vec(),
                 Duration::from_secs(15),
             )
             .await?;
-        info!("HITL decision: {}", String::from_utf8_lossy(&decision));
-
+        println!("HITL decision: {}", String::from_utf8_lossy(&decision));
         approver.shutdown().await?;
-        a2a_worker.shutdown().await?;
-        mcp_worker.shutdown().await?;
+        tool_runner.shutdown().await?;
+        assistant.shutdown().await?;
         Ok(())
     })
     .await
+}
+
+// Spawn one bridge worker and wait until its consumer is reading.
+async fn spawn_worker(
+    laser: &Laser,
+    id: &str,
+    llm: Arc<dyn LlmClient>,
+) -> Result<AgentHandle, LaserError> {
+    let source: WireAgentId = id.parse()?;
+    let mut handle = Agent::builder()
+        .id(id.parse()?)
+        .listen_on(AgentTopic::Sessions)
+        .handler(Worker {
+            llm,
+            source,
+            reply_topic: AgentTopic::Sessions,
+        })
+        .build()
+        .spawn(laser.clone());
+    handle.ready().await?;
+    Ok(handle)
 }
 
 // The worker behind every bridge: it reads the decoded AGDX command envelope,
@@ -211,7 +219,7 @@ struct Approver;
 
 impl AgentHandler for Approver {
     async fn handle(&self, _message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        ctx.respond_input(AgentTopic::Responses, b"approved".to_vec())
+        ctx.respond_input(AgentTopic::Sessions, b"approved".to_vec())
             .await
     }
 }

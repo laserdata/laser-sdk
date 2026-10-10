@@ -1,3 +1,4 @@
+use crate::agent::budget::BudgetBreach;
 use crate::agent::contract::Contract;
 use crate::agent::router::{CapabilitySelector, InboxRoute, Router};
 use crate::context::ContextAssembler;
@@ -7,8 +8,6 @@ use crate::kv::{KV_LEASE_OP_VERSION, KvLeaseRenew};
 use crate::laser::Laser;
 use crate::provenance::{AgentTopic, Provenance};
 use crate::types::{AgentId, ConversationId};
-#[cfg(feature = "runs")]
-use laser_wire::agent::TaskState;
 use laser_wire::framing::{decode_named, encode_named};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -46,13 +45,13 @@ const MAX_REASSIGNMENTS: u32 = 2;
 /// the engine's own counters. Any unset dimension is unbounded. A breach is a
 /// [`LaserError::BudgetExceeded`], read from the engine's running totals.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Budget {
+pub struct WorkflowBudget {
     tokens: Option<u64>,
     wall_clock: Option<Duration>,
     invocations: Option<u32>,
 }
 
-impl Budget {
+impl WorkflowBudget {
     /// An unbounded budget (the default).
     pub fn unlimited() -> Self {
         Self::default()
@@ -204,17 +203,15 @@ struct Step {
 pub struct Workflow<'a> {
     laser: &'a Laser,
     name: String,
-    budget: Budget,
+    budget: WorkflowBudget,
     inbox_route: InboxRoute,
     run_id: Option<ConversationId>,
     steps: Vec<Step>,
-    #[cfg(feature = "runs")]
-    registered: bool,
 }
 
 impl<'a> Workflow<'a> {
     /// Set the workflow's spend ceiling.
-    pub fn budget(mut self, budget: Budget) -> Self {
+    pub fn budget(mut self, budget: WorkflowBudget) -> Self {
         self.budget = budget;
         self
     }
@@ -234,20 +231,6 @@ impl<'a> Workflow<'a> {
     /// id, so omit this to start anew.
     pub fn run_id(mut self, run_id: ConversationId) -> Self {
         self.run_id = Some(run_id);
-        self
-    }
-
-    /// Register this run in the managed run registry: [`run`](Self::run) submits
-    /// it before the first publish (converging on the run's own id), stamps the
-    /// pinned `run` metadata key on the status records the engine emits, reads
-    /// the run row between steps so a recorded cancel intent routes into the
-    /// saga cancellation path, and reports the terminal state. Requires the
-    /// `agent_workflow` capability: when the plane does not serve the registry,
-    /// `run()` fails with the typed unsupported before any publish. An
-    /// unregistered run stamps nothing and stays byte-identical on the log.
-    #[cfg(feature = "runs")]
-    pub fn registered(mut self) -> Self {
-        self.registered = true;
         self
     }
 
@@ -283,90 +266,75 @@ impl<'a> Workflow<'a> {
     /// dependency order. A step's reply that fails its verifier, or a dispatch that
     /// does not complete, fails the workflow after running the completed steps'
     /// compensations in reverse (the saga rollback).
-    #[tracing::instrument(target = "laser", level = "info", skip_all, fields(agent = %self.name, operation = "workflow"))]
-    pub async fn run(self) -> Result<WorkflowOutcome, LaserError> {
-        #[cfg(feature = "runs")]
-        if self.registered {
-            return self.run_registered().await;
-        }
-        self.execute(None).await
-    }
-
-    /// The registered form of [`run`](Self::run): submit to the run registry
-    /// first, mark the run working, execute, and report the terminal state. A
-    /// terminal mark that fails to publish surfaces as the error (the registered
-    /// contract includes the reporting), except when the run itself already
+    ///
+    /// The run is a session on `agent.sessions` whose id is the run id, and every
+    /// step and compensation is a child session of it. The run session starts
+    /// before the first step and ends by the outcome. Between steps the engine
+    /// checks `agent.control` for a cancel request, which compensates and
+    /// returns [`LaserError::Cancelled`], and then whether the run session is
+    /// [over its budget](crate::agent::Session::over_budget), which
+    /// compensates and returns [`LaserError::BudgetExceeded`]. Any budget
+    /// breach ends the run session failed with reason `budget`. A lifecycle
+    /// record that fails to
+    /// publish surfaces as the error, except when the run itself already
     /// failed, where the run's error wins.
-    #[cfg(feature = "runs")]
-    async fn run_registered(mut self) -> Result<WorkflowOutcome, LaserError> {
-        if !self.laser.capabilities().await.agent_workflow {
-            return Err(LaserError::unsupported_feature(
-                "workflow",
-                "agent_workflow",
-                "a registered workflow requires a plane that serves the run registry",
-            ));
-        }
+    #[tracing::instrument(target = "laser", level = "info", skip_all, fields(agent = %self.name, operation = "workflow"))]
+    pub async fn run(mut self) -> Result<WorkflowOutcome, LaserError> {
         let source: AgentId = self.name.parse().map_err(|_| {
             LaserError::Invalid(format!(
                 "workflow name `{}` is not a valid agent id",
                 self.name
             ))
         })?;
-        // Pin the run's conversation now: `execute` would otherwise mint its
-        // own default and the registry row would name a different run.
-        let run_conversation = self.run_id.unwrap_or_default();
-        self.run_id = Some(run_conversation);
-        let info = self
+        let run_id = self.run_id.unwrap_or_default();
+        self.run_id = Some(run_id);
+        let mut builder = self
             .laser
-            .runs()
-            .submit_with(
-                &self.name,
-                Some(run_conversation.to_string()),
-                None,
-                BTreeMap::new(),
-            )
-            .await?;
-        let run = info.run_id;
-        let laser = self.laser.clone();
-        mark_run(
-            &laser,
-            &source,
-            run_conversation.into(),
-            &run,
-            TaskState::Working,
-            None,
-        )
-        .await?;
-        let result = self.execute(Some(run.clone())).await;
-        let (state, detail) = match &result {
-            Ok(_) => (TaskState::Completed, None),
-            Err(LaserError::Cancelled { .. }) => (TaskState::Canceled, None),
-            Err(error) => (TaskState::Failed, Some(error.to_string())),
+            .sessions()
+            .start()
+            .with_id(run_id)
+            .agent(source.wire_id());
+        if let Some(tokens) = self.budget.tokens {
+            builder = builder.budget(laser_wire::agent::Budget {
+                tokens: Some(tokens),
+                cost_micros: None,
+            });
+        }
+        let (session, lease) = builder.begin().await?;
+        let result = self.execute(&session).await;
+        let ended = match &result {
+            Ok(_) => session.end().await,
+            Err(LaserError::Cancelled { .. }) => session.cancel().await,
+            Err(LaserError::BudgetExceeded { ceiling, spent }) => {
+                session
+                    .fail_over_budget(&BudgetBreach::exceeded(*ceiling, *spent))
+                    .await
+            }
+            Err(error) => {
+                session
+                    .fail(laser_wire::agent::AgentErrorBody {
+                        code: laser_wire::agent::AgentErrorCode::Internal,
+                        message: Some(error.to_string()),
+                        retryable: false,
+                        detail: None,
+                    })
+                    .await
+            }
         };
-        let marked = mark_run(
-            &laser,
-            &source,
-            run_conversation.into(),
-            &run,
-            state,
-            detail,
-        )
-        .await;
-        match (result, marked) {
+        drop(lease);
+        match (result, ended) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), _) => Err(error),
         }
     }
 
-    /// The engine body shared by the registered and unregistered forms. When
-    /// `registered_run` is set, the run row is read at every step boundary and a
-    /// recorded cancel intent compensates and returns [`LaserError::Cancelled`].
-    #[cfg_attr(not(feature = "query"), allow(unused_variables))]
-    // `registered_run` feeds the run-registry status marks, so without the
-    // `runs` feature the parameter is deliberately unread.
-    #[cfg_attr(not(feature = "runs"), allow(unused_variables))]
-    async fn execute(self, registered_run: Option<String>) -> Result<WorkflowOutcome, LaserError> {
+    // The engine body: steps in dependency order, a cancel check on the run
+    // session at every step boundary.
+    async fn execute(
+        &self,
+        session: &crate::agent::Session,
+    ) -> Result<WorkflowOutcome, LaserError> {
         let order = topological_order(&self.steps)?;
         let source: AgentId = self.name.parse().map_err(|_| {
             LaserError::Invalid(format!(
@@ -394,14 +362,15 @@ impl<'a> Workflow<'a> {
                 // Recorded complete on a prior run, skip it.
                 continue;
             }
-            #[cfg(feature = "runs")]
-            if let Some(run) = registered_run.as_deref()
-                && self.laser.runs().status(run).await?.cancel_requested
-            {
+            if session.cancel_requested().await? {
                 self.compensate(&completed, &outputs).await;
                 return Err(LaserError::Cancelled {
-                    run: run.to_owned(),
+                    run: run_id.to_string(),
                 });
+            }
+            if let Some(breach) = session.budget_breach().await? {
+                self.compensate(&completed, &outputs).await;
+                return Err(breach.into_error());
             }
             if matches!(step.target, Router::Broadcast) {
                 self.compensate(&completed, &outputs).await;
@@ -468,7 +437,7 @@ impl<'a> Workflow<'a> {
                     .await
                     .map(|(output, tokens)| (output, tokens, true)),
                 _ => self
-                    .dispatch_one(&source, step.target.clone(), payload, started)
+                    .dispatch_one(&source, step, payload, started, run_id)
                     .await
                     .and_then(|outcome| outcome.completed("a workflow step did not complete"))
                     .map(|(output, tokens)| (output, tokens, false)),
@@ -520,17 +489,23 @@ impl<'a> Workflow<'a> {
     async fn dispatch_one(
         &self,
         source: &AgentId,
-        target: Router,
+        step: &Step,
         payload: Vec<u8>,
         started: Instant,
+        run_id: ConversationId,
     ) -> Result<StepDispatch, LaserError> {
+        // The step's child session id derives from the run, so a resumed run
+        // reaches the same child instead of starting another.
+        let child = ConversationId::derive(&format!("{run_id}/{}/1", step.label));
         let outcome = self
             .laser
-            .contract(target)
+            .contract(step.target.clone())
             .from(source.clone())
             .payload(payload)
             .inbox_route(self.inbox_route.clone())
             .deadline(self.step_deadline(started))
+            .conversation(child)
+            .parent(run_id, run_id)
             .send()
             .await?;
         Ok(StepDispatch::from(outcome))
@@ -626,6 +601,7 @@ impl<'a> Workflow<'a> {
                 .deadline(self.step_deadline(started))
                 .fence(fence_token)
                 .conversation(task_conversation)
+                .parent(run_id, run_id)
                 .send()
                 .await?;
             let dispatch = StepDispatch::from(outcome);
@@ -643,7 +619,7 @@ impl<'a> Workflow<'a> {
                 () = tokio::time::sleep(renewal_delay) => {
                     let request = KvLeaseRenew {
                         v: KV_LEASE_OP_VERSION,
-                        namespace: namespace.to_owned(),
+                        namespace: kv.resource_namespace().to_owned(),
                         key: key.as_bytes().to_vec(),
                         holder_id: holder.clone(),
                         subject_user_id: None,
@@ -808,6 +784,7 @@ impl<'a> Workflow<'a> {
             let Ok(source) = self.name.parse::<AgentId>() else {
                 return;
             };
+            let run_id = self.run_id.unwrap_or_default();
             // Compensation is best-effort: a build failure skips this one rather
             // than aborting the reverse-order saga unwind.
             let Ok(payload) = compensate.build(&StepContext { outputs }).await else {
@@ -820,6 +797,11 @@ impl<'a> Workflow<'a> {
                 .payload(payload)
                 .inbox_route(self.inbox_route.clone())
                 .deadline(Duration::from_secs(30))
+                .conversation(ConversationId::derive(&format!(
+                    "{run_id}/{}/compensate",
+                    step.label
+                )))
+                .parent(run_id, run_id)
                 .send()
                 .await;
         }
@@ -941,7 +923,7 @@ impl<'a> StepHandle<'a> {
     }
 
     /// Set the workflow budget (forwards to [`Workflow::budget`]).
-    pub fn budget(mut self, budget: Budget) -> Self {
+    pub fn budget(mut self, budget: WorkflowBudget) -> Self {
         self.workflow.budget = budget;
         self
     }
@@ -955,13 +937,6 @@ impl<'a> StepHandle<'a> {
     /// Resume an earlier run (forwards to [`Workflow::run_id`]).
     pub fn run_id(mut self, run_id: ConversationId) -> Self {
         self.workflow.run_id = Some(run_id);
-        self
-    }
-
-    /// Register the run (forwards to [`Workflow::registered`]).
-    #[cfg(feature = "runs")]
-    pub fn registered(mut self) -> Self {
-        self.workflow.registered = true;
         self
     }
 
@@ -992,44 +967,12 @@ impl Laser {
         Workflow {
             laser: self,
             name: name.to_owned(),
-            budget: Budget::unlimited(),
+            budget: WorkflowBudget::unlimited(),
             inbox_route: InboxRoute::default(),
             run_id: None,
             steps: Vec::new(),
-            #[cfg(feature = "runs")]
-            registered: false,
         }
     }
-}
-
-/// Publish one run-lifecycle status record: a `task` status with the pinned
-/// `run` metadata key the run-registry fold selects on, on the responses topic
-/// where task status already lives. `detail` rides as a `detail` metadata
-/// string so a failed run's summary reaches the registry row.
-#[cfg(feature = "runs")]
-pub(crate) async fn mark_run(
-    laser: &Laser,
-    source: &AgentId,
-    conversation: laser_wire::agent::ConversationId,
-    run: &str,
-    state: TaskState,
-    detail: Option<String>,
-) -> Result<(), LaserError> {
-    // A status envelope must carry a correlation. A run-lifecycle mark is not a
-    // reply to one command, so it correlates on the run itself (its conversation
-    // id), stable across the Working and terminal marks. The registry fold still
-    // selects on the `run` metadata key, not the correlation.
-    let correlation = laser_wire::agent::CorrelationId::from_u128(conversation.as_u128());
-    let producer = laser.agdx(AgentTopic::Responses, source.wire_id(), conversation);
-    let mut send = producer
-        .status(laser_wire::agent::OPERATION_TASK)
-        .with_correlation(correlation)
-        .with_task_state(state)
-        .with_metadata(laser_wire::agent::METADATA_RUN, run);
-    if let Some(detail) = detail {
-        send = send.with_metadata("detail", detail);
-    }
-    send.send().await.map(|_| ())
 }
 
 /// Order the steps so every step follows its `after` dependencies (Kahn's

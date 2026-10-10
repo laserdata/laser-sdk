@@ -34,14 +34,25 @@ impl PyLaser {
 #[pyclass(name = "ForkHandle", frozen)]
 pub struct PyForkHandle {
     laser: Laser,
-    /// The fork id this handle addresses.
-    #[pyo3(get)]
     id: String,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyForkHandle {
+    /// The fork id this handle addresses, as the caller named it.
+    #[getter]
+    fn id(&self) -> String {
+        self.laser.fork(&self.id).id().to_owned()
+    }
+
+    /// The fork id as sent on the wire, scoped to the default stream unless
+    /// the handle names resources bare.
+    #[getter]
+    fn resource_id(&self) -> String {
+        self.laser.fork(&self.id).resource_id().to_owned()
+    }
+
     /// Open this fork. `severed=True` freezes a snapshot at the trunk's current
     /// offsets. The default, `continuous=True` when stated explicitly, keeps
     /// seeing new trunk appends. Narrow a severed snapshot with `tables`.

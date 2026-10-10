@@ -105,7 +105,7 @@ mod tests {
             mode: "enforce".to_owned(),
             kind: "send".to_owned(),
             stream: "laser".to_owned(),
-            topic: "agent.commands".to_owned(),
+            topic: "agent.sessions".to_owned(),
             source: Some(source.to_owned()),
             target: None,
             conversation: None,

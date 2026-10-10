@@ -119,14 +119,45 @@ impl PublishOptions {
                             Ok(Ok(()))
                         );
                     }
-                    let delay = self
-                        .retry_backoff
-                        .saturating_mul(1u32 << attempt.min(16))
-                        .min(Duration::from_secs(30));
+                    let delay = self.retry_delay(attempt);
                     tracing::warn!(attempt = attempt + 1, max_retries = self.max_retries, %error, "publish failed, reconnecting before retry");
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
+            }
+        }
+    }
+
+    // The pause before retry `attempt`, counted from zero: the backoff doubled
+    // per attempt and capped at 30 seconds.
+    pub(crate) fn retry_delay(&self, attempt: u32) -> Duration {
+        self.retry_backoff
+            .saturating_mul(1u32 << attempt.min(16))
+            .min(Duration::from_secs(30))
+    }
+
+    // An idempotent read sent again while Iggy answers it with a transient
+    // refusal, with the connection's publish retry count and backoff. A
+    // command the Iggy client does not retry itself, such as the cluster
+    // metadata probe, otherwise fails its caller on a refusal the next
+    // attempt clears.
+    pub(crate) async fn retry_transient_read<T, F, Fut>(self, mut read: F) -> Result<T, LaserError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, LaserError>>,
+    {
+        let mut attempt = 0;
+        loop {
+            match read().await {
+                Err(LaserError::Iggy(cause))
+                    if attempt < self.max_retries
+                        && crate::error::is_transient_iggy_io_error(&cause) =>
+                {
+                    tracing::debug!(attempt = attempt + 1, max_retries = self.max_retries, error = %cause, "transient refusal, reading again");
+                    tokio::time::sleep(self.retry_delay(attempt)).await;
+                    attempt += 1;
+                }
+                result => return result,
             }
         }
     }
@@ -155,6 +186,59 @@ mod tests {
             max_retries: 2,
             retry_backoff: Duration::from_millis(1),
         }
+    }
+
+    #[tokio::test]
+    async fn given_a_transient_refusal_when_reading_then_should_read_again_until_it_succeeds() {
+        let reads = Cell::new(0);
+        let result = options()
+            .retry_transient_read(|| {
+                reads.set(reads.get() + 1);
+                let attempt = reads.get();
+                async move {
+                    if attempt < 3 {
+                        return Err(LaserError::Iggy(IggyError::TransientNotAccepted));
+                    }
+                    Ok(7)
+                }
+            })
+            .await
+            .expect("the third read succeeds");
+        assert_eq!(result, 7);
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn given_transient_refusals_past_the_retry_count_when_reading_then_should_return_the_last_refusal()
+     {
+        let reads = Cell::new(0);
+        let result: Result<(), LaserError> = options()
+            .retry_transient_read(|| {
+                reads.set(reads.get() + 1);
+                async { Err(LaserError::Iggy(IggyError::TransientNotAccepted)) }
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LaserError::Iggy(IggyError::TransientNotAccepted))
+        ));
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn given_a_permanent_failure_when_reading_then_should_not_read_again() {
+        let reads = Cell::new(0);
+        let result: Result<(), LaserError> = options()
+            .retry_transient_read(|| {
+                reads.set(reads.get() + 1);
+                async { Err(LaserError::Iggy(IggyError::Unauthorized)) }
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(LaserError::Iggy(IggyError::Unauthorized))
+        ));
+        assert_eq!(reads.get(), 1);
     }
 
     #[tokio::test]

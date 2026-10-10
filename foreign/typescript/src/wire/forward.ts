@@ -2,6 +2,28 @@ import { CodecError } from "../client/errors.js"
 import { decodeGrant, encodeGrant, type Grant } from "./authz.js"
 import { type CborMap, expectMap, field } from "./cbor.js"
 
+export interface ForwardedScope {
+  readonly streamId: number
+  readonly stream: string
+  readonly streamCreatedAtMicros: bigint
+}
+
+export function encodeForwardedScope(scope: ForwardedScope): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["stream_id", BigInt(scope.streamId)],
+    ["stream", scope.stream],
+    ["stream_created_at_micros", scope.streamCreatedAtMicros]
+  ])
+}
+
+export function decodeForwardedScope(map: CborMap, context: string): ForwardedScope {
+  return {
+    streamId: field.requiredU32(map, "stream_id", context),
+    stream: field.requiredString(map, "stream", context),
+    streamCreatedAtMicros: field.requiredU64(map, "stream_created_at_micros", context)
+  }
+}
+
 export interface ForwardedQuery {
   readonly userId: number
   readonly clientId: bigint
@@ -16,6 +38,7 @@ export interface ForwardedCommand {
   readonly correlation?: string
   readonly operationId?: bigint
   readonly readAll: boolean
+  readonly scope?: ForwardedScope
   readonly commandCode: number
   readonly payload: Uint8Array
   readonly grants: readonly Grant[]
@@ -73,6 +96,7 @@ export function encodeForwardedCommand(command: ForwardedCommand): Map<string, u
     map.set("operation_id", requireU128(command.operationId, "ForwardedCommand.operationId"))
   }
   map.set("read_all", command.readAll)
+  if (command.scope !== undefined) map.set("scope", encodeForwardedScope(command.scope))
   map.set("command_code", BigInt(command.commandCode))
   map.set("payload", command.payload)
   if (command.grants.length > 0) map.set("grants", encodeGrants(command.grants))
@@ -82,12 +106,16 @@ export function encodeForwardedCommand(command: ForwardedCommand): Map<string, u
 export function decodeForwardedCommand(map: CborMap, context: string): ForwardedCommand {
   const correlation = decodeCorrelation(map, context)
   const operationId = field.optionalU128(map, "operation_id", context)
+  const scopeMap = field.optionalMap(map, "scope", context)
   return {
     userId: field.requiredU32(map, "user_id", context),
     clientId: field.requiredU128(map, "client_id", context),
     ...(correlation !== undefined ? { correlation } : {}),
     ...(operationId !== undefined ? { operationId } : {}),
     readAll: field.optionalBoolean(map, "read_all", context) ?? false,
+    ...(scopeMap !== undefined
+      ? { scope: decodeForwardedScope(scopeMap, `${context}.scope`) }
+      : {}),
     commandCode: field.requiredU32(map, "command_code", context),
     payload: field.requiredBytes(map, "payload", context),
     grants: decodeGrants(map, context)

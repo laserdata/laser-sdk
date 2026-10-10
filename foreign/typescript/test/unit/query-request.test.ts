@@ -1,10 +1,20 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { ConfigError, ProtocolError } from "../../src/client/errors.js"
+import { ConfigError, InvalidError, ProtocolError } from "../../src/client/errors.js"
 import { Json } from "../../src/stream/codecs.js"
 import { QueryRequest } from "../../src/managed/query.js"
 import { BackendResourceId, QueryExecutionId } from "../../src/wire/ids.js"
-import type { Query, QueryResult } from "../../src/wire/query.js"
+import {
+  QueryBuilder,
+  decodeQuery,
+  encodeQuery,
+  filterPred,
+  newQuery,
+  operationalTarget,
+  validateQuery,
+  type Query,
+  type QueryResult
+} from "../../src/wire/query.js"
 
 function result(query: Query, cursor?: string): QueryResult {
   return {
@@ -196,4 +206,65 @@ void test("aggregates carry the Rust names and explicit aliases", async () => {
     { func: "std_dev", alias: "stddev", field: "amount" },
     { func: "percentile", alias: "p95", field: "amount", arg: 0.95 }
   ])
+})
+
+void test("given_a_query_builder_with_the_required_fields_when_built_then_should_match_the_new_query_defaults", () => {
+  const executionId = QueryExecutionId.fromU128(7n)
+  const built = new QueryBuilder()
+    .executionId(executionId)
+    .target(operationalTarget("readings"))
+    .deadlineMicros(1_000n)
+    .build()
+  assert.deepEqual(built, newQuery(operationalTarget("readings"), executionId, 1_000n))
+})
+
+void test("given_a_query_builder_with_optional_fields_when_built_then_should_round_trip_through_the_wire", () => {
+  const filter = filterPred("host", "eq", { kind: "string", value: "node-7" })
+  const built = new QueryBuilder()
+    .executionId(QueryExecutionId.fromU128(8n))
+    .target(operationalTarget("readings"))
+    .deadlineMicros(2_000n)
+    .messageType("reading")
+    .timeRange([10n, 20n])
+    .filter(filter)
+    .order([{ field: "ts", dir: "desc" }])
+    .distinct(true)
+    .fork("what-if")
+    .consistency("strong")
+    .build()
+  validateQuery(built)
+  assert.equal(built.messageType, "reading")
+  assert.deepEqual(built.filter, filter)
+  assert.equal(built.consistency, "strong")
+  assert.deepEqual(decodeQuery(encodeQuery(built), "query"), built)
+})
+
+void test("given_an_optional_field_set_to_undefined_when_built_then_should_leave_it_out", () => {
+  const built = new QueryBuilder()
+    .executionId(QueryExecutionId.fromU128(9n))
+    .target(operationalTarget("readings"))
+    .deadlineMicros(3_000n)
+    .fork("what-if")
+    .fork(undefined)
+    .build()
+  assert.equal("fork" in built, false)
+})
+
+void test("given_a_query_builder_missing_a_required_field_when_built_then_should_throw_invalid", () => {
+  assert.throws(
+    () => new QueryBuilder().target(operationalTarget("readings")).deadlineMicros(1n).build(),
+    InvalidError
+  )
+  assert.throws(
+    () => new QueryBuilder().executionId(QueryExecutionId.fromU128(1n)).deadlineMicros(1n).build(),
+    InvalidError
+  )
+  assert.throws(
+    () =>
+      new QueryBuilder()
+        .executionId(QueryExecutionId.fromU128(1n))
+        .target(operationalTarget("readings"))
+        .build(),
+    InvalidError
+  )
 })

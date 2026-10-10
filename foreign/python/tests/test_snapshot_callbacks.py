@@ -4,6 +4,18 @@ import laser_sdk as ls
 import pytest
 
 
+def snapshot(conversation, as_of, state):
+    return {
+        "stream": "agents",
+        "stream_id": 0,
+        "stream_created_at_micros": 100,
+        "conversation": conversation,
+        "fold": "planner",
+        "as_of": as_of,
+        "state": state,
+    }
+
+
 @pytest.mark.parametrize("awaitable", [False, True])
 async def test_given_custom_snapshots_when_saved_and_read_then_should_keep_all_fields(awaitable):
     stored = {}
@@ -25,8 +37,8 @@ async def test_given_custom_snapshots_when_saved_and_read_then_should_keep_all_f
     store = ls.SnapshotStore(Backend())
     conversation = ls.new_conversation_id()
     assert await store.latest(conversation) is None
-    await store.save(conversation, {0: 7, 4: 0}, b"opaque state")
-    expected = {"conversation": conversation, "as_of": {0: 7, 4: 0}, "state": b"opaque state"}
+    expected = snapshot(conversation, [(2, 20, 0, 7), (2, 20, 4, 0)], b"opaque state")
+    await store.save(expected)
     assert await store.latest(conversation) == expected
     assert calls[1] == ("save", expected)
 
@@ -46,7 +58,7 @@ async def test_given_sdk_snapshot_callback_errors_when_called_then_should_keep_t
     with pytest.raises(ls.InvalidError, match="snapshot read refused"):
         await store.latest(conversation)
     with pytest.raises(ls.UnsupportedError, match="snapshot writes unavailable"):
-        await store.save(conversation, {}, b"state")
+        await store.save(snapshot(conversation, [], b"state"))
 
 
 async def test_given_a_pending_snapshot_callback_when_cancelled_then_should_retire_its_task():
@@ -75,31 +87,31 @@ async def test_given_a_pending_snapshot_callback_when_cancelled_then_should_reti
 
 @pytest.mark.integration
 async def test_given_a_custom_snapshot_when_state_resumes_then_should_skip_inclusive_offsets(laser):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     conversation = ls.new_conversation_id()
     context = laser.context(conversation)
-    await context.append(ls.AgentTopic.Commands, b"1")
-    checkpoint = await context.checkpoint([ls.AgentTopic.Commands])
-    as_of = {
-        partition: offset - 1
-        for partition, offset in checkpoint.topic_offsets(ls.AgentTopic.Commands).items()
-        if offset > 0
-    }
-    assert as_of
-    await context.append(ls.AgentTopic.Commands, b"2")
+    await context.append(ls.AgentTopic.Sessions, b"1")
+    for _ in range(100):
+        checkpoint = await context.checkpoint([ls.AgentTopic.Sessions])
+        if any(checkpoint.topic_offsets(ls.AgentTopic.Sessions).values()):
+            break
+        await asyncio.sleep(0.05)
+    saved = await ls.snapshot_from_checkpoint(laser, conversation, "planner", checkpoint, b"10")
+    assert saved["as_of"]
+    await context.append(ls.AgentTopic.Sessions, b"2")
     seen = []
 
     class Backend:
         async def latest(self, requested):
             seen.append(requested)
             await asyncio.sleep(0)
-            return {"conversation": requested, "as_of": as_of, "state": b"10"}
+            return saved
 
         async def save(self, snapshot):
             pass
 
     total = await context.state_with(
-        Backend(), [ls.AgentTopic.Commands], 0, lambda state, message: state + int(message.payload)
+        Backend(), [ls.AgentTopic.Sessions], 0, lambda state, message: state + int(message.payload)
     )
     assert total == 12
     assert seen == [conversation]

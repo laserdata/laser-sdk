@@ -1,3 +1,4 @@
+import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { UnsupportedError } from "../client/errors.js"
 import { decodeOne, expectMap } from "../wire/cbor.js"
@@ -18,19 +19,23 @@ export class Watch {
 
   private constructor(
     private readonly getCapabilities: () => Promise<Capabilities>,
-    private readonly openCursor: () => Promise<Cursor>
+    private readonly openCursor: () => Promise<Cursor>,
+    private readonly scope: ResourceScope = BARE_SCOPE
   ) {}
 
   /** @internal */
   static create(
     getCapabilities: () => Promise<Capabilities>,
-    openCursor: () => Promise<Cursor>
+    openCursor: () => Promise<Cursor>,
+    scope: ResourceScope = BARE_SCOPE
   ): Watch {
-    return new Watch(getCapabilities, openCursor)
+    return new Watch(getCapabilities, openCursor, scope)
   }
 
+  /** Keep only advancements of this materialized index, named as the
+   * connection's `resourceName` names it. */
   index(index: string): this {
-    this.filterIndex = index
+    this.filterIndex = this.scope.name(index)
     return this
   }
 

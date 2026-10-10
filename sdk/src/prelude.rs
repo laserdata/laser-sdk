@@ -10,8 +10,8 @@ pub use crate::agent::WORKFLOW_FENCE_NAMESPACE;
 #[cfg(feature = "agent")]
 pub use crate::agent::{
     Agent, AgentCtx, AgentHandle, AgentHandler, AgentMessage, Contract, ConversationState,
-    ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig, SessionTurn,
-    SessionTurnKind, Sessions, Workflow,
+    ReliableConsumer, ReplayBound, RoutePolicy, Router, Session, SessionConfig, SessionLease,
+    SessionTurn, Sessions, TopicRetention, Workflow,
 };
 pub use crate::capabilities::Capabilities;
 #[cfg(feature = "agent")]
@@ -29,7 +29,7 @@ pub use crate::fork::ForkHandle;
 #[cfg(feature = "kv")]
 pub use crate::kv::{Kv, KvEntry, KvPage};
 #[cfg(feature = "streaming")]
-pub use crate::laser::{Laser, LaserBuilder, PublishOptions};
+pub use crate::laser::{Laser, LaserBuilder, PublishOptions, ResourceNaming};
 #[cfg(feature = "agent")]
 pub use crate::memory::{Memory, MemoryHandle, MemoryItem};
 #[cfg(feature = "streaming")]
@@ -38,8 +38,6 @@ pub use crate::message::Message;
 pub use crate::provenance::{AgentTopic, Provenance};
 #[cfg(feature = "query")]
 pub use crate::query::{QueryResult, Row};
-#[cfg(feature = "runs")]
-pub use crate::runs::Runs;
 #[cfg(feature = "streaming")]
 pub use crate::stream::ContentType;
 #[cfg(feature = "streaming")]
@@ -52,8 +50,6 @@ pub use crate::stream::{
 pub use crate::typed::{TypedDecodeError, TypedRecord, TypedRecords, TypedTopic};
 #[cfg(feature = "watch")]
 pub use crate::watch::{Watch, WatchReader};
-#[cfg(feature = "runs")]
-pub use laser_wire::agent_workflow::AgentRunState;
 #[cfg(feature = "graph")]
 pub use laser_wire::graph::EdgeDir;
 
@@ -76,11 +72,11 @@ pub mod full {
     pub use crate::agent::MemoryHandler;
     #[cfg(feature = "agent")]
     pub use crate::agent::{
-        Agdx, AgdxSend, AgdxStream, AgentMiddleware, AgentRegistry, Budget, CapabilitySelector,
+        Agdx, AgdxSend, AgdxStream, AgentMiddleware, AgentRegistry, CapabilitySelector,
         ChunkAssembler, ConcurrencyPolicy, ContractBuilder, DeadLetterSink, Deduplicator, Gather,
         GatherPolicy, InboxRoute, RegisteredCard, RetryPolicy, RouteCandidate, RouteScorer,
         ScatterOutcome, ScatterReport, SessionPolicy, SlidingWindow, StepContext, StepFn,
-        StepHandle, StreamEvent, Verifier, WorkflowOutcome,
+        StepHandle, StreamEvent, Verifier, WorkflowBudget, WorkflowOutcome,
     };
     #[cfg(feature = "agui")]
     pub use crate::agui::AgUiEvent;
@@ -133,8 +129,6 @@ pub mod full {
         QueryRequest, RawSql, RetentionPolicy, SchemaDef, SchemaInfo, SchemaSource, Select, Sort,
         SourceSelector, Value, VectorQuery, Window,
     };
-    #[cfg(feature = "runs")]
-    pub use crate::runs::RunListRequest;
     #[cfg(all(feature = "agent", feature = "kv"))]
     pub use crate::snapshot::KvSnapshotStore;
     #[cfg(feature = "agent")]
@@ -147,8 +141,6 @@ pub mod full {
     };
     #[cfg(feature = "streaming")]
     pub use crate::stream::{ConsumerGroupInfo, CreateConsumerGroup};
-    #[cfg(feature = "runs")]
-    pub use laser_wire::agent_workflow::{AgentRunInfo, RunBudget, RunPage};
     #[cfg(feature = "destinations")]
     pub use laser_wire::checkpoint::{
         AttemptColumnMetrics, AttemptObject, CheckpointError, CheckpointMutationResult,
@@ -186,4 +178,34 @@ pub mod full {
     // explicitly: `use laser_sdk::stream::{Json, Msgpack};`.
     #[cfg(feature = "agent")]
     pub use crate::state_store::{FileStore, InMemoryStore, StateStore};
+    // The session and error vocabulary ordinary session, agent, and governance
+    // code names: a session budget, its status, the display type a turn folds
+    // to, and the structured error body a failure carries.
+    #[cfg(feature = "rbac")]
+    pub use crate::rbac::{Action, Effect, Feature, Grant, ResourcePattern, Role, delegated_allow};
+    #[cfg(feature = "agent")]
+    pub use laser_wire::agent::{AgentErrorBody, AgentErrorCode, Budget, SessionStatus};
+    #[cfg(feature = "agent")]
+    pub use laser_wire::dispatch::DisplayType;
+}
+
+#[cfg(all(test, feature = "agent", feature = "rbac"))]
+mod tests {
+    #[test]
+    fn given_the_full_prelude_when_glob_imported_then_should_name_the_session_and_rbac_vocabulary()
+    {
+        use super::full::*;
+        let names = [
+            std::any::type_name::<Budget>(),
+            std::any::type_name::<SessionStatus>(),
+            std::any::type_name::<DisplayType>(),
+            std::any::type_name::<AgentErrorBody>(),
+            std::any::type_name::<AgentErrorCode>(),
+            std::any::type_name::<Action>(),
+            std::any::type_name::<Feature>(),
+            std::any::type_name::<Effect>(),
+        ];
+        assert!(names.iter().all(|name| name.starts_with("laser_wire::")));
+        assert!(!delegated_allow(&[], &[], Feature::Kv, Action::Read, None));
+    }
 }

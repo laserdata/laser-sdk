@@ -9,7 +9,8 @@ use laser_wire::codes::{
     AGDX_LIST_SCHEMAS_CODE, AGDX_REGISTER_SCHEMA_CODE, QUERY_OP_VERSION,
 };
 use laser_wire::control::{
-    ControlCommand, Projection, ProjectionBinding, ProjectionKind, SchemaSource, SourceSelector,
+    ControlCommand, Projection, ProjectionBinding, ProjectionId, ProjectionKind, SchemaSource,
+    SourceSelector,
 };
 use laser_wire::framing::encode_named;
 use laser_wire::query::QueryError;
@@ -73,6 +74,64 @@ impl Laser {
             )),
         }
     }
+
+    // A control command whose resource names belong to this handle's stream.
+    async fn publish_scoped_control(&self, command: ControlCommand) -> Result<(), LaserError> {
+        let stream = self.resource_stream().map(str::to_owned);
+        self.publish_control_in(command, stream.as_deref()).await
+    }
+
+    fn scoped_projection_id(&self, id: &ProjectionId) -> ProjectionId {
+        ProjectionId::new(self.resource_name(id.as_str()))
+    }
+
+    fn local_projection_id(&self, id: ProjectionId) -> ProjectionId {
+        match self.local_resource_name(id.as_str()) {
+            Some(local) if local != id.as_str() => ProjectionId::new(local),
+            _ => id,
+        }
+    }
+
+    fn scoped_projection(&self, mut projection: Projection) -> Projection {
+        projection.id = self.scoped_projection_id(&projection.id);
+        projection
+    }
+
+    fn scoped_binding(&self, mut binding: ProjectionBinding) -> ProjectionBinding {
+        for id in &mut binding.allowed_projections {
+            *id = self.scoped_projection_id(id);
+        }
+        binding.default_projection = binding
+            .default_projection
+            .map(|id| self.scoped_projection_id(&id));
+        binding.index = self.resource_name(&binding.index);
+        binding
+    }
+
+    fn local_binding(&self, mut binding: ProjectionBinding) -> ProjectionBinding {
+        binding.allowed_projections = binding
+            .allowed_projections
+            .into_iter()
+            .map(|id| self.local_projection_id(id))
+            .collect();
+        binding.default_projection = binding
+            .default_projection
+            .map(|id| self.local_projection_id(id));
+        if let Some(local) = self.local_resource_name(&binding.index) {
+            binding.index = local.to_owned();
+        }
+        binding
+    }
+
+    fn local_projection_info(&self, mut info: ProjectionInfo) -> ProjectionInfo {
+        info.projection.id = self.local_projection_id(info.projection.id);
+        info.bindings = info
+            .bindings
+            .into_iter()
+            .map(|binding| self.local_binding(binding))
+            .collect();
+        info
+    }
 }
 
 /// Handle to the projection registry, built with
@@ -102,8 +161,9 @@ impl<'a> Projections<'a> {
                 projection.id
             )));
         }
+        let projection = self.laser.scoped_projection(projection);
         self.laser
-            .publish_control(ControlCommand::RegisterProjection(projection))
+            .publish_scoped_control(ControlCommand::RegisterProjection(projection))
             .await
     }
 
@@ -111,8 +171,9 @@ impl<'a> Projections<'a> {
     /// LaserData Cloud stops applying it, and existing materialized rows are
     /// left untouched. `id` is the projection ref (e.g. `"reading.v1"`).
     pub async fn drop(&self, id: impl Into<String>) -> Result<(), LaserError> {
+        let id = self.laser.resource_name(&id.into());
         self.laser
-            .publish_control(ControlCommand::DropProjection(id.into()))
+            .publish_scoped_control(ControlCommand::DropProjection(id))
             .await
     }
 
@@ -136,8 +197,9 @@ impl<'a> Projections<'a> {
                 projection.id
             )));
         }
+        let projection = self.laser.scoped_projection(projection);
         self.laser
-            .publish_control(ControlCommand::RegisterGraph(projection))
+            .publish_scoped_control(ControlCommand::RegisterGraph(projection))
             .await
     }
 
@@ -145,24 +207,28 @@ impl<'a> Projections<'a> {
     /// `DropGraph` control command. The materialized nodes and edges are left
     /// untouched, the same as [`drop`](Self::drop) for a row projection.
     pub async fn drop_graph(&self, id: impl Into<String>) -> Result<(), LaserError> {
+        let id = self.laser.resource_name(&id.into());
         self.laser
-            .publish_control(ControlCommand::DropGraph(id.into()))
+            .publish_scoped_control(ControlCommand::DropGraph(id))
             .await
     }
 
     /// Read one projection's details by `id` (schema, content type, indexed
-    /// fields, bindings), or `None` when no projection has that id.
+    /// fields, bindings), or `None` when no projection has that id. Names
+    /// under this handle's stream come back as the caller wrote them.
     pub async fn get(&self, id: impl Into<String>) -> Result<Option<ProjectionInfo>, LaserError> {
         let request = GetProjection {
             v: QUERY_OP_VERSION,
-            id: id.into(),
+            id: self.laser.resource_name(&id.into()),
         };
         match self
             .laser
             .execute_browse(AGDX_GET_PROJECTION_CODE, &request)
             .await?
         {
-            BrowseOutcome::Projection(info) => Ok(info),
+            BrowseOutcome::Projection(info) => {
+                Ok(info.map(|info| self.laser.local_projection_info(info)))
+            }
             _ => Err(LaserError::Protocol(
                 "get: unexpected browse outcome".to_owned(),
             )),
@@ -199,8 +265,9 @@ impl Bindings<'_> {
     /// topic)` source. Register the referenced projection first, or LaserData Cloud
     /// rejects the binding.
     pub async fn apply(&self, binding: ProjectionBinding) -> Result<(), LaserError> {
+        let binding = self.laser.scoped_binding(binding);
         self.laser
-            .publish_control(ControlCommand::ApplyBinding(binding))
+            .publish_scoped_control(ControlCommand::ApplyBinding(binding))
             .await
     }
 
@@ -214,8 +281,9 @@ impl Bindings<'_> {
         source: SourceSelector,
         projection_ref: Option<String>,
     ) -> Result<(), LaserError> {
+        let projection_ref = projection_ref.map(|id| self.laser.resource_name(&id));
         self.laser
-            .publish_control(ControlCommand::RemoveBinding {
+            .publish_scoped_control(ControlCommand::RemoveBinding {
                 source,
                 projection_ref,
             })
@@ -255,7 +323,7 @@ impl Schemas<'_> {
     /// different definition. Dropping an unknown id is a no-op.
     pub async fn drop(&self, id: u32) -> Result<(), LaserError> {
         self.laser
-            .publish_control(ControlCommand::DropSchema(id))
+            .publish_scoped_control(ControlCommand::DropSchema(id))
             .await
     }
 
@@ -265,6 +333,7 @@ impl Schemas<'_> {
         let request = GetSchema {
             v: QUERY_OP_VERSION,
             id,
+            stream: self.laser.resource_stream().map(str::to_owned),
         };
         match self
             .laser
@@ -284,6 +353,7 @@ impl Schemas<'_> {
         let request = ListSchemas {
             v: QUERY_OP_VERSION,
             name_contains: None,
+            stream: self.laser.resource_stream().map(str::to_owned),
         };
         match self
             .laser
@@ -332,6 +402,7 @@ impl RegisterSchemaRequest<'_> {
             source: self.source,
             name: self.name,
             version: self.version,
+            stream: self.laser.resource_stream().map(str::to_owned),
         };
         match self
             .laser
@@ -377,7 +448,8 @@ impl<'a> ProjectionsRequest<'a> {
         self
     }
 
-    /// Keep only projections whose id starts with `prefix`.
+    /// Keep only projections whose id starts with `prefix`, the caller's own
+    /// name for it.
     pub fn id_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.id_prefix = Some(prefix.into());
         self
@@ -390,13 +462,22 @@ impl<'a> ProjectionsRequest<'a> {
         self
     }
 
-    /// Run the browse and return the matching projections.
+    /// Run the browse and return the matching projections. A handle that
+    /// scopes its resources to a stream lists only that stream's projections,
+    /// under the ids the caller gave them.
     pub async fn fetch(self) -> Result<Vec<ProjectionInfo>, LaserError> {
+        let id_prefix = match self.laser.resource_stream() {
+            Some(stream) => Some(laser_wire::authz::scoped_resource(
+                stream,
+                self.id_prefix.as_deref().unwrap_or_default(),
+            )),
+            None => self.id_prefix,
+        };
         let request = ListProjections {
             v: QUERY_OP_VERSION,
             topics: self.topics,
             name_contains: self.name_contains,
-            id_prefix: self.id_prefix,
+            id_prefix,
             search: self.search,
         };
         match self
@@ -404,10 +485,76 @@ impl<'a> ProjectionsRequest<'a> {
             .execute_browse(AGDX_LIST_PROJECTIONS_CODE, &request)
             .await?
         {
-            BrowseOutcome::Projections(list) => Ok(list),
+            BrowseOutcome::Projections(list) => Ok(list
+                .into_iter()
+                .filter(|info| {
+                    self.laser
+                        .local_resource_name(info.projection.id.as_str())
+                        .is_some()
+                })
+                .map(|info| self.laser.local_projection_info(info))
+                .collect()),
             _ => Err(LaserError::Protocol(
                 "list: unexpected browse outcome".to_owned(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::laser::{Laser, ResourceNaming};
+    use laser_wire::browse::ProjectionInfo;
+    use laser_wire::control::{Projection, ProjectionBinding};
+
+    fn laser() -> Laser {
+        Laser::from_client(crate::iggy::prelude::IggyClient::default()).with_default_stream("acme")
+    }
+
+    fn binding() -> ProjectionBinding {
+        ProjectionBinding::builder()
+            .source("acme", "readings")
+            .allow("reading.v1")
+            .default_projection("reading.v1")
+            .index("readings_rows")
+            .build()
+    }
+
+    #[test]
+    fn given_a_default_stream_when_scoping_a_binding_then_should_scope_refs_and_index() {
+        let scoped = laser().scoped_binding(binding());
+        assert_eq!(
+            scoped.allowed_projections[0].as_str(),
+            "stream:acme/reading.v1"
+        );
+        assert_eq!(
+            scoped.default_projection.as_ref().map(|id| id.as_str()),
+            Some("stream:acme/reading.v1")
+        );
+        assert_eq!(scoped.index, "stream:acme/readings_rows");
+        assert_eq!(scoped.source.stream, "acme", "the source is an Iggy stream");
+    }
+
+    #[test]
+    fn given_a_scoped_projection_info_when_localized_then_should_return_the_caller_names() {
+        let laser = laser();
+        let projection = laser.scoped_projection(Projection::builder("reading.v1").build());
+        assert_eq!(projection.id.as_str(), "stream:acme/reading.v1");
+        let info = laser.local_projection_info(ProjectionInfo {
+            projection,
+            bindings: vec![laser.scoped_binding(binding())],
+        });
+        assert_eq!(info.projection.id.as_str(), "reading.v1");
+        assert_eq!(
+            info.bindings[0].allowed_projections[0].as_str(),
+            "reading.v1"
+        );
+        assert_eq!(info.bindings[0].index, "readings_rows");
+    }
+
+    #[test]
+    fn given_bare_naming_when_scoping_a_binding_then_should_leave_it_unchanged() {
+        let laser = laser().with_resource_naming(ResourceNaming::Bare);
+        assert_eq!(laser.scoped_binding(binding()), binding());
     }
 }

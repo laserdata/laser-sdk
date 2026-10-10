@@ -22,6 +22,10 @@ pub struct ChangeRecord {
     pub to_offset: u64,
     /// Rows the batch landed in the view.
     pub rows: u32,
+    /// The stream whose source the batch read, when the deployment publishes
+    /// change records per stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -39,6 +43,7 @@ mod tests {
             from_offset: 100,
             to_offset: 141,
             rows: 42,
+            stream: None,
         };
         let bytes = encode_named(&record).expect("encodes");
         let back: ChangeRecord = decode_named(&bytes).expect("decodes");

@@ -21,9 +21,20 @@ pub struct LaserWorld {
     pub laser: Option<Laser>,
     pub platform: Option<Arc<TestIggy>>,
     pub conversation: Option<ConversationId>,
-    /// The session and checkpoint of the session scenarios.
+    /// The session, its lease, and its checkpoint in the session scenarios.
     pub session: Option<Session>,
+    pub session_lease: Option<laser_sdk::agent::SessionLease>,
     pub checkpoint: Option<Checkpoint>,
+    /// The session another step reads back: a submitted or controlled one.
+    pub other_session: Option<ConversationId>,
+    /// The worker agent of the submit scenario.
+    pub worker: Option<laser_sdk::agent::AgentHandle>,
+    /// The partitions a routed command and its reply landed on.
+    pub routed: Option<(Option<u32>, Option<u32>)>,
+    /// The session a routed command and its reply rode.
+    pub routed_session: Option<ConversationId>,
+    /// The native session scenarios: their configuration, agents, leases, and outcomes.
+    pub native: crate::steps::session::Native,
     /// `Ok(())` or the stringified error of the last fallible action.
     pub last_result: Option<Result<(), String>>,
     /// Number of records accepted by the last streaming batch publish.
@@ -88,6 +99,15 @@ pub struct LaserWorld {
     pub bridge_task_state: Option<String>,
     pub reconstructed_state: Option<serde_json::Value>,
     pub agui_event_types: Vec<String>,
+    /// The answering agents of the addressed bridge scenario, what each
+    /// answered, and the replies the bridge calls received.
+    pub responders: Vec<laser_sdk::agent::AgentHandle>,
+    pub answered: HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>,
+    pub bridge_task: Option<String>,
+    pub tool_result: Option<String>,
+    pub input_decision: Option<String>,
+    /// The managed-session scenarios: their streams, sessions, and reads.
+    pub managed: crate::steps::managed_sessions::Managed,
 }
 
 impl fmt::Debug for LaserWorld {

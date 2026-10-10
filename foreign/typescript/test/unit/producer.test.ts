@@ -245,3 +245,101 @@ void test("given_balanced_background_shards_when_sending_then_should_write_up_to
   assert.equal(peak, 2)
   await producer.shutdown()
 })
+
+function serverError(code: number): TransportError {
+  return new TransportError("server refused", false, { cause: { errorCode: code } })
+}
+
+void test("given_a_transient_setup_failure_when_sending_then_should_retry_setup_within_the_publish_budget", async () => {
+  let ensures = 0
+  let sends = 0
+  const transport = {
+    ensureStream: () => {
+      ensures += 1
+      return ensures === 1
+        ? Promise.reject(new TransportError("transient", true))
+        : Promise.resolve()
+    },
+    ensureTopic: () => Promise.resolve(),
+    sendMessagesWithHeaders: () => {
+      sends += 1
+      return Promise.resolve({ confirmations: [] })
+    }
+  } as unknown as LaserTransport
+  await Producer.create(transport, "stream", "topic", { retries: 1, retryBackoffMs: 1 }).send(
+    new Uint8Array([1])
+  )
+  assert.equal(ensures, 2)
+  assert.equal(sends, 1)
+
+  ensures = 0
+  await assert.rejects(
+    Producer.create(transport, "stream", "topic", { retries: 0, retryBackoffMs: 1 }).send(
+      new Uint8Array([1])
+    ),
+    (error: unknown) => error instanceof PublishFailedError
+  )
+  assert.equal(ensures, 1)
+})
+
+void test("given_a_lost_topic_creation_race_when_sending_then_should_retry_setup_and_succeed", async () => {
+  let creates = 0
+  const transport = {
+    ensureStream: () => Promise.resolve(),
+    createTopicIfAbsent: () => {
+      creates += 1
+      return creates < 3 ? Promise.reject(serverError(2013)) : Promise.resolve()
+    },
+    sendMessagesWithHeaders: () => Promise.resolve({ confirmations: [] })
+  } as unknown as LaserTransport
+  await Producer.create(transport, "stream", "topic", { retries: 0 }).send(new Uint8Array([1]))
+  assert.equal(creates, 3)
+})
+
+void test("given_a_background_producer_when_writes_fail_then_should_resend_at_once_then_at_the_fixed_interval", async () => {
+  const at: number[] = []
+  const transport = transportWithSend(() => {
+    at.push(Date.now())
+    return at.length < 4
+      ? Promise.reject(serverError(2010))
+      : Promise.resolve({ confirmations: [] })
+  })
+  const producer = Producer.create(transport, "stream", "topic", {
+    retries: 3,
+    retryBackoffMs: 60,
+    createTopic: false,
+    createStream: false,
+    background: { lingerMs: 0 }
+  })
+  await producer.send(new Uint8Array([1]))
+  await producer.shutdown()
+  assert.equal(at.length, 4)
+  const gaps = at.slice(1).map((time, index) => time - (at[index] ?? time))
+  assert.ok((gaps[0] ?? 0) < 30, `first resend waited ${String(gaps[0])} ms`)
+  for (const gap of gaps.slice(1)) assert.ok(gap >= 55 && gap < 110, `resend gap ${String(gap)} ms`)
+})
+
+void test("given_a_background_producer_when_the_confirmation_is_lost_then_should_not_resend", async () => {
+  let attempts = 0
+  const failures: PublishFailedError[] = []
+  const transport = transportWithSend(() => {
+    attempts += 1
+    return Promise.reject(serverError(303))
+  })
+  const producer = Producer.create(transport, "stream", "topic", {
+    retries: 3,
+    retryBackoffMs: 1,
+    createTopic: false,
+    createStream: false,
+    background: {
+      lingerMs: 0,
+      onError: (error) => {
+        failures.push(error)
+      }
+    }
+  })
+  await producer.send(new Uint8Array([1]))
+  await producer.shutdown()
+  assert.equal(attempts, 1)
+  assert.equal(failures.length, 1)
+})

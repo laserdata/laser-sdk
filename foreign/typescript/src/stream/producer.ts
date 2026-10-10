@@ -1,5 +1,8 @@
+import { millisToMicros } from "../client/duration.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
+import { iggyErrorCode } from "../client/error-classify.js"
 import { InvalidError, PublishFailedError, TimeoutError, TransportError } from "../client/errors.js"
+import { publishWithin } from "../client/publish-options.js"
 import {
   type LaserTransport,
   type MessageWithHeaders,
@@ -31,11 +34,11 @@ export interface ProducerOptions {
   readonly createTopic?: boolean
   /** Partition count of a topic this producer creates. Defaults to 1. */
   readonly partitions?: number
-  /** Message expiry of a topic this producer creates, in microseconds. Leave
+  /** Message expiry of a topic this producer creates, in milliseconds. Leave
    * it out for the server default. */
-  readonly expireAfterMicros?: bigint
+  readonly expireAfterMs?: number
   /** Create the topic with messages that never expire. Set this or
-   * `expireAfterMicros`, not both. */
+   * `expireAfterMs`, not both. */
   readonly neverExpire?: boolean
   /** Most messages one direct request carries. A larger batch is split into
    * consecutive requests of this size, each awaited before the next one.
@@ -48,7 +51,7 @@ export interface ProducerOptions {
   /** Maximum size of a topic this producer creates, in bytes. Leave it out
    * for the server default. */
   readonly maxTopicBytes?: bigint
-  /** Create the topic without a size limit. Overrides `maxTopicBytes`. */
+  /** Create the topic without a size limit. Set this or `maxTopicBytes`, not both. */
   readonly unlimitedTopicSize?: boolean
   /** Buffered background mode instead of the default direct mode. A send
    * returns once its records are queued, with no confirmations. Call
@@ -131,11 +134,20 @@ export class ProducerMessage {
 
 const DEFAULT_RETRIES = 3
 const DEFAULT_RETRY_BACKOFF_MS = 250
+const DEFAULT_PUBLISH_TIMEOUT_MS = 60_000
 const MAX_RETRY_DELAY_MS = 30_000
 const MAX_TIMER_MS = 0x7fff_ffff
 const DEFAULT_BATCH_LENGTH = 1_000
 const MAX_KEY_BYTES = 255
 const MIB = 1024 * 1024
+// A producer init that loses a stream or topic creation race retries this many
+// times, 50 ms times the attempt apart, as Rust `init_producer` does.
+const CREATE_RACE_ATTEMPTS = 10
+const STREAM_NAME_ALREADY_EXISTS = 1012
+const TOPIC_NAME_ALREADY_EXISTS = 2013
+// Apache Iggy answers that imply the batch committed and only the confirmation
+// was lost. Background mode never resends them.
+const LOST_CONFIRMATION_CODES: ReadonlySet<number> = new Set([302, 303])
 
 interface QueuedSend {
   readonly messages: readonly MessageWithHeaders[]
@@ -235,6 +247,10 @@ function backgroundSettings(background: ProducerBackgroundOptions): BackgroundSe
   }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function lowerMessage(message: ProducerMessage): MessageWithHeaders {
   return { payload: message.payload, headers: message.headers }
 }
@@ -293,11 +309,19 @@ export class Producer implements AsyncDisposable {
       throw new InvalidError("producer batch length must be greater than zero")
     }
     this.lingerMs = nonNegative(options.lingerMs ?? 0, "producer lingerMs")
-    if (options.neverExpire === true && options.expireAfterMicros !== undefined) {
-      throw new InvalidError("producer takes neverExpire or expireAfterMicros, not both")
+    if (options.neverExpire === true && options.expireAfterMs !== undefined) {
+      throw new InvalidError("producer takes neverExpire or expireAfterMs, not both")
     }
-    if (options.expireAfterMicros !== undefined && options.expireAfterMicros <= 0n) {
-      throw new InvalidError("producer expireAfterMicros must be greater than zero")
+    if (
+      options.expireAfterMs !== undefined &&
+      (!Number.isFinite(options.expireAfterMs) || options.expireAfterMs <= 0)
+    ) {
+      throw new InvalidError(
+        "producer expireAfterMs must be a positive finite number of milliseconds"
+      )
+    }
+    if (options.unlimitedTopicSize === true && options.maxTopicBytes !== undefined) {
+      throw new InvalidError("producer takes unlimitedTopicSize or maxTopicBytes, not both")
     }
     if (options.maxTopicBytes !== undefined && options.maxTopicBytes <= 0n) {
       throw new InvalidError("producer maxTopicBytes must be greater than zero")
@@ -326,33 +350,78 @@ export class Producer implements AsyncDisposable {
   }
 
   // Creates the stream and topic once, before the first send, when the
-  // options ask for it.
+  // options ask for it. Setup runs under the publish retry budget, as Rust runs
+  // producer init through the publish retry loop: each attempt is bounded by
+  // the publish timeout, and a transient failure or timeout is retried with the
+  // producer's retries and doubling backoff.
   private provision(): Promise<void> {
     this.provisioned ??= (async () => {
-      const createStream = this.options.createStream ?? true
-      const createTopic = this.options.createTopic ?? true
-      if (createStream) await this.transport.ensureStream(this.streamName)
-      if (!createTopic) return
-      const partitions = this.options.partitions ?? 1
-      const expiry =
-        this.options.neverExpire === true ? NEVER_EXPIRE : this.options.expireAfterMicros
-      const maxTopicSize =
-        this.options.unlimitedTopicSize === true ? UNLIMITED_TOPIC_SIZE : this.options.maxTopicBytes
-      if (this.transport.createTopicIfAbsent !== undefined) {
-        await this.transport.createTopicIfAbsent(this.streamName, this.topicName, partitions, {
-          ...(maxTopicSize === undefined ? {} : { maxTopicSize }),
-          ...(expiry === undefined ? {} : { messageExpiryMicros: expiry })
-        })
-        return
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await publishWithin(this.provisionRacing(), this.publishTimeoutMs())
+          return
+        } catch (error) {
+          const retryable =
+            error instanceof TimeoutError || (error instanceof TransportError && error.retryable)
+          if (!retryable || attempt >= this.retries) throw error
+          await delay(this.directRetryDelayMs(attempt))
+        }
       }
-      if (maxTopicSize !== undefined || expiry !== undefined)
-        throw new InvalidError("this transport cannot set topic provisioning settings")
-      await this.transport.ensureTopic(this.streamName, this.topicName, partitions)
     })().catch((error: unknown) => {
       this.provisioned = undefined
       throw error
     })
     return this.provisioned
+  }
+
+  private publishTimeoutMs(): number {
+    return this.transport.publishOptions?.().timeoutMs ?? DEFAULT_PUBLISH_TIMEOUT_MS
+  }
+
+  // A lost creation race is success once the winner's stream or topic is
+  // visible, so the setup runs again after a short pause.
+  private async provisionRacing(): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await this.provisionOnce()
+        return
+      } catch (error) {
+        const code = iggyErrorCode(error)
+        const raced = code === STREAM_NAME_ALREADY_EXISTS || code === TOPIC_NAME_ALREADY_EXISTS
+        if (!raced || attempt >= CREATE_RACE_ATTEMPTS) throw error
+        await delay(50 * attempt)
+      }
+    }
+  }
+
+  private async provisionOnce(): Promise<void> {
+    const createStream = this.options.createStream ?? true
+    const createTopic = this.options.createTopic ?? true
+    if (createStream) await this.transport.ensureStream(this.streamName)
+    if (!createTopic) return
+    const partitions = this.options.partitions ?? 1
+    const expiry =
+      this.options.neverExpire === true
+        ? NEVER_EXPIRE
+        : this.options.expireAfterMs === undefined
+          ? undefined
+          : millisToMicros(this.options.expireAfterMs)
+    const maxTopicSize =
+      this.options.unlimitedTopicSize === true ? UNLIMITED_TOPIC_SIZE : this.options.maxTopicBytes
+    if (this.transport.createTopicIfAbsent !== undefined) {
+      await this.transport.createTopicIfAbsent(this.streamName, this.topicName, partitions, {
+        ...(maxTopicSize === undefined ? {} : { maxTopicSize }),
+        ...(expiry === undefined ? {} : { messageExpiryMicros: expiry })
+      })
+      return
+    }
+    if (maxTopicSize !== undefined || expiry !== undefined)
+      throw new InvalidError("this transport cannot set topic provisioning settings")
+    await this.transport.ensureTopic(this.streamName, this.topicName, partitions)
+  }
+
+  private directRetryDelayMs(attempt: number): number {
+    return Math.min(this.retryBackoffMs * 2 ** Math.min(attempt, 16), MAX_RETRY_DELAY_MS)
   }
 
   async send(payload: BytesLike, options: ProducerSendOptions = {}): Promise<SendMessagesResponse> {
@@ -713,10 +782,16 @@ export class Producer implements AsyncDisposable {
     throw failure
   }
 
+  // Direct mode retries transient failures with a doubling backoff capped at
+  // 30 seconds. Background mode follows Apache Iggy's dispatcher like Rust and
+  // Python: the first resend is immediate, later ones wait the configured
+  // backoff each time, and every failure is resent except one that implies the
+  // batch committed.
   private async sendAttempts(
     messages: readonly MessageWithHeaders[],
     routing: Routing
   ): Promise<SendMessagesResponse> {
+    const background = this.background !== undefined
     if (this.transport.publishRetriesManaged === true) {
       return this.transport.sendMessagesWithHeaders(
         this.streamName,
@@ -729,7 +804,8 @@ export class Producer implements AsyncDisposable {
           ...(this.options.retries === undefined ? {} : { maxRetries: this.retries }),
           ...(this.options.retryBackoffMs === undefined
             ? {}
-            : { retryBackoffMs: this.retryBackoffMs })
+            : { retryBackoffMs: this.retryBackoffMs }),
+          ...(background ? { fixedRetryIntervalMs: this.retryBackoffMs } : {})
         }
       )
     }
@@ -743,14 +819,17 @@ export class Producer implements AsyncDisposable {
           routing.kind === "partition" ? routing.partition : undefined
         )
       } catch (error) {
-        if (!(error instanceof TransportError) || !error.retryable || attempt >= this.retries) {
-          throw error
-        }
-        await new Promise((resolve) =>
-          setTimeout(
-            resolve,
-            Math.min(this.retryBackoffMs * 2 ** Math.min(attempt, 16), MAX_RETRY_DELAY_MS)
-          )
+        const retryable = background
+          ? !LOST_CONFIRMATION_CODES.has(iggyErrorCode(error) ?? -1) &&
+            !(
+              error instanceof TransportError &&
+              !error.retryable &&
+              iggyErrorCode(error) === undefined
+            )
+          : error instanceof TransportError && error.retryable
+        if (!retryable || attempt >= this.retries) throw error
+        await delay(
+          background ? (attempt === 0 ? 0 : this.retryBackoffMs) : this.directRetryDelayMs(attempt)
         )
       }
     }

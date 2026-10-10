@@ -9,12 +9,14 @@ import {
   decodeGraphQuery,
   decodeGraphReply,
   decodeGraphUpsert,
+  decodeSourceRef,
   encodeGraphEdgeFrame,
   encodeGraphNeighbors,
   encodeGraphNodeFrame,
   encodeGraphQueryFrame,
   encodeGraphReplyFrame,
   encodeGraphUpsertFrame,
+  encodeSourceRef,
   EdgeId,
   edgeDirIsOut,
   graphEdgeRelate,
@@ -209,6 +211,36 @@ void test("given_the_graph_upsert_fixture_when_decoded_then_should_re_encode_byt
   assert.equal(upsert.edges.length, 1)
   const reencoded = encodeGraphUpsertFrame(upsert)
   assert.deepEqual(Buffer.from(reencoded), Buffer.from(bytes))
+})
+
+void test("given_session_linked_graph_upsert_when_decoded_then_should_preserve_the_session", async () => {
+  const bytes = await readFixture("graph_upsert_session.bin")
+  const upsert = decodeGraphUpsert(
+    expectMap(decodeOne(bytes, "graph_upsert_session"), "graph_upsert_session"),
+    "graph_upsert_session"
+  )
+  assert.equal(upsert.session?.stream, "alpha")
+  assert.equal(upsert.session.session.asU128(), 3n)
+  assert.deepEqual(Buffer.from(encodeGraphUpsertFrame(upsert)), Buffer.from(bytes))
+})
+
+void test("given_producer_and_generation_fixtures_when_decoded_then_should_preserve_origin", async () => {
+  const sourceBytes = await readFixture("source_ref_generation.bin")
+  const source = decodeSourceRef(
+    decodeOne(sourceBytes, "source_ref_generation"),
+    "source_ref_generation"
+  )
+  assert.equal(source.kind, "message")
+  assert.equal(source.generation, 1_700_000_000_000_000n)
+  assert.deepEqual(Buffer.from(encodeNamed(encodeSourceRef(source))), Buffer.from(sourceBytes))
+  const nodeBytes = await readFixture("graph_node_producer.bin")
+  const node = decodeGraphNode(expectMap(decodeOne(nodeBytes, "node"), "node"), "node")
+  assert.equal(node.producer?.name, "extractor")
+  assert.deepEqual(Buffer.from(encodeGraphNodeFrame(node)), Buffer.from(nodeBytes))
+  const edgeBytes = await readFixture("graph_edge_producer.bin")
+  const edge = decodeGraphEdge(expectMap(decodeOne(edgeBytes, "edge"), "edge"), "edge")
+  assert.equal(edge.producer?.version, "0.7.0")
+  assert.deepEqual(Buffer.from(encodeGraphEdgeFrame(edge)), Buffer.from(edgeBytes))
 })
 
 void test("given_the_graph_query_fixture_when_decoded_then_should_preserve_the_traversal", async () => {

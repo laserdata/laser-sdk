@@ -111,7 +111,7 @@ void test("given_a_permanent_server_error_when_publishing_then_should_not_retry"
   let attempts = 0
   const client = await transport(() => {
     attempts += 1
-    return Promise.reject(Object.assign(new Error("unauthorized"), { errorCode: 20 }))
+    return Promise.reject(Object.assign(new Error("unauthorized"), { errorCode: 41 }))
   })
   await assert.rejects(
     client.sendMessages("stream", "topic", [new Uint8Array([1])], {
@@ -122,6 +122,34 @@ void test("given_a_permanent_server_error_when_publishing_then_should_not_retry"
       error instanceof PublishFailedError && error.publishCause() instanceof TransportError
   )
   assert.equal(attempts, 1)
+})
+
+void test("given_a_missing_topic_when_publishing_then_should_rebuild_the_routing_once", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    return Promise.reject(Object.assign(new Error("topic not found"), { errorCode: 2011 }))
+  })
+  await assert.rejects(
+    client.sendMessages("stream", "topic", [new Uint8Array([1])], {
+      kind: "partition",
+      partition: 0
+    }),
+    PublishFailedError
+  )
+  assert.equal(attempts, 2)
+  let recreated = 0
+  const healed = await transport(() => {
+    recreated += 1
+    return recreated === 1
+      ? Promise.reject(Object.assign(new Error("stream not found"), { errorCode: 1010 }))
+      : Promise.resolve({ confirmations: [] })
+  })
+  await healed.sendMessages("stream", "topic", [new Uint8Array([1])], {
+    kind: "partition",
+    partition: 0
+  })
+  assert.equal(recreated, 2)
 })
 
 void test("given_a_stalled_publish_with_no_retries_when_timed_out_then_should_close_and_reject", async () => {
@@ -320,4 +348,47 @@ void test("given_a_refused_agent_send_when_published_then_should_report_a_publis
       return true
     }
   )
+})
+
+void test("given_background_retry_timing_when_a_server_refuses_then_should_resend_at_once_then_at_the_fixed_interval", async () => {
+  const at: number[] = []
+  const client = await transport(() => {
+    at.push(Date.now())
+    return Promise.reject(Object.assign(new Error("refused"), { errorCode: 41 }))
+  }, 3)
+  await assert.rejects(
+    client.sendMessagesWithHeaders(
+      "stream",
+      "topic",
+      [{ payload: new Uint8Array([1]), headers: new Map() }],
+      undefined,
+      0,
+      { maxRetries: 3, fixedRetryIntervalMs: 40 }
+    ),
+    PublishFailedError
+  )
+  assert.equal(at.length, 4)
+  const gaps = at.slice(1).map((time, index) => time - (at[index] ?? time))
+  assert.ok((gaps[0] ?? 0) < 20, `first resend waited ${String(gaps[0])} ms`)
+  for (const gap of gaps.slice(1)) assert.ok(gap >= 35 && gap < 90, `resend gap ${String(gap)} ms`)
+})
+
+void test("given_background_retry_timing_when_the_confirmation_is_lost_then_should_not_resend", async () => {
+  let attempts = 0
+  const client = await transport(() => {
+    attempts += 1
+    return Promise.reject(Object.assign(new Error("bad bytes"), { errorCode: 303 }))
+  }, 3)
+  await assert.rejects(
+    client.sendMessagesWithHeaders(
+      "stream",
+      "topic",
+      [{ payload: new Uint8Array([1]), headers: new Map() }],
+      undefined,
+      0,
+      { maxRetries: 3, fixedRetryIntervalMs: 1 }
+    ),
+    PublishFailedError
+  )
+  assert.equal(attempts, 1)
 })

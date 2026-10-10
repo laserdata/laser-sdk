@@ -229,7 +229,7 @@ impl<'a> Filters<'a> {
         let mutation = FilterMutation::Revise {
             filter_id,
             expected_revision,
-            filter,
+            filter: self.scoped_filter(filter),
         };
         match self.apply(mutation).await?.result {
             FilterMutationResult::Revised(revision) => Ok(revision),
@@ -250,6 +250,12 @@ impl<'a> Filters<'a> {
         expected_identity: laser_wire::filter::FilterGroupIdentity,
     ) -> Result<(FilterBinding, Option<CatalogPosition>), LaserError> {
         let operation_id = operation_id.unwrap_or_else(|| u128::from(ulid::Ulid::generate()));
+        let policy = match policy {
+            GroupFilterSpec::Definition(filter) => {
+                GroupFilterSpec::Definition(self.scoped_filter(filter))
+            }
+            other => other,
+        };
         let applied = self
             .apply_positioned(
                 operation_id,
@@ -304,6 +310,15 @@ impl<'a> Filters<'a> {
             FilterMutationResult::Unbound(binding) => Ok((binding, applied.catalog_position)),
             _ => Err(unexpected("unbind")),
         }
+    }
+
+    // A filter with writer schemas resolves them in the registry this handle
+    // registers schemas in, unless the caller named one.
+    fn scoped_filter(&self, mut filter: ConsumerFilter) -> ConsumerFilter {
+        if !filter.schema_refs.is_empty() && filter.schema_stream.is_none() {
+            filter.schema_stream = self.laser.resource_stream().map(str::to_owned);
+        }
+        filter
     }
 
     // Apply `mutation` under a fresh operation id and wait for its outcome.
@@ -458,7 +473,8 @@ impl<'a> Filters<'a> {
     }
 }
 
-/// A preview request. Build it with [`Filters::preview`].
+/// A preview request. Build it with
+/// [`GroupFilter::preview`](crate::stream::GroupFilter::preview).
 pub struct FilterPreviewBuilder<'a> {
     filters: Filters<'a>,
     request: FilterPreviewRequest,

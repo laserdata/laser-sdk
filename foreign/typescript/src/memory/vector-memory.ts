@@ -72,7 +72,9 @@ export class VectorMemory implements Memory {
       kind: "item",
       id: id.toString(),
       memoryKind: kind,
-      body: payload
+      body: payload,
+      ...(scope.origin !== undefined ? { origin: scope.origin } : {}),
+      ...(scope.producer !== undefined ? { producer: scope.producer } : {})
     })
     if (governed.kind !== "item")
       throw new InvalidError("a memory-item governor modification must remain an item")
@@ -94,7 +96,9 @@ export class VectorMemory implements Memory {
         payload: governed.body.slice(),
         provenance,
         kind,
-        signals: []
+        signals: [],
+        ...(governed.origin !== undefined ? { origin: governed.origin } : {}),
+        ...(governed.producer !== undefined ? { producer: governed.producer } : {})
       },
       feedback: 0
     })
@@ -174,21 +178,33 @@ export class VectorMemory implements Memory {
     const governed = await this.govern(scope, {
       kind: "feedback",
       target: feedback.target.toString(),
-      weight: feedback.weight
+      weight: feedback.weight,
+      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
     })
     if (governed.kind !== "feedback") {
       throw new InvalidError("a memory-feedback governor modification must remain feedback")
     }
-    const entry = this.items.find((candidate) => candidate.id.toString() === governed.target)
+    const entry = this.items.find(
+      (candidate) =>
+        candidate.id.toString() === governed.target &&
+        inConversation(candidate, governed.conversation)
+    )
     if (entry !== undefined) entry.feedback += governed.weight
     return MemoryId.new()
   }
 
   async forget(scope: MemoryScope, id: MemoryId): Promise<void> {
-    const governed = await this.govern(scope, { kind: "forget", target: id.toString() })
+    const governed = await this.govern(scope, {
+      kind: "forget",
+      target: id.toString(),
+      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
+    })
     if (governed.kind !== "forget")
       throw new InvalidError("a memory-forget governor modification must remain a tombstone")
-    const index = this.items.findIndex((entry) => entry.id.toString() === governed.target)
+    const index = this.items.findIndex(
+      (entry) =>
+        entry.id.toString() === governed.target && inConversation(entry, governed.conversation)
+    )
     if (index !== -1) this.items.splice(index, 1)
   }
 
@@ -210,7 +226,7 @@ export class VectorMemory implements Memory {
     const payload = await this.laser[INTERNAL_GOVERN]({
       kind: ActionKind.MemoryWrite,
       stream,
-      topic: AgentTopic.Audit,
+      topic: AgentTopic.Memory,
       ...(scope.agent !== undefined ? { source: scope.agent.asStr() } : {}),
       ...(scope.conversation !== undefined ? { conversation: scope.conversation } : {}),
       payload: encoded,
@@ -263,7 +279,7 @@ function cosine(left: readonly number[], right: readonly number[]): number {
   return leftNorm === 0 || rightNorm === 0 ? 0 : dot / Math.sqrt(leftNorm * rightNorm)
 }
 
-function tokenize(text: string): ReadonlySet<string> {
+export function tokenize(text: string): ReadonlySet<string> {
   return new Set(
     text
       .toLowerCase()
@@ -272,10 +288,16 @@ function tokenize(text: string): ReadonlySet<string> {
   )
 }
 
-function keywordScore(query: ReadonlySet<string>, payload: Uint8Array): number {
+export function keywordScore(query: ReadonlySet<string>, payload: Uint8Array): number {
   if (query.size === 0) return 0
   const body = tokenize(new TextDecoder().decode(payload))
   let hits = 0
   for (const token of query) if (body.has(token)) hits += 1
   return hits / query.size
+}
+
+function inConversation(entry: VectorEntry, conversation: string | undefined): boolean {
+  return (
+    conversation === undefined || entry.item.provenance.conversationId.toString() === conversation
+  )
 }

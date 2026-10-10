@@ -1,23 +1,33 @@
+use crate::agent::budget::BudgetGate;
 use crate::agent::clock::{Clock, SystemClock};
+use crate::agent::control::ControlBook;
 use crate::agent::ctx::AgentCtx;
+use crate::agent::pause::{Hold, PauseRuntime, Replay, SourceTopic};
+use crate::agent::session::{SessionConfig, Sessions};
+use crate::capabilities::HelloOutcome;
 use crate::error::LaserError;
 use crate::laser::Laser;
-use crate::provenance::{AgentTopic, Provenance};
+use crate::provenance::{AgentTopic, LlmUsage, Provenance};
+use crate::stream::{CommitPolicy, Consumer, ConsumerMessage, Headers};
 use crate::types::{AgentId, ConsumerGroupName, ConversationId, MessageId};
 use async_trait::async_trait;
-use iggy::consumer_ext::MessageConsumer;
+use futures::FutureExt;
 use iggy::prelude::*;
 use laser_wire::agent::{
-    AgentDeadLetter, AgentEnvelope, AgentKind, DeadLetterReason, LogPosition, OPERATION_TASK,
-    SignatureContext, TaskState, features, validate,
+    AgentDeadLetter, AgentEnvelope, AgentErrorBody, AgentErrorCode, AgentKind, DeadLetterReason,
+    LogPosition, OPERATION_TASK, SignatureContext, TaskState, features, validate,
 };
 use laser_wire::codes::AGENT_OP_VERSION;
 use laser_wire::content::ContentType;
+use laser_wire::dispatch::{
+    Dispatch, HandledOperations, addressee_filter, classify, classify_generic,
+};
 use laser_wire::framing::{decode_named, encode_named};
-use laser_wire::headers::{AGENT_VERSION, CONTENT_TYPE, FENCE};
+use laser_wire::headers::{AGENT_VERSION, CONTENT_TYPE, CONVERSATION_ID, FENCE};
+use laser_wire::topics::{AGENT_CONTROL, AGENT_SESSIONS};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
@@ -25,7 +35,7 @@ use tracing::{debug, error, warn};
 
 // Capped exponential backoff between consecutive poll failures: 50ms, 100ms,
 // 200ms, up to one second.
-fn backoff_for(attempt: u32) -> Duration {
+pub(crate) fn backoff_for(attempt: u32) -> Duration {
     const BASE_MILLIS: u64 = 50;
     const CEILING_MILLIS: u64 = 1000;
     let scaled = BASE_MILLIS.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1).min(16)));
@@ -156,19 +166,29 @@ impl AgentMessage {
         }
     }
 
-    // Decode a received message into an `AgentMessage`, materializing the payload
-    // exactly once. On a decode failure the owned payload rides back in the error
-    // so the caller can dead-letter it verbatim without a second copy (the old
-    // path cloned the payload up front on every message just for that case).
-    fn from_received(
-        received: ReceivedMessage,
+    // Decode a delivered record into an `AgentMessage`. On a decode failure
+    // the payload rides back in the error so the caller can dead-letter it
+    // verbatim.
+    fn from_consumer(
+        received: &ConsumerMessage,
         understood_features: u64,
     ) -> Result<DecodedAgentMessage, (Box<LaserError>, Vec<u8>)> {
-        // The message's own offset, not `received.current_offset` (the partition
-        // high-water, shared across a polled batch).
-        let id = MessageId::new(received.partition_id, received.message.header.offset);
-        let payload = received.message.payload.to_vec();
-        let decoded = match decode_agent_record(&received.message, understood_features) {
+        let id = received.position;
+        let payload = received.payload.to_vec();
+        if received.headers_malformed {
+            return Err((
+                Box::new(LaserError::Invalid(
+                    "the record's header block does not decode".to_owned(),
+                )),
+                payload,
+            ));
+        }
+        let decoded = match decode_record_parts(
+            &received.headers,
+            &received.payload,
+            received.timestamp_micros,
+            understood_features,
+        ) {
             Ok(decoded) => decoded,
             Err(error) => return Err((Box::new(error), payload)),
         };
@@ -210,6 +230,21 @@ pub(crate) fn decode_agent_record(
     understood_features: u64,
 ) -> Result<DecodedAgentRecord, LaserError> {
     let headers = message.user_headers_map()?.unwrap_or_default();
+    decode_record_parts(
+        &headers,
+        &message.payload,
+        message.header.timestamp,
+        understood_features,
+    )
+}
+
+// Decode one record from its header map, payload, and broker timestamp.
+fn decode_record_parts(
+    headers: &Headers,
+    payload: &[u8],
+    observed_at_micros: u64,
+    understood_features: u64,
+) -> Result<DecodedAgentRecord, LaserError> {
     let content_type_key = HeaderKey::from_str(CONTENT_TYPE)?;
     let content_type_code = headers
         .get(&content_type_key)
@@ -228,7 +263,7 @@ pub(crate) fn decode_agent_record(
                     "unsupported agent envelope version {version}"
                 )));
             }
-            let envelope: AgentEnvelope = decode_named(&message.payload)?;
+            let envelope: AgentEnvelope = decode_named(payload)?;
             validate(&envelope)?;
             let unmet = envelope.unmet_requirements(understood_features);
             if unmet != features::NONE {
@@ -244,7 +279,7 @@ pub(crate) fn decode_agent_record(
             (provenance, Some(envelope), Some(context))
         }
         None => (
-            crate::provenance::provenance_from_headers(&headers)?,
+            crate::provenance::provenance_from_headers(headers)?,
             None,
             None,
         ),
@@ -254,7 +289,7 @@ pub(crate) fn decode_agent_record(
         envelope,
         content_type,
         signature_context,
-        observed_at_micros: message.header.timestamp,
+        observed_at_micros,
     })
 }
 
@@ -271,6 +306,18 @@ pub(crate) fn provenance_and_envelope(
     Ok((decoded.provenance, decoded.envelope))
 }
 
+// The conversation a record's header names, in either encoding the wire
+// allows, when the rest of the record does not decode.
+fn original_conversation(headers: &Headers) -> Option<ConversationId> {
+    let value = headers.get(&HeaderKey::from_str(CONVERSATION_ID).ok()?)?;
+    match value.kind() {
+        HeaderKind::Uint128 => {
+            Some(laser_wire::agent::ConversationId::from_u128(value.as_uint128().ok()?).into())
+        }
+        _ => value.as_str().ok()?.parse().ok(),
+    }
+}
+
 // Synthesize the runtime provenance from an AGDX envelope, so the consumer's
 // target filter, dedup, and deadline checks read one shape for both message
 // kinds. Agent ids are name strings on both sides, so `source`/`target` map
@@ -278,6 +325,8 @@ pub(crate) fn provenance_and_envelope(
 fn provenance_from_envelope(envelope: &AgentEnvelope) -> Provenance {
     Provenance::builder()
         .conversation_id(envelope.conversation.into())
+        .maybe_parent_conversation_id(envelope.parent.map(Into::into))
+        .maybe_root_conversation_id(envelope.root.map(Into::into))
         .maybe_agent(AgentId::try_from(envelope.source.as_str()).ok())
         .maybe_target_agent_id(
             envelope
@@ -297,6 +346,11 @@ fn provenance_from_envelope(envelope: &AgentEnvelope) -> Provenance {
                 .map(|correlation| correlation.to_string()),
         )
         .maybe_deadline(envelope.deadline_micros.map(IggyTimestamp::from))
+        .maybe_usage(envelope.usage.map(|usage| LlmUsage {
+            input_tokens: Some(usage.input_tokens),
+            output_tokens: Some(usage.output_tokens),
+            cost_usd: None,
+        }))
         // An enveloped fenced effect carries the fence as the `agdx.fence`
         // metadata key, so the consumer gate reads it the same way it reads the
         // header on a generic-provenance message.
@@ -422,6 +476,16 @@ pub struct ReliableConsumer {
     /// Notified on every dead-letter with the result of publishing it, so a lost
     /// poison message (a DLQ publish failure) is an observable event, not a log line.
     pub on_dead_letter: Option<std::sync::Arc<dyn DeadLetterSink>>,
+    /// The command operations the handler serves. `None` serves every
+    /// operation. A command for another operation is reported as skipped,
+    /// so a model or tool record an agent writes for itself never becomes its
+    /// own work.
+    pub operations: Option<Vec<String>>,
+    /// The session configuration the runtime applies: the session lens
+    /// handlers read through `AgentCtx::session`, and
+    /// [`SessionConfig::fail_on_dead_letter`]. Defaults to
+    /// [`SessionConfig::default`].
+    pub sessions: Option<SessionConfig>,
     /// When set, every message's envelope signature is verified against this
     /// registry before dispatch, and an unsigned or unverified record is
     /// dead-lettered. Set it on control and effect topics, where verification is
@@ -437,8 +501,17 @@ pub struct ReliableConsumer {
 impl ReliableConsumer {
     /// Consume until `shutdown` fires, dispatching each message to `handler`.
     /// `ready` fires once the consumer has joined its group and is polling.
+    ///
+    /// Delivery runs on [`ConsumerGroup::consumer`](crate::stream::ConsumerGroup::consumer),
+    /// so a server that resolves group policies reads through the group-aware
+    /// engine. On `agent.sessions` and `agent.control`, when the server serves
+    /// filtered reads and the filter catalog, the group is bound to the
+    /// addressee filter `agdx.to In [<agent>, "*"]` before it reads. A group
+    /// bound to another filter is refused. On open Apache Iggy the group
+    /// stays unbound and records are classified on the client. A capability
+    /// probe that established nothing is an error.
     pub async fn run<H>(
-        self,
+        mut self,
         laser: &Laser,
         handler: H,
         ready: oneshot::Sender<()>,
@@ -447,56 +520,52 @@ impl ReliableConsumer {
     where
         H: AgentHandler + Sync + Send + 'static,
     {
-        let shutdown_grace = self.shutdown_grace;
-        let concurrency = self.concurrency;
-        // Both schedulers commit explicitly after successful handling. Iggy's
-        // auto-commit runs while yielding a record, before the handler result is
-        // known, so it cannot provide commit-after-success semantics.
-        let auto_commit = AutoCommit::Disabled;
-        let mut consumer = laser
-            .client()
-            .consumer_group(self.group.as_str(), laser.stream_required()?, &self.topic)?
-            .auto_commit(auto_commit)
-            .create_consumer_group_if_not_exists()
-            .auto_join_consumer_group()
-            .poll_interval(IggyDuration::new(self.poll_interval))
-            .build();
-        consumer.init().await?;
+        let stream = laser.stream_required()?.to_owned();
+        let engine = DeliveryEngine::resolve(laser).await?;
+        let me = self.agent.as_ref().map(AgentId::wire_id);
+        if let Some(me) = &me {
+            engine
+                .bind_addressee(laser, &stream, &self.topic, self.group.as_str(), me)
+                .await?;
+        }
+        let opener = Opener {
+            laser: laser.clone(),
+            stream: stream.clone(),
+            topic: self.topic.clone(),
+            group: self.group.as_str().to_owned(),
+            poll_interval: self.poll_interval,
+            native: engine.native,
+        };
+        let consumer = opener.open().await?;
 
         let deduplicator = self
             .deduplicator
+            .take()
             .unwrap_or_else(|| Box::new(SlidingWindow::new(self.dedup_window)));
         if self.warm_dedup {
-            warm_dedup_window(
-                laser,
-                self.group.as_str(),
-                &self.topic,
-                deduplicator.as_ref(),
-                self.dedup_window,
-            )
-            .await?;
+            warm_dedup_window(laser, &self, deduplicator.as_ref()).await?;
         }
-        // Joined and dedup-warmed: signal readiness. A dropped receiver is fine.
-        let _ = ready.send(());
-        let agent = self.agent;
         // Resolve the subscribed stream and topic to their numeric ids once, so
         // every dead-letter capsule can carry a complete `LogPosition` for the
         // poison message without a server round-trip per failure. The consumer has
         // already joined this stream/topic, so a missing id is a should-never
         // happen: warn loudly rather than silently stamping a wrong locator -
         // the partition and offset (the locate-within-topic half) stay correct.
-        let stream_ident = Identifier::named(laser.stream_required()?)?;
+        let stream_ident = Identifier::named(&stream)?;
         let topic_ident = Identifier::named(&self.topic)?;
         let stream_id = laser
             .client()
             .get_stream(&stream_ident)
             .await?
             .map(|details| details.id);
-        let topic_id = laser
+        let topic_details = laser
             .client()
             .get_topic(&stream_ident, &topic_ident)
-            .await?
-            .map(|details| details.id);
+            .await?;
+        let topic_id = topic_details.as_ref().map(|details| details.id);
+        let topic_generation = topic_details
+            .as_ref()
+            .map_or(0, |details| details.created_at.as_micros());
         if stream_id.is_none() || topic_id.is_none() {
             warn!(
                 topic = %self.topic,
@@ -504,15 +573,74 @@ impl ReliableConsumer {
                  carry 0 for the unresolved locator half (partition and offset stay correct)"
             );
         }
+        let source = match (stream_id, topic_id) {
+            (Some(stream_id), Some(topic_id)) => Some(SourceTopic {
+                stream_id,
+                topic_id,
+                generation: topic_generation,
+            }),
+            _ => None,
+        };
         let (stream_id, topic_id) = (stream_id.unwrap_or_default(), topic_id.unwrap_or_default());
-        let group_consumer = Consumer::group(Identifier::named(self.group.as_str())?);
-        let reliable = ReliableWorker {
+        let sessions = laser.sessions_with(self.sessions.clone().unwrap_or_default());
+
+        // The control subscription: a bounded read of `agent.control` loads
+        // the requests already on the log, and the follower reads every
+        // partition from where it ended, so each instance of the role sees
+        // every pause, resume, and cancel request whatever partitions its
+        // group assigns it. Handlers read the requests through their session
+        // lens. An agent with an id also runs the pause runtime. A stream
+        // without the topic has no operator control.
+        let control = Arc::new(ControlBook::default());
+        let (reconcile, reconcile_requests) = tokio::sync::mpsc::unbounded_channel();
+        let mut pause = None;
+        let control_follower = if self.topic == AGENT_CONTROL {
+            None
+        } else {
+            match crate::agent::pause::load_control(laser, me.as_ref(), &control).await? {
+                Some(feed) => {
+                    match (&me, source) {
+                        (Some(me), Some(source)) => {
+                            pause = Some(Arc::new(PauseRuntime::new(
+                                sessions.clone(),
+                                me.clone(),
+                                Arc::clone(&control),
+                                &feed,
+                                source,
+                                reconcile.clone(),
+                            )));
+                        }
+                        (Some(_), None) => {
+                            warn!(topic = %self.topic, "the source topic ids did not resolve, sessions of this agent cannot be paused");
+                        }
+                        (None, _) => {}
+                    }
+                    control.set_live(true);
+                    let (stop, stopped) = oneshot::channel();
+                    let task = tokio::spawn(crate::agent::pause::follow_control(
+                        laser.clone(),
+                        feed,
+                        me.clone(),
+                        Arc::clone(&control),
+                        pause.is_some().then(|| reconcile.clone()),
+                        self.poll_interval,
+                        stopped,
+                    ));
+                    Some((stop, task))
+                }
+                None => None,
+            }
+        };
+        drop(reconcile);
+
+        let probe_interval = sessions.config().heartbeat_value();
+        let reliable = Arc::new(ReliableWorker {
             handler,
             laser: laser.clone(),
             retry: self.retry,
             understood_features: self.understood_features,
             dedup: deduplicator,
-            agent,
+            agent: self.agent,
             respond_on: self.respond_on,
             inbox_route: self.inbox_route,
             ack_on_pickup: self.ack_on_pickup,
@@ -520,6 +648,12 @@ impl ReliableConsumer {
             topic_id,
             middleware: self.middleware,
             on_dead_letter: self.on_dead_letter,
+            topic: self.topic.clone(),
+            operations: self.operations,
+            sessions,
+            control,
+            pause: pause.clone(),
+            budget: BudgetGate::default(),
             high_water_fence: dashmap::DashMap::new(),
             fence_last_sweep: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "sign")]
@@ -528,325 +662,684 @@ impl ReliableConsumer {
             signing_key: self.signing_key,
             #[cfg(feature = "sign")]
             verified_records: Mutex::new(DedupWindow::new(VERIFIED_RECORD_WINDOW)),
+        });
+
+        // Rebuild the pause state from the log before the first dispatch,
+        // then let the pause driver bring each session a request names up
+        // to date.
+        let pause_driver = match &pause {
+            Some(runtime) => {
+                if let Err(error) = runtime.recover().await {
+                    stop_follower(control_follower).await;
+                    return Err(error);
+                }
+                let (stop, stopped) = oneshot::channel();
+                let worker: Arc<dyn Replay> = reliable.clone();
+                let task = tokio::spawn(crate::agent::pause::drive(
+                    Arc::clone(runtime),
+                    worker,
+                    reconcile_requests,
+                    stopped,
+                ));
+                Some((stop, task))
+            }
+            None => None,
         };
-        match concurrency {
+
+        // An aborted or dropped runtime stops its background tasks with it.
+        let _background = AbortOnDrop(
+            control_follower
+                .iter()
+                .map(|(_, task)| task.abort_handle())
+                .chain(pause_driver.iter().map(|(_, task)| task.abort_handle()))
+                .collect(),
+        );
+
+        // Joined, dedup-warmed, and recovered: signal readiness. A dropped
+        // receiver is fine.
+        let _ = ready.send(());
+        // A dropped shutdown sender never stops the consumer, only a sent
+        // signal does.
+        let stop = async {
+            if shutdown.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        .fuse();
+        let result = match self.concurrency {
             ConcurrencyPolicy::Serial => {
-                run_serial(
-                    consumer,
-                    reliable,
-                    group_consumer,
-                    stream_ident,
-                    topic_ident,
-                    shutdown,
-                    shutdown_grace,
-                )
-                .await
+                run_serial(&opener, consumer, &reliable, stop, self.shutdown_grace).await
             }
             ConcurrencyPolicy::SerialPerPartition { max_partitions } => {
+                let limits = LaneLimits {
+                    max_partitions: max_partitions.max(1),
+                    max_queued_records: self.max_queued_records.clamp(1, u32::MAX as usize),
+                    max_queued_bytes: self.max_queued_bytes.clamp(1, u32::MAX as usize),
+                    probe_interval,
+                };
                 run_per_partition(
+                    &opener,
                     consumer,
-                    reliable,
-                    max_partitions.max(1),
-                    self.max_queued_records.max(1),
-                    self.max_queued_bytes.max(1),
-                    shutdown,
-                    shutdown_grace,
+                    Arc::clone(&reliable),
+                    limits,
+                    stop,
+                    self.shutdown_grace,
                 )
                 .await
             }
+        };
+        if let Some((stop, mut task)) = pause_driver {
+            let _ = stop.send(());
+            if tokio::time::timeout(self.shutdown_grace, &mut task)
+                .await
+                .is_err()
+            {
+                warn!("the pause driver did not finish within the shutdown grace, aborting it");
+                task.abort();
+            }
+        }
+        stop_follower(control_follower).await;
+        result
+    }
+}
+
+// Aborts the runtime's background tasks when the runtime future is dropped,
+// so an aborted agent leaves no control follower or pause driver behind.
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
         }
     }
 }
 
-struct SerialCommitter<'a, H> {
-    worker: &'a ReliableWorker<H>,
-    client: &'a IggyClient,
-    group: &'a Consumer,
-    stream: &'a Identifier,
-    topic: &'a Identifier,
-    failure: tokio::sync::mpsc::Sender<IggyError>,
-}
-
-impl<H> SerialCommitter<'_, H> {
-    async fn stop(&self, error: IggyError) -> Result<(), IggyError> {
-        let _ = self.failure.send(error).await;
-        std::future::pending().await
+// Stop the control follower and wait for it to leave.
+async fn stop_follower(follower: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>) {
+    if let Some((stop, task)) = follower {
+        let _ = stop.send(());
+        let _ = task.await;
     }
 }
 
-impl<H> MessageConsumer for SerialCommitter<'_, H>
-where
-    H: AgentHandler + Sync,
-{
-    async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
-        let partition = received.partition_id;
-        let offset = received.message.header.offset;
-        if let Err(error) = self.worker.consume(received).await {
-            return self.stop(error).await;
+/// How the runtime reads its groups, decided once at spawn from the
+/// server's capabilities.
+#[derive(Clone, Copy)]
+struct DeliveryEngine {
+    /// Read groups natively. Only when no group policy can apply.
+    native: bool,
+    /// The server serves filtered reads and the catalog that binds a group
+    /// to its filter.
+    filters: bool,
+}
+
+impl DeliveryEngine {
+    async fn resolve(laser: &Laser) -> Result<Self, LaserError> {
+        let mut capabilities = laser.capabilities().await;
+        if capabilities.hello == HelloOutcome::Unknown {
+            capabilities = laser.refresh_capabilities().await;
         }
-        if let Err(error) = self
-            .client
-            .store_consumer_offset(self.group, self.stream, self.topic, Some(partition), offset)
+        // An uncertain probe, or a server that serves filters without
+        // group-aware reads, is an error here, never a native fallback.
+        if !crate::stream::transport::policy_aware(&capabilities)? {
+            return Ok(Self {
+                native: true,
+                filters: false,
+            });
+        }
+        // The group-aware engine opens its own connections, which a client
+        // brought by the caller cannot. Such a runtime reads natively and
+        // binds no filter: delivery stays correct because the runtime still
+        // classifies every record by its addressee, it only examines more.
+        if laser.connection_string().is_none() {
+            if capabilities.managed {
+                tracing::warn!(
+                    "the agent reads natively because its client was not built from a connection string, so no group filter is bound"
+                );
+            }
+            return Ok(Self {
+                native: true,
+                filters: false,
+            });
+        }
+        Ok(Self {
+            native: false,
+            filters: capabilities.filters.native && capabilities.filters.catalog,
+        })
+    }
+
+    // Bind the role group of `topic` to the addressee filter. Only the
+    // session topics carry `agdx.to` on every record, so a filter on any
+    // other topic would drop untargeted records.
+    async fn bind_addressee(
+        &self,
+        laser: &Laser,
+        stream: &str,
+        topic: &str,
+        group: &str,
+        me: &laser_wire::agent::AgentId,
+    ) -> Result<(), LaserError> {
+        if !self.filters || (topic != AGENT_SESSIONS && topic != AGENT_CONTROL) {
+            return Ok(());
+        }
+        laser
+            .stream(stream)
+            .topic(topic)
+            .consumer_group(group)
+            .create()
+            .filter(addressee_filter(me))
+            .build()
             .await
-        {
-            return self.stop(error).await;
+            .map(|_| ())
+    }
+}
+
+/// Opens the runtime's consumer of one topic, again after a recoverable
+/// failure.
+#[derive(Clone)]
+struct Opener {
+    laser: Laser,
+    stream: String,
+    topic: String,
+    group: String,
+    poll_interval: Duration,
+    native: bool,
+}
+
+impl Opener {
+    async fn open(&self) -> Result<Consumer, LaserError> {
+        let builder = self
+            .laser
+            .stream(&self.stream)
+            .topic(&self.topic)
+            .consumer_group(&self.group)
+            .consumer()
+            .commit_policy(CommitPolicy::Disabled)
+            .poll_interval(self.poll_interval)
+            .create_group(true);
+        let builder = if self.native {
+            builder.native()
+        } else {
+            builder
+        };
+        builder.build().await
+    }
+
+    // Leave the failed consumer and open another, after the backoff the
+    // failure count asks for.
+    async fn reopen(&self, consumer: &mut Consumer, failures: u32) -> Result<(), LaserError> {
+        if let Err(error) = consumer.shutdown().await {
+            debug!(%error, topic = %self.topic, "the failed consumer did not leave its group cleanly");
         }
+        sleep(backoff_for(failures)).await;
+        *consumer = self.open().await?;
         Ok(())
     }
 }
 
-async fn run_serial<H>(
-    mut consumer: IggyConsumer,
-    reliable: ReliableWorker<H>,
-    group: Consumer,
-    stream: Identifier,
-    topic: Identifier,
-    shutdown: oneshot::Receiver<()>,
+// The consecutive consumer failures after which a retryable failure is no
+// longer treated as transient.
+pub(crate) const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 10;
+
+// Whether a consumer failure is worth reopening the consumer for. The
+// verdict is `LaserError::is_retryable`, the one TypeScript shares: a stale
+// membership, an unavailable catalog, and transient transport failures are,
+// a policy conflict, a changed source, and a filter fault are not. A member
+// the group no longer knows rejoins.
+fn recoverable(error: &LaserError, failures: u32) -> bool {
+    let rejoin = matches!(
+        error,
+        LaserError::Iggy(IggyError::ConsumerGroupMemberNotFound(..))
+    );
+    (rejoin || error.is_retryable()) && failures < MAX_CONSECUTIVE_POLL_ERRORS
+}
+
+// The serial scheduler: one record at a time, committed after it is handled,
+// by the task that owns the consumer. A failed dead-letter publish stops the
+// consumer with the record uncommitted.
+async fn run_serial<H, S>(
+    opener: &Opener,
+    mut consumer: Consumer,
+    worker: &ReliableWorker<H>,
+    stop: S,
     shutdown_grace: Duration,
 ) -> Result<(), LaserError>
 where
     H: AgentHandler + Sync + Send + 'static,
+    S: std::future::Future<Output = ()> + futures::future::FusedFuture,
 {
-    let (drain_tx, drain_rx) = oneshot::channel();
-    let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
-    let client = reliable.laser.client();
-    let committer = SerialCommitter {
-        worker: &reliable,
-        client: &client,
-        group: &group,
-        stream: &stream,
-        topic: &topic,
-        failure: failure_tx,
-    };
-    let mut drained = true;
-    let result = {
-        let consume = consumer.consume_messages(&committer, drain_rx);
-        tokio::pin!(consume);
-        tokio::select! {
-            result = &mut consume => result.map_err(LaserError::from),
-            Some(error) = failure_rx.recv() => Err(LaserError::from(error)),
-            signal = shutdown => match signal {
-                Ok(()) => {
-                    let _ = drain_tx.send(());
-                    let finish = async {
-                        tokio::select! {
-                            result = &mut consume => result.map_err(LaserError::from),
-                            Some(error) = failure_rx.recv() => Err(LaserError::from(error)),
-                        }
-                    };
-                    match tokio::time::timeout(shutdown_grace, finish).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            drained = false;
-                            Err(LaserError::Timeout("agent shutdown drain"))
-                        }
-                    }
+    tokio::pin!(stop);
+    let mut failures = 0u32;
+    let mut stopping = false;
+    let result = loop {
+        if stopping {
+            break Ok(());
+        }
+        let next = tokio::select! {
+            () = &mut stop => break Ok(()),
+            next = consumer.next() => next,
+        };
+        let message = match next {
+            None => break Ok(()),
+            Some(Ok(message)) => message,
+            Some(Err(error)) => {
+                failures += 1;
+                if !recoverable(&error, failures) {
+                    break Err(error);
                 }
-                Err(_) => tokio::select! {
-                    result = &mut consume => result.map_err(LaserError::from),
-                    Some(error) = failure_rx.recv() => Err(LaserError::from(error)),
-                },
-            },
+                warn!(%error, attempt = failures, topic = %opener.topic, "agent consumer failed, reopening it");
+                if let Err(error) = opener.reopen(&mut consumer, failures).await {
+                    break Err(error);
+                }
+                worker.invalidate_pause();
+                continue;
+            }
+        };
+        failures = 0;
+        worker.observe_assignment(&consumer);
+        let handled = worker.consume(&message);
+        tokio::pin!(handled);
+        let outcome = tokio::select! {
+            outcome = &mut handled => outcome,
+            () = &mut stop => {
+                stopping = true;
+                match tokio::time::timeout(shutdown_grace, &mut handled).await {
+                    Ok(outcome) => outcome,
+                    // The record is still in flight, so the consumer is not
+                    // shut down: leaving would store nothing more, but the
+                    // connection close ends the membership instead.
+                    Err(_) => return Err(LaserError::Timeout("agent shutdown drain")),
+                }
+            }
+        };
+        if let Err(error) = outcome {
+            break Err(error);
+        }
+        if let Err(error) = consumer.commit(&message).await {
+            failures += 1;
+            if !recoverable(&error, failures) {
+                break Err(error);
+            }
+            warn!(%error, source = %message.position, "committing a handled record failed, reopening the consumer");
+            if let Err(error) = opener.reopen(&mut consumer, failures).await {
+                break Err(error);
+            }
+            worker.invalidate_pause();
         }
     };
-    if drained && let Err(error) = consumer.shutdown().await {
+    if let Err(error) = consumer.shutdown().await {
         warn!(%error, "failed to leave the consumer group on shutdown");
     }
     result
 }
 
-// The per-partition scheduler: poll the consumer, route each message to a lane
-// keyed by partition, and store each offset only after its lane has handled the
-// message. Lanes run concurrently across partitions. Within one partition the
-// lane is a serial mpsc queue, so ordering and per-partition offset monotonicity
-// hold. A retrying handler blocks only its own lane. Offsets are stored by this
-// task (the sole owner of the consumer), driven by lane completions, so there is
-// no shared mutable consumer. On shutdown the lane senders are dropped, so each
-// lane finishes its queued messages and exits, bounded by the grace.
-async fn run_per_partition<H>(
-    mut consumer: IggyConsumer,
-    reliable: ReliableWorker<H>,
+/// The per-partition scheduler's bounds.
+struct LaneLimits {
     max_partitions: usize,
     max_queued_records: usize,
     max_queued_bytes: usize,
-    shutdown: oneshot::Receiver<()>,
+    /// How often the assignment probe drops lanes of partitions this member
+    /// no longer reads.
+    probe_interval: Duration,
+}
+
+// The per-partition scheduler: route each record to a lane keyed by
+// partition and commit it once its lane has handled it. Lanes run
+// concurrently across partitions, and within one partition a lane is a
+// serial queue, so ordering and the committed prefix hold. Commits are issued
+// by this task, the sole owner of the consumer, from lane completions. A lane
+// whose dead-letter publish fails stops, so its queued successors are never
+// committed. A recoverable consumer failure drains every lane, then reopens
+// the consumer.
+async fn run_per_partition<H, S>(
+    opener: &Opener,
+    mut consumer: Consumer,
+    worker: Arc<ReliableWorker<H>>,
+    limits: LaneLimits,
+    stop: S,
     shutdown_grace: Duration,
 ) -> Result<(), LaserError>
 where
     H: AgentHandler + Sync + Send + 'static,
+    S: std::future::Future<Output = ()> + futures::future::FusedFuture,
 {
-    use futures::StreamExt;
+    tokio::pin!(stop);
+    let mut failures = 0u32;
+    loop {
+        let (outcome, drain) =
+            drive_lanes(opener, &mut consumer, &worker, &limits, &mut stop).await;
+        if drain.delivered {
+            failures = 0;
+        }
+        // After a consumer failure a commit may be refused for a partition
+        // the member lost. Its records are read again by the new owner.
+        let tolerate_commits = matches!(outcome, LaneOutcome::Failed(_));
+        let drained =
+            tokio::time::timeout(shutdown_grace, drain.finish(&consumer, tolerate_commits)).await;
+        match outcome {
+            LaneOutcome::Stopped => {
+                return match drained {
+                    Ok(Ok(())) => {
+                        // Every lane finished and committed, so the member can
+                        // leave its group. On a drain timeout the lanes may
+                        // hold unhandled records, and the membership is left
+                        // to the connection close instead.
+                        if let Err(error) = consumer.shutdown().await {
+                            warn!(%error, "failed to leave the consumer group on shutdown");
+                        }
+                        Ok(())
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(LaserError::Timeout("agent shutdown drain")),
+                };
+            }
+            LaneOutcome::Fatal(error) => {
+                // The failed lane committed nothing after its record, so
+                // leaving stores no more than what was committed.
+                if matches!(drained, Ok(Ok(())))
+                    && let Err(error) = consumer.shutdown().await
+                {
+                    warn!(%error, "failed to leave the consumer group on shutdown");
+                }
+                return Err(error);
+            }
+            LaneOutcome::Failed(error) => {
+                if let Ok(Err(drain_error)) | Err(drain_error) =
+                    drained.map_err(|_| LaserError::Timeout("agent lane drain"))
+                {
+                    return Err(drain_error);
+                }
+                failures += 1;
+                if !recoverable(&error, failures) {
+                    return Err(error);
+                }
+                warn!(%error, attempt = failures, topic = %opener.topic, "agent consumer failed, reopening it");
+                opener.reopen(&mut consumer, failures).await?;
+                worker.invalidate_pause();
+            }
+        }
+    }
+}
 
-    let max_queued_records = max_queued_records.min(u32::MAX as usize);
-    let max_queued_bytes = max_queued_bytes.min(u32::MAX as usize);
-    let worker = std::sync::Arc::new(reliable);
-    let mut lanes: std::collections::HashMap<u32, tokio::sync::mpsc::Sender<QueuedMessage>> =
+enum LaneOutcome {
+    /// Shutdown was signalled or the stream ended.
+    Stopped,
+    /// The consumer failed, which may be recoverable.
+    Failed(LaserError),
+    /// A lane could not dead-letter a record. Nothing after it is committed.
+    Fatal(LaserError),
+}
+
+struct Lane {
+    sender: tokio::sync::mpsc::Sender<QueuedMessage>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+// The lanes still running after the polling loop ends, and their pending
+// completions.
+struct LaneDrain {
+    lanes: Vec<tokio::task::JoinHandle<()>>,
+    completions: tokio::sync::mpsc::Receiver<Result<ConsumerMessage, LaserError>>,
+    /// Whether the pass delivered any record, which resets the failure count.
+    delivered: bool,
+}
+
+impl LaneDrain {
+    // Wait for every lane to finish its queue and commit what it handled.
+    // The first lane failure stops further commits.
+    async fn finish(
+        mut self,
+        consumer: &Consumer,
+        tolerate_commits: bool,
+    ) -> Result<(), LaserError> {
+        for lane in self.lanes {
+            let _ = lane.await;
+        }
+        while let Some(completion) = self.completions.recv().await {
+            let message = completion?;
+            match consumer.commit(&message).await {
+                Ok(()) => {}
+                Err(error) if tolerate_commits => {
+                    debug!(%error, source = %message.position, "a handled record could not be committed, it is read again");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn drive_lanes<H, S>(
+    opener: &Opener,
+    consumer: &mut Consumer,
+    worker: &Arc<ReliableWorker<H>>,
+    limits: &LaneLimits,
+    stop: &mut std::pin::Pin<&mut S>,
+) -> (LaneOutcome, LaneDrain)
+where
+    H: AgentHandler + Sync + Send + 'static,
+    S: std::future::Future<Output = ()> + futures::future::FusedFuture,
+{
+    let mut lanes: std::collections::HashMap<u32, Lane> = std::collections::HashMap::new();
+    // Lanes of revoked partitions finishing their queues. A lane opened for
+    // the same partition waits for its predecessor, so a partition is never
+    // handled by two lanes at once.
+    let mut retiring: std::collections::HashMap<u32, tokio::task::JoinHandle<()>> =
         std::collections::HashMap::new();
-    let mut lane_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let (commit_tx, mut commit_rx) =
-        tokio::sync::mpsc::channel::<Result<(u32, u64), IggyError>>(max_partitions * 2);
-    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let record_capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(max_queued_records));
-    let byte_capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(max_queued_bytes));
-    tokio::pin!(shutdown);
+    let (commit_tx, mut commit_rx) = tokio::sync::mpsc::channel::<
+        Result<ConsumerMessage, LaserError>,
+    >(limits.max_partitions * 2);
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let record_capacity = Arc::new(tokio::sync::Semaphore::new(limits.max_queued_records));
+    let byte_capacity = Arc::new(tokio::sync::Semaphore::new(limits.max_queued_bytes));
+    let mut probe = tokio::time::interval(limits.probe_interval);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    probe.reset();
+    let mut delivered = false;
 
-    // A non-transport poll error (an authorization failure on the topic, say)
-    // is recoverable in principle, so it does not end the consumer. It is also
-    // usually persistent, so retrying it immediately would spin a core. Back
-    // off between consecutive failures and give up once they stop looking
-    // transient.
-    const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 10;
-    let mut consecutive_poll_errors: u32 = 0;
-
-    let stopped = 'polling: loop {
-        // Store every completed offset before polling again. The consumer is not
-        // borrowed by any live future here, so this is the one place offsets are
-        // committed, keeping the borrow simple.
+    let outcome = 'polling: loop {
+        // Commit every completed record before polling again. The group
+        // engine applies these between reads, so no read is cancelled.
         while let Ok(completion) = commit_rx.try_recv() {
             match completion {
-                Ok((partition, offset)) => {
-                    if let Err(error) = consumer.store_offset(offset, Some(partition)).await {
-                        break 'polling Err(LaserError::from(error));
+                Ok(message) => {
+                    if let Err(error) = consumer.commit_handled(&message).await {
+                        break 'polling LaneOutcome::Failed(error);
                     }
                 }
-                Err(error) => break 'polling Err(LaserError::from(error)),
+                Err(error) => break 'polling LaneOutcome::Fatal(error),
             }
         }
         tokio::select! {
-            _ = &mut shutdown => break Ok(()),
-            // Wake to drain a completed offset at the top of the loop. The value is
-            // left in the channel (a spurious wake is harmless).
-            _ = notify.notified() => {}
-            message = consumer.next() => match message {
-                Some(Ok(received)) => {
-                    consecutive_poll_errors = 0;
-                    let partition = received.partition_id;
-                    let known = lanes.contains_key(&partition);
-                    if !known && lanes.len() >= max_partitions {
-                        // Over the lane cap: handle inline rather than drop the
-                        // message or spawn an unbounded number of lanes.
-                        let offset = received.message.header.offset;
-                        if let Err(error) = worker.consume(received).await {
-                            break 'polling Err(LaserError::from(error));
+            () = &mut *stop => break LaneOutcome::Stopped,
+            // Wake to commit a completion at the top of the loop. The value
+            // stays in the channel, so a spurious wake is harmless.
+            () = notify.notified() => {}
+            _ = probe.tick() => {
+                drop_revoked(opener, consumer, &mut lanes, &mut retiring).await;
+            }
+            next = consumer.next() => match next {
+                Some(Ok(message)) => {
+                    delivered = true;
+                    worker.observe_assignment(consumer);
+                    let partition = message.partition_id;
+                    if !lanes.contains_key(&partition) && lanes.len() >= limits.max_partitions {
+                        // Over the lane cap: handle inline rather than drop
+                        // the record or spawn an unbounded number of lanes.
+                        // No lane holds this partition, so nothing queued
+                        // precedes the record.
+                        if let Err(error) = worker.consume(&message).await {
+                            break 'polling LaneOutcome::Fatal(error);
                         }
-                        if let Err(error) = consumer.store_offset(offset, Some(partition)).await {
-                            break 'polling Err(LaserError::from(error));
+                        if let Err(error) = consumer.commit_handled(&message).await {
+                            break 'polling LaneOutcome::Failed(error);
                         }
                         continue;
                     }
                     let lane = lanes.entry(partition).or_insert_with(|| {
-                        let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedMessage>(max_queued_records);
-                        let worker = worker.clone();
-                        let commit_tx = commit_tx.clone();
-                        let notify = notify.clone();
-                        lane_handles.push(tokio::spawn(async move {
-                            while let Some(queued) = rx.recv().await {
-                                let received = queued.received;
-                                let partition = received.partition_id;
-                                let offset = received.message.header.offset;
-                                let result = worker.consume(received).await;
-                                drop(queued.record_permit);
-                                drop(queued.byte_permit);
-                                let failed = result.is_err();
-                                let completion = result.map(|()| (partition, offset));
-                                let _ = commit_tx.send(completion).await;
-                                notify.notify_one();
-                                if failed {
-                                    break;
-                                }
-                            }
-                        }));
-                        tx
+                        spawn_lane(
+                            worker,
+                            retiring.remove(&partition),
+                            limits.max_queued_records,
+                            commit_tx.clone(),
+                            Arc::clone(&notify),
+                        )
                     });
-                    let buffered_bytes = received.message.payload.len()
-                        + received.message.header.user_headers_length as usize;
-                    let record_permit = record_capacity
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| LaserError::HandlerConfig("record queue closed".to_owned()))?;
-                    let byte_permits = buffered_bytes.clamp(1, max_queued_bytes) as u32;
-                    let byte_permit = byte_capacity
-                        .clone()
+                    let buffered_bytes = message.payload.len()
+                        + message.user_headers.as_ref().map_or(0, bytes::Bytes::len);
+                    let Ok(record_permit) = Arc::clone(&record_capacity).acquire_owned().await
+                    else {
+                        break 'polling LaneOutcome::Fatal(LaserError::HandlerConfig(
+                            "record queue closed".to_owned(),
+                        ));
+                    };
+                    let byte_permits = buffered_bytes.clamp(1, limits.max_queued_bytes) as u32;
+                    let Ok(byte_permit) = Arc::clone(&byte_capacity)
                         .acquire_many_owned(byte_permits)
                         .await
-                        .map_err(|_| LaserError::HandlerConfig("byte queue closed".to_owned()))?;
+                    else {
+                        break 'polling LaneOutcome::Fatal(LaserError::HandlerConfig(
+                            "byte queue closed".to_owned(),
+                        ));
+                    };
                     let queued = QueuedMessage {
-                        received,
+                        message,
                         record_permit,
                         byte_permit,
                     };
-                    if lane.send(queued).await.is_err() {
-                        break 'polling Err(LaserError::HandlerConfig(
-                            "partition lane stopped before accepting a message".to_owned(),
-                        ));
+                    if lane.sender.send(queued).await.is_err() {
+                        // The lane stopped after a failed dead-letter publish.
+                        // Its failure is waiting in the completion channel.
+                        continue;
                     }
                 }
-                Some(Err(error)) => match error {
-                    IggyError::Disconnected
-                    | IggyError::CannotEstablishConnection
-                    | IggyError::StaleClient
-                    | IggyError::InvalidServerAddress
-                    | IggyError::InvalidClientAddress
-                    | IggyError::NotConnected
-                    | IggyError::ClientShutdown => break Err(LaserError::from(error)),
-                    other => {
-                        consecutive_poll_errors += 1;
-                        if consecutive_poll_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
-                            break 'polling Err(LaserError::from(other));
-                        }
-                        warn!(
-                            error = %other,
-                            attempt = consecutive_poll_errors,
-                            "agent consumer poll failed, backing off"
-                        );
-                        sleep(backoff_for(consecutive_poll_errors)).await;
+                Some(Err(error)) => {
+                    if matches!(error, LaserError::Iggy(IggyError::ConsumerGroupMemberNotFound(..))) {
+                        drop_revoked(opener, consumer, &mut lanes, &mut retiring).await;
                     }
-                },
-                None => break Ok(()),
+                    break LaneOutcome::Failed(error);
+                }
+                None => break LaneOutcome::Stopped,
             },
         }
     };
-
-    // Drain: dropping the lane senders lets each lane finish its queued messages
-    // and exit. Await the lanes and flush their final offsets, bounded by grace.
-    drop(lanes);
+    // Dropping the senders lets each lane finish its queue and exit.
+    let mut tasks: Vec<_> = lanes.into_values().map(|lane| lane.task).collect();
+    tasks.extend(retiring.into_values());
     drop(commit_tx);
-    let drain = async {
-        for handle in lane_handles {
-            let _ = handle.await;
+    (
+        outcome,
+        LaneDrain {
+            lanes: tasks,
+            completions: commit_rx,
+            delivered,
+        },
+    )
+}
+
+fn spawn_lane<H>(
+    worker: &Arc<ReliableWorker<H>>,
+    predecessor: Option<tokio::task::JoinHandle<()>>,
+    capacity: usize,
+    commits: tokio::sync::mpsc::Sender<Result<ConsumerMessage, LaserError>>,
+    notify: Arc<tokio::sync::Notify>,
+) -> Lane
+where
+    H: AgentHandler + Sync + Send + 'static,
+{
+    let (sender, mut queue) = tokio::sync::mpsc::channel::<QueuedMessage>(capacity);
+    let worker = Arc::clone(worker);
+    let task = tokio::spawn(async move {
+        if let Some(predecessor) = predecessor {
+            let _ = predecessor.await;
         }
-        while let Some(completion) = commit_rx.recv().await {
-            match completion {
-                Ok((partition, offset)) => {
-                    if let Err(error) = consumer.store_offset(offset, Some(partition)).await {
-                        return Err(LaserError::from(error));
-                    }
-                }
-                Err(error) => return Err(LaserError::from(error)),
+        while let Some(queued) = queue.recv().await {
+            let result = worker.consume(&queued.message).await;
+            drop(queued.record_permit);
+            drop(queued.byte_permit);
+            let failed = result.is_err();
+            let _ = commits.send(result.map(|()| queued.message)).await;
+            notify.notify_one();
+            if failed {
+                break;
             }
         }
-        Ok::<(), LaserError>(())
+    });
+    Lane { sender, task }
+}
+
+// The assignment probe. A lane of a partition this member no longer reads is
+// closed: it finishes the records it holds and exits, instead of living until
+// shutdown. The group-aware engine knows its own assignment. A native group
+// asks the server.
+async fn drop_revoked(
+    opener: &Opener,
+    consumer: &Consumer,
+    lanes: &mut std::collections::HashMap<u32, Lane>,
+    retiring: &mut std::collections::HashMap<u32, tokio::task::JoinHandle<()>>,
+) {
+    let assigned = match consumer.assigned_partitions() {
+        Some(assigned) => Some(assigned),
+        None => opener.assigned_partitions().await,
     };
-    match tokio::time::timeout(shutdown_grace, drain).await {
-        Ok(Ok(())) => {
-            // Every lane finished and stored its offsets, so the member can leave
-            // its group and a restarted consumer owns every partition. On a drain
-            // timeout the lanes may hold unhandled messages, so leaving (which
-            // flushes the polled high-water offsets) would mark them consumed.
-            // That membership is left to the connection close instead.
-            if let Err(error) = consumer.shutdown().await {
-                warn!(%error, "failed to leave the consumer group on shutdown");
-            }
-            stopped
+    let Some(assigned) = assigned else {
+        return;
+    };
+    let revoked: Vec<u32> = lanes
+        .keys()
+        .filter(|partition| !assigned.contains(partition))
+        .copied()
+        .collect();
+    for partition in revoked {
+        if let Some(lane) = lanes.remove(&partition) {
+            debug!(
+                partition,
+                "dropping the lane of a partition no longer assigned"
+            );
+            drop(lane.sender);
+            retiring.insert(partition, lane.task);
         }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(LaserError::Timeout("agent shutdown drain")),
+    }
+    retiring.retain(|_, task| !task.is_finished());
+}
+
+impl Opener {
+    // The partitions the server assigns this connection in the group, `None`
+    // when the probe fails or the connection is not a member.
+    async fn assigned_partitions(&self) -> Option<std::collections::BTreeSet<u32>> {
+        let client = self.laser.client();
+        let me = match client.get_me().await {
+            Ok(me) => me.client_id,
+            Err(error) => {
+                debug!(%error, "the assignment probe could not identify this client");
+                return None;
+            }
+        };
+        let group = client
+            .get_consumer_group(
+                &Identifier::named(&self.stream).ok()?,
+                &Identifier::named(&self.topic).ok()?,
+                &Identifier::named(&self.group).ok()?,
+            )
+            .await;
+        match group {
+            Ok(Some(details)) => details
+                .members
+                .iter()
+                .find(|member| member.id == me)
+                .map(|member| member.partitions.iter().copied().collect()),
+            Ok(None) => None,
+            Err(error) => {
+                debug!(%error, "the assignment probe could not read the group");
+                None
+            }
+        }
     }
 }
 
 struct QueuedMessage {
-    received: ReceivedMessage,
+    message: ConsumerMessage,
     record_permit: tokio::sync::OwnedSemaphorePermit,
     byte_permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -910,6 +1403,9 @@ fn accept_fence(
     true
 }
 
+// The identity an agentless consumer classifies untargeted records as.
+const ANONYMOUS_AGENT: &str = "anonymous";
+
 struct ReliableWorker<H> {
     handler: H,
     laser: Laser,
@@ -924,6 +1420,18 @@ struct ReliableWorker<H> {
     topic_id: u32,
     middleware: Vec<std::sync::Arc<dyn AgentMiddleware>>,
     on_dead_letter: Option<std::sync::Arc<dyn DeadLetterSink>>,
+    topic: String,
+    operations: Option<Vec<String>>,
+    /// The session factory handlers and pickups open their lens from, under
+    /// the consumer's session configuration.
+    sessions: Sessions,
+    /// The control requests the control subscription observed.
+    control: Arc<ControlBook>,
+    /// The pause runtime, for an agent with an id on a stream with
+    /// `agent.control`.
+    pause: Option<Arc<PauseRuntime>>,
+    /// The budget check before a session's work reaches the handler.
+    budget: BudgetGate,
     #[cfg(feature = "sign")]
     verifier: Option<std::sync::Arc<crate::sign::KeyRegistry>>,
     #[cfg(feature = "sign")]
@@ -947,6 +1455,84 @@ struct ReliableWorker<H> {
 }
 
 impl<H> ReliableWorker<H> {
+    // Tell the pause runtime which partitions the consumer reads, when it
+    // knows.
+    fn observe_assignment(&self, consumer: &Consumer) {
+        if let Some(pause) = &self.pause {
+            pause.observe_assignment(consumer.assigned_partitions());
+        }
+    }
+
+    // The consumer was reopened: the pause runtime reads the lane again
+    // before the next dispatch.
+    fn invalidate_pause(&self) {
+        if let Some(pause) = &self.pause {
+            pause.invalidate();
+        }
+    }
+
+    fn dispatch(&self, message: &AgentMessage) -> Dispatch {
+        // A consumer without an agent id accepts records for any addressee, so
+        // it classifies each record as its own addressee would.
+        let me = match (&self.agent, &message.provenance.target_agent_id) {
+            (Some(agent), _) | (None, Some(agent)) => agent.wire_id(),
+            (None, None) => ANONYMOUS_AGENT.parse().expect("a valid agent id"),
+        };
+        match &message.envelope {
+            Some(envelope) => {
+                let operations: Vec<&str> = self
+                    .operations
+                    .iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                let handled = match self.operations {
+                    Some(_) => HandledOperations::Only(&operations),
+                    None => HandledOperations::Any,
+                };
+                classify(envelope, &self.topic, &me, handled)
+            }
+            None => classify_generic(
+                message
+                    .provenance
+                    .target_agent_id
+                    .as_ref()
+                    .map(AgentId::as_str),
+                message.provenance.causal_parent.is_some(),
+                message.provenance.correlation_id.is_some(),
+                &self.topic,
+                &me,
+            ),
+        }
+    }
+
+    async fn pick_up_submitted(
+        &self,
+        message: &AgentMessage,
+    ) -> Option<crate::agent::SessionLease> {
+        let envelope = message.envelope.as_ref()?;
+        let submitted = envelope
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(laser_wire::agent::METADATA_SUBMITTED))
+            .is_some_and(|value| matches!(value, laser_wire::query::Value::Bool(true)));
+        let agent = self.agent.as_ref()?;
+        if !submitted || envelope.kind != AgentKind::Command {
+            return None;
+        }
+        let session = self
+            .sessions
+            .open(message.provenance.conversation_id)
+            .as_agent(agent.wire_id());
+        match session.pick_up().await {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                warn!(%error, source = %message.id, "failed to mark the submitted session working");
+                None
+            }
+        }
+    }
+
     fn log_position(&self, id: MessageId) -> LogPosition {
         LogPosition::new(self.stream_id, self.topic_id, id.partition_id, id.offset)
     }
@@ -974,17 +1560,20 @@ impl<H> ReliableWorker<H> {
         let mut provenance = message.provenance.clone();
         provenance.causal_parent = Some(message.id);
         provenance.deadline = None;
-        self.publish_dead_letter(provenance, message.id, capsule, Some(message))
+        let session = Some(message.provenance.conversation_id);
+        self.publish_dead_letter(provenance, message.id, capsule, Some(message), session)
             .await
     }
 
     // Dead-letters a message whose provenance could not be decoded. The original
-    // payload rides verbatim so nothing is lost, and the synthetic provenance carries
-    // only the source offset as the causal parent (there are no original headers
-    // to keep, failing to decode them is why this path ran).
+    // payload rides verbatim so nothing is lost. The capsule keeps the
+    // record's own conversation when its header still reads, so the dead
+    // letter stays on its session's timeline. A record without one gets a
+    // conversation derived from its log position, stable across redeliveries.
     async fn dead_letter_undecodable(
         &self,
         source: MessageId,
+        conversation: Option<ConversationId>,
         payload: Vec<u8>,
     ) -> Result<(), LaserError> {
         let capsule = AgentDeadLetter {
@@ -994,11 +1583,17 @@ impl<H> ReliableWorker<H> {
             detail: None,
             payload,
         };
+        let position = capsule.source;
         let provenance = Provenance::builder()
-            .conversation_id(ConversationId::new())
+            .conversation_id(conversation.unwrap_or_else(|| {
+                ConversationId::derive(&format!(
+                    "dead-letter\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                    position.stream_id, position.topic_id, position.partition_id, position.offset
+                ))
+            }))
             .causal_parent(source)
             .build();
-        self.publish_dead_letter(provenance, source, capsule, None)
+        self.publish_dead_letter(provenance, source, capsule, None, conversation)
             .await
     }
 
@@ -1008,6 +1603,7 @@ impl<H> ReliableWorker<H> {
         source: MessageId,
         capsule: AgentDeadLetter,
         message: Option<&AgentMessage>,
+        session: Option<ConversationId>,
     ) -> Result<(), LaserError> {
         let reason = capsule.reason;
         let result = self.send_dead_letter(&provenance, &capsule).await;
@@ -1017,7 +1613,66 @@ impl<H> ReliableWorker<H> {
         if let Some(sink) = &self.on_dead_letter {
             sink.on_dead_letter(message, &capsule, &result).await;
         }
+        if result.is_ok()
+            && let Some(session) = session
+        {
+            self.fail_session_on_dead_letter(session, &capsule).await;
+        }
         result
+    }
+
+    // Under `SessionConfig::fail_on_dead_letter`, a dead-lettered record
+    // fails its session. Best effort: the dead letter is already published,
+    // so a failed status write is logged and the record still commits.
+    async fn fail_session_on_dead_letter(
+        &self,
+        session: ConversationId,
+        capsule: &AgentDeadLetter,
+    ) {
+        if !self.sessions.config().fails_on_dead_letter() {
+            return;
+        }
+        let Some(agent) = &self.agent else {
+            warn!(%session, "a consumer without an agent id cannot fail the session of a dead letter");
+            return;
+        };
+        let source = capsule.source;
+        let body = AgentErrorBody {
+            code: AgentErrorCode::Internal,
+            message: Some(match capsule.detail.as_deref() {
+                Some(detail) => format!(
+                    "a record of this session was dead-lettered ({:?}): {detail}",
+                    capsule.reason
+                ),
+                None => format!(
+                    "a record of this session was dead-lettered ({:?})",
+                    capsule.reason
+                ),
+            }),
+            retryable: false,
+            detail: Some(BTreeMap::from([
+                (
+                    "dead_letter_reason".to_owned(),
+                    laser_wire::query::Value::Uint(u64::from(capsule.reason.code())),
+                ),
+                (
+                    "source".to_owned(),
+                    laser_wire::query::Value::Str(format!(
+                        "{}/{}/{}/{}",
+                        source.stream_id, source.topic_id, source.partition_id, source.offset
+                    )),
+                ),
+            ])),
+        };
+        if let Err(error) = self
+            .sessions
+            .open(session)
+            .as_agent(agent.wire_id())
+            .fail(body)
+            .await
+        {
+            warn!(%error, %session, "failed to fail the session of a dead-lettered record");
+        }
     }
 
     // Encode and publish one dead-letter capsule, returning the outcome so the
@@ -1044,20 +1699,31 @@ impl<H> ReliableWorker<H> {
     }
 }
 
-impl<H> MessageConsumer for ReliableWorker<H>
+impl<H> ReliableWorker<H>
 where
     H: AgentHandler + Sync,
 {
+    // Handle one delivered record. `Err` only when a dead letter, a parking
+    // record, or a pause acknowledgment could not be published, so the
+    // record must stay uncommitted.
     #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(conversation = tracing::field::Empty, operation = "handle"))]
-    async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
-        let source = MessageId::new(received.partition_id, received.message.header.offset);
-        let decoded = match AgentMessage::from_received(received, self.understood_features) {
+    async fn consume(&self, received: &ConsumerMessage) -> Result<(), LaserError> {
+        self.deliver(received, true).await
+    }
+
+    // Handle one record. A live record passes the pause check, a held record
+    // replayed after the resume does not.
+    async fn deliver(&self, received: &ConsumerMessage, live: bool) -> Result<(), LaserError> {
+        let source = received.position;
+        let decoded = match AgentMessage::from_consumer(received, self.understood_features) {
             Ok(decoded) => decoded,
             Err((error, payload)) => {
                 warn!(%error, source = %source, "undecodable provenance, dead-lettering raw payload");
-                self.dead_letter_undecodable(source, payload)
-                    .await
-                    .map_err(|_| IggyError::Error)?;
+                let conversation = (!received.headers_malformed)
+                    .then(|| original_conversation(&received.headers))
+                    .flatten();
+                self.dead_letter_undecodable(source, conversation, payload)
+                    .await?;
                 return Ok(());
             }
         };
@@ -1096,6 +1762,16 @@ where
             return Ok(());
         }
 
+        // Dispatch classification, shared with every SDK and the session fold.
+        // Only work for an operation this handler serves reaches it. Replies,
+        // status, events, control, and records for another agent are skipped
+        // and still committed. The author is never a discriminator.
+        let dispatch = self.dispatch(&message);
+        if dispatch != Dispatch::Work {
+            debug!(source = %message.id, dispatch = dispatch.as_str(), "skipping a record that is not work for this agent");
+            return Ok(());
+        }
+
         // Mandatory signature verification on a verified (control or effect) topic.
         // An unsigned or unverified record is dead-lettered before any gate or
         // handler runs: the field is optional on the wire, so the only enforcement
@@ -1117,8 +1793,7 @@ where
                     0,
                     "signature verification failed",
                 )
-                .await
-                .map_err(|_| IggyError::Error)?;
+                .await?;
                 return Ok(());
             };
             // A verified signature proves who authored the envelope, not that
@@ -1141,6 +1816,47 @@ where
                 }
             }
             message.verified_principal = Some(verified.principal);
+        }
+
+        // The pause check (D7a), before the fence and dedup gates so a held
+        // record keeps its slot for the resume. Work for a paused session is
+        // parked on the session lane and committed. A resumed session handles
+        // its held records first. The session gate stays held through the
+        // handler, so a pause acknowledgment follows the record in flight.
+        let _gate = match (&self.pause, live) {
+            (Some(pause), true) => {
+                let gate = pause.gate(message.provenance.conversation_id).await;
+                if pause.hold(self, &message).await? == Hold::Commit {
+                    return Ok(());
+                }
+                Some(gate)
+            }
+            _ => None,
+        };
+
+        // The budget check (D9), on a deployment that indexes sessions: work
+        // for a session over its budget ends the session failed with reason
+        // `budget`, once, and is committed without reaching the handler.
+        if let Some(agent) = &self.agent {
+            let session = message.provenance.conversation_id;
+            let admitted = self
+                .budget
+                .admit(
+                    &self.sessions,
+                    session,
+                    received.partition_id,
+                    received.current_offset,
+                    || {
+                        let mut lens = self.sessions.open(session).as_agent(agent.wire_id());
+                        lens.control = Some(Arc::clone(&self.control));
+                        lens
+                    },
+                )
+                .await;
+            if !admitted {
+                debug!(source = %message.id, "skipping work for a session over its budget");
+                return Ok(());
+            }
         }
 
         // Fence gate, ordered BEFORE dedup. A log-resident effect carrying a fence
@@ -1185,8 +1901,7 @@ where
                 0,
                 "message past its deadline",
             )
-            .await
-            .map_err(|_| IggyError::Error)?;
+            .await?;
             return Ok(());
         }
 
@@ -1217,6 +1932,10 @@ where
             }
         }
 
+        // Picking up the first command of a submitted session marks the
+        // session working and keeps it listed in this process's heartbeat
+        // while the handler runs.
+        let _pickup = self.pick_up_submitted(&message).await;
         let ctx = AgentCtx::new(
             &self.laser,
             &message,
@@ -1225,7 +1944,9 @@ where
             self.inbox_route.clone(),
             #[cfg(feature = "sign")]
             self.signing_key.clone(),
-        );
+        )
+        .with_request_at(self.log_position(message.id))
+        .with_sessions(self.sessions.clone(), Arc::clone(&self.control));
         // Middleware `before_handle` runs once, in order, before the retry loop.
         // A rejection there dead-letters the message without ever running the
         // handler (the auth/gatekeeping use), so it is a non-retryable stop.
@@ -1233,14 +1954,27 @@ where
             if let Err(error) = middleware.before_handle(&message).await {
                 warn!(%error, source = %message.id, "middleware rejected message before handling, dead-lettering");
                 self.dead_letter(&message, DeadLetterReason::Rejected, 0, &error.to_string())
-                    .await
-                    .map_err(|_| IggyError::Error)?;
+                    .await?;
                 return Ok(());
             }
         }
         let mut attempt = 0;
         loop {
-            let result = self.handler.handle(&message, &ctx).await;
+            // A panicking handler becomes a non-retryable error, so the record
+            // dead-letters as rejected and the consumer keeps running.
+            let result = std::panic::AssertUnwindSafe(self.handler.handle(&message, &ctx))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    let reason = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_owned());
+                    Err(LaserError::HandlerConfig(format!(
+                        "handler panicked: {reason}"
+                    )))
+                });
             // `after_handle` sees every attempt's outcome and one-based number, so a
             // metrics middleware counts retries, successes, and terminal failures.
             for middleware in &self.middleware {
@@ -1262,8 +1996,7 @@ where
                             attempt + 1,
                             &error.to_string(),
                         )
-                        .await
-                        .map_err(|_| IggyError::Error)?;
+                        .await?;
                         return Ok(());
                     }
                     if attempt + 1 >= self.retry.max_attempts {
@@ -1274,8 +2007,7 @@ where
                             attempt + 1,
                             &error.to_string(),
                         )
-                        .await
-                        .map_err(|_| IggyError::Error)?;
+                        .await?;
                         return Ok(());
                     }
                     warn!(%error, source = %message.id, attempt = attempt + 1, "handler failed, retrying");
@@ -1287,6 +2019,18 @@ where
     }
 }
 
+impl<H> Replay for ReliableWorker<H>
+where
+    H: AgentHandler + Sync,
+{
+    fn replay<'a>(
+        &'a self,
+        received: &'a ConsumerMessage,
+    ) -> futures::future::BoxFuture<'a, Result<(), LaserError>> {
+        Box::pin(self.deliver(received, false))
+    }
+}
+
 // Pre-fills the dedup window from each partition so a freshly started consumer
 // recognizes duplicates of messages it processed before the restart. Reads only
 // up to the group's stored (already-consumed) offset and at most `depth` per
@@ -1294,19 +2038,18 @@ where
 // and cause them to be skipped (data loss).
 async fn warm_dedup_window(
     laser: &Laser,
-    group: &str,
-    topic: &str,
+    settings: &ReliableConsumer,
     dedup: &dyn Deduplicator,
-    depth: usize,
 ) -> Result<(), LaserError> {
     let stream = Identifier::named(laser.stream_required()?)?;
-    let topic_id = Identifier::named(topic)?;
+    let topic_id = Identifier::named(&settings.topic)?;
     let Some(details) = laser.client().get_topic(&stream, &topic_id).await? else {
         return Ok(());
     };
-    let group_consumer = Consumer::group(Identifier::named(group)?);
-    let reader = Consumer::new(Identifier::named("laser-dedup-warmer")?);
-    let depth = u64::try_from(depth).unwrap_or(u64::MAX);
+    let group_consumer =
+        iggy::prelude::Consumer::group(Identifier::named(settings.group.as_str())?);
+    let reader = iggy::prelude::Consumer::new(Identifier::named("laser-dedup-warmer")?);
+    let depth = u64::try_from(settings.dedup_window).unwrap_or(u64::MAX);
     for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
         let Some(offset) = laser
             .client()
@@ -1335,14 +2078,43 @@ async fn warm_dedup_window(
             if message.header.offset > stored {
                 continue;
             }
-            if let Ok(provenance) = Provenance::try_from(&message)
-                && let Some(key) = dedup_key(&provenance)
-            {
+            if let Some(key) = warm_dedup_key(
+                &message,
+                settings.agent.as_ref(),
+                settings.understood_features,
+                #[cfg(feature = "sign")]
+                settings.verifier.as_deref(),
+            ) {
                 dedup.observe(&key).await;
             }
         }
     }
     Ok(())
+}
+
+fn warm_dedup_key(
+    message: &IggyMessage,
+    agent: Option<&AgentId>,
+    understood_features: u64,
+    #[cfg(feature = "sign")] verifier: Option<&crate::sign::KeyRegistry>,
+) -> Option<String> {
+    let decoded = decode_agent_record(message, understood_features).ok()?;
+    if let (Some(target), Some(agent)) = (&decoded.provenance.target_agent_id, agent)
+        && target != agent
+    {
+        return None;
+    }
+    #[cfg(feature = "sign")]
+    if let Some(registry) = verifier {
+        registry
+            .verify_observed_at(
+                decoded.envelope.as_ref()?,
+                decoded.signature_context.as_ref()?,
+                decoded.observed_at_micros,
+            )
+            .ok()?;
+    }
+    dedup_key(&decoded.provenance)
 }
 
 /// The dedup seam: decides whether an idempotency key has been seen before. The
@@ -1414,6 +2186,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn given_an_agdx_command_when_warming_dedup_then_should_restore_the_scoped_key() {
+        let envelope = AgentEnvelope::command(
+            laser_wire::agent::RecordId::from_u128(3),
+            laser_wire::agent::ConversationId::from_u128(1),
+            "author".parse().expect("source parses"),
+            laser_wire::agent::CorrelationId::from_u128(2),
+            b"work".to_vec(),
+        )
+        .with_operation(laser_wire::agent::OPERATION_CHAT)
+        .with_target("worker".parse().expect("target parses"))
+        .with_idempotency_key("attempt-1".parse().expect("key parses"));
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::from_str(AGENT_VERSION).expect("version key"),
+            HeaderValue::from(AGENT_OP_VERSION),
+        );
+        let message = IggyMessage::builder()
+            .payload(bytes::Bytes::from(
+                encode_named(&envelope).expect("envelope encodes"),
+            ))
+            .user_headers(headers)
+            .build()
+            .expect("message builds");
+        let worker: AgentId = "worker".parse().expect("worker parses");
+        let other: AgentId = "other".parse().expect("other parses");
+
+        assert_eq!(
+            warm_dedup_key(
+                &message,
+                Some(&worker),
+                features::NONE,
+                #[cfg(feature = "sign")]
+                None,
+            ),
+            Some(format!("author{DEDUP_SCOPE_SEP}attempt-1"))
+        );
+        assert!(
+            warm_dedup_key(
+                &message,
+                Some(&other),
+                features::NONE,
+                #[cfg(feature = "sign")]
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn given_a_small_positive_fence_when_decoded_then_should_preserve_the_token() {
         let envelope = AgentEnvelope::command(
             laser_wire::agent::RecordId::from_u128(3),
@@ -1425,6 +2246,29 @@ mod tests {
         .with_metadata(FENCE, laser_wire::query::Value::Int(7));
 
         assert_eq!(provenance_from_envelope(&envelope).fence_token, Some(7));
+    }
+
+    #[test]
+    fn given_an_envelope_with_usage_when_decoded_then_should_keep_token_counts() {
+        let envelope = AgentEnvelope::command(
+            laser_wire::agent::RecordId::from_u128(3),
+            laser_wire::agent::ConversationId::from_u128(1),
+            "author".parse().expect("agent id parses"),
+            laser_wire::agent::CorrelationId::from_u128(2),
+            b"work".to_vec(),
+        )
+        .with_operation(laser_wire::agent::OPERATION_CHAT)
+        .with_usage(laser_wire::agent::TokenUsage {
+            input_tokens: 13,
+            output_tokens: 21,
+            ..Default::default()
+        });
+
+        let usage = provenance_from_envelope(&envelope)
+            .usage
+            .expect("usage should be preserved");
+        assert_eq!(usage.input_tokens, Some(13));
+        assert_eq!(usage.output_tokens, Some(21));
     }
 
     #[test]

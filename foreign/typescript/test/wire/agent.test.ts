@@ -11,12 +11,35 @@ import {
   decodeAgentDeadLetter,
   decodeAgentErrorBody,
   decodeAgentPresence,
+  decodeSessionEnd,
+  decodeSessionParking,
+  decodeSessionPauseRequestJson,
+  encodeSessionParking,
+  encodeSessionPauseRequestJson,
+  validateSessionParking,
+  decodeContextManifest,
+  decodeContextCompaction,
+  decodeContextRetrieval,
+  decodeStateDelta,
+  decodeStateSnapshot,
+  decodeSessionStart,
+  decodeSessionTransition,
+  decodeTokenUsage,
   decodeBodyRef,
   decodeSignature,
   encodeAgentCard,
   encodeAgentDeadLetter,
   encodeAgentErrorBody,
   encodeAgentPresence,
+  encodeSessionEnd,
+  encodeContextManifest,
+  encodeContextCompaction,
+  encodeContextRetrieval,
+  encodeStateDelta,
+  encodeStateSnapshot,
+  encodeSessionStart,
+  encodeSessionTransition,
+  encodeTokenUsage,
   encodeBodyRef,
   encodeSignature,
   healthCode,
@@ -25,13 +48,20 @@ import {
   parseAgentId,
   parseAgentKind,
   parseIdempotencyKey,
+  sessionStatusFromWire,
+  OPERATION_SESSION,
+  statusEnvelope,
+  withTaskState,
   taskStateCode,
   taskStateDisplay,
   taskStateFromCode,
   taskStateIsTerminal,
-  validateAgentPresence
+  validateAgentEnvelope,
+  validateAgentPresence,
+  type SessionStart
 } from "../../src/wire/agent.js"
-import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
+import { decodeOne, encodeNamed, encodeOne, expectMap } from "../../src/wire/cbor.js"
+import { ConversationId, RecordId, decodeSessionRef, encodeSessionRef } from "../../src/wire/ids.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
 
@@ -63,7 +93,8 @@ void test("given_task_state_codes_when_mapped_then_should_match_the_pinned_dicti
     ["Failed", 6, "failed", true],
     ["Rejected", 7, "rejected", true],
     ["AuthRequired", 8, "auth-required", false],
-    ["Unknown", 9, "unknown", false]
+    ["Unknown", 9, "unknown", false],
+    ["Paused", 10, "paused", false]
   ]
   for (const [name, code, display, terminal] of expected) {
     const state = taskStateFromCode(code)
@@ -78,6 +109,171 @@ void test("given_task_state_codes_when_mapped_then_should_match_the_pinned_dicti
   assert.equal(taskStateCode(future), 42)
   assert.equal(taskStateDisplay(future), "unrecognized-42")
   assert.equal(taskStateIsTerminal(future), false)
+})
+
+void test("given_session_bodies_when_encoded_then_should_round_trip_and_validate_status", () => {
+  const start: SessionStart = {
+    label: "Research",
+    namespace: "agents",
+    agent: parseAgentId("planner"),
+    sdk: { language: "typescript", version: "0.7.0" },
+    idleTimeoutMicros: 300_000_000n,
+    budget: { tokens: 1000n },
+    tags: ["demo"]
+  }
+  const body = encodeNamed(encodeSessionStart(start))
+  assert.deepEqual(decodeSessionStart(expectMap(decodeOne(body, "start"), "start"), "start"), start)
+  const conversation = ConversationId.fromU128(2n)
+  const source = parseAgentId("planner")
+  const submitted = {
+    ...withTaskState(
+      statusEnvelope(RecordId.fromU128(1n), conversation, source, OPERATION_SESSION),
+      { kind: "known", name: "Submitted" }
+    ),
+    body
+  }
+  validateAgentEnvelope(submitted)
+  assert.throws(() => {
+    validateAgentEnvelope({ ...submitted, parent: ConversationId.fromU128(8n) })
+  })
+  const transition = encodeNamed(encodeSessionTransition({ actor: source }))
+  assert.deepEqual(
+    decodeSessionTransition(
+      expectMap(decodeOne(transition, "transition"), "transition"),
+      "transition"
+    ),
+    { actor: source }
+  )
+  validateAgentEnvelope({
+    ...submitted,
+    taskState: { kind: "known", name: "Paused" },
+    body: transition
+  })
+  const end = encodeNamed(encodeSessionEnd({ reason: "done" }))
+  assert.deepEqual(decodeSessionEnd(expectMap(decodeOne(end, "end"), "end"), "end"), {
+    reason: "done"
+  })
+  assert.throws(() => {
+    validateAgentEnvelope({
+      ...submitted,
+      taskState: { kind: "known", name: "Completed" },
+      body: end
+    })
+  })
+  validateAgentEnvelope({
+    ...submitted,
+    taskState: { kind: "known", name: "Completed" },
+    body: end,
+    last: true
+  })
+  assert.equal(sessionStatusFromWire("paused"), "paused")
+  assert.equal(sessionStatusFromWire("future"), "unrecognized")
+})
+
+void test("given_session_fixtures_when_decoded_then_should_re_encode_byte_identically", async () => {
+  const start = await roundTrip("agent_session_start.bin", decodeSessionStart, encodeSessionStart)
+  assert.equal(start.sdk.version, "0.7.0")
+  const transition = await roundTrip(
+    "agent_session_transition.bin",
+    decodeSessionTransition,
+    encodeSessionTransition
+  )
+  assert.equal(transition.acknowledges?.offset, 9n)
+  const end = await roundTrip("agent_session_end.bin", decodeSessionEnd, encodeSessionEnd)
+  assert.equal(end.reason, "done")
+  const parking = await roundTrip(
+    "agent_session_parking.bin",
+    decodeSessionParking,
+    encodeSessionParking
+  )
+  validateSessionParking(parking)
+  assert.equal(parking.source.kind === "message" ? parking.source.offset : undefined, 41n)
+  assert.equal(parking.request.offset, 7n)
+  assert.throws(() => {
+    validateSessionParking({ ...parking, source: { kind: "memory", id: "m" } })
+  })
+  assert.deepEqual(decodeSessionPauseRequestJson(new TextEncoder().encode("{}")), {
+    participants: []
+  })
+  const named = { participants: [parseAgentId("worker")] }
+  assert.equal(encodeSessionPauseRequestJson(named), '{"participants":["worker"]}')
+  assert.deepEqual(
+    decodeSessionPauseRequestJson(new TextEncoder().encode(encodeSessionPauseRequestJson(named))),
+    named
+  )
+  const statusBytes = await readFixture("agent_session_status.bin")
+  const status = decodeOne(statusBytes, "agent_session_status.bin")
+  assert.equal(status, "paused")
+  if (typeof status !== "string") throw new Error("session status fixture must be a string")
+  assert.equal(sessionStatusFromWire(status), "paused")
+  assert.deepEqual(Buffer.from(encodeOne(status)), Buffer.from(statusBytes))
+  const ref = await roundTrip("session_ref.bin", decodeSessionRef, encodeSessionRef)
+  assert.equal(ref.stream, "alpha")
+  assert.equal(ref.session.asU128(), 3n)
+  const usage = await roundTrip("agent_usage_cost.bin", decodeTokenUsage, encodeTokenUsage)
+  assert.equal(usage.costMicros, 12_500n)
+})
+
+void test("given_context_and_state_fixtures_when_decoded_then_should_match_rust_bytes", async () => {
+  const manifest = await roundTrip(
+    "context_manifest.bin",
+    decodeContextManifest,
+    encodeContextManifest
+  )
+  assert.equal(manifest.fragments.length, 2)
+  const compaction = await roundTrip(
+    "context_compaction.bin",
+    decodeContextCompaction,
+    encodeContextCompaction
+  )
+  assert.equal(compaction.summarizer.name, "summarizer")
+  const retrievalBytes = await readFixture("context_retrieval.bin")
+  const retrieval = decodeContextRetrieval(
+    expectMap(decodeOne(retrievalBytes, "context_retrieval"), "context_retrieval"),
+    "context_retrieval"
+  )
+  assert.equal(retrieval.items[0]?.[1], 0.5)
+  assert.deepEqual(
+    Buffer.from(encodeNamed(encodeContextRetrieval(retrieval), { forceFloatNumbers: true })),
+    Buffer.from(retrievalBytes)
+  )
+  const delta = await roundTrip("state_delta.bin", decodeStateDelta, encodeStateDelta)
+  assert.equal(delta.opId, "patch-4")
+  const snapshot = await roundTrip("state_snapshot.bin", decodeStateSnapshot, encodeStateSnapshot)
+  assert.equal(snapshot.baseRevision, 4n)
+})
+
+void test("given_invalid_context_digest_or_patch_op_when_encoded_then_should_reject", async () => {
+  const manifest = await roundTrip(
+    "context_manifest.bin",
+    decodeContextManifest,
+    encodeContextManifest
+  )
+  const memory = manifest.fragments.find((fragment) => fragment.kind === "memory")
+  assert.ok(memory)
+  assert.throws(() =>
+    encodeContextManifest({
+      ...manifest,
+      fragments: [{ ...memory, digest: new Uint8Array(31) }]
+    })
+  )
+  const delta = await roundTrip("state_delta.bin", decodeStateDelta, encodeStateDelta)
+  assert.throws(() =>
+    encodeStateDelta({ ...delta, patch: [{ op: "unknown", path: "/a" }] as never })
+  )
+})
+
+void test("given_inexact_state_integer_when_encoded_then_should_reject", () => {
+  assert.throws(() =>
+    encodeStateSnapshot({ baseRevision: 0n, document: { large: 9_007_199_254_740_992 } })
+  )
+  assert.throws(() =>
+    encodeStateDelta({
+      baseRevision: 0n,
+      patch: [{ op: "add", path: "/large", value: 9_007_199_254_740_992 }],
+      opId: "patch-1"
+    })
+  )
 })
 
 void test("given_agent_id_strings_when_parsed_then_should_accept_printable_and_reject_control_or_empty", () => {

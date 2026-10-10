@@ -26,6 +26,7 @@ import { AGDX_GET_CLIENTS_METADATA_CODE, CLIENT_METADATA_OP_VERSION } from "../w
 import { MAX_PAGE_SIZE } from "../wire/limits.js"
 import { KeyKind, type KeyRegistry } from "../signing.js"
 import { decodeAgentMessage } from "./reliable-consumer.js"
+import { compareCodePoints } from "../runtime/compare.js"
 
 const PRESENCE_TTL_MICROS = 2_000_000n
 const APPLIED_FACT_CAPACITY = 16_384
@@ -318,8 +319,10 @@ export class AgentRegistry {
     }
   }
 
+  /** Every registered card, ordered by agent id in byte order like Rust, so
+   * `RoutePolicy` `any` and ranking ties pick the same agent in every SDK. */
   agents(): readonly RegisteredCard[] {
-    return [...this.cards.values()]
+    return [...this.cards.values()].sort(byAgentId)
   }
 
   lookup(agent: AgentId): RegisteredCard | undefined {
@@ -327,7 +330,7 @@ export class AgentRegistry {
   }
 
   resolve(skillId: string, nowMicros: bigint = this.nowMicros()): readonly RegisteredCard[] {
-    return [...this.cards.values()].filter(
+    return this.agents().filter(
       (card) =>
         cardAvailableFor(card, skillId) &&
         cardIsFresh(card, nowMicros) &&
@@ -383,4 +386,8 @@ export class AgentRegistry {
       this.cache.presenceReadAtMicros = this.presenceReadAtMicros
     }
   }
+}
+
+function byAgentId(left: RegisteredCard, right: RegisteredCard): number {
+  return compareCodePoints(left.agent.asStr(), right.agent.asStr())
 }

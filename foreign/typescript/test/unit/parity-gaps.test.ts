@@ -273,7 +273,7 @@ void test("given_expiry_only_when_a_producer_provisions_then_should_use_create_i
       return Promise.resolve()
     }
   } as unknown as LaserTransport
-  await Producer.create(transport, "fleet", "readings", { expireAfterMicros: 1_000_000n }).send(
+  await Producer.create(transport, "fleet", "readings", { expireAfterMs: 1_000 }).send(
     new Uint8Array([1])
   )
   assert.deepEqual(created, [{ messageExpiryMicros: 1_000_000n }])
@@ -532,7 +532,7 @@ void test("given_a_message_expiry_when_the_transport_cannot_set_it_then_should_r
     ensureTopic: () => Promise.resolve()
   } as unknown as LaserTransport
   const producer = Producer.create(transport, "fleet", "readings", {
-    expireAfterMicros: 1_000_000n
+    expireAfterMs: 1_000
   })
   await assert.rejects(producer.send(new Uint8Array([1])), (error: unknown) => {
     assert.ok(error instanceof PublishFailedError)
@@ -561,7 +561,7 @@ function agdxOver(transport: LaserTransport) {
   return createAgdx(
     transport,
     "agents",
-    "agent.commands",
+    "agent.sessions",
     AgentId.new("source-agent"),
     ConversationId.derive("claim-check")
   )
@@ -645,7 +645,7 @@ class KindMemory implements Memory {
   }
 
   recall(): Promise<readonly MemoryItem[]> {
-    return Promise.resolve(this.items)
+    return Promise.resolve([...this.items].reverse())
   }
 
   improve(): Promise<MemoryId> {
@@ -692,7 +692,7 @@ void test("given_a_summarizer_when_consolidated_then_should_fold_only_the_messag
   assert.deepEqual(report, { summarized: 2, reweighted: 0, pruned: 0, derived: 0 })
   assert.deepEqual(
     store.remembered.map((body) => new TextDecoder().decode(body)),
-    ["cpu 82+cpu 91"]
+    ["cpu 91+cpu 82"]
   )
   assert.equal(store.forgotten.length, 0)
 })
@@ -716,7 +716,7 @@ void test("given_prune_summarized_when_consolidated_then_should_forget_the_folde
   assert.deepEqual(report, { summarized: 2, reweighted: 0, pruned: 3, derived: 0 })
   assert.deepEqual(
     store.forgotten.map((id) => id.asU128()),
-    [items[0], items[2], items[1]].map((entry) => entry?.id.asU128())
+    [items[2], items[0], items[1]].map((entry) => entry?.id.asU128())
   )
 })
 

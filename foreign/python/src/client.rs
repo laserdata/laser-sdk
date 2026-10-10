@@ -1,5 +1,5 @@
 use crate::async_bridge::future_into_py;
-use crate::convert::{duration_seconds, py_to_de};
+use crate::convert::{duration_ms, py_to_de};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::PyKeyRegistry;
 use laser_sdk::capabilities::{
@@ -33,21 +33,19 @@ constants! {
     "DEFAULT_LINGER_MS": u128 = laser_sdk::batching::DEFAULT_LINGER.as_millis(),
     "MIN_LINGER_MS": u128 = laser_sdk::batching::MIN_LINGER.as_millis(),
     "DEFAULT_KEY_NAMESPACE": &str = laser_sdk::sign::DEFAULT_KEY_NAMESPACE,
-    "DEFAULT_ATTEMPT_TIMEOUT_SECS": f64 = laser_sdk::kv::DEFAULT_ATTEMPT_TIMEOUT.as_secs_f64(),
+    "DEFAULT_ATTEMPT_TIMEOUT_MS": u128 = laser_sdk::kv::DEFAULT_ATTEMPT_TIMEOUT.as_millis(),
     "DEFAULT_SNAPSHOT_NAMESPACE": &str = laser_sdk::snapshot::DEFAULT_SNAPSHOT_NAMESPACE,
     "DEFAULT_SNAPSHOT_TOPIC": &str = laser_sdk::snapshot::DEFAULT_SNAPSHOT_TOPIC,
-    "DEFAULT_MEMORY_TOPIC_TTL_SECS": f64 = laser_sdk::memory::DEFAULT_MEMORY_TOPIC_TTL.as_secs_f64(),
+    "DEFAULT_MEMORY_TOPIC_TTL_MS": u128 = laser_sdk::memory::DEFAULT_MEMORY_TOPIC_TTL.as_millis(),
     "POLICY_DECISION_OPERATION": &str = laser_sdk::govern::POLICY_DECISION_OPERATION,
     "A2A_PROTOCOL_VERSION": &str = laser_sdk::a2a::A2A_PROTOCOL_VERSION,
     "A2A_JSONRPC_BINDING": &str = laser_sdk::a2a::A2A_JSONRPC_BINDING,
-    "DEFAULT_OUTCOME_WAIT_SECS": f64 = laser_sdk::filters::DEFAULT_OUTCOME_WAIT.as_secs_f64(),
+    "DEFAULT_OUTCOME_WAIT_MS": u128 = laser_sdk::filters::DEFAULT_OUTCOME_WAIT.as_millis(),
     "FILTER_EVALUATOR_VERSION": u32 = laser_sdk::filters::FILTER_EVALUATOR_VERSION,
     "FINISH_REASON_ABANDONED": &str = laser_sdk::agent::FINISH_REASON_ABANDONED,
     "FINISH_REASON_GAP": &str = laser_sdk::agent::FINISH_REASON_GAP,
-    "DEFAULT_SESSION_TOPICS": Vec<&str> = laser_sdk::agent::DEFAULT_SESSION_TOPICS
-        .iter()
-        .filter_map(|topic| topic.name())
-        .collect(),
+    "DEFAULT_SESSION_IDLE_TIMEOUT_MS": u128 = laser_sdk::agent::DEFAULT_SESSION_IDLE_TIMEOUT.as_millis(),
+    "DEFAULT_SESSION_HEARTBEAT_MS": u128 = laser_sdk::agent::DEFAULT_SESSION_HEARTBEAT.as_millis(),
     "DEFAULT_SESSION_MEMORY_NAMESPACE": &str = laser_sdk::agent::DEFAULT_SESSION_MEMORY_NAMESPACE,
     "DEFAULT_SESSION_CONTEXT_TURNS": usize = laser_sdk::agent::DEFAULT_SESSION_CONTEXT_TURNS,
     "DEFAULT_SESSION_CONTEXT_TOKENS": usize = laser_sdk::agent::DEFAULT_SESSION_CONTEXT_TOKENS,
@@ -201,7 +199,7 @@ impl PyLaser {
     /// or never answered the login.
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (connection_string=None, *, address=None, credentials=None, stream=None, ops_stream=None, control_topic=None, dlq_topic=None, changes_topic=None, verifier=None, capabilities=None, governor=None, governor_mode=None, governor_retention=None, connect_timeout_ms=None, publish_timeout_ms=None, publish_max_retries=None, publish_retry_backoff_ms=None))]
+    #[pyo3(signature = (connection_string=None, *, address=None, credentials=None, stream=None, ops_stream=None, control_topic=None, dlq_topic=None, changes_topic=None, verifier=None, capabilities=None, governor=None, governor_mode=None, governor_retention=None, connect_timeout_ms=None, publish_timeout_ms=None, publish_max_retries=None, publish_retry_backoff_ms=None, resource_naming=None))]
     fn connect<'py>(
         py: Python<'py>,
         connection_string: Option<String>,
@@ -221,6 +219,7 @@ impl PyLaser {
         publish_timeout_ms: Option<u64>,
         publish_max_retries: Option<u32>,
         publish_retry_backoff_ms: Option<u64>,
+        resource_naming: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let verifier = verifier.map(PyKeyRegistry::snapshot);
         let capabilities = capabilities.map(|value| value.inner.clone());
@@ -235,6 +234,9 @@ impl PyLaser {
         };
         future_into_py(py, async move {
             let mut builder = Laser::builder();
+            if let Some(naming) = resource_naming {
+                builder = builder.resource_naming(parse_resource_naming(&naming)?);
+            }
             if let Some(value) = connection_string {
                 builder = builder.connection_string(value);
             }
@@ -363,7 +365,7 @@ impl PyLaser {
     /// intended for bring-your-own backends and deterministic pre-gate tests.
     /// Omitted fields preserve the current capability set.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, agent_workflow=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, query_execution=None, versions=None, backends=None))]
+    #[pyo3(signature = (*, managed=None, query=None, query_consistency=None, query_keyword=None, destinations=None, destinations_consistency=None, kv=None, kv_cas=None, kv_cas_fenced=None, kv_fenced_leases=None, graph=None, forks=None, sessions=None, stream_tenancy=None, watch=None, authz=None, filters=None, filters_catalog=None, filters_group_policy_reads=None, a2a_gateway=None, query_execution=None, versions=None, backends=None))]
     fn with_capabilities<'py>(
         &self,
         py: Python<'py>,
@@ -379,7 +381,8 @@ impl PyLaser {
         kv_fenced_leases: Option<bool>,
         graph: Option<bool>,
         forks: Option<bool>,
-        agent_workflow: Option<bool>,
+        sessions: Option<bool>,
+        stream_tenancy: Option<bool>,
         watch: Option<bool>,
         authz: Option<bool>,
         filters: Option<bool>,
@@ -440,8 +443,11 @@ impl PyLaser {
             if let Some(value) = forks {
                 capabilities.forks = value;
             }
-            if let Some(value) = agent_workflow {
-                capabilities.agent_workflow = value;
+            if let Some(value) = sessions {
+                capabilities.sessions = value;
+            }
+            if let Some(value) = stream_tenancy {
+                capabilities.stream_tenancy = value;
             }
             if let Some(value) = watch {
                 capabilities.watch = value;
@@ -505,6 +511,8 @@ impl PyLaser {
     }
 
     /// The capability set this client negotiated with the connected infrastructure.
+    /// A set without a managed plane is probed again when it is at least one second
+    /// old, so a plane that was not ready at connect is picked up.
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -523,9 +531,9 @@ impl PyLaser {
     fn wait_until_ready<'py>(
         &self,
         py: Python<'py>,
-        timeout_secs: f64,
+        timeout_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let timeout = duration_seconds(timeout_secs, "timeout_secs")?;
+        let timeout = duration_ms(timeout_ms, "timeout_ms")?;
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner
@@ -662,10 +670,13 @@ pub struct PyCapabilities {
     /// Managed copy-on-write forks are served.
     #[pyo3(get)]
     pub forks: bool,
-    /// The managed run registry is served (`Laser.runs()` submit / cancel /
-    /// status / list, and `registered=True` workflows).
+    /// Managed session reads are served.
     #[pyo3(get)]
-    pub agent_workflow: bool,
+    pub sessions: bool,
+    /// Every managed name is scoped to one stream, and each stream's change
+    /// feed rides its own ops topic.
+    #[pyo3(get)]
+    pub stream_tenancy: bool,
     /// The change feed is published (`Laser.watch()`).
     #[pyo3(get)]
     pub watch: bool,
@@ -845,7 +856,8 @@ impl From<Capabilities> for PyCapabilities {
             kv: PyKvCaps::from(value.kv),
             graph: value.graph,
             forks: value.forks,
-            agent_workflow: value.agent_workflow,
+            sessions: value.sessions,
+            stream_tenancy: value.stream_tenancy,
             watch: value.watch,
             authz: value.authz,
             filters: PyFilterCaps::from(value.filters),
@@ -1284,4 +1296,44 @@ fn serde_word<T: serde::Serialize>(value: &T) -> String {
 fn serde_word_value<T: serde::de::DeserializeOwned>(word: &str, label: &str) -> PyResult<T> {
     serde_json::from_value(serde_json::Value::String(word.to_owned()))
         .map_err(|_| InvalidError::new_err(format!("unknown {label} '{word}'")))
+}
+
+// A `resource_naming` word: `stream` scopes managed names to the default
+// stream, `bare` sends them as written.
+pub(crate) fn parse_resource_naming(value: &str) -> PyResult<laser_sdk::laser::ResourceNaming> {
+    match value {
+        "stream" => Ok(laser_sdk::laser::ResourceNaming::Stream),
+        "bare" => Ok(laser_sdk::laser::ResourceNaming::Bare),
+        other => Err(crate::errors::InvalidError::new_err(format!(
+            "unknown resource naming '{other}' (expected stream or bare)"
+        ))),
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyLaser {
+    /// A clone that names managed resources by `naming`: `stream` scopes every
+    /// managed name to the default stream (`stream:<stream>/<name>`), `bare`
+    /// sends names as written.
+    fn with_resource_naming(&self, naming: &str) -> PyResult<PyLaser> {
+        Ok(PyLaser::from_inner(
+            self.inner
+                .with_resource_naming(parse_resource_naming(naming)?),
+        ))
+    }
+
+    /// How this handle names managed resources, `stream` or `bare`.
+    #[getter]
+    fn resource_naming(&self) -> &'static str {
+        match self.inner.resource_naming() {
+            laser_sdk::laser::ResourceNaming::Stream => "stream",
+            laser_sdk::laser::ResourceNaming::Bare => "bare",
+        }
+    }
+
+    /// The name `name` is sent as under this handle's naming.
+    fn resource_name(&self, name: &str) -> String {
+        self.inner.resource_name(name)
+    }
 }

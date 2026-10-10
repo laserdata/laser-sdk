@@ -230,8 +230,10 @@ pub struct ProducerBuilder {
     create_stream: bool,
     create_topic: bool,
     partitions: u32,
-    expiry: IggyExpiry,
-    max_topic_size: MaxTopicSize,
+    expire_after: Option<Duration>,
+    never_expire: bool,
+    max_topic_bytes: Option<u64>,
+    unlimited_topic_size: bool,
     background: Option<BackgroundConfig>,
 }
 
@@ -248,8 +250,10 @@ impl ProducerBuilder {
             create_stream: true,
             create_topic: true,
             partitions: 1,
-            expiry: IggyExpiry::ServerDefault,
-            max_topic_size: MaxTopicSize::ServerDefault,
+            expire_after: None,
+            never_expire: false,
+            max_topic_bytes: None,
+            unlimited_topic_size: false,
             background: None,
         }
     }
@@ -303,28 +307,76 @@ impl ProducerBuilder {
         self
     }
 
+    /// Creates the topic with messages expiring after `expiry`, which must be
+    /// greater than zero. Set this or [`never_expire`](Self::never_expire), not
+    /// both, or [`build`](Self::build) fails with [`LaserError::Invalid`].
+    /// Without either the server default applies.
     #[must_use]
     pub fn expire_after(mut self, expiry: Duration) -> Self {
-        self.expiry = IggyExpiry::ExpireDuration(expiry.into());
+        self.expire_after = Some(expiry);
         self
     }
 
+    /// Creates the topic with messages that never expire. Set this or
+    /// [`expire_after`](Self::expire_after), not both.
     #[must_use]
     pub fn never_expire(mut self) -> Self {
-        self.expiry = IggyExpiry::NeverExpire;
+        self.never_expire = true;
         self
     }
 
+    /// Creates the topic capped at `payload` bytes, which must be greater than
+    /// zero. Set this or [`unlimited_topic_size`](Self::unlimited_topic_size),
+    /// not both, or [`build`](Self::build) fails with [`LaserError::Invalid`].
+    /// Without either the server default applies.
     #[must_use]
     pub fn max_topic_bytes(mut self, payload: u64) -> Self {
-        self.max_topic_size = MaxTopicSize::from(payload);
+        self.max_topic_bytes = Some(payload);
         self
     }
 
+    /// Creates the topic without a size limit. Set this or
+    /// [`max_topic_bytes`](Self::max_topic_bytes), not both.
     #[must_use]
     pub fn unlimited_topic_size(mut self) -> Self {
-        self.max_topic_size = MaxTopicSize::Unlimited;
+        self.unlimited_topic_size = true;
         self
+    }
+
+    // The topic expiry and size the builder settings ask for. Both forms of
+    // one setting is a conflict, as in Python and TypeScript.
+    fn topic_limits(&self) -> Result<(IggyExpiry, MaxTopicSize), LaserError> {
+        let expiry = match (self.expire_after, self.never_expire) {
+            (Some(_), true) => {
+                return Err(LaserError::Invalid(
+                    "producer takes expire_after or never_expire, not both".to_owned(),
+                ));
+            }
+            (Some(age), false) if age.is_zero() => {
+                return Err(LaserError::Invalid(
+                    "producer expire_after must be greater than zero".to_owned(),
+                ));
+            }
+            (Some(age), false) => IggyExpiry::ExpireDuration(age.into()),
+            (None, true) => IggyExpiry::NeverExpire,
+            (None, false) => IggyExpiry::ServerDefault,
+        };
+        let max_topic_size = match (self.max_topic_bytes, self.unlimited_topic_size) {
+            (Some(_), true) => {
+                return Err(LaserError::Invalid(
+                    "producer takes max_topic_bytes or unlimited_topic_size, not both".to_owned(),
+                ));
+            }
+            (Some(0), false) => {
+                return Err(LaserError::Invalid(
+                    "producer max_topic_bytes must be greater than zero".to_owned(),
+                ));
+            }
+            (Some(bytes), false) => MaxTopicSize::from(bytes),
+            (None, true) => MaxTopicSize::Unlimited,
+            (None, false) => MaxTopicSize::ServerDefault,
+        };
+        Ok((expiry, max_topic_size))
     }
 
     /// Switches to Apache Iggy's buffered, sharded `background` send mode
@@ -340,6 +392,7 @@ impl ProducerBuilder {
     }
 
     pub async fn build(self) -> Result<Producer, LaserError> {
+        let (expiry, max_topic_size) = self.topic_limits()?;
         if self.background.is_none() && self.batch_length == 0 {
             return Err(LaserError::Invalid(
                 "producer batch length must be greater than zero".to_owned(),
@@ -388,7 +441,7 @@ impl ProducerBuilder {
             builder.do_not_create_stream_if_not_exists()
         };
         builder = if self.create_topic {
-            builder.create_topic_if_not_exists(self.partitions, self.expiry, self.max_topic_size)
+            builder.create_topic_if_not_exists(self.partitions, expiry, max_topic_size)
         } else {
             builder.do_not_create_topic_if_not_exists()
         };
@@ -401,7 +454,7 @@ impl ProducerBuilder {
                         self.topic.laser.publish_generation(),
                         std::sync::atomic::Ordering::Release,
                     );
-                    Ok(producer.init().await?)
+                    Ok(crate::laser::init_producer(&producer).await?)
                 },
                 || {
                     self.topic
@@ -635,6 +688,7 @@ pub struct ConsumerBuilder {
     polling_retry_interval: Duration,
     init_retries: Option<(u32, Duration)>,
     allow_replay: bool,
+    native: bool,
 }
 
 impl ConsumerBuilder {
@@ -668,7 +722,17 @@ impl ConsumerBuilder {
             polling_retry_interval: DEFAULT_RETRY_INTERVAL,
             init_retries: None,
             allow_replay: false,
+            native: false,
         }
+    }
+
+    // Read a group natively even on a server that resolves group policies.
+    // Only for a caller that knows no policy can bind the group, because a
+    // bound group read natively would skip its policy.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn native(mut self) -> Self {
+        self.native = true;
+        self
     }
 
     /// Most records one poll returns. A policy-aware group consumer also
@@ -748,7 +812,9 @@ impl ConsumerBuilder {
                 "consumer batch length must be greater than zero".to_owned(),
             ));
         }
-        if let ConsumerTarget::Group(group) = &self.target {
+        if let ConsumerTarget::Group(group) = &self.target
+            && !self.native
+        {
             let mut capabilities = self.topic.laser().capabilities().await;
             if capabilities.hello == HelloOutcome::Unknown {
                 capabilities = self.topic.laser().refresh_capabilities().await;
@@ -811,6 +877,7 @@ impl ConsumerBuilder {
             consumer: group_offset_consumer(&group)?,
         };
         let offsets = Arc::new(std::sync::Mutex::new(GroupOffsets::default()));
+        let deferred = Arc::new(std::sync::Mutex::new(Vec::new()));
         Ok(Consumer {
             yielded_zero: BTreeSet::new(),
             inner: Some(ConsumerInner::Group(Arc::new(tokio::sync::Mutex::new(
@@ -824,12 +891,14 @@ impl ConsumerBuilder {
                     yielded_since_flush: 0,
                     last_flush: Instant::now(),
                     offsets: Arc::clone(&offsets),
+                    deferred: Arc::clone(&deferred),
                 },
             )))),
             manual_commit: self.commit == CommitPolicy::Disabled,
             shutdown_target: None,
             next_future: std::sync::Mutex::new(None),
             offsets: Some(offsets),
+            deferred: Some(deferred),
             returned_native: std::sync::Mutex::new(VecDeque::new()),
             offset_owner,
         })
@@ -926,6 +995,7 @@ impl ConsumerBuilder {
             shutdown_target,
             next_future: std::sync::Mutex::new(None),
             offsets: None,
+            deferred: None,
             returned_native: std::sync::Mutex::new(VecDeque::new()),
             offset_owner,
         })
@@ -939,7 +1009,7 @@ impl ConsumerBuilder {
 /// established nothing is not a server without filters. Only a server whose
 /// announcement, or refusal to announce, positively lacks filters reads
 /// natively.
-fn policy_aware(capabilities: &Capabilities) -> Result<bool, LaserError> {
+pub(crate) fn policy_aware(capabilities: &Capabilities) -> Result<bool, LaserError> {
     if capabilities.filters.group_policy_reads {
         return Ok(true);
     }
@@ -1044,7 +1114,7 @@ impl ConsumerMessage {
     // A record whose header block does not decode is still delivered: its
     // payload and position are intact, and dropping it would lose a record a
     // commit before delivery already covered.
-    fn of(
+    pub(crate) fn of(
         message: IggyMessage,
         partition_id: u32,
         current_offset: u64,
@@ -1096,9 +1166,14 @@ pub struct Consumer {
     // stays `Sync`: it is reached through `&mut self` alone.
     next_future: std::sync::Mutex<Option<NextFuture>>,
     offsets: Option<Arc<std::sync::Mutex<GroupOffsets>>>,
+    // Handled deliveries the group engine acknowledges before its next read.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    deferred: Option<DeferredAcks>,
     returned_native: std::sync::Mutex<VecDeque<ConsumerMessage>>,
     offset_owner: OffsetOwner,
 }
+
+type DeferredAcks = Arc<std::sync::Mutex<Vec<Delivery>>>;
 
 /// A consumer's offset as the server stores it, read by
 /// [`Consumer::stored_offset`].
@@ -1139,6 +1214,8 @@ struct OffsetOwner {
 struct GroupOffsets {
     consumed: BTreeMap<u32, u64>,
     stored: BTreeMap<u32, u64>,
+    // The partitions the reader reads now, `None` before its first read.
+    assigned: Option<BTreeSet<u32>>,
 }
 
 /// The group-aware delivery engine behind a policy-aware group consumer: the
@@ -1155,11 +1232,15 @@ struct GroupEngine {
     yielded_since_flush: u32,
     last_flush: Instant,
     offsets: Arc<std::sync::Mutex<GroupOffsets>>,
+    deferred: DeferredAcks,
 }
 
 impl GroupEngine {
     async fn next(&mut self) -> Option<Result<ConsumerMessage, LaserError>> {
         if let Err(error) = self.finish_delivery().await {
+            return Some(Err(error));
+        }
+        if let Err(error) = self.apply_deferred().await {
             return Some(Err(error));
         }
         loop {
@@ -1188,6 +1269,9 @@ impl GroupEngine {
             // handled prefix while the partitions stay idle instead of
             // waiting for the next page to arrive.
             let page = loop {
+                if let Err(error) = self.apply_deferred().await {
+                    return Some(Err(error));
+                }
                 if let Err(error) = self.flush_if_due(CommitPoint::Poll).await {
                     return Some(Err(error));
                 }
@@ -1267,11 +1351,46 @@ impl GroupEngine {
         Ok(())
     }
 
+    // Acknowledge the deliveries handled since the last read, in the order
+    // they were handled. A failed acknowledgment stays queued with the ones
+    // after it, so the next attempt resends it. A partition this member lost
+    // refuses its acknowledgment, and the new owner reads those records
+    // again, so that one is dropped.
+    async fn apply_deferred(&mut self) -> Result<(), LaserError> {
+        loop {
+            let next = self
+                .deferred
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first()
+                .cloned();
+            let Some(delivery) = next else {
+                return Ok(());
+            };
+            match self.commit(&delivery).await {
+                Ok(()) => {}
+                Err(error)
+                    if error.filter_reason()
+                        == Some(laser_wire::filter::FilterErrorReason::MembershipStale) =>
+                {
+                    tracing::debug!(target: "laser", %error, partition_id = delivery.partition_id, "a handled record of a lost partition is read again by its new owner");
+                }
+                Err(error) => return Err(error),
+            }
+            self.deferred
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(0);
+        }
+    }
+
     fn sync_stored(&self) {
-        self.offsets
+        let mut offsets = self
+            .offsets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stored = self.reader.stored_offsets();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        offsets.stored = self.reader.stored_offsets();
+        offsets.assigned = Some(self.reader.partitions().into_iter().collect());
     }
 }
 
@@ -1365,6 +1484,43 @@ impl Consumer {
                     .await
             }
         }
+    }
+
+    // Commit a handled record without waiting for a read in flight. The
+    // group engine queues the acknowledgment and sends it before its next
+    // read, so the read is never cancelled. A native consumer stores the
+    // offset at once.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) async fn commit_handled(&self, message: &ConsumerMessage) -> Result<(), LaserError> {
+        match (self.inner.as_ref(), &self.deferred) {
+            (Some(ConsumerInner::Group(_)), Some(deferred)) => {
+                let delivery = message.delivery.clone().ok_or_else(|| {
+                    LaserError::Invalid(
+                        "the record was not delivered by this group consumer".to_owned(),
+                    )
+                })?;
+                deferred
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(delivery);
+                Ok(())
+            }
+            _ => self.commit(message).await,
+        }
+    }
+
+    // The partitions a policy-aware group consumer reads now. `None` for a
+    // native consumer, whose assignment only the server knows, and before
+    // the first read.
+    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
+    pub(crate) fn assigned_partitions(&self) -> Option<BTreeSet<u32>> {
+        self.offsets.as_ref().and_then(|offsets| {
+            offsets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .assigned
+                .clone()
+        })
     }
 
     /// Store an explicit server offset. Native only: a policy-aware group
@@ -1462,6 +1618,10 @@ impl Consumer {
                 })?;
                 let mut engine = engine.into_inner();
                 let completed = engine.finish_delivery().await;
+                let completed = match completed {
+                    Ok(()) => engine.apply_deferred().await,
+                    Err(error) => Err(error),
+                };
                 let closed = engine.reader.close().await;
                 completed.and(closed)
             }
@@ -1565,6 +1725,68 @@ impl Stream for Consumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn producer_builder() -> ProducerBuilder {
+        let laser = crate::laser::Laser::from_client(iggy::prelude::IggyClient::default());
+        laser.stream("fleet").topic("readings").producer()
+    }
+
+    #[tokio::test]
+    async fn given_both_expiry_settings_when_building_a_producer_then_should_refuse_it() {
+        let result = producer_builder()
+            .expire_after(Duration::from_secs(60))
+            .never_expire()
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(LaserError::Invalid(message)) if message.contains("not both"))
+        );
+        let result = producer_builder()
+            .never_expire()
+            .expire_after(Duration::from_secs(60))
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(LaserError::Invalid(message)) if message.contains("not both"))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_both_size_settings_when_building_a_producer_then_should_refuse_it() {
+        let result = producer_builder()
+            .max_topic_bytes(1_048_576)
+            .unlimited_topic_size()
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(LaserError::Invalid(message)) if message.contains("not both"))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_zero_expiry_or_size_when_building_a_producer_then_should_refuse_it() {
+        let result = producer_builder()
+            .expire_after(Duration::ZERO)
+            .build()
+            .await;
+        assert!(matches!(result, Err(LaserError::Invalid(_))));
+        let result = producer_builder().max_topic_bytes(0).build().await;
+        assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
+
+    #[test]
+    fn given_one_form_of_each_setting_when_resolved_then_should_map_to_the_topic_limits() {
+        let (expiry, size) = producer_builder()
+            .never_expire()
+            .unlimited_topic_size()
+            .topic_limits()
+            .expect("one form each");
+        assert_eq!(expiry, IggyExpiry::NeverExpire);
+        assert_eq!(size, MaxTopicSize::Unlimited);
+        let (expiry, size) = producer_builder().topic_limits().expect("defaults");
+        assert_eq!(expiry, IggyExpiry::ServerDefault);
+        assert_eq!(size, MaxTopicSize::ServerDefault);
+    }
 
     #[test]
     fn given_a_consumer_when_shared_across_tasks_then_should_be_send_and_sync() {

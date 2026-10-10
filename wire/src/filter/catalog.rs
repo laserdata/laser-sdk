@@ -172,7 +172,8 @@ pub enum FilterMutation {
     Describe { filter_id: u32, description: String },
     /// Hide from new bindings.
     Archive { filter_id: u32 },
-    /// Tombstone. Rejected while any group is bound.
+    /// Tombstone. Every group bound to the filter is released first, each
+    /// release advancing that group's policy generation like an unbind.
     Drop { filter_id: u32 },
     /// Pin a consumer group to a revision. The group must exist.
     Bind {

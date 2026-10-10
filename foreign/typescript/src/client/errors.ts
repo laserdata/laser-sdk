@@ -1,6 +1,7 @@
 import type { MessageWithHeaders, SendMessagesConfirmation } from "../iggy/apache-iggy.js"
 import type { CheckpointError } from "../wire/checkpoint.js"
 import type { FaultReason, FilterError, FilterGroupIdentity } from "../wire/filter.js"
+import type { SessionError as WireSessionError } from "../wire/session.js"
 
 export type LaserErrorKind =
   | "config"
@@ -20,9 +21,9 @@ export type LaserErrorKind =
   | "kv"
   | "fork"
   | "graph"
+  | "session"
   | "authz"
   | "filter"
-  | "agent-workflow"
   | "routing"
   | "presence-conflict"
   | "signature"
@@ -75,8 +76,8 @@ export class AmbiguousMutationError extends LaserError {
   }
 }
 
-/** An aborted wait, or a registered run whose cancel intent was observed at
- * a step boundary. `run` names that run. Not retryable on the same run. */
+/** An aborted wait, or a workflow run whose cancel request was observed at a
+ * step boundary. `run` names that run. Not retryable on the same run. */
 export class CancelledError extends LaserError {
   readonly run: string | undefined
 
@@ -298,6 +299,17 @@ export class GraphExecutionError extends LaserError {
   }
 }
 
+/** The deployment answered a session read with a typed failure. */
+export class SessionError extends LaserError {
+  constructor(
+    message: string,
+    readonly detail: WireSessionError,
+    options?: { cause?: unknown }
+  ) {
+    super(message, "session", options)
+  }
+}
+
 export class AuthzExecutionError extends LaserError {
   constructor(
     message: string,
@@ -367,16 +379,6 @@ export class ConsumerGroupSetupError extends LaserError {
       "filter",
       { cause }
     )
-  }
-}
-
-export class AgentWorkflowExecutionError extends LaserError {
-  constructor(
-    message: string,
-    readonly detail: unknown,
-    options?: { cause?: unknown }
-  ) {
-    super(message, "agent-workflow", options)
   }
 }
 

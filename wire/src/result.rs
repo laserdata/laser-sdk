@@ -7,12 +7,13 @@
 // `Unrecognized` rather than failing, the same forward-compat shape the growable
 // u8 dictionaries use.
 
-use crate::agent_workflow::AgentError;
+use crate::authz::AuthzError;
 use crate::checkpoint::CheckpointError;
 use crate::fork::ForkError;
 use crate::graph::GraphError;
 use crate::kv::KvError;
 use crate::query::QueryError;
+use crate::session::SessionError;
 use serde::{Deserialize, Serialize};
 
 /// One logical outcome code spanning query, key-value, fork, and browse. Built
@@ -278,16 +279,31 @@ impl From<&GraphError> for ResultCode {
     }
 }
 
-impl From<&AgentError> for ResultCode {
-    fn from(error: &AgentError) -> Self {
+impl From<&AuthzError> for ResultCode {
+    fn from(error: &AuthzError) -> Self {
         match error {
-            AgentError::Unsupported(_) => ResultCode::Unsupported,
-            AgentError::NotFound(_) => ResultCode::NotFound,
-            AgentError::Invalid(_) => ResultCode::InvalidArgument,
-            AgentError::Backend(_) => ResultCode::Backend,
-            AgentError::Unavailable(_) => ResultCode::Unavailable,
-            AgentError::Version { .. } => ResultCode::VersionSkew,
-            AgentError::NotLeader => ResultCode::Unavailable,
+            AuthzError::Unsupported(_) => ResultCode::Unsupported,
+            AuthzError::Unauthorized => ResultCode::Forbidden,
+            AuthzError::UnknownRole(_) => ResultCode::NotFound,
+            AuthzError::InvalidName(_) | AuthzError::TenancyViolation(_) => {
+                ResultCode::InvalidArgument
+            }
+            AuthzError::Conflict { .. } => ResultCode::Conflict,
+            AuthzError::Version { .. } => ResultCode::VersionSkew,
+        }
+    }
+}
+
+impl From<&SessionError> for ResultCode {
+    fn from(error: &SessionError) -> Self {
+        match error {
+            SessionError::Unsupported(_) => ResultCode::Unsupported,
+            SessionError::NotFound(_) | SessionError::NotRegistered(_) => ResultCode::NotFound,
+            SessionError::Invalid(_) => ResultCode::InvalidArgument,
+            SessionError::Unauthorized(_) => ResultCode::Forbidden,
+            SessionError::Stale(_) => ResultCode::StaleGeneration,
+            SessionError::Backend(_) => ResultCode::Backend,
+            SessionError::Unavailable(_) => ResultCode::Unavailable,
         }
     }
 }
@@ -364,8 +380,12 @@ mod tests {
             ResultCode::Unavailable
         );
         assert_eq!(
-            ResultCode::from(&AgentError::NotLeader),
-            ResultCode::Unavailable
+            ResultCode::from(&AuthzError::TenancyViolation("prefix acme".to_owned())),
+            ResultCode::InvalidArgument
+        );
+        assert_eq!(
+            ResultCode::from(&AuthzError::Unauthorized),
+            ResultCode::Forbidden
         );
     }
 
@@ -377,7 +397,6 @@ mod tests {
             ResultCode::from(&QueryError::Unavailable("dropped".to_owned())),
             ResultCode::from(&KvError::Unavailable("dropped".to_owned())),
             ResultCode::from(&ForkError::Unavailable("dropped".to_owned())),
-            ResultCode::from(&AgentError::Unavailable("dropped".to_owned())),
         ] {
             assert_eq!(surface, ResultCode::Unavailable);
         }

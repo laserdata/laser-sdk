@@ -2,7 +2,7 @@ import { decodeOne, encodeNamed, expectMap } from "./wire/cbor.js"
 import { decodeFoldSnapshot, encodeFoldSnapshot, type FoldSnapshot } from "./wire/snapshot.js"
 import type { ConversationId as SdkConversationId } from "./types/ids.js"
 import type { ConversationId } from "./wire/ids.js"
-import { NoStreamError } from "./client/errors.js"
+import { NoStreamError, ProtocolError } from "./client/errors.js"
 import { INTERNAL_TRANSPORT } from "./client/internals.js"
 import type { Laser } from "./client/laser.js"
 
@@ -30,6 +30,7 @@ export function decodeSnapshot(payload: Uint8Array): FoldSnapshot {
 export class TopicSnapshotStore implements SnapshotStore {
   constructor(
     private readonly laser: Laser,
+    private readonly fold: string,
     private readonly topic = DEFAULT_SNAPSHOT_TOPIC
   ) {}
 
@@ -47,7 +48,14 @@ export class TopicSnapshotStore implements SnapshotStore {
     const transport = this.laser[INTERNAL_TRANSPORT]()
     const partitions = await transport.findTopicPartitionCount(stream, this.topic)
     if (partitions === undefined) return undefined
-    let newest: { readonly offset: bigint; readonly snapshot: FoldSnapshot } | undefined
+    let newest:
+      | {
+          readonly timestamp: bigint
+          readonly partition: number
+          readonly offset: bigint
+          readonly snapshot: FoldSnapshot
+        }
+      | undefined
     for (let partitionId = 0; partitionId < partitions; partitionId += 1) {
       const target = { kind: "single", partitionId } as const
       const tail = await transport.pollMessages(
@@ -73,9 +81,16 @@ export class TopicSnapshotStore implements SnapshotStore {
           Number(SCAN_BATCH),
           false
         )
-        const found = newestMatch(window, end, conversation)
+        const found = newestMatch(window, end, conversation, stream, this.fold, partitionId)
         if (found !== undefined) {
-          if (newest === undefined || found.offset > newest.offset) newest = found
+          if (
+            newest === undefined ||
+            found.timestamp > newest.timestamp ||
+            (found.timestamp === newest.timestamp &&
+              (found.partition > newest.partition ||
+                (found.partition === newest.partition && found.offset > newest.offset)))
+          )
+            newest = found
           break
         }
         end = start
@@ -85,8 +100,11 @@ export class TopicSnapshotStore implements SnapshotStore {
   }
 
   async save(snapshot: FoldSnapshot): Promise<void> {
+    validateStoreIdentity(this.laser.defaultStream, this.fold, snapshot)
     await this.laser.topic(this.topic).send(encodeNamed(encodeFoldSnapshot(snapshot)), {
-      key: new TextEncoder().encode(snapshot.conversation.toString())
+      key: new TextEncoder().encode(
+        `${snapshot.conversation.toString()}:${String(new TextEncoder().encode(snapshot.fold).length)}:${snapshot.fold}`
+      )
     })
   }
 }
@@ -94,22 +112,33 @@ export class TopicSnapshotStore implements SnapshotStore {
 export class KvSnapshotStore implements SnapshotStore {
   constructor(
     private readonly laser: Laser,
+    private readonly fold: string,
     private readonly namespace = DEFAULT_SNAPSHOT_NAMESPACE
   ) {}
 
   async latest(conversation: SdkConversationId): Promise<FoldSnapshot | undefined> {
+    const stream = this.laser.defaultStream
+    if (stream === undefined) throw new NoStreamError("a snapshot lookup requires a default stream")
     const payload = await this.laser
       .kv(this.namespace)
-      .get(new TextEncoder().encode(conversation.toString()))
+      .get(new TextEncoder().encode(snapshotKey(stream, conversation.toString(), this.fold)))
     if (payload === undefined) return undefined
     const context = "fold snapshot"
-    return decodeFoldSnapshot(expectMap(decodeOne(payload, context), context), context)
+    const snapshot = decodeFoldSnapshot(expectMap(decodeOne(payload, context), context), context)
+    if (snapshot.conversation.toString() !== conversation.toString() || snapshot.fold !== this.fold)
+      throw new ProtocolError("snapshot identity does not match the store")
+    return snapshot
   }
 
   async save(snapshot: FoldSnapshot): Promise<void> {
+    validateStoreIdentity(this.laser.defaultStream, this.fold, snapshot)
     await this.laser
       .kv(this.namespace)
-      .set(new TextEncoder().encode(snapshot.conversation.toString()))
+      .set(
+        new TextEncoder().encode(
+          snapshotKey(snapshot.stream, snapshot.conversation.toString(), snapshot.fold)
+        )
+      )
       .bytes(encodeNamed(encodeFoldSnapshot(snapshot)))
       .send()
   }
@@ -128,17 +157,52 @@ function snapshotOf(payload: Uint8Array): FoldSnapshot | undefined {
 }
 
 function newestMatch(
-  window: readonly { readonly offset: bigint; readonly payload: Uint8Array }[],
+  window: readonly {
+    readonly offset: bigint
+    readonly timestampMicros?: bigint
+    readonly payload: Uint8Array
+  }[],
   end: bigint,
-  conversation: SdkConversationId
-): { readonly offset: bigint; readonly snapshot: FoldSnapshot } | undefined {
+  conversation: SdkConversationId,
+  stream: string,
+  fold: string,
+  partition: number
+):
+  | {
+      readonly timestamp: bigint
+      readonly partition: number
+      readonly offset: bigint
+      readonly snapshot: FoldSnapshot
+    }
+  | undefined {
   for (let index = window.length - 1; index >= 0; index -= 1) {
     const message = window[index]
     if (message === undefined || message.offset >= end) continue
     const snapshot = snapshotOf(message.payload)
-    if (snapshot !== undefined && sameConversation(snapshot.conversation, conversation)) {
-      return { offset: message.offset, snapshot }
+    if (
+      snapshot !== undefined &&
+      sameConversation(snapshot.conversation, conversation) &&
+      snapshot.stream === stream &&
+      snapshot.fold === fold
+    ) {
+      if (message.timestampMicros === undefined)
+        throw new ProtocolError("snapshot record has no broker timestamp")
+      return { timestamp: message.timestampMicros, partition, offset: message.offset, snapshot }
     }
   }
   return undefined
+}
+
+function snapshotKey(stream: string, conversation: string, fold: string): string {
+  return `${String(new TextEncoder().encode(stream).length)}:${stream}:${conversation}:${fold}`
+}
+
+function validateStoreIdentity(
+  stream: string | undefined,
+  fold: string,
+  snapshot: FoldSnapshot
+): void {
+  if (stream === undefined) throw new NoStreamError("a snapshot write requires a default stream")
+  if (snapshot.stream !== stream || snapshot.fold !== fold)
+    throw new ProtocolError("snapshot identity does not match the store")
 }

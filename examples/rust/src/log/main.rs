@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 // The Log primitive: a topic is an append-only record of every message
 // in your system. Write once, read forever, from the beginning or from now.
-const STREAM: &str = "fleet";
 const TOPIC: &str = "readings";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -16,13 +15,13 @@ struct Reading {
 #[tokio::main]
 async fn main() -> Result<(), LaserError> {
     init_tracing();
-    // Connect once. `stream_for("log")` only names this run's own isolated
-    // stream so every example can run side by side. The demo below addresses
-    // `fleet/readings` explicitly, which any connection can reach.
-    let laser = laser(&stream_for("log"), Capabilities::OPEN).await?;
-    fresh_run(&laser, &stream_for("log"), async {
+    // Connect once. `stream_for("log")` names this example's own stream, so
+    // every example can run side by side on one server.
+    let stream = stream_for("log");
+    let laser = laser(&stream, Capabilities::OPEN).await?;
+    fresh_run(&laser, &stream, async {
         phase("write two messages, then read them back");
-        let topic = laser.stream(STREAM).topic(TOPIC);
+        let topic = laser.topic(TOPIC);
         topic.ensure(2).await?;
 
         for reading in [

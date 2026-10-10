@@ -28,9 +28,9 @@ mod connect_options;
 pub mod context;
 #[cfg(feature = "agent")]
 pub mod context_scope;
-// The shared control-command publish path, used by both the projection
-// registry and the run-source registry.
-#[cfg(any(feature = "projections", feature = "runs"))]
+// The shared control-command publish path, used by the projection registry
+// and session source registration.
+#[cfg(any(feature = "projections", feature = "agent"))]
 mod control;
 #[cfg(feature = "agent")]
 pub mod crash_context;
@@ -60,8 +60,7 @@ pub mod laser;
     feature = "kv",
     feature = "projections",
     feature = "query",
-    feature = "rbac",
-    feature = "runs"
+    feature = "rbac"
 ))]
 mod managed;
 #[cfg(feature = "mcp-bridge")]
@@ -81,8 +80,6 @@ mod publish_options;
 pub mod query;
 #[cfg(feature = "rbac")]
 pub mod rbac;
-#[cfg(feature = "runs")]
-pub mod runs;
 #[cfg(feature = "schema-codecs")]
 pub mod schema_codecs;
 #[cfg(feature = "sign")]

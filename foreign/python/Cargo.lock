@@ -1797,15 +1797,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
@@ -2026,7 +2017,7 @@ checksum = "507460a910eb7b32ee961886ff48539633b788a36b65692b95f225b844c82553"
 
 [[package]]
 name = "laser-sdk"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "apache-avro",
  "async-trait",
@@ -2039,7 +2030,6 @@ dependencies = [
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
- "json-patch",
  "jsonschema",
  "laser-wire",
  "prost-reflect",
@@ -2057,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk-python"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2076,12 +2066,13 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "apache-avro",
  "bon",
  "bson",
  "ciborium",
+ "json-patch",
  "memchr",
  "ouroboros",
  "prost-reflect",
@@ -2605,7 +2596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

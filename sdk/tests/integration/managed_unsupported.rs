@@ -189,43 +189,6 @@ async fn given_open_iggy_when_graph_upsert_then_should_be_unsupported() {
     assert_eq!(error.code(), ResultCode::Unsupported);
 }
 
-#[tokio::test]
-#[serial_test::serial(integration)]
-async fn given_open_iggy_when_run_verbs_called_then_should_be_unsupported() {
-    let laser = laser().await;
-    let runs = laser.runs();
-    let submit = runs
-        .submit("diagnoser", b"input")
-        .await
-        .expect_err("submit must be unsupported on open Apache Iggy");
-    assert!(
-        submit.is_unsupported(),
-        "expected Unsupported, got {submit:?}"
-    );
-    let status = runs
-        .status("run-7")
-        .await
-        .expect_err("status must be unsupported on open Apache Iggy");
-    assert!(
-        status.is_unsupported(),
-        "expected Unsupported, got {status:?}"
-    );
-    let cancel = runs
-        .cancel("run-7")
-        .await
-        .expect_err("cancel must be unsupported on open Apache Iggy");
-    assert!(
-        cancel.is_unsupported(),
-        "expected Unsupported, got {cancel:?}"
-    );
-    let list = runs
-        .list()
-        .fetch()
-        .await
-        .expect_err("list must be unsupported on open Apache Iggy");
-    assert!(list.is_unsupported(), "expected Unsupported, got {list:?}");
-}
-
 // `commit()` requires a precondition (`expect_version`/`expect_absent`). Without
 // one it is a programmer error surfaced as a typed `Invalid`, never a panic and
 // never a round-trip. The check fires before the capability gate, so it holds

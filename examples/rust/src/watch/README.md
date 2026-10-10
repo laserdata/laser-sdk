@@ -1,4 +1,4 @@
-# watch - the Change feed primitive
+# watch: the Change feed primitive
 
 The change feed reports when a projected view advances. This example reads those notifications before querying the view.
 

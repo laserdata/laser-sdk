@@ -105,15 +105,24 @@ def test_given_an_invalid_operator_when_building_then_should_raise_invalid():
         ls.FilterExpr.pred("after.mode", "resembles", "safe")
 
 
-async def test_given_no_plane_when_probed_then_should_serve_group_reads_without_a_catalog(
+async def test_given_no_catalog_when_reading_then_should_follow_the_group_read_capability(
     laser,
 ):
     capabilities = await laser.capabilities()
     if capabilities.filters.catalog:
         pytest.skip("a plane serves the filter catalog on this stack")
 
-    assert capabilities.filters.native is True
-    assert capabilities.filters.group_policy_reads is True
+    await laser.topic(TOPIC).ensure(1)
+    group = laser.topic(TOPIC).consumer_group("group-read-capability")
+    await group.create()
+    if capabilities.filters.group_policy_reads:
+        reader = await group.reader(count=1)
+        await reader.close()
+    else:
+        with pytest.raises(ls.UnsupportedError) as refused:
+            await group.reader(count=1)
+        assert refused.value.surface == "filters"
+        assert refused.value.feature == "group_policy_reads"
 
 
 async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refuse(laser):
@@ -138,10 +147,15 @@ async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_shoul
     assert (await by_id.info()).name == "anomaly-desk"
 
 
-async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_record(laser):
+@pytest.mark.parametrize("allow_replay", [False, True])
+async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_record(
+    laser, allow_replay
+):
     await publish(laser, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
     group = laser.topic(TOPIC).consumer_group("plain-desk")
-    consumer = group.consumer(polling="first", auto_commit="disabled", poll_interval_ms=5)
+    consumer = group.consumer(
+        polling="first", auto_commit="disabled", poll_interval_ms=5, allow_replay=allow_replay
+    )
     try:
         delivered = []
         for _ in range(3):
@@ -151,8 +165,28 @@ async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_re
         assert delivered == [0, 1, 2], "a group without a filter receives everything"
         assert await consumer.last_consumed_offset(0) == 2
         assert await consumer.last_stored_offset(0) == 2
-        with pytest.raises(ls.InvalidError):
+        if (await laser.capabilities()).filters.group_policy_reads:
+            with pytest.raises(ls.InvalidError):
+                await consumer.store_offset(1, partition=0)
+        else:
             await consumer.store_offset(1, partition=0)
+            stored = await consumer.stored_offset(0)
+            assert stored is not None
+            assert stored.stored_offset == (1 if allow_replay else 2)
+            await consumer.delete_offset(partition=0)
+            assert await consumer.stored_offset(0) is None
+            assert await consumer.last_stored_offset(0) == (1 if allow_replay else 2)
+            await consumer.store_offset(1, partition=0)
+            stored = await consumer.stored_offset(0)
+            if allow_replay:
+                assert stored is not None
+                assert stored.stored_offset == 1
+            else:
+                assert stored is None
+            await consumer.store_offset(0, partition=0)
+            stored = await consumer.stored_offset(0)
+            assert stored is not None
+            assert stored.stored_offset == 0
     finally:
         await consumer.shutdown()
     assert (await group.info()).filter is None
@@ -180,6 +214,12 @@ async def test_given_an_unbound_group_id_when_read_then_should_preserve_arbitrar
         assert second.payload == payloads[1]
     finally:
         await resumed.shutdown()
+    if not (await laser.capabilities()).filters.group_policy_reads:
+        with pytest.raises(ls.UnsupportedError) as refused:
+            await by_id.reader(start="first", count=2)
+        assert refused.value.surface == "filters"
+        assert refused.value.feature == "group_policy_reads"
+        return
     filtered = await by_id.reader(start="first", count=2)
     try:
         page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
@@ -251,10 +291,11 @@ async def test_given_a_normal_group_read_when_cancelled_at_delivery_then_should_
         await consumer.shutdown()
 
 
-async def test_given_a_cancelled_normal_group_delivery_when_shutdown_then_should_not_commit_it(
+async def test_given_cancelled_polling_delivery_when_shutdown_then_should_follow_commit_timing(
     laser, monkeypatch
 ):
     await publish(laser, [SAFE_MODE, DECOMMISSION])
+    group_policy_reads = (await laser.capabilities()).filters.group_policy_reads
     group = laser.topic(TOPIC).consumer_group("cancelled-shutdown")
     consumer = group.consumer(batch_length=1, polling="first")
     await consumer.init()
@@ -282,7 +323,7 @@ async def test_given_a_cancelled_normal_group_delivery_when_shutdown_then_should
     resumed = group.consumer(batch_length=1, auto_commit="disabled")
     try:
         record = await asyncio.wait_for(resumed.next(), READ_TIMEOUT)
-        assert record.position.offset == 0, "shutdown must preserve the undelivered message"
+        assert record.position.offset == (0 if group_policy_reads else 1)
     finally:
         await resumed.shutdown()
 
@@ -714,6 +755,9 @@ async def test_given_a_binary_group_filter_when_configured_then_should_preview_g
 ):
     if not (await laser.capabilities()).filters.catalog:
         pytest.skip("requires a managed plane")
+    # Schema registration is scoped to the default stream, which must exist
+    # before the managed plane authorizes it.
+    await laser.stream(laser.default_stream).ensure()
     corpus = json.loads(
         (Path(__file__).resolve().parents[3] / "wire/fixtures/filter_codec_cases.json").read_text()
     )

@@ -1,6 +1,6 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, payload_bytes, py_to_de, ser_to_py};
+use crate::convert::{duration_ms, payload_bytes, py_to_de, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use iggy::prelude::{Identifier, IggyTimestamp};
 use laser_sdk::agent::AgentMessage;
@@ -311,11 +311,12 @@ impl PyAgentMessage {
         self.inner.body().to_vec()
     }
 
-    /// The real body of a claim-checked message: when the content type is `ref`,
-    /// decode the `BodyRef` capsule, fetch the referenced bytes from `store`, and
-    /// verify their SHA-256 against the capsule digest before returning them (a
-    /// mismatch raises, never unverified bytes). Any other content type returns
-    /// the payload as-is. `store` is a Python object with `async def get(reference:
+    /// The real body of a claim-checked message. It starts from `body()`, the
+    /// AGDX envelope body or the raw payload. When the content type is `ref`,
+    /// that body is a `BodyRef` capsule: fetch the referenced bytes from `store`
+    /// and verify their SHA-256 against the capsule digest before returning
+    /// them (a mismatch raises, never unverified bytes). Any other content type
+    /// returns `body()` as-is. `store` is a Python object with `async def get(reference:
     /// str) -> bytes` (and, for the publish side, `async def put(data: bytes) ->
     /// str`). The consume-side pairing of the publish builder's claim-check.
     fn resolve_body<'py>(&self, py: Python<'py>, store: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
@@ -369,12 +370,22 @@ impl PyAgentMessage {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
-    /// Create the default data stream and the well-known agent topics, `partitions`
-    /// each. Idempotent. Requires a default stream.
-    fn bootstrap<'py>(&self, py: Python<'py>, partitions: u32) -> PyResult<Bound<'py, PyAny>> {
+    /// Create the agent topics on the default stream, `partitions` each.
+    /// `agent.sessions` needs a `TopicRetention`. Idempotent. Requires a
+    /// default stream.
+    fn bootstrap<'py>(
+        &self,
+        py: Python<'py>,
+        partitions: u32,
+        retention: &crate::session::PyTopicRetention,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
+        let retention = retention.inner;
         future_into_py(py, async move {
-            laser.bootstrap(partitions).await.map_err(to_pyerr)
+            laser
+                .bootstrap(partitions, retention)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -401,9 +412,9 @@ impl PyLaser {
     }
 
     /// Send a request and await its correlated reply on `reply_topic`, up to
-    /// `timeout_secs`. Correlation is a fresh correlation id the responder echoes
+    /// `timeout_ms`. Correlation is a fresh correlation id the responder echoes
     /// (the business idempotency key is left untouched).
-    #[pyo3(signature = (request_topic, reply_topic, payload, provenance, *, timeout_secs=30.0))]
+    #[pyo3(signature = (request_topic, reply_topic, payload, provenance, *, timeout_ms))]
     fn request<'py>(
         &self,
         py: Python<'py>,
@@ -411,7 +422,7 @@ impl PyLaser {
         reply_topic: String,
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
-        timeout_secs: f64,
+        timeout_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let payload = payload_bytes(payload)?;
@@ -425,7 +436,7 @@ impl PyLaser {
                     AgentTopic::Custom(&reply_id),
                     payload,
                     &provenance,
-                    duration_seconds(timeout_secs, "timeout_secs")?,
+                    duration_ms(timeout_ms, "timeout_ms")?,
                 )
                 .await
                 .map_err(to_pyerr)?;
@@ -434,10 +445,15 @@ impl PyLaser {
     }
 
     /// A fresh child conversation of `parent`, carrying parent / root ids.
-    fn spawn_subconversation(&self, parent: &PyProvenance) -> PyProvenance {
-        PyProvenance {
-            inner: self.inner.spawn_subconversation(&parent.inner),
-        }
+    fn spawn_subconversation(
+        &self,
+        parent: &PyProvenance,
+        author: String,
+    ) -> PyResult<PyProvenance> {
+        let author = AgentId::new(author).map_err(|error| to_pyerr(error.into()))?;
+        Ok(PyProvenance {
+            inner: self.inner.spawn_subconversation(&parent.inner, &author),
+        })
     }
 
     /// Redrive a dead-lettered message from a capsule dict (an AGDX
@@ -464,7 +480,7 @@ impl PyLaser {
 }
 
 /// The well-known agent topic names, so callers reference
-/// `AgentTopic.Commands` instead of retyping the string. Each variant is the
+/// `AgentTopic.Sessions` instead of retyping the string. Each variant is the
 /// topic name string. Any other name works too: the agent methods take a
 /// plain topic string.
 #[gen_stub_pyclass]
@@ -476,17 +492,15 @@ pub struct PyAgentTopic;
 #[allow(non_upper_case_globals)]
 impl PyAgentTopic {
     #[classattr]
-    const Commands: &'static str = topic_name(AgentTopic::Commands);
+    const Sessions: &'static str = topic_name(AgentTopic::Sessions);
     #[classattr]
-    const Responses: &'static str = topic_name(AgentTopic::Responses);
+    const Streams: &'static str = topic_name(AgentTopic::Streams);
     #[classattr]
-    const ToolCalls: &'static str = topic_name(AgentTopic::ToolCalls);
+    const Heartbeats: &'static str = topic_name(AgentTopic::Heartbeats);
     #[classattr]
-    const ToolResults: &'static str = topic_name(AgentTopic::ToolResults);
+    const Control: &'static str = topic_name(AgentTopic::Control);
     #[classattr]
-    const LlmIo: &'static str = topic_name(AgentTopic::LlmIo);
-    #[classattr]
-    const HumanInput: &'static str = topic_name(AgentTopic::HumanInput);
+    const Memory: &'static str = topic_name(AgentTopic::Memory);
     #[classattr]
     const Audit: &'static str = topic_name(AgentTopic::Audit);
     #[classattr]

@@ -100,7 +100,7 @@ class World:
             correlation_id=correlation_id,
         )
         self.run(
-            lambda: self.laser.send_agent(ls.AgentTopic.Commands, payload.encode(), provenance)
+            lambda: self.laser.send_agent(ls.AgentTopic.Sessions, payload.encode(), provenance)
         )
 
     def assemble(self):
@@ -114,6 +114,8 @@ class World:
             self.error = error
 
     def close(self):
+        for agent in getattr(self, "responders", []):
+            self.run(agent.shutdown)
         self.loop.close()
 
 
@@ -162,7 +164,11 @@ def fresh_stream(world):
 @given(parsers.parse("a fresh stream bootstrapped with {partitions:d} partitions"))
 def fresh_stream_bootstrapped(world, partitions):
     world.connect()
-    world.run(lambda: world.laser.bootstrap(partitions))
+    world.run(
+        lambda: world.laser.bootstrap(
+            partitions, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
+    )
 
 
 @given("a new conversation")

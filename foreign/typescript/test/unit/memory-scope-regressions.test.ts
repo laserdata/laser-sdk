@@ -17,6 +17,12 @@ import { VectorMemory } from "../../src/memory/vector-memory.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import type { KvEntry, KvPage } from "../../src/wire/kv.js"
 
+// A fake client that sends every resource name as written.
+const BARE_NAMING = {
+  resourceNameIn: (_stream: string | undefined, name: string) => name,
+  resourceScope: () => undefined
+}
+
 function entry(id: bigint, conversation: ConversationId, user: string, app: string): KvEntry {
   return {
     key: new TextEncoder().encode(MemoryId.fromU128(id).toString()),
@@ -30,6 +36,7 @@ function memory(pages: readonly KvPage[]) {
   const calls: { conversation?: string; cursor?: Uint8Array }[] = []
   const laser = {
     defaultStream: "records",
+    ...BARE_NAMING,
     kv: () => ({
       scan: () => {
         const current: { conversation?: string; cursor?: Uint8Array } = {}
@@ -38,6 +45,7 @@ function memory(pages: readonly KvPage[]) {
             current.conversation = value
             return scan
           },
+          lensStream: () => scan,
           cursor: (value: Uint8Array) => {
             current.cursor = value
             return scan
@@ -84,6 +92,28 @@ void test("given_paged_user_and_application_memory_when_recalled_without_convers
   assert.equal(items[0]?.provenance.conversationId.toString(), first.toString())
   assert.equal(items[1]?.provenance.conversationId.toString(), second.toString())
   assert.deepEqual(calls, [{}, { cursor: new Uint8Array([2]) }])
+})
+
+void test("given_managed_log_memory_when_searched_then_should_scan_past_unrelated_newer_items", async () => {
+  const conversation = ConversationId.derive("search")
+  const matching = entry(1n, conversation, "reader", "diagnostics")
+  const unrelated = entry(2n, conversation, "reader", "diagnostics")
+  const { handle } = memory([
+    {
+      entries: [
+        { ...matching, value: new TextEncoder().encode("apple") },
+        { ...unrelated, value: new TextEncoder().encode("orange") }
+      ]
+    }
+  ])
+  const items = await handle.recall(
+    { conversation },
+    { semantic: "apple", strategy: RecallStrategy.Keyword, limit: 1 }
+  )
+  assert.deepEqual(
+    items.map((item) => new TextDecoder().decode(item.payload)),
+    ["apple"]
+  )
 })
 
 void test("given_a_conversation_filter_when_the_read_view_contains_other_rows_then_should_keep_only_its_scope", async () => {
@@ -272,4 +302,27 @@ void test("given_turns_in_two_conversations_when_consolidated_then_should_store_
     assert.equal(summaries.length, 1)
     assert.equal(summaries[0]?.provenance.conversationId.toString(), conversation.toString())
   }
+})
+
+void test("given_content_ids_out_of_arrival_order_when_recalled_from_the_view_then_should_keep_the_latest_broker_time", async () => {
+  const conversation = ConversationId.derive("arrival")
+  const stamped = (id: bigint, partition: number, timestampMicros: bigint): KvEntry => {
+    const base = entry(id, conversation, "reader", "diagnostics")
+    return {
+      ...base,
+      scope: {
+        ...base.scope,
+        timestampMicros,
+        source: { kind: "message", stream: 1, topic: 2, partition, offset: 0n }
+      }
+    }
+  }
+  const { handle } = memory([
+    { entries: [stamped(9n, 0, 10n), stamped(1n, 1, 30n), stamped(5n, 2, 20n)] }
+  ])
+  const items = await handle.recall({}, { limit: 2 })
+  assert.deepEqual(
+    items.map((item) => item.id.asU128()),
+    [1n, 5n]
+  )
 })

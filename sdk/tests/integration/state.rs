@@ -21,7 +21,7 @@ async fn given_appended_events_when_replaying_conversation_state_then_should_fol
             .build();
         laser
             .send_agent(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 Bytes::from(format!("{i}")),
                 &provenance,
             )
@@ -33,7 +33,7 @@ async fn given_appended_events_when_replaying_conversation_state_then_should_fol
         let sum = ConversationState::load(
             &laser,
             conversation,
-            vec![AgentTopic::Commands],
+            vec![AgentTopic::Sessions],
             ReplayBound::Full,
             0,
             sum_events,
@@ -48,7 +48,7 @@ async fn given_appended_events_when_replaying_conversation_state_then_should_fol
     let replayed = ConversationState::load(
         &laser,
         conversation,
-        vec![AgentTopic::Commands],
+        vec![AgentTopic::Sessions],
         ReplayBound::Full,
         0,
         sum_events,

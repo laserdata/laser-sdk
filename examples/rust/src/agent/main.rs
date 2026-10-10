@@ -26,15 +26,22 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("agent"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("agent"), async {
-        // The well-known agent topics (commands, responses, registry, ...) must
+        // The agent topics (the shared session topic and its satellites) must
         // exist before an agent's consumer group joins one.
-        laser.bootstrap(PARTITIONS).await?;
+        laser
+            .bootstrap(
+                PARTITIONS,
+                laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(
+                    86_400,
+                )),
+            )
+            .await?;
 
         phase("spawn a handler, then hand it a deadline-bounded task");
         let mut triage = Agent::builder()
             .id("triage".parse()?)
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             // The advertised capability is what makes this agent addressable by
             // what it can do rather than by the name it happens to run under.
             .capabilities(vec![CapabilityDescriptor {
@@ -56,7 +63,7 @@ async fn main() -> Result<(), LaserError> {
             .contract(Router::to_capable(CAPABILITY, RoutePolicy::Any))
             .from("orchestrator".parse()?)
             .payload("ticket #42 is stuck")
-            .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+            .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
             .deadline(DEADLINE)
             .send()
             .await?;

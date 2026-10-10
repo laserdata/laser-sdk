@@ -45,9 +45,11 @@ pub struct Capabilities {
     pub forks: bool,
     /// A managed A2A gateway (auth, streaming, persisted task store).
     pub a2a_gateway: bool,
-    /// The managed run registry (`Laser::runs` submit / cancel / status /
-    /// list). Off when the plane does not serve the band.
-    pub agent_workflow: bool,
+    /// Managed reads of agent sessions in one stream.
+    pub sessions: bool,
+    /// The deployment scopes every managed name to one stream, and each
+    /// stream's change feed rides its own ops topic.
+    pub stream_tenancy: bool,
     /// The change feed (`Laser::watch`): `ChangeRecord`s published after each
     /// committed projector batch for a binding that opted into `notify`. Off
     /// when the deployment does not publish the feed.
@@ -195,7 +197,8 @@ impl Capabilities {
         graph: false,
         forks: false,
         a2a_gateway: false,
-        agent_workflow: false,
+        sessions: false,
+        stream_tenancy: false,
         watch: false,
         authz: false,
         filters: FilterCaps {
@@ -358,10 +361,17 @@ impl Capabilities {
         self
     }
 
-    /// Returns a copy advertising the managed agent and workflow control band.
+    /// Returns a copy advertising managed session reads.
     #[must_use]
-    pub fn with_agent_workflow(mut self, value: bool) -> Self {
-        self.agent_workflow = value;
+    pub fn with_sessions(mut self, value: bool) -> Self {
+        self.sessions = value;
+        self
+    }
+
+    /// Returns a copy advertising stream tenancy.
+    #[must_use]
+    pub fn with_stream_tenancy(mut self, value: bool) -> Self {
+        self.stream_tenancy = value;
         self
     }
 
@@ -404,7 +414,8 @@ impl Capabilities {
         self.kv.cas_fenced |= versions.has_feature(feature::KV_CAS_FENCED);
         self.kv.fenced_leases |= versions.has_feature(feature::KV_FENCED_LEASES);
         self.kv.cas_fenced |= self.kv.fenced_leases;
-        self.agent_workflow |= versions.has_feature(feature::AGENT_WORKFLOW);
+        self.sessions |= versions.has_feature(feature::SESSIONS);
+        self.stream_tenancy |= versions.has_feature(feature::STREAM_TENANCY);
         self.query.keyword |= versions.has_feature(feature::KEYWORD_SEARCH);
         self.watch |= versions.has_feature(feature::WATCH);
         self.authz |= versions.has_feature(feature::AUTHZ);
@@ -463,9 +474,11 @@ mod tests {
             feature::KV_CAS
                 | feature::READ_YOUR_WRITES
                 | feature::KV_CAS_FENCED
-                | feature::KV_FENCED_LEASES,
+                | feature::KV_FENCED_LEASES
+                | feature::SESSIONS,
         );
         caps.merge_features(&versions);
+        assert!(caps.sessions);
         assert!(caps.kv.cas, "KV_CAS bit should set kv.cas");
         assert!(
             caps.kv.cas_fenced,

@@ -1,5 +1,149 @@
 use crate::harness;
+use laser_sdk::iggy::prelude::{Identifier, StreamClient, TopicClient};
 use laser_sdk::prelude::full::*;
+use laser_sdk::wire::snapshot::{FoldSnapshot, SnapshotOffset};
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_multi_topic_snapshot_when_resumed_then_should_read_each_topic_after_its_own_offset()
+ {
+    let laser = harness::laser().await;
+    laser
+        .bootstrap(
+            1,
+            laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400)),
+        )
+        .await
+        .expect("agent topics exist");
+    laser
+        .topic("agent.snapshots")
+        .ensure(1)
+        .await
+        .expect("snapshot topic exists");
+    let conversation = ConversationId::new();
+    let provenance = Provenance::builder()
+        .conversation_id(conversation)
+        .agent("planner".parse().expect("valid agent id"))
+        .build();
+    for _ in 0..3 {
+        laser
+            .send_agent(AgentTopic::Sessions, b"command".to_vec(), &provenance)
+            .await
+            .expect("command sent");
+    }
+    laser
+        .send_agent(AgentTopic::Streams, b"response".to_vec(), &provenance)
+        .await
+        .expect("response sent");
+    let topics = vec![AgentTopic::Sessions, AgentTopic::Streams];
+    harness::eventually(|| {
+        let laser = laser.clone();
+        let topics = topics.clone();
+        async move {
+            let history = ContextAssembler::builder()
+                .conversation_id(conversation)
+                .topics(topics)
+                .build()
+                .assemble(&laser)
+                .await
+                .expect("history reads");
+            (history.len() == 4).then_some(())
+        }
+    })
+    .await;
+    let checkpoint = laser
+        .context(conversation)
+        .checkpoint(&topics)
+        .await
+        .expect("checkpoint captured");
+    let stream_name = laser.default_stream().expect("default stream");
+    let stream_id = Identifier::named(stream_name).expect("stream id");
+    let stream = laser
+        .client()
+        .get_stream(&stream_id)
+        .await
+        .expect("stream read")
+        .expect("stream exists");
+    let mut as_of = Vec::new();
+    for topic in &topics {
+        let name = topic.topic_string();
+        let details = laser
+            .client()
+            .get_topic(&stream_id, &topic.as_identifier())
+            .await
+            .expect("topic read")
+            .expect("topic exists");
+        for (&partition, &next) in checkpoint.topic_offsets(&name).expect("topic offsets") {
+            if next == 0 {
+                continue;
+            }
+            as_of.push(SnapshotOffset::new(
+                details.id,
+                details.created_at.as_micros(),
+                partition,
+                next - 1,
+            ));
+        }
+    }
+    as_of.sort_by_key(|entry| {
+        (
+            entry.topic_id,
+            entry.topic_created_at_micros,
+            entry.partition_id,
+        )
+    });
+    let snapshot = FoldSnapshot {
+        stream: stream_name.to_owned(),
+        stream_id: stream.id,
+        stream_created_at_micros: stream.created_at.as_micros(),
+        conversation: conversation.into(),
+        fold: "planner".to_owned(),
+        as_of,
+        state: b"4".to_vec(),
+    };
+    let mut stale = snapshot.clone();
+    stale.as_of[0].topic_created_at_micros += 1;
+    assert!(matches!(
+        laser_sdk::agent::checkpoint_from_snapshot(&laser, &stale, &topics).await,
+        Err(LaserError::Invalid(_))
+    ));
+    stale = snapshot.clone();
+    stale.stream_created_at_micros += 1;
+    assert!(matches!(
+        laser_sdk::agent::checkpoint_from_snapshot(&laser, &stale, &topics).await,
+        Err(LaserError::Invalid(_))
+    ));
+    let store = TopicSnapshotStore::new(laser.clone(), "planner");
+    store.save(&snapshot).await.expect("snapshot saved");
+    laser
+        .send_agent(AgentTopic::Sessions, b"command".to_vec(), &provenance)
+        .await
+        .expect("new command sent");
+    laser
+        .send_agent(AgentTopic::Streams, b"response".to_vec(), &provenance)
+        .await
+        .expect("new response sent");
+    let count = harness::eventually(|| {
+        let laser = laser.clone();
+        let topics = topics.clone();
+        let store = &store;
+        async move {
+            let count = ConversationState::load_with(
+                &laser,
+                store,
+                conversation,
+                topics,
+                0u64,
+                |count, _| count + 1,
+            )
+            .await
+            .expect("state resumed");
+            (count == 6).then_some(count)
+        }
+    })
+    .await;
+    assert_eq!(count, 6);
+}
 
 #[tokio::test]
 #[serial_test::serial(integration)]

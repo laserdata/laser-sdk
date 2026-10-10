@@ -62,11 +62,21 @@ void test("given_each_schema_control_fixture_when_decoded_then_should_preserve_t
   }
 })
 
-void test("given_the_run_source_control_fixtures_when_decoded_then_should_preserve_the_topic", async () => {
-  const registered = await assertControlRoundTrips("control_register_run_source.bin")
-  const removed = await assertControlRoundTrips("control_remove_run_source.bin")
-  assert.equal(registered.command.kind, "registerRunSource")
-  assert.equal(removed.command.kind, "removeRunSource")
+void test("given_session_source_control_fixtures_when_decoded_then_should_preserve_stream_and_topics", async () => {
+  const all = await assertControlRoundTrips("control_register_session_source_all.bin")
+  const named = await assertControlRoundTrips("control_register_session_source_named.bin")
+  const removed = await assertControlRoundTrips("control_remove_session_source.bin")
+  assert.deepEqual(all.command, {
+    kind: "registerSessionSource",
+    stream: "agents",
+    topics: { kind: "all" }
+  })
+  assert.deepEqual(named.command, {
+    kind: "registerSessionSource",
+    stream: "agents",
+    topics: { kind: "named", names: ["agent.sessions"] }
+  })
+  assert.deepEqual(removed.command, { kind: "removeSessionSource", stream: "agents" })
 })
 
 void test("given_unknown_additive_control_values_when_decoded_then_should_degrade_or_pass_through", () => {

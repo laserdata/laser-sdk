@@ -13,10 +13,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) const CONTROL_PARTITION_KEY: &str = "control";
 
 impl Laser {
-    /// Publish one durable control command to `<ops>/control.commands`. The
-    /// shared write path for the projection registry and the run-source
-    /// registry, so it is compiled whenever either surface is enabled.
+    /// Publish one durable control command to `<ops>/control.commands`, scoped
+    /// to no stream. Session source registration uses it.
+    #[cfg(feature = "agent")]
     pub(crate) async fn publish_control(&self, command: ControlCommand) -> Result<(), LaserError> {
+        self.publish_control_in(command, None).await
+    }
+
+    /// Publish one control command scoped to `stream`, the stream its
+    /// resource names belong to. The shared write path for the projection
+    /// registry and session source registration.
+    pub(crate) async fn publish_control_in(
+        &self,
+        command: ControlCommand,
+        stream: Option<&str>,
+    ) -> Result<(), LaserError> {
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
@@ -27,6 +38,7 @@ impl Laser {
             v: CONTROL_OP_VERSION,
             timestamp_micros,
             command,
+            stream: stream.map(str::to_owned),
         };
         let payload = Bytes::from(
             encode_named(&envelope)

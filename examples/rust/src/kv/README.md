@@ -1,8 +1,10 @@
-# kv - the State primitive
+# kv: the State primitive
 
 This example reads and writes key-value state. It also demonstrates conditional updates, revocable leases, and copy-on-write forks where the deployment supports them.
 
 This example requires `laser-plane` in Laser Stack or LaserData Cloud. Without it, the example explains the requirement and exits successfully. Conditional writes, fenced leases, and forks require their own reported capabilities.
+
+Key-value entries, leases, and forks live under the stream's scoped names and belong to the example stream. A rerun recreates the stream, so its entries start again at version 1. Fence tokens keep counting across runs, so a token from an earlier run never matches a new lease.
 
 ## What it shows
 

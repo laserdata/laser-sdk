@@ -3,12 +3,13 @@ use crate::error::LaserError;
 use crate::types::MessageId;
 use dashmap::DashMap;
 use iggy::prelude::*;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
 const REPLY_BATCH: u32 = 200;
 const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PENDING_REPLY_LIMIT: usize = 64;
 
 /// One shared reply consumer per `(stream, reply topic)`. It decodes each record
 /// once and completes the one waiter whose correlation matches, so N concurrent
@@ -30,9 +31,56 @@ struct ReplyHubInner {
 }
 
 struct ReplyWaiter {
-    sender: oneshot::Sender<AgentMessage>,
+    state: Mutex<ReplyWaiterState>,
+    expected: ExpectedReply,
     #[cfg(feature = "sign")]
     expected_signer: Option<String>,
+}
+
+struct ReplyWaiterState {
+    sender: Option<oneshot::Sender<AgentMessage>>,
+    request: Option<Option<MessageId>>,
+    pending: Vec<AgentMessage>,
+}
+
+// What a record must carry to answer one request: the request's session, a
+// reply kind, and, when the request named its sender, that sender as the
+// addressee.
+pub(crate) struct ExpectedReply {
+    pub(crate) session: crate::types::ConversationId,
+    pub(crate) requester: Option<String>,
+}
+
+impl ExpectedReply {
+    fn accepts(&self, message: &AgentMessage) -> bool {
+        if message.provenance.conversation_id != self.session {
+            return false;
+        }
+        let addressee = match &message.envelope {
+            Some(envelope) => {
+                if !matches!(
+                    envelope.kind,
+                    laser_wire::agent::AgentKind::Response | laser_wire::agent::AgentKind::Error
+                ) {
+                    return false;
+                }
+                envelope
+                    .target
+                    .as_ref()
+                    .map(|target| target.as_str().to_owned())
+            }
+            None => message
+                .provenance
+                .target_agent_id
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+        };
+        match (&self.requester, addressee) {
+            (Some(requester), Some(addressee)) => *requester == addressee,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
 }
 
 impl Drop for ReplyHubInner {
@@ -109,6 +157,7 @@ impl ReplyHub {
     pub(crate) fn subscribe(
         &self,
         correlation: String,
+        expected: ExpectedReply,
         expected_signer: Option<String>,
     ) -> ReplyTicket {
         let (tx, rx) = oneshot::channel();
@@ -117,7 +166,12 @@ impl ReplyHub {
         self.inner.waiters.insert(
             correlation.clone(),
             ReplyWaiter {
-                sender: tx,
+                state: Mutex::new(ReplyWaiterState {
+                    sender: Some(tx),
+                    request: None,
+                    pending: Vec::new(),
+                }),
+                expected,
                 #[cfg(feature = "sign")]
                 expected_signer,
             },
@@ -139,6 +193,33 @@ pub(crate) struct ReplyTicket {
 }
 
 impl ReplyTicket {
+    /// Bind the committed request address before a correlated record can complete the wait.
+    pub(crate) fn arm(&self, request: Option<MessageId>) {
+        let Some(hub) = self.hub.upgrade() else {
+            return;
+        };
+        let Some(waiter) = hub.waiters.get(&self.correlation) else {
+            return;
+        };
+        let mut state = waiter
+            .state
+            .lock()
+            .expect("reply waiter lock is not poisoned");
+        state.request = Some(request);
+        let reply = state
+            .pending
+            .iter()
+            .position(|message| request.is_none_or(|address| message.id != address))
+            .map(|index| state.pending.remove(index));
+        let sender = reply.as_ref().and_then(|_| state.sender.take());
+        drop(state);
+        drop(waiter);
+        if let (Some(sender), Some(reply)) = (sender, reply) {
+            hub.waiters.remove(&self.correlation);
+            let _ = sender.send(reply);
+        }
+    }
+
     /// Await the correlated reply up to `timeout`, then deregister.
     pub(crate) async fn wait(mut self, timeout: Duration) -> Result<AgentMessage, LaserError> {
         match tokio::time::timeout(timeout, &mut self.rx).await {
@@ -244,10 +325,6 @@ async fn dispatch_loop(
                 };
                 #[cfg(not(feature = "sign"))]
                 let verified_principal = None;
-                drop(waiter);
-                let Some((_, waiter)) = inner.waiters.remove(&correlation) else {
-                    continue;
-                };
                 let reply = AgentMessage {
                     provenance,
                     id: MessageId::new(partition, message.header.offset),
@@ -256,8 +333,32 @@ async fn dispatch_loop(
                     content_type: decoded.content_type,
                     verified_principal,
                 };
-                let _ = waiter.sender.send(reply);
-                dispatched = true;
+                if !waiter.expected.accepts(&reply) {
+                    continue;
+                }
+                let mut state = waiter
+                    .state
+                    .lock()
+                    .expect("reply waiter lock is not poisoned");
+                let Some(request) = state.request else {
+                    if state.pending.len() == PENDING_REPLY_LIMIT {
+                        state.pending.remove(0);
+                    }
+                    state.pending.push(reply);
+                    dispatched = true;
+                    continue;
+                };
+                if request.is_some_and(|address| reply.id == address) {
+                    continue;
+                }
+                let sender = state.sender.take();
+                drop(state);
+                drop(waiter);
+                if let Some(sender) = sender {
+                    inner.waiters.remove(&correlation);
+                    let _ = sender.send(reply);
+                    dispatched = true;
+                }
             }
         }
         drop(inner);

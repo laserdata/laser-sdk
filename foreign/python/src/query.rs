@@ -39,12 +39,20 @@ impl PyLaser {
     /// `fetch_one`). Query is a managed feature: against Apache Iggy it raises
     /// `UnsupportedError`.
     fn query(&self, index: String) -> PyQuery {
+        let index = self.inner.resource_name(&index);
         PyQuery::new(self.inner.clone(), QueryTarget::operational(index))
     }
 
     /// Start a query against an explicit operational or lakehouse target dict.
+    /// An operational index is scoped like `query(index)`.
     fn query_target(&self, target: &Bound<'_, PyAny>) -> PyResult<PyQuery> {
-        Ok(PyQuery::new(self.inner.clone(), py_to_de(target)?))
+        let target = match py_to_de(target)? {
+            QueryTarget::Operational { index } => {
+                QueryTarget::operational(self.inner.resource_name(&index))
+            }
+            other => other,
+        };
+        Ok(PyQuery::new(self.inner.clone(), target))
     }
 
     /// Start a query against one materialization destination generation.
@@ -332,7 +340,7 @@ impl PyQuery {
 
     /// Resolve against a fork's copy-on-write view instead of the trunk.
     fn fork<'py>(mut slf: PyRefMut<'py, Self>, fork_id: String) -> PyRefMut<'py, Self> {
-        slf.query.fork = Some(fork_id);
+        slf.query.fork = Some(slf.laser.resource_name(&fork_id));
         slf
     }
 
@@ -394,9 +402,10 @@ impl PyQuery {
         self.query.execution_id.to_string()
     }
 
-    /// Set the execution deadline `seconds` from now (default 30 seconds).
-    fn deadline(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyResult<PyRefMut<'_, Self>> {
-        let wait = crate::convert::duration_seconds(seconds, "seconds")?;
+    /// Set the execution deadline `timeout_ms` milliseconds from now
+    /// (default 30,000).
+    fn deadline(mut slf: PyRefMut<'_, Self>, timeout_ms: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let wait = crate::convert::duration_ms(timeout_ms, "timeout_ms")?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -532,7 +541,8 @@ impl PyQuery {
         slf
     }
 
-    /// Filter rows whose timestamp (epoch micros) falls in [start, end].
+    /// Filter rows whose timestamp (epoch micros) falls in [start, end], both
+    /// bounds inclusive.
     fn time_range<'py>(mut slf: PyRefMut<'py, Self>, start: u64, end: u64) -> PyRefMut<'py, Self> {
         slf.query.time_range = Some((start, end));
         slf
@@ -1143,7 +1153,8 @@ impl PyQueryBuilder {
         slf
     }
 
-    /// The `(start, end)` epoch microsecond range, or `None` for any time.
+    /// The `(start, end)` epoch microsecond range, both bounds inclusive, or
+    /// `None` for any time.
     #[pyo3(signature = (time_range))]
     fn time_range(
         mut slf: PyRefMut<'_, Self>,

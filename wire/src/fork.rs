@@ -180,11 +180,23 @@ pub enum ForkError {
 /// a copy-on-write query as a quoted identifier, so the charset must be a
 /// strict safelist, not just a length bound: this is the one anti-injection
 /// rule. A valid id is non-empty, at most [`MAX_FORK_ID_BYTES`] bytes, and made
-/// only of ASCII letters, digits, `-`, `_`, and `.`. A backend that binds the
-/// id as a parameter may skip the call, but one that inlines it gets the defense for
+/// only of ASCII letters, digits, `-`, `_`, and `.`. A stream-scoped id
+/// `stream:<stream>/<local>` is valid when the whole id fits the same bound and
+/// both parts pass the same charset rule. A backend that binds the id as a
+/// parameter may skip the call, but one that inlines it gets the defense for
 /// free by calling this before use.
 pub fn validate_fork_id(fork_id: &str) -> Result<(), InvalidError> {
-    crate::validate::validate_safelisted_name("fork id", fork_id, MAX_FORK_ID_BYTES)
+    let Some((stream, local)) = crate::authz::split_scoped_resource(fork_id) else {
+        return crate::validate::validate_safelisted_name("fork id", fork_id, MAX_FORK_ID_BYTES);
+    };
+    if fork_id.len() > MAX_FORK_ID_BYTES {
+        return Err(InvalidError::new(format!(
+            "fork id is {}B, exceeds cap {MAX_FORK_ID_BYTES}B",
+            fork_id.len()
+        )));
+    }
+    crate::validate::validate_safelisted_name("fork id stream", stream, MAX_FORK_ID_BYTES)?;
+    crate::validate::validate_safelisted_name("fork id", local, MAX_FORK_ID_BYTES)
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -209,6 +221,30 @@ mod tests {
         );
         assert!(validate_fork_id(&"f".repeat(MAX_FORK_ID_BYTES)).is_ok());
         assert!(validate_fork_id(&"f".repeat(MAX_FORK_ID_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn given_stream_scoped_fork_ids_when_validated_then_should_safelist_both_parts() {
+        assert!(validate_fork_id("stream:acme/experiment-2026-q2").is_ok());
+        assert!(
+            validate_fork_id("stream:acme/a/b").is_err(),
+            "slash in the local part"
+        );
+        assert!(
+            validate_fork_id("stream:ac me/run").is_err(),
+            "space in the stream"
+        );
+        assert!(
+            validate_fork_id("stream:acme/").is_err(),
+            "empty local part"
+        );
+        assert!(
+            validate_fork_id("stream:acme").is_err(),
+            "the stream resource itself"
+        );
+        let local = "f".repeat(MAX_FORK_ID_BYTES - "stream:acme/".len());
+        assert!(validate_fork_id(&format!("stream:acme/{local}")).is_ok());
+        assert!(validate_fork_id(&format!("stream:acme/{local}f")).is_err());
     }
 
     #[test]

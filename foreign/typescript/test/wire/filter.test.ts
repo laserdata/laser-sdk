@@ -9,7 +9,7 @@ import {
   decodeSchemaDef,
   encodeControlEnvelope
 } from "../../src/wire/control.js"
-import { CompiledFilter, type DecodeLimits, usesRegex } from "../../src/wire/filter-eval.js"
+import { CompiledFilter, type DecodeLimits } from "../../src/wire/filter-eval.js"
 import {
   ConsumerFilter,
   ExactDecimal,
@@ -237,11 +237,6 @@ void test("given_the_shared_corpus_when_evaluated_then_should_reproduce_every_ve
       expected: entry.get("expected") as string
     }
     const filter = decodeConsumerFilter(item.filter, item.name)
-    // A regex runs on the server's Rust engine only, so TypeScript refuses to compile it.
-    if (usesRegex(filter.expr)) {
-      assert.throws(() => CompiledFilter.compile(filter), InvalidError, item.name)
-      continue
-    }
     const compiled = CompiledFilter.compile(filter)
     const record = {
       payload: new TextEncoder().encode(item.payload),

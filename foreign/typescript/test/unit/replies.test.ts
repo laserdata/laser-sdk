@@ -7,7 +7,7 @@ import { agentMessageBody } from "../../src/agent/reliable-consumer.js"
 import { ReplyHub, findAgdxReply } from "../../src/agent/replies.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
-import { ConversationId } from "../../src/types/ids.js"
+import { AgentId, ConversationId } from "../../src/types/ids.js"
 import type { ConsumerStart } from "../../src/stream/consumer-start.js"
 import { encodeAgentEnvelope, parseAgentId, responseEnvelope } from "../../src/wire/agent.js"
 import { encodeNamed } from "../../src/wire/cbor.js"
@@ -83,6 +83,43 @@ void test("given_a_matching_reply_when_dispatched_then_should_resolve_the_waitin
     const ticket = hub.subscribe("corr-1")
     const reply = await ticket.wait(2_000)
     assert.equal(reply.provenance.correlationId, "corr-1")
+    assert.equal(reply.id.offset, 5n)
+  } finally {
+    hub.stop()
+  }
+})
+
+void test("given_one_topic_for_request_and_reply_when_armed_then_should_skip_the_request_address", async () => {
+  const transport = fakeTransport([
+    { strategy: "last", result: [] },
+    {
+      strategy: "offset",
+      result: [replyMessage("corr-self", 5n), replyMessage("corr-self", 6n)]
+    }
+  ])
+  const hub = await ReplyHub.create(transport, "stream", "one-topic")
+  try {
+    const ticket = hub.subscribe("corr-self", undefined, true)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    ticket.arm({ partitionId: 0, offset: 5n })
+    const reply = await ticket.wait(2_000)
+    assert.equal(reply.id.offset, 6n)
+  } finally {
+    hub.stop()
+  }
+})
+
+void test("given_different_reply_topic_when_offsets_match_then_should_accept_the_reply", async () => {
+  const transport = fakeTransport([
+    { strategy: "last", result: [] },
+    { strategy: "offset", result: [replyMessage("corr-other-topic", 5n)] }
+  ])
+  const hub = await ReplyHub.create(transport, "stream", "reply-topic")
+  try {
+    const ticket = hub.subscribe("corr-other-topic", undefined, true)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    ticket.arm()
+    const reply = await ticket.wait(2_000)
     assert.equal(reply.id.offset, 5n)
   } finally {
     hub.stop()
@@ -303,4 +340,66 @@ void test("given_a_forged_reply_before_a_verified_one_when_looked_up_then_should
   ])
   const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
   assert.equal(new TextDecoder().decode(found?.body), "honest")
+})
+
+void test("given_an_expected_reply_when_dispatched_then_should_take_only_the_requesters_reply_in_its_session", async () => {
+  const session = ConversationId.new()
+  const generic = (offset: bigint, conversationId: ConversationId, target?: string) => ({
+    payload: new TextEncoder().encode(String(offset)),
+    partitionId: 0,
+    offset,
+    headers: encodeProvenanceHeaders({
+      conversationId,
+      correlationId: "corr-expected",
+      ...(target !== undefined ? { targetAgentId: AgentId.new(target) } : {})
+    })
+  })
+  const transport = fakeTransport([
+    { strategy: "last", result: [] },
+    {
+      strategy: "offset",
+      result: [
+        generic(1n, ConversationId.new(), "planner"),
+        generic(2n, session, "bystander"),
+        generic(3n, session),
+        generic(4n, session, "planner")
+      ]
+    }
+  ])
+  const hub = await ReplyHub.create(transport, "stream", "replies")
+  try {
+    const ticket = hub.subscribe("corr-expected", undefined, false, {
+      session,
+      requester: "planner"
+    })
+    const reply = await ticket.wait(2_000)
+    assert.equal(reply.id.offset, 4n)
+  } finally {
+    hub.stop()
+  }
+})
+
+void test("given_a_reply_deeper_than_a_thousand_records_per_pass_when_looked_up_then_should_scan_ten_thousand_per_pass", async () => {
+  const correlation = CorrelationId.fromU128(0x0407n)
+  const depth = 40_000n
+  const reply = agdxReply(correlation, "deep", depth)
+  const filler = (offset: bigint): PolledMessage => ({
+    payload: new Uint8Array(),
+    partitionId: 0,
+    offset,
+    headers: new Map()
+  })
+  const transport: Pick<LaserTransport, "findTopicPartitionCount" | "pollMessages"> = {
+    findTopicPartitionCount: () => Promise.resolve(1),
+    pollMessages(_streamId, _topicId, _target, strategy, count) {
+      const from = strategy.kind === "offset" ? strategy.value : 0n
+      const page: PolledMessage[] = []
+      for (let offset = from; offset <= depth && page.length < count; offset += 1n) {
+        page.push(offset === depth ? reply : filler(offset))
+      }
+      return Promise.resolve(page)
+    }
+  }
+  const found = await findAgdxReply(transport as LaserTransport, "stream", "replies", correlation)
+  assert.equal(new TextDecoder().decode(found?.body), "deep")
 })

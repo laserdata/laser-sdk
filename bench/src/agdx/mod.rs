@@ -355,7 +355,7 @@ impl AgentHandler for EchoHandler {
         self.tracker.handler_entry(id).await;
         ctx.laser()
             .agdx(
-                AgentTopic::Responses,
+                AgentTopic::Sessions,
                 self.source.clone(),
                 envelope.conversation,
             )
@@ -637,10 +637,10 @@ pub async fn run_request_reply_evidence(
     let stream = format!("bench-request-reply-{seed:016x}");
     let command_topic = laser
         .stream(&stream)
-        .topic(AgentTopic::Commands.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     let response_topic = laser
         .stream(&stream)
-        .topic(AgentTopic::Responses.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     for topic in [&command_topic, &response_topic] {
         topic
             .ensure(case.partitions)
@@ -662,7 +662,7 @@ pub async fn run_request_reply_evidence(
         .with_default_stream(&stream);
     let mut agent = Agent::builder()
         .id(worker.clone())
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(EchoHandler {
             tracker: tracker.clone(),
             source: worker.wire_id(),
@@ -743,7 +743,7 @@ pub async fn run_stream_evidence(
     let stream_name = format!("bench-agdx-stream-{seed:016x}");
     let topic = laser
         .stream(&stream_name)
-        .topic(AgentTopic::LlmIo.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     topic
         .ensure(case.partitions)
         .await
@@ -839,7 +839,7 @@ fn stream_operation(
                 .checked_add(sequence)
                 .ok_or_else(|| "AGDX stream ID exceeds u64".to_owned())?;
             let mut stream = laser
-                .agdx(AgentTopic::LlmIo, source, conversation(seed, id))
+                .agdx(AgentTopic::Sessions, source, conversation(seed, id))
                 .stream(correlation(seed, id), OPERATION_CHAT);
             let channel = stream.channel();
             let completion = tracker.register(channel, id).await;
@@ -1010,7 +1010,7 @@ fn request_reply_operation(
                 .ok_or_else(|| "AGDX request ID exceeds u64".to_owned())?;
             let receiver = tracker.register(id).await;
             let publish_result = laser
-                .agdx(AgentTopic::Commands, source, conversation(seed, id))
+                .agdx(AgentTopic::Sessions, source, conversation(seed, id))
                 .command(correlation(seed, id), record_payload(&payload, id)?)
                 .send()
                 .await;

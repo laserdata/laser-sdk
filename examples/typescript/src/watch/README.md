@@ -1,4 +1,4 @@
-# watch - stop re-querying blind
+# watch: the Change feed primitive
 
 The change feed reports when a projected view advances. This example reads those notifications before querying the view.
 
@@ -25,4 +25,4 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:watch
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/change-feed
-- Full system built on this primitive: [`event-analytics`](../event-analytics) - the same change feed driving live analytics instead of a one-shot print.
+- Full system built on this primitive: [`event-analytics`](../event-analytics): the same change feed driving live analytics instead of a one-shot print.

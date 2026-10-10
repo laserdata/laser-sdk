@@ -53,7 +53,7 @@ impl PyLaser {
 }
 
 /// Process-local retention for governance digest-chain heads: at most
-/// `capacity` conversations, and a head idle for `idle_ttl_secs` may be
+/// `capacity` conversations, and a head idle for `idle_ttl_ms` may be
 /// evicted. An omitted argument keeps the SDK default. Eviction or a process
 /// restart starts a new local chain for that conversation.
 #[gen_stub_pyclass]
@@ -67,14 +67,14 @@ pub struct PyGovernorRetention {
 #[pymethods]
 impl PyGovernorRetention {
     #[new]
-    #[pyo3(signature = (*, capacity=None, idle_ttl_secs=None))]
-    fn new(capacity: Option<usize>, idle_ttl_secs: Option<f64>) -> PyResult<Self> {
+    #[pyo3(signature = (*, capacity=None, idle_ttl_ms=None))]
+    fn new(capacity: Option<usize>, idle_ttl_ms: Option<f64>) -> PyResult<Self> {
         let mut inner = GovernorRetention::default();
         if let Some(capacity) = capacity {
             inner.capacity = capacity;
         }
-        if let Some(idle_ttl_secs) = idle_ttl_secs {
-            inner.idle_ttl = crate::convert::duration_seconds(idle_ttl_secs, "idle_ttl_secs")?;
+        if let Some(idle_ttl_ms) = idle_ttl_ms {
+            inner.idle_ttl = crate::convert::duration_ms(idle_ttl_ms, "idle_ttl_ms")?;
         }
         Ok(Self { inner })
     }
@@ -85,17 +85,18 @@ impl PyGovernorRetention {
         self.inner.capacity
     }
 
-    /// Inactivity, in seconds, after which an unlocked head may be evicted.
+    /// Inactivity, in milliseconds, after which an unlocked head may be
+    /// evicted.
     #[getter]
-    fn idle_ttl_secs(&self) -> f64 {
-        self.inner.idle_ttl.as_secs_f64()
+    fn idle_ttl_ms(&self) -> f64 {
+        self.inner.idle_ttl.as_secs_f64() * 1000.0
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "GovernorRetention(capacity={}, idle_ttl_secs={})",
+            "GovernorRetention(capacity={}, idle_ttl_ms={})",
             self.inner.capacity,
-            self.inner.idle_ttl.as_secs_f64()
+            self.inner.idle_ttl.as_secs_f64() * 1000.0
         )
     }
 }
@@ -850,22 +851,23 @@ impl PyQuorumGovernor {
 
     /// Enroll one named voter (an object with `async def decide(action) ->
     /// ActionDecision`, the same contract `Laser.with_governor` takes). A
-    /// `mandatory` voter must be affirmative, regardless of policy.
-    fn voter(
-        &mut self,
+    /// `mandatory` voter must be affirmative, regardless of policy. Returns
+    /// this governor, so enrollments chain like the Rust builder.
+    fn voter<'py>(
+        mut slf: PyRefMut<'py, Self>,
         name: String,
         governor: &Bound<'_, PyAny>,
         mandatory: bool,
-    ) -> PyResult<()> {
+    ) -> PyResult<PyRefMut<'py, Self>> {
         let governor = Arc::new(PyActionGovernor::new(governor)?);
         // The builder is consumed and put back. If a previous call unwound
         // between the two, the slot stays empty, so report that as a typed
         // error rather than panicking on every later call.
-        let current = self.inner.take().ok_or_else(|| {
+        let current = slf.inner.take().ok_or_else(|| {
             InvalidError::new_err("this QuorumGovernor is unusable: a previous voter() call failed")
         })?;
-        self.inner = Some(current.voter(name, governor, mandatory));
-        Ok(())
+        slf.inner = Some(current.voter(name, governor, mandatory));
+        Ok(slf)
     }
 
     /// Decide `action` by fanning out to every voter concurrently and folding

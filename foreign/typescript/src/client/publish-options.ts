@@ -34,6 +34,32 @@ export function publishOptions(
   return resolved
 }
 
+/** The pause before retry `attempt`, counted from zero: the backoff doubled per attempt and capped at 30 seconds. */
+export function retryDelayMs(options: PublishOptions, attempt: number): number {
+  return Math.min(options.retryBackoffMs * 2 ** Math.min(attempt, 16), 30_000)
+}
+
+/**
+ * An idempotent read sent again while it fails with a transient refusal, with
+ * the connection's publish retry count and backoff. A command the Iggy client
+ * does not retry itself, such as the cluster metadata probe, otherwise fails
+ * its caller on a refusal the next attempt clears.
+ */
+export async function retryTransientRead<T>(
+  options: PublishOptions,
+  read: () => Promise<T>,
+  transient: (error: unknown) => boolean
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await read()
+    } catch (error) {
+      if (attempt >= options.maxRetries || !transient(error)) throw error
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs(options, attempt)))
+    }
+  }
+}
+
 export async function publishWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {

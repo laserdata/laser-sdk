@@ -138,6 +138,16 @@ pub enum IntentError {
     DecisionIntentMismatch,
 }
 
+// An intent rejected at construction, voting, or folding is a validation
+// failure the caller fixes, never a retry, so it is `LaserError::Invalid` like
+// an envelope the validity matrix rejects. Python and TypeScript raise their
+// `IntentError` as an `InvalidError` subclass the same way.
+impl From<IntentError> for crate::error::LaserError {
+    fn from(error: IntentError) -> Self {
+        crate::error::LaserError::Invalid(error.to_string())
+    }
+}
+
 /// How [`Vote`]s combine into a [`Decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,6 +431,18 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_an_intent_error_when_propagated_with_question_mark_then_should_be_invalid() {
+        fn propose() -> Result<(), crate::error::LaserError> {
+            Err(IntentError::NoEligibleVoters)?;
+            Ok(())
+        }
+        assert!(matches!(
+            propose(),
+            Err(crate::error::LaserError::Invalid(message)) if message.contains("eligible voter")
+        ));
+    }
 
     fn agent(name: &str) -> AgentId {
         name.parse().expect("agent id parses")

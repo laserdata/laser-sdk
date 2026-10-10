@@ -10,6 +10,105 @@ use std::time::Duration;
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tokio::test]
+async fn given_native_offset_history_when_rewound_and_deleted_then_should_follow_the_replay_option()
+{
+    let laser = harness::laser().await;
+    let topic = laser.topic("native-offset-history");
+    topic
+        .producer()
+        .partitions(1)
+        .build()
+        .await
+        .expect("the native producer initializes")
+        .send_batch([
+            ProducerMessage::new(b"zero".as_slice()),
+            ProducerMessage::new(b"one".as_slice()),
+            ProducerMessage::new(b"two".as_slice()),
+        ])
+        .await
+        .expect("the native offset records publish");
+    for allow_replay in [false, true] {
+        let builder = topic
+            .consumer(format!("native-offset-history-{allow_replay}"), 0)
+            .start_at(ConsumerStart::First)
+            .commit_policy(CommitPolicy::Disabled);
+        let builder = if allow_replay {
+            builder.allow_replay()
+        } else {
+            builder
+        };
+        let mut consumer = builder.build().await.expect("the native consumer builds");
+        let mut records = Vec::new();
+        for _ in 0..3 {
+            records.push(
+                consumer
+                    .next_within(RECEIVE_TIMEOUT)
+                    .await
+                    .expect("the native record arrives"),
+            );
+        }
+        consumer.commit(&records[2]).await.expect("commit two");
+        consumer.commit(&records[1]).await.expect("commit one");
+        let expected = if allow_replay { 1 } else { 2 };
+        assert_eq!(consumer.last_stored_offset(0), Some(expected));
+        consumer.store_offset(2, Some(0)).await.expect("store two");
+        consumer.store_offset(2, Some(0)).await.expect("repeat two");
+        consumer.store_offset(1, Some(0)).await.expect("store one");
+        assert_eq!(
+            consumer
+                .stored_offset(0)
+                .await
+                .expect("read the stored offset")
+                .expect("an offset exists")
+                .stored_offset,
+            expected
+        );
+        consumer
+            .delete_offset(Some(0))
+            .await
+            .expect("delete the offset");
+        assert!(
+            consumer
+                .stored_offset(0)
+                .await
+                .expect("read after deletion")
+                .is_none()
+        );
+        assert_eq!(consumer.last_stored_offset(0), Some(expected));
+        consumer
+            .store_offset(1, Some(0))
+            .await
+            .expect("store after deletion");
+        assert_eq!(
+            consumer
+                .stored_offset(0)
+                .await
+                .expect("read after storing")
+                .map(|offset| offset.stored_offset),
+            allow_replay.then_some(1)
+        );
+        consumer
+            .store_offset(0, Some(0))
+            .await
+            .expect("zero always stores");
+        assert_eq!(consumer.last_stored_offset(0), Some(0));
+        assert_eq!(
+            consumer
+                .stored_offset(0)
+                .await
+                .expect("read zero")
+                .expect("zero exists")
+                .stored_offset,
+            0
+        );
+        consumer
+            .shutdown()
+            .await
+            .expect("the native consumer closes");
+    }
+}
+
+#[tokio::test]
 async fn given_production_profile_when_streaming_then_should_preserve_delivery_and_offsets() {
     let laser = harness::connected_laser().await;
     let topic = laser.topic("production-streaming");
@@ -275,7 +374,15 @@ async fn given_a_cached_stream_when_deleted_and_recreated_then_should_discard_it
     let identifier = Identifier::named(stream).expect("the stream name is valid");
     let agent = "retired-agent".parse().expect("the agent id is valid");
     for externally_deleted in [false, true] {
-        laser.bootstrap(1).await.expect("bootstrap the stream");
+        laser
+            .bootstrap(
+                1,
+                laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(
+                    86_400,
+                )),
+            )
+            .await
+            .expect("bootstrap the stream");
         laser
             .quarantine(
                 "operator".parse().expect("the operator id is valid"),
@@ -301,7 +408,15 @@ async fn given_a_cached_stream_when_deleted_and_recreated_then_should_discard_it
                 .expect("invalidate the stream"),
             !externally_deleted
         );
-        laser.bootstrap(1).await.expect("recreate the stream");
+        laser
+            .bootstrap(
+                1,
+                laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(
+                    86_400,
+                )),
+            )
+            .await
+            .expect("recreate the stream");
         let mut registry = laser.agent_registry().expect("open a fresh registry");
         assert!(!registry.is_quarantined(&agent));
         laser
@@ -650,5 +765,15 @@ async fn given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_
             after.shutdown().await.expect("shutdown after purge");
             producer.shutdown().await.expect("producer shutdown");
         }
+    }
+}
+
+#[tokio::test]
+async fn given_producers_racing_on_a_new_topic_when_built_then_should_all_initialize() {
+    let laser = harness::laser().await;
+    let topic = laser.topic("racing-topic-creation");
+    let builds = (0..8).map(|_| topic.producer().partitions(1).build());
+    for result in futures::future::join_all(builds).await {
+        result.expect("a producer that lost the creation race still initializes");
     }
 }

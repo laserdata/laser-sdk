@@ -2,175 +2,242 @@ import { createInterface } from "node:readline/promises"
 import {
   Agent,
   AgentId,
+  agentMessageBody,
   AgentTopic,
-  Budget,
   capabilitySelector,
-  routeTo,
-  type AgentHandle,
+  routeAllCapable,
+  routeToCapable,
+  WorkflowBudget,
+  type Contract,
+  type Health,
   type Laser
 } from "@laserdata/laser-sdk"
 
-import { AsyncResourceGroup, decodeUtf8, envBoolean, phase, runExample, utf8 } from "../common.js"
+import {
+  AsyncResourceGroup,
+  connectAgain,
+  decodeUtf8,
+  envBoolean,
+  phase,
+  runExample,
+  SESSION_RETENTION,
+  utf8
+} from "../common.js"
+
+// One orchestrator coordinating a pool of long-running capability agents,
+// entirely over the log. It is interactive and paced: it stops at each phase
+// and waits for Enter, so you can watch every transition in the LaserData
+// console's Orchestration view. `LASER_NON_INTERACTIVE=1` runs it straight
+// through. The phases mirror the Rust and Python `orchestra` examples.
+//
+// Routing uses a fixed inbox topic so it runs against Apache Iggy.
 
 export const EXAMPLE = "orchestra"
-const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
+const CLASSIFY = "classify"
+const DIAGNOSE = "diagnose"
+const REMEDIATE = "remediate"
+const SLOW_TASK = "slow-task"
+const INCIDENT = "auth API latency spike"
+const ORCHESTRATOR = AgentId.new("orchestrator")
+const OPERATOR = AgentId.new("operator")
+const FIXED_INBOX = { kind: "fixed" as const, topic: AgentTopic.Sessions }
+const HEALTHY: Health = { kind: "known", name: "Healthy" }
+const UNAVAILABLE: Health = { kind: "known", name: "Unavailable" }
 
-async function pause(label: string): Promise<void> {
-  console.log(label)
-  if (envBoolean("LASER_NON_INTERACTIVE", false)) return
-  // Node 22.14 has no `Symbol.dispose` on a readline interface, so close it by hand.
-  const input = createInterface({
-    input: process.stdin,
-    output: process.stdout
-  })
-  try {
-    await input.question("Press Enter to continue: ")
-  } finally {
-    input.close()
-  }
+export interface OrchestraSummary {
+  readonly classified: string | undefined
+  readonly findings: number
+  readonly workflowSteps: number
+  readonly quarantined: number
+  readonly reinstated: number
+  readonly recovered: string | undefined
 }
 
-function spawnWorker(laser: Laser, name: string, delayMs = 0): AgentHandle {
-  return Agent.builder()
-    .id(AgentId.new(name))
-    .listenOn(AgentTopic.Commands)
-    .respondOn(AgentTopic.Responses)
-    .ackOnPickup()
-    .pollInterval(5)
-    .handler({
-      async handle(message, context): Promise<void> {
-        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs))
-        await context.respond(
-          utf8(`${name}:${decodeUtf8(message.envelope?.body ?? message.payload)}`)
-        )
-      }
-    })
-    .build()
-    .spawn(laser)
-}
+export async function run(laser: Laser, _signal: AbortSignal): Promise<OrchestraSummary> {
+  await laser.bootstrap(1, SESSION_RETENTION)
 
-async function advertise(
-  laser: Laser,
-  name: string,
-  skill: string,
-  unavailable = false
-): Promise<void> {
-  await laser.publishCard(AgentId.new(name), {
-    name,
-    capabilities: [
-      {
-        skillId: skill,
-        health: {
-          kind: "known",
-          name: unavailable ? "Unavailable" : "Healthy"
-        }
-      }
-    ],
-    ttlMicros: 300_000_000n
-  })
-}
-
-export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   phase("Discovery: a pool of long-running capability agents connects")
-  await laser.bootstrap(1)
-  const names = ["triage", "diag-alpha", "diag-beta", "remediate", "slow", "backup"] as const
+  // Kept alive for the whole run so the console stays populated. Health is a
+  // property of the card: diag-gamma advertises unavailable to prove routing
+  // reads it, and laggard is deliberately slow to drive the expiry phase.
   await using agents = new AsyncResourceGroup()
-  const handles = names.map((name) =>
-    agents.add(spawnWorker(laser, name, name === "slow" ? 250 : 0))
-  )
-  await Promise.all(handles.map((handle) => handle.ready()))
-  await advertise(laser, "triage", "triage")
-  await advertise(laser, "diag-alpha", "diagnose")
-  await advertise(laser, "diag-beta", "diagnose")
-  await advertise(laser, "diag-offline", "diagnose", true)
-  await advertise(laser, "remediate", "remediate")
-  await advertise(laser, "slow", "slow")
-  await advertise(laser, "backup", "slow")
+  await spawnWorker(agents, "triager", CLASSIFY, HEALTHY, 200)
+  await spawnWorker(agents, "diag-alpha", DIAGNOSE, HEALTHY, 400)
+  await spawnWorker(agents, "diag-beta", DIAGNOSE, HEALTHY, 400)
+  await spawnWorker(agents, "diag-gamma", DIAGNOSE, UNAVAILABLE, 400)
+  await spawnWorker(agents, "executor", REMEDIATE, HEALTHY, 300)
+  await spawnWorker(agents, "laggard", SLOW_TASK, HEALTHY, 6_000)
+  console.log("six agents connected and advertised their capability cards")
+  await pause("DISCOVERY: six agents are live in the registry (one unavailable)")
 
   phase("Contract: a directed task to one capable agent, with a deadline")
-  const contract = await laser
-    .contract(routeTo(AgentId.new("triage")))
-    .from(AgentId.new("orchestrator"))
-    .payload(utf8("classify incident"))
-    .inboxRoute(fixedCommands)
-    .deadline(2_000)
-    .send()
-  if (contract.kind !== "completed") throw new Error(`triage contract ended as ${contract.kind}`)
-  await pause("contract completed")
+  // The orchestrator names a capability, not an agent. Routing resolves the one
+  // classifier from the registry and waits for the reply or the deadline.
+  const classified = completedBody(await contractSkill(laser, CLASSIFY, 10_000))
+  console.log(`classifier replied: ${classified ?? "<did not complete>"}`)
+  await pause("CONTRACT: a directed task completed (see it in the Contracts panel)")
 
   phase("Fan-out: a panel scattered to every capable agent")
-  const selector = capabilitySelector("diagnose", { kind: "any" })
-  const first = await laser.scatter(
-    AgentId.new("orchestrator"),
-    selector,
-    utf8("inspect incident"),
-    fixedCommands,
-    2_000
-  )
-  if (first.length !== 2) throw new Error("healthy scatter must return two findings")
-  await pause(`scatter completed with ${String(first.length)} findings`)
+  // Three agents advertise diagnose, but one is unavailable, so the scatter
+  // reaches the two healthy ones without the orchestrator knowing their ids.
+  const findings = (await diagnosePanel(laser)).length
+  console.log(`panel gathered ${String(findings)} findings (the unavailable agent was skipped)`)
+  await pause("FAN-OUT: two healthy diagnosers answered, the unavailable one was skipped")
 
-  phase("Workflow: triage, diagnose, then remediate")
+  phase("Workflow: triage, then a diagnose panel, then remediate (journalled)")
+  // The run is a session and every step a child session of it, so the
+  // sessions view shows the whole tree on any deployment.
   const workflow = await laser
-    .workflow("orchestrator")
-    .inboxRoute(fixedCommands)
-    .budget(Budget.unlimited().invocations(3).wallClock(10_000))
-    .step("triage", routeTo(AgentId.new("triage")), () => utf8("triage"))
-    .step("diagnose", routeTo(AgentId.new("diag-alpha")), ({ outputs }) =>
-      utf8(`diagnose:${decodeUtf8(outputs.get("triage") ?? new Uint8Array())}`)
+    .workflow("incident-response")
+    .inboxRoute(FIXED_INBOX)
+    // Cap the dispatches and wall clock so a runaway fan-out cannot spin.
+    .budget(WorkflowBudget.unlimited().invocations(8).wallClock(60_000))
+    .step("triage", routeToCapable(CLASSIFY, { kind: "any" }), () => utf8(INCIDENT))
+    // Each step reads the prior steps' outputs from the journal, so the
+    // dependency edge is data, not a shared variable.
+    .step("diagnose", routeAllCapable(DIAGNOSE, { kind: "any" }), ({ outputs }) =>
+      utf8(`diagnose: ${decodeUtf8(outputs.get("triage") ?? new Uint8Array())}`)
     )
     .after("triage")
-    .step("remediate", routeTo(AgentId.new("remediate")), ({ outputs }) =>
-      utf8(`remediate:${decodeUtf8(outputs.get("diagnose") ?? new Uint8Array())}`)
+    .verifyWith((folded) => folded.length > 0)
+    .step("remediate", routeToCapable(REMEDIATE, { kind: "any" }), ({ outputs }) =>
+      utf8(`remediate: ${decodeUtf8(outputs.get("diagnose") ?? new Uint8Array())}`)
     )
     .after("diagnose")
     .run()
-  if (workflow.outputs.size !== 3) throw new Error("workflow did not journal all three steps")
-  await pause(`workflow ${workflow.runId.toString()} completed`)
+  console.log(`workflow completed and journalled: ${String(workflow.outputs.size)} steps`)
+  await pause("WORKFLOW: the run journalled triage -> diagnose -> remediate (Workflow panel)")
 
   phase("Quarantine: an operator pulls a misbehaving agent")
-  await laser.quarantine(AgentId.new("operator"), AgentId.new("diag-alpha"))
-  const after = await laser.scatter(
-    AgentId.new("orchestrator"),
-    selector,
-    utf8("inspect after quarantine"),
-    fixedCommands,
-    2_000
-  )
-  if (after.length !== 1) throw new Error("quarantine must remove one diagnostic target")
-  await pause("quarantine rerouted the panel")
+  // Quarantine is a registry fact every fused registry folds, so the next panel
+  // routes around diag-alpha with no change to the orchestrator.
+  await laser.quarantine(OPERATOR, AgentId.new("diag-alpha"))
+  const quarantined = (await diagnosePanel(laser)).length
+  console.log(`panel after quarantine: ${String(quarantined)} findings (alpha routed around)`)
+  await pause("QUARANTINE: diag-alpha is quarantined in the registry, the panel routes around it")
 
   phase("Recovery: the operator reinstates the agent")
-  await laser.unquarantine(AgentId.new("operator"), AgentId.new("diag-alpha"))
-  const restored = await laser.scatter(
-    AgentId.new("orchestrator"),
-    selector,
-    utf8("inspect after recovery"),
-    fixedCommands,
-    2_000
-  )
-  if (restored.length !== 2) throw new Error("unquarantine must restore the diagnostic target")
-  await pause("the full diagnostic panel recovered")
+  await laser.unquarantine(OPERATOR, AgentId.new("diag-alpha"))
+  const reinstated = (await diagnosePanel(laser)).length
+  console.log(`panel after un-quarantine: ${String(reinstated)} findings (alpha is back)`)
+  await pause("RECOVERY: diag-alpha is reinstated, the panel is whole again")
 
-  phase("Expiry + recovery: a tight deadline times out, then reroutes")
-  const expired = await laser
-    .contract(routeTo(AgentId.new("slow")))
-    .from(AgentId.new("orchestrator"))
-    .payload(utf8("bounded task"))
-    .inboxRoute(fixedCommands)
-    .deadline(50)
+  phase("Expiry + recovery: a tight deadline times out, the orchestrator recovers")
+  // The slow agent acks pickup but cannot finish inside the one-second deadline,
+  // so the contract expires. The orchestrator recovers by re-dispatching to a
+  // healthy fast agent, the pattern any real coordinator uses for a stuck task.
+  const slow = await contractSkill(laser, SLOW_TASK, 1_000)
+  let recovered: string | undefined
+  if (slow.kind === "completed") {
+    console.log(`unexpectedly fast: ${completedBody(slow) ?? ""}`)
+  } else {
+    console.log("the slow agent missed the deadline, recovering on a healthy agent")
+    recovered = completedBody(await contractSkill(laser, REMEDIATE, 10_000))
+    console.log(`recovered: ${recovered ?? "<did not complete>"}`)
+  }
+  await pause("EXPIRY: the slow agent timed out, the task recovered on a healthy agent")
+
+  console.log(
+    "\norchestra: discovery, routing, fan-out, a journalled workflow, health,\n" +
+      "reversible quarantine, and deadline recovery, all coordinated over the log."
+  )
+  return {
+    classified,
+    findings,
+    workflowSteps: workflow.outputs.size,
+    quarantined,
+    reinstated,
+    recovered
+  }
+}
+
+/**
+ * Spawns one long-running capability agent on its own connection, so each is
+ * a distinct live presence in the console. It advertises its card on start,
+ * and the resource group keeps the connection open until the run ends.
+ */
+async function spawnWorker(
+  agents: AsyncResourceGroup,
+  name: string,
+  skill: string,
+  health: Health,
+  delayMs: number
+): Promise<void> {
+  const connection = agents.add(await connectAgain(EXAMPLE))
+  const handle = agents.add(
+    Agent.builder()
+      .id(AgentId.new(name))
+      .listenOn(AgentTopic.Sessions)
+      .respondOn(AgentTopic.Sessions)
+      .capabilities([{ skillId: skill, health }])
+      // Ack on pickup so the orchestrator can tell a consumed task from an
+      // expired one, which is what makes the expiry phase legible.
+      .ackOnPickup()
+      .handler({
+        async handle(message, context): Promise<void> {
+          await new Promise((resolve) => setTimeout(resolve, delayMs))
+          const task = decodeUtf8(agentMessageBody(message))
+          await context.respond(utf8(workerReply(name, skill, task)))
+        }
+      })
+      .build()
+      .spawn(connection)
+  )
+  await handle.ready()
+}
+
+function workerReply(name: string, skill: string, task: string): string {
+  switch (skill) {
+    case CLASSIFY:
+      return `severity=high (${task})`
+    case DIAGNOSE:
+      return `${name}: cache stampede on the hot key [${task}]`
+    case REMEDIATE:
+      return `${name}: drained the hot key, scaled the cache [${task}]`
+    default:
+      return `${name}: ${skill} done [${task}]`
+  }
+}
+
+async function contractSkill(laser: Laser, skill: string, deadlineMs: number): Promise<Contract> {
+  return laser
+    .contract(routeToCapable(skill, { kind: "any" }))
+    .from(ORCHESTRATOR)
+    .payload(utf8(INCIDENT))
+    .inboxRoute(FIXED_INBOX)
+    .deadline(deadlineMs)
     .send()
-  if (expired.kind !== "timedOut") throw new Error("slow task must time out")
-  const recovered = await laser
-    .contract(routeTo(AgentId.new("backup")))
-    .from(AgentId.new("orchestrator"))
-    .payload(utf8("bounded task"))
-    .inboxRoute(fixedCommands)
-    .deadline(2_000)
-    .send()
-  if (recovered.kind !== "completed") throw new Error("healthy redispatch must complete")
-  await pause("deadline recovery completed")
-  console.log("\nall orchestration phases completed with durable journal evidence")
+}
+
+/** Scatters a diagnose panel to every capable agent. Unavailable agents are
+ * left out by capability resolution. */
+async function diagnosePanel(laser: Laser): Promise<readonly Uint8Array[]> {
+  return laser.scatter(
+    ORCHESTRATOR,
+    capabilitySelector(DIAGNOSE, { kind: "any" }),
+    utf8(INCIDENT),
+    FIXED_INBOX,
+    10_000
+  )
+}
+
+function completedBody(outcome: Contract): string | undefined {
+  return outcome.kind === "completed" ? decodeUtf8(agentMessageBody(outcome.reply)) : undefined
+}
+
+/** Prints what to watch, then waits for Enter unless `LASER_NON_INTERACTIVE` is set. */
+async function pause(prompt: string): Promise<void> {
+  console.log(
+    `\n  >>> ${prompt}\n      (watch the console's /orchestration view, then press Enter)`
+  )
+  if (envBoolean("LASER_NON_INTERACTIVE", false)) return
+  // Node 22.14 has no `Symbol.dispose` on a readline interface, so close it by hand.
+  const input = createInterface({ input: process.stdin, output: process.stdout })
+  try {
+    await input.question("")
+  } finally {
+    input.close()
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await runExample(EXAMPLE, run)

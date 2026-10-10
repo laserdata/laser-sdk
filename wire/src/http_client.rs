@@ -11,7 +11,6 @@
 // is just a `Future`, with no executor dependency, so it still compiles for
 // `wasm32-unknown-unknown`.
 
-use crate::agent_workflow::{AgentRunInfo, AgentSubmit};
 use crate::authz::{Role, WhoamiReply};
 use crate::browse::{ProjectionInfo, SchemaInfo};
 use crate::checkpoint::CheckpointReadConsistency;
@@ -31,9 +30,10 @@ use crate::http::{
     FilterBindingListQuery, FilterListQuery, FilterRevisionListQuery, FilterTestBody,
     ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
     KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
-    QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, RunPageView, RunsQuery,
-    SchemaListQuery, SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView,
-    TableMetricsView, TableSchemaView, TableSnapshotView, TableView,
+    QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, SchemaListQuery,
+    SessionChangesQuery, SessionEventsQuery, SessionLinksQuery, SessionStateQuery, SessionsQuery,
+    SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView, TableMetricsView,
+    TableSchemaView, TableSnapshotView, TableView,
 };
 use crate::kv::{CasExpect, KvNamespaceInfo};
 use crate::query::{Query, QueryResult};
@@ -417,17 +417,21 @@ impl<T: Transport> HttpClient<T> {
         self.get(with_query(http::SCHEMAS_PATH, filter)?).await
     }
 
-    /// `POST /agdx/schemas`: register a schema, get its allocated id.
+    /// `POST /agdx/schemas`: register a schema, get its allocated id. `stream`
+    /// names the stream whose registry allocates it, `None` the
+    /// deployment-wide registry.
     pub async fn register_schema(
         &self,
         source: SchemaSource,
         name: Option<String>,
         version: Option<u32>,
+        stream: Option<String>,
     ) -> ClientResult<u32, T::Error> {
         let body = http::RegisterSchemaBody {
             source,
             name,
             version,
+            stream,
         };
         self.send_json(Method::Post, http::SCHEMAS_PATH.to_owned(), &body)
             .await
@@ -551,28 +555,80 @@ impl<T: Transport> HttpClient<T> {
         self.get(with_query(http::CLIENTS_PATH, query)?).await
     }
 
-    /// `POST /agdx/runs`: submit a task to an agent or workflow, returning the
-    /// minted (or converged) run.
-    pub async fn submit_run(&self, body: &AgentSubmit) -> ClientResult<AgentRunInfo, T::Error> {
-        self.send_json(Method::Post, http::RUNS_PATH.to_owned(), body)
+    /// `GET /agdx/sessions/{stream}`: one page of the stream's sessions,
+    /// filtered and paged per `query`.
+    pub async fn list_sessions(
+        &self,
+        stream: &str,
+        query: &SessionsQuery,
+    ) -> ClientResult<crate::session::SessionPage, T::Error> {
+        self.get(with_query(&http::sessions_path(stream), query)?)
             .await
     }
 
-    /// `GET /agdx/runs/{id}`: read one run's status, or `None` on a 404.
-    pub async fn run_status(&self, id: &str) -> ClientResult<Option<AgentRunInfo>, T::Error> {
-        self.get_optional(http::run_path(id)).await
+    /// `GET /agdx/sessions/{stream}/{id}`: one session's summary, or `None` on
+    /// a 404.
+    pub async fn session(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+    ) -> ClientResult<Option<crate::session::SessionInfo>, T::Error> {
+        self.get_optional(http::session_path(stream, id)).await
     }
 
-    /// `GET /agdx/runs`: one page of runs, filtered and paged per `query`.
-    /// Follow `cursor` as the next request's cursor to page.
-    pub async fn list_runs(&self, query: &RunsQuery) -> ClientResult<RunPageView, T::Error> {
-        self.get(with_query(http::RUNS_PATH, query)?).await
+    /// `GET /agdx/sessions/{stream}/{id}/events`: one page of a session's
+    /// events.
+    pub async fn session_events(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+        query: &SessionEventsQuery,
+    ) -> ClientResult<crate::session::SessionEventsPage, T::Error> {
+        self.get(with_query(&http::session_events_path(stream, id), query)?)
+            .await
     }
 
-    /// `POST /agdx/runs/{id}/cancel`: record the cancel intent, returning the
-    /// run (the engine observes the intent at its next step boundary).
-    pub async fn cancel_run(&self, id: &str) -> ClientResult<AgentRunInfo, T::Error> {
-        self.send_empty(Method::Post, http::run_cancel_path(id))
+    /// `GET /agdx/sessions/{stream}/{id}/state`: a session's state document.
+    pub async fn session_state(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+        query: &SessionStateQuery,
+    ) -> ClientResult<crate::session::SessionStateView, T::Error> {
+        self.get(with_query(&http::session_state_path(stream, id), query)?)
+            .await
+    }
+
+    /// `GET /agdx/sessions/{stream}/{id}/links`: the resources a session
+    /// wrote, recalled, or touched.
+    pub async fn session_links(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+        query: &SessionLinksQuery,
+    ) -> ClientResult<crate::session::SessionLinksView, T::Error> {
+        self.get(with_query(&http::session_links_path(stream, id), query)?)
+            .await
+    }
+
+    /// `GET /agdx/sessions/{stream}/{id}/sources`: the source partitions that
+    /// hold a session's records.
+    pub async fn session_sources(
+        &self,
+        stream: &str,
+        id: crate::agent::ConversationId,
+    ) -> ClientResult<crate::session::SessionSources, T::Error> {
+        self.get(http::session_sources_path(stream, id)).await
+    }
+
+    /// `GET /agdx/sessions/{stream}/changes`: the stream's change rows after
+    /// `query.after`.
+    pub async fn session_changes(
+        &self,
+        stream: &str,
+        query: &SessionChangesQuery,
+    ) -> ClientResult<crate::session::SessionChanges, T::Error> {
+        self.get(with_query(&http::session_changes_path(stream), query)?)
             .await
     }
 
@@ -618,28 +674,46 @@ impl<T: Transport> HttpClient<T> {
     }
 
     /// `GET /agdx/schemas/{id}`: read one writer schema, or `None` on a 404.
-    pub async fn get_schema(&self, id: u32) -> ClientResult<Option<SchemaInfo>, T::Error> {
-        self.get_optional(http::schema_path(id)).await
+    /// `stream` names the stream whose registry holds the id, `None` the
+    /// deployment-wide registry.
+    pub async fn get_schema(
+        &self,
+        id: u32,
+        stream: Option<&str>,
+    ) -> ClientResult<Option<SchemaInfo>, T::Error> {
+        self.get_optional(schema_route(http::schema_path(id), stream)?)
+            .await
     }
 
-    /// `DELETE /agdx/schemas/{id}`: drop (tombstone) a schema.
-    pub async fn drop_schema(&self, id: u32) -> ClientResult<(), T::Error> {
-        self.expect_ok(Method::Delete, http::schema_path(id), None)
-            .await
+    /// `DELETE /agdx/schemas/{id}`: drop (tombstone) a schema. `stream` names
+    /// the stream whose registry holds the id.
+    pub async fn drop_schema(&self, id: u32, stream: Option<&str>) -> ClientResult<(), T::Error> {
+        self.expect_ok(
+            Method::Delete,
+            schema_route(http::schema_path(id), stream)?,
+            None,
+        )
+        .await
     }
 
     /// `POST /agdx/schemas/{id}/decode`: decode a record body under the schema,
     /// returning its JSON form, or `None` when the body does not decode under it.
+    /// `stream` names the stream whose registry holds the id.
     pub async fn decode_record(
         &self,
         id: u32,
         payload: &[u8],
+        stream: Option<&str>,
     ) -> ClientResult<Option<serde_json::Value>, T::Error> {
         let body = DecodeRecordBody {
             payload: base64url_encode(payload),
         };
-        self.send_json(Method::Post, http::schema_decode_path(id), &body)
-            .await
+        self.send_json(
+            Method::Post,
+            schema_route(http::schema_decode_path(id), stream)?,
+            &body,
+        )
+        .await
     }
 
     /// `GET /agdx/filters`: list saved consumer filters, newest first.
@@ -974,6 +1048,15 @@ impl<T: Transport> HttpClient<T> {
 
 /// Append `?<urlencoded>` to a path when `params` serializes to a non-empty
 /// query string, else return the path unchanged.
+fn schema_route<E>(path: String, stream: Option<&str>) -> Result<String, ClientError<E>> {
+    with_query(
+        &path,
+        &http::SchemaQuery {
+            stream: stream.map(str::to_owned),
+        },
+    )
+}
+
 fn with_query<E, P: Serialize>(path: &str, params: &P) -> Result<String, ClientError<E>> {
     let query = serde_urlencoded::to_string(params)
         .map_err(|error| ClientError::Decode(format!("query params: {error}")))?;

@@ -33,33 +33,17 @@ def test_given_a_native_snapshot_store_when_checking_its_type_then_should_be_a_s
 
 
 def test_given_a_fold_snapshot_when_resuming_then_should_start_past_the_folded_offset():
-    snapshot = {"conversation": ls.new_conversation_id(), "as_of": {0: 7}, "state": b""}
-    assert ls.fold_snapshot_resume_offset(snapshot, 0) == 8
-    assert ls.fold_snapshot_resume_offset(snapshot, 3) == 0
-
-
-@pytest.mark.parametrize(
-    ("state", "terminal"),
-    [
-        ("submitted", False),
-        ("running", False),
-        ("completed", True),
-        ("cancelled", True),
-        ("failed", True),
-    ],
-)
-def test_given_a_run_state_when_checking_terminal_then_should_match_rust(state, terminal):
-    assert ls.agent_run_state_is_terminal(state) is terminal
-
-
-def test_given_an_unknown_run_state_when_checking_terminal_then_should_raise_value_error():
-    with pytest.raises(ValueError):
-        ls.agent_run_state_is_terminal("paused")
-
-
-def test_given_the_runs_surface_when_importing_then_should_name_the_record_agent_run_info():
-    assert hasattr(ls, "AgentRunInfo")
-    assert not hasattr(ls, "RunInfo")
+    snapshot = {
+        "stream": "agents",
+        "stream_id": 0,
+        "stream_created_at_micros": 100,
+        "conversation": ls.new_conversation_id(),
+        "fold": "planner",
+        "as_of": [[2, 20, 0, 7]],
+        "state": b"",
+    }
+    assert ls.fold_snapshot_resume_offset(snapshot, 2, 20, 0) == 8
+    assert ls.fold_snapshot_resume_offset(snapshot, 2, 21, 0) == 0
 
 
 def test_given_a_mutation_when_building_a_checkpoint_envelope_then_should_stamp_the_op_version():

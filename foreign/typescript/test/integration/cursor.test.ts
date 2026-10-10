@@ -74,23 +74,21 @@ void test("given_a_snapshot_of_offsets_when_a_new_cursor_resumes_then_should_con
   }
 })
 
-void test("given_a_cursor_stream_when_a_message_is_sent_later_then_should_yield_it_without_terminating", async () => {
+void test("given_a_cursor_stream_when_caught_up_then_should_end_and_a_later_stream_should_resume", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const topic = await freshTopic(laser)
     await topic.send(utf8("first"))
 
     const cursor = (await topic.replay()).batch(10)
-    const iterator = cursor.stream({ pollIntervalMs: 50 })[Symbol.asyncIterator]()
-
-    const first = await iterator.next()
-    assert.equal(first.done, false)
-    assert.equal(decodeUtf8(first.value.payload), "first")
+    const first: string[] = []
+    for await (const message of cursor.stream()) first.push(decodeUtf8(message.payload))
+    assert.deepEqual(first, ["first"])
 
     await topic.send(utf8("second"))
-    const second = await iterator.next()
-    assert.equal(second.done, false)
-    assert.equal(decodeUtf8(second.value.payload), "second")
+    const second: string[] = []
+    for await (const message of cursor.stream()) second.push(decodeUtf8(message.payload))
+    assert.deepEqual(second, ["second"])
   } finally {
     await laser.close()
   }

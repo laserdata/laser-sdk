@@ -5,7 +5,7 @@ use crate::types::{AgentId, ConversationId, MessageId};
 use iggy::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 
-const READ_BATCH: u32 = 1000;
+pub(crate) const READ_BATCH: u32 = 1000;
 
 /// The most raw records a context read examines in each partition: the newest
 /// ones, or the newest ones before a [`Checkpoint`] for a point-in-time read.
@@ -31,13 +31,19 @@ pub struct ContextMessage {
     pub envelope: Option<laser_wire::agent::AgentEnvelope>,
     /// The name of the topic the message was read from.
     pub topic: String,
+    /// The broker's append time in microseconds.
+    pub timestamp_micros: u64,
+    /// The numeric id of the stream the message was read from.
+    pub stream_id: u32,
+    /// The numeric id of the topic the message was read from.
+    pub topic_id: u32,
 }
 
 /// A point in a conversation's log: the next offset each partition of each
 /// named topic will write, as captured by
 /// [`ContextScope::checkpoint`](crate::context_scope::ContextScope::checkpoint).
-/// [`ContextAssembler::to_checkpoint`] folds history up to it and
-/// [`ContextAssembler::from_checkpoint`] resumes after it. It is a client-side
+/// A [`ContextAssembler`] built with `to_checkpoint` folds history up to it,
+/// and one built with `from_checkpoint` resumes after it. It is a client-side
 /// bookmark keyed by topic ([`AgentTopic::topic_string`]), never a record on
 /// the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,10 +52,21 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
+    pub(crate) fn from_topic_offsets(per_topic: BTreeMap<String, BTreeMap<u32, u64>>) -> Self {
+        Self { per_topic }
+    }
+
     /// The per-partition offsets for `topic` (by [`AgentTopic::topic_string`]),
     /// or `None` when the checkpoint was not taken over that topic.
     pub fn topic_offsets(&self, topic: &str) -> Option<&BTreeMap<u32, u64>> {
         self.per_topic.get(topic)
+    }
+
+    /// Every checkpointed topic with its partition offsets, by topic name.
+    pub fn topics(&self) -> impl Iterator<Item = (&str, &BTreeMap<u32, u64>)> {
+        self.per_topic
+            .iter()
+            .map(|(topic, offsets)| (topic.as_str(), offsets))
     }
 
     /// True when no named topic was checkpointed.
@@ -108,12 +125,53 @@ pub async fn checkpoint(
 /// Selects which assembled messages feed an LLM call.
 pub trait ContextPolicy: Send + Sync {
     fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage>;
+
+    /// The policy name a context manifest records.
+    fn name(&self) -> String {
+        "custom".to_owned()
+    }
+
+    /// The policy version a context manifest records.
+    fn version(&self) -> String {
+        "1".to_owned()
+    }
+
+    /// The kept and dropped records of one selection, and why.
+    fn selection(&self, history: &[ContextMessage]) -> Selection {
+        let kept = self.select(history);
+        let dropped = history
+            .iter()
+            .filter(|message| {
+                !kept
+                    .iter()
+                    .any(|kept| kept.id == message.id && kept.topic == message.topic)
+            })
+            .cloned()
+            .collect();
+        Selection {
+            kept,
+            dropped,
+            reason: self.name(),
+        }
+    }
+}
+
+/// What a [`ContextPolicy`] kept and dropped, and the policy that decided.
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub kept: Vec<ContextMessage>,
+    pub dropped: Vec<ContextMessage>,
+    pub reason: String,
 }
 
 /// Keep the most recent N messages.
 pub struct LastN(pub usize);
 
 impl ContextPolicy for LastN {
+    fn name(&self) -> String {
+        format!("last_n({})", self.0)
+    }
+
     fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage> {
         let start = history.len().saturating_sub(self.0);
         history[start..].to_vec()
@@ -124,6 +182,10 @@ impl ContextPolicy for LastN {
 pub struct RoleFilter(pub HashSet<AgentId>);
 
 impl ContextPolicy for RoleFilter {
+    fn name(&self) -> String {
+        "role_filter".to_owned()
+    }
+
     fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage> {
         history
             .iter()
@@ -145,6 +207,11 @@ impl ContextPolicy for RoleFilter {
 pub struct Chain(pub Vec<Box<dyn ContextPolicy>>);
 
 impl ContextPolicy for Chain {
+    fn name(&self) -> String {
+        let names: Vec<String> = self.0.iter().map(|policy| policy.name()).collect();
+        format!("chain({})", names.join(","))
+    }
+
     fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage> {
         let mut current = history.to_vec();
         for policy in &self.0 {
@@ -170,7 +237,10 @@ impl TokenBudget {
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
-            estimate: Box::new(|message| message.payload.len().div_ceil(4)),
+            estimate: Box::new(|message| {
+                usize::try_from(laser_wire::agent::estimate_tokens(message.payload.len()))
+                    .unwrap_or(usize::MAX)
+            }),
         }
     }
 
@@ -189,6 +259,10 @@ impl TokenBudget {
 }
 
 impl ContextPolicy for TokenBudget {
+    fn name(&self) -> String {
+        format!("token_budget({})", self.max_tokens)
+    }
+
     fn select(&self, history: &[ContextMessage]) -> Vec<ContextMessage> {
         // Walk newest-first, keeping messages while the running estimate fits, so
         // the kept set is the most-recent tail under budget. Always keep at least
@@ -214,7 +288,7 @@ pub struct ContextAssembler {
     conversation_id: ConversationId,
     #[builder(default = false)]
     across_subconversations: bool,
-    #[builder(default = vec![AgentTopic::Commands, AgentTopic::Responses])]
+    #[builder(default = vec![AgentTopic::Sessions])]
     topics: Vec<AgentTopic<'static>>,
     #[builder(default = Box::new(LastN(50)))]
     policy: Box<dyn ContextPolicy>,
@@ -250,35 +324,55 @@ impl ContextAssembler {
         self.read(laser, ReadSpan::Whole).await
     }
 
-    async fn read(self, laser: &Laser, span: ReadSpan) -> Result<Vec<ContextMessage>, LaserError> {
+    async fn read(
+        mut self,
+        laser: &Laser,
+        span: ReadSpan,
+    ) -> Result<Vec<ContextMessage>, LaserError> {
+        // A topic named twice is read once.
+        let mut seen = std::collections::BTreeSet::new();
+        self.topics
+            .retain(|topic| seen.insert(topic.topic_string()));
         let stream = Identifier::named(laser.stream_required()?)?;
+        let Some(stream_details) = laser.client().get_stream(&stream).await? else {
+            return Ok(Vec::new());
+        };
+        let stream_id = stream_details.id;
 
-        // Resolve each topic's partition count concurrently.
+        // Resolve each topic's id and partition count concurrently.
         let mut meta = tokio::task::JoinSet::new();
         for (topic_idx, topic) in self.topics.iter().enumerate() {
             let laser = laser.clone();
             let stream = stream.clone();
             let topic_id = topic.as_identifier();
             meta.spawn(async move {
-                let count = laser
+                let details = laser
                     .client()
                     .get_topic(&stream, &topic_id)
                     .await?
-                    .map(|details| crate::poll::bounded_partitions(details.partitions_count));
-                Ok::<_, LaserError>((topic_idx, topic_id, count))
+                    .map(|details| {
+                        (
+                            details.id,
+                            crate::poll::bounded_partitions(details.partitions_count),
+                        )
+                    });
+                Ok::<_, LaserError>((topic_idx, topic_id, details))
             });
         }
         let mut sources = Vec::new();
         while let Some(joined) = meta.join_next().await {
-            let (topic_idx, topic_id, count) = joined.map_err(join_failed)??;
-            for partition in 0..count.unwrap_or(0) {
-                sources.push((topic_idx, topic_id.clone(), partition));
+            let (topic_idx, topic_id, details) = joined.map_err(join_failed)??;
+            let Some((numeric_topic, count)) = details else {
+                continue;
+            };
+            for partition in 0..count {
+                sources.push((topic_idx, topic_id.clone(), numeric_topic, partition));
             }
         }
 
         // Drain every partition concurrently.
         let mut drains = tokio::task::JoinSet::new();
-        for (topic_idx, topic_id, partition) in sources {
+        for (topic_idx, topic_id, numeric_topic, partition) in sources {
             let laser = laser.clone();
             let stream = stream.clone();
             let topic_name = self.topics[topic_idx].topic_string();
@@ -330,6 +424,9 @@ impl ContextAssembler {
                                     payload: message.payload.to_vec(),
                                     envelope,
                                     topic: topic_name.clone(),
+                                    timestamp_micros: message.header.timestamp,
+                                    stream_id,
+                                    topic_id: numeric_topic,
                                 },
                             ));
                         }
@@ -501,21 +598,21 @@ mod tests {
         let checkpoint = Checkpoint {
             per_topic: BTreeMap::from([
                 (
-                    "agent.commands".to_owned(),
+                    "agent.sessions".to_owned(),
                     BTreeMap::from([(0, 5), (1, 2)]),
                 ),
-                ("agent.llm_io".to_owned(), BTreeMap::new()),
+                ("agent.streams".to_owned(), BTreeMap::new()),
             ]),
         };
         assert_eq!(
-            checkpoint.topic_offsets("agent.commands"),
+            checkpoint.topic_offsets("agent.sessions"),
             Some(&BTreeMap::from([(0, 5), (1, 2)]))
         );
         assert_eq!(
-            checkpoint.topic_offsets("agent.llm_io"),
+            checkpoint.topic_offsets("agent.streams"),
             Some(&BTreeMap::new())
         );
-        assert_eq!(checkpoint.topic_offsets("agent.tool_calls"), None);
+        assert_eq!(checkpoint.topic_offsets("agent.memory"), None);
         assert!(!checkpoint.is_empty());
         assert!(Checkpoint::default().is_empty());
     }
@@ -529,7 +626,10 @@ mod tests {
                 .build(),
             payload: Vec::new(),
             envelope: None,
-            topic: "agent.commands".to_owned(),
+            topic: "agent.sessions".to_owned(),
+            timestamp_micros: offset,
+            stream_id: 1,
+            topic_id: 1,
         }
     }
 

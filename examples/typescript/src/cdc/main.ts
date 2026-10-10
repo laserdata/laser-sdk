@@ -10,7 +10,15 @@ import {
   type Laser,
   type MatchedRecord
 } from "@laserdata/laser-sdk"
-import { decodeUtf8, managedGate, phase, runExample, runToken, utf8 } from "../common.js"
+import {
+  decodeUtf8,
+  exampleStream,
+  managedGate,
+  phase,
+  runExample,
+  runToken,
+  utf8
+} from "../common.js"
 
 // A satellite fleet streams the change feed of its mission-ops database: every
 // battery reading, orbit maneuver, and ground-station status flip. The anomaly
@@ -81,7 +89,7 @@ interface Feed {
 export async function run(laser: Laser, _signal: AbortSignal): Promise<boolean> {
   const capabilities = await laser.capabilities()
   if (!managedGate(capabilities, "filterCatalog", EXAMPLE, "consumer group filters")) return false
-  const stream = laser.defaultStream ?? ""
+  const stream = exampleStream(laser)
   const topic = laser.stream(stream).topic(TOPIC)
 
   phase("publish a busy fleet change feed, keyed by satellite")

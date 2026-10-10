@@ -1,7 +1,14 @@
 import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.command.js"
 import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
+import { GET_STREAM } from "apache-iggy/dist/wire/stream/get-stream.command.js"
+import { GET_TOPIC } from "apache-iggy/dist/wire/topic/get-topic.command.js"
 import { connectOptions } from "../client/connect-options.js"
-import { publishOptions, publishWithin, type PublishOptions } from "../client/publish-options.js"
+import {
+  publishOptions,
+  publishWithin,
+  retryDelayMs,
+  type PublishOptions
+} from "../client/publish-options.js"
 import {
   Consumer,
   DeserializeError,
@@ -24,6 +31,7 @@ import { isIP } from "node:net"
 import {
   AmbiguousMutationError,
   ConfigError,
+  SessionError,
   InvalidError,
   ProtocolError,
   PublishFailedError,
@@ -85,15 +93,24 @@ export const UNLIMITED_TOPIC_SIZE = 18_446_744_073_709_551_615n
 export const NEVER_EXPIRE = 18_446_744_073_709_551_615n
 
 const TOPIC_NAME_ALREADY_EXISTS = 2013
+const NOT_FOUND_METADATA_CODES = new Set([1009, 1010, 2010, 2011])
+// A missing resource, stream, or topic on publish: the cached routing may
+// predate a deleted and recreated stream or topic.
+const MISSING_RESOURCE_CODES = new Set([20, 1009, 1010, 2010, 2011])
 const UNAUTHENTICATED = 40
+// `InvalidJsonResponse` and `InvalidBytesResponse`: the batch committed and only
+// its confirmation was lost.
+const LOST_CONFIRMATION_CODES: ReadonlySet<number> = new Set([302, 303])
 const POLL_MESSAGES_CODE = 100
 const PUBLISH_BATCH_LENGTH = 1_000
 const NUMERIC_IDENTIFIER = 1
 const STRING_IDENTIFIER = 2
 // Server replies a later attempt can clear: a write the cluster did not
 // commit or admit, and a partition the node could not read or find yet.
-const TRANSIENT_PUBLISH_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 3007, 10002])
+const TRANSIENT_SERVER_CODES: ReadonlySet<number> = new Set([57, 58, 3004, 3007, 10002])
 const DEFAULT_RECONNECT_INTERVAL_MS = 1_000
+// The Apache Iggy TCP default port, as in Rust.
+const DEFAULT_TCP_PORT = 8090
 const ACCEPT_STAGE = "Iggy server to accept the connection"
 const LOGIN_STAGE = "Iggy login reply"
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
@@ -180,6 +197,16 @@ export interface LaserTransport {
     settings: TopicCreateSettings
   ): Promise<void>
   findTopicPartitionCount(streamId: string, topicId: string): Promise<number | undefined>
+  findSnapshotStream?(
+    stream: string
+  ): Promise<{ readonly id: number; readonly createdAtMicros: bigint } | undefined>
+  findSnapshotTopic?(
+    stream: string,
+    topic: string
+  ): Promise<
+    | { readonly id: number; readonly createdAtMicros: bigint; readonly partitions: number }
+    | undefined
+  >
   getTopicPartitionCount(streamId: string, topicId: string): Promise<number>
   resolveStreamTopicIds?(
     streamId: string,
@@ -213,7 +240,16 @@ export interface LaserTransport {
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number,
-    options?: Partial<PublishOptions> & { readonly batchLength?: number }
+    options?: Partial<PublishOptions> & {
+      readonly batchLength?: number
+      /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
+      readonly fixedRetryIntervalMs?: number
+      readonly beforeSend?: () => Promise<{
+        readonly streamId: number
+        readonly topicId: number
+        readonly partitions: number
+      }>
+    }
   ): Promise<SendMessagesResponse>
   pollMessages(
     streamId: string,
@@ -280,6 +316,10 @@ export interface LaserTransport {
   openCoordinator?(): Promise<CoordinatorConnection>
   /** Whether this transport can open node and coordinator connections of its own. */
   readonly connectsNodes?: boolean
+  /** How long one publish may take, in milliseconds. */
+  publishTimeoutMs?(): number
+  /** The publish timeout, retry count, and backoff this connection uses. */
+  publishOptions?(): PublishOptions
   close(): Promise<void>
 }
 
@@ -657,6 +697,10 @@ interface ParsedConnectionString {
     readonly intervalMs: number
     readonly maxRetries: number | undefined
   }
+  readonly heartbeatIntervalMs?: number
+  readonly noDelay?: boolean
+  /** Validated like Rust. The Node transport reconnects on its own schedule. */
+  readonly reestablishAfterMs?: number
 }
 
 function laserDataHost(host: string): boolean {
@@ -669,103 +713,213 @@ function laserDataHost(host: string): boolean {
   )
 }
 
-function parseReconnectInterval(value: string | null): number {
-  if (value === null) return DEFAULT_RECONNECT_INTERVAL_MS
+// Apache Iggy's TCP connection string options, the only ones Rust and Python
+// accept.
+const CONNECTION_OPTIONS: ReadonlySet<string> = new Set([
+  "tls",
+  "tls_domain",
+  "tls_ca_file",
+  "reconnection_retries",
+  "reconnection_interval",
+  "reestablish_after",
+  "heartbeat_interval",
+  "nodelay"
+])
+
+function parseDuration(name: string, value: string): number {
   const match = /^(\d+)(ms|s|m)$/.exec(value)
   if (match === null) {
-    throw new ConfigError("reconnection_interval must use ms, s, or m")
+    throw new ConfigError(`${name} must use ms, s, or m`)
   }
   const amount = Number(match[1])
   const unit = match[2]
   const multiplier = unit === "ms" ? 1 : unit === "s" ? 1_000 : 60_000
-  const intervalMs = amount * multiplier
-  if (!Number.isSafeInteger(intervalMs) || intervalMs < 0) {
-    throw new ConfigError("reconnection_interval is outside the supported range")
+  const durationMs = amount * multiplier
+  if (!Number.isSafeInteger(durationMs) || durationMs < 0) {
+    throw new ConfigError(`${name} is outside the supported range`)
   }
-  return intervalMs
+  return durationMs
 }
 
-function parseReconnectRetries(value: string | null): number | undefined {
+function parseReconnectRetries(value: string | undefined): number | undefined {
   if (value === "unlimited") return undefined
-  if (value === null) return undefined
+  if (value === undefined) return undefined
   const retries = Number(value)
-  if (!Number.isSafeInteger(retries) || retries < 0) {
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(retries)) {
     throw new ConfigError("reconnection_retries must be a non-negative integer or unlimited")
   }
   return retries
 }
 
+// The scheme is optional. A `://` after the userinfo has begun belongs to a
+// password, not to a scheme.
+function stripScheme(value: string): string {
+  for (const scheme of ["iggy://", "iggy+tcp://"]) {
+    if (value.startsWith(scheme)) return value.slice(scheme.length)
+  }
+  const separator = value.indexOf("://")
+  if (separator >= 0 && !/[:@]/.test(value.slice(0, separator))) {
+    throw new ConfigError("unsupported connection string scheme: use iggy:// or iggy+tcp://")
+  }
+  return value
+}
+
+// `user:password` or a personal access token, both non-empty and verbatim.
+// Apache Iggy splits them on `:` and `@` without percent-decoding.
+function parseCredentials(userinfo: string): ClientCredentials {
+  if (userinfo.includes("@")) {
+    throw new ConfigError("connection string credentials cannot contain `@`")
+  }
+  const parts = userinfo.split(":")
+  if (parts.length > 2) {
+    throw new ConfigError("connection string credentials cannot contain more than one `:`")
+  }
+  const [first = "", password] = parts
+  if (password === undefined) {
+    if (first.length === 0) throw new ConfigError("connection string has an empty access token")
+    return { token: first }
+  }
+  if (first.length === 0 || password.length === 0) {
+    throw new ConfigError("connection string has an empty username or password")
+  }
+  return { username: first, password }
+}
+
+// `host` or `host:port`. A missing port becomes 8090. IPv6 literals are refused
+// because Apache Iggy's connection string cannot carry them.
+function parseAddress(address: string): { readonly host: string; readonly port: number } {
+  if (/[[\]/#]/.test(address)) {
+    throw new ConfigError(
+      "connection string address must be host or host:port, IPv6 literals and paths are not supported"
+    )
+  }
+  const separator = address.indexOf(":")
+  const host = separator < 0 ? address : address.slice(0, separator)
+  const portText = separator < 0 ? undefined : address.slice(separator + 1)
+  if (host.length === 0) throw new ConfigError("connection string missing host")
+  if (portText === undefined) return { host, port: DEFAULT_TCP_PORT }
+  const port = Number(portText)
+  if (!/^\d+$/.test(portText) || port < 1 || port > 65_535) {
+    throw new ConfigError("connection string port must be a number from 1 to 65535")
+  }
+  return { host, port }
+}
+
+// Every option is `key=value`, names one of Apache Iggy's TCP options, and
+// appears once. Boolean options take `true` or `false` only.
+function parseOptions(query: string): ReadonlyMap<string, string> {
+  const options = new Map<string, string>()
+  for (const pair of query.split("&")) {
+    const parts = pair.split("=")
+    const [key, value] = parts
+    if (parts.length !== 2 || key === undefined || value === undefined) {
+      throw new ConfigError("connection string option must be key=value")
+    }
+    if (!CONNECTION_OPTIONS.has(key)) {
+      throw new ConfigError(
+        "connection string has an unknown option: supported are tls, tls_domain, tls_ca_file, reconnection_retries, reconnection_interval, reestablish_after, heartbeat_interval, nodelay"
+      )
+    }
+    if (options.has(key)) throw new ConfigError("connection string repeats an option")
+    if ((key === "tls" || key === "nodelay") && value !== "true" && value !== "false") {
+      throw new ConfigError("connection string tls and nodelay take true or false")
+    }
+    options.set(key, value)
+  }
+  if (options.get("tls") === "false" && options.has("tls_ca_file")) {
+    throw new ConfigError("connection string sets tls=false together with tls_ca_file")
+  }
+  return options
+}
+
+/**
+ * Parses a connection string with the Rust grammar: an optional `iggy://` or
+ * `iggy+tcp://` scheme, required verbatim credentials, `host[:port]`, and only
+ * Apache Iggy's TCP options. The string carries a password, so errors never
+ * echo it.
+ */
 export function parseConnectionString(
   connectionString: string,
   env: Readonly<Record<string, string | undefined>> = process.env
 ): ParsedConnectionString {
-  const trimmed = connectionString.trim()
-  const withScheme =
-    trimmed.startsWith("iggy://") || trimmed.startsWith("iggy+") ? trimmed : `iggy://${trimmed}`
-  let url: URL
-  try {
-    url = new URL(withScheme)
-  } catch (cause) {
-    // The string carries a password, so it is never echoed. Errors below can
-    // name the parsed authority, which holds no credential.
-    throw new ConfigError("invalid connection string", { cause })
+  const rest = stripScheme(connectionString.trim())
+  const queryStart = rest.indexOf("?")
+  const beforeQuery = queryStart < 0 ? rest : rest.slice(0, queryStart)
+  const at = beforeQuery.lastIndexOf("@")
+  if (at < 0) {
+    throw new ConfigError(
+      "connection string missing credentials: use user:password@host or token@host"
+    )
   }
-
-  if (url.protocol !== "iggy:" && url.protocol !== "iggy+tcp:") {
-    throw new ConfigError(`unsupported connection scheme: ${url.protocol}`)
-  }
-
-  if (!url.hostname) {
-    throw new ConfigError("connection string missing host")
-  }
-
-  const port = url.port ? Number(url.port) : 8090
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new ConfigError(`connection string has invalid port: ${url.port}`)
-  }
-
-  const username = decodeURIComponent(url.username)
-  const password = decodeURIComponent(url.password)
-  const credentials: ClientCredentials =
-    username.length === 0
-      ? { username: "iggy", password: "iggy" }
-      : password.length === 0
-        ? { token: username }
-        : { username, password }
+  const credentials = parseCredentials(rest.slice(0, at))
+  const { host, port } = parseAddress(beforeQuery.slice(at + 1))
+  const options =
+    queryStart < 0 ? new Map<string, string>() : parseOptions(rest.slice(queryStart + 1))
 
   // Read by value, not by presence: `LASER_NO_TLS=0` and `=false` must not
   // silently downgrade a managed host to plaintext.
   const noTls = ["1", "true", "yes", "on"].includes(
     (env["LASER_NO_TLS"] ?? "").trim().toLowerCase()
   )
-  const autoTls = !noTls && laserDataHost(url.hostname)
-  const caPath = url.searchParams.get("tls_ca_file") ?? env["LASER_TLS_CERT"]
-  const customTls = !noTls && caPath !== undefined && caPath.length > 0
-  const explicitTls = url.searchParams.get("tls")
-  const tls = explicitTls === null ? autoTls || customTls : explicitTls === "true"
+  const envCert = env["LASER_TLS_CERT"]
+  const explicitTls = options.get("tls")
+  const stringCa = options.get("tls_ca_file")
+  let tls = explicitTls === "true"
+  let caPath: string | undefined
   let ca: string | undefined
-  if (caPath !== undefined && caPath.length > 0) {
+  // A CA file in the string states TLS intent, so it turns TLS on even under
+  // `LASER_NO_TLS`. An explicit `tls=false` or `LASER_NO_TLS` stops automatic
+  // TLS, as in Rust `resolve_tls`.
+  if (stringCa !== undefined) {
+    tls = true
+    caPath = stringCa
+  } else if (explicitTls !== "false" && !noTls) {
+    if (envCert !== undefined && envCert.length > 0) {
+      tls = true
+      caPath = envCert
+    } else if (laserDataHost(host)) {
+      tls = true
+      ca = LASERDATA_ROOT_CA
+    }
+  }
+  if (caPath !== undefined) {
     try {
       ca = readFileSync(caPath, "utf8")
     } catch (cause) {
       throw new ConfigError(`failed to read TLS CA file: ${caPath}`, { cause })
     }
-  } else if (autoTls) {
-    ca = LASERDATA_ROOT_CA
   }
 
-  const reconnection = {
-    intervalMs: parseReconnectInterval(url.searchParams.get("reconnection_interval")),
-    maxRetries: parseReconnectRetries(url.searchParams.get("reconnection_retries"))
-  }
-
+  const heartbeat = options.get("heartbeat_interval")
+  const nodelay = options.get("nodelay")
+  const servername = options.get("tls_domain")
+  const interval = options.get("reconnection_interval")
   return {
-    host: url.hostname,
+    host,
     port,
+    ...(servername !== undefined ? { servername } : {}),
     credentials,
     tls,
     ...(ca !== undefined ? { ca } : {}),
-    reconnection
+    reconnection: {
+      intervalMs:
+        interval === undefined
+          ? DEFAULT_RECONNECT_INTERVAL_MS
+          : parseDuration("reconnection_interval", interval),
+      maxRetries: parseReconnectRetries(options.get("reconnection_retries"))
+    },
+    ...(heartbeat !== undefined
+      ? { heartbeatIntervalMs: parseDuration("heartbeat_interval", heartbeat) }
+      : {}),
+    ...(nodelay !== undefined ? { noDelay: nodelay === "true" } : {}),
+    ...(options.has("reestablish_after")
+      ? {
+          reestablishAfterMs: parseDuration(
+            "reestablish_after",
+            options.get("reestablish_after") ?? ""
+          )
+        }
+      : {})
   }
 }
 
@@ -805,11 +959,12 @@ async function connectSimpleClient(
 ): Promise<ConnectedClient> {
   const config: ClientConfig = parsed.tls
     ? {
-        heartbeatInterval: VSR_HEARTBEAT_INTERVAL_MS,
+        heartbeatInterval: parsed.heartbeatIntervalMs ?? VSR_HEARTBEAT_INTERVAL_MS,
         transport: "TLS",
         options: {
           port: parsed.port,
           host: parsed.host,
+          ...(parsed.noDelay !== undefined ? { noDelay: parsed.noDelay } : {}),
           ...(parsed.servername !== undefined
             ? { servername: parsed.servername }
             : isIP(parsed.host) === 0
@@ -821,9 +976,13 @@ async function connectSimpleClient(
         reconnect: { enabled: false, interval: 0, maxRetries: 0 }
       }
     : {
-        heartbeatInterval: VSR_HEARTBEAT_INTERVAL_MS,
+        heartbeatInterval: parsed.heartbeatIntervalMs ?? VSR_HEARTBEAT_INTERVAL_MS,
         transport: "TCP",
-        options: { port: parsed.port, host: parsed.host },
+        options: {
+          port: parsed.port,
+          host: parsed.host,
+          ...(parsed.noDelay !== undefined ? { noDelay: parsed.noDelay } : {})
+        },
         credentials: parsed.credentials,
         reconnect: { enabled: false, interval: 0, maxRetries: 0 }
       }
@@ -949,6 +1108,14 @@ function pinnedClient(raw: RawClient, loginDeadline: number | undefined): Simple
   return new SimpleClient(facade)
 }
 
+// A failure a later attempt can clear: no server reply, or a server reply the
+// cluster marks transient.
+function retryableFailure(error: unknown): boolean {
+  if (serverResponseError(error) === undefined) return true
+  const code = serverErrorCode(error)
+  return code !== undefined && TRANSIENT_SERVER_CODES.has(code)
+}
+
 function serverResponseError(error: unknown): Error | undefined {
   let current = error
   for (let depth = 0; depth < 8; depth += 1) {
@@ -1032,6 +1199,14 @@ export class ApacheIggyTransport implements LaserTransport {
     private readonly publishConfig: PublishOptions
   ) {}
 
+  publishTimeoutMs(): number {
+    return this.publishConfig.timeoutMs
+  }
+
+  publishOptions(): PublishOptions {
+    return this.publishConfig
+  }
+
   get iggyClient(): SimpleClient {
     return this.client
   }
@@ -1082,7 +1257,7 @@ export class ApacheIggyTransport implements LaserTransport {
       try {
         return await operation(this.client)
       } catch (cause) {
-        throw new TransportError(message, serverResponseError(cause) === undefined, { cause })
+        throw new TransportError(message, retryableFailure(cause), { cause })
       }
     }
     try {
@@ -1095,9 +1270,7 @@ export class ApacheIggyTransport implements LaserTransport {
         if (!retryAfterReconnect && serverResponseError(firstCause) === undefined) {
           throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })
         }
-        throw new TransportError(message, serverResponseError(firstCause) === undefined, {
-          cause: firstCause
-        })
+        throw new TransportError(message, retryableFailure(firstCause), { cause: firstCause })
       }
       if (!retryAfterReconnect) {
         throw new AmbiguousMutationError(`${message}: outcome is unknown`, { cause: firstCause })
@@ -1107,9 +1280,7 @@ export class ApacheIggyTransport implements LaserTransport {
         return await operation(this.client)
       } catch (cause) {
         const actual = cause ?? firstCause
-        throw new TransportError(message, serverResponseError(actual) === undefined, {
-          cause: actual
-        })
+        throw new TransportError(message, retryableFailure(actual), { cause: actual })
       }
     }
   }
@@ -1327,6 +1498,61 @@ export class ApacheIggyTransport implements LaserTransport {
     return topic.partitionsCount
   }
 
+  // The standard client turns creation stamps into millisecond dates. A
+  // snapshot checks the exact microsecond stamp, so these two lookups read the
+  // raw standard reply: id at byte 0, creation micros at byte 4, and for a
+  // topic the partition count at byte 12.
+  async findSnapshotStream(
+    stream: string
+  ): Promise<{ readonly id: number; readonly createdAtMicros: bigint } | undefined> {
+    const data = await this.rawMetadata(
+      GET_STREAM.code,
+      GET_STREAM.serialize({ streamId: stream }),
+      `failed to read stream \`${stream}\``
+    )
+    if (data === undefined) return undefined
+    return { id: data.readUInt32LE(0), createdAtMicros: data.readBigUInt64LE(4) }
+  }
+
+  async findSnapshotTopic(
+    stream: string,
+    topic: string
+  ): Promise<
+    | { readonly id: number; readonly createdAtMicros: bigint; readonly partitions: number }
+    | undefined
+  > {
+    const data = await this.rawMetadata(
+      GET_TOPIC.code,
+      GET_TOPIC.serialize({ streamId: stream, topicId: topic }),
+      `failed to read topic \`${topic}\``
+    )
+    if (data === undefined) return undefined
+    return {
+      id: data.readUInt32LE(0),
+      createdAtMicros: data.readBigUInt64LE(4),
+      partitions: data.readUInt32LE(12)
+    }
+  }
+
+  private async rawMetadata(
+    code: number,
+    payload: Buffer,
+    message: string
+  ): Promise<Buffer | undefined> {
+    return this.execute(async (client) => {
+      const raw = await client.clientProvider()
+      try {
+        const response = await raw.sendCommand(code, payload)
+        if (response.length === 0) return undefined
+        if (response.data.length < 16) throw new ProtocolError("metadata reply is too short")
+        return response.data
+      } catch (error) {
+        if (NOT_FOUND_METADATA_CODES.has(serverErrorCode(error) ?? -1)) return undefined
+        throw error
+      }
+    }, message)
+  }
+
   async getTopicPartitionCount(streamId: string, topicId: string): Promise<number> {
     const partitions = await this.findTopicPartitionCount(streamId, topicId)
     if (partitions === undefined) {
@@ -1377,9 +1603,10 @@ export class ApacheIggyTransport implements LaserTransport {
 
   private async publish(
     operation: (client: SimpleClient) => Promise<SendMessagesResponse>,
-    options?: Partial<PublishOptions>
+    options?: Partial<PublishOptions> & { readonly fixedRetryIntervalMs?: number }
   ): Promise<SendMessagesResponse> {
     const config = { ...this.publishConfig, ...options }
+    const fixed = options?.fixedRetryIntervalMs
     for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
       let used = this.client
       try {
@@ -1404,19 +1631,23 @@ export class ApacheIggyTransport implements LaserTransport {
           return await publishWithin(operation(used), Math.max(1, deadline - Date.now()))
         })
       } catch (cause) {
+        if (cause instanceof SessionError) throw cause
         const response = serverResponseError(cause)
         const code = serverErrorCode(cause)
-        const transient = code !== undefined && TRANSIENT_PUBLISH_CODES.has(code)
+        const transient = code !== undefined && TRANSIENT_SERVER_CODES.has(code)
         // An expired session on a connection that logged in once means the
         // socket was re-dialed underneath it. A reconnect logs in again.
         const reauthenticate = code === UNAUTHENTICATED && this.connection !== undefined
+        const unusable =
+          cause instanceof DeserializeError ||
+          cause instanceof ConfigError ||
+          (cause instanceof TransportError && !cause.retryable)
+        // Background mode resends every failure except a lost confirmation,
+        // like Apache Iggy's dispatcher in Rust and Python.
         const retryable =
-          transient ||
-          reauthenticate ||
-          (response === undefined &&
-            !(cause instanceof DeserializeError) &&
-            !(cause instanceof ConfigError) &&
-            !(cause instanceof TransportError && !cause.retryable))
+          fixed === undefined
+            ? transient || reauthenticate || (response === undefined && !unusable)
+            : !unusable && !LOST_CONFIRMATION_CODES.has(code ?? -1)
         // Retire the connection this attempt ran on, and only while it is still
         // the current one. A concurrent publish may already have replaced it,
         // and destroying that fresh connection would starve every publisher for
@@ -1429,14 +1660,15 @@ export class ApacheIggyTransport implements LaserTransport {
         if (
           !retryable ||
           attempt === config.maxRetries ||
-          (this.connection === undefined && !transient)
+          (this.connection === undefined &&
+            !transient &&
+            (fixed === undefined || response === undefined))
         ) {
           if (cause instanceof TimeoutError) throw cause
           throw new TransportError("Iggy publish failed", retryable, { cause })
         }
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.min(config.retryBackoffMs * 2 ** Math.min(attempt, 16), 30_000))
-        )
+        const wait = fixed === undefined ? retryDelayMs(config, attempt) : attempt === 0 ? 0 : fixed
+        await new Promise((resolve) => setTimeout(resolve, wait))
       }
     }
     throw new TransportError("publish attempts exhausted", true)
@@ -1479,7 +1711,16 @@ export class ApacheIggyTransport implements LaserTransport {
     messages: readonly MessageWithHeaders[],
     partitionKey?: string | Uint8Array,
     partitionId?: number,
-    options?: Partial<PublishOptions> & { readonly batchLength?: number }
+    options?: Partial<PublishOptions> & {
+      readonly batchLength?: number
+      /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
+      readonly fixedRetryIntervalMs?: number
+      readonly beforeSend?: () => Promise<{
+        readonly streamId: number
+        readonly topicId: number
+        readonly partitions: number
+      }>
+    }
   ): Promise<SendMessagesResponse> {
     const routing: Routing =
       partitionId !== undefined
@@ -1505,7 +1746,16 @@ export class ApacheIggyTransport implements LaserTransport {
     topicId: string,
     messages: readonly MessageWithHeaders[],
     routing: Routing,
-    options?: Partial<PublishOptions> & { readonly batchLength?: number }
+    options?: Partial<PublishOptions> & {
+      readonly batchLength?: number
+      /** Background mode: resend at once, then every this many milliseconds, any failure but a lost confirmation. */
+      readonly fixedRetryIntervalMs?: number
+      readonly beforeSend?: () => Promise<{
+        readonly streamId: number
+        readonly topicId: number
+        readonly partitions: number
+      }>
+    }
   ): Promise<SendMessagesResponse> {
     if (messages.length === 0) return { confirmations: [] }
     if (routing.kind === "key" && (routing.key.byteLength === 0 || routing.key.byteLength > 255))
@@ -1523,18 +1773,43 @@ export class ApacheIggyTransport implements LaserTransport {
           value: toIggyHeaderValue(value)
         }))
       }))
-      try {
-        const response = await this.publish(async (client) => {
-          resolvedPartition ??= await this.resolvePartition(streamId, topicId, routing, client)
+      const sendChunk = (): Promise<SendMessagesResponse> =>
+        this.publish(async (client) => {
+          const source = await options?.beforeSend?.()
+          const partition =
+            source === undefined
+              ? (resolvedPartition ??= await this.resolvePartition(
+                  streamId,
+                  topicId,
+                  routing,
+                  client
+                ))
+              : routing.kind === "partition"
+                ? routing.partition
+                : routing.kind === "key"
+                  ? xxHash32(routing.key) % source.partitions
+                  : await this.resolvePartition(streamId, topicId, routing, client)
           if (this.disconnected.has(client))
             throw new TransportError("publish connection was retired", true)
           return client.message.send({
-            streamId,
-            topicId,
+            streamId: source?.streamId ?? streamId,
+            topicId: source?.topicId ?? topicId,
             messages: prepared,
-            partition: Partitioning.PartitionId(resolvedPartition)
+            partition: Partitioning.PartitionId(partition)
           })
         }, options)
+      try {
+        let response: SendMessagesResponse
+        try {
+          response = await sendChunk()
+        } catch (cause) {
+          if (!MISSING_RESOURCE_CODES.has(serverErrorCode(cause) ?? -1)) throw cause
+          // Rebuild the routing once, as a recreated stream or topic needs.
+          this.partitionCounts.delete(this.topicKey(streamId, topicId))
+          this.balancedCursors.delete(this.topicKey(streamId, topicId))
+          if (routing.kind !== "partition") resolvedPartition = undefined
+          response = await sendChunk()
+        }
         confirmations.push(...response.confirmations)
       } catch (cause) {
         throw new PublishFailedError(streamId, topicId, confirmations, records.slice(start), cause)
@@ -1762,7 +2037,9 @@ export class ApacheIggyTransport implements LaserTransport {
         ...this.connection,
         host,
         port: port === 0 ? this.connection.port : port,
-        ...(isIP(this.connection.host) === 0 ? { servername: this.connection.host } : {})
+        ...(this.connection.servername === undefined && isIP(this.connection.host) === 0
+          ? { servername: this.connection.host }
+          : {})
       },
       Date.now() + connectOptions().timeoutMs,
       true

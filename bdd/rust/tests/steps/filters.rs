@@ -260,15 +260,34 @@ async fn unbound_consumer(world: &mut LaserWorld) {
 async fn unbound_reader(world: &mut LaserWorld) {
     let group = world.laser().topic(TOPIC).consumer_group("unbound-desk");
     group.create().build().await.expect("plain group");
-    let mut reader = group
+    let reader = group
         .reader()
         .expect("group source")
         .start(FilteredStart::First)
         .count(100)
         .max_examined(100)
         .build()
+        .await;
+    if !world
+        .laser()
+        .capabilities()
         .await
-        .expect("unbound reader");
+        .filters
+        .group_policy_reads
+    {
+        let error = reader.err().expect("group-aware reads must be refused");
+        assert!(matches!(
+            error,
+            laser_sdk::LaserError::Unsupported {
+                surface: "filters",
+                feature: Some("group_policy_reads"),
+                ..
+            }
+        ));
+        world.last_result = Some(Err("unsupported".to_owned()));
+        return;
+    }
+    let mut reader = reader.expect("unbound reader");
     world.filtered_payloads.clear();
     while world.filtered_payloads.len() < feed().len() {
         let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
@@ -288,6 +307,27 @@ async fn unbound_reader(world: &mut LaserWorld) {
             .expect("acknowledge original records");
     }
     reader.close().await.expect("close");
+}
+
+#[then("the advanced reader follows the group-aware read capability")]
+async fn advanced_reader_capability(world: &mut LaserWorld) {
+    if world
+        .laser()
+        .capabilities()
+        .await
+        .filters
+        .group_policy_reads
+    {
+        assert_eq!(
+            world.filtered_payloads,
+            feed()
+                .iter()
+                .map(|name| record(name).to_vec())
+                .collect::<Vec<_>>()
+        );
+    } else {
+        assert_eq!(world.last_result, Some(Err("unsupported".to_owned())));
+    }
 }
 
 #[then("it receives every original feed record")]

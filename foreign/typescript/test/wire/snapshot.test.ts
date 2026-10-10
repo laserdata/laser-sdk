@@ -19,21 +19,28 @@ void test("given_the_fold_snapshot_fixture_when_decoded_then_should_preserve_off
     expectMap(decodeOne(bytes, "fold_snapshot"), "fold_snapshot"),
     "fold_snapshot"
   )
-  assert.deepEqual(Array.from(snapshot.asOf), [
-    [0, 41n],
-    [1, 9n]
+  assert.equal(snapshot.stream, "agents")
+  assert.equal(snapshot.streamId, 0)
+  assert.equal(snapshot.fold, "planner")
+  assert.deepEqual(snapshot.asOf, [
+    { topicId: 2, topicCreatedAtMicros: 20n, partitionId: 0, offset: 41n },
+    { topicId: 2, topicCreatedAtMicros: 20n, partitionId: 1, offset: 9n }
   ])
-  assert.equal(foldSnapshotResumeOffset(snapshot, 0), 42n)
-  assert.equal(foldSnapshotResumeOffset(snapshot, 2), 0n)
+  assert.equal(foldSnapshotResumeOffset(snapshot, 2, 20n, 0), 42n)
+  assert.equal(foldSnapshotResumeOffset(snapshot, 2, 21n, 0), 0n)
   assert.deepEqual(Buffer.from(snapshot.state), Buffer.from('{"folded":true}'))
   assert.deepEqual(Buffer.from(encodeNamed(encodeFoldSnapshot(snapshot))), Buffer.from(bytes))
 })
 
 void test("given_the_maximum_folded_offset_when_resumed_then_should_saturate", () => {
   const snapshot = {
+    stream: "agents",
+    streamId: 0,
+    streamCreatedAtMicros: 100n,
     conversation: ConversationId.fromU128(1n),
-    asOf: new Map([[0, (1n << 64n) - 1n]]),
+    fold: "planner",
+    asOf: [{ topicId: 2, topicCreatedAtMicros: 20n, partitionId: 0, offset: (1n << 64n) - 1n }],
     state: new Uint8Array()
   }
-  assert.equal(foldSnapshotResumeOffset(snapshot, 0), (1n << 64n) - 1n)
+  assert.equal(foldSnapshotResumeOffset(snapshot, 2, 20n, 0), (1n << 64n) - 1n)
 })

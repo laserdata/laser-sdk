@@ -1,5 +1,5 @@
 use crate::async_bridge::future_into_py;
-use crate::convert::{duration_seconds, payload_bytes, ser_to_py};
+use crate::convert::{duration_ms, payload_bytes, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::filters::{PyConsumerFilter, PyFilteredReader, filter_headers, filtered_start};
 use crate::stream::PyTopic;
@@ -175,7 +175,7 @@ impl PyConsumerGroup {
     /// `max_unacked_pages` bounds outstanding pages per partition, default 1024.
     /// `read_mode` is primary or local. Local reads cannot acknowledge.
     /// `local_guard` checks delivered records against the filter locally.
-    /// `idle_interval` is seconds, finite and non-negative.
+    /// `idle_interval_ms` is milliseconds, finite and non-negative.
     #[pyo3(signature = (
         *,
         start=None,
@@ -185,7 +185,7 @@ impl PyConsumerGroup {
         max_unacked_pages=None,
         read_mode="primary",
         local_guard=false,
-        idle_interval=None,
+        idle_interval_ms=None,
         partitions=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -199,7 +199,7 @@ impl PyConsumerGroup {
         max_unacked_pages: Option<usize>,
         read_mode: &str,
         local_guard: bool,
-        idle_interval: Option<f64>,
+        idle_interval_ms: Option<f64>,
         partitions: Option<Vec<u32>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let start = start
@@ -215,8 +215,8 @@ impl PyConsumerGroup {
                 )));
             }
         };
-        let idle_interval = idle_interval
-            .map(|seconds| duration_seconds(seconds, "idle_interval"))
+        let idle_interval = idle_interval_ms
+            .map(|ms| duration_ms(ms, "idle_interval_ms"))
             .transpose()?;
         let group = self.group.clone();
         future_into_py(py, async move {
@@ -295,28 +295,13 @@ impl PyConsumerGroupInfo {
     }
 }
 
-#[gen_stub_pymethods]
-#[pymethods]
 impl PyGroupFilter {
-    /// Give the group its policy: a `filter` definition saved as the group's
-    /// own filter, or one of its own revisions as `filter_id` and `revision`.
-    /// The group is bound in one catalog transaction. The same digest again
-    /// keeps the binding. Another digest on a group that runs a policy raises
-    /// `FilterError` with reason `conflict`: create a new group for another
-    /// policy. Pass `operation_id` to resume the same configuration after a
-    /// crash. Returns the binding dict.
-    #[pyo3(signature = (filter=None, *, filter_id=None, revision=None, operation_id=None))]
-    fn configure<'py>(
+    fn configure_policy<'py>(
         &self,
         py: Python<'py>,
-        filter: Option<PyConsumerFilter>,
-        filter_id: Option<u32>,
-        revision: Option<u32>,
         operation_id: Option<u128>,
+        policy: GroupFilterSpec,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let policy = group_policy(filter, filter_id, revision)?.ok_or_else(|| {
-            InvalidError::new_err("pass `filter`, or both `filter_id` and `revision`")
-        })?;
         let group = self.group.clone();
         future_into_py(py, async move {
             let binding = group
@@ -326,6 +311,63 @@ impl PyGroupFilter {
                 .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &binding))
         })
+    }
+}
+
+// A definition or a revision, exactly one of them.
+fn required_policy(
+    filter: Option<PyConsumerFilter>,
+    filter_id: Option<u32>,
+    revision: Option<u32>,
+) -> PyResult<GroupFilterSpec> {
+    group_policy(filter, filter_id, revision)?
+        .ok_or_else(|| InvalidError::new_err("pass `filter`, or both `filter_id` and `revision`"))
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyGroupFilter {
+    /// Give the group `filter` as its policy. The definition is saved as the
+    /// group's own filter and the group is bound to it in one catalog
+    /// transaction. The same digest again keeps the binding. Another digest on
+    /// a group that runs a policy raises `FilterError` with reason `conflict`:
+    /// create a new group for another policy. Returns the binding dict.
+    fn configure<'py>(
+        &self,
+        py: Python<'py>,
+        filter: PyConsumerFilter,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.configure_policy(py, None, GroupFilterSpec::Definition(filter.inner))
+    }
+
+    /// `configure` with a `filter` definition or one of the group's own
+    /// revisions, named by `filter_id` and `revision`.
+    #[pyo3(signature = (*, filter=None, filter_id=None, revision=None))]
+    fn configure_with<'py>(
+        &self,
+        py: Python<'py>,
+        filter: Option<PyConsumerFilter>,
+        filter_id: Option<u32>,
+        revision: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let policy = required_policy(filter, filter_id, revision)?;
+        self.configure_policy(py, None, policy)
+    }
+
+    /// `configure_with` under a caller-chosen `operation_id`, so a caller that
+    /// records the id first resumes the same configuration after a crash and
+    /// reads its first outcome. `None` mints a fresh id.
+    #[pyo3(signature = (operation_id, *, filter=None, filter_id=None, revision=None))]
+    fn configure_as<'py>(
+        &self,
+        py: Python<'py>,
+        operation_id: Option<u128>,
+        filter: Option<PyConsumerFilter>,
+        filter_id: Option<u32>,
+        revision: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let policy = required_policy(filter, filter_id, revision)?;
+        self.configure_policy(py, operation_id, policy)
     }
 
     /// The active binding dict, `None` for an unbound group.

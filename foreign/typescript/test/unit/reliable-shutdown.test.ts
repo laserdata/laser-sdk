@@ -3,7 +3,13 @@ import { test } from "node:test"
 
 import { ReliableConsumer, type ConcurrencyPolicy } from "../../src/agent/reliable-consumer.js"
 import { CancelledError, InvalidError, TimeoutError } from "../../src/client/errors.js"
-import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import {
+  INTERNAL_COMMIT_HANDLED,
+  INTERNAL_NATIVE_CONSUMER,
+  INTERNAL_TRANSPORT
+} from "../../src/client/internals.js"
+import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
+import { SessionConfig } from "../../src/session.js"
 import type { Laser } from "../../src/client/laser.js"
 import { encodeProvenanceHeaders } from "../../src/provenance/provenance.js"
 import type { Consumer, ConsumerMessage } from "../../src/stream/consumer.js"
@@ -43,6 +49,7 @@ function source(commit: () => Promise<void>) {
       })
     },
     commit,
+    [INTERNAL_COMMIT_HANDLED]: commit,
     shutdown: () => Promise.resolve()
   } as unknown as Consumer
   return {
@@ -52,7 +59,13 @@ function source(commit: () => Promise<void>) {
         [INTERNAL_NATIVE_CONSUMER]: () => Promise.resolve(consumer)
       })
     }),
+    capabilities: () => Promise.resolve({ ...OPEN_CAPABILITIES, hello: "rejected" }),
+    sessions: (config?: SessionConfig) => ({
+      config: config ?? new SessionConfig(),
+      indexesSessions: () => Promise.resolve(false)
+    }),
     [INTERNAL_TRANSPORT]: () => ({
+      findTopicPartitionCount: () => Promise.resolve(undefined),
       resolveStreamTopicIds: () => Promise.resolve({ streamId: 1, topicId: 2 })
     })
   } as unknown as Laser

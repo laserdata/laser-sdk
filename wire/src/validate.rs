@@ -401,6 +401,19 @@ impl Validate for MemoryRecord {
                 body.len()
             )));
         }
+        if let MemoryRecord::Forget {
+            conversation: Some(conversation),
+            ..
+        }
+        | MemoryRecord::Feedback {
+            conversation: Some(conversation),
+            ..
+        } = self
+        {
+            conversation
+                .parse::<crate::agent::ConversationId>()
+                .map_err(|_| InvalidError::new("memory record conversation is not a valid id"))?;
+        }
         Ok(())
     }
 }
@@ -648,6 +661,7 @@ mod tests {
         let over = KvSet {
             v: KV_OP_VERSION,
             namespace: "ns".to_owned(),
+            session: None,
             key: vec![b'x'; MAX_KEY_BYTES + 1],
             value: vec![1, 2, 3],
             expires_at_micros: None,
@@ -656,6 +670,7 @@ mod tests {
         let ok = KvSet {
             v: KV_OP_VERSION,
             namespace: "ns".to_owned(),
+            session: None,
             key: vec![b'x'; 8],
             value: vec![1, 2, 3],
             expires_at_micros: None,
@@ -665,6 +680,7 @@ mod tests {
 
     fn node_with(labels: Vec<String>, attrs: Vec<(String, Value)>) -> GraphNode {
         GraphNode {
+            producer: None,
             id: crate::graph::NodeId::from_u128(1),
             labels,
             attrs,
@@ -721,6 +737,7 @@ mod tests {
         let over = GraphUpsert {
             v: 1,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: (0..=MAX_GRAPH_RESULT_ELEMENTS)
                 .map(|_| node_with(Vec::new(), Vec::new()))
                 .collect(),
@@ -730,6 +747,7 @@ mod tests {
         let ok = GraphUpsert {
             v: 1,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: vec![node_with(vec!["Person".to_owned()], Vec::new())],
             edges: Vec::new(),
         };
@@ -741,6 +759,7 @@ mod tests {
         let upsert = GraphUpsert {
             v: 1,
             graph: "knowledge".to_owned(),
+            session: None,
             nodes: vec![node_with(
                 (0..=MAX_GRAPH_NODE_LABELS)
                     .map(|index| format!("label-{index}"))
@@ -788,12 +807,16 @@ mod tests {
     #[test]
     fn given_an_oversized_memory_body_when_validated_then_should_reject() {
         let over = MemoryRecord::Item {
+            origin: None,
+            producer: None,
             id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
             kind: "fact".to_owned(),
             body: vec![0u8; MAX_MEMORY_BODY_BYTES + 1],
         };
         assert!(over.validate().is_err());
         let ok = MemoryRecord::Item {
+            origin: None,
+            producer: None,
             id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
             kind: "fact".to_owned(),
             body: b"auth is slow".to_vec(),
@@ -801,10 +824,19 @@ mod tests {
         assert!(ok.validate().is_ok());
         assert!(
             MemoryRecord::Forget {
-                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned()
+                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+                conversation: None,
             }
             .validate()
             .is_ok()
+        );
+        assert!(
+            MemoryRecord::Forget {
+                target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+                conversation: Some("not an id".to_owned()),
+            }
+            .validate()
+            .is_err()
         );
     }
 

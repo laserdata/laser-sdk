@@ -36,7 +36,8 @@ pub struct Lease {
 impl Laser {
     /// A handle to the managed key-value store, scoped to `namespace`. Cheap to
     /// create, it borrows the connection. Keys are unique within a namespace and
-    /// scans are scoped to it.
+    /// scans are scoped to it. The namespace is sent as
+    /// [`resource_name`](Self::resource_name) names it.
     ///
     /// ```no_run
     /// # use laser_sdk::prelude::*;
@@ -49,26 +50,41 @@ impl Laser {
     /// # Ok(()) }
     /// ```
     pub fn kv(&self, namespace: impl Into<String>) -> Kv {
+        let namespace = self.resource_name(&namespace.into());
         Kv {
             laser: self.clone(),
-            namespace: namespace.into(),
+            namespace,
+            session: None,
         }
     }
 
     /// Every KV namespace that holds at least one entry for this caller,
     /// sorted. Namespace discovery for tooling and UIs: browse the store
-    /// without knowing names upfront. Read-only, user-scoped.
+    /// without knowing names upfront. Read-only, user-scoped. A handle that
+    /// scopes its resources to a stream lists only that stream's namespaces,
+    /// under the names the caller gave them.
     pub async fn kv_namespaces(&self) -> Result<Vec<KvNamespaceInfo>, LaserError> {
         let request = KvNamespaces { v: KV_OP_VERSION };
         match self
             .execute_kv(None, AGDX_KV_NAMESPACES_CODE, &request)
             .await?
         {
-            KvOutcome::Namespaces(namespaces) => Ok(namespaces),
+            KvOutcome::Namespaces(namespaces) => Ok(self.local_namespaces(namespaces)),
             _ => Err(LaserError::Protocol(
                 "kv namespaces: unexpected outcome".to_owned(),
             )),
         }
+    }
+
+    fn local_namespaces(&self, namespaces: Vec<KvNamespaceInfo>) -> Vec<KvNamespaceInfo> {
+        namespaces
+            .into_iter()
+            .filter_map(|mut info| {
+                let local = self.local_resource_name(&info.namespace)?.to_owned();
+                info.namespace = local;
+                Some(info)
+            })
+            .collect()
     }
 
     // Send one KV command over the binary connection and decode the reply. Gated
@@ -116,11 +132,33 @@ impl Laser {
 pub struct Kv {
     laser: Laser,
     namespace: String,
+    session: Option<laser_wire::agent::SessionRef>,
 }
 
 impl Kv {
-    /// The namespace this handle is bound to.
+    /// This handle with every set, compare-and-swap, delete, and patch linked
+    /// to `session`, so the deployment records which session wrote each key.
+    #[must_use]
+    pub fn in_session(mut self, session: laser_wire::agent::SessionRef) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// The session this handle links its writes to.
+    pub fn session(&self) -> Option<&laser_wire::agent::SessionRef> {
+        self.session.as_ref()
+    }
+
+    /// The namespace this handle is bound to, as the caller named it.
     pub fn namespace(&self) -> &str {
+        self.laser
+            .local_resource_name(&self.namespace)
+            .unwrap_or(&self.namespace)
+    }
+
+    /// The namespace this handle sends, scoped by the connection's
+    /// [`ResourceNaming`](crate::laser::ResourceNaming).
+    pub fn resource_namespace(&self) -> &str {
         &self.namespace
     }
 
@@ -222,6 +260,7 @@ impl Kv {
         KvSetRequest {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key: key.as_ref().to_vec(),
             value: Vec::new(),
             expires_at_micros: None,
@@ -251,7 +290,7 @@ impl Kv {
             value: Vec::new(),
             expires_at_micros: None,
             expect: None,
-            fence_namespace: fence_namespace.into(),
+            fence_namespace: self.laser.resource_name(&fence_namespace.into()),
             fence_key: fence_key.as_ref().to_vec(),
             fence_token,
         }
@@ -264,6 +303,7 @@ impl Kv {
         let request = KvDelete {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key,
             if_match: None,
         };
@@ -344,6 +384,7 @@ impl Kv {
         let request = KvPatch {
             v: KV_OP_VERSION,
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key,
             patch: patch.into(),
             if_match: None,
@@ -568,6 +609,7 @@ impl Kv {
             end: None,
             key_contains: None,
             conversation: None,
+            stream: None,
         }
     }
 
@@ -582,6 +624,7 @@ impl Kv {
             end: None,
             key_contains: None,
             conversation: None,
+            stream: None,
             limit: DEFAULT_SCAN_LIMIT,
             cursor: None,
         }
@@ -620,6 +663,7 @@ impl crate::state_store::StateStore for Kv {
 pub struct KvSetRequest {
     laser: Laser,
     namespace: String,
+    session: Option<laser_wire::agent::SessionRef>,
     key: Vec<u8>,
     value: Vec<u8>,
     expires_at_micros: Option<u64>,
@@ -727,6 +771,7 @@ impl KvSetRequest {
         let request = KvCas {
             v: KV_OP_VERSION,
             namespace: self.namespace,
+            session: self.session,
             key,
             value: self.value,
             expires_at_micros: self.expires_at_micros,
@@ -757,6 +802,7 @@ impl KvSetRequest {
         let request = KvSet {
             v: KV_OP_VERSION,
             namespace: self.namespace,
+            session: self.session,
             key,
             value: self.value,
             expires_at_micros: self.expires_at_micros,
@@ -903,6 +949,7 @@ pub struct KvScanRequest {
     end: Option<Vec<u8>>,
     key_contains: Option<String>,
     conversation: Option<String>,
+    stream: Option<String>,
     limit: usize,
     cursor: Option<Vec<u8>>,
 }
@@ -914,6 +961,7 @@ impl KvScanRequest {
     /// key-value entries carry no conversation, so this filters them out.
     pub fn conversation(mut self, conversation: ConversationId) -> Self {
         self.conversation = Some(conversation.to_string());
+        self.stream = self.laser.resource_stream().map(str::to_owned);
         self
     }
 
@@ -985,6 +1033,14 @@ impl KvScanRequest {
         }
     }
 
+    // The stream the conversation lens belongs to when it is not the default
+    // stream, as for memory riding an explicitly named stream.
+    #[cfg(feature = "agent")]
+    pub(crate) fn lens_stream(mut self, stream: Option<String>) -> Self {
+        self.stream = stream;
+        self
+    }
+
     fn request(&self) -> KvScan {
         KvScan {
             v: KV_OP_VERSION,
@@ -994,6 +1050,7 @@ impl KvScanRequest {
             end: self.end.clone(),
             key_contains: self.key_contains.clone(),
             conversation: self.conversation.clone(),
+            stream: self.stream.clone(),
             limit: self.limit,
             cursor: self.cursor.clone(),
         }
@@ -1011,6 +1068,7 @@ pub struct KvDeleteManyRequest {
     end: Option<Vec<u8>>,
     key_contains: Option<String>,
     conversation: Option<String>,
+    stream: Option<String>,
 }
 
 impl KvDeleteManyRequest {
@@ -1018,6 +1076,7 @@ impl KvDeleteManyRequest {
     /// given conversation wrote (a memory namespace's rows for one conversation).
     pub fn conversation(mut self, conversation: ConversationId) -> Self {
         self.conversation = Some(conversation.to_string());
+        self.stream = self.laser.resource_stream().map(str::to_owned);
         self
     }
 
@@ -1051,6 +1110,7 @@ impl KvDeleteManyRequest {
             end: self.end,
             key_contains: self.key_contains,
             conversation: self.conversation,
+            stream: self.stream,
         };
         match self
             .laser
@@ -1079,7 +1139,7 @@ pub struct KvCopyRequest {
 impl KvCopyRequest {
     /// Send the copy into another namespace instead of the source's.
     pub fn into_namespace(mut self, namespace: impl Into<String>) -> Self {
-        self.to_namespace = Some(namespace.into());
+        self.to_namespace = Some(self.laser.resource_name(&namespace.into()));
         self
     }
 
@@ -1168,6 +1228,91 @@ mod tests {
         capabilities.kv.fenced_leases = true;
         Laser::from_client(crate::iggy::prelude::IggyClient::default())
             .with_capabilities(capabilities)
+    }
+
+    fn scoped(naming: crate::laser::ResourceNaming) -> Laser {
+        fenced_laser()
+            .with_default_stream("acme")
+            .with_resource_naming(naming)
+    }
+
+    #[test]
+    fn given_a_default_stream_when_opening_a_namespace_then_should_send_it_scoped() {
+        let kv = scoped(crate::laser::ResourceNaming::Stream).kv("sessions");
+        assert_eq!(kv.resource_namespace(), "stream:acme/sessions");
+        assert_eq!(kv.namespace(), "sessions");
+    }
+
+    #[test]
+    fn given_bare_naming_when_opening_a_namespace_then_should_send_it_unchanged() {
+        let kv = scoped(crate::laser::ResourceNaming::Bare).kv("sessions");
+        assert_eq!(kv.resource_namespace(), "sessions");
+        assert_eq!(kv.namespace(), "sessions");
+    }
+
+    #[test]
+    fn given_a_conversation_lens_when_scanning_then_should_name_the_stream() {
+        let conversation = ConversationId::derive("lens");
+        let laser = scoped(crate::laser::ResourceNaming::Stream);
+        let request = laser
+            .kv("memory")
+            .scan()
+            .conversation(conversation)
+            .request();
+        assert_eq!(request.namespace, "stream:acme/memory");
+        assert_eq!(request.stream.as_deref(), Some("acme"));
+        assert_eq!(request.conversation, Some(conversation.to_string()));
+        let unfiltered = laser.kv("memory").scan().request();
+        assert_eq!(unfiltered.stream, None);
+        let bare = scoped(crate::laser::ResourceNaming::Bare)
+            .kv("memory")
+            .scan()
+            .conversation(conversation)
+            .request();
+        assert_eq!(bare.stream, None);
+    }
+
+    #[test]
+    fn given_a_conversation_lens_when_deleting_many_then_should_name_the_stream() {
+        let request = scoped(crate::laser::ResourceNaming::Stream)
+            .kv("memory")
+            .delete_many()
+            .conversation(ConversationId::derive("lens"));
+        assert_eq!(request.namespace, "stream:acme/memory");
+        assert_eq!(request.stream.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn given_fence_and_copy_namespaces_when_built_then_should_scope_both() {
+        let kv = scoped(crate::laser::ResourceNaming::Stream).kv("state");
+        let fenced = kv.cas_fenced("key", "coordination", "lease", 1);
+        assert_eq!(fenced.namespace, "stream:acme/state");
+        assert_eq!(fenced.fence_namespace, "stream:acme/coordination");
+        let copy = kv.copy_to("a", "b").into_namespace("archive");
+        assert_eq!(copy.to_namespace.as_deref(), Some("stream:acme/archive"));
+    }
+
+    #[test]
+    fn given_listed_namespaces_when_localized_then_should_keep_only_the_own_stream() {
+        let info = |namespace: &str| KvNamespaceInfo {
+            namespace: namespace.to_owned(),
+            entries: 1,
+        };
+        let listed = vec![
+            info("stream:acme/sessions"),
+            info("stream:other/sessions"),
+            info("legacy"),
+        ];
+        let local = scoped(crate::laser::ResourceNaming::Stream).local_namespaces(listed.clone());
+        assert_eq!(
+            local
+                .iter()
+                .map(|info| info.namespace.as_str())
+                .collect::<Vec<_>>(),
+            ["sessions"]
+        );
+        let bare = scoped(crate::laser::ResourceNaming::Bare).local_namespaces(listed);
+        assert_eq!(bare.len(), 3);
     }
 
     #[test]

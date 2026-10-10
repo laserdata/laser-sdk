@@ -1,12 +1,13 @@
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
 use crate::convert::{
-    codec_decode, codec_encode, duration_seconds, json_to_py, payload_bytes, py_to_json, ser_to_py,
+    codec_decode, codec_encode, duration_ms, json_to_py, payload_bytes, py_to_json, ser_to_py,
 };
 use crate::errors::{InvalidError, to_pyerr};
 use laser_sdk::kv::{KvEntry, KvMetadata, KvPage, Lease, MutationPosition};
 use laser_sdk::laser::Laser;
 use laser_sdk::types::ConversationId;
+use laser_sdk::wire::agent::SessionRef;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
@@ -19,6 +20,36 @@ fn parse_conversation(conversation: Option<String>) -> PyResult<Option<Conversat
             .map(Some)
             .map_err(|error| InvalidError::new_err(format!("invalid conversation id: {error}"))),
         None => Ok(None),
+    }
+}
+
+impl PyKv {
+    /// The Rust handle this Python handle stands for, linked to its session.
+    pub(crate) fn rust_handle(&self) -> laser_sdk::kv::Kv {
+        self.laser.kv(&self.namespace).linked(self.session.clone())
+    }
+
+    pub(crate) fn linked(laser: Laser, namespace: String, session: SessionRef) -> Self {
+        Self {
+            laser,
+            namespace,
+            session: Some(session),
+        }
+    }
+}
+
+// Link a key-value handle's writes to the session a `Session.kv` handle
+// carries, or leave it unlinked.
+trait Linked {
+    fn linked(self, session: Option<SessionRef>) -> Self;
+}
+
+impl Linked for laser_sdk::kv::Kv {
+    fn linked(self, session: Option<SessionRef>) -> Self {
+        match session {
+            Some(session) => self.in_session(session),
+            None => self,
+        }
     }
 }
 
@@ -49,6 +80,7 @@ impl PyLaser {
         PyKv {
             laser: self.inner.clone(),
             namespace,
+            session: None,
         }
     }
 
@@ -67,8 +99,8 @@ impl PyLaser {
 #[pyclass(name = "Kv", frozen)]
 pub struct PyKv {
     laser: Laser,
-    #[pyo3(get)]
     namespace: String,
+    session: Option<SessionRef>,
 }
 
 /// The durable managed-mutation position used as a barrier for takeover reads.
@@ -131,7 +163,7 @@ pub struct PyLease {
     #[pyo3(get)]
     pub token: u64,
     #[pyo3(get)]
-    pub granted_ttl_secs: f64,
+    pub granted_ttl_ms: f64,
     position: PyMutationPosition,
 }
 
@@ -139,7 +171,7 @@ impl From<Lease> for PyLease {
     fn from(value: Lease) -> Self {
         Self {
             token: value.token,
-            granted_ttl_secs: value.granted_ttl.as_secs_f64(),
+            granted_ttl_ms: value.granted_ttl.as_secs_f64() * 1000.0,
             position: value.position.into(),
         }
     }
@@ -155,8 +187,8 @@ impl PyLease {
 
     fn __repr__(&self) -> String {
         format!(
-            "Lease(token={}, granted_ttl_secs={})",
-            self.token, self.granted_ttl_secs
+            "Lease(token={}, granted_ttl_ms={})",
+            self.token, self.granted_ttl_ms
         )
     }
 }
@@ -164,13 +196,55 @@ impl PyLease {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyKv {
+    /// The namespace this handle is bound to, as the caller named it.
+    #[getter]
+    fn namespace(&self) -> String {
+        self.laser.kv(&self.namespace).namespace().to_owned()
+    }
+
+    /// The namespace as sent on the wire, scoped to the default stream unless
+    /// the handle names resources bare.
+    #[getter]
+    fn resource_namespace(&self) -> String {
+        self.laser
+            .kv(self.namespace.clone())
+            .resource_namespace()
+            .to_owned()
+    }
+
+    /// This handle with every set, compare-and-swap, delete, and patch linked
+    /// to `session`, a `{"stream", "session"}` dict as `Session.reference`
+    /// returns, so the deployment records which session wrote each key.
+    fn in_session(&self, session: &Bound<'_, PyAny>) -> PyResult<PyKv> {
+        Ok(PyKv {
+            laser: self.laser.clone(),
+            namespace: self.namespace.clone(),
+            session: Some(crate::convert::py_to_de(session)?),
+        })
+    }
+
+    /// The session this handle links its writes to, as a dict, or None.
+    #[getter]
+    fn session<'py>(&self, py: Python<'py>) -> PyResult<Option<Py<PyAny>>> {
+        self.session
+            .as_ref()
+            .map(|session| ser_to_py(py, session))
+            .transpose()
+    }
+
     /// Fetch the raw value bytes at `key`, or `None` if absent or expired.
     fn get<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
-            let value = laser.kv(namespace).get(key).await.map_err(to_pyerr)?;
+            let value = laser
+                .kv(namespace)
+                .linked(session)
+                .get(key)
+                .await
+                .map_err(to_pyerr)?;
             Ok(value)
         })
     }
@@ -186,9 +260,15 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
-            let value = laser.kv(namespace).get(key).await.map_err(to_pyerr)?;
+            let value = laser
+                .kv(namespace)
+                .linked(session)
+                .get(key)
+                .await
+                .map_err(to_pyerr)?;
             Python::attach(|py| match value {
                 Some(payload) => codec_decode(codec.bind(py), &payload),
                 None => Ok(py.None()),
@@ -204,9 +284,15 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
-            let entry = laser.kv(namespace).get_entry(key).await.map_err(to_pyerr)?;
+            let entry = laser
+                .kv(namespace)
+                .linked(session)
+                .get_entry(key)
+                .await
+                .map_err(to_pyerr)?;
             Python::attach(|py| match entry {
                 Some(entry) => Ok(PyKvEntry::from(entry)
                     .into_pyobject(py)?
@@ -229,11 +315,13 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         let min_position = MutationPosition::from(&*min_position);
         future_into_py(py, async move {
             let entry = laser
                 .kv(namespace)
+                .linked(session)
                 .get_entry_at_least(key, min_position)
                 .await
                 .map_err(to_pyerr)?;
@@ -255,9 +343,15 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
-            let value = laser.kv(namespace).get(key).await.map_err(to_pyerr)?;
+            let value = laser
+                .kv(namespace)
+                .linked(session)
+                .get(key)
+                .await
+                .map_err(to_pyerr)?;
             Python::attach(|py| match value {
                 Some(payload) => {
                     let value: serde_json::Value = serde_json::from_slice(&payload)
@@ -276,9 +370,10 @@ impl PyKv {
         Ok(PyKvSet {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key: payload_bytes(key)?,
             body: Body::Unset,
-            ttl_secs: None,
+            ttl_ms: None,
             expires_at_micros: None,
             expect: None,
         })
@@ -291,12 +386,12 @@ impl PyKv {
     /// builder: chain `.bytes()`/`.json()`/`.msgpack()`, exactly one of
     /// `.expect_version(v)` or `.expect_absent()`, optionally `.ttl()`, then
     /// `await request.commit()`. The keyword form (`value=`, `expect_version=`,
-    /// `expect_absent=`, `ttl_secs=`) fills the same builder, and awaiting the
+    /// `expect_absent=`, `ttl_ms=`) fills the same builder, and awaiting the
     /// request commits it. Returns the new version. A stale fence, or a lease
-    /// that expired or was released, raises `KvError` (`is_version_conflict()`
-    /// is false). A precondition miss raises `KvError` with
-    /// `is_version_conflict()` true.
-    #[pyo3(signature = (key, fence_namespace, fence_key, fence_token, value=None, *, expect_version=None, expect_absent=false, ttl_secs=None))]
+    /// that expired or was released, raises `KvError` with the
+    /// `version_conflict` attribute false. A precondition miss raises `KvError`
+    /// with `version_conflict` true.
+    #[pyo3(signature = (key, fence_namespace, fence_key, fence_token, value=None, *, expect_version=None, expect_absent=false, ttl_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn cas_fenced(
         &self,
@@ -307,7 +402,7 @@ impl PyKv {
         value: Option<&Bound<'_, PyAny>>,
         expect_version: Option<u64>,
         expect_absent: bool,
-        ttl_secs: Option<f64>,
+        ttl_ms: Option<f64>,
     ) -> PyResult<PyKvCasFenced> {
         let expect = match (expect_version, expect_absent) {
             (Some(_), true) => {
@@ -322,6 +417,7 @@ impl PyKv {
         Ok(PyKvCasFenced {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key: payload_bytes(key)?,
             fence_namespace,
             fence_key: payload_bytes(fence_key)?,
@@ -330,7 +426,7 @@ impl PyKv {
                 Some(value) => Body::Bytes(payload_bytes(value)?),
                 None => Body::Unset,
             },
-            ttl_secs,
+            ttl_ms,
             expires_at_micros: None,
             expect,
         })
@@ -340,9 +436,15 @@ impl PyKv {
     fn delete<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
-            laser.kv(namespace).delete(key).await.map_err(to_pyerr)
+            laser
+                .kv(namespace)
+                .linked(session)
+                .delete(key)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -351,30 +453,42 @@ impl PyKv {
     fn exists<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
-            let meta = laser.kv(namespace).exists(key).await.map_err(to_pyerr)?;
+            let meta = laser
+                .kv(namespace)
+                .linked(session)
+                .exists(key)
+                .await
+                .map_err(to_pyerr)?;
             Ok(meta.map(PyKvMetadata::from))
         })
     }
 
-    /// Set or refresh the entry's expiry in place. `ttl_secs` of `None` clears it.
+    /// Set or refresh the entry's expiry in place. `ttl_ms` of `None` clears it.
     /// Returns the entry's (unchanged) version.
-    #[pyo3(signature = (key, ttl_secs=None))]
+    #[pyo3(signature = (key, ttl_ms=None))]
     fn expire<'py>(
         &self,
         py: Python<'py>,
         key: &Bound<'_, PyAny>,
-        ttl_secs: Option<f64>,
+        ttl_ms: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
-        let ttl = ttl_secs
-            .map(|seconds| duration_seconds(seconds, "ttl_secs"))
+        let ttl = ttl_ms
+            .map(|ttl_ms| duration_ms(ttl_ms, "ttl_ms"))
             .transpose()?;
         future_into_py(py, async move {
-            laser.kv(namespace).expire(key, ttl).await.map_err(to_pyerr)
+            laser
+                .kv(namespace)
+                .linked(session)
+                .expire(key, ttl)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -390,10 +504,12 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
             laser
                 .kv(namespace)
+                .linked(session)
                 .expire_at(key, expires_at_micros)
                 .await
                 .map_err(to_pyerr)
@@ -410,41 +526,45 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         let patch = payload_bytes(patch)?;
         future_into_py(py, async move {
             laser
                 .kv(namespace)
+                .linked(session)
                 .patch(key, patch)
                 .await
                 .map_err(to_pyerr)
         })
     }
 
-    /// Acquire a revocable lease on `key` for `ttl_secs` as `holder` (a stable
-    /// node or worker id). Returns a `Lease` with `token`, `granted_ttl_secs`,
+    /// Acquire a revocable lease on `key` for `ttl_ms` as `holder` (a stable
+    /// node or worker id). Returns a `Lease` with `token`, `granted_ttl_ms`,
     /// and the `position` to pass to `get_entry_at_least`. A live
     /// lease always conflicts: extend with `renew_lease`, never by
-    /// re-acquiring. `ttl_secs` is a requested maximum between 1 second and 5
-    /// minutes; the store may grant less and never more, so a value outside that
+    /// re-acquiring. `ttl_ms` is a requested maximum between 1,000 and
+    /// 300,000 milliseconds; the store may grant less and never more, so a value outside that
     /// range raises before the round trip and a holder needing longer renews.
     /// Needs the `kv_fenced_leases` capability. If acquisition is
     /// ambiguous, the SDK closes the dedicated coordination connection and waits
-    /// `ttl_secs` before raising the non-retryable ambiguous-mutation error.
+    /// `ttl_ms` before raising the non-retryable ambiguous-mutation error.
     fn lease<'py>(
         &self,
         py: Python<'py>,
         key: &Bound<'_, PyAny>,
         holder: String,
-        ttl_secs: f64,
+        ttl_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
             let lease = laser
                 .kv(namespace)
-                .lease(key, holder, duration_seconds(ttl_secs, "ttl_secs")?)
+                .linked(session)
+                .lease(key, holder, duration_ms(ttl_ms, "ttl_ms")?)
                 .await
                 .map_err(to_pyerr)?;
             Ok(PyLease::from(lease))
@@ -454,7 +574,7 @@ impl PyKv {
     /// Extend a held lease without changing its token, presenting the same
     /// `holder` and the `token` the grant returned. Returns
     /// a `Lease` with the unchanged token, fresh TTL, and renewal position.
-    /// `ttl_secs` obeys the same range as `lease`. An expired, released, or
+    /// `ttl_ms` obeys the same range as `lease`. An expired, released, or
     /// re-acquired lease raises `KvError`: stop the protected work, a new epoch
     /// needs a fresh `lease`.
     fn renew_lease<'py>(
@@ -463,15 +583,17 @@ impl PyKv {
         key: &Bound<'_, PyAny>,
         holder: String,
         token: u64,
-        ttl_secs: f64,
+        ttl_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
             let lease = laser
                 .kv(namespace)
-                .renew_lease(key, holder, token, duration_seconds(ttl_secs, "ttl_secs")?)
+                .linked(session)
+                .renew_lease(key, holder, token, duration_ms(ttl_ms, "ttl_ms")?)
                 .await
                 .map_err(to_pyerr)?;
             Ok(PyLease::from(lease))
@@ -489,10 +611,12 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = payload_bytes(key)?;
         future_into_py(py, async move {
             laser
                 .kv(namespace)
+                .linked(session)
                 .release(key, holder, token)
                 .await
                 .map_err(to_pyerr)
@@ -537,12 +661,18 @@ impl PyKv {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let keys = keys
             .iter()
             .map(payload_bytes)
             .collect::<PyResult<Vec<_>>>()?;
         future_into_py(py, async move {
-            laser.kv(namespace).get_many(keys).await.map_err(to_pyerr)
+            laser
+                .kv(namespace)
+                .linked(session)
+                .get_many(keys)
+                .await
+                .map_err(to_pyerr)
         })
     }
 
@@ -552,6 +682,7 @@ impl PyKv {
         PyKvDeleteMany {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             prefix: None,
             range: None,
             key_contains: None,
@@ -564,6 +695,7 @@ impl PyKv {
         PyKvScan {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             prefix: None,
             range: None,
             key_contains: None,
@@ -585,6 +717,7 @@ impl PyKv {
         Ok(PyKvCopy {
             laser: self.laser.clone(),
             namespace: self.namespace.clone(),
+            session: self.session.clone(),
             key: payload_bytes(key)?,
             to_key: payload_bytes(to_key)?,
             to_namespace,
@@ -600,6 +733,7 @@ impl PyKv {
 pub struct PyKvCopy {
     laser: Laser,
     namespace: String,
+    session: Option<SessionRef>,
     key: Vec<u8>,
     to_key: Vec<u8>,
     to_namespace: Option<String>,
@@ -619,12 +753,13 @@ impl PyKvCopy {
     fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = self.key.clone();
         let to_key = self.to_key.clone();
         let to_namespace = self.to_namespace.clone();
         let delete_source = self.delete_source;
         future_into_py(py, async move {
-            let kv = laser.kv(namespace);
+            let kv = laser.kv(namespace).linked(session);
             let mut request = if delete_source {
                 kv.move_to(key, to_key)
             } else {
@@ -649,12 +784,13 @@ impl PyKvCopy {
 pub struct PyKvCasFenced {
     laser: Laser,
     namespace: String,
+    session: Option<SessionRef>,
     key: Vec<u8>,
     fence_namespace: String,
     fence_key: Vec<u8>,
     fence_token: u64,
     body: Body,
-    ttl_secs: Option<f64>,
+    ttl_ms: Option<f64>,
     expires_at_micros: Option<u64>,
     expect: Option<Expect>,
 }
@@ -700,9 +836,9 @@ impl PyKvCasFenced {
         Ok(slf)
     }
 
-    /// Expire the entry `seconds` from now.
-    fn ttl(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
-        slf.ttl_secs = Some(seconds);
+    /// Expire the entry `ttl_ms` milliseconds from now.
+    fn ttl(mut slf: PyRefMut<'_, Self>, ttl_ms: f64) -> PyRefMut<'_, Self> {
+        slf.ttl_ms = Some(ttl_ms);
         slf
     }
 
@@ -728,19 +864,22 @@ impl PyKvCasFenced {
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let key = self.key.clone();
         let fence_namespace = self.fence_namespace.clone();
         let fence_key = self.fence_key.clone();
         let fence_token = self.fence_token;
         let body = self.body.clone();
-        let ttl_secs = self.ttl_secs;
+        let ttl_ms = self.ttl_ms;
         let expires_at_micros = self.expires_at_micros;
         let expect = self.expect;
         future_into_py(py, async move {
-            let mut request =
-                laser
-                    .kv(namespace)
-                    .cas_fenced(key, fence_namespace, fence_key, fence_token);
+            let mut request = laser.kv(namespace).linked(session).cas_fenced(
+                key,
+                fence_namespace,
+                fence_key,
+                fence_token,
+            );
             request = match body {
                 Body::Unset => {
                     return Err(to_pyerr(laser_sdk::LaserError::Invalid(
@@ -752,8 +891,8 @@ impl PyKvCasFenced {
                 Body::Json(value) => request.json(&value).map_err(to_pyerr)?,
                 Body::Msgpack(value) => request.msgpack(&value).map_err(to_pyerr)?,
             };
-            if let Some(seconds) = ttl_secs {
-                request = request.ttl(duration_seconds(seconds, "ttl_secs")?);
+            if let Some(ttl_ms) = ttl_ms {
+                request = request.ttl(duration_ms(ttl_ms, "ttl_ms")?);
             }
             if let Some(epoch_micros) = expires_at_micros {
                 request = request.expires_at(epoch_micros);
@@ -914,9 +1053,10 @@ impl PyKvPage {
 pub struct PyKvSet {
     laser: Laser,
     namespace: String,
+    session: Option<SessionRef>,
     key: Vec<u8>,
     body: Body,
-    ttl_secs: Option<f64>,
+    ttl_ms: Option<f64>,
     expires_at_micros: Option<u64>,
     expect: Option<Expect>,
 }
@@ -962,9 +1102,9 @@ impl PyKvSet {
         Ok(slf)
     }
 
-    /// Expire the entry `seconds` from now.
-    fn ttl(mut slf: PyRefMut<'_, Self>, seconds: f64) -> PyRefMut<'_, Self> {
-        slf.ttl_secs = Some(seconds);
+    /// Expire the entry `ttl_ms` milliseconds from now.
+    fn ttl(mut slf: PyRefMut<'_, Self>, ttl_ms: f64) -> PyRefMut<'_, Self> {
+        slf.ttl_ms = Some(ttl_ms);
         slf
     }
 
@@ -989,13 +1129,14 @@ impl PyKvSet {
     /// Apply an unconditional write. Raises `InvalidError` when a precondition
     /// was set: a conditional write goes through `commit()`.
     fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (laser, namespace, key, body, ttl_secs, expires_at_micros, expect) = self.snapshot();
+        let (laser, namespace, key, body, ttl_ms, expires_at_micros, expect) = self.snapshot();
+        let session = self.session.clone();
         future_into_py(py, async move {
-            let kv = laser.kv(namespace);
+            let kv = laser.kv(namespace).linked(session);
             let mut request = kv.set(&key);
             request = apply_body(request, body).map_err(to_pyerr)?;
-            if let Some(seconds) = ttl_secs {
-                request = request.ttl(duration_seconds(seconds, "ttl_secs")?);
+            if let Some(ttl_ms) = ttl_ms {
+                request = request.ttl(duration_ms(ttl_ms, "ttl_ms")?);
             }
             if let Some(epoch_micros) = expires_at_micros {
                 request = request.expires_at(epoch_micros);
@@ -1012,13 +1153,14 @@ impl PyKvSet {
     /// Apply a compare-and-swap (needs `expect_version` / `expect_absent`).
     /// Returns the entry's new version.
     fn commit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (laser, namespace, key, body, ttl_secs, expires_at_micros, expect) = self.snapshot();
+        let (laser, namespace, key, body, ttl_ms, expires_at_micros, expect) = self.snapshot();
+        let session = self.session.clone();
         future_into_py(py, async move {
-            let kv = laser.kv(namespace);
+            let kv = laser.kv(namespace).linked(session);
             let mut request = kv.set(&key);
             request = apply_body(request, body).map_err(to_pyerr)?;
-            if let Some(seconds) = ttl_secs {
-                request = request.ttl(duration_seconds(seconds, "ttl_secs")?);
+            if let Some(ttl_ms) = ttl_ms {
+                request = request.ttl(duration_ms(ttl_ms, "ttl_ms")?);
             }
             if let Some(epoch_micros) = expires_at_micros {
                 request = request.expires_at(epoch_micros);
@@ -1051,7 +1193,7 @@ impl PyKvSet {
             self.namespace.clone(),
             self.key.clone(),
             self.body.clone(),
-            self.ttl_secs,
+            self.ttl_ms,
             self.expires_at_micros,
             self.expect,
         )
@@ -1078,6 +1220,7 @@ fn apply_body(
 pub struct PyKvScan {
     laser: Laser,
     namespace: String,
+    session: Option<SessionRef>,
     prefix: Option<Vec<u8>>,
     range: Option<(Vec<u8>, Vec<u8>)>,
     key_contains: Option<String>,
@@ -1138,6 +1281,7 @@ impl PyKvScan {
     fn fetch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let prefix = self.prefix.clone();
         let range = self.range.clone();
         let key_contains = self.key_contains.clone();
@@ -1145,7 +1289,7 @@ impl PyKvScan {
         let limit = self.limit;
         let cursor = self.cursor.clone();
         future_into_py(py, async move {
-            let kv = laser.kv(namespace);
+            let kv = laser.kv(namespace).linked(session);
             let mut request = kv.scan();
             if let Some(prefix) = prefix {
                 request = request.prefix(prefix);
@@ -1174,13 +1318,14 @@ impl PyKvScan {
     fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let prefix = self.prefix.clone();
         let range = self.range.clone();
         let key_contains = self.key_contains.clone();
         let conversation = parse_conversation(self.conversation.clone())?;
         let limit = self.limit;
         future_into_py(py, async move {
-            let kv = laser.kv(namespace);
+            let kv = laser.kv(namespace).linked(session);
             let mut request = kv.scan();
             if let Some(prefix) = prefix {
                 request = request.prefix(prefix);
@@ -1209,6 +1354,7 @@ impl PyKvScan {
 pub struct PyKvDeleteMany {
     laser: Laser,
     namespace: String,
+    session: Option<SessionRef>,
     prefix: Option<Vec<u8>>,
     range: Option<(Vec<u8>, Vec<u8>)>,
     key_contains: Option<String>,
@@ -1254,12 +1400,13 @@ impl PyKvDeleteMany {
     fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let namespace = self.namespace.clone();
+        let session = self.session.clone();
         let prefix = self.prefix.clone();
         let range = self.range.clone();
         let key_contains = self.key_contains.clone();
         let conversation = parse_conversation(self.conversation.clone())?;
         future_into_py(py, async move {
-            let kv = laser.kv(namespace);
+            let kv = laser.kv(namespace).linked(session);
             let mut request = kv.delete_many();
             if let Some(prefix) = prefix {
                 request = request.prefix(prefix);

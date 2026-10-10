@@ -1,9 +1,7 @@
 use crate::agent_runtime::static_topic;
 use crate::async_bridge::future_into_py;
 use crate::client::PyLaser;
-use crate::convert::{
-    duration_seconds, json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py,
-};
+use crate::convert::{duration_ms, json_to_py, payload_bytes, py_to_de, py_to_json, ser_to_py};
 use crate::errors::to_pyerr;
 use laser_sdk::LaserError;
 use laser_sdk::a2a::A2aBridge;
@@ -45,11 +43,11 @@ fn json_arg(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLaser {
-    /// Publish an AG-UI state snapshot (the full shared state as JSON) on `topic`.
+    /// Publish an AG-UI state snapshot: replace the session state document of
+    /// the conversation with `state`, a dict, then snapshot it.
     fn publish_state_snapshot<'py>(
         &self,
         py: Python<'py>,
-        topic: String,
         source: String,
         conversation_id: String,
         state: &Bound<'_, PyAny>,
@@ -60,17 +58,17 @@ impl PyLaser {
         let state = py_to_json(state)?;
         future_into_py(py, async move {
             laser
-                .publish_state_snapshot(static_topic(topic)?, source, conversation, &state)
+                .publish_state_snapshot(source, conversation, &state)
                 .await
                 .map_err(to_pyerr)
         })
     }
 
-    /// Publish an AG-UI state delta (an RFC 6902 JSON Patch document) on `topic`.
+    /// Publish an AG-UI state delta: apply `patch`, an RFC 6902 JSON Patch
+    /// list, to the session state document of the conversation.
     fn publish_state_delta<'py>(
         &self,
         py: Python<'py>,
-        topic: String,
         source: String,
         conversation_id: String,
         patch: &Bound<'_, PyAny>,
@@ -81,25 +79,24 @@ impl PyLaser {
         let patch = py_to_json(patch)?;
         future_into_py(py, async move {
             laser
-                .publish_state_delta(static_topic(topic)?, source, conversation, &patch)
+                .publish_state_delta(source, conversation, &patch)
                 .await
                 .map_err(to_pyerr)
         })
     }
 
-    /// Reconstruct AG-UI shared state by replaying the conversation's snapshot
-    /// and deltas on `topic`, or `None` until a snapshot exists.
+    /// The session state document of the conversation, or `None` until a
+    /// state record exists.
     fn reconstruct_state<'py>(
         &self,
         py: Python<'py>,
         conversation_id: String,
-        topic: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         let conversation = parse_conversation(&conversation_id)?;
         future_into_py(py, async move {
             let state = laser
-                .reconstruct_state(conversation, static_topic(topic)?)
+                .reconstruct_state(conversation)
                 .await
                 .map_err(to_pyerr)?;
             Python::attach(|py| match state {
@@ -133,6 +130,7 @@ struct ToolSpec {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    // Absent reads as null, which `with_tool` refuses as `InvalidError`.
     #[serde(default)]
     input_schema: serde_json::Value,
 }
@@ -219,16 +217,52 @@ impl PyA2aBridge {
     }
 
     /// `SendMessage`: publish the params (a dict, or raw JSON str / bytes) as a
-    /// task and return the submitted task as a dict.
+    /// task and return the submitted task as a dict. `target` addresses the
+    /// task to one agent. Without it every agent on a shared session topic
+    /// receives the task.
+    #[pyo3(signature = (params_json, *, target=None))]
     fn submit<'py>(
         &self,
         py: Python<'py>,
         params_json: &Bound<'_, PyAny>,
+        target: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         let params = json_arg(params_json)?;
+        let target = target_agent(target)?;
         future_into_py(py, async move {
-            let task = bridge.submit(params).await.map_err(to_pyerr)?;
+            let task = match target {
+                Some(target) => bridge.submit_to(target, params).await,
+                None => bridge.submit(params).await,
+            }
+            .map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &task))
+        })
+    }
+
+    /// `SendMessage` as a child session of `parent`, in the tree rooted at
+    /// `root` (the parent when omitted). The handling agent ends the child.
+    /// `target` addresses the task to one agent, as in `submit`.
+    #[pyo3(signature = (parent, params_json, *, root=None, target=None))]
+    fn submit_in<'py>(
+        &self,
+        py: Python<'py>,
+        parent: String,
+        params_json: &Bound<'_, PyAny>,
+        root: Option<String>,
+        target: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let bridge = self.inner.get();
+        let params = json_arg(params_json)?;
+        let (parent, root) =
+            crate::agent_runtime::parent_pair(Some(parent), root)?.expect("a parent was given");
+        let target = target_agent(target)?;
+        future_into_py(py, async move {
+            let task = match target {
+                Some(target) => bridge.submit_in_to(target, parent, root, params).await,
+                None => bridge.submit_in(parent, root, params).await,
+            }
+            .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &task))
         })
     }
@@ -299,11 +333,11 @@ impl PyMcpBridge {
     /// `prompts` are lists of dicts (a tool is `{name, description?,
     /// input_schema}`, a prompt is `{prompt: {name, title?, description?,
     /// arguments?}, messages: [[role, text]]}`). `memory_tools=True` adds the
-    /// conventional `remember` and `recall` tools. `timeout_secs` bounds each
+    /// conventional `remember` and `recall` tools. `timeout_ms` bounds each
     /// tool call (default 30). Every tool call carries the `bridge_hops`
     /// loop-guard path, starting at `source`.
     #[new]
-    #[pyo3(signature = (laser, source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_secs=None, memory_tools=false))]
+    #[pyo3(signature = (laser, source, tool_topic, reply_topic, server_name, *, tools=None, resources=None, prompts=None, timeout_ms=None, memory_tools=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         laser: PyRef<'_, PyLaser>,
@@ -314,7 +348,7 @@ impl PyMcpBridge {
         tools: Option<&Bound<'_, PyAny>>,
         resources: Option<&Bound<'_, PyAny>>,
         prompts: Option<&Bound<'_, PyAny>>,
-        timeout_secs: Option<f64>,
+        timeout_ms: Option<f64>,
         memory_tools: bool,
     ) -> PyResult<Self> {
         let tools: Vec<ToolSpec> = tools.map(py_to_de).transpose()?.unwrap_or_default();
@@ -329,7 +363,9 @@ impl PyMcpBridge {
             server_name,
         );
         for tool in tools {
-            bridge = bridge.with_tool(tool.name, tool.description, tool.input_schema);
+            bridge = bridge
+                .with_tool(tool.name, tool.description, tool.input_schema)
+                .map_err(to_pyerr)?;
         }
         for resource in resources {
             bridge = bridge.with_resource(
@@ -342,8 +378,8 @@ impl PyMcpBridge {
         for prompt in prompts {
             bridge = bridge.with_prompt(prompt.prompt, prompt.messages);
         }
-        if let Some(secs) = timeout_secs {
-            bridge = bridge.with_timeout(duration_seconds(secs, "timeout_secs")?);
+        if let Some(ms) = timeout_ms {
+            bridge = bridge.with_timeout(duration_ms(ms, "timeout_ms")?);
         }
         if memory_tools {
             bridge = bridge.with_memory_tools();
@@ -403,17 +439,57 @@ impl PyMcpBridge {
 
     /// `tools/call`: route the call to the agent and return the tool result as a
     /// dict. `params_json` is the JSON the call carries to the agent, a dict or
-    /// raw JSON str / bytes.
+    /// raw JSON str / bytes. `target` addresses the call to one agent.
+    /// Without it every agent on a shared session topic receives the call.
+    #[pyo3(signature = (name, params_json, *, target=None))]
     fn call_tool<'py>(
         &self,
         py: Python<'py>,
         name: String,
         params_json: &Bound<'_, PyAny>,
+        target: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         let arguments = json_arg(params_json)?;
+        let target = target_agent(target)?;
         future_into_py(py, async move {
-            let result = bridge.call_tool(&name, arguments).await.map_err(to_pyerr)?;
+            let result = match target {
+                Some(target) => bridge.call_tool_to(target, &name, arguments).await,
+                None => bridge.call_tool(&name, arguments).await,
+            }
+            .map_err(to_pyerr)?;
+            Python::attach(|py| ser_to_py(py, &result))
+        })
+    }
+
+    /// `tools/call` as a child session of `parent`, in the tree rooted at
+    /// `root` (the parent when omitted). The child ends by the result.
+    /// `target` addresses the call to one agent, as in `call_tool`.
+    #[pyo3(signature = (parent, name, params_json, *, root=None, target=None))]
+    fn call_tool_in<'py>(
+        &self,
+        py: Python<'py>,
+        parent: String,
+        name: String,
+        params_json: &Bound<'_, PyAny>,
+        root: Option<String>,
+        target: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let bridge = self.inner.get();
+        let arguments = json_arg(params_json)?;
+        let (parent, root) =
+            crate::agent_runtime::parent_pair(Some(parent), root)?.expect("a parent was given");
+        let target = target_agent(target)?;
+        future_into_py(py, async move {
+            let result = match target {
+                Some(target) => {
+                    bridge
+                        .call_tool_in_to(target, parent, root, &name, arguments)
+                        .await
+                }
+                None => bridge.call_tool_in(parent, root, &name, arguments).await,
+            }
+            .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &result))
         })
     }
@@ -477,4 +553,11 @@ fn capability_descriptor(
             .map_err(|e| crate::errors::CodecError::new_err(e.to_string()));
     }
     py_to_de(value)
+}
+
+// The agent a bridge call is addressed to, when the caller named one.
+fn target_agent(target: Option<String>) -> PyResult<Option<AgentId>> {
+    target
+        .map(|target| target.parse().map_err(|e| to_pyerr(LaserError::from(e))))
+        .transpose()
 }

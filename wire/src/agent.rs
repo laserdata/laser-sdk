@@ -477,14 +477,14 @@ pub enum AgentKind {
     Event,
     /// One piece of a stream, ordered by `sequence` within a `channel`.
     Chunk,
-    /// Lifecycle signal, discriminated by `operation`: task updates (`task`),
-    /// liveness cards (`card`), and progress ticks (`progress`).
+    /// Lifecycle signal, discriminated by `operation`: task or session updates,
+    /// liveness cards, and progress ticks.
     Status,
     /// A terminal failure. The body is a structured [`AgentErrorBody`].
     Error,
 }
 
-/// A2A's task lifecycle, adopted verbatim, riding the wire as a u8 code (the
+/// A2A's task lifecycle with LaserData's `Paused` extension, riding the wire as a u8 code (the
 /// `agdx.ct` dictionary pattern) so a future A2A state takes the next free code
 /// and flows through old consumers as an opaque non-terminal value instead of
 /// forcing a version bump on someone else's release schedule. Codes are
@@ -507,6 +507,8 @@ pub enum TaskState {
     Rejected,
     AuthRequired,
     Unknown,
+    /// LaserData's paused session state.
+    Paused,
     /// A code this build does not know: passed through, treated as non-terminal.
     Unrecognized(u8),
 }
@@ -524,6 +526,7 @@ impl TaskState {
             TaskState::Rejected => 7,
             TaskState::AuthRequired => 8,
             TaskState::Unknown => 9,
+            TaskState::Paused => 10,
             TaskState::Unrecognized(code) => code,
         }
     }
@@ -541,6 +544,7 @@ impl TaskState {
             7 => TaskState::Rejected,
             8 => TaskState::AuthRequired,
             9 => TaskState::Unknown,
+            10 => TaskState::Paused,
             other => TaskState::Unrecognized(other),
         }
     }
@@ -580,6 +584,7 @@ impl fmt::Display for TaskState {
             TaskState::Rejected => f.write_str("rejected"),
             TaskState::AuthRequired => f.write_str("auth-required"),
             TaskState::Unknown => f.write_str("unknown"),
+            TaskState::Paused => f.write_str("paused"),
             TaskState::Unrecognized(code) => write!(f, "unrecognized-{code}"),
         }
     }
@@ -599,8 +604,379 @@ impl FromStr for TaskState {
             "rejected" => TaskState::Rejected,
             "auth-required" => TaskState::AuthRequired,
             "unknown" => TaskState::Unknown,
+            "paused" => TaskState::Paused,
             other => return Err(InvalidError::new(format!("unknown task state `{other}`"))),
         })
+    }
+}
+
+/// The session lifecycle exposed by managed reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Submitted,
+    Active,
+    Paused,
+    Completed,
+    Failed,
+    Canceled,
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One session addressed within a stream by name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRef {
+    pub stream: String,
+    pub session: ConversationId,
+}
+
+/// The SDK that created a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SdkInfo {
+    pub language: String,
+    pub version: String,
+}
+
+/// The optional token and cost ceiling requested for a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Budget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+}
+
+/// The first status body of a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub agent: AgentId,
+    pub sdk: SdkInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ConversationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<ConversationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// A session status update that can acknowledge a control record.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTransition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledges: Option<LogPosition>,
+}
+
+/// The JSON body of a `session_pause` request on `agent.control`: the agents
+/// whose acknowledgments complete the pause, frozen when the request is
+/// written. An empty set names no agent, and every agent that receives work
+/// for the session while it is paused acknowledges when it holds that work.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPauseRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<AgentId>,
+}
+
+/// One work record an agent held while its session was paused. A
+/// `session_parked` event on the session lane carries it, and a
+/// `session_unparked` event with the same body records that the agent handled
+/// the record after the resume. The source address with its topic generation,
+/// the agent, and the pause request position together identify one parking.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionParking {
+    pub source: crate::graph::SourceRef,
+    pub role: AgentId,
+    pub request: LogPosition,
+}
+
+impl crate::validate::Validate for SessionParking {
+    fn validate(&self) -> Result<(), InvalidError> {
+        match &self.source {
+            crate::graph::SourceRef::Message {
+                generation: Some(_),
+                ..
+            } => Ok(()),
+            crate::graph::SourceRef::Message { .. } => Err(InvalidError::new(
+                "a parked record must name its source topic generation",
+            )),
+            _ => Err(InvalidError::new(
+                "a parked record must point at a log record",
+            )),
+        }
+    }
+}
+
+/// The body of a terminal session status.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionEnd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AgentErrorBody>,
+}
+
+/// The estimated token count of `bytes` bytes of context: one token per four
+/// bytes, rounded up. Every SDK and the session fold use this one estimate.
+pub const fn estimate_tokens(bytes: usize) -> u64 {
+    bytes.div_ceil(4) as u64
+}
+
+/// The metadata key for a model call's requested model.
+pub const METADATA_REQUEST_MODEL: &str = "gen_ai.request.model";
+/// The metadata key for the model that answered a call.
+pub const METADATA_RESPONSE_MODEL: &str = "gen_ai.response.model";
+/// The metadata key for the provider that served a model call.
+pub const METADATA_PROVIDER_NAME: &str = "gen_ai.provider.name";
+/// The metadata key that marks a command as the first command of a
+/// submitted session. The receiving agent marks the session working when it
+/// picks the command up.
+pub const METADATA_SUBMITTED: &str = "submitted";
+/// The metadata key for a call's duration in microseconds, measured by the
+/// application around the provider or tool call.
+pub const METADATA_DURATION_MICROS: &str = "duration_micros";
+
+/// The inputs and source positions used to assemble one model context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextManifest {
+    pub policy: String,
+    pub policy_version: String,
+    pub fragments: Vec<Fragment>,
+    pub tokens: u64,
+    pub bytes: u64,
+    pub frontier: Vec<(u32, u32, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<CorrelationId>,
+}
+
+/// One input in the context that a model received.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Fragment {
+    Message {
+        at: crate::graph::SourceRef,
+        tokens: u32,
+        bytes: u32,
+    },
+    Memory {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<crate::schema::Digest32>,
+        tokens: u32,
+        bytes: u32,
+    },
+    Kv {
+        namespace: String,
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<crate::schema::Digest32>,
+        tokens: u32,
+        bytes: u32,
+    },
+    State {
+        key: String,
+        revision: u64,
+        tokens: u32,
+        bytes: u32,
+    },
+    Summary {
+        at: crate::graph::SourceRef,
+        tokens: u32,
+        bytes: u32,
+    },
+}
+
+/// A summary that replaces a range of context records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompaction {
+    pub summary_at: crate::graph::SourceRef,
+    pub covered: Vec<(u32, u32, u64, u64)>,
+    pub summarizer: crate::graph::ProducerInfo,
+}
+
+/// The items selected by one context retrieval.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextRetrieval {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    pub items: Vec<(String, f32)>,
+}
+
+/// One RFC 6902 operation of a state patch.
+pub use json_patch::PatchOperation;
+
+/// One revision-guarded RFC 6902 state patch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StateDelta {
+    pub base_revision: u64,
+    pub patch: Vec<json_patch::PatchOperation>,
+    pub op_id: String,
+}
+
+/// A complete state document at the applied revision it replaces.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub base_revision: u64,
+    pub document: serde_json::Value,
+}
+
+impl crate::validate::Validate for ContextManifest {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.fragments.len() > crate::limits::MAX_MANIFEST_FRAGMENTS {
+            return Err(InvalidError::new("context manifest has too many fragments"));
+        }
+        for fragment in &self.fragments {
+            let digest = match fragment {
+                Fragment::Memory { digest, .. } | Fragment::Kv { digest, .. } => digest.as_ref(),
+                _ => None,
+            };
+            if let Some(digest) = digest {
+                crate::validate::Validate::validate(digest)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl crate::validate::Validate for StateDelta {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if self.patch.len() > crate::limits::MAX_STATE_PATCH_OPS {
+            return Err(InvalidError::new("state patch has too many operations"));
+        }
+        if self.op_id.is_empty() {
+            return Err(InvalidError::new(
+                "state patch operation id must not be empty",
+            ));
+        }
+        let bytes = serde_json::to_vec(&self.patch)
+            .map_err(|error| InvalidError::new(error.to_string()))?;
+        if bytes.len() > crate::limits::MAX_STATE_DOCUMENT_BYTES {
+            return Err(InvalidError::new(
+                "state patch exceeds the document byte cap",
+            ));
+        }
+        let patch = serde_json::to_value(&self.patch)
+            .map_err(|error| InvalidError::new(error.to_string()))?;
+        validate_portable_json(&patch)?;
+        Ok(())
+    }
+}
+
+impl crate::validate::Validate for StateSnapshot {
+    fn validate(&self) -> Result<(), InvalidError> {
+        let bytes = serde_json::to_vec(&self.document)
+            .map_err(|error| InvalidError::new(error.to_string()))?;
+        if bytes.len() > crate::limits::MAX_STATE_DOCUMENT_BYTES {
+            return Err(InvalidError::new("state document exceeds its byte cap"));
+        }
+        validate_portable_json(&self.document)?;
+        Ok(())
+    }
+}
+
+const MAX_EXACT_JSON_INTEGER: i128 = 9_007_199_254_740_991;
+
+fn validate_portable_json(value: &serde_json::Value) -> Result<(), InvalidError> {
+    match value {
+        serde_json::Value::Number(number) => {
+            let exact = if let Some(integer) = number.as_i64() {
+                i128::from(integer).abs() <= MAX_EXACT_JSON_INTEGER
+            } else if let Some(integer) = number.as_u64() {
+                i128::from(integer) <= MAX_EXACT_JSON_INTEGER
+            } else {
+                number.as_f64().is_some_and(|float| {
+                    float.is_finite()
+                        && (float.fract() != 0.0 || float.abs() <= MAX_EXACT_JSON_INTEGER as f64)
+                })
+            };
+            if !exact {
+                return Err(InvalidError::new(
+                    "state JSON integer exceeds the exact number range",
+                ));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_portable_json(item)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values() {
+                validate_portable_json(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Apply a JSON Patch to a copy of a state document and check the shared limits.
+pub fn apply_json_patch(
+    document: &serde_json::Value,
+    patch: &[json_patch::PatchOperation],
+) -> Result<serde_json::Value, InvalidError> {
+    if patch.len() > crate::limits::MAX_STATE_PATCH_OPS {
+        return Err(InvalidError::new("state patch has too many operations"));
+    }
+    let patch_bytes =
+        serde_json::to_vec(patch).map_err(|error| InvalidError::new(error.to_string()))?;
+    if patch_bytes.len() > crate::limits::MAX_STATE_DOCUMENT_BYTES {
+        return Err(InvalidError::new(
+            "state patch exceeds the document byte cap",
+        ));
+    }
+    validate_portable_json(document)?;
+    let patch_value =
+        serde_json::to_value(patch).map_err(|error| InvalidError::new(error.to_string()))?;
+    validate_portable_json(&patch_value)?;
+    let mut result = document.clone();
+    json_patch::patch(&mut result, patch).map_err(|error| InvalidError::new(error.to_string()))?;
+    crate::validate::Validate::validate(&StateSnapshot {
+        base_revision: 0,
+        document: result.clone(),
+    })?;
+    Ok(result)
+}
+
+impl crate::validate::Validate for SessionStart {
+    fn validate(&self) -> Result<(), InvalidError> {
+        if let Some(label) = &self.label
+            && (label.len() > crate::limits::MAX_SESSION_LABEL_BYTES
+                || label.chars().any(char::is_control))
+        {
+            return Err(InvalidError::new(
+                "session label exceeds its cap or contains a control character",
+            ));
+        }
+        if let Some(namespace) = &self.namespace {
+            crate::kv::validate_namespace(namespace)?;
+        }
+        if self.root.is_some() && self.parent.is_none() {
+            return Err(InvalidError::new("session root requires a parent"));
+        }
+        if self.tags.len() > crate::limits::MAX_MEMORY_TAGS {
+            return Err(InvalidError::new("session has too many tags"));
+        }
+        if self
+            .tags
+            .iter()
+            .any(|tag| tag.len() > crate::limits::MAX_MEMORY_TAG_BYTES)
+        {
+            return Err(InvalidError::new("session tag exceeds its byte cap"));
+        }
+        Ok(())
     }
 }
 
@@ -620,6 +996,9 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Cost in integer micro-units of the deployment's configured currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
 }
 
 /// Why an agent operation failed, as a pinned u8 dictionary (the
@@ -1133,6 +1512,12 @@ pub struct AgentEnvelope {
     pub record: Option<RecordId>,
     /// Also the partition key.
     pub conversation: ConversationId,
+    /// The session this conversation was spawned from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ConversationId>,
+    /// The first conversation in this session tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<ConversationId>,
     /// Agent-authorship claim (see the module docs).
     pub source: AgentId,
     /// Routing refinement within a shared topic. The topic itself is the
@@ -1246,6 +1631,8 @@ impl AgentEnvelope {
             kind,
             record: None,
             conversation,
+            parent: None,
+            root: None,
             source,
             target: None,
             cause: None,
@@ -1507,12 +1894,12 @@ pub enum ValidateError {
 // | finish_reason    | X       | O        | X     | O (with last) | X | X  |
 // | idempotency_key  | O       | O        | O     | X     | X      | X     |
 // | deadline_micros  | O       | X        | X     | O     | X      | X     |
-// | task_state       | X       | O        | X     | X     | R (task) | O   |
-// | operation        | O       | O        | O     | R seq 0 (chat|reasoning|tool_args), X after | R (task|card|progress|quarantine|unquarantine) | O |
+// | task_state       | X       | O        | X     | X     | R (task|session) | O |
+// | operation        | O       | O        | O     | R seq 0 (chat|reasoning|tool_args), X after | R (task|session|card|progress|quarantine|unquarantine) | O |
 // | tool             | O       | O        | O     | O     | X      | O     |
 // | usage            | X       | O        | O     | O (terminal) | O | O  |
 // | metadata         | O       | O        | O     | O     | O      | O     |
-// | body             | R       | R        | R     | R (may be empty with last) | O | R |
+// | body             | R       | R        | R     | R (may be empty with last) | R session, O otherwise | R |
 /// Check an envelope against the per-kind validity matrix and the caps.
 pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
     use AgentKind::*;
@@ -1536,6 +1923,21 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
     // record: required everywhere except chunk (where it is optional).
     if kind != Chunk {
         require(envelope.record.is_some(), "record")?;
+    }
+
+    if envelope.root.is_some() && envelope.parent.is_none() {
+        return Err(ValidateError::Invalid {
+            field: "root",
+            reason: "root requires parent".to_owned(),
+        });
+    }
+    if envelope.parent == Some(envelope.conversation)
+        || envelope.root == Some(envelope.conversation)
+    {
+        return Err(ValidateError::Invalid {
+            field: "parent",
+            reason: "parent and root must differ from conversation".to_owned(),
+        });
     }
 
     // correlation.
@@ -1616,7 +2018,10 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
     // task_state.
     match kind {
         Status => {
-            if envelope.operation.as_deref() == Some(OPERATION_TASK) {
+            if matches!(
+                envelope.operation.as_deref(),
+                Some(OPERATION_TASK | OPERATION_SESSION)
+            ) {
                 require(envelope.task_state.is_some(), "task_state")?;
             }
         }
@@ -1626,7 +2031,7 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
 
     // operation: two CLOSED vocabularies (protocol machinery, version-gated
     // like AgentKind), open OTel values everywhere else. The status
-    // discriminator must be task | card | progress, and the chunk-stream purpose
+    // discriminator must be task | session | card | progress, and the chunk-stream purpose
     // must be chat | reasoning | tool_args and rides ONLY the opening chunk
     // (sequence 0), where it is required.
     match kind {
@@ -1636,6 +2041,7 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
                 && !matches!(
                     operation,
                     OPERATION_TASK
+                        | OPERATION_SESSION
                         | OPERATION_CARD
                         | OPERATION_PROGRESS
                         | OPERATION_QUARANTINE
@@ -1645,7 +2051,7 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
                 return Err(ValidateError::Invalid {
                     field: "operation",
                     reason: format!(
-                        "status operation must be `{OPERATION_TASK}`, `{OPERATION_CARD}`, \
+                        "status operation must be `{OPERATION_TASK}`, `{OPERATION_SESSION}`, `{OPERATION_CARD}`, \
                          `{OPERATION_PROGRESS}`, `{OPERATION_QUARANTINE}`, or \
                          `{OPERATION_UNQUARANTINE}`, got `{operation}`"
                     ),
@@ -1701,6 +2107,71 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
 
     // body.
     match kind {
+        Status if envelope.operation.as_deref() == Some(OPERATION_SESSION) => {
+            require(!envelope.body.is_empty(), "body")?;
+            let state = envelope
+                .task_state
+                .expect("session state was required above");
+            if envelope.last != state.is_terminal() {
+                return Err(ValidateError::Invalid {
+                    field: "last",
+                    reason: "session last must match terminal task state".to_owned(),
+                });
+            }
+            // The body shape is checked where the CBOR codec is built in.
+            #[cfg(feature = "cbor")]
+            {
+                let invalid_body = |reason: String| ValidateError::Invalid {
+                    field: "body",
+                    reason,
+                };
+                let validate_start = |start: &SessionStart| {
+                    crate::validate::Validate::validate(start)
+                        .map_err(|error| invalid_body(error.to_string()))?;
+                    if start.parent != envelope.parent || start.root != envelope.root {
+                        return Err(invalid_body(
+                            "session ancestry must match envelope parent and root".to_owned(),
+                        ));
+                    }
+                    Ok(())
+                };
+                match state {
+                    TaskState::Submitted => {
+                        let start: SessionStart = crate::framing::decode_named(&envelope.body)
+                            .map_err(|error| invalid_body(error.to_string()))?;
+                        validate_start(&start)?;
+                    }
+                    TaskState::Working => {
+                        let body: ciborium::value::Value =
+                            crate::framing::decode_named(&envelope.body)
+                                .map_err(|error| invalid_body(error.to_string()))?;
+                        let is_start = matches!(
+                            body,
+                            ciborium::value::Value::Map(ref entries)
+                                if entries.iter().any(|(key, _)| {
+                                    matches!(key, ciborium::value::Value::Text(name) if name == "agent" || name == "sdk")
+                                })
+                        );
+                        if is_start {
+                            let start: SessionStart = crate::framing::decode_named(&envelope.body)
+                                .map_err(|error| invalid_body(error.to_string()))?;
+                            validate_start(&start)?;
+                        } else {
+                            crate::framing::decode_named::<SessionTransition>(&envelope.body)
+                                .map_err(|error| invalid_body(error.to_string()))?;
+                        }
+                    }
+                    state if state.is_terminal() => {
+                        crate::framing::decode_named::<SessionEnd>(&envelope.body)
+                            .map_err(|error| invalid_body(error.to_string()))?;
+                    }
+                    _ => {
+                        crate::framing::decode_named::<SessionTransition>(&envelope.body)
+                            .map_err(|error| invalid_body(error.to_string()))?;
+                    }
+                }
+            }
+        }
         Status => {}
         Chunk => {
             if envelope.body.is_empty() && !envelope.last {
@@ -1764,6 +2235,8 @@ pub fn validate(envelope: &AgentEnvelope) -> Result<(), ValidateError> {
 
 /// The `status` operation value for task lifecycle updates.
 pub const OPERATION_TASK: &str = "task";
+/// The `status` operation value for session lifecycle updates.
+pub const OPERATION_SESSION: &str = "session";
 /// The `status` operation value for liveness/capability cards.
 pub const OPERATION_CARD: &str = "card";
 /// The `status` operation value for progress ticks.
@@ -1800,6 +2273,12 @@ pub const OPERATION_STATE_SNAPSHOT: &str = "state_snapshot";
 /// The `event` operation value for a state delta (the body is an RFC 6902
 /// JSON Patch document).
 pub const OPERATION_STATE_DELTA: &str = "state_delta";
+/// The `event` operation value for a work record an agent held while its
+/// session was paused. The body is a [`SessionParking`].
+pub const OPERATION_SESSION_PARKED: &str = "session_parked";
+/// The `event` operation value that records a held work record handled after
+/// the resume. The body is the [`SessionParking`] of the held record.
+pub const OPERATION_SESSION_UNPARKED: &str = "session_unparked";
 
 // Pinned AGDX-native metadata keys. Values stay strings or scalars per the
 // metadata rules. The keys are pinned so transcripts, bridges, and projections
@@ -1814,13 +2293,6 @@ pub const METADATA_ROLE: &str = "role";
 /// deployments (A2A in, AG-UI out, A2A out again). Bounded by the metadata
 /// caps like every other entry.
 pub const METADATA_BRIDGE_HOPS: &str = "bridge_hops";
-/// Metadata key: the run id a status record belongs to, stamped by a
-/// registered workflow or contract and read by the run-registry fold. A record
-/// without it never enters the fold, so the key costs nothing and means
-/// nothing for everything that is not a registered run. Bounded by the
-/// metadata caps like every other entry.
-pub const METADATA_RUN: &str = "run";
-
 /// Metadata key: the user an agent acts on behalf of. It rides `metadata` (not a
 /// header) so it falls inside the signed envelope span, so the signer cannot
 /// forge whom it claims to act for.
@@ -1900,6 +2372,131 @@ fn value_size(value: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validate::Validate;
+
+    fn session_start() -> SessionStart {
+        SessionStart {
+            label: Some("Research".to_owned()),
+            namespace: Some("agents".to_owned()),
+            agent: "planner".parse().expect("valid agent id"),
+            sdk: SdkInfo {
+                language: "rust".to_owned(),
+                version: "0.7.0".to_owned(),
+            },
+            parent: None,
+            root: None,
+            idle_timeout_micros: Some(300_000_000),
+            budget: Some(Budget {
+                tokens: Some(1000),
+                cost_micros: None,
+            }),
+            tags: vec!["demo".to_owned()],
+        }
+    }
+
+    #[test]
+    fn given_session_status_when_decoded_then_should_keep_known_and_unknown_values() {
+        assert_eq!(
+            serde_json::from_str::<SessionStatus>("\"paused\"").expect("paused"),
+            SessionStatus::Paused
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionStatus>("\"future\"").expect("unknown"),
+            SessionStatus::Unrecognized
+        );
+    }
+
+    #[test]
+    fn given_session_start_when_validated_then_should_enforce_label_and_tag_caps() {
+        let mut start = session_start();
+        start.validate().expect("valid start");
+        start.label = Some("bad\nlabel".to_owned());
+        assert!(start.validate().is_err());
+        start.label = Some("x".repeat(crate::limits::MAX_SESSION_LABEL_BYTES + 1));
+        assert!(start.validate().is_err());
+        start.label = None;
+        start.tags = vec!["tag".to_owned(); crate::limits::MAX_MEMORY_TAGS + 1];
+        assert!(start.validate().is_err());
+    }
+
+    #[cfg(feature = "cbor")]
+    #[test]
+    fn given_session_status_bodies_when_validated_then_should_match_the_lifecycle() {
+        let mut status = AgentEnvelope::status(
+            RecordId::from_u128(1),
+            ConversationId::from_u128(2),
+            "planner".parse().expect("valid agent id"),
+            OPERATION_SESSION,
+        );
+        status.task_state = Some(TaskState::Submitted);
+        status.body = crate::framing::encode_named(&session_start()).expect("start encodes");
+        validate(&status).expect("submitted start");
+        status.parent = Some(ConversationId::from_u128(8));
+        assert!(
+            validate(&status).is_err(),
+            "start and envelope ancestry must match"
+        );
+        status.parent = None;
+
+        status.task_state = Some(TaskState::Paused);
+        status.body = crate::framing::encode_named(&SessionTransition::default())
+            .expect("transition encodes");
+        validate(&status).expect("paused transition");
+
+        status.task_state = Some(TaskState::Completed);
+        status.body = crate::framing::encode_named(&SessionEnd::default()).expect("end encodes");
+        assert!(validate(&status).is_err(), "terminal status needs last");
+        status.last = true;
+        validate(&status).expect("completed end");
+    }
+
+    #[cfg(feature = "cbor")]
+    #[test]
+    fn given_a_parked_record_when_encoded_then_should_round_trip_and_require_a_generation() {
+        use crate::validate::Validate;
+        let source = |generation| crate::graph::SourceRef::Message {
+            stream: 1,
+            topic: 2,
+            partition: 3,
+            offset: 4,
+            generation,
+            conversation: Some(ConversationId::from_u128(5).to_string()),
+        };
+        let parking = SessionParking {
+            source: source(Some(6)),
+            role: "worker".parse().expect("valid agent id"),
+            request: LogPosition::new(1, 7, 0, 8),
+        };
+        parking.validate().expect("a complete parking is valid");
+        let bytes = crate::framing::encode_named(&parking).expect("parking encodes");
+        let decoded: SessionParking = crate::framing::decode_named(&bytes).expect("decodes");
+        assert_eq!(decoded, parking);
+        let unproven = SessionParking {
+            source: source(None),
+            ..parking.clone()
+        };
+        assert!(unproven.validate().is_err());
+        let not_a_record = SessionParking {
+            source: crate::graph::SourceRef::Memory { id: "m".to_owned() },
+            ..parking
+        };
+        assert!(not_a_record.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_pause_request_body_when_decoded_then_should_read_an_empty_body_as_no_participants() {
+        let empty: SessionPauseRequest = serde_json::from_slice(b"{}").expect("empty decodes");
+        assert!(empty.participants.is_empty());
+        let named = SessionPauseRequest {
+            participants: vec!["worker".parse().expect("valid agent id")],
+        };
+        let json = serde_json::to_string(&named).expect("request encodes");
+        assert_eq!(json, r#"{"participants":["worker"]}"#);
+        assert_eq!(
+            serde_json::from_str::<SessionPauseRequest>(&json).expect("decodes"),
+            named
+        );
+    }
 
     #[test]
     fn given_an_id_when_displayed_then_should_round_trip_through_crockford_base32() {
@@ -1983,6 +2580,7 @@ mod tests {
             (TaskState::Rejected, 7),
             (TaskState::AuthRequired, 8),
             (TaskState::Unknown, 9),
+            (TaskState::Paused, 10),
         ];
         for (state, code) in expected {
             assert_eq!(state.code(), code);
@@ -1995,6 +2593,9 @@ mod tests {
         assert!(!future.is_terminal());
         assert!(TaskState::Completed.is_terminal());
         assert!(!TaskState::Working.is_terminal());
+        assert!(!TaskState::Paused.is_terminal());
+        assert_eq!(TaskState::Paused.to_string(), "paused");
+        assert_eq!("paused".parse::<TaskState>(), Ok(TaskState::Paused));
     }
 
     #[test]
@@ -2611,18 +3212,15 @@ mod wire_tests {
         assert_eq!(redrive, inner);
     }
     #[test]
-    fn given_a_run_lifecycle_status_when_validated_then_should_require_the_correlation() {
-        // The shape `mark_run` emits: a task status stamped with the run
-        // metadata key. A task status must carry a correlation, so the
-        // run-lifecycle mark correlates on the run and only then validates.
+    fn given_a_task_status_when_validated_then_should_require_the_correlation() {
+        // A task status must carry a correlation.
         let base = AgentEnvelope::status(
             RecordId::from_u128(1),
             ConversationId::from_u128(2),
             "runner".parse().expect("valid agent id"),
             OPERATION_TASK,
         )
-        .with_task_state(TaskState::Working)
-        .with_metadata(METADATA_RUN, "run-1");
+        .with_task_state(TaskState::Working);
         assert!(
             matches!(
                 validate(&base),

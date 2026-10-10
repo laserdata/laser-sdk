@@ -71,7 +71,10 @@ export interface Capabilities {
   readonly graph: boolean
   readonly forks: boolean
   readonly a2aGateway: boolean
-  readonly agentWorkflow: boolean
+  readonly sessions: boolean
+  /** The deployment scopes every managed name to one stream, and each
+   * stream's change feed rides its own ops topic. */
+  readonly streamTenancy: boolean
   readonly watch: boolean
   readonly authz: boolean
   readonly filters: FilterCaps
@@ -90,7 +93,7 @@ export type CapabilitySurface =
   | "kvFencedLeases"
   | "graph"
   | "forks"
-  | "agentWorkflow"
+  | "sessions"
   | "watch"
   | "authz"
   | "filters"
@@ -111,7 +114,8 @@ export const OPEN_CAPABILITIES: Capabilities = Object.freeze({
   graph: false,
   forks: false,
   a2aGateway: false,
-  agentWorkflow: false,
+  sessions: false,
+  streamTenancy: false,
   watch: false,
   authz: false,
   filters: Object.freeze({ native: false, catalog: false, groupPolicyReads: false }),
@@ -175,7 +179,6 @@ export function isOpenOnly(capabilities: Capabilities): boolean {
     capabilities.graph === open.graph &&
     capabilities.forks === open.forks &&
     capabilities.a2aGateway === open.a2aGateway &&
-    capabilities.agentWorkflow === open.agentWorkflow &&
     capabilities.watch === open.watch &&
     capabilities.authz === open.authz &&
     filters.native === open.filters.native &&
@@ -258,8 +261,8 @@ export function requireCapability(capabilities: Capabilities, surface: Capabilit
                     ? capabilities.graph
                     : surface === "forks"
                       ? capabilities.forks
-                      : surface === "agentWorkflow"
-                        ? capabilities.agentWorkflow
+                      : surface === "sessions"
+                        ? capabilities.sessions
                         : surface === "watch"
                           ? capabilities.watch
                           : surface === "filters"
@@ -350,7 +353,8 @@ function foldAnnouncement(capabilities: Capabilities, announce: BackendAnnounce)
     },
     graph: capabilities.graph || versions.graph > 0,
     forks: capabilities.forks || versions.fork > 0,
-    agentWorkflow: capabilities.agentWorkflow || has(feature.AGENT_WORKFLOW),
+    sessions: capabilities.sessions || has(feature.SESSIONS),
+    streamTenancy: capabilities.streamTenancy || has(feature.STREAM_TENANCY),
     watch: capabilities.watch || has(feature.WATCH),
     filters: {
       ...answered.filters,

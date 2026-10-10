@@ -47,12 +47,11 @@ void test("given_a_connected_client_when_reaching_the_managed_surfaces_then_shou
   assert.ok(laser.graph("kg"))
   assert.deepEqual(laser.query("readings_v1").intoQuery().target, {
     kind: "operational",
-    index: "readings_v1"
+    index: "stream:fleet/readings_v1"
   })
   assert.ok(laser.projections())
   assert.ok(laser.bindings())
   assert.ok(laser.schemas())
-  assert.ok(laser.runs())
   assert.ok(laser.watch())
   assert.ok(laser.watch().index("readings_v1"))
 })
@@ -71,7 +70,7 @@ void test("given_a_connected_client_when_reaching_memory_then_should_build_each_
   await using laser = await laserWithStream()
 
   assert.equal(laser.memory("host:node-7").logBackend()?.namespace, "host:node-7")
-  assert.equal(laser.memory("host:node-7").logBackend()?.topic, AgentTopic.Audit)
+  assert.equal(laser.memory("host:node-7").logBackend()?.topic, AgentTopic.Memory)
   assert.equal(laser.memoryOnTopic("incidents").logBackend()?.topic, "incidents")
   assert.equal(laser.memoryOnTopic("incidents", "ops").logBackend()?.stream, "ops")
 

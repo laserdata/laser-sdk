@@ -7,7 +7,7 @@ import {
   type AgentHandler,
   type ReliableConsumerControl
 } from "../../src/agent/reliable-consumer.js"
-import { NoStreamError } from "../../src/client/errors.js"
+import { HandlerConfigError, NoStreamError } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
 import type { ConsolidationReport } from "../../src/memory/types.js"
 import { AgentId } from "../../src/types/ids.js"
@@ -15,7 +15,7 @@ import { AgentId } from "../../src/types/ids.js"
 function builder() {
   return Agent.builder()
     .id(AgentId.new("consolidating-worker"))
-    .listenOn("agent.commands")
+    .listenOn("agent.sessions")
     .handler({ handle: () => Promise.resolve() })
     .consolidateEvery(10)
 }
@@ -175,3 +175,9 @@ void test(
     await handle.shutdown()
   }
 )
+
+void test("given_a_zero_consolidation_period_when_built_then_should_refuse_it_as_config", () => {
+  for (const period of [0, -1, Number.NaN]) {
+    assert.throws(() => builder().consolidateEvery(period).build(), HandlerConfigError)
+  }
+})

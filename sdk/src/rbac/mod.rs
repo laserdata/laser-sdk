@@ -38,12 +38,18 @@ impl Laser {
         }
     }
 
-    /// List defined roles, optionally filtered by name prefix.
-    pub async fn list_roles(&self, name_prefix: Option<&str>) -> Result<Vec<Role>, LaserError> {
+    /// List defined roles, optionally filtered by name prefix and by a
+    /// `search` substring, the same bounded registry browse as listing
+    /// projections.
+    pub async fn list_roles(
+        &self,
+        name_prefix: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Vec<Role>, LaserError> {
         let request = ListRolesReq {
             v: AUTHZ_OP_VERSION,
             name_prefix: name_prefix.map(str::to_owned),
-            search: None,
+            search: search.map(str::to_owned),
         };
         match self
             .execute_authz(AGDX_AUTHZ_LIST_ROLES_CODE, &request)

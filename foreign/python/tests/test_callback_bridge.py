@@ -141,7 +141,7 @@ async def test_given_a_stalled_send_when_its_attempt_times_out_then_should_cance
             self.cancelled_before_reset = self.cancelled.is_set()
 
     transport = Stalled()
-    client = ls.FencedLeaseClient(transport).with_attempt_timeout(0.005)
+    client = ls.FencedLeaseClient(transport).with_attempt_timeout(5)
     with pytest.raises(ls.LaserError) as failure:
         await client.release(client.prepare_release(RELEASE))
     assert failure.value.ambiguous_mutation

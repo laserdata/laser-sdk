@@ -7,7 +7,7 @@ pytestmark = pytest.mark.integration
 
 
 async def test_given_async_workflow_callbacks_when_run_then_should_await_build_and_verify(laser):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     seen = []
 
     async def handle(context, message):
@@ -27,14 +27,14 @@ async def test_given_async_workflow_callbacks_when_run_then_should_await_build_a
 
     agent = laser.spawn_agent(
         "workflow-worker",
-        ls.AgentTopic.Commands,
+        ls.AgentTopic.Sessions,
         handle,
-        respond_on=ls.AgentTopic.Responses,
+        respond_on=ls.AgentTopic.Sessions,
         poll_interval_ms=10,
     )
     try:
         await agent.ready()
-        workflow = laser.workflow("async-workflow", fixed_inbox=ls.AgentTopic.Commands)
+        workflow = laser.workflow("async-workflow", fixed_inbox=ls.AgentTopic.Sessions)
         workflow.step("first", to="workflow-worker", build=Builder(), verify=Check())
         outcome = await workflow.run()
         assert outcome.outputs == {"first": b"task:reply"}
@@ -44,7 +44,7 @@ async def test_given_async_workflow_callbacks_when_run_then_should_await_build_a
 
 
 async def test_given_async_compensation_when_a_later_build_fails_then_should_await_rollback(laser):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     seen = []
 
     async def handle(context, message):
@@ -62,14 +62,14 @@ async def test_given_async_compensation_when_a_later_build_fails_then_should_awa
 
     agent = laser.spawn_agent(
         "rollback-worker",
-        ls.AgentTopic.Commands,
+        ls.AgentTopic.Sessions,
         handle,
-        respond_on=ls.AgentTopic.Responses,
+        respond_on=ls.AgentTopic.Sessions,
         poll_interval_ms=10,
     )
     try:
         await agent.ready()
-        workflow = laser.workflow("rollback-workflow", fixed_inbox=ls.AgentTopic.Commands)
+        workflow = laser.workflow("rollback-workflow", fixed_inbox=ls.AgentTopic.Sessions)
         workflow.step(
             "first", to="rollback-worker", build=lambda outputs: b"do", compensate=compensate
         )
@@ -84,7 +84,7 @@ async def test_given_async_compensation_when_a_later_build_fails_then_should_awa
 async def test_given_async_verifier_error_when_a_step_replies_then_should_keep_the_error_class(
     laser,
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
 
     async def handle(context, message):
         await context.respond(b"reply")
@@ -95,14 +95,14 @@ async def test_given_async_verifier_error_when_a_step_replies_then_should_keep_t
 
     agent = laser.spawn_agent(
         "verified-worker",
-        ls.AgentTopic.Commands,
+        ls.AgentTopic.Sessions,
         handle,
-        respond_on=ls.AgentTopic.Responses,
+        respond_on=ls.AgentTopic.Sessions,
         poll_interval_ms=10,
     )
     try:
         await agent.ready()
-        workflow = laser.workflow("verified-workflow", fixed_inbox=ls.AgentTopic.Commands)
+        workflow = laser.workflow("verified-workflow", fixed_inbox=ls.AgentTopic.Sessions)
         workflow.step("first", to="verified-worker", build=lambda outputs: b"task", verify=verify)
         with pytest.raises(ls.ProtocolError, match="verification refused"):
             await workflow.run()

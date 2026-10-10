@@ -4,7 +4,7 @@ This package provides the Python Laser SDK for Apache Iggy. [LaserData, Inc.](ht
 
 Rust and Python share the data contract and Rust implementation. The bindings expose Python forms of the SDK operations, configuration, and errors. Shared examples and behavior scenarios cover language-neutral behavior.
 
-> The current release is `0.6.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
+> The current release is `0.7.0`. The wire contract and public API use semantic versioning. Before `1.0.0`, minor releases can contain breaking changes.
 
 `spawn_agent(agent_id, ..., consumer_group=None)` separates agent identity from its consumer group. The default group uses the agent ID spelling. Set `consumer_group` when the deployment needs a different group.
 
@@ -40,7 +40,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Use a `user:password@host:port` connection string, or pass `address=` with `credentials=(user, password)` instead. `Laser.connect_env()` reads `LASER_CONNECTION_STRING` and an optional `LASER_STREAM`, `Laser.local()` connects to `iggy:iggy@127.0.0.1:8090`, and `Laser.connect_with_stream(conn, stream)` pins a default stream. The SDK supplies the Apache Iggy TCP scheme. Select a stream with `laser.stream(name)` and a topic with `.topic(name)`. The optional `stream=` selects a default for the shorter `laser.topic(name)` form. It does not restrict access to other streams. Accessors select objects, and operations such as `publish`, `replay`, and `ensure` perform I/O.
+Use a `user:password@host[:port]` or `token@host[:port]` connection string, or pass `address=` with `credentials=(user, password)` instead. The port defaults to 8090. Only the `iggy://` and `iggy+tcp://` schemes and Apache Iggy's TCP options are accepted, credentials are required, and an unknown or repeated option raises `ConfigError` before dialing. `tls_ca_file=` alone turns TLS on. `Laser.connect_env()` reads `LASER_CONNECTION_STRING` and an optional `LASER_STREAM`, `Laser.local()` connects to `iggy:iggy@127.0.0.1:8090`, and `Laser.connect_with_stream(conn, stream)` pins a default stream. The SDK supplies the Apache Iggy TCP scheme. Select a stream with `laser.stream(name)` and a topic with `.topic(name)`. The optional `stream=` selects a default for the shorter `laser.topic(name)` form. It does not restrict access to other streams. Accessors select objects, and operations such as `publish`, `replay`, and `ensure` perform I/O.
 
 Python uses the Rust client reconnect policy. TCP connections retry a failed dial and reconnect dropped sockets, by default without limit at one-second intervals. The 30-second connect budget stops the retries of the initial connection. Set `reconnection_retries=<count|unlimited>` and `reconnection_interval=<duration>` in the connection string. After reconnecting, the client reapplies those credentials.
 
@@ -51,6 +51,8 @@ LaserData Cloud and Laser Stack enable managed surfaces only when their backend 
 ## Connect timeout
 
 `Laser.connect` gives up after 30 seconds. The budget covers the dial, the TLS handshake, the login, and the capability probe. Pass `connect_timeout_ms` to use another budget, or set `LASER_CONNECT_TIMEOUT_MS`. The argument overrides the variable. An expired budget raises `TimeoutError` that says whether the server never accepted the connection or never answered the login. `laser.stream(name).delete()` removes a stream you no longer need, and `await laser.close()` ends the shared connection. See [connect timeout and cleanup](../../docs/connect-timeout.md).
+
+Every relative duration in the Python SDK is in milliseconds and its keyword ends in `_ms`, for example `timeout_ms`, `ttl_ms`, `linger_ms`, `wait_ms`, and `TopicRetention.expire_after(age_ms)`, matching the TypeScript SDK. A fraction of a millisecond is kept, and a negative or non-finite value raises `InvalidError`. Absolute times and wire fields stay in epoch microseconds (`*_micros`).
 
 ## Publish and consume
 
@@ -200,7 +202,7 @@ print(result.page.total, result.page.has_more)
 Each query keeps one execution identity and an absolute deadline. Use the same builder to inspect or cancel a running query:
 
 ```python
-request = laser.query("readings_v1").filter_gte("cpu", 90).deadline(30)
+request = laser.query("readings_v1").filter_gte("cpu", 90).deadline(30_000)
 result = await request.fetch()
 status = await request.status()
 if status["state"] == "running":
@@ -260,29 +262,29 @@ Query, the key-value store, the knowledge graph, and forks are managed features 
 
 ```python
 kv = laser.kv("sessions")
-await kv.set("user:42").json({"state": "online"}).ttl(300).send()
+await kv.set("user:42").json({"state": "online"}).ttl(300_000).send()
 state = await kv.get_typed("user:42")
 entry = await kv.get_entry("user:42")
 print(entry.source())  # origin stream/topic ids, partition, and offset when stamped
 values = await kv.get_many(["user:42", "user:43"])  # one round trip (the mixed-operation batch)
 await kv.copy_to("user:42", "user:42:2026", to_namespace="archive")  # one backend transaction
 await kv.move_to("plan:draft", "plan:current")  # copy plus source delete
-lease = await kv.lease("source-owner", "worker-1", 30)
+lease = await kv.lease("source-owner", "worker-1", 30_000)
 state = await kv.get_entry_at_least("source-state", lease.position)
-lease = await kv.renew_lease("source-owner", "worker-1", lease.token, 30)
+lease = await kv.renew_lease("source-owner", "worker-1", lease.token, 30_000)
 await kv.release("source-owner", "worker-1", lease.token)
 await kv.delete("user:42")
 ```
 
 `cas_fenced`, `copy_to`, and `move_to` return request builders. Await one directly, or finish it with `commit()` for `cas_fenced` and `send()` for the copies.
 
-`Lease` exposes `token`, `granted_ttl_secs`, and `position`, a `MutationPosition`. After takeover, pass that position to `get_entry_at_least` to exclude state older than the grant. Request a lifetime from 1 second to 5 minutes. The store can grant less time, but never more. Values outside the range fail before sending.
+`Lease` exposes `token`, `granted_ttl_ms`, and `position`, a `MutationPosition`. After takeover, pass that position to `get_entry_at_least` to exclude state older than the grant. Request a lifetime from 1,000 to 300,000 milliseconds. The store can grant less time, but never more. Values outside the range fail before sending.
 
 Renew a lease before its granted lifetime expires. Reacquisition does not extend a live lease. Acquisition uses a dedicated coordination connection. If the outcome is unknown, the SDK retires the connection and waits through the requested lifetime. It then raises an ambiguous-mutation error that requires operation-specific recovery.
 
 ### Prepared coordination requests
 
-`FencedLeaseClient` exposes the same prepared mutation flow as Rust. It accepts `DedicatedKvTransport` or an object with `send(code, frame)` and `reset()` methods. Reset must stop all in-flight requests before it returns. A custom `close()` performs terminal retirement when provided. Otherwise client close calls `reset()`. Each attempt times out after 10 seconds, and `with_attempt_timeout(seconds)` changes that.
+`FencedLeaseClient` exposes the same prepared mutation flow as Rust. It accepts `DedicatedKvTransport` or an object with `send(code, frame)` and `reset()` methods. Reset must stop all in-flight requests before it returns. A custom `close()` performs terminal retirement when provided. Otherwise client close calls `reset()`. Each attempt times out after 10 seconds, and `with_attempt_timeout(timeout_ms)` changes that.
 
 ```python
 from laser_sdk import FencedLeaseClient
@@ -385,19 +387,19 @@ async def handle(ctx, message):
 
 
 laser = await Laser.connect("iggy:iggy@127.0.0.1:8090", stream="agents")
-await laser.bootstrap(partitions=4)
+await laser.bootstrap(partitions=4, retention=ls.TopicRetention.expire_after(86_400_000))
 
-handle_agent = laser.spawn_agent("echo", "agent.commands", handle, respond_on="agent.responses")
+handle_agent = laser.spawn_agent("echo", "agent.sessions", handle, respond_on="agent.sessions")
 await handle_agent.ready()
 
 from laser_sdk import Provenance
 
 reply = await laser.request(
-    "agent.commands",
-    "agent.responses",
+    "agent.sessions",
+    "agent.sessions",
     b"hello",
     Provenance(agent="caller"),
-    timeout_secs=10,
+    timeout_ms=10_000,
 )
 print(bytes(reply.payload).decode())
 
@@ -406,11 +408,13 @@ await handle_agent.shutdown()
 
 Keep the handle until `shutdown()` or `join()`. Dropping it signals a graceful stop and cancels periodic consolidation, and `abort()` stops the agent immediately. `async with laser.spawn_agent(...) as handle:` waits for readiness and stops the agent on exit.
 
+Each agent id reads through its own consumer group, named after the agent id unless `consumer_group=` names another, so every instance of one agent shares its work. The handler only sees work for this agent: commands addressed to it or to every agent. Replies, status records, and records for other agents are committed without calling it. On `agent.sessions` and `agent.control`, when the server resolves group policies and serves filtered reads and the filter catalog, the group is bound to the addressee filter `agdx.to In [<agent id>, "*"]` before the first read, so the server sends only those records. Otherwise the agent reads every record and sorts them itself. [Agents, groups, and layouts](../../docs/building-agents.md#agents-groups-and-layouts) explains how to pick a layout.
+
 ### Agent memory and configuration
 
 `MemoryHandler(inner, memory).auto_remember("message")` remembers each successful turn under its conversation and source agent. A failed handler writes no memory. A failed memory write does not repeat an effect that the handler completed.
 
-`spawn_agent` accepts capability descriptor dicts as well as skill names. `fixed_inbox` sets the handler's default fan-out route. `governor_retention=(capacity, idle_ttl_secs)` bounds the process-local evidence heads for an agent governor. `dedup_window` sets the default in-memory capacity in keys. A custom `dedup` callback replaces that window, and passing both raises `InvalidError`.
+`spawn_agent` accepts capability descriptor dicts as well as skill names. `fixed_inbox` sets the handler's default fan-out route. `governor_retention=(capacity, idle_ttl_ms)` bounds the process-local evidence heads for an agent governor. `dedup_window` sets the default in-memory capacity in keys. A custom `dedup` callback replaces that window, and passing both raises `InvalidError`.
 
 Periodic consolidation requires both `consolidate_every_ms` and a callable or an object with `consolidate(scope)`. When the agent has an ID, each pass receives that agent in the scope dict. Otherwise the scope is empty. Pass failures are logged and later passes continue. Shutdown and context exit stop new passes and request cancellation of an active asynchronous callback. `join()` keeps consolidation active until the agent stops.
 
@@ -418,7 +422,7 @@ Periodic consolidation requires both `consolidate_every_ms` and a callable or an
 
 `command`, `respond`, `emit`, `status`, and `fail` accept `cause`, `cause_at`, `deadline_micros`, `idempotency_key`, `metadata`, `tool`, `usage`, and `claim_check`. A causal position is `ls.LogPosition(stream_id, topic_id, partition_id, offset)` and requires a cause record ID. The returned envelope retains the Rust packed 20-byte position capsule. `claim_check=(store, threshold_bytes)` moves a large body to the supplied blob store.
 
-An AGDX producer's `signing_key` signs those five send verbs. Chunk streams and `request_input` use the unsigned Rust helpers. `request_input` accepts the reply topic, prompt, and timeout.
+An AGDX producer's `signing_key` signs those five send verbs. Chunk streams and `request_input` use the unsigned Rust helpers. `request_input` accepts the reply topic, prompt, timeout, and an optional `target` agent.
 
 ### Signed, principal-bound contracts
 
@@ -459,15 +463,17 @@ match result:
         print("no reply")
 ```
 
-`contract` defaults to a 30-second deadline, like Rust and TypeScript, and returns a `Contract`: `Contract.Completed(reply)`, `Contract.Failed(reply)`, `Contract.NotConsumed()`, or `Contract.TimedOut()`. Route to one named agent with `agent=` and `skill=None`. `expire_if_not_consumed_ms` lets an unpicked task end as `not_consumed`, and `reply_on`, `conversation`, `fence`, and `registered` mirror the Rust contract builder. `laser.agent(id)` returns an `AgentScope` with `send`, `ask`, `contract`, `publish_card`, and `advertise`. `laser.agent_registry()` reads folded cards, quarantine facts, and live presence. `scatter` returns the reply bodies of the agents that completed. `scatter_report` returns a `ScatterReport` whose `outcomes` hold each agent's `Contract` or failure, with `completed()` and `failures()` views. Read `reply.verified_principal` when policy or UI code must inspect the signer. With a verifier configured, unsigned, invalid, and wrong-principal replies are ignored rather than returned with an empty identity.
+`contract` defaults to a 30-second deadline, like Rust and TypeScript, and returns a `Contract`: `Contract.Completed(reply)`, `Contract.Failed(reply)`, `Contract.NotConsumed()`, or `Contract.TimedOut()`. Route to one named agent with `agent=` and `skill=None`. `expire_if_not_consumed_ms` lets an unpicked task end as `not_consumed`, and `reply_on`, `conversation`, `fence`, and `registered` mirror the Rust contract builder. `laser.agent(id)` returns an `AgentScope` with `send`, `ask`, `contract`, `publish_card`, and `advertise`. `laser.agent_registry()` reads folded cards, quarantine facts, and live presence. `scatter` returns the reply bodies of the agents that completed. `scatter`, `scatter_report`, and `AgentCtx.fan_out` take a required `deadline_ms`, as in Rust and TypeScript. `scatter_report` returns a `ScatterReport` whose `outcomes` hold each agent's `Contract` or failure, with `completed()` and `failures()` views. Read `reply.verified_principal` when policy or UI code must inspect the signer. With a verifier configured, unsigned, invalid, and wrong-principal replies are ignored rather than returned with an empty identity.
 
 For a human-in-the-loop pause, the typed AGDX producer's `request_input` publishes a prompt and blocks on the human's correlated reply, which a handler resolves with `AgentCtx.respond_input`:
 
 ```python
-decision = await laser.agdx("agent.human_input", "orchestrator", conversation_id).request_input(
-    "agent.responses", b"approve draining node-7?", timeout_secs=15
+decision = await laser.agdx("agent.sessions", "orchestrator", conversation_id).request_input(
+    "agent.sessions", b"approve draining node-7?", timeout_ms=15_000, target="approver"
 )
 ```
+
+`target` addresses the prompt to one agent. Without it every agent listening on a shared session topic receives the prompt.
 
 The same identity rules as contracts apply. A caller connected with `verifier=` accepts only signed responses, so an approver spawned with `signing_key=` resumes it and nothing else can. A producer signs its own sends the same way: `laser.agdx(..., signing_key=key)` signs every envelope it publishes (`command`/`respond`/`emit`/`status`/`fail`), the Python spelling of the per-send `.signed_by` builder in Rust and TypeScript.
 
@@ -490,7 +496,7 @@ async def gatekeeper(ctx, message):
     # Pause on a human decision before continuing, the ctx-scoped sibling
     # of the top-level request_input above.
     decision = await ctx.approval_gate(
-        "agent.responses", b"approve draining node-7?", timeout_secs=15
+        "agent.sessions", b"approve draining node-7?", timeout_ms=15_000
     )
     await ctx.respond(decision)
 ```
@@ -505,7 +511,7 @@ async def gatekeeper(ctx, message):
 from laser_sdk import agent_ctx, agent_message, Provenance
 
 message = agent_message(b"hello", Provenance(agent="tester"))
-ctx = agent_ctx(laser, message, agent="tester", respond_on="agent.responses")
+ctx = agent_ctx(laser, message, agent="tester", respond_on="agent.sessions")
 await handle(ctx, message)  # call your handler function directly
 ```
 
@@ -528,15 +534,15 @@ class NoDrains:
 
 governed = laser.with_governor(NoDrains(), mode="enforce")
 try:
-    await governed.send_agent("agent.commands", b"drain-node node-7", provenance)
+    await governed.send_agent("agent.sessions", b"drain-node node-7", provenance)
 except PolicyBlockedError as refused:
     print(refused)  # policy blocked: drains need approval
 
 # Per-agent: everything the handler publishes is governed too.
-handle_agent = laser.spawn_agent("operator", "agent.commands", handle, governor=NoDrains())
+handle_agent = laser.spawn_agent("operator", "agent.sessions", handle, governor=NoDrains())
 ```
 
-The governor receives a `GovernedAction` whose `counters` (`ActionCounters`) report the sends, requests, and bytes already spent in that scope. `decision.verdict` is a `Verdict`. Compare it with `Verdict.block()` or read `verdict.as_str()`, and read a step-up scope or modified body from `verdict.scope` and `verdict.body`. `decision.policy` is a `PolicyRef`. `laser.with_governor_retention(governor, mode, GovernorRetention(capacity=, idle_ttl_secs=))` bounds the process-local evidence heads.
+The governor receives a `GovernedAction` whose `counters` (`ActionCounters`) report the sends, requests, and bytes already spent in that scope. `decision.verdict` is a `Verdict`. Compare it with `Verdict.block()` or read `verdict.as_str()`, and read a step-up scope or modified body from `verdict.scope` and `verdict.body`. `decision.policy` is a `PolicyRef`. `laser.with_governor_retention(governor, mode, GovernorRetention(capacity=, idle_ttl_ms=))` bounds the process-local evidence heads.
 
 `QuorumGovernor` combines named voters through `all`, `any`, or `at_least(n)`. A voter can implement deterministic rules or call a model. Every `mandatory` voter must return `allow`, `observe`, or `modify`. A mandatory denial or error blocks the operation under every policy:
 
@@ -606,27 +612,91 @@ if activity:
 ```python
 from laser_sdk import CrashContext
 
-journal = await laser.assemble_context(conversation_id, topics=[AgentTopic.Commands])
+journal = await laser.assemble_context(conversation_id, topics=[AgentTopic.Sessions])
 context = CrashContext(journal=journal, dead_letter=None, last_decision=activity.last_decision)
 print(context.summarize())
 ```
 
-## Runs (managed)
+## Sessions
 
-The managed run registry answers "what happened to that task" without folding topics yourself. Gated on the `agent_workflow` capability, `UnsupportedError` elsewhere.
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `agent.sessions` needs an explicit retention, because it holds every session's records.
 
 ```python
-runs = laser.runs()
-await runs.register_source("agents", "agent.status")
-run = await runs.submit("diagnoser", b'{"incident": "INC-7"}')
-info = await runs.status(run.run_id)
-page = await runs.list(state="running", limit=25)
-await runs.cancel(run.run_id)  # records the intent, the engine observes it
-await runs.remove_source("agents", "agent.status")
+import laser_sdk as ls
 
+sessions = laser.sessions()
+await sessions.bootstrap(4, ls.TopicRetention.expire_after(7 * 86_400_000))
+
+# `async with` begins the session, ends it when the block finishes, and fails
+# it with the exception type and traceback when the block raises.
+async with sessions.create("ticket-42").agent("triage") as session:
+    assembled = await session.assemble(ls.LastN(20))
+    call = await session.model(
+        ls.ModelRequest("gpt-4o", assembled.text(), provider="openai"), assembled
+    )
+    answer = await my_model(assembled.text())  # the SDK never calls a model
+    await call.complete(ls.ModelResponse(answer, usage={"input_tokens": 812, "output_tokens": 64}))
+    tool = await session.tool("lookup", {"ticket": 42, "api_key": "k"})  # api_key is redacted
+    await tool.complete(b"found")
+    await session.state().set("status", "triaged")
+    await session.state().patch([{"op": "add", "path": "/owner", "value": "ops"}])
+```
+
+`create(label)` derives the id from the stream, the namespace, and the label. `start()` makes a fresh id. `await builder.begin()` returns a `(Session, SessionLease)` pair when a block does not fit, and `session.run(lease, work)` ends the session by the outcome of `work`. `end()`, `fail(error)` (an `AgentErrorBody` dict such as `{"code": 4, "message": "deadline passed"}`), and `cancel()` write the terminal record. Every handle copy shares one terminal latch, so a retried `end()` resends the same record and a later `cancel()` raises `InvalidError`. A held lease lists the session in the process heartbeat on `agent.heartbeats`. Call `lease.release()` when the process stops working on the session.
+
+Hand a session to an agent with `submit`. The agent's handler reaches it through `ctx.session()`:
+
+```python
+async def handle(ctx, message):
+    session = ctx.session()
+    await session.state().set("seen", True)
+    await session.end()
+
+
+worker = laser.spawn_agent("worker", ls.AgentTopic.Sessions, handle)
+submitted = await (
+    laser.sessions()
+    .submit("worker", b'{"ticket": 42}')
+    .from_("intake")
+    .label("ticket-42")
+    .budget(ls.Budget(tokens=4_000))
+    .send()
+)
+turns = await laser.sessions().open(submitted.session).context()
+print([turn.display for turn in turns])  # session.submitted, session.resumed, ...
+```
+
+An operator stops a session through `agent.control`, which only accounts with send permission on that topic can write:
+
+```python
+control = laser.sessions().control(laser.default_stream, submitted.session).as_operator("ops")
+await control.cancel()  # the agents end it at their next boundary
+await control.force_cancel()  # ends a session whose agent is gone
+```
+
+`laser.sessions(stream=, layout=, idle_timeout_ms=, heartbeat_ms=, register_source=, fail_on_dead_letter=, memory_namespace=, context_turns=, context_tokens=, sdk=)` configures the factory. The defaults are a 300-second idle timeout and a 60-second heartbeat. `layout=ls.SessionLayout.PerAgentPartition({"planner": 0, "worker": 2})` puts the work addressed to each declared agent on its own partition of `agent.sessions`. `SessionLayout.PerAgentTopic(topics={"planner": "planner.inbox", "worker": "worker.inbox"})` routes the work addressed to each declared agent onto its own topic, `SessionLayout.SinglePartition()` puts everything on one partition, and `SessionLayout.Shared()` is the default. Lifecycle and state always stay on the session's partition. `sessions.bootstrap(partitions, retention)` also registers the stream as a session source when the server announces `sessions`, and reports `registered`.
+
+On a deployment that announces `sessions`, the factory reads the managed session index. Replies are dicts, and a failed read raises `SessionError`:
+
+```python
+page = await laser.sessions().list(status="active", limit=20)
+info = await laser.sessions().get(submitted.session)
+events = await laser.sessions().events(submitted.session, limit=100)
+record = await laser.read_at(events["items"][0]["at"])  # works on Apache Iggy too
+watch = laser.sessions().watch(1_000)
+change = await watch.next()
+```
+
+Inside a handler, `await ctx.session().pending_control()` returns the pause and cancel requests the agent recorded from `agent.control`. The runtime never interrupts a handler. `control(...).signed_by(key)` signs control records. `spawn_agent(..., sessions=laser.sessions(fail_on_dead_letter=True))` fails the session of a dead-lettered record.
+
+An operator can pause a session. `pause()` names the agents that must acknowledge, set them with `participants([...])` or let the SDK read them from the session. Agents hold work that arrives while the session is paused and handle it after `resume()`. `await session.parked()` lists held work that was never handled, for example after a cancel while paused.
+
+`await session.over_budget()` tells you whether the session's recorded usage passed the budget in its start record, by tokens or by cost. A deployment that indexes sessions answers from its index, and open Apache Iggy folds the retained lane. On a deployment that indexes sessions, an agent with an id checks each session before its handler runs. When the session is over its budget, the agent fails it once with reason `budget` and commits the work without handling it. A workflow checks its run at every step boundary, compensates, raises `BudgetExceededError`, and ends the run session failed with reason `budget`. Budget reads are eventually consistent, so a budget is a cooperative limit, not a hard spending cap.
+
+Workflows run as sessions too. A run is a root session and each step and compensation is a child session. `contract(..., parent=, root=)`, `A2aBridge.submit_in(parent, params, root=)`, and `McpBridge.call_tool_in(parent, name, params, root=)` run as child sessions of `parent`. The bridge calls also take `target=` to address one agent.
+
+```python
 wf = laser.workflow("incident-response")
-wf.registered()  # the run's lifecycle lands in the registry
-
 # A fenced external effect must use the same namespace in the workflow lease
 # and in the handler's kv("storage").cas_fenced(...) commit.
 wf.step(
@@ -668,21 +738,18 @@ saved = cursor.offsets
 # trims the selection to an estimated token count, applied after `last_n`.
 history = await laser.assemble_context(conversation_id, last_n=50, token_budget=4_000)
 
-# An agent session: typed turns over the conversation-level topics, a
-# model-ready context, scoped memory, and checkpointed replay.
-session = laser.sessions().create("agent-42")
-await session.append("instruction", b"summarize the ticket")
-await session.append("model.response", b"it is a login bug")
+# One session's lane: a model-ready context and checkpointed replay.
+session = laser.sessions().open(session_id)
 for turn in await session.context():
-    print(turn.kind, turn.text())
+    print(turn.display, turn.text())
 checkpoint = await session.checkpoint()
 saved = checkpoint.to_json()
 later = await session.turns_since(ls.Checkpoint.from_json(saved))
 ```
 
-`laser.context(conversation)` returns a `ContextScope`. Its `fetch(n=50, token_budget=)` and `block` read `agent.commands` and `agent.responses` unless `topics=` names others, and return `ContextMessage` records (`id`, `provenance`, `payload`, `envelope`, `topic`). `fetch_with(topics, Chain([LastN(20), TokenBudget(4_000)]))` takes the policy objects `LastN`, `TokenBudget(max_tokens, estimator=None)`, `RoleFilter(agents)`, and `Chain`. `state(topics, init, fold, last_n=|from_offsets=|from_checkpoint=|at=|full=True)`, `state_with(store, topics, init, fold)`, and `checkpoint(topics)` fold the conversation log like Rust. `context_checkpoint(laser, topics)` captures a checkpoint without a conversation, and `ConversationState.load(laser, conversation, topics, init, fold)` folds one directly with the same bounds. Each read covers at most the newest `CONTEXT_READ_WINDOW` (10,000) messages per partition.
+`laser.context(conversation)` returns a `ContextScope`. Its `fetch(n=50, token_budget=)` and `block` read `agent.sessions` unless `topics=` names others, and return `ContextMessage` records (`id`, `provenance`, `payload`, `envelope`, `topic`). `fetch_with(topics, Chain([LastN(20), TokenBudget(4_000)]))` takes the policy objects `LastN`, `TokenBudget(max_tokens, estimator=None)`, `RoleFilter(agents)`, and `Chain`. `state(topics, init, fold, last_n=|from_offsets=|from_checkpoint=|at=|full=True)`, `state_with(store, topics, init, fold)`, and `checkpoint(topics)` fold the conversation log like Rust. `context_checkpoint(laser, topics)` captures a checkpoint without a conversation, and `ConversationState.load(laser, conversation, topics, init, fold)` folds one directly with the same bounds. Each read covers at most the newest `CONTEXT_READ_WINDOW` (10,000) messages per partition.
 
-`laser.sessions(stream=..., topics={"instruction": "support.turns"}, memory_namespace=..., context_turns=..., context_tokens=...)` configures the stream, topics, memory namespace, and context limits for sessions. Every turn kind needs a distinct topic.
+`ContextMessage` also carries `timestamp_micros`, the broker append time, and the numeric `stream_id` and `topic_id`. `LastN`, `TokenBudget`, `RoleFilter`, and `Chain` report `name`, `version`, and `selection(history)`, which a context manifest records. A custom policy can set `name` and `version` attributes. Every SDK estimates tokens the same way: the byte count divided by four, rounded up.
 
 ## Memory and state
 
@@ -719,40 +786,45 @@ Reach an agent as an A2A task source or an MCP tool server, and render a convers
 ```python
 from laser_sdk import A2aBridge, McpBridge
 
-# A2A: submit a task, poll for the result.
-a2a = A2aBridge(laser, "a2a-gateway", "agent.commands", "agent.responses")
-task = await a2a.submit({"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}})
+# A2A: submit a task to the "assistant" agent, poll for the result.
+a2a = A2aBridge(laser, "a2a-gateway", "agent.sessions", "agent.sessions")
+task = await a2a.submit(
+    {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}},
+    target="assistant",
+)
 status = await a2a.task(task["id"])
 
 # MCP: advertise tools, route tools/call to the agent.
 mcp = McpBridge(
     laser,
     "mcp-gateway",
-    "agent.tool_calls",
-    "agent.tool_results",
+    "agent.sessions",
+    "agent.sessions",
     "laser-mcp",
     tools=[{"name": "ask", "input_schema": {"type": "object"}}],
 )
 tools = mcp.list_tools()
-result = await mcp.call_tool("ask", {"q": "what is AGDX?"})
+result = await mcp.call_tool("ask", {"q": "what is AGDX?"}, target="assistant")
 
 
 # An agent answers a bridge request from its handler:
 async def handle(ctx, message):
-    await ctx.respond_input("agent.responses", b"the answer")
+    await ctx.respond_input("agent.sessions", b"the answer")
 
 
 # AG-UI: snapshot + deltas reconstruct shared state off the log.
-await laser.publish_state_snapshot("agent.llm_io", "ui", conversation_id, {"count": 1})
-state = await laser.reconstruct_state(conversation_id, "agent.llm_io")
-events = await laser.agui_events(conversation_id, "agent.llm_io")
+await laser.publish_state_snapshot("ui", conversation_id, {"count": 1})
+state = await laser.reconstruct_state(conversation_id)
+events = await laser.agui_events(conversation_id, "agent.sessions")
 ```
+
+`target` addresses a bridge call to one agent. Without it every agent listening on a shared session topic receives the call. The JSON-RPC `handle_rpc` path sends unaddressed.
 
 Host the actual HTTP endpoint with your Python web framework over these adapter methods.
 
 ## Errors
 
-Every failure raises a subclass of `LaserError`. The classes are `ConfigError` (with `NoStreamError`, `NoRespondTopicError`, and `HandlerConfigError` below it), `HandlerError`, `RejectedError`, `TimeoutError`, `AmbiguousMutationError`, `StateStoreError`, `QueryError`, `KvError`, `ForkError`, `GraphError`, `AgentError`, `AuthzError`, `CheckpointError`, `FilterError` (with `FilterFaultError`, `FilterOversizedRecordError`, and `ConsumerGroupSetupError`), `SignatureError`, `UnsupportedError`, `InvalidError` (with `IntentError`, `ValidateError`, and `IdError`), `CodecError` (with `TypedDecodeError`), `ProtocolError`, `TransportError`, `PublishFailedError`, `IntegrityError`, `PolicyBlockedError`, `StepUpRequiredError`, `PolicyDeferredError`, `RoutingError` (with `NoCapableAgentError`, `NoInboxError`, and `RoutePrincipalMismatchError`), `PresenceConflictError`, `FenceViolationError`, `BudgetExceededError`, `CancelledError`, `QuarantinedError`, and `ProvenanceError`. Each instance carries `code`, `retryable`, `iggy_error_code`, `filter_reason`, `unavailable`, `unsupported`, `not_found`, `version_skew`, `version_conflict`, `ambiguous_mutation`, `stale`, `permission_denied`, `stream_or_topic_not_found`, `no_capable_agent`, `lease_lost`, `fence_violation`, `budget_exceeded`, `quarantined`, and `not_leader` attributes so you can branch without matching on the type. `IntentError`, `ValidateError`, `IdError`, and `ProvenanceError` add a `kind` with class constants such as `IdError.INVALID_ULID`. A publish that gives up raises `PublishFailedError`, whose `committed` and `unconfirmed` report what it left. A handler rejection raises `RejectedError`. `TimeoutError` also subclasses the builtin `TimeoutError`, `InvalidError` also subclasses `ValueError`, and `CancelledError` also subclasses `asyncio.CancelledError`, so stdlib-style `except TimeoutError` and `except asyncio.CancelledError` catch them too.
+Every failure raises a subclass of `LaserError`. The classes are `ConfigError` (with `NoStreamError`, `NoRespondTopicError`, and `HandlerConfigError` below it), `HandlerError`, `RejectedError`, `TimeoutError`, `AmbiguousMutationError`, `StateStoreError`, `QueryError`, `KvError`, `ForkError`, `GraphError`, `AuthzError`, `CheckpointError`, `FilterError` (with `FilterFaultError`, `FilterOversizedRecordError`, and `ConsumerGroupSetupError`), `SignatureError`, `UnsupportedError`, `InvalidError` (with `IntentError`, `ValidateError`, and `IdError`), `CodecError` (with `TypedDecodeError`), `ProtocolError`, `TransportError`, `PublishFailedError`, `IntegrityError`, `PolicyBlockedError`, `StepUpRequiredError`, `PolicyDeferredError`, `RoutingError` (with `NoCapableAgentError`, `NoInboxError`, and `RoutePrincipalMismatchError`), `PresenceConflictError`, `FenceViolationError`, `BudgetExceededError`, `CancelledError`, `QuarantinedError`, and `ProvenanceError`. Each instance carries `code`, `retryable`, `iggy_error_code`, `filter_reason`, `unavailable`, `unsupported`, `not_found`, `version_skew`, `version_conflict`, `ambiguous_mutation`, `stale`, `permission_denied`, `stream_or_topic_not_found`, `no_capable_agent`, `lease_lost`, `fence_violation`, `budget_exceeded`, `quarantined`, and `not_leader` attributes so you can branch without matching on the type. `IntentError`, `ValidateError`, `IdError`, and `ProvenanceError` add a `kind` with class constants such as `IdError.INVALID_ULID`. A publish that gives up raises `PublishFailedError`, whose `committed` and `unconfirmed` report what it left. A handler rejection raises `RejectedError`. `TimeoutError` also subclasses the builtin `TimeoutError`, `InvalidError` also subclasses `ValueError`, and `CancelledError` also subclasses `asyncio.CancelledError`, so stdlib-style `except TimeoutError` and `except asyncio.CancelledError` catch them too.
 
 ## Reading
 
@@ -762,9 +834,13 @@ Use `async for message in laser.stream("fleet").topic("events").replay()` to rea
 
 Use `async with await Laser.connect(conn) as laser:` to manage a connection. The shared connection closes when its last handle is dropped. `with_default_stream` and `with_ops_stream` return handles that share that connection. `await laser.close()` ends the shared connection for every handle.
 
-## 0.6.0 additions
+## Resource names
 
-0.6.0 also changes existing Python behavior. Middleware `after_handle` and the `dead_letter` callback receive new arguments, consumers default to `commit_interval_ms=0`, `contract` waits 30 seconds by default, and `Capabilities` drops `sessions` and `durable_dedup`. The [client behavior guide](../../docs/client-behavior.md) lists every change with its replacement. These additions match the Rust and TypeScript surfaces:
+A `Laser` with a default stream scopes every managed name to that stream, `stream:<stream>/<name>`: KV and memory namespaces, leases and fences, the key registry, graph names, projection and index ids, query indexes, fork ids, and the watch index filter. Listings return local names, and schema calls carry the stream. `laser.resource_name(name)`, `Kv.resource_namespace`, and `ForkHandle.resource_id` show the scoped name. `Laser.connect(..., resource_naming="bare")` or `laser.with_resource_naming("bare")` sends every name as written. `Capabilities.stream_tenancy` reports a deployment that enforces the scoping, and `ConsumerFilter.with_schema_stream(stream)` names a filter's schema registry.
+
+## More APIs
+
+These calls match the Rust and TypeScript surfaces:
 
 - `Topic.producer(background=True)` buffers sends through Iggy's background mode with its defaults, and `background=BackgroundConfig(...)` sets shards, flush limits, the failure mode, and an `error_callback`. `await producer.shutdown()` waits for sends in flight, flushes, and closes.
 - `Topic.cbor(cls)` and `await Topic.schema(schema_id, cls)` add typed topics. `PublishRequest.claim_check(store, threshold_bytes)` stores large bodies by reference.
@@ -817,7 +893,7 @@ Custom route policies accept `None`, a built-in word, or a synchronous callable 
 
 Portable native helpers include `encode_snapshot`, `decode_snapshot`, `resume_offsets`, and `fuse_reciprocal_rank`. Snapshot bytes match the Rust fixture. Pure request conversions preserve the original bytes through `command_from_message_send` and `tool_call_from_request`. Their outbound counterparts are `task_from_envelope` and `tool_result_from_envelope`. Card and delegation helpers are `sign_card_value`, `verify_card`, and `verify_delegation`. `check_in` and `resolve_body` share claim-check thresholds and digest checks with publication and consumption.
 
-`SystemClock` and `TestClock` subclass `Clock`. `SystemClock().now_micros()` returns epoch microseconds. `TestClock(start_micros=0)` exposes `now_micros`, `set`, and `advance`. Inputs fit unsigned 64-bit values. Advancement wraps at the native limit.
+`SystemClock` and `TestClock` subclass `Clock`. `SystemClock().now_micros()` returns epoch microseconds. `TestClock(start_micros=0)` exposes `now_micros`, `set`, and `advance`. Inputs fit unsigned 64-bit values, and anything else raises `InvalidError`. Advancement wraps at the native limit.
 
 Both bridges expose `handle_rpc(request)`, an awaitable that returns a JSON-RPC response dict. It supports malformed-request errors without requiring an HTTP framework. `KvKeyRegistry.enroll(principal, verifying)` enrolls an agent key, and `enroll_record(record)` returns the lifecycle-aware record version.
 

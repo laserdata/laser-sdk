@@ -213,11 +213,15 @@ impl PyTopic {
     }
 
     /// Many raw payloads in one Iggy send, all sharing `partition_key` (or
-    /// balanced when `None`). An empty list is a cheap no-op.
+    /// balanced when `None`). An empty list is a cheap no-op. An item can also
+    /// be an `IggyMessage` from `PublishFailedError.unconfirmed`, which is
+    /// resent with its original message id and headers so the server
+    /// deduplicates it.
     #[pyo3(signature = (messages, *, partition_key=None))]
     fn batch<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "typing.Sequence[typing.Union[builtins.bytes, builtins.bytearray, builtins.str, IggyMessage]]", imports = ("typing", "builtins")))]
         messages: Vec<Bound<'_, PyAny>>,
         partition_key: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -225,6 +229,9 @@ impl PyTopic {
         let messages = messages
             .iter()
             .map(|payload| {
+                if let Ok(message) = payload.cast::<crate::errors::PyUnconfirmedMessage>() {
+                    return message.get().to_iggy_message();
+                }
                 let bytes = crate::convert::payload_bytes(payload)?;
                 iggy::prelude::IggyMessage::builder()
                     .payload(bytes.into())
@@ -249,7 +256,7 @@ impl PyTopic {
         &self,
         max_records: Option<usize>,
         max_bytes: Option<usize>,
-        linger_ms: Option<u64>,
+        linger_ms: Option<f64>,
         partition_key: Option<String>,
     ) -> PyResult<crate::batching::PyBatchingProducer> {
         let mut builder = self.handle().batching().map_err(to_pyerr)?;
@@ -260,7 +267,7 @@ impl PyTopic {
             builder = builder.max_bytes(n);
         }
         if let Some(ms) = linger_ms {
-            builder = builder.linger(Duration::from_millis(ms));
+            builder = builder.linger(crate::convert::duration_ms(ms, "linger_ms")?);
         }
         if let Some(key) = partition_key {
             builder = builder.partition_key(key);
@@ -281,13 +288,16 @@ impl PyTopic {
     /// (shards, sharding, flush limits, byte budget, in-flight writes,
     /// backpressure, error callback). `batch_length` and `linger_ms` apply to
     /// direct mode only. A send then returns once the record is queued, so call
-    /// `await producer.shutdown()` before exit.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, message_expiry="server_default", max_topic_size=0, background=None))]
+    /// `await producer.shutdown()` before exit. A topic this producer creates
+    /// takes `expire_after_ms` (milliseconds) or `never_expire=True`, else the
+    /// server default, and `max_topic_bytes` or `unlimited_topic_size=True`,
+    /// else the server default. Setting both of a pair raises `InvalidError`.
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,
         batch_length: u32,
-        linger_ms: u64,
+        linger_ms: f64,
         retries: Option<u32>,
         retry_interval_ms: Option<u64>,
         key: Option<&Bound<'_, PyAny>>,
@@ -295,10 +305,27 @@ impl PyTopic {
         create_stream: bool,
         create_topic: bool,
         partitions: u32,
-        message_expiry: &str,
-        max_topic_size: u64,
+        expire_after_ms: Option<f64>,
+        never_expire: bool,
+        max_topic_bytes: Option<u64>,
+        unlimited_topic_size: bool,
         background: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyProducer> {
+        let max_topic_size = match (max_topic_bytes, unlimited_topic_size) {
+            (Some(_), true) => {
+                return Err(InvalidError::new_err(
+                    "set max_topic_bytes or unlimited_topic_size, not both",
+                ));
+            }
+            (Some(0), false) => {
+                return Err(InvalidError::new_err(
+                    "max_topic_bytes must be greater than zero",
+                ));
+            }
+            (Some(bytes), false) => iggy::prelude::MaxTopicSize::from(bytes),
+            (None, true) => iggy::prelude::MaxTopicSize::Unlimited,
+            (None, false) => iggy::prelude::MaxTopicSize::ServerDefault,
+        };
         if batch_length == 0 {
             return Err(InvalidError::new_err(
                 "producer batch_length must be greater than zero",
@@ -319,16 +346,31 @@ impl PyTopic {
             .ok_or_else(|| to_pyerr(LaserError::NoStream))?;
         let settings = ProducerSettings {
             batch_length,
-            linger: Duration::from_millis(linger_ms),
+            linger: crate::convert::duration_ms(linger_ms, "linger_ms")?,
             retries,
             retry_interval: retry_interval_ms.map(Duration::from_millis),
             routing: routing(key, partition)?,
             create_stream,
             create_topic,
             partitions,
-            expiry: message_expiry
-                .parse::<IggyExpiry>()
-                .map_err(InvalidError::new_err)?,
+            expiry: match (expire_after_ms, never_expire) {
+                (Some(_), true) => {
+                    return Err(InvalidError::new_err(
+                        "set expire_after_ms or never_expire, not both",
+                    ));
+                }
+                (Some(ms), false) => {
+                    let age = crate::convert::duration_ms(ms, "expire_after_ms")?;
+                    if age.is_zero() {
+                        return Err(InvalidError::new_err(
+                            "expire_after_ms must be greater than zero",
+                        ));
+                    }
+                    IggyExpiry::ExpireDuration(age.into())
+                }
+                (None, true) => IggyExpiry::NeverExpire,
+                (None, false) => IggyExpiry::ServerDefault,
+            },
             max_topic_size,
             background: match background.filter(|value| !value.is_none()) {
                 None => None,

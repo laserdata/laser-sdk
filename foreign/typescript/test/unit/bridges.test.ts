@@ -1,5 +1,9 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { createAgdx } from "../../src/agent/agdx.js"
+import { AgentTopic } from "../../src/provenance/agent-topic.js"
+import { Sessions } from "../../src/session.js"
+import { decodeAgentEnvelope, type AgentEnvelope } from "../../src/wire/agent.js"
 import {
   A2A_JSONRPC_BINDING,
   A2A_PROTOCOL_VERSION,
@@ -14,7 +18,7 @@ import {
   type Task,
   type TaskStatus
 } from "../../src/bridges/a2a.js"
-import { applyJsonPatch, envelopesToAgUi } from "../../src/bridges/agui.js"
+import { applyJsonPatch, envelopeToAgUi, envelopesToAgUi } from "../../src/bridges/agui.js"
 import { authorizeEdge, edgeDenialChallenge, edgeDenialCode } from "../../src/bridges/edge-auth.js"
 import {
   MCP_APP_ERROR_CODE,
@@ -41,10 +45,14 @@ import {
   INTERNAL_VERIFIER
 } from "../../src/client/internals.js"
 import type { Laser } from "../../src/client/laser.js"
-import type { LaserTransport, PolledMessage } from "../../src/iggy/apache-iggy.js"
+import type {
+  LaserTransport,
+  MessageWithHeaders,
+  PolledMessage
+} from "../../src/iggy/apache-iggy.js"
 import { KeyRegistry, SigningKey, verifyCard } from "../../src/signing.js"
 import { AgentId, ConversationId as TaskConversationId } from "../../src/types/ids.js"
-import { encodeNamed } from "../../src/wire/cbor.js"
+import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import { AGENT_OP_VERSION } from "../../src/wire/codes.js"
 import { AGENT_VERSION, CONTENT_TYPE } from "../../src/wire/headers.js"
 import {
@@ -168,6 +176,23 @@ void test("given_task_and_reasoning_envelopes_when_rendered_then_should_emit_agu
   assert.deepEqual(
     envelopesToAgUi([submitted, chunk]).map((event) => event.type),
     ["RUN_STARTED", "REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT", "REASONING_MESSAGE_END"]
+  )
+})
+
+void test("given_failed_task_status_when_rendered_then_should_emit_run_error", () => {
+  const failed = withTaskState(
+    withCorrelation(
+      statusEnvelope(RecordId.fromU128(2n), conversation, source, OPERATION_TASK),
+      correlation
+    ),
+    { kind: "known", name: "Failed" }
+  )
+  assert.deepEqual(
+    envelopeToAgUi({
+      ...failed,
+      metadata: new Map([["detail", { kind: "str", value: "worker failed" }]])
+    }),
+    [{ type: "RUN_ERROR", message: "worker failed" }]
   )
 })
 
@@ -404,7 +429,7 @@ void test("given_an_mcp_tool_call_when_handled_then_should_spell_the_content_kin
   assert.deepEqual(failed, { jsonrpc: "2.0", id: "2", error })
 })
 
-void test("given_raw_json_bytes_or_a_value_when_calling_a_tool_then_should_send_the_same_json", async () => {
+void test("given_raw_json_bytes_text_or_a_value_when_calling_a_tool_then_should_send_the_same_json", async () => {
   const reply = responseEnvelope(
     RecordId.fromU128(1n),
     conversation,
@@ -416,10 +441,160 @@ void test("given_raw_json_bytes_or_a_value_when_calling_a_tool_then_should_send_
   const bridge = mcpOver(reply, bodies)
   const raw = '{"q" : "agdx"}'
   await bridge.callTool("search", new TextEncoder().encode(raw))
+  await bridge.callTool("search", raw)
   const result = await bridge.callTool("search", { q: "agdx" })
   assert.deepEqual(result.content, [{ kind: "text", text: "called" }])
   assert.deepEqual(
     bodies.map((body) => new TextDecoder().decode(body)),
-    [raw, '{"q":"agdx"}']
+    [raw, raw, '{"q":"agdx"}']
   )
+})
+
+void test("given_a_parent_session_when_an_a2a_task_is_submitted_in_it_then_should_start_a_child_before_the_command", async () => {
+  const sent: AgentEnvelope[] = []
+  const transport = {
+    sendMessagesWithHeaders(
+      _stream: string,
+      _topic: string,
+      messages: readonly MessageWithHeaders[]
+    ) {
+      for (const message of messages) {
+        sent.push(
+          decodeAgentEnvelope(expectMap(decodeOne(message.payload, "sent"), "sent"), "sent")
+        )
+      }
+      return Promise.resolve({ confirmations: [] })
+    }
+  } as unknown as LaserTransport
+  const laser = {
+    defaultStream: "agents",
+    capabilities: () => Promise.resolve({ sessions: false }),
+    [INTERNAL_TRANSPORT]: () => ({
+      findSnapshotStream: () => Promise.resolve({ id: 0, createdAtMicros: 1n }),
+      findSnapshotTopic: () => Promise.resolve({ id: 0, createdAtMicros: 2n, partitions: 4 })
+    }),
+    agdx: (topic: string, source: AgentId, conversation: TaskConversationId) =>
+      createAgdx(transport, "agents", topic, source, conversation),
+    sessions: (): Sessions => Sessions.create(laser)
+  } as unknown as Laser
+  const bridge = new A2aBridge(
+    laser,
+    AgentId.new("bridge"),
+    AgentTopic.Sessions,
+    AgentTopic.Sessions
+  )
+  const parent = TaskConversationId.new()
+  const root = TaskConversationId.new()
+  const task = await bridge.submitIn(parent, root, { message: { text: "hi" } })
+  assert.equal(sent.length, 2)
+  const [start, command] = sent
+  assert.ok(start !== undefined && command !== undefined)
+  assert.equal(start.operation, "session")
+  assert.deepEqual(start.taskState, { kind: "known", name: "Submitted" })
+  assert.equal(command.kind, AgentKind.Command)
+  for (const envelope of [start, command]) {
+    assert.equal(envelope.conversation.toString(), task.id)
+    assert.equal(envelope.parent?.toString(), parent.toString())
+    assert.equal(envelope.root?.toString(), root.toString())
+  }
+})
+
+function capturingLaser(sent: AgentEnvelope[], reply?: AgentEnvelope): Laser {
+  const transport = {
+    sendMessagesWithHeaders(
+      _stream: string,
+      _topic: string,
+      messages: readonly MessageWithHeaders[]
+    ) {
+      for (const message of messages) {
+        sent.push(
+          decodeAgentEnvelope(expectMap(decodeOne(message.payload, "sent"), "sent"), "sent")
+        )
+      }
+      return Promise.resolve({ confirmations: [] })
+    }
+  } as unknown as LaserTransport
+  const hub = {
+    subscribeStream: () => ({
+      next: () => Promise.resolve({ envelope: reply }),
+      cancel: () => undefined
+    })
+  }
+  const laser = {
+    defaultStream: "agents",
+    capabilities: () => Promise.resolve({ sessions: false }),
+    [INTERNAL_TRANSPORT]: () => ({
+      findSnapshotStream: () => Promise.resolve({ id: 0, createdAtMicros: 1n }),
+      findSnapshotTopic: () => Promise.resolve({ id: 0, createdAtMicros: 2n, partitions: 4 })
+    }),
+    agdx: (topic: string, source: AgentId, conversation: TaskConversationId) =>
+      createAgdx(transport, "agents", topic, source, conversation),
+    sessions: (): Sessions => Sessions.create(laser),
+    [INTERNAL_REPLY_HUB]: () => Promise.resolve(hub)
+  } as unknown as Laser
+  return laser
+}
+
+function commandTargets(sent: readonly AgentEnvelope[]): (string | undefined)[] {
+  return sent
+    .filter((envelope) => envelope.kind === AgentKind.Command)
+    .map((envelope) => envelope.target)
+}
+
+void test("given_a_target_when_an_a2a_task_is_submitted_then_should_address_the_command_to_that_agent", async () => {
+  const sent: AgentEnvelope[] = []
+  const bridge = new A2aBridge(
+    capturingLaser(sent),
+    AgentId.new("bridge"),
+    AgentTopic.Sessions,
+    AgentTopic.Sessions
+  )
+  const parent = TaskConversationId.new()
+  await bridge.submit({ message: { text: "hi" } }, { target: AgentId.new("beta") })
+  await bridge.submitIn(
+    parent,
+    parent,
+    { message: { text: "hi" } },
+    { target: AgentId.new("alpha") }
+  )
+  await bridge.submit({ message: { text: "hi" } })
+  assert.deepEqual(commandTargets(sent), ["beta", "alpha", undefined])
+})
+
+void test("given_a_target_when_an_mcp_tool_is_called_then_should_address_the_command_to_that_agent", async () => {
+  const sent: AgentEnvelope[] = []
+  const reply = responseEnvelope(
+    RecordId.fromU128(1n),
+    conversation,
+    source,
+    correlation,
+    new TextEncoder().encode("called")
+  )
+  const bridge = new McpBridge(
+    capturingLaser(sent, reply),
+    AgentId.new("mcp"),
+    AgentTopic.Sessions,
+    AgentTopic.Sessions,
+    "tools"
+  )
+  const parent = TaskConversationId.new()
+  await bridge.callTool("search", { q: "x" }, { target: AgentId.new("beta") })
+  await bridge.callToolIn(parent, parent, "search", { q: "y" }, { target: AgentId.new("alpha") })
+  await bridge.callTool("search", { q: "z" })
+  assert.deepEqual(commandTargets(sent), ["beta", "alpha", undefined])
+})
+
+void test("given_a_tool_schema_that_is_not_a_json_object_when_registered_then_should_refuse_it", () => {
+  const reply = responseEnvelope(
+    RecordId.fromU128(1n),
+    conversation,
+    source,
+    correlation,
+    new Uint8Array()
+  )
+  const bridge = mcpOver(reply)
+  for (const schema of [undefined, null, "object", 1, []]) {
+    assert.throws(() => bridge.withTool("search", undefined, schema), InvalidError)
+  }
+  bridge.withTool("search", undefined, { type: "object" })
 })

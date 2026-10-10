@@ -265,6 +265,133 @@ export function newQuery(
   }
 }
 
+/**
+ * Builds a `Query` field for field, like Rust `Query::builder()`. `executionId`,
+ * `target`, and `deadlineMicros` are required. Every other field starts at the
+ * `newQuery` default, and passing `undefined` to an optional field clears it.
+ */
+export class QueryBuilder {
+  private executionIdValue: QueryExecutionId | undefined
+  private targetValue: QueryTarget | undefined
+  private deadlineMicrosValue: bigint | undefined
+  private fields: QueryBuilderFields = {
+    byKey: [],
+    order: [],
+    page: { limit: 50, offset: 0n, wantTotal: false },
+    distinct: false,
+    select: { fields: [], payload: false },
+    consistency: "eventual"
+  }
+
+  executionId(executionId: QueryExecutionId): this {
+    this.executionIdValue = executionId
+    return this
+  }
+
+  target(target: QueryTarget): this {
+    this.targetValue = target
+    return this
+  }
+
+  /** The absolute Unix deadline in microseconds. */
+  deadlineMicros(deadlineMicros: bigint): this {
+    this.deadlineMicrosValue = deadlineMicros
+    return this
+  }
+
+  byKey(byKey: readonly KeyMatch[]): this {
+    return this.with({ byKey })
+  }
+
+  messageType(messageType: string | undefined): this {
+    return this.with({ messageType })
+  }
+
+  /** The `[start, end]` range in epoch microseconds, both bounds inclusive. */
+  timeRange(timeRange: readonly [bigint, bigint] | undefined): this {
+    return this.with({ timeRange })
+  }
+
+  filter(filter: Filter | undefined): this {
+    return this.with({ filter })
+  }
+
+  vector(vector: VectorQuery | undefined): this {
+    return this.with({ vector })
+  }
+
+  text(text: TextQuery | undefined): this {
+    return this.with({ text })
+  }
+
+  order(order: readonly Sort[]): this {
+    return this.with({ order })
+  }
+
+  page(page: QueryPageRequest): this {
+    return this.with({ page })
+  }
+
+  aggregate(aggregate: Aggregate | undefined): this {
+    return this.with({ aggregate })
+  }
+
+  having(having: Filter | undefined): this {
+    return this.with({ having })
+  }
+
+  distinct(distinct: boolean): this {
+    return this.with({ distinct })
+  }
+
+  select(select: Select): this {
+    return this.with({ select })
+  }
+
+  /** The fork whose view to read, or `undefined` for the trunk. */
+  fork(fork: string | undefined): this {
+    return this.with({ fork })
+  }
+
+  rawSql(rawSql: RawSql | undefined): this {
+    return this.with({ rawSql })
+  }
+
+  consistency(consistency: Consistency): this {
+    return this.with({ consistency })
+  }
+
+  /** The query. Throws `InvalidError` when a required field is unset. */
+  build(): Query {
+    if (this.executionIdValue === undefined) throw missingQueryField("executionId")
+    if (this.targetValue === undefined) throw missingQueryField("target")
+    if (this.deadlineMicrosValue === undefined) throw missingQueryField("deadlineMicros")
+    const query: Record<string, unknown> = {
+      executionId: this.executionIdValue,
+      target: this.targetValue,
+      deadlineMicros: this.deadlineMicrosValue
+    }
+    for (const [name, value] of Object.entries(this.fields)) {
+      if (value !== undefined) query[name] = value
+    }
+    return query as unknown as Query
+  }
+
+  private with(fields: QueryBuilderFields): this {
+    this.fields = { ...this.fields, ...fields }
+    return this
+  }
+}
+
+type QueryBuilderFields = {
+  readonly [K in Exclude<keyof Query, "executionId" | "target" | "deadlineMicros">]?:
+    Query[K] | undefined
+}
+
+function missingQueryField(name: string): InvalidError {
+  return new InvalidError(`query builder requires ${name}`)
+}
+
 export function operationalQuery(
   executionId: QueryExecutionId,
   index: string,
@@ -653,7 +780,9 @@ export function validateQuery(query: Query): void {
   }
   if (query.messageType !== undefined) validateName(query.messageType)
   if (query.timeRange !== undefined && query.timeRange[0] >= query.timeRange[1])
-    throw new InvalidError("query time range must be a nonempty half-open interval")
+    throw new InvalidError(
+      "query time range start must be before its end, and both bounds are inclusive"
+    )
   for (const sort of query.order) validateName(sort.field)
   for (const field of query.select.fields) validateName(field)
   if (query.text !== undefined) {

@@ -149,7 +149,7 @@ if (external !== undefined) {
     server = spawn(binary, [], {
       env: {
         ...process.env,
-        IGGY_PATH: directory,
+        IGGY_PATH: join(directory, "data"),
         IGGY_TCP_ADDRESS: `127.0.0.1:${String(port)}`,
         IGGY_HTTP_ENABLED: "false",
         IGGY_QUIC_ENABLED: "false",

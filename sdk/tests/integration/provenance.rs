@@ -16,14 +16,14 @@ async fn given_a_message_with_provenance_when_read_back_from_iggy_then_should_pr
         .build();
 
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"hello"), &sent)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"hello"), &sent)
         .await
         .expect("the command should be sent");
 
     let messages = harness::eventually(|| async {
         let messages = ContextAssembler::builder()
             .conversation_id(conversation)
-            .topics(vec![AgentTopic::Commands])
+            .topics(vec![AgentTopic::Sessions])
             .build()
             .assemble(&laser)
             .await

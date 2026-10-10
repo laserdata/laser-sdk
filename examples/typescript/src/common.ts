@@ -6,7 +6,8 @@ import {
   type GraphNode,
   type MemoryItem,
   type Projection,
-  type ProjectionBinding
+  type ProjectionBinding,
+  TopicRetention
 } from "@laserdata/laser-sdk"
 
 // The deployment features an example can require before it runs.
@@ -20,7 +21,6 @@ export type ExampleFeature =
   | "kvFencedLeases"
   | "graph"
   | "forks"
-  | "agentWorkflow"
   | "watch"
   | "authz"
   | "filters"
@@ -30,6 +30,8 @@ export const LOCAL_CONNECTION_STRING = "iggy:iggy@127.0.0.1:8090"
 export const DEFAULT_PORT = 8090
 export const DEFAULT_STREAM = "laser"
 export const PARTITIONS = 4
+/** How long `agent.sessions` keeps records in the examples: one day. */
+export const SESSION_RETENTION = TopicRetention.expireAfter(86_400_000)
 
 export class AsyncResourceGroup implements AsyncDisposable {
   private readonly resources: AsyncDisposable[] = []
@@ -96,15 +98,33 @@ export function resolveConnectionString(env: NodeJS.ProcessEnv = process.env): s
   return normalizeTarget(`iggy+tcp://${resolveCredentials(env)}${server}`, env)
 }
 
+/** The example's own stream. `connectExample` always sets it as the default. */
+export function exampleStream(laser: Laser): string {
+  const stream = laser.defaultStream
+  if (stream === undefined) throw new Error("the example client has no default stream")
+  return stream
+}
+
+/**
+ * Opens another connection on the example's stream without resetting it, for
+ * a run that gives each agent its own connection.
+ */
+export async function connectAgain(
+  example: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<Laser> {
+  return Laser.builder()
+    .connectionString(resolveConnectionString(env))
+    .stream(streamFor(example, env))
+    .connect()
+}
+
 export async function connectExample(
   example: string,
   env: NodeJS.ProcessEnv = process.env
 ): Promise<Laser> {
   const stream = streamFor(example, env)
-  const laser = await Laser.builder()
-    .connectionString(resolveConnectionString(env))
-    .stream(stream)
-    .connect()
+  const laser = await connectAgain(example, env)
   try {
     await resetStream(laser, example, env)
     await laser.stream(stream).ensure()
@@ -306,7 +326,7 @@ export async function ensureView(
     inlinePayloadDefault: false
   }
   const binding: ProjectionBinding = {
-    source: { stream: laser.defaultStream ?? "", topic },
+    source: { stream: exampleStream(laser), topic },
     allowedProjections: [id],
     defaultProjection: id,
     index,
@@ -507,8 +527,6 @@ function surfaceAvailable(capabilities: Capabilities, feature: ExampleFeature): 
       return capabilities.graph
     case "forks":
       return capabilities.forks
-    case "agentWorkflow":
-      return capabilities.agentWorkflow
     case "watch":
       return capabilities.watch
     case "authz":

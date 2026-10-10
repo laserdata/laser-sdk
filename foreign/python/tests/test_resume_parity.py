@@ -65,13 +65,16 @@ def test_given_content_and_kind_when_reading_memory_helpers_then_should_match_th
     )
     assert ls.memory_id_content("procedure", b"x", user="alice") == "3E6HJGHKFDBMQ91TCJEHV28X40"
     assert ls.memory_kind_class("fact") == "semantic"
-    assert ls.Sessions.turn_kind(ls.Sessions.turn_topic("instruction")) == "instruction"
+    assert ls.derive_session_id("agents", "", "x") != ls.derive_session_id("agents", "ns", "x")
 
 
 @pytest.mark.integration
 async def test_given_a_schema_handle_when_publishing_then_should_share_its_cached_codec(laser):
     if not (await laser.capabilities()).managed:
         pytest.skip("schema registration requires a managed backend")
+    # Schema registration is scoped to the default stream, which must exist
+    # before the managed plane authorizes it.
+    await laser.stream(laser.default_stream).ensure()
     source = {
         "kind": "avro",
         "schema": json.dumps(
@@ -179,9 +182,10 @@ async def test_given_custom_memory_when_scope_and_query_are_set_then_should_pass
 async def test_given_context_history_when_bounded_then_should_honor_children_offsets_and_policies(
     laser,
 ):
-    await laser.bootstrap(1)
-    parent = ls.Provenance(agent="planner")
-    child = laser.spawn_subconversation(parent)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
+    parent = ls.Provenance(agent="upstream")
+    child = laser.spawn_subconversation(parent, "planner")
+    assert child.agent == "planner"
     await laser.send_agent("agent.audit", b"parent", parent)
     await laser.send_agent("agent.audit", b"child", child)
     checkpoint = await laser.context(parent.conversation_id).checkpoint(["agent.audit"])
@@ -211,7 +215,7 @@ async def test_given_context_history_when_bounded_then_should_honor_children_off
             return messages[-1:]
 
     assert await read(policy=TailPolicy()) == [b"tail"]
-    assert await read(roles=["planner"], last_n=1) == [b"tail"]
+    assert await read(roles=["upstream"], last_n=1) == [b"tail"]
     with pytest.raises(ls.InvalidError, match="policy cannot be combined"):
         await read(policy=ls.LastN(1), last_n=2)
 
@@ -258,7 +262,7 @@ async def test_given_a_failing_custom_policy_when_assembling_then_should_raise_i
 async def test_given_an_unscoped_consumer_when_records_arrive_then_should_handle_without_identity(
     laser,
 ):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     handled = []
     delivered = asyncio.Event()
 
@@ -267,15 +271,15 @@ async def test_given_an_unscoped_consumer_when_records_arrive_then_should_handle
         delivered.set()
 
     with pytest.raises(ls.InvalidError, match="requires consumer_group"):
-        laser.spawn_agent(None, "agent.commands", handle)
+        laser.spawn_agent(None, "agent.sessions", handle)
     with pytest.raises(ls.InvalidError, match="requires an agent identity"):
         laser.spawn_agent(
-            None, "agent.commands", handle, consumer_group="unscoped", capabilities=["diagnose"]
+            None, "agent.sessions", handle, consumer_group="unscoped", capabilities=["diagnose"]
         )
-    consumer = laser.spawn_agent(None, "agent.commands", handle, consumer_group="unscoped")
+    consumer = laser.spawn_agent(None, "agent.sessions", handle, consumer_group="unscoped")
     try:
         await consumer.ready()
-        await laser.send_agent("agent.commands", b"record", ls.Provenance())
+        await laser.send_agent("agent.sessions", b"record", ls.Provenance())
         await asyncio.wait_for(delivered.wait(), 2)
         assert handled == [b"record"]
     finally:
@@ -308,7 +312,7 @@ async def test_given_an_arrow_record_when_a_fingerprint_is_set_then_should_stamp
         "fingerprint-reader", polling="first", auto_commit="disabled", allow_replay=True
     )
     try:
-        message = await consumer.next_within(2)
+        message = await consumer.next_within(2_000)
         assert message.payload == b"raw payload"
         assert message.headers["agdx.sfp"] == fingerprint
         assert message.headers["agdx.ct"] == 7
@@ -355,7 +359,7 @@ async def test_given_an_active_embedder_when_the_call_is_cancelled_then_should_s
 @pytest.mark.integration
 @pytest.mark.parametrize("stop", ["abort", "shutdown"])
 async def test_given_an_active_handler_when_stopped_then_should_cancel_its_callback(laser, stop):
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, retention=ls.TopicRetention.expire_after(86_400_000))
     active = asyncio.Event()
     stopped = asyncio.Event()
     effects = []
@@ -368,10 +372,10 @@ async def test_given_an_active_handler_when_stopped_then_should_cancel_its_callb
         finally:
             stopped.set()
 
-    agent = laser.spawn_agent("cancellable-worker", "agent.commands", handle, shutdown_grace_ms=5)
+    agent = laser.spawn_agent("cancellable-worker", "agent.sessions", handle, shutdown_grace_ms=5)
     try:
         await agent.ready()
-        await laser.send_agent("agent.commands", b"record", ls.Provenance())
+        await laser.send_agent("agent.sessions", b"record", ls.Provenance())
         await asyncio.wait_for(active.wait(), 2)
         if stop == "abort":
             agent.abort()

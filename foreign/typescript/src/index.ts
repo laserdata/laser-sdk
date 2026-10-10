@@ -22,8 +22,8 @@ export {
   FilterExecutionError,
   FilterFaultError,
   FilterOversizedRecordError,
-  AgentWorkflowExecutionError,
   GraphExecutionError,
+  SessionError,
   RejectedError,
   PresenceConflictError,
   HandlerError,
@@ -101,7 +101,7 @@ export {
   verifyDelegation
 } from "./signing.js"
 export type { AgentCardSignature, VerifiedPrincipal } from "./signing.js"
-export { checkIn, resolveBody } from "./blob.js"
+export { agentMessageResolveBody, checkIn, resolveBody } from "./blob.js"
 export type { BlobStore } from "./blob.js"
 export { Laser, LaserBuilder } from "./client/laser.js"
 export type { SendMessagesConfirmation, SendMessagesResponse } from "./iggy/apache-iggy.js"
@@ -119,8 +119,31 @@ export {
 } from "./client/capabilities.js"
 export { QueryRequest } from "./managed/query.js"
 export { Destinations } from "./managed/destinations.js"
-export type { QueryResult, Row, Filter, Consistency, QueryTarget } from "./wire/query.js"
-export { filterAll, filterAny, filterNegate, filterPred, queryResultValue } from "./wire/query.js"
+export type {
+  Aggregate,
+  CmpOp,
+  Consistency,
+  Dir,
+  Filter,
+  KeyMatch,
+  QueryPageRequest,
+  QueryResult,
+  QueryTarget,
+  RawSql,
+  Row,
+  Select,
+  Sort,
+  TextQuery,
+  VectorQuery
+} from "./wire/query.js"
+export {
+  QueryBuilder,
+  filterAll,
+  filterAny,
+  filterNegate,
+  filterPred,
+  queryResultValue
+} from "./wire/query.js"
 export { typedValueDiagnosticText } from "./wire/schema.js"
 export type {
   CheckpointMutationResult,
@@ -275,7 +298,8 @@ export type {
   AuthzHistoryReply,
   AuthzEvent,
   AuthzEventKind,
-  AuthzError
+  AuthzError,
+  Feature
 } from "./wire/authz.js"
 export {
   delegatedAllow,
@@ -286,13 +310,17 @@ export {
   resourcePatternPrefix,
   resourcePatternMatches
 } from "./wire/authz.js"
-export { Runs, RunListRequest } from "./managed/runs.js"
-export type { AgentRunInfo, AgentRunState, RunPage } from "./wire/agent-workflow.js"
-export { agentRunStateIsTerminal } from "./wire/agent-workflow.js"
 export { Watch, WatchReader } from "./managed/watch.js"
 export type { ChangeRecord } from "./wire/change.js"
 export { GraphHandle } from "./managed/graph.js"
-export { EdgeId, graphNodeEntity, graphEdgeRelate, graphEdgeValidAt } from "./wire/graph.js"
+export {
+  EdgeId,
+  NodeId,
+  graphNodeEntity,
+  graphEdgeRelate,
+  graphEdgeValidAt,
+  graphEdgeWithSource
+} from "./wire/graph.js"
 export type { EdgeDir, GraphReturn, GraphNode, GraphEdge, GraphResult } from "./wire/graph.js"
 export { AgentTopic } from "./provenance/agent-topic.js"
 export {
@@ -318,24 +346,57 @@ export {
   TokenBudget,
   contextCheckpoint
 } from "./context.js"
-export type { ContextMessage, ContextPolicy } from "./context.js"
+export type { ContextMessage, ContextPolicy, Selection } from "./context.js"
 export { ContextScope, ScopedMemory } from "./context-scope.js"
 export {
   DEFAULT_SESSION_CONTEXT_TOKENS,
   DEFAULT_SESSION_CONTEXT_TURNS,
+  DEFAULT_SESSION_HEARTBEAT_MS,
+  DEFAULT_SESSION_IDLE_TIMEOUT_MS,
   DEFAULT_SESSION_MEMORY_NAMESPACE,
-  DEFAULT_SESSION_TOPICS,
   Session,
+  SessionBuilder,
   SessionConfig,
+  SessionControl,
   Sessions,
-  sessionTurnKind,
-  sessionTurnText,
-  sessionTurnTopic
+  SubmitBuilder,
+  TopicRetention,
+  deriveSessionId,
+  sessionTurnText
 } from "./session.js"
-export type { SessionTurn, SessionTurnKind } from "./session.js"
-export { ConversationState, resumeOffsets } from "./conversation-state.js"
+export type { SessionBootstrap, SessionLayout, SessionTurn, Submitted } from "./session.js"
+export type { SessionRef } from "./wire/ids.js"
+export type {
+  LinkSurface,
+  SessionEventsPage,
+  SessionInfo,
+  SessionLinksView,
+  SessionPage,
+  SessionStateView
+} from "./wire/session.js"
+export { SessionEventsRequest, SessionListRequest, SessionWatch } from "./session-reads.js"
+export type { SessionChange } from "./session-reads.js"
+export type { DisplayType } from "./wire/dispatch.js"
+export { SessionLease } from "./agent/lease.js"
+export type { PendingControl } from "./agent/control.js"
+export type { ParkedRecords } from "./agent/lane-scan.js"
+export {
+  AssembledContext,
+  ModelCall,
+  ModelRequest,
+  SessionState,
+  ToolCall,
+  defaultRedact
+} from "./session-ops.js"
+export type { ModelResponse } from "./session-ops.js"
+export {
+  ConversationState,
+  checkpointFromSnapshot,
+  resumeOffsets,
+  snapshotFromCheckpoint
+} from "./conversation-state.js"
 export type { ReplayBound } from "./conversation-state.js"
-export { FileStore, InMemoryStore } from "./state-store.js"
+export { FileStore, InMemoryStore, KvStore } from "./state-store.js"
 export type { StateStore } from "./state-store.js"
 export {
   DEFAULT_SNAPSHOT_NAMESPACE,
@@ -386,7 +447,7 @@ export { Agent, AgentBuilder, AgentHandle } from "./agent/builder.js"
 export { MemoryHandler } from "./agent/memory-handler.js"
 export { ContractBuilder, ScatterReport } from "./agent/contract.js"
 export type { Contract, ScatterOutcome } from "./agent/contract.js"
-export { Budget, StepHandle, WORKFLOW_FENCE_NAMESPACE, Workflow } from "./agent/workflow.js"
+export { StepHandle, WORKFLOW_FENCE_NAMESPACE, Workflow, WorkflowBudget } from "./agent/workflow.js"
 export type { OnTimeout, StepContext, StepFn, WorkflowOutcome, Verifier } from "./agent/workflow.js"
 export {
   A2A_JSONRPC_BINDING,
@@ -427,7 +488,7 @@ export { enterBridge } from "./bridges/hops.js"
 export { NOOP_OBSERVER } from "./observe.js"
 export type { LaserObserver, ObservationLevel, SpanScope } from "./observe.js"
 export { agentCtx, agentMessage } from "./testing.js"
-export type { ConsumerRef, ConsumptionStatus } from "./client/laser.js"
+export type { ConsumerRef, ConsumptionStatus, ResourceNaming } from "./client/laser.js"
 export { ChunkAssembler, FINISH_REASON_ABANDONED, FINISH_REASON_GAP } from "./agent/assembler.js"
 export type { StreamEvent } from "./agent/assembler.js"
 export {
@@ -471,8 +532,8 @@ export {
   DEFAULT_CHUNK_LINGER_MS,
   MAX_CHUNK_BODY_BYTES
 } from "./agent/agdx.js"
-export type { Agdx, AgdxSend, AgdxStream } from "./agent/agdx.js"
-export { RecordId, CorrelationId, ChannelId } from "./wire/ids.js"
+export type { Agdx, AgdxReceipt, AgdxSend, AgdxStream } from "./agent/agdx.js"
+export { RecordId, CorrelationId, ChannelId, QueryExecutionId } from "./wire/ids.js"
 export { ContentType } from "./wire/content.js"
 export {
   chunkEnvelope,
@@ -500,11 +561,14 @@ export {
 export type {
   AgentErrorBody,
   AgentErrorCode,
+  Budget,
   CapabilityDescriptor,
   IdempotencyKey,
+  SessionStatus,
   TaskState
 } from "./wire/agent.js"
 export { provenancePartitionKey } from "./provenance/provenance.js"
+export type { ProducerInfo } from "./wire/graph.js"
 export type { Provenance, LlmUsage } from "./provenance/provenance.js"
 export { HeaderValue } from "./stream/header-value.js"
 export { Record } from "./stream/record.js"
@@ -588,7 +652,7 @@ export {
   opVersionsHasFeature
 } from "./wire/hello.js"
 export type { LogPosition } from "./wire/ids.js"
-export { logPositionFromBytes, logPositionToBytes } from "./wire/ids.js"
+export { logPositionFromBytes, logPositionToBytes, newLogPosition } from "./wire/ids.js"
 export type { ResultCode } from "./wire/result.js"
 export type { SourceRef } from "./wire/graph.js"
 export type { GroupFilterSpec } from "./wire/filter.js"

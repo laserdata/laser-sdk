@@ -1,3 +1,4 @@
+import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { ForkExecutionError, InvalidError, ProtocolError } from "../client/errors.js"
 import { executeManaged, type ManagedTransport } from "../client/managed.js"
@@ -50,37 +51,54 @@ export class ForkHandle {
   private constructor(
     private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
-    readonly id: string
+    /** The fork id this handle sends, scoped by the connection's
+     * `ResourceNaming`. Pass it to `query(..).fork(..)` or any other request
+     * naming this fork. */
+    readonly resourceId: string,
+    private readonly scope: ResourceScope
   ) {}
+
+  /** The fork id this handle is bound to, as the caller named it. */
+  get id(): string {
+    return this.scope.local(this.resourceId) ?? this.resourceId
+  }
 
   /** @internal */
   static create(
     backend: ManagedTransport,
     getCapabilities: () => Promise<Capabilities>,
-    id: string
+    id: string,
+    scope: ResourceScope = BARE_SCOPE
   ): ForkHandle {
-    return new ForkHandle(backend, getCapabilities, id)
+    return new ForkHandle(backend, getCapabilities, scope.name(id), scope)
   }
 
   /** @internal */
   static async forks(
     backend: ManagedTransport,
-    getCapabilities: () => Promise<Capabilities>
+    getCapabilities: () => Promise<Capabilities>,
+    scope: ResourceScope = BARE_SCOPE
   ): Promise<readonly ForkInfo[]> {
     const capabilities = await getCapabilities()
-    return fetchForks(backend, capabilities)
+    return (await fetchForks(backend, capabilities)).flatMap((fork) => {
+      const id = scope.local(fork.forkId)
+      if (id === undefined) return []
+      const parent =
+        fork.parent === undefined ? undefined : (scope.local(fork.parent) ?? fork.parent)
+      return [{ ...fork, forkId: id, ...(parent !== undefined ? { parent } : {}) }]
+    })
   }
 
   /** Starts a fork creation request. */
   create(): ForkCreateRequest {
-    return ForkCreateRequest.create(this.backend, this.getCapabilities, this.id)
+    return ForkCreateRequest.create(this.backend, this.getCapabilities, this.resourceId, this.scope)
   }
 
   /** Applies speculative rows to the trunk and returns the applied row count. */
   async promote(): Promise<number> {
     const capabilities = await this.getCapabilities()
     const outcome = await executeFork(this.backend, capabilities, ForkPromoteCommand, {
-      forkId: this.id
+      forkId: this.resourceId
     })
     if (outcome.kind === "promoted") return outcome.rows
     throw unexpected("promote", outcome)
@@ -90,7 +108,7 @@ export class ForkHandle {
   async squash(): Promise<boolean> {
     const capabilities = await this.getCapabilities()
     const outcome = await executeFork(this.backend, capabilities, ForkDeleteCommand, {
-      forkId: this.id
+      forkId: this.resourceId
     })
     if (outcome.kind === "deleted") return outcome.removed
     throw unexpected("squash", outcome)
@@ -101,10 +119,11 @@ export class ForkHandle {
     return ForkPutRequest.create(
       this.backend,
       this.getCapabilities,
-      this.id,
-      table,
+      this.resourceId,
+      this.scope.name(table),
       partitionId,
-      offset
+      offset,
+      this.scope
     )
   }
 }
@@ -118,16 +137,18 @@ export class ForkCreateRequest {
   private constructor(
     private readonly backend: ManagedTransport,
     private readonly getCapabilities: () => Promise<Capabilities>,
-    private readonly forkId: string
+    private readonly forkId: string,
+    private readonly scope: ResourceScope
   ) {}
 
   /** @internal */
   static create(
     backend: ManagedTransport,
     getCapabilities: () => Promise<Capabilities>,
-    forkId: string
+    forkId: string,
+    scope: ResourceScope = BARE_SCOPE
   ): ForkCreateRequest {
-    return new ForkCreateRequest(backend, getCapabilities, forkId)
+    return new ForkCreateRequest(backend, getCapabilities, forkId, scope)
   }
 
   /** Creates a frozen snapshot at current trunk offsets. */
@@ -144,13 +165,13 @@ export class ForkCreateRequest {
 
   /** Records an audit parent without changing the trunk base. */
   parent(parent: string): this {
-    this.forkParent = parent
+    this.forkParent = this.scope.name(parent)
     return this
   }
 
   /** Restricts a severed snapshot to the supplied tables. */
   tables(tables: readonly string[]): this {
-    this.forkTables = tables
+    this.forkTables = tables.map((table) => this.scope.name(table))
     return this
   }
 
@@ -185,7 +206,8 @@ export class ForkPutRequest {
     private readonly forkId: string,
     private readonly table: string,
     private readonly partitionId: number,
-    private readonly offset: bigint
+    private readonly offset: bigint,
+    private readonly scope: ResourceScope
   ) {}
 
   /** @internal */
@@ -195,14 +217,15 @@ export class ForkPutRequest {
     forkId: string,
     table: string,
     partitionId: number,
-    offset: bigint
+    offset: bigint,
+    scope: ResourceScope = BARE_SCOPE
   ): ForkPutRequest {
-    return new ForkPutRequest(backend, getCapabilities, forkId, table, partitionId, offset)
+    return new ForkPutRequest(backend, getCapabilities, forkId, table, partitionId, offset, scope)
   }
 
   /** Sets the row projection identity. */
   projection(id: string, version: number): this {
-    this.forkProjectionId = id
+    this.forkProjectionId = this.scope.name(id)
     this.forkProjectionVersion = version
     return this
   }

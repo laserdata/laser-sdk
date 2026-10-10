@@ -1,6 +1,7 @@
 import { blake3 } from "@noble/hashes/blake3.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
 import { InvalidError } from "./client/errors.js"
+import { compareCodePoints } from "./runtime/compare.js"
 import { IntentId, type AgentId, type ConversationId } from "./types/ids.js"
 import { encodeNamed } from "./wire/cbor.js"
 
@@ -86,26 +87,20 @@ export class Intent {
   readonly deadlineMicros: bigint
   readonly atMicros: bigint
 
-  /** `intentId`, `digest` and `atMicros` restore a decoded intent. A new
-   * intent mints its id, hashes its body and stamps the current time. */
-  constructor(
-    options: IntentOptions & {
-      readonly intentId?: IntentId
-      readonly digest?: string
-      readonly atMicros?: bigint
-    }
-  ) {
-    this.intentId = options.intentId ?? IntentId.new()
+  /** Mints the intent id, hashes the body, and stamps the proposal time now,
+   * like Rust `Intent::new`. */
+  constructor(options: IntentOptions) {
+    this.intentId = IntentId.new()
     this.conversation = options.conversation
     this.proposer = options.proposer
     this.body = options.body.slice()
-    this.digest = options.digest ?? digestOf(this.body)
+    this.digest = digestOf(this.body)
     this.eligibleVoters = [...options.eligibleVoters]
     this.mandatoryVoters = [...(options.mandatoryVoters ?? [])]
     this.policy = options.policy
     this.policyVersion = options.policyVersion
     this.deadlineMicros = options.deadlineMicros
-    this.atMicros = options.atMicros ?? BigInt(Date.now()) * 1_000n
+    this.atMicros = BigInt(Date.now()) * 1_000n
     this.validate()
   }
 
@@ -146,12 +141,13 @@ export class Vote {
     readonly atMicros: bigint = BigInt(Date.now()) * 1_000n
   ) {}
 
-  static cast(intent: Intent, voter: AgentId, choice: VoteChoice, atMicros?: bigint): Vote {
+  /** A ballot for `intent` from an eligible `voter`, stamped now like Rust `Vote::cast`. */
+  static cast(intent: Intent, voter: AgentId, choice: VoteChoice): Vote {
     intent.validate()
     if (!intent.eligibleVoters.some((eligible) => eligible.equals(voter))) {
       throw IntentError.ineligibleVoter(voter.toString())
     }
-    return new Vote(intent.intentId, intent.digest, intent.policyVersion, voter, choice, atMicros)
+    return new Vote(intent.intentId, intent.digest, intent.policyVersion, voter, choice)
   }
 }
 
@@ -199,7 +195,7 @@ export function decide(
     )
     .toSorted(
       (left, right) =>
-        left.voter.asStr().localeCompare(right.voter.asStr()) ||
+        compareCodePoints(left.voter.asStr(), right.voter.asStr()) ||
         compareBigInt(left.atMicros, right.atMicros) ||
         choiceRank(left.choice) - choiceRank(right.choice)
     )

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import laser_sdk as ls
 from pytest_bdd import parsers, scenarios, then, when
 
 # The Background steps ("a running data platform", "a fresh stream") are shared
@@ -10,7 +11,11 @@ scenarios(str(SCENARIOS / "streaming.feature"))
 
 @when(parsers.parse("I bootstrap the stream with {partitions:d} partitions"))
 def bootstrap(world, partitions):
-    world.run(lambda: world.laser.bootstrap(partitions))
+    world.run(
+        lambda: world.laser.bootstrap(
+            partitions, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
+    )
 
 
 @then("the stream is ready")

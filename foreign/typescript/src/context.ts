@@ -1,10 +1,11 @@
 import { ConfigError, InvalidError } from "./client/errors.js"
+import { INTERNAL_TRANSPORT } from "./client/internals.js"
 import type { Laser } from "./client/laser.js"
-import { decodeAgentMessage } from "./agent/reliable-consumer.js"
+import { decodeAgentMessage } from "./agent/decode.js"
 import { AgentTopic } from "./provenance/agent-topic.js"
 import type { Provenance } from "./provenance/provenance.js"
 import type { AgentId, ConversationId, MessageId } from "./types/ids.js"
-import type { AgentEnvelope } from "./wire/agent.js"
+import { type AgentEnvelope, estimateTokens } from "./wire/agent.js"
 
 const READ_BATCH = 1_000
 
@@ -32,6 +33,12 @@ export interface ContextMessage {
   readonly envelope?: AgentEnvelope
   /** The name of the topic the message was read from. */
   readonly topic: string
+  /** The broker's append time in microseconds. */
+  readonly timestampMicros: bigint
+  /** The numeric id of the stream the message was read from. */
+  readonly streamId: number
+  /** The numeric id of the topic the message was read from. */
+  readonly topicId: number
 }
 
 /** A point in a conversation's log: the next offset each partition of each
@@ -42,6 +49,11 @@ export class Checkpoint {
   private constructor(
     private readonly perTopic: ReadonlyMap<string, ReadonlyMap<number, bigint>>
   ) {}
+
+  /** @internal */
+  static fromTopicOffsets(perTopic: ReadonlyMap<string, ReadonlyMap<number, bigint>>): Checkpoint {
+    return new Checkpoint(perTopic)
+  }
 
   /** @internal */
   static async capture(laser: Laser, topics: readonly string[]): Promise<Checkpoint> {
@@ -55,6 +67,11 @@ export class Checkpoint {
    * was not taken over that topic. */
   topicOffsets(topic: string): ReadonlyMap<number, bigint> | undefined {
     return this.perTopic.get(topic)
+  }
+
+  /** Every checkpointed topic with its partition offsets, by topic name. */
+  topics(): IterableIterator<[string, ReadonlyMap<number, bigint>]> {
+    return this.perTopic.entries()
   }
 
   isEmpty(): boolean {
@@ -115,23 +132,94 @@ export function contextCheckpoint(laser: Laser, topics: readonly string[]): Prom
   return Checkpoint.capture(laser, topics)
 }
 
+/** Selects which assembled messages feed an LLM call. `name`, `version`, and
+ * `selection` are optional: a policy without them reads as `custom`, version
+ * `1`, with the selection derived from `select`. */
 export interface ContextPolicy {
   select(history: readonly ContextMessage[]): readonly ContextMessage[]
+  /** The policy name a context manifest records. */
+  name?(): string
+  /** The policy version a context manifest records. */
+  version?(): string
+  /** The kept and dropped records of one selection, and why. */
+  selection?(history: readonly ContextMessage[]): Selection
 }
 
+/** What a `ContextPolicy` kept and dropped, and the policy that decided. */
+export interface Selection {
+  readonly kept: readonly ContextMessage[]
+  readonly dropped: readonly ContextMessage[]
+  readonly reason: string
+}
+
+/** The name `policy` records in a context manifest. */
+export function contextPolicyName(policy: ContextPolicy): string {
+  return policy.name?.() ?? "custom"
+}
+
+/** The version `policy` records in a context manifest. */
+export function contextPolicyVersion(policy: ContextPolicy): string {
+  return policy.version?.() ?? "1"
+}
+
+/** The kept and dropped records of `policy` over `history`, derived from
+ * `select`. */
+export function contextSelection(
+  policy: ContextPolicy,
+  history: readonly ContextMessage[]
+): Selection {
+  const kept = policy.select(history)
+  const dropped = history.filter(
+    (message) =>
+      !kept.some(
+        (entry) =>
+          entry.topic === message.topic &&
+          entry.id.partitionId === message.id.partitionId &&
+          entry.id.offset === message.id.offset
+      )
+  )
+  return { kept, dropped, reason: contextPolicyName(policy) }
+}
+
+/** Keep the most recent `count` messages. */
 export class LastN implements ContextPolicy {
   constructor(readonly count: number) {}
+
+  name(): string {
+    return `last_n(${String(this.count)})`
+  }
+
+  version(): string {
+    return "1"
+  }
+
+  selection(history: readonly ContextMessage[]): Selection {
+    return contextSelection(this, history)
+  }
 
   select(history: readonly ContextMessage[]): readonly ContextMessage[] {
     return history.slice(Math.max(0, history.length - Math.max(0, this.count)))
   }
 }
 
+/** Keep only messages from the given agents. */
 export class RoleFilter implements ContextPolicy {
   private readonly agents: ReadonlySet<string>
 
   constructor(agents: Iterable<AgentId>) {
     this.agents = new Set([...agents].map((agent) => agent.asStr()))
+  }
+
+  name(): string {
+    return "role_filter"
+  }
+
+  version(): string {
+    return "1"
+  }
+
+  selection(history: readonly ContextMessage[]): Selection {
+    return contextSelection(this, history)
   }
 
   select(history: readonly ContextMessage[]): readonly ContextMessage[] {
@@ -142,8 +230,21 @@ export class RoleFilter implements ContextPolicy {
   }
 }
 
+/** Apply several policies in order, each narrowing the previous result. */
 export class Chain implements ContextPolicy {
   constructor(readonly policies: readonly ContextPolicy[]) {}
+
+  name(): string {
+    return `chain(${this.policies.map(contextPolicyName).join(",")})`
+  }
+
+  version(): string {
+    return "1"
+  }
+
+  selection(history: readonly ContextMessage[]): Selection {
+    return contextSelection(this, history)
+  }
 
   select(history: readonly ContextMessage[]): readonly ContextMessage[] {
     return this.policies.reduce<readonly ContextMessage[]>(
@@ -153,12 +254,27 @@ export class Chain implements ContextPolicy {
   }
 }
 
+/** Keep the most recent messages that fit within `maxTokens`, estimated per
+ * message with `estimateTokens` over the payload unless an estimator is given.
+ * At least one message is always kept. */
 export class TokenBudget implements ContextPolicy {
   constructor(
     private readonly maxTokens: number,
     private readonly estimate: (message: ContextMessage) => number = (message) =>
-      Math.ceil(message.payload.byteLength / 4)
+      Number(estimateTokens(message.payload.byteLength))
   ) {}
+
+  name(): string {
+    return `token_budget(${String(this.maxTokens)})`
+  }
+
+  version(): string {
+    return "1"
+  }
+
+  selection(history: readonly ContextMessage[]): Selection {
+    return contextSelection(this, history)
+  }
 
   select(history: readonly ContextMessage[]): readonly ContextMessage[] {
     const kept: ContextMessage[] = []
@@ -189,7 +305,7 @@ export interface ContextAssemblerOptions {
 export class ContextAssemblerBuilder {
   private conversation: ConversationId | undefined
   private acrossChildren = false
-  private selectedTopics: readonly string[] = [AgentTopic.Commands, AgentTopic.Responses]
+  private selectedTopics: readonly string[] = [AgentTopic.Sessions]
   private selectedPolicy: ContextPolicy = new LastN(50)
   private offsets: ReadonlyMap<number, bigint> = new Map()
   private resumeFrom: Checkpoint | undefined
@@ -285,16 +401,18 @@ async function readContext(
 ): Promise<readonly ContextMessage[]> {
   const perTopic = await Promise.all(
     options.topics.map(async (topic, topicIndex) => {
-      // The log timestamp only orders the merged read, like in Rust.
-      const collected: (ContextMessage & {
-        readonly timestampMicros: bigint
-        readonly topicIndex: number
-      })[] = []
+      // The log timestamp orders the merged read, like in Rust.
+      const collected: (ContextMessage & { readonly topicIndex: number })[] = []
       // A topic nobody has written yet has no history, same as in Rust.
       if ((await laser.topic(topic).partitionCount()) === undefined) return collected
       const handle = laser.topic(topic)
+      const stream = laser.defaultStream
+      const ids =
+        stream === undefined
+          ? undefined
+          : await laser[INTERNAL_TRANSPORT]().resolveStreamTopicIds?.(stream, topic)
       const cursor = (await handle.replay()).batch(READ_BATCH)
-      const partitions = [...cursor.offsets.keys()]
+      const partitions = cursor.partitions
       const resume = options.fromCheckpoint
       const from = (partition: number): bigint =>
         resume === undefined
@@ -333,6 +451,8 @@ async function readContext(
               ? { envelope: decoded.message.envelope }
               : {}),
             timestampMicros: record.timestampMicros ?? 0n,
+            streamId: ids?.streamId ?? 0,
+            topicId: ids?.topicId ?? 0,
             topic,
             topicIndex
           })

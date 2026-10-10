@@ -38,10 +38,128 @@ import {
   encodeTableFilePageJson,
   encodeTableMetricsJson,
   encodeTableSchemaJson,
-  encodeTableViewJson
+  encodeTableViewJson,
+  forkPath,
+  forkPromotePath,
+  forkRowsPath,
+  sessionsPath,
+  sessionPath,
+  sessionChangesPath,
+  sessionEventsPath,
+  sessionStatePath,
+  sessionLinksPath,
+  sessionSourcesPath,
+  pathSegment,
+  sessionsQueryParams,
+  decodeSessionsQuery,
+  decodeSessionEventsQuery,
+  decodeSessionChangesQuery,
+  decodeSessionStateQuery,
+  decodeSessionLinksQuery,
+  sessionEventsQueryParams,
+  sessionChangesQueryParams,
+  sessionStateQueryParams,
+  sessionLinksQueryParams,
+  sessionErrorBody,
+  PARAM_FIXED_FRONTIER,
+  PARAM_HISTORY_LIMIT,
+  PARAM_TEXT
 } from "../../src/wire/http.js"
+import { ConversationId } from "../../src/wire/ids.js"
+import { STREAM_RESOURCE_PREFIX, streamResource } from "../../src/wire/authz.js"
+import { CodecError } from "../../src/client/errors.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
+
+void test("given_a_stream_scoped_session_when_paths_are_built_then_should_encode_each_segment", () => {
+  const stream = "a/b?!"
+  const id = ConversationId.fromU128(3n)
+  const base = "/agdx/sessions/a%2Fb%3F%21/00000000000000000000000003"
+  assert.equal(pathSegment(stream), "a%2Fb%3F%21")
+  assert.equal(sessionsPath(stream), "/agdx/sessions/a%2Fb%3F%21")
+  assert.equal(sessionPath(stream, id), base)
+  assert.equal(sessionChangesPath(stream), "/agdx/sessions/a%2Fb%3F%21/changes")
+  assert.equal(sessionEventsPath(stream, id), `${base}/events`)
+  assert.equal(sessionStatePath(stream, id), `${base}/state`)
+  assert.equal(sessionLinksPath(stream, id), `${base}/links`)
+  assert.equal(sessionSourcesPath(stream, id), `${base}/sources`)
+})
+
+void test("given_a_stream_scoped_fork_id_when_paths_are_built_then_should_encode_it_as_one_segment", () => {
+  assert.equal(forkPath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry")
+  assert.equal(forkPromotePath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry/promote")
+  assert.equal(forkRowsPath("stream:acme/try"), "/agdx/forks/stream%3Aacme%2Ftry/rows")
+  assert.equal(forkPath("try-1"), "/agdx/forks/try-1")
+})
+
+void test("given_session_queries_when_decoded_then_should_take_the_stream_from_the_path", () => {
+  assert.equal(sessionsPath("agents"), "/agdx/sessions/agents")
+  const scoped = decodeSessionsQuery(new URLSearchParams("status=active&root=r1&label_prefix=t-"))
+  assert.equal(scoped.root, "r1")
+  assert.equal(scoped.labelPrefix, "t-")
+  assert.equal(sessionsQueryParams(scoped).toString(), "status=active&root=r1&label_prefix=t-")
+  const query = decodeSessionsQuery(new URLSearchParams("status=active&total=true"))
+  assert.equal(query.status, "active")
+  assert.equal(query.wantTotal, true)
+  assert.equal(sessionsQueryParams(query).toString(), "status=active&total=true")
+  assert.equal(
+    sessionsQueryParams({ agent: "planner", text: "check", cursor: "c1", limit: 0 }).toString(),
+    "agent=planner&text=check&cursor=c1&limit=0"
+  )
+  const events = decodeSessionEventsQuery(new URLSearchParams("fixed_frontier=true"))
+  assert.equal(events.fixedFrontier, true)
+  assert.equal(events.limit, undefined)
+  assert.equal(
+    sessionEventsQueryParams({ cursor: "c", limit: 5, fixedFrontier: true }).toString(),
+    "cursor=c&limit=5&fixed_frontier=true"
+  )
+  assert.deepEqual(decodeSessionEventsQuery(new URLSearchParams()), { fixedFrontier: false })
+  const changes = decodeSessionChangesQuery(new URLSearchParams())
+  assert.equal(changes.after, 0n)
+  assert.equal(sessionChangesQueryParams({ after: 42n, limit: 10 }).toString(), "after=42&limit=10")
+  assert.deepEqual(decodeSessionChangesQuery(new URLSearchParams("after=42&limit=10")), {
+    after: 42n,
+    limit: 10
+  })
+  assert.deepEqual(decodeSessionStateQuery(new URLSearchParams("history_limit=7")), {
+    historyLimit: 7
+  })
+  assert.equal(sessionStateQueryParams({ historyLimit: 7 }).toString(), "history_limit=7")
+  assert.deepEqual(decodeSessionLinksQuery(new URLSearchParams("surface=memory")), {
+    surface: "memory"
+  })
+  assert.equal(sessionLinksQueryParams({ surface: "memory" }).toString(), "surface=memory")
+  assert.throws(() => decodeSessionsQuery(new URLSearchParams("limit=-1")), CodecError)
+  assert.throws(
+    () => decodeSessionEventsQuery(new URLSearchParams("fixed_frontier=yes")),
+    CodecError
+  )
+  assert.throws(() => decodeSessionChangesQuery(new URLSearchParams("after=x")), CodecError)
+  assert.equal(PARAM_FIXED_FRONTIER, "fixed_frontier")
+  assert.equal(PARAM_HISTORY_LIMIT, "history_limit")
+  assert.equal(PARAM_TEXT, "text")
+  assert.equal(streamResource("agents"), "stream:agents")
+  assert.equal(STREAM_RESOURCE_PREFIX, "stream:")
+})
+
+void test("given_a_session_error_when_rendered_as_an_error_body_then_should_carry_its_result_code", () => {
+  assert.deepEqual(sessionErrorBody({ kind: "notRegistered", message: "agents" }), {
+    code: { kind: "known", name: "NotFound" },
+    message: "stream is not registered for sessions: agents"
+  })
+  assert.deepEqual(sessionErrorBody({ kind: "stale", message: "topic 3" }).code, {
+    kind: "known",
+    name: "StaleGeneration"
+  })
+  assert.deepEqual(sessionErrorBody({ kind: "unauthorized", message: "x" }).code, {
+    kind: "known",
+    name: "Forbidden"
+  })
+  assert.deepEqual(sessionErrorBody({ kind: "unrecognized", tag: "Later", value: null }).code, {
+    kind: "known",
+    name: "Backend"
+  })
+})
 
 async function fixture(name: string): Promise<string> {
   return readFile(path.join(FIXTURES_DIR, name), "utf8")

@@ -3,54 +3,91 @@ use crate::agent::{ChunkAssembler, StreamEvent};
 use crate::context::ContextAssembler;
 use crate::error::LaserError;
 use crate::govern::{ActionCounters, ActionKind, GovernedAction};
-use crate::laser::{Laser, ensure_stream, ensure_topic};
+use crate::laser::{Laser, ensure_stream, ensure_topic, ensure_topic_retained};
 use crate::provenance::{AgentTopic, Provenance};
-use crate::types::{ConsumerGroupName, ConversationId, MessageId};
+use crate::types::{AgentId, ConsumerGroupName, ConversationId, MessageId};
 use iggy::prelude::*;
 use laser_wire::agent::{
     AgentDeadLetter, AgentEnvelope, AgentKind, ChannelId, CorrelationId, LogPosition,
     OPERATION_TASK, TaskState,
 };
+use laser_wire::dispatch::{Dispatch, HandledOperations, classify};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tracing::info;
 
-const WELL_KNOWN_TOPICS: [AgentTopic<'static>; 9] = [
-    AgentTopic::Commands,
-    AgentTopic::Responses,
-    AgentTopic::ToolCalls,
-    AgentTopic::ToolResults,
-    AgentTopic::LlmIo,
-    AgentTopic::HumanInput,
+// The satellites bootstrap creates beside `agent.sessions`. `agent.control`
+// is never among them: provisioning creates it with an operator send grant.
+// `agent.registry` is created by the first card or registry fact, as before.
+const SATELLITE_TOPICS: [AgentTopic<'static>; 5] = [
+    AgentTopic::Streams,
+    AgentTopic::Memory,
+    AgentTopic::Dlq,
     AgentTopic::Audit,
     AgentTopic::WorkflowJournal,
-    AgentTopic::Dlq,
 ];
+
+// Heartbeats only prove liveness now, so they expire after an hour.
+const HEARTBEAT_EXPIRY_MICROS: u64 = 3_600_000_000;
 
 const REPLY_BATCH: u32 = 1000;
 
 impl Laser {
-    /// Create the default data stream and the well-known agent topics (commands, responses, ...), `partitions` each. Idempotent. Requires a default stream (see [`Laser::connect_with_stream`]).
+    /// Create the agent topics on the default stream, `partitions` each:
+    /// `agent.sessions` under `retention`, `agent.heartbeats` with a one-hour
+    /// expiry, and the satellites `agent.streams`, `agent.memory`,
+    /// `agent.dlq`, `agent.audit`, and `agent.workflow_journal`. The registry
+    /// topic is created by the first card or registry fact. Idempotent. A stream that already exists is used as
+    /// it is, so a pre-provisioned stream needs no stream permission.
+    /// `agent.control` is not created here, because only operators may send to
+    /// it. Requires a default stream (see [`Laser::connect_with_stream`]).
     ///
-    /// The nine topics hold `9 * partitions` partitions on the server, and every partition costs it open files and memory. Keep `partitions` small on small tiers, and remove a stream you no longer need with [`Stream::delete`](crate::stream::Stream::delete).
+    /// The seven topics hold `7 * partitions` partitions on the server, and every partition costs it open files and memory. Keep `partitions` small on small tiers, and remove a stream you no longer need with [`Stream::delete`](crate::stream::Stream::delete).
     ///
-    /// Warms a producer for every well-known topic concurrently, so that cost is
-    /// paid once up front instead of lazily on a handler's first reply.
+    /// Warms a producer for every topic concurrently, so that cost is paid once
+    /// up front instead of lazily on a handler's first reply.
     #[tracing::instrument(
         target = "laser",
         level = "info",
         skip_all,
         fields(operation = "bootstrap")
     )]
-    pub async fn bootstrap(&self, partitions: u32) -> Result<(), LaserError> {
+    pub async fn bootstrap(
+        &self,
+        partitions: u32,
+        retention: crate::agent::TopicRetention,
+    ) -> Result<(), LaserError> {
         let stream = self.stream_required()?;
-        ensure_stream(&self.client(), stream).await?;
-        for topic in WELL_KNOWN_TOPICS {
-            ensure_topic(&self.client(), stream, &topic.topic_string(), partitions).await?;
+        let client = self.client();
+        ensure_stream(&client, stream).await?;
+        ensure_topic_retained(
+            &client,
+            stream,
+            laser_wire::topics::AGENT_SESSIONS,
+            partitions,
+            retention.expiry(),
+            retention.max_size(),
+        )
+        .await?;
+        ensure_topic_retained(
+            &client,
+            stream,
+            laser_wire::topics::AGENT_HEARTBEATS,
+            partitions,
+            IggyExpiry::ExpireDuration(IggyDuration::from(HEARTBEAT_EXPIRY_MICROS)),
+            MaxTopicSize::ServerDefault,
+        )
+        .await?;
+        for topic in SATELLITE_TOPICS {
+            ensure_topic(&client, stream, &topic.topic_string(), partitions).await?;
         }
         let mut warming = tokio::task::JoinSet::new();
-        for topic in WELL_KNOWN_TOPICS {
+        for topic in [AgentTopic::Sessions, AgentTopic::Heartbeats]
+            .into_iter()
+            .chain(SATELLITE_TOPICS)
+        {
             let laser = self.clone();
             let stream = stream.to_owned();
             warming.spawn(async move { laser.producer_on(&stream, &topic.topic_string()).await });
@@ -77,6 +114,7 @@ impl Laser {
     ) -> Result<(), LaserError> {
         self.send_agent_as(ActionKind::Send, topic, payload, provenance)
             .await
+            .map(|_| ())
     }
 
     // `send_agent` with the governed-action kind named by the caller, so the
@@ -88,10 +126,11 @@ impl Laser {
         topic: AgentTopic<'_>,
         payload: impl Into<Vec<u8>>,
         provenance: &Provenance,
-    ) -> Result<(), LaserError> {
-        let headers: BTreeMap<HeaderKey, HeaderValue> = provenance.try_into()?;
+    ) -> Result<SendMessagesResponse, LaserError> {
+        let mut headers: BTreeMap<HeaderKey, HeaderValue> = provenance.try_into()?;
         let key = provenance.partition_key();
         let topic_name = topic.topic_string();
+        stamp_broadcast_addressee(&mut headers, &topic_name)?;
         let mut payload: Vec<u8> = payload.into();
         let action = GovernedAction {
             kind,
@@ -116,9 +155,19 @@ impl Laser {
         if let Some(modified) = self.govern(action).await? {
             payload = modified;
         }
-        self.send_with_headers(&topic_name, payload, headers, Some(&key))
-            .await
-            .map(|_| ())
+        // A declared per-agent topic layout moves a record addressed to a
+        // declared agent off the lane onto that agent's topic.
+        let destination = provenance
+            .target_agent_id
+            .as_ref()
+            .and_then(|target| self.agent_destination(&topic_name, None, Some(&target.wire_id())));
+        self.send_with_headers(
+            destination.as_deref().unwrap_or(&topic_name),
+            payload,
+            headers,
+            Some(&key),
+        )
+        .await
     }
 
     /// Redrive a dead-lettered message: read the original record at the
@@ -263,6 +312,23 @@ impl Laser {
         Ok(events)
     }
 
+    // Where replies addressed to `requester` land: its declared topic when
+    // the stream declares per-agent topics and replies would ride the lane,
+    // else `reply_topic` itself.
+    pub(crate) fn reply_topic_for(
+        &self,
+        reply_topic: &AgentTopic<'_>,
+        requester: Option<&laser_wire::agent::AgentId>,
+    ) -> Result<iggy::prelude::Identifier, LaserError> {
+        let declared = (reply_topic.topic_string() == laser_wire::topics::AGENT_SESSIONS)
+            .then(|| requester.and_then(|agent| self.declared_topic(agent)))
+            .flatten();
+        Ok(match declared {
+            Some(topic) => iggy::prelude::Identifier::named(&topic)?,
+            None => reply_topic.as_identifier(),
+        })
+    }
+
     /// A reply reader seeded at `reply_topic`'s current tail, for the synchronous
     /// request/reply bridges. The caller builds it BEFORE sending the request, so
     /// the scan reads only the reply (which lands after the send) instead of
@@ -271,14 +337,12 @@ impl Laser {
     pub(crate) async fn agdx_reply_reader(
         &self,
         reply_topic: AgentTopic<'_>,
+        requester: Option<&laser_wire::agent::AgentId>,
     ) -> Result<AgentReplyReader, LaserError> {
+        let topic = self.reply_topic_for(&reply_topic, requester)?;
         #[allow(unused_mut)]
-        let mut reader = AgentReplyReader::new_at_tail(
-            &self.client(),
-            self.stream_required()?,
-            reply_topic.as_identifier(),
-        )
-        .await?;
+        let mut reader =
+            AgentReplyReader::new_at_tail(&self.client(), self.stream_required()?, topic).await?;
         #[cfg(feature = "sign")]
         {
             reader.verifier = self.registry_verifier();
@@ -343,7 +407,7 @@ impl Laser {
     }
 
     /// A fresh child conversation of `parent`, carrying its parent/root ids for causality.
-    pub fn spawn_subconversation(&self, parent: &Provenance) -> Provenance {
+    pub fn spawn_subconversation(&self, parent: &Provenance, author: &AgentId) -> Provenance {
         let root = parent
             .root_conversation_id
             .unwrap_or(parent.conversation_id);
@@ -351,6 +415,7 @@ impl Laser {
             .conversation_id(ConversationId::new())
             .parent_conversation_id(parent.conversation_id)
             .root_conversation_id(root)
+            .agent(author.clone())
             .build()
     }
 
@@ -382,20 +447,40 @@ impl Laser {
             .unwrap_or_else(|| ulid::Ulid::generate().to_string());
         let mut provenance = provenance.clone();
         provenance.correlation_id = Some(correlation.clone());
+        let same_topic = request_topic.topic_string() == reply_topic.topic_string();
         // Register with the shared reply dispatcher BEFORE sending: the reply
         // cannot exist until the request is sent, and the hub reads the topic once
         // for every waiter, so N concurrent requests share one read stream instead
         // of each scanning the topic.
-        let hub = self.reply_hub(&reply_topic).await?;
+        let requester = provenance
+            .agent
+            .as_ref()
+            .map(crate::types::AgentId::wire_id);
+        let topic = self.reply_topic_for(&reply_topic, requester.as_ref())?;
+        let hub = self.reply_hub(&AgentTopic::Custom(&topic)).await?;
         let ticket = hub.subscribe(
             correlation,
+            crate::agent::replies::ExpectedReply {
+                session: provenance.conversation_id,
+                requester: provenance
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.as_str().to_owned()),
+            },
             provenance
                 .target_agent_id
                 .as_ref()
                 .map(|target| target.as_str().to_owned()),
         );
-        self.send_agent_as(ActionKind::Request, request_topic, payload, &provenance)
+        let sent = self
+            .send_agent_as(ActionKind::Request, request_topic, payload, &provenance)
             .await?;
+        let confirmation = sent.confirmations.first().ok_or_else(|| {
+            LaserError::Protocol("request send had no committed message address".to_owned())
+        })?;
+        ticket.arm(
+            same_topic.then(|| MessageId::new(confirmation.partition_id, confirmation.base_offset)),
+        );
         ticket.wait(timeout).await
     }
 
@@ -417,9 +502,9 @@ impl Laser {
         target: ConsumerRef,
         at: LogPosition,
     ) -> Result<ConsumptionStatus, LaserError> {
-        let consumer = match target {
+        let consumer = match &target {
             ConsumerRef::Group(name) => Consumer::group(Identifier::named(name.as_str())?),
-            ConsumerRef::Consumer(id) => Consumer::new(Identifier::named(&id)?),
+            ConsumerRef::Consumer(id) => Consumer::new(Identifier::named(id)?),
         };
         let info = self
             .client()
@@ -431,10 +516,23 @@ impl Laser {
             )
             .await?;
         Ok(match info {
-            Some(offset) if offset.stored_offset >= at.offset => ConsumptionStatus::Consumed {
-                committed: offset.stored_offset,
-                head: offset.current_offset,
-            },
+            Some(offset) if offset.stored_offset >= at.offset => {
+                let dispatch = match &target {
+                    ConsumerRef::Group(name) => self.dispatch_at(name.as_str(), at).await?,
+                    ConsumerRef::Consumer(_) => None,
+                };
+                match dispatch {
+                    Some(dispatch) if dispatch != Dispatch::Work => ConsumptionStatus::Skipped {
+                        committed: offset.stored_offset,
+                        head: offset.current_offset,
+                        dispatch,
+                    },
+                    _ => ConsumptionStatus::Consumed {
+                        committed: offset.stored_offset,
+                        head: offset.current_offset,
+                    },
+                }
+            }
             Some(offset) => ConsumptionStatus::NotYetConsumed {
                 behind_by: at.offset.saturating_sub(offset.stored_offset),
             },
@@ -454,6 +552,67 @@ pub enum ConsumptionStatus {
     /// The target has committed past the message: `committed` is its stored
     /// offset, `head` the partition head at the time of the probe.
     Consumed { committed: u64, head: u64 },
+    /// The target agent's group committed past the message without handling
+    /// it, because the record is not work for that agent. `dispatch` says why.
+    Skipped {
+        committed: u64,
+        head: u64,
+        dispatch: Dispatch,
+    },
+}
+
+impl Laser {
+    // How the agent named by `group` classifies the record at `at`, or `None`
+    // when the record is gone, does not decode, or the group is not an agent.
+    async fn dispatch_at(
+        &self,
+        group: &str,
+        at: LogPosition,
+    ) -> Result<Option<Dispatch>, LaserError> {
+        let Ok(me) = group.parse::<laser_wire::agent::AgentId>() else {
+            return Ok(None);
+        };
+        let stream = Identifier::numeric(at.stream_id)?;
+        let topic = Identifier::numeric(at.topic_id)?;
+        let Some(details) = self.client().get_topic(&stream, &topic).await? else {
+            return Ok(None);
+        };
+        let reader = Consumer::new(Identifier::named("laser-consumed")?);
+        let polled = self
+            .client()
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(at.partition_id),
+                &reader,
+                &PollingStrategy::offset(at.offset),
+                1,
+                false,
+            )
+            .await?;
+        let Some(message) = polled
+            .messages
+            .iter()
+            .find(|message| message.header.offset == at.offset)
+        else {
+            return Ok(None);
+        };
+        let Ok(record) = crate::agent::consumer::decode_agent_record(message, u64::MAX) else {
+            return Ok(None);
+        };
+        Ok(Some(match record.envelope {
+            Some(envelope) => classify(&envelope, &details.name, &me, HandledOperations::Any),
+            None if record
+                .provenance
+                .target_agent_id
+                .as_ref()
+                .is_some_and(|target| target.as_str() != me.as_str()) =>
+            {
+                Dispatch::Foreign
+            }
+            None => Dispatch::Work,
+        }))
+    }
 }
 
 /// Which consumer to probe in [`Laser::consumed`]: a deployment consumer group
@@ -816,4 +975,71 @@ enum ContractSignal {
     Completed(Option<String>),
     Failed(Option<String>),
     Ignore,
+}
+
+/// Every record on a shared session topic carries `agdx.to`, `*` when the
+/// caller named no target, so a role group bound to the addressee filter on a
+/// deployment that serves group-aware reads still receives it. Open Apache
+/// Iggy classifies on the client and already delivered untargeted records.
+/// Other topics keep the caller's headers verbatim.
+pub(crate) fn stamp_broadcast_addressee(
+    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    topic: &str,
+) -> Result<(), LaserError> {
+    if topic != laser_wire::topics::AGENT_SESSIONS && topic != laser_wire::topics::AGENT_CONTROL {
+        return Ok(());
+    }
+    let key = HeaderKey::from_str(laser_wire::headers::TARGET_AGENT_ID)?;
+    let broadcast = HeaderValue::from_str(laser_wire::headers::Addressee::Broadcast.as_str())?;
+    headers.entry(key).or_insert(broadcast);
+    Ok(())
+}
+
+#[cfg(test)]
+mod addressee_tests {
+    use super::*;
+
+    fn headers_with_target(target: Option<&str>) -> BTreeMap<HeaderKey, HeaderValue> {
+        let mut headers = BTreeMap::new();
+        if let Some(target) = target {
+            headers.insert(
+                HeaderKey::from_str(laser_wire::headers::TARGET_AGENT_ID).expect("key"),
+                HeaderValue::from_str(target).expect("value"),
+            );
+        }
+        headers
+    }
+
+    fn addressee(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Option<String> {
+        headers
+            .get(&HeaderKey::from_str(laser_wire::headers::TARGET_AGENT_ID).expect("key"))
+            .map(|value| value.as_str().expect("text addressee").to_owned())
+    }
+
+    #[test]
+    fn given_an_untargeted_send_on_a_session_topic_when_stamped_then_should_broadcast() {
+        for topic in [
+            laser_wire::topics::AGENT_SESSIONS,
+            laser_wire::topics::AGENT_CONTROL,
+        ] {
+            let mut headers = headers_with_target(None);
+            stamp_broadcast_addressee(&mut headers, topic).expect("stamp");
+            assert_eq!(addressee(&headers).as_deref(), Some("*"), "{topic}");
+        }
+    }
+
+    #[test]
+    fn given_a_targeted_send_when_stamped_then_should_keep_the_target() {
+        let mut headers = headers_with_target(Some("planner"));
+        stamp_broadcast_addressee(&mut headers, laser_wire::topics::AGENT_SESSIONS).expect("stamp");
+        assert_eq!(addressee(&headers).as_deref(), Some("planner"));
+    }
+
+    #[test]
+    fn given_an_untargeted_send_on_another_topic_when_stamped_then_should_leave_headers_alone() {
+        let mut headers = headers_with_target(None);
+        stamp_broadcast_addressee(&mut headers, "commands").expect("stamp");
+        assert_eq!(addressee(&headers), None);
+        assert!(headers.is_empty());
+    }
 }

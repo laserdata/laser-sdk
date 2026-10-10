@@ -1,3 +1,4 @@
+import { breachError, exceededBreach } from "./budget.js"
 import { ownedBytes, type BytesLike } from "../client/bytes.js"
 import {
   BudgetExceededError,
@@ -11,16 +12,17 @@ import { AgentTopic } from "../provenance/agent-topic.js"
 import { AgentId, ConversationId } from "../types/ids.js"
 import { decodeOne, encodeNamed, expectMap, field } from "../wire/cbor.js"
 import { agentMessageBody } from "./reliable-consumer.js"
-import { markRun, type Contract } from "./contract.js"
+import type { Contract } from "./contract.js"
+import type { Session } from "../session.js"
 import { ADVERTISED_INBOX_ROUTE, type InboxRoute, type Router } from "./router.js"
 
 const STEP_BUDGET_FLOOR_MS = 100
 const DEFAULT_STEP_DEADLINE_MS = 30_000
 const MAX_REASSIGNMENTS = 2
 export const WORKFLOW_FENCE_NAMESPACE = "agdx.workflow.fence"
-const WORKFLOW_LEASE_TTL_MICROS = 60_000_000n
+const WORKFLOW_LEASE_TTL_MS = 60_000
 
-export class Budget {
+export class WorkflowBudget {
   /** @internal */
   readonly tokenLimit: bigint | undefined
   /** @internal */
@@ -34,27 +36,27 @@ export class Budget {
     this.invocationLimit = invocationLimit
   }
 
-  static unlimited(): Budget {
-    return new Budget()
+  static unlimited(): WorkflowBudget {
+    return new WorkflowBudget()
   }
 
-  static tokens(tokens: bigint): Budget {
+  static tokens(tokens: bigint): WorkflowBudget {
     if (tokens < 0n) throw new InvalidError("token budget must be non-negative")
-    return new Budget(tokens)
+    return new WorkflowBudget(tokens)
   }
 
-  wallClock(milliseconds: number): Budget {
-    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+  wallClock(wallClockMs: number): WorkflowBudget {
+    if (!Number.isFinite(wallClockMs) || wallClockMs < 0) {
       throw new InvalidError("wall-clock budget must be a non-negative finite number")
     }
-    return new Budget(this.tokenLimit, milliseconds, this.invocationLimit)
+    return new WorkflowBudget(this.tokenLimit, wallClockMs, this.invocationLimit)
   }
 
-  invocations(invocations: number): Budget {
+  invocations(invocations: number): WorkflowBudget {
     if (!Number.isSafeInteger(invocations) || invocations < 0) {
       throw new InvalidError("invocation budget must be a non-negative safe integer")
     }
-    return new Budget(this.tokenLimit, this.wallClockLimitMs, invocations)
+    return new WorkflowBudget(this.tokenLimit, this.wallClockLimitMs, invocations)
   }
 }
 
@@ -167,11 +169,10 @@ export function topologicalOrder(
 }
 
 export class Workflow {
-  private budgetValue = Budget.unlimited()
+  private budgetValue = WorkflowBudget.unlimited()
   private route: InboxRoute = ADVERTISED_INBOX_ROUTE
   private resumeId: ConversationId | undefined
   private readonly steps: Step[] = []
-  private registerRun = false
 
   private constructor(
     private readonly laser: Laser,
@@ -183,7 +184,7 @@ export class Workflow {
     return new Workflow(laser, name)
   }
 
-  budget(budget: Budget): this {
+  budget(budget: WorkflowBudget): this {
     this.budgetValue = budget
     return this
   }
@@ -195,11 +196,6 @@ export class Workflow {
 
   runId(runId: ConversationId): this {
     this.resumeId = runId
-    return this
-  }
-
-  registered(): this {
-    this.registerRun = true
     return this
   }
 
@@ -216,54 +212,56 @@ export class Workflow {
     return StepHandle.create(this, step)
   }
 
-  /** Aborting `signal` cancels the run, as dropping the run future does in Rust. */
+  /** Run the workflow to completion, returning each step's output. The run is
+   * a session on `agent.sessions` whose id is the run id, and every step and
+   * compensation is a child session of it. The run session starts before the
+   * first step and ends by the outcome. Between steps the engine checks
+   * `agent.control` for a cancel request, which compensates and throws
+   * `CancelledError`, and then whether the run session is over its budget,
+   * which compensates and throws `BudgetExceededError`. Any budget breach ends
+   * the run session failed with reason `budget`. Aborting `signal` cancels
+   * the run, as dropping the run future does in Rust. A lifecycle record that
+   * fails to publish surfaces as the error, except when the run itself
+   * already failed. */
   async run(options: { readonly signal?: AbortSignal } = {}): Promise<WorkflowOutcome> {
-    if (this.registerRun && !(await this.laser.capabilities()).agentWorkflow) {
-      throw new UnsupportedError(
-        "a registered workflow requires a plane that serves the run registry"
-      )
-    }
     const source = AgentId.new(this.name)
     const runId = this.resumeId ?? ConversationId.new()
-    let registeredRun: string | undefined
-    if (this.registerRun) {
-      registeredRun = (await this.laser.runs().submitWith(this.name, { runId: runId.toString() }))
-        .runId
-      await markRun(this.laser, source, runId, registeredRun, { kind: "known", name: "Working" })
-    }
+    this.resumeId = runId
+    let builder = this.laser.sessions().start().withId(runId).agent(source)
+    const tokens = this.budgetValue.tokenLimit
+    if (tokens !== undefined) builder = builder.budget({ tokens })
+    const { session, lease } = await builder.begin()
     try {
-      const outcome = await this.execute(source, runId, registeredRun, options.signal)
-      if (registeredRun !== undefined) {
-        await markRun(this.laser, source, runId, registeredRun, {
-          kind: "known",
-          name: "Completed"
-        })
-      }
-      return outcome
-    } catch (error) {
-      if (registeredRun !== undefined) {
-        const cancelled = error instanceof CancelledError
+      let outcome: WorkflowOutcome
+      try {
+        outcome = await this.execute(source, runId, session, options.signal)
+      } catch (error) {
         try {
-          await markRun(
-            this.laser,
-            source,
-            runId,
-            registeredRun,
-            { kind: "known", name: cancelled ? "Canceled" : "Failed" },
-            cancelled ? undefined : error instanceof Error ? error.message : String(error)
-          )
+          if (error instanceof CancelledError) await session.cancel()
+          else if (error instanceof BudgetExceededError) {
+            await session.failOverBudget(exceededBreach(error.ceiling, error.spent))
+          } else
+            await session.fail({
+              code: { kind: "known", name: "Internal" },
+              message: error instanceof Error ? error.message : String(error),
+              retryable: false
+            })
         } catch {
-          // Preserve the workflow failure when terminal run reporting also fails.
+          // The run's error wins over a lifecycle error.
         }
+        throw error
       }
-      throw error
+      await session.end()
+      return outcome
+    } finally {
+      lease.release()
     }
   }
 
   private async execute(
     source: AgentId,
     runId: ConversationId,
-    registeredRun: string | undefined,
+    session: Session,
     signal: AbortSignal | undefined
   ): Promise<WorkflowOutcome> {
     const order = topologicalOrder(this.steps)
@@ -277,19 +275,22 @@ export class Workflow {
       const step = this.steps[index]
       if (step === undefined || outputs.has(step.label)) continue
       if (signal?.aborted === true) {
-        await this.compensate(completed, outputs)
+        await this.compensate(completed, outputs, runId)
         throw new CancelledError(`workflow \`${this.name}\` was cancelled`, {
-          cause: signal.reason
+          cause: signal.reason,
+          run: runId.toString()
         })
       }
-      if (
-        registeredRun !== undefined &&
-        (await this.laser.runs().status(registeredRun)).cancelRequested
-      ) {
-        await this.compensate(completed, outputs)
-        throw new CancelledError(`workflow run \`${registeredRun}\` was cancelled`, {
-          run: registeredRun
+      if (await session.cancelRequested()) {
+        await this.compensate(completed, outputs, runId)
+        throw new CancelledError(`workflow run \`${runId.toString()}\` was cancelled`, {
+          run: runId.toString()
         })
+      }
+      const breach = await session.budgetBreach()
+      if (breach !== undefined) {
+        await this.compensate(completed, outputs, runId)
+        throw breachError(breach)
       }
       try {
         this.validateStep(step)
@@ -306,7 +307,7 @@ export class Workflow {
         completed.push(index)
         this.checkBudget(invocations, tokensSpent, started)
       } catch (error) {
-        await this.compensate(completed, outputs)
+        await this.compensate(completed, outputs, runId)
         throw error
       }
     }
@@ -376,6 +377,10 @@ export class Workflow {
         .payload(payload)
         .inboxRoute(this.route)
         .deadline(this.stepDeadline(started))
+        // The step's child session id derives from the run, so a resumed run
+        // reaches the same child instead of starting another.
+        .conversation(ConversationId.derive(`${runId.toString()}/${step.label}/1`))
+        .parent(runId, runId)
         .send()
     )
     if (outcome.kind !== "completed") {
@@ -401,8 +406,8 @@ export class Workflow {
       const kv = this.laser.kv(step.fenceNamespace ?? WORKFLOW_FENCE_NAMESPACE)
       const key = new TextEncoder().encode(runId.toString())
       const holder = `workflow:${runId.toString()}:${String(attempt + 1)}`
-      let lease = await kv.lease(key, holder, WORKFLOW_LEASE_TTL_MICROS)
-      let leaseExpiresAt = performance.now() + leaseDurationMs(lease.grantedTtlMicros)
+      let lease = await kv.lease(key, holder, WORKFLOW_LEASE_TTL_MS)
+      let leaseExpiresAt = performance.now() + leaseDurationMs(lease.grantedTtlMs)
       const contract = this.laser
         .contract(step.target)
         .from(source)
@@ -411,6 +416,7 @@ export class Workflow {
         .deadline(this.stepDeadline(started))
         .fence(lease.token)
         .conversation(taskConversation)
+        .parent(runId, runId)
         .send()
       const completed = contract.then(
         async (outcome) => {
@@ -431,7 +437,7 @@ export class Workflow {
         | { readonly ok: false; readonly error: unknown }
       try {
         for (;;) {
-          const tick = renewalTick(renewalDelayMs(lease.grantedTtlMicros))
+          const tick = renewalTick(renewalDelayMs(lease.grantedTtlMs))
           const next = await Promise.race([
             completed,
             tick.promise.then(() => ({ kind: "renew" as const }))
@@ -452,7 +458,7 @@ export class Workflow {
               "the exclusive workflow lease cannot be renewed before expiry"
             )
           }
-          const renewal = kv.renewLease(key, holder, lease.token, WORKFLOW_LEASE_TTL_MICROS).then(
+          const renewal = kv.renewLease(key, holder, lease.token, WORKFLOW_LEASE_TTL_MS).then(
             (value) => ({ kind: "renewed" as const, ok: true as const, value }),
             (error: unknown) => ({ kind: "renewed" as const, ok: false as const, error })
           )
@@ -484,7 +490,7 @@ export class Workflow {
           }
           if (!pending.ok) throw pending.error
           lease = pending.value
-          leaseExpiresAt = performance.now() + leaseDurationMs(lease.grantedTtlMicros)
+          leaseExpiresAt = performance.now() + leaseDurationMs(lease.grantedTtlMs)
         }
       } catch (error) {
         attemptResult = { ok: false, error }
@@ -523,7 +529,8 @@ export class Workflow {
 
   private async compensate(
     completed: readonly number[],
-    outputs: ReadonlyMap<string, Uint8Array>
+    outputs: ReadonlyMap<string, Uint8Array>,
+    runId: ConversationId
   ): Promise<void> {
     for (const index of [...completed].reverse()) {
       const step = this.steps[index]
@@ -536,6 +543,8 @@ export class Workflow {
           .payload(payload)
           .inboxRoute(this.route)
           .deadline(DEFAULT_STEP_DEADLINE_MS)
+          .conversation(ConversationId.derive(`${runId.toString()}/${step.label}/compensate`))
+          .parent(runId, runId)
           .send()
       } catch {
         // Compensation is best effort and cannot replace the original failure.
@@ -570,16 +579,12 @@ export class Workflow {
   }
 }
 
-function renewalDelayMs(grantedTtlMicros: bigint): number {
-  const halfMillis = grantedTtlMicros / 2_000n
-  return Number(
-    halfMillis > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : halfMillis
-  )
+function renewalDelayMs(grantedTtlMs: number): number {
+  return Math.floor(grantedTtlMs / 2)
 }
 
-function leaseDurationMs(grantedTtlMicros: bigint): number {
-  const millis = (grantedTtlMicros + 999n) / 1_000n
-  return Number(millis > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : millis)
+function leaseDurationMs(grantedTtlMs: number): number {
+  return Math.ceil(grantedTtlMs)
 }
 
 function renewalTick(milliseconds: number): { readonly promise: Promise<void>; cancel(): void } {
@@ -636,7 +641,7 @@ export class StepHandle {
     return this
   }
 
-  budget(budget: Budget): this {
+  budget(budget: WorkflowBudget): this {
     this.owner.budget(budget)
     return this
   }
@@ -648,11 +653,6 @@ export class StepHandle {
 
   runId(runId: ConversationId): this {
     this.owner.runId(runId)
-    return this
-  }
-
-  registered(): this {
-    this.owner.registered()
     return this
   }
 

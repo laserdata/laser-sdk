@@ -1,3 +1,4 @@
+import { millisToMicros } from "./duration.js"
 import { closeProducerStatistics } from "../stream/producer-statistics.js"
 import type { GroupContext } from "../stream/consumer-group.js"
 import { connectOptions, type ConnectOptions } from "./connect-options.js"
@@ -7,10 +8,14 @@ import {
   type ClientOwnership,
   type IggyClient,
   type LaserTransport,
+  NEVER_EXPIRE,
+  type SendMessagesResponse,
   serverErrorCode
 } from "../iggy/apache-iggy.js"
 import { createAgdx, type Agdx } from "../agent/agdx.js"
+import { replyTopicFor, resolveAgentTopic } from "../agent/partitioning.js"
 import { decodeAgentMessage, type AgentMessage } from "../agent/reliable-consumer.js"
+import { type Dispatch, classify } from "../wire/dispatch.js"
 import { ReplyHub } from "../agent/replies.js"
 import { ContractBuilder, scatter, scatterReport, type ScatterReport } from "../agent/contract.js"
 import { Workflow } from "../agent/workflow.js"
@@ -34,7 +39,13 @@ import {
 import { AsyncOnce } from "../runtime/async-once.js"
 import { Stream } from "../stream/stream.js"
 import { ContextScope } from "../context-scope.js"
-import { Sessions, type SessionConfig } from "../session.js"
+import {
+  Sessions,
+  type SessionConfig,
+  type SessionLayout,
+  type TopicRetention
+} from "../session.js"
+import { LeaseRegistry } from "../agent/lease.js"
 import {
   ActionKind,
   GovernorState,
@@ -69,9 +80,15 @@ import {
   whoami
 } from "../managed/rbac.js"
 import { GraphHandle } from "../managed/graph.js"
-import { Runs } from "../managed/runs.js"
 import { Watch } from "../managed/watch.js"
-import type { AuthzHistoryReply, AuthzSubject, Role, WhoamiReply } from "../wire/authz.js"
+import {
+  type AuthzHistoryReply,
+  type AuthzSubject,
+  type Role,
+  type WhoamiReply,
+  scopedResource,
+  splitScopedResource
+} from "../wire/authz.js"
 import type { BatchItem } from "../wire/batch.js"
 import {
   AGDX_HELLO_CODE,
@@ -104,24 +121,37 @@ import {
   encodeAgentCard,
   validateAgentCard,
   AgentKind,
+  parseAgentId,
   type AgentEnvelope,
   type AgentCard,
+  type AgentId as WireAgentId,
   type AgentPresence
 } from "../wire/agent.js"
 import { ContentType, contentTypeCode } from "../wire/content.js"
 import { CONTENT_TYPE } from "../wire/headers.js"
-import { IDEMPOTENCY_KEY } from "../wire/headers.js"
+import { IDEMPOTENCY_KEY, TARGET_AGENT_ID } from "../wire/headers.js"
+import type { HeaderValue } from "../stream/header-value.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import {
   encodeProvenanceHeaders,
   provenancePartitionKey,
   type Provenance
 } from "../provenance/provenance.js"
-import { CHANGES_TOPIC, CONTROL_TOPIC, DLQ_TOPIC, OPS_STREAM } from "../wire/topics.js"
+import {
+  AGENT_CONTROL,
+  AGENT_SESSIONS,
+  CHANGES_TOPIC,
+  CONTROL_TOPIC,
+  DLQ_TOPIC,
+  OPS_STREAM,
+  streamOpsTopic
+} from "../wire/topics.js"
 import { encodeNamed } from "../wire/cbor.js"
 import type { ChannelId } from "../wire/ids.js"
+import type { SourceRef } from "../wire/graph.js"
+import type { ContextMessage } from "../context.js"
 import type { LogPosition } from "../wire/ids.js"
-import type { AgentDeadLetter } from "../wire/agent.js"
+import type { AgentDeadLetter, PatchOp } from "../wire/agent.js"
 import type { ConsumerGroupName } from "../types/ids.js"
 import {
   ConfigError,
@@ -134,9 +164,15 @@ import {
   UnsupportedError
 } from "./errors.js"
 import { executeManaged, type ManagedTransport } from "./managed.js"
+import { BARE_SCOPE, type ResourceScope } from "./resource-scope.js"
 import {
+  INTERNAL_DIALED,
   INTERNAL_GOVERN,
+  INTERNAL_ENSURE_RETAINED,
+  INTERNAL_LAYOUTS,
+  INTERNAL_PUBLISH_CONTROL,
   INTERNAL_REPLY_HUB,
+  INTERNAL_SESSION_LEASES,
   INTERNAL_TRANSPORT,
   INTERNAL_VERIFIER
 } from "./internals.js"
@@ -182,6 +218,14 @@ const NO_TOPOLOGY_OVERRIDES: TopologyOverrides = {
   changesTopic: false
 }
 
+/** How a `Laser` names the managed resources it sends: KV, memory, lease, and
+ * fence namespaces, the key registry, graph names, projection ids and index
+ * names, and fork ids. `stream`, the default, scopes every name to the default
+ * stream as `stream:<stream>/<name>`, sends a name that already starts with
+ * `stream:` as is, and sends bare names from a handle without a default
+ * stream. `bare` sends every name exactly as written, deployment wide. */
+export type ResourceNaming = "stream" | "bare"
+
 export interface LaserBuildOptions {
   readonly connectOptions: ConnectOptions
   readonly publishOptions: PublishOptions
@@ -201,6 +245,7 @@ export interface LaserBuildOptions {
   readonly verifier?: KeyRegistry
   readonly topology: LaserTopology
   readonly topologyOverrides: TopologyOverrides
+  readonly resourceNaming?: ResourceNaming
 }
 
 export class LaserBuilder {
@@ -212,6 +257,7 @@ export class LaserBuilder {
   private clientValue: IggyClient | undefined
   private ownershipValue: ClientOwnership = "borrowed"
   private defaultStreamValue: string | undefined
+  private resourceNamingValue: ResourceNaming | undefined
   private capabilitiesValue: Capabilities | undefined
   private governorValue: LaserBuildOptions["governor"]
   private observerValue: LaserObserver = NOOP_OBSERVER
@@ -231,13 +277,13 @@ export class LaserBuilder {
   /**
    * Budget for the initial connect: TCP dial, TLS handshake, login, and the managed capability probe. An expired budget rejects with `TimeoutError` naming the stage that stalled. Default: 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`.
    */
-  connectTimeout(milliseconds: number): this {
-    this.connectOptionsValue = { timeoutMs: milliseconds }
+  connectTimeout(timeoutMs: number): this {
+    this.connectOptionsValue = { timeoutMs: timeoutMs }
     return this
   }
 
-  publishTimeout(milliseconds: number): this {
-    this.publishOptionsValue = { ...this.publishOptionsValue, timeoutMs: milliseconds }
+  publishTimeout(timeoutMs: number): this {
+    this.publishOptionsValue = { ...this.publishOptionsValue, timeoutMs: timeoutMs }
     return this
   }
 
@@ -246,8 +292,8 @@ export class LaserBuilder {
     return this
   }
 
-  publishRetryBackoff(milliseconds: number): this {
-    this.publishOptionsValue = { ...this.publishOptionsValue, retryBackoffMs: milliseconds }
+  publishRetryBackoff(backoffMs: number): this {
+    this.publishOptionsValue = { ...this.publishOptionsValue, retryBackoffMs: backoffMs }
     return this
   }
 
@@ -274,6 +320,14 @@ export class LaserBuilder {
 
   stream(value: string): this {
     this.defaultStreamValue = value
+    return this
+  }
+
+  /** How the client names the managed resources it sends. The default
+   * `stream` scopes them to the default stream, `bare` sends names exactly as
+   * written. */
+  resourceNaming(value: ResourceNaming): this {
+    this.resourceNamingValue = value
     return this
   }
 
@@ -338,6 +392,9 @@ export class LaserBuilder {
     if (this.credentialsValue !== undefined && this.addressValue === undefined) {
       throw new ConfigError("credentials() requires address()")
     }
+    if (this.addressValue !== undefined && this.credentialsValue === undefined) {
+      throw new ConfigError("address() requires credentials()")
+    }
     if (this.addressValue !== undefined) {
       const { host, port } = this.addressValue
       if (host.length === 0 || !Number.isInteger(port) || port <= 0 || port > 65_535) {
@@ -364,6 +421,9 @@ export class LaserBuilder {
       ...(this.clientValue !== undefined ? { client: this.clientValue } : {}),
       ownership: this.ownershipValue,
       ...(this.defaultStreamValue !== undefined ? { defaultStream: this.defaultStreamValue } : {}),
+      ...(this.resourceNamingValue !== undefined
+        ? { resourceNaming: this.resourceNamingValue }
+        : {}),
       ...(this.capabilitiesValue !== undefined ? { capabilities: this.capabilitiesValue } : {}),
       ...(this.governorValue !== undefined ? { governor: this.governorValue } : {}),
       observer: this.observerValue,
@@ -375,8 +435,12 @@ export class LaserBuilder {
 }
 
 export {
+  INTERNAL_DIALED,
   INTERNAL_GOVERN,
+  INTERNAL_LAYOUTS,
+  INTERNAL_PUBLISH_CONTROL,
   INTERNAL_REPLY_HUB,
+  INTERNAL_SESSION_LEASES,
   INTERNAL_TRANSPORT,
   INTERNAL_VERIFIER
 } from "./internals.js"
@@ -387,8 +451,14 @@ interface LaserSharedState {
   // Lease acquisition over a dedicated coordination connection, one per
   // root client and shared by its clones.
   readonly leases: LeaseCoordinator
+  // Session liveness leases and their heartbeat timer, shared by clones.
+  readonly sessionLeases: LeaseRegistry
+  // The session layout declared per stream, read at every agent send.
+  readonly layouts: Map<string, SessionLayout>
+  // Whether this client dialed a connection string, so it can open further
+  // connections of its own.
+  readonly dialed: boolean
   advertisedAgent?: string
-  lastCapabilities?: Capabilities
   capabilityProbeAtMs?: number
   announcedTopology: LaserTopology
   closing?: Promise<void>
@@ -401,6 +471,13 @@ export type ConsumerRef =
 export type ConsumptionStatus =
   | { readonly kind: "notYetConsumed"; readonly behindBy: bigint }
   | { readonly kind: "consumed"; readonly committed: bigint; readonly head: bigint }
+  /** The agent's group committed past the record without handling it. */
+  | {
+      readonly kind: "skipped"
+      readonly committed: bigint
+      readonly head: bigint
+      readonly dispatch: Dispatch
+    }
 
 // `connectionString` is the string the client dialed, absent for an injected
 // client, which has nothing to dial a coordination connection with.
@@ -409,21 +486,41 @@ function newSharedState(connectionString: string | undefined): LaserSharedState 
     registryCaches: new Map(),
     replyHubs: new Map(),
     leases: LeaseCoordinator.forConnection(connectionString),
+    sessionLeases: new LeaseRegistry(),
+    layouts: new Map(),
+    dialed: connectionString !== undefined,
     announcedTopology: DEFAULT_TOPOLOGY
   }
 }
 
-const WELL_KNOWN_AGENT_TOPICS: readonly string[] = [
-  AgentTopic.Commands,
-  AgentTopic.Responses,
-  AgentTopic.ToolCalls,
-  AgentTopic.ToolResults,
-  AgentTopic.LlmIo,
-  AgentTopic.HumanInput,
+// The satellites bootstrap creates beside `agent.sessions`. `agent.control`
+// is never among them: provisioning creates it with an operator send grant.
+// `agent.registry` is created by the first card or registry fact.
+const SATELLITE_TOPICS: readonly string[] = [
+  AgentTopic.Streams,
+  AgentTopic.Memory,
+  AgentTopic.Dlq,
   AgentTopic.Audit,
-  AgentTopic.WorkflowJournal,
-  AgentTopic.Dlq
+  AgentTopic.WorkflowJournal
 ]
+
+// Heartbeats only prove liveness, so they expire after an hour.
+const HEARTBEAT_EXPIRY_MICROS = 3_600_000_000n
+
+function retentionSettings(retention: TopicRetention): {
+  readonly messageExpiryMicros: bigint
+  readonly maxTopicSize?: bigint
+} {
+  const expiry = retention.expiry()
+  const maxSize = retention.maxSize()
+  return {
+    messageExpiryMicros:
+      expiry === undefined
+        ? NEVER_EXPIRE
+        : ((micros) => (micros > 1n ? micros : 1n))(millisToMicros(expiry)),
+    ...(maxSize !== undefined ? { maxTopicSize: maxSize } : {})
+  }
+}
 
 function actionKind(kind: AgentKind): ActionKind {
   switch (kind) {
@@ -503,6 +600,85 @@ export class Laser implements AsyncDisposable {
     private readonly ownsClosure = true
   ) {}
 
+  // How this handle names its managed resources. Clones keep it.
+  private naming: ResourceNaming = "stream"
+
+  private namedLike(other: Laser): this {
+    this.naming = other.naming
+    return this
+  }
+
+  /** A clone that names managed resources under `naming`, sharing the one
+   * connection. `bare` opts out of the default stream scoping. */
+  withResourceNaming(naming: ResourceNaming): Laser {
+    const renamed = this.withObserver(this.observer)
+    renamed.naming = naming
+    return renamed
+  }
+
+  /** How this handle names the managed resources it sends. */
+  resourceNaming(): ResourceNaming {
+    return this.naming
+  }
+
+  /** The name this handle sends for the managed resource `name`:
+   * `stream:<default stream>/<name>` under `stream` naming with a default
+   * stream, else `name` unchanged. A name that already starts with `stream:`
+   * is returned unchanged. */
+  resourceName(name: string): string {
+    return this.resourceNameIn(this.defaultStream, name)
+  }
+
+  /** The default stream when this handle scopes its resources to it.
+   * @internal */
+  resourceStream(): string | undefined {
+    return this.resourceScope(this.defaultStream)
+  }
+
+  /** `stream` when this handle scopes its resources, the gate every scoped
+   * name and every lens `stream` field passes through.
+   * @internal */
+  resourceScope(stream: string | undefined): string | undefined {
+    return this.naming === "stream" && stream !== undefined && stream.length > 0
+      ? stream
+      : undefined
+  }
+
+  /** `name` scoped to `stream` under this handle's naming. An empty name stays
+   * empty so the caller's validation still rejects it.
+   * @internal */
+  resourceNameIn(stream: string | undefined, name: string): string {
+    const scope = this.resourceScope(stream)
+    return scope !== undefined && name.length > 0 ? scopedResource(scope, name) : name
+  }
+
+  /** This handle's naming, for the managed handles it builds.
+   * @internal */
+  resourceScopeOf(stream: string | undefined = this.defaultStream): ResourceScope {
+    const scope = this.resourceScope(stream)
+    if (scope === undefined) return BARE_SCOPE
+    return {
+      name: (local) => this.resourceNameIn(scope, local),
+      local: (name) => {
+        const scoped = splitScopedResource(name)
+        return scoped?.[0] === scope ? scoped[1] : undefined
+      },
+      stream: scope
+    }
+  }
+
+  /** The caller's name for `name` returned by a listing: the local part when
+   * it sits under this handle's own prefix, `undefined` when it belongs to
+   * another stream or, while scoping is active, to no stream. A handle that
+   * does not scope keeps every name unchanged.
+   * @internal */
+  localResourceName(name: string): string | undefined {
+    const stream = this.resourceStream()
+    if (stream === undefined) return name
+    const scoped = splitScopedResource(name)
+    return scoped?.[0] === stream ? scoped[1] : undefined
+  }
+
   get opsStream(): string {
     return this.topologyOverrides.opsStream
       ? this.configuredTopology.opsStream
@@ -540,12 +716,9 @@ export class Laser implements AsyncDisposable {
           deadline
         )
       } else if (options.address !== undefined) {
-        const credentials = options.credentials ?? { username: "iggy", password: "iggy" }
-        const userInfo = `${encodeURIComponent(credentials.username)}:${encodeURIComponent(credentials.password)}`
-        const authorityHost = options.address.host.includes(":")
-          ? `[${options.address.host.replace(/^\[|\]$/g, "")}]`
-          : options.address.host
-        dialed = `iggy://${userInfo}@${authorityHost}:${String(options.address.port)}`
+        // Credentials go in verbatim and the parser validates them, as in Rust.
+        const { username, password } = options.credentials ?? { username: "", password: "" }
+        dialed = `iggy+tcp://${username}:${password}@${options.address.host}:${String(options.address.port)}`
         transport = await ApacheIggyTransport.connect(dialed, options.publishOptions, deadline)
       } else {
         dialed = options.connectionString ?? LOCAL_CONNECTION_STRING
@@ -572,6 +745,7 @@ export class Laser implements AsyncDisposable {
         options.topologyOverrides,
         options.capabilities ?? OPEN_CAPABILITIES
       )
+      laser.naming = options.resourceNaming ?? "stream"
       if (options.capabilities === undefined) await laser.probeCapabilitiesBefore(deadline)
       return laser
     })
@@ -626,6 +800,13 @@ export class Laser implements AsyncDisposable {
     return Laser.connect(LOCAL_CONNECTION_STRING)
   }
 
+  /**
+   * A view pinned to a default data `stream` that shares this connection.
+   * Disposing the view with `await using` leaves the connection open, so keep
+   * the root `Laser` in scope and dispose or `close()` it, or the open socket
+   * keeps the process alive. `close()` on the view closes the shared connection
+   * for every view, as Rust and Python `close` do.
+   */
   withDefaultStream(stream: string): Laser {
     return new Laser(
       this.transport,
@@ -640,7 +821,7 @@ export class Laser implements AsyncDisposable {
       this.configuredCapabilities,
       this.capabilityOverride,
       false
-    )
+    ).namedLike(this)
   }
 
   /** A clone whose managed operations use `opsStream` instead of the ops
@@ -694,7 +875,7 @@ export class Laser implements AsyncDisposable {
       this.configuredCapabilities,
       this.capabilityOverride,
       false
-    )
+    ).namedLike(this)
   }
 
   withCapabilities(capabilities: Capabilities): Laser {
@@ -711,7 +892,7 @@ export class Laser implements AsyncDisposable {
       this.configuredCapabilities,
       capabilities,
       false
-    )
+    ).namedLike(this)
   }
 
   withGovernor(
@@ -732,7 +913,7 @@ export class Laser implements AsyncDisposable {
       this.configuredCapabilities,
       this.capabilityOverride,
       false
-    )
+    ).namedLike(this)
   }
 
   withObserver(observer: LaserObserver): Laser {
@@ -749,7 +930,7 @@ export class Laser implements AsyncDisposable {
       this.configuredCapabilities,
       this.capabilityOverride,
       false
-    )
+    ).namedLike(this)
   }
 
   private async observe<T>(
@@ -779,20 +960,22 @@ export class Laser implements AsyncDisposable {
 
   async capabilities(): Promise<Capabilities> {
     if (this.capabilityOverride !== undefined) return this.capabilityOverride
-    if (
-      this.shared.lastCapabilities?.managed === false &&
-      Date.now() - (this.shared.capabilityProbeAtMs ?? 0) >= 1_000
-    ) {
-      this.capabilitiesOnce.clear()
-    }
-    const capabilities = await this.capabilitiesOnce.get(async () =>
-      mergeCapabilities(
+    const probe = async (): Promise<Capabilities> => {
+      const probed = mergeCapabilities(
         this.configuredCapabilities,
         await probeCapabilities(this.managedTransport())
       )
-    )
-    this.shared.lastCapabilities = capabilities
-    this.shared.capabilityProbeAtMs = Date.now()
+      this.shared.capabilityProbeAtMs = Date.now()
+      return probed
+    }
+    let capabilities = await this.capabilitiesOnce.get(probe)
+    // A set without a managed plane is probed again once its last probe is a
+    // second old, or when it was never probed, as in Rust `reprobe_due`.
+    const probedAt = this.shared.capabilityProbeAtMs
+    if (!capabilities.managed && (probedAt === undefined || Date.now() - probedAt >= 1_000)) {
+      this.capabilitiesOnce.invalidate(capabilities)
+      capabilities = await this.capabilitiesOnce.get(probe)
+    }
     this.applyAdvertisedTopology(capabilities)
     return capabilities
   }
@@ -809,10 +992,12 @@ export class Laser implements AsyncDisposable {
         )
       })
       try {
-        return mergeCapabilities(
+        const probed = mergeCapabilities(
           this.configuredCapabilities,
           await Promise.race([probeCapabilities(this.managedTransport()), expired])
         )
+        this.shared.capabilityProbeAtMs = Date.now()
+        return probed
       } finally {
         clearTimeout(timer)
       }
@@ -870,8 +1055,42 @@ export class Laser implements AsyncDisposable {
   }
 
   /** @internal */
-  [INTERNAL_REPLY_HUB](topic: string): Promise<ReplyHub> {
-    return this.replyHub(topic)
+  [INTERNAL_LAYOUTS](): Map<string, SessionLayout> {
+    return this.shared.layouts
+  }
+
+  /** @internal */
+  [INTERNAL_DIALED](): boolean {
+    return this.shared.dialed
+  }
+
+  /** @internal */
+  [INTERNAL_SESSION_LEASES](): LeaseRegistry {
+    return this.shared.sessionLeases
+  }
+
+  /** @internal */
+  [INTERNAL_PUBLISH_CONTROL](command: ControlCommand): Promise<void> {
+    return this.publishControl(command)
+  }
+
+  /** @internal */
+  /** The reply hub for replies sent to `topic`, on `requester`'s declared
+   * topic when a per-agent topic layout moves its replies off the lane.
+   * @internal */
+  [INTERNAL_REPLY_HUB](topic: string, requester?: AgentId): Promise<ReplyHub> {
+    return this.replyHub(this.replyTopicFor(topic, requester))
+  }
+
+  // Where `requester` waits for replies sent to `topic` under the default
+  // stream's declared layout.
+  private replyTopicFor(topic: string, requester: AgentId | undefined): string {
+    const stream = this.defaultStream
+    return replyTopicFor(
+      stream === undefined ? undefined : this.shared.layouts.get(stream),
+      topic,
+      requester?.asStr()
+    )
   }
 
   /** @internal */
@@ -967,7 +1186,8 @@ export class Laser implements AsyncDisposable {
           payload: envelope.body,
           signed: willSign
         }),
-      this.verifier
+      this.verifier,
+      () => this.shared.layouts.get(stream)
     )
   }
 
@@ -983,26 +1203,30 @@ export class Laser implements AsyncDisposable {
     return Workflow.create(this, name)
   }
 
+  /** Replace the session state document of `conversation` with `state`, a
+   * JSON object, then snapshot it, on the session lane. */
   publishStateSnapshot(
-    topic: string,
     source: AgentId,
     conversation: ConversationId,
-    state: unknown
+    state: Readonly<Record<string, unknown>>
   ): Promise<void> {
-    return publishStateSnapshot(this, topic, source, conversation, state)
+    return publishStateSnapshot(this, source, conversation, state)
   }
 
+  /** Apply `patch`, an RFC 6902 JSON Patch array, to the session state
+   * document of `conversation`. */
   publishStateDelta(
-    topic: string,
     source: AgentId,
     conversation: ConversationId,
-    patch: unknown
+    patch: readonly PatchOp[]
   ): Promise<void> {
-    return publishStateDelta(this, topic, source, conversation, patch)
+    return publishStateDelta(this, source, conversation, patch)
   }
 
-  reconstructState(conversation: ConversationId, topic: string): Promise<unknown> {
-    return reconstructState(this, conversation, topic)
+  /** The session state document of `conversation`, `undefined` until a state
+   * record exists. */
+  reconstructState(conversation: ConversationId): Promise<unknown> {
+    return reconstructState(this, conversation)
   }
 
   aguiEvents(conversation: ConversationId, topic: string): Promise<readonly AgUiEvent[]> {
@@ -1033,9 +1257,8 @@ export class Laser implements AsyncDisposable {
     return ContextScope.create(this, conversation)
   }
 
-  /** The session accessor: one conversation seen as typed turns, a model-ready
-   * context, scoped memory, and checkpointed replay. Built on `context`, so a
-   * session is never a second store. */
+  /** The session accessor under `config`, or the defaults. Free and
+   * synchronous, IO happens at the verbs. */
   sessions(config?: SessionConfig): Sessions {
     return Sessions.create(this, config)
   }
@@ -1054,30 +1277,86 @@ export class Laser implements AsyncDisposable {
     return MemoryTopicBuilder.create(this, topic)
   }
 
+  /** Memory on an explicit backend. The vector backend needs `embedder` and
+   * any other backend refuses one, both with `InvalidError` at open. */
   memoryWith(namespace: string, backend: MemoryBackend, embedder?: Embedder): MemoryHandle {
-    return backend === MemoryBackend.Vector
-      ? MemoryHandle.governedVector(this, embedder)
-      : MemoryHandle.log(this, namespace)
+    if (backend === MemoryBackend.Vector) {
+      if (embedder === undefined)
+        throw new InvalidError("the vector memory backend needs an embedder")
+      return MemoryHandle.governedVector(this, embedder)
+    }
+    if (embedder !== undefined) {
+      throw new InvalidError(`the ${backend} memory backend takes no embedder`)
+    }
+    return MemoryHandle.log(this, namespace)
   }
 
   memoryCustom(memory: Memory): MemoryHandle {
     return MemoryHandle.custom(memory)
   }
 
-  async bootstrap(partitions: number): Promise<void> {
+  /** Creates the agent topics on the default stream, `partitions` each:
+   * `agent.sessions` under `retention`, `agent.heartbeats` with a one-hour
+   * expiry, and the satellites `agent.streams`, `agent.memory`, `agent.dlq`,
+   * `agent.audit`, and `agent.workflow_journal`. Idempotent. A stream that
+   * already exists is used as it is. `agent.control` is not created here,
+   * because only operators may send to it, and the registry topic is created
+   * by the first card or registry fact. The seven topics hold
+   * `7 * partitions` partitions on the server, so keep `partitions` small on
+   * small tiers. */
+  async bootstrap(partitions: number, retention: TopicRetention): Promise<void> {
     const stream = this.requireDefaultStream("bootstrap()")
     await this.observe(
       "laser.bootstrap",
       { operation: "bootstrap", stream, partitions },
       async () => {
         await this.transport.ensureStream(stream)
-        await Promise.all(
-          WELL_KNOWN_AGENT_TOPICS.map((topic) =>
-            this.transport.ensureTopic(stream, topic, partitions)
-          )
-        )
+        await Promise.all([
+          this.ensureRetainedTopic(
+            stream,
+            AgentTopic.Sessions,
+            partitions,
+            retentionSettings(retention)
+          ),
+          this.ensureRetainedTopic(stream, AgentTopic.Heartbeats, partitions, {
+            messageExpiryMicros: HEARTBEAT_EXPIRY_MICROS
+          }),
+          ...SATELLITE_TOPICS.map((topic) => this.transport.ensureTopic(stream, topic, partitions))
+        ])
       }
     )
+  }
+
+  /** Creates `topic` on the default stream with `partitions` and the lane's
+   * `retention`, the way bootstrap creates `agent.sessions`.
+   * @internal */
+  async [INTERNAL_ENSURE_RETAINED](
+    topic: string,
+    partitions: number,
+    retention: TopicRetention
+  ): Promise<void> {
+    const stream = this.requireDefaultStream("bootstrap()")
+    await this.ensureRetainedTopic(stream, topic, partitions, retentionSettings(retention))
+  }
+
+  private async ensureRetainedTopic(
+    stream: string,
+    topic: string,
+    partitions: number,
+    settings: { readonly messageExpiryMicros: bigint; readonly maxTopicSize?: bigint }
+  ): Promise<void> {
+    if (this.transport.createTopicIfAbsent !== undefined) {
+      await this.transport.createTopicIfAbsent(stream, topic, partitions, settings)
+    } else if (this.transport.ensureTopicWithExpiry !== undefined) {
+      await this.transport.ensureTopicWithExpiry(
+        stream,
+        topic,
+        partitions,
+        settings.messageExpiryMicros
+      )
+    } else {
+      await this.transport.ensureTopic(stream, topic, partitions)
+    }
   }
 
   async sendAgent(
@@ -1086,11 +1365,21 @@ export class Laser implements AsyncDisposable {
     provenance: Provenance,
     options: { readonly contentType?: ContentType } = {}
   ): Promise<void> {
+    await this.sendAgentWithKind(topic, payload, provenance, options, ActionKind.Send)
+  }
+
+  private async sendAgentWithKind(
+    topic: string,
+    payload: BytesLike,
+    provenance: Provenance,
+    options: { readonly contentType?: ContentType },
+    kind: ActionKind
+  ): Promise<SendMessagesResponse> {
     const stream = this.requireDefaultStream("sendAgent()")
-    await this.observe(
+    return this.observe(
       "laser.agent.send",
       {
-        operation: "send",
+        operation: kind,
         stream,
         topic,
         conversation: provenance.conversationId.toString(),
@@ -1101,7 +1390,7 @@ export class Laser implements AsyncDisposable {
       },
       async () => {
         const governedPayload = await this[INTERNAL_GOVERN]({
-          kind: ActionKind.Send,
+          kind,
           stream,
           topic,
           ...(provenance.agent !== undefined ? { source: provenance.agent.asStr() } : {}),
@@ -1116,20 +1405,34 @@ export class Laser implements AsyncDisposable {
           signed: false
         })
         const headers = new Map(encodeProvenanceHeaders(provenance))
+        stampBroadcastAddressee(headers, topic)
         if (options.contentType !== undefined) {
           headers.set(CONTENT_TYPE, {
             kind: "uint8",
             value: contentTypeCode(options.contentType)
           })
         }
-        await this.transport.sendMessageWithHeaders(
+        return this.transport.sendMessageWithHeaders(
           stream,
-          topic,
+          this.agentTopicFor(stream, topic, provenance),
           governedPayload,
           headers,
           provenancePartitionKey(provenance)
         )
       }
+    )
+  }
+
+  // A plain agent record addressed to a declared agent on `agent.sessions`
+  // lands on that agent's topic under a per-agent topic layout.
+  private agentTopicFor(stream: string, topic: string, provenance: Provenance): string {
+    return (
+      resolveAgentTopic(
+        this.shared.layouts.get(stream),
+        topic,
+        undefined,
+        provenance.targetAgentId?.asStr()
+      ) ?? topic
     )
   }
 
@@ -1146,12 +1449,63 @@ export class Laser implements AsyncDisposable {
       .send()
   }
 
-  spawnSubconversation(parent: Provenance): Provenance {
+  spawnSubconversation(parent: Provenance, author: AgentId): Provenance {
     return {
       conversationId: ConversationId.new(),
       parentConversationId: parent.conversationId,
       rootConversationId: parent.rootConversationId ?? parent.conversationId,
-      ...(parent.agent !== undefined ? { agent: parent.agent } : {})
+      agent: author
+    }
+  }
+
+  /** Read the one record `at` names, checking that the topic still has the
+   * generation the reference recorded and that the returned record sits at the
+   * named offset. `undefined` when the record is gone or the topic was
+   * recreated. Only a message reference names a log record. */
+  async readAt(at: SourceRef): Promise<ContextMessage | undefined> {
+    if (at.kind !== "message") {
+      throw new InvalidError("only a message reference names a log record")
+    }
+    const names = await this.transport.resolveStreamTopicNames?.(at.stream, at.topic)
+    if (names === undefined) return undefined
+    const details = await this.transport.findSnapshotTopic?.(names.stream, names.topic)
+    if (details?.id !== at.topic) return undefined
+    if (at.generation !== undefined && at.generation !== details.createdAtMicros) return undefined
+    const polled = await this.transport.pollMessages(
+      names.stream,
+      names.topic,
+      { kind: "single", partitionId: at.partition },
+      { kind: "offset", value: at.offset },
+      1,
+      false
+    )
+    const message = polled.find((candidate) => candidate.offset === at.offset)
+    if (message === undefined) return undefined
+    const currentNames = await this.transport.resolveStreamTopicNames?.(at.stream, at.topic)
+    if (currentNames?.stream !== names.stream || currentNames.topic !== names.topic) {
+      return undefined
+    }
+    const currentDetails = await this.transport.findSnapshotTopic?.(
+      currentNames.stream,
+      currentNames.topic
+    )
+    if (
+      currentDetails?.id !== details.id ||
+      currentDetails.createdAtMicros !== details.createdAtMicros
+    ) {
+      return undefined
+    }
+    const decoded = decodeAgentMessage({ ...message, partitionId: at.partition })
+    if (decoded.kind === "error") throw decoded.error
+    return {
+      id: { partitionId: at.partition, offset: at.offset },
+      provenance: decoded.message.provenance,
+      payload: message.payload,
+      ...(decoded.message.envelope !== undefined ? { envelope: decoded.message.envelope } : {}),
+      topic: names.topic,
+      timestampMicros: message.timestampMicros ?? 0n,
+      streamId: at.stream,
+      topicId: at.topic
     }
   }
 
@@ -1214,9 +1568,45 @@ export class Laser implements AsyncDisposable {
       at.partitionId
     )
     if (offset === undefined) return { kind: "notYetConsumed", behindBy: at.offset + 1n }
-    return offset.storedOffset >= at.offset
-      ? { kind: "consumed", committed: offset.storedOffset, head: offset.currentOffset }
-      : { kind: "notYetConsumed", behindBy: at.offset - offset.storedOffset }
+    if (offset.storedOffset < at.offset)
+      return { kind: "notYetConsumed", behindBy: at.offset - offset.storedOffset }
+    const dispatch =
+      consumer.kind === "group" ? await this.dispatchAt(consumer.name, names, at) : undefined
+    return dispatch !== undefined && dispatch !== "work"
+      ? { kind: "skipped", committed: offset.storedOffset, head: offset.currentOffset, dispatch }
+      : { kind: "consumed", committed: offset.storedOffset, head: offset.currentOffset }
+  }
+
+  // How the agent named by `group` classifies the record at `at`, or
+  // `undefined` when the record is gone, does not decode, or the group is not
+  // an agent.
+  private async dispatchAt(
+    group: string,
+    names: { readonly stream: string; readonly topic: string },
+    at: LogPosition
+  ): Promise<Dispatch | undefined> {
+    let me: WireAgentId
+    try {
+      me = parseAgentId(group)
+    } catch {
+      return undefined
+    }
+    const records = await this.transport.pollMessages(
+      names.stream,
+      names.topic,
+      { kind: "single", partitionId: at.partitionId },
+      { kind: "offset", value: at.offset },
+      1,
+      false
+    )
+    const record = records.find((candidate) => candidate.offset === at.offset)
+    if (record === undefined) return undefined
+    const decoded = decodeAgentMessage(record, (1n << 64n) - 1n)
+    if (decoded.kind !== "message") return undefined
+    const { envelope, provenance } = decoded.message
+    if (envelope !== undefined) return classify(envelope, names.topic, me, "any")
+    const target = provenance.targetAgentId?.asStr()
+    return target !== undefined && target !== me ? "foreign" : "work"
   }
 
   async redriveDeadLetter(capsule: AgentDeadLetter): Promise<void> {
@@ -1277,10 +1667,32 @@ export class Laser implements AsyncDisposable {
     }
     const correlationId = provenance.correlationId ?? ConversationId.new().toString()
     const correlated = { ...provenance, correlationId }
-    const hub = await this.replyHub(replyTopic)
-    const ticket = hub.subscribe(correlationId, correlated.targetAgentId?.asStr())
+    const listenTopic = this.replyTopicFor(replyTopic, correlated.agent)
+    const sendTopic =
+      this.defaultStream === undefined
+        ? requestTopic
+        : this.agentTopicFor(this.defaultStream, requestTopic, correlated)
+    const hub = await this.replyHub(listenTopic)
+    const ticket = hub.subscribe(correlationId, correlated.targetAgentId?.asStr(), true, {
+      session: correlated.conversationId,
+      ...(correlated.agent !== undefined ? { requester: correlated.agent.asStr() } : {})
+    })
     try {
-      await this.sendAgent(requestTopic, payload, correlated)
+      const sent = await this.sendAgentWithKind(
+        requestTopic,
+        payload,
+        correlated,
+        {},
+        ActionKind.Request
+      )
+      const confirmation = sent.confirmations[0]
+      if (confirmation === undefined)
+        throw new ProtocolError("request send had no committed message address")
+      ticket.arm(
+        sendTopic === listenTopic
+          ? { partitionId: confirmation.partitionId, offset: confirmation.baseOffset }
+          : undefined
+      )
     } catch (error) {
       ticket.cancel()
       throw error
@@ -1392,16 +1804,22 @@ export class Laser implements AsyncDisposable {
     return hub
   }
 
+  /** Start a query against an operational index, sent as `resourceName`
+   * names it. */
   query(index: string): QueryRequest {
     return this.queryTarget({ kind: "operational", index })
   }
 
+  /** Start a query against an explicit operational or lakehouse target. An
+   * operational index is sent as `resourceName` names it. */
   queryTarget(target: QueryTarget): QueryRequest {
+    const scope = this.resourceScopeOf()
     return QueryRequest.create(
-      target,
+      target.kind === "operational" ? { ...target, index: scope.name(target.index) } : target,
       (query) => this.executeQuery(query),
       (executionId) => this.queryStatus(executionId),
-      (executionId) => this.cancelQuery(executionId)
+      (executionId) => this.cancelQuery(executionId),
+      scope
     )
   }
 
@@ -1439,27 +1857,37 @@ export class Laser implements AsyncDisposable {
         ...(transport.clusterNodeCount !== undefined
           ? { clusterNodeCount: transport.clusterNodeCount.bind(transport) }
           : {}),
+        ...(transport.publishOptions !== undefined
+          ? { publishOptions: transport.publishOptions.bind(transport) }
+          : {}),
         ...(transport.openCoordinator !== undefined
           ? { openCoordinator: transport.openCoordinator.bind(transport) }
           : {}),
         ...(transport.connectsNodes !== undefined ? { connectsNodes: transport.connectsNodes } : {})
       },
       capabilities: () => this.capabilities(),
-      refreshCapabilities: () => this.refreshCapabilities()
+      refreshCapabilities: () => this.refreshCapabilities(),
+      scope: this.resourceScopeOf()
     }
   }
 
+  /** A handle to the managed key-value store, scoped to `namespace`. The
+   * namespace is sent as `resourceName` names it. */
   kv(namespace: string): Kv {
     return Kv.create(
       this.managedTransport(),
       () => this.capabilities(),
       namespace,
-      this.shared.leases
+      this.shared.leases,
+      this.resourceScopeOf()
     )
   }
 
+  /** Every KV namespace that holds at least one entry for this caller. A
+   * handle that scopes its resources to a stream lists only that stream's
+   * namespaces, under the names the caller gave them. */
   async kvNamespaces(): Promise<readonly KvNamespaceInfo[]> {
-    return Kv.namespaces(this.managedTransport(), () => this.capabilities())
+    return Kv.namespaces(this.managedTransport(), () => this.capabilities(), this.resourceScopeOf())
   }
 
   async executeBatch(ops: readonly BatchItem[]): Promise<readonly Uint8Array[]> {
@@ -1467,51 +1895,77 @@ export class Laser implements AsyncDisposable {
     return executeBatch(this.managedTransport(), capabilities, ops)
   }
 
+  /** A handle to one fork by id. The id is sent as `resourceName` names it. */
   fork(forkId: string): ForkHandle {
-    return ForkHandle.create(this.managedTransport(), () => this.capabilities(), forkId)
+    return ForkHandle.create(
+      this.managedTransport(),
+      () => this.capabilities(),
+      forkId,
+      this.resourceScopeOf()
+    )
   }
 
+  /** Every open fork for the authenticated user. A handle that scopes its
+   * resources to a stream lists only that stream's forks, under the ids the
+   * caller gave them. */
   async forks(): Promise<readonly ForkInfo[]> {
-    return ForkHandle.forks(this.managedTransport(), () => this.capabilities())
+    return ForkHandle.forks(
+      this.managedTransport(),
+      () => this.capabilities(),
+      this.resourceScopeOf()
+    )
   }
 
   projections(): Projections {
     return Projections.create(
       this.managedTransport(),
       () => this.capabilities(),
-      (command) => this.publishControl(command)
+      (command, stream) => this.publishControl(command, stream),
+      this.resourceScopeOf()
     )
   }
 
   bindings(): Bindings {
-    return Bindings.create((command) => this.publishControl(command))
+    return Bindings.create(
+      (command, stream) => this.publishControl(command, stream),
+      this.resourceScopeOf()
+    )
   }
 
   schemas(): Schemas {
     return Schemas.create(
       this.managedTransport(),
       () => this.capabilities(),
-      (command) => this.publishControl(command)
-    )
-  }
-
-  runs(): Runs {
-    return Runs.create(
-      this.managedTransport(),
-      () => this.capabilities(),
-      (command) => this.publishControl(command)
+      (command, stream) => this.publishControl(command, stream),
+      this.resourceScopeOf()
     )
   }
 
   watch(): Watch {
     return Watch.create(
       () => this.capabilities(),
-      () => this.stream(this.opsStream).topic(this.changesTopic).replay()
+      async () => {
+        // Under stream tenancy each stream's change feed rides its own ops
+        // topic, so a scoped handle reads its stream's topic.
+        const stream = this.resourceStream()
+        const topic =
+          stream !== undefined && (await this.capabilities()).streamTenancy
+            ? streamOpsTopic(stream, CHANGES_TOPIC)
+            : this.changesTopic
+        return this.stream(this.opsStream).topic(topic).replay()
+      },
+      this.resourceScopeOf()
     )
   }
 
   graph(name: string): GraphHandle {
-    return GraphHandle.create(this.managedTransport(), () => this.capabilities(), name)
+    return GraphHandle.create(
+      this.managedTransport(),
+      () => this.capabilities(),
+      name,
+      undefined,
+      this.resourceScopeOf()
+    )
   }
 
   async whoami(): Promise<WhoamiReply> {
@@ -1569,11 +2023,12 @@ export class Laser implements AsyncDisposable {
     )
   }
 
-  private async publishControl(command: ControlCommand): Promise<void> {
+  private async publishControl(command: ControlCommand, stream?: string): Promise<void> {
     const envelope = {
       v: CONTROL_OP_VERSION,
       timestampMicros: BigInt(Date.now()) * 1000n,
-      command
+      command,
+      ...(stream !== undefined ? { stream } : {})
     }
     const payload = encodeNamed(encodeControlEnvelope(envelope))
     await this.stream(this.opsStream)
@@ -1696,6 +2151,7 @@ export class Laser implements AsyncDisposable {
         )
       }
       this.shared.replyHubs.clear()
+      this.shared.sessionLeases.close()
       await this.shared.leases.close()
       await closeProducerStatistics(this.transport)
       await this.observe("laser.close", { operation: "close" }, () => this.transport.close())
@@ -1703,8 +2159,24 @@ export class Laser implements AsyncDisposable {
     await this.shared.closing
   }
 
-  /** Delegates async disposal to `close()`. */
+  /**
+   * Closes the connection when this is the root `Laser` from `connect*()` or
+   * `builder()`. A view from `withDefaultStream` or another `with*` method only
+   * borrows the connection, so disposing it is a no-op. Rust and Python close
+   * when the last handle is dropped, which JavaScript cannot observe, so the
+   * root owns the connection here.
+   */
   [Symbol.asyncDispose](): Promise<void> {
     return this.ownsClosure ? this.close() : Promise.resolve()
   }
+}
+
+/** Every record on a shared session topic carries `agdx.to`, `*` when the
+ * caller named no target, so a role group bound to the addressee filter on a
+ * deployment that serves group-aware reads still receives it. Open Apache Iggy
+ * classifies on the client and already delivered untargeted records. Other
+ * topics keep the caller's headers verbatim. */
+function stampBroadcastAddressee(headers: Map<string, HeaderValue>, topic: string): void {
+  if (topic !== AGENT_SESSIONS && topic !== AGENT_CONTROL) return
+  if (!headers.has(TARGET_AGENT_ID)) headers.set(TARGET_AGENT_ID, { kind: "string", value: "*" })
 }

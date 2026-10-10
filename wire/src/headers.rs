@@ -66,6 +66,12 @@ pub const CONVERSATION_ID: &str = "gen_ai.conversation.id";
 pub const CONVERSATION_FIELD: &str = "conversation_id";
 /// Header key: the producing agent's id.
 pub const AGENT_ID: &str = "gen_ai.agent.id";
+/// Header key: model requested for this call.
+pub const REQUEST_MODEL: &str = "gen_ai.request.model";
+/// Header key: model that answered this call.
+pub const RESPONSE_MODEL: &str = "gen_ai.response.model";
+/// Header key: provider that served this call.
+pub const PROVIDER_NAME: &str = "gen_ai.provider.name";
 /// Header key: LLM input/prompt tokens.
 pub const USAGE_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
 /// Header key: LLM output/completion tokens.
@@ -104,3 +110,167 @@ pub const MEMORY_NAMESPACE: &str = "agdx.mem.ns";
 pub const MEMORY_USER: &str = "agdx.mem.user";
 /// Header key: the app scope layer. Unscoped recall widens across it.
 pub const MEMORY_APP: &str = "agdx.mem.app";
+
+/// One typed user-header value as a record carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HeaderField {
+    Text(String),
+    Uint8(u8),
+    Uint32(u32),
+    Uint64(u64),
+    Float64(f64),
+}
+
+/// Who a record is addressed to. Broadcast rides `agdx.to` as the literal `*`
+/// and is never read as an agent id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Addressee {
+    Agent(crate::agent::AgentId),
+    Broadcast,
+}
+
+impl Addressee {
+    /// The `agdx.to` text.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Agent(agent) => agent.as_str(),
+            Self::Broadcast => BROADCAST,
+        }
+    }
+
+    /// Read an `agdx.to` value. `*` is broadcast, anything else must be an
+    /// agent id.
+    pub fn parse(text: &str) -> Result<Self, crate::error::InvalidError> {
+        if text == BROADCAST {
+            return Ok(Self::Broadcast);
+        }
+        text.parse()
+            .map(Self::Agent)
+            .map_err(|_| crate::error::InvalidError::new("agdx.to is not an agent id or `*`"))
+    }
+}
+
+/// The `agdx.to` value that addresses every agent.
+pub const BROADCAST: &str = "*";
+
+/// The routing and provenance headers of one record. Envelope records carry
+/// the envelope version and content type. Generic records do not. Ids ride as
+/// canonical strings and numbers ride typed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordHeaders {
+    pub envelope: Option<(u32, crate::content::ContentType)>,
+    pub conversation: crate::agent::ConversationId,
+    pub parent: Option<crate::agent::ConversationId>,
+    pub root: Option<crate::agent::ConversationId>,
+    pub agent: Option<crate::agent::AgentId>,
+    pub addressee: Option<Addressee>,
+    pub causal_parent: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub correlation: Option<String>,
+    pub fence: Option<u64>,
+    pub deadline_micros: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
+impl RecordHeaders {
+    /// Headers of a generic record in `conversation`.
+    pub fn new(conversation: crate::agent::ConversationId) -> Self {
+        Self {
+            envelope: None,
+            conversation,
+            parent: None,
+            root: None,
+            agent: None,
+            addressee: None,
+            causal_parent: None,
+            idempotency_key: None,
+            correlation: None,
+            fence: None,
+            deadline_micros: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+        }
+    }
+
+    /// Headers of an envelope record: version, content type, conversation,
+    /// ancestry, author, and addressee. A record without a target is
+    /// addressed to every agent when `broadcast` is set, as every record on a
+    /// shared session topic must be.
+    pub fn for_envelope(
+        envelope: &crate::agent::AgentEnvelope,
+        content_type: crate::content::ContentType,
+        broadcast: bool,
+    ) -> Self {
+        let mut headers = Self::new(envelope.conversation);
+        headers.envelope = Some((crate::codes::AGENT_OP_VERSION, content_type));
+        headers.parent = envelope.parent;
+        headers.root = envelope.root;
+        headers.agent = Some(envelope.source.clone());
+        headers.addressee = match &envelope.target {
+            Some(target) => Some(Addressee::Agent(target.clone())),
+            None if broadcast => Some(Addressee::Broadcast),
+            None => None,
+        };
+        headers
+    }
+
+    /// The header block, sorted by key.
+    pub fn encode(&self) -> Vec<(&'static str, HeaderField)> {
+        let text = |value: &dyn std::fmt::Display| HeaderField::Text(value.to_string());
+        let mut block = Vec::new();
+        if let Some((version, content_type)) = self.envelope {
+            block.push((AGENT_VERSION, HeaderField::Uint32(version)));
+            block.push((CONTENT_TYPE, HeaderField::Uint8(content_type.code())));
+        }
+        block.push((CONVERSATION_ID, text(&self.conversation)));
+        let optional: [(&'static str, Option<HeaderField>); 12] = [
+            (PARENT_CONVERSATION_ID, self.parent.map(|id| text(&id))),
+            (ROOT_CONVERSATION_ID, self.root.map(|id| text(&id))),
+            (
+                AGENT_ID,
+                self.agent
+                    .as_ref()
+                    .map(|agent| HeaderField::Text(agent.as_str().to_owned())),
+            ),
+            (
+                TARGET_AGENT_ID,
+                self.addressee
+                    .as_ref()
+                    .map(|to| HeaderField::Text(to.as_str().to_owned())),
+            ),
+            (
+                CAUSAL_PARENT,
+                self.causal_parent.clone().map(HeaderField::Text),
+            ),
+            (
+                IDEMPOTENCY_KEY,
+                self.idempotency_key.clone().map(HeaderField::Text),
+            ),
+            (
+                CORRELATION_ID,
+                self.correlation.clone().map(HeaderField::Text),
+            ),
+            (FENCE, self.fence.map(HeaderField::Uint64)),
+            (DEADLINE, self.deadline_micros.map(HeaderField::Uint64)),
+            (
+                USAGE_INPUT_TOKENS,
+                self.input_tokens.map(HeaderField::Uint64),
+            ),
+            (
+                USAGE_OUTPUT_TOKENS,
+                self.output_tokens.map(HeaderField::Uint64),
+            ),
+            (COST_USD, self.cost_usd.map(HeaderField::Float64)),
+        ];
+        block.extend(
+            optional
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        block.sort_by(|left, right| left.0.cmp(right.0));
+        block
+    }
+}

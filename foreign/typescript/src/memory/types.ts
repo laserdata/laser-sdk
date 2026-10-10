@@ -5,7 +5,7 @@ import { ConversationId } from "../types/ids.js"
 import type { AgentId } from "../types/ids.js"
 import { contentId } from "../wire/hashing.js"
 import { crockfordDecode, crockfordEncode } from "../wire/ids.js"
-import type { SourceRef } from "../wire/graph.js"
+import type { ProducerInfo, SourceRef } from "../wire/graph.js"
 
 export const MemoryKind = {
   Fact: "fact",
@@ -125,6 +125,12 @@ export interface MemoryScope {
   readonly conversation?: ConversationId
   readonly app?: string
   readonly lifetime?: Lifetime
+  /** The session record that motivated a remembered item. Written with the
+   * item, never used to filter recall. */
+  readonly origin?: SourceRef
+  /** The component that produced a remembered item. Written with the item,
+   * never used to filter recall. */
+  readonly producer?: ProducerInfo
 }
 
 export interface RecallSignal {
@@ -145,6 +151,10 @@ export interface MemoryItem {
   readonly score?: number
   readonly signals: readonly RecallSignal[]
   readonly source?: SourceRef
+  /** The session record that motivated the item, when it was remembered with one. */
+  readonly origin?: SourceRef
+  /** The component that produced the item, when it was remembered with one. */
+  readonly producer?: ProducerInfo
 }
 
 /** The memory item payload as UTF-8, lossy. */

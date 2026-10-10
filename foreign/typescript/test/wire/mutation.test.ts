@@ -32,6 +32,20 @@ void test("given_the_mutation_command_fixture_when_decoded_then_should_preserve_
   )
 })
 
+void test("given_a_scoped_mutation_command_when_decoded_then_should_keep_the_trusted_scope", async () => {
+  const bytes = await fixtureBytes("mutation_command_scoped.bin")
+  const envelope = decodeMutationCommandEnvelope(
+    expectMap(decodeOne(bytes, "mutation_command_scoped"), "mutation_command_scoped"),
+    "mutation_command_scoped"
+  )
+  assert.equal(envelope.scope?.streamId, 0)
+  assert.equal(envelope.scope.streamCreatedAtMicros, 1_700_000_000_000_000n)
+  assert.deepEqual(
+    Buffer.from(encodeNamed(encodeMutationCommandEnvelope(envelope))),
+    Buffer.from(bytes)
+  )
+})
+
 void test("given_the_managed_request_fixture_when_decoded_then_should_preserve_operation_identity", async () => {
   const bytes = await fixtureBytes("managed_request.bin")
   const envelope = decodeManagedRequestEnvelope(

@@ -180,8 +180,7 @@ pub struct ContractBuilder<'a> {
     deadline: Duration,
     fence: Option<u64>,
     conversation: Option<ConversationId>,
-    #[cfg(feature = "runs")]
-    registered: bool,
+    parent: Option<(ConversationId, ConversationId)>,
 }
 
 impl Laser {
@@ -197,13 +196,12 @@ impl Laser {
             from: None,
             payload: Vec::new(),
             inbox_route: InboxRoute::default(),
-            reply_topic: AgentTopic::Responses,
+            reply_topic: AgentTopic::Sessions,
             expiry: None,
             deadline: Duration::from_secs(30),
             fence: None,
             conversation: None,
-            #[cfg(feature = "runs")]
-            registered: false,
+            parent: None,
         }
     }
 }
@@ -230,7 +228,7 @@ impl ContractBuilder<'_> {
     }
 
     /// The topic the contract awaits the reply on (default
-    /// [`AgentTopic::Responses`]). Must be where the target replies and acks.
+    /// [`AgentTopic::Sessions`]). Must be where the target replies and acks.
     pub fn reply_on(mut self, reply_topic: AgentTopic<'static>) -> Self {
         self.reply_topic = reply_topic;
         self
@@ -288,17 +286,19 @@ impl ContractBuilder<'_> {
         self
     }
 
-    /// Register this contract in the managed run registry: [`send`](Self::send)
-    /// submits it before the command publish (the backend content-addresses the
-    /// run identity, so a retried send converges), stamps the pinned `run`
-    /// metadata key on the command and on the lifecycle status records the
-    /// contract emits, and reports the terminal state. Requires the
-    /// `agent_workflow` capability: when the plane does not serve the registry,
-    /// `send()` fails with the typed unsupported before any publish. An
-    /// unregistered contract stamps nothing and stays byte-identical on the log.
-    #[cfg(feature = "runs")]
-    pub fn registered(mut self) -> Self {
-        self.registered = true;
+    /// Run the contract as a child session of `parent`, in the tree rooted at
+    /// `root` (the parent itself when it has no parent). [`send`](Self::send)
+    /// writes the child's submitted start on `agent.sessions` before the
+    /// command, stamps the ancestry on the command, and ends the child by the
+    /// outcome: completed on a reply, failed otherwise. A lifecycle record
+    /// that fails to publish surfaces as the error unless the contract itself
+    /// already erred.
+    pub fn parent(
+        mut self,
+        parent: crate::types::ConversationId,
+        root: crate::types::ConversationId,
+    ) -> Self {
+        self.parent = Some((parent.into(), root.into()));
         self
     }
 
@@ -309,14 +309,6 @@ impl ContractBuilder<'_> {
         let source = self.from.clone().ok_or_else(|| {
             LaserError::Invalid("a contract requires `.from(source agent id)`".to_owned())
         })?;
-        #[cfg(feature = "runs")]
-        if self.registered && !self.laser.capabilities().await.agent_workflow {
-            return Err(LaserError::unsupported_feature(
-                "contract",
-                "agent_workflow",
-                "a registered contract requires a plane that serves the run registry",
-            ));
-        }
         #[cfg(feature = "sign")]
         let expected_principal = self.router.required_principal();
         let (target, inbox) = self.resolve().await?;
@@ -327,29 +319,30 @@ impl ContractBuilder<'_> {
         let conversation = self.conversation.unwrap_or_else(ConversationId::mint);
         let correlation = CorrelationId::mint();
 
-        // Register before the command publish: the run row exists before any
-        // delivery, and the backend converges a retried submit on the same run.
-        #[cfg(feature = "runs")]
-        let registered_run = if self.registered {
-            let info = laser
-                .runs()
-                .submit_with(
-                    target.to_string(),
-                    None,
-                    Some(self.payload.clone()),
-                    std::collections::BTreeMap::new(),
+        // A child session's start lands before its command, so a reader never
+        // sees work for a session that does not exist yet.
+        let child = match self.parent {
+            Some((parent, root)) => Some(
+                start_child(
+                    laser,
+                    &source.wire_id(),
+                    &target.wire_id(),
+                    conversation,
+                    parent,
+                    root,
                 )
-                .await?;
-            Some(info.run_id)
-        } else {
-            None
+                .await?,
+            ),
+            None => None,
         };
 
         // Seed the reply reader at the topic tail BEFORE sending, so it reads only
         // the ack and the reply, never the topic's history. Under a verifier the
         // reply signer must be the route's authenticated principal when one was
         // required, otherwise the resolved target's enrolled identity.
-        let mut reader = laser.agdx_reply_reader(self.reply_topic.clone()).await?;
+        let mut reader = laser
+            .agdx_reply_reader(self.reply_topic.clone(), Some(&source.wire_id()))
+            .await?;
         #[cfg(feature = "sign")]
         {
             reader.expected_signer = Some(
@@ -375,9 +368,13 @@ impl ContractBuilder<'_> {
                 laser_wire::query::Value::Uint(fence),
             );
         }
-        #[cfg(feature = "runs")]
-        if let Some(run) = registered_run.as_deref() {
-            command = command.with_metadata(laser_wire::agent::METADATA_RUN, run);
+        if let Some((parent, root)) = self.parent {
+            command = command
+                .with_ancestry(Some(parent), Some(root))
+                .with_metadata(
+                    laser_wire::agent::METADATA_SUBMITTED,
+                    laser_wire::query::Value::Bool(true),
+                );
         }
         if let Some(expiry) = expiry {
             let at = SystemClock
@@ -387,47 +384,18 @@ impl ContractBuilder<'_> {
         }
         command.send().await?;
 
-        #[cfg(feature = "runs")]
-        if let Some(run) = registered_run.as_deref() {
-            crate::agent::workflow::mark_run(
-                laser,
-                &source,
-                conversation,
-                run,
-                laser_wire::agent::TaskState::Working,
-                None,
-            )
-            .await?;
-        }
-
         let outcome = watch_terminal(laser, &mut reader, correlation, expiry, deadline).await;
 
-        // Report the terminal state before returning. A mark that fails to
-        // publish surfaces as the error (the registered contract includes the
-        // reporting), except when the contract itself already erred.
-        #[cfg(feature = "runs")]
-        if let Some(run) = registered_run.as_deref() {
-            use laser_wire::agent::TaskState;
-            let (state, detail) = match &outcome {
-                Ok(Contract::Completed(_)) => (TaskState::Completed, None),
-                Ok(Contract::Failed(_)) => (
-                    TaskState::Failed,
-                    Some("the target replied with a terminal error".to_owned()),
-                ),
-                Ok(Contract::NotConsumed) => (
-                    TaskState::Failed,
-                    Some("the command was not consumed within the expiry".to_owned()),
-                ),
-                Ok(Contract::TimedOut) => (
-                    TaskState::Failed,
-                    Some("no terminal reply landed within the deadline".to_owned()),
-                ),
-                Err(error) => (TaskState::Failed, Some(error.to_string())),
+        // End the child by the outcome before returning. A lifecycle record that
+        // fails to publish surfaces as the error, except when the contract
+        // itself already erred.
+        if let Some(child) = child {
+            let ended = match &outcome {
+                Ok(Contract::Completed(_)) => child.end().await,
+                Ok(other) => child.fail(contract_failure(failure_reason(other))).await,
+                Err(error) => child.fail(contract_failure(error.to_string())).await,
             };
-            let marked =
-                crate::agent::workflow::mark_run(laser, &source, conversation, run, state, detail)
-                    .await;
-            if let (Ok(_), Err(error)) = (&outcome, marked) {
+            if let (Ok(_), Err(error)) = (&outcome, ended) {
                 return Err(error);
             }
         }
@@ -462,6 +430,63 @@ impl ContractBuilder<'_> {
             .inbox_route
             .resolve(&target, registry.inbox_for(&target))?;
         Ok((target, inbox))
+    }
+}
+
+// Write a child session's submitted start as `source` and return its lens.
+pub(crate) async fn start_child(
+    laser: &Laser,
+    source: &laser_wire::agent::AgentId,
+    target: &laser_wire::agent::AgentId,
+    conversation: ConversationId,
+    parent: ConversationId,
+    root: ConversationId,
+) -> Result<crate::agent::Session, LaserError> {
+    let sessions = laser.sessions();
+    let start = laser_wire::agent::SessionStart {
+        label: None,
+        namespace: None,
+        agent: target.clone(),
+        sdk: sessions.config().sdk_info().clone(),
+        parent: Some(parent),
+        root: Some(root),
+        idle_timeout_micros: Some(
+            u64::try_from(sessions.config().idle_timeout_value().as_micros()).unwrap_or(u64::MAX),
+        ),
+        budget: None,
+        tags: Vec::new(),
+    };
+    let session = sessions
+        .open(conversation.into())
+        .as_agent(source.clone())
+        .with_ancestry(Some(parent.into()), Some(root.into()));
+    session
+        .lane()?
+        .status(laser_wire::agent::OPERATION_SESSION)
+        .with_task_state(laser_wire::agent::TaskState::Submitted)
+        .body(laser_wire::framing::encode_named(&start)?)
+        .content_type(laser_wire::content::ContentType::Cbor)
+        .with_ancestry(Some(parent), Some(root))
+        .send()
+        .await?;
+    Ok(session)
+}
+
+fn failure_reason(outcome: &Contract) -> String {
+    match outcome {
+        Contract::Completed(_) => "completed".to_owned(),
+        Contract::Failed(_) => "the target replied with a terminal error".to_owned(),
+        Contract::NotConsumed => "the command was not consumed within the expiry".to_owned(),
+        Contract::TimedOut => "no terminal reply landed within the deadline".to_owned(),
+    }
+}
+
+fn contract_failure(message: String) -> laser_wire::agent::AgentErrorBody {
+    laser_wire::agent::AgentErrorBody {
+        code: laser_wire::agent::AgentErrorCode::Internal,
+        message: Some(message),
+        retryable: false,
+        detail: None,
     }
 }
 

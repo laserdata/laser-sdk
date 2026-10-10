@@ -50,6 +50,14 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 /// so it is bounded and control-character-free, while its charset stays open
 /// (namespaces legitimately carry `/`-style hierarchy).
 pub const MAX_NAMESPACE_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a session label.
+pub const MAX_SESSION_LABEL_BYTES: usize = 256;
+/// Most session ids one heartbeat record lists. A process with more leases in
+/// one stream splits them over several records.
+pub const MAX_HEARTBEAT_SESSIONS: usize = 2048;
+pub const MAX_STATE_PATCH_OPS: usize = 256;
+pub const MAX_STATE_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MANIFEST_FRAGMENTS: usize = 1024;
 /// Maximum lease holder identity length, in bytes. A holder id is a stable
 /// node or worker identifier that flows into lease matching and audit events,
 /// so it is required to be non-empty and length-bounded. Its charset is open.

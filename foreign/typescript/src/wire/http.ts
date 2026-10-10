@@ -33,11 +33,13 @@ import {
 } from "./query.js"
 import { decodeSourceRef, encodeSourceRef, type SourceRef } from "./graph.js"
 import { type ResultCode, resultCodeFromWord, resultCodeWord } from "./result.js"
+import { type SessionError, sessionErrorMessage, sessionErrorResultCode } from "./session.js"
 import { decodeWireTopology, encodeWireTopology, type WireTopology } from "./topology.js"
 import {
   bigIntToBytes16,
   bytes16ToBigInt,
   CheckpointRequestId,
+  type ConversationId,
   crockfordDecode,
   crockfordEncode,
   DestinationId,
@@ -90,7 +92,225 @@ export const KV_PATH = "/agdx/kv"
 export const FORKS_PATH = "/agdx/forks"
 export const GRAPHS_PATH = "/agdx/graphs"
 export const CLIENTS_PATH = "/agdx/clients"
-export const RUNS_PATH = "/agdx/runs"
+export const SESSIONS_PATH = "/agdx/sessions"
+/** `?limit=`: page size. */
+export const PARAM_LIMIT = "limit"
+/** `?cursor=`: opaque continuation token from the prior page. */
+export const PARAM_CURSOR = "cursor"
+/** `?status=` on a session list: one session status. */
+export const PARAM_STATUS = "status"
+/** `?agent=` on a session list: sessions this agent took part in. */
+export const PARAM_AGENT = "agent"
+/** `?text=` on a session list: a substring of the label or id. */
+export const PARAM_TEXT = "text"
+/** `?root=` on a session list: the root of the session tree. */
+export const PARAM_ROOT = "root"
+/** `?label_prefix=` on a session list: the start of the label. */
+export const PARAM_LABEL_PREFIX = "label_prefix"
+/** `?surface=` on session links: one link surface. */
+export const PARAM_SURFACE = "surface"
+/** `?after=` on session changes: the last change sequence already seen. */
+export const PARAM_AFTER = "after"
+/** `?total=` on a session list: also count every match. */
+export const PARAM_TOTAL = "total"
+/** `?fixed_frontier=` on session events: pin the fold frontier of the first
+ * page for a historical walk. */
+export const PARAM_FIXED_FRONTIER = "fixed_frontier"
+/** `?history_limit=` on session state: the most history rows to return. */
+export const PARAM_HISTORY_LIMIT = "history_limit"
+/** `?stream=` on the schema routes: the stream whose registry is addressed. */
+export const PARAM_STREAM = "stream"
+/** `?name_contains=` on a list: a substring of the name. */
+export const PARAM_NAME_CONTAINS = "name_contains"
+
+/** `GET /agdx/schemas` query. An absent `stream` lists the deployment-wide
+ * registry. */
+export interface SchemaListQuery {
+  readonly nameContains?: string
+  readonly stream?: string
+}
+
+/** `?stream=` on `GET`/`DELETE /agdx/schemas/{id}` and
+ * `POST /agdx/schemas/{id}/decode`: the stream whose registry holds the id.
+ * Absent addresses the deployment-wide registry. */
+export interface SchemaQuery {
+  readonly stream?: string
+}
+
+export function schemaListQueryParams(query: SchemaListQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_NAME_CONTAINS, query.nameContains)
+  setParam(params, PARAM_STREAM, query.stream)
+  return params
+}
+
+export function schemaQueryParams(query: SchemaQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_STREAM, query.stream)
+  return params
+}
+
+/** Filters for `GET /agdx/sessions/{stream}`. The stream is the path segment.
+ * A `limit` of zero or none leaves the page size to the server. */
+export interface SessionsQuery {
+  readonly status?: string
+  readonly root?: string
+  readonly labelPrefix?: string
+  readonly agent?: string
+  readonly text?: string
+  readonly cursor?: string
+  readonly limit?: number
+  readonly wantTotal?: boolean
+}
+
+/** Query of `GET /agdx/sessions/{stream}/{id}/events`. A `limit` of zero or
+ * none leaves the page size to the server. */
+export interface SessionEventsQuery {
+  readonly cursor?: string
+  readonly limit?: number
+  readonly fixedFrontier?: boolean
+}
+
+/** Query of `GET /agdx/sessions/{stream}/{id}/state`. A `historyLimit` of zero
+ * or none leaves the history size to the server. */
+export interface SessionStateQuery {
+  readonly historyLimit?: number
+}
+
+/** Query of `GET /agdx/sessions/{stream}/{id}/links`. */
+export interface SessionLinksQuery {
+  readonly surface?: string
+}
+
+/** Query of `GET /agdx/sessions/{stream}/changes`. A `limit` of zero or none
+ * leaves the page size to the server. */
+export interface SessionChangesQuery {
+  readonly after?: bigint
+  readonly limit?: number
+}
+
+export function sessionsQueryParams(query: SessionsQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_STATUS, query.status)
+  setParam(params, PARAM_ROOT, query.root)
+  setParam(params, PARAM_LABEL_PREFIX, query.labelPrefix)
+  setParam(params, PARAM_AGENT, query.agent)
+  setParam(params, PARAM_TEXT, query.text)
+  setParam(params, PARAM_CURSOR, query.cursor)
+  setParam(params, PARAM_LIMIT, query.limit)
+  if (query.wantTotal === true) params.set(PARAM_TOTAL, "true")
+  return params
+}
+
+export function decodeSessionsQuery(params: URLSearchParams): SessionsQuery {
+  const limit = u32Param(params, PARAM_LIMIT)
+  return {
+    ...stringParam(params, PARAM_STATUS, "status"),
+    ...stringParam(params, PARAM_ROOT, "root"),
+    ...stringParam(params, PARAM_LABEL_PREFIX, "labelPrefix"),
+    ...stringParam(params, PARAM_AGENT, "agent"),
+    ...stringParam(params, PARAM_TEXT, "text"),
+    ...stringParam(params, PARAM_CURSOR, "cursor"),
+    ...(limit !== undefined ? { limit } : {}),
+    wantTotal: boolParam(params, PARAM_TOTAL)
+  }
+}
+
+export function sessionEventsQueryParams(query: SessionEventsQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_CURSOR, query.cursor)
+  setParam(params, PARAM_LIMIT, query.limit)
+  if (query.fixedFrontier === true) params.set(PARAM_FIXED_FRONTIER, "true")
+  return params
+}
+
+export function decodeSessionEventsQuery(params: URLSearchParams): SessionEventsQuery {
+  const limit = u32Param(params, PARAM_LIMIT)
+  return {
+    ...stringParam(params, PARAM_CURSOR, "cursor"),
+    ...(limit !== undefined ? { limit } : {}),
+    fixedFrontier: boolParam(params, PARAM_FIXED_FRONTIER)
+  }
+}
+
+export function sessionStateQueryParams(query: SessionStateQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_HISTORY_LIMIT, query.historyLimit)
+  return params
+}
+
+export function decodeSessionStateQuery(params: URLSearchParams): SessionStateQuery {
+  const historyLimit = u32Param(params, PARAM_HISTORY_LIMIT)
+  return historyLimit !== undefined ? { historyLimit } : {}
+}
+
+export function sessionLinksQueryParams(query: SessionLinksQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  setParam(params, PARAM_SURFACE, query.surface)
+  return params
+}
+
+export function decodeSessionLinksQuery(params: URLSearchParams): SessionLinksQuery {
+  return stringParam(params, PARAM_SURFACE, "surface")
+}
+
+export function sessionChangesQueryParams(query: SessionChangesQuery): URLSearchParams {
+  const params = new URLSearchParams()
+  params.set(PARAM_AFTER, String(query.after ?? 0n))
+  setParam(params, PARAM_LIMIT, query.limit)
+  return params
+}
+
+export function decodeSessionChangesQuery(params: URLSearchParams): SessionChangesQuery {
+  const raw = params.get(PARAM_AFTER)
+  if (raw !== null && !/^\d+$/.test(raw)) {
+    throw new CodecError(
+      `query parameter ${PARAM_AFTER} must be an unsigned integer`,
+      "query",
+      PARAM_AFTER
+    )
+  }
+  const after = raw === null ? 0n : BigInt(raw)
+  if (after > 0xffff_ffff_ffff_ffffn) {
+    throw new CodecError(`query parameter ${PARAM_AFTER} must fit u64`, "query", PARAM_AFTER)
+  }
+  const limit = u32Param(params, PARAM_LIMIT)
+  return { after, ...(limit !== undefined ? { limit } : {}) }
+}
+
+/** The HTTP error body of a session read failure. */
+export function sessionErrorBody(error: SessionError): ErrorBody {
+  return { code: sessionErrorResultCode(error), message: sessionErrorMessage(error) }
+}
+
+function setParam(params: URLSearchParams, key: string, value: string | number | undefined): void {
+  if (value !== undefined) params.set(key, String(value))
+}
+
+function stringParam<Key extends string>(
+  params: URLSearchParams,
+  key: string,
+  name: Key
+): Readonly<Partial<Record<Key, string>>> {
+  const value = params.get(key)
+  return (value === null ? {} : { [name]: value }) as Readonly<Partial<Record<Key, string>>>
+}
+
+function u32Param(params: URLSearchParams, key: string): number | undefined {
+  const raw = params.get(key)
+  if (raw === null) return undefined
+  if (!/^\d+$/.test(raw) || Number(raw) > 0xffff_ffff) {
+    throw new CodecError(`query parameter ${key} must be an unsigned 32-bit integer`, "query", key)
+  }
+  return Number(raw)
+}
+
+function boolParam(params: URLSearchParams, key: string): boolean {
+  const raw = params.get(key)
+  if (raw === null || raw === "false") return false
+  if (raw === "true") return true
+  throw new CodecError(`query parameter ${key} must be true or false`, "query", key)
+}
 export const AUTHZ_WHOAMI_PATH = "/agdx/authz/whoami"
 export const AUTHZ_ROLES_PATH = "/agdx/authz/roles"
 export const FILTERS_PATH = "/agdx/filters"
@@ -131,11 +351,28 @@ export const kvEntryPath = (namespace: string, key: string): string =>
   `${kvNamespacePath(namespace)}/${key}`
 export const kvCasPath = (namespace: string, key: string): string =>
   `${kvEntryPath(namespace, key)}/cas`
-export const forkPath = (id: string): string => `${FORKS_PATH}/${id}`
+export const forkPath = (id: string): string => `${FORKS_PATH}/${pathSegment(id)}`
 export const forkPromotePath = (id: string): string => `${forkPath(id)}/promote`
 export const forkRowsPath = (id: string): string => `${forkPath(id)}/rows`
-export const runPath = (id: string): string => `${RUNS_PATH}/${id}`
-export const runCancelPath = (id: string): string => `${runPath(id)}/cancel`
+export function pathSegment(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`
+  )
+}
+
+export const sessionsPath = (stream: string): string => `${SESSIONS_PATH}/${pathSegment(stream)}`
+export const sessionChangesPath = (stream: string): string => `${sessionsPath(stream)}/changes`
+export const sessionPath = (stream: string, id: ConversationId): string =>
+  `${sessionsPath(stream)}/${pathSegment(id.toString())}`
+export const sessionEventsPath = (stream: string, id: ConversationId): string =>
+  `${sessionPath(stream, id)}/events`
+export const sessionStatePath = (stream: string, id: ConversationId): string =>
+  `${sessionPath(stream, id)}/state`
+export const sessionLinksPath = (stream: string, id: ConversationId): string =>
+  `${sessionPath(stream, id)}/links`
+export const sessionSourcesPath = (stream: string, id: ConversationId): string =>
+  `${sessionPath(stream, id)}/sources`
 export const destinationPath = (id: DestinationId): string =>
   `${DESTINATIONS_PATH}/${id.toString()}`
 export const destinationEnablePath = (id: DestinationId): string => `${destinationPath(id)}/enable`
@@ -215,7 +452,7 @@ export interface HttpCapabilities {
   readonly kv: KvCapsView
   readonly graph: boolean
   readonly fork: boolean
-  readonly agentWorkflow: boolean
+  readonly sessions: boolean
   readonly watch: boolean
   readonly authz: boolean
   readonly filters: FilterCapsView
@@ -1223,7 +1460,7 @@ export function decodeCapabilitiesJson(text: string): HttpCapabilities {
     },
     graph: field.optionalBoolean(map, "graph", context) ?? false,
     fork: field.requiredBoolean(map, "fork", context),
-    agentWorkflow: field.optionalBoolean(map, "agent_workflow", context) ?? false,
+    sessions: field.optionalBoolean(map, "sessions", context) ?? false,
     watch: field.optionalBoolean(map, "watch", context) ?? false,
     authz: field.optionalBoolean(map, "authz", context) ?? false,
     filters: decodeFilterCaps(field.optionalMap(map, "filters", context), `${context}.filters`),
@@ -1253,7 +1490,7 @@ export function encodeCapabilitiesJson(value: HttpCapabilities): string {
     ],
     ["graph", value.graph],
     ["fork", value.fork],
-    ["agent_workflow", value.agentWorkflow],
+    ["sessions", value.sessions],
     ["watch", value.watch],
     ["authz", value.authz],
     ["filters", encodeFilterCaps(value.filters)],

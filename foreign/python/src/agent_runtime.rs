@@ -1,7 +1,7 @@
 use crate::agent::{PyAgentMessage, PyProvenance};
 use crate::async_bridge::{HookLoop, PyHook, call_hook, future_into_py};
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, payload_bytes, ser_to_py};
+use crate::convert::{duration_ms, payload_bytes, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::{PyKeyRegistry, PySigningKey};
 use async_trait::async_trait;
@@ -64,13 +64,14 @@ pub(crate) fn inbox_route(fixed_inbox: Option<String>) -> PyResult<InboxRoute> {
 pub(crate) fn static_topic(name: String) -> PyResult<AgentTopic<'static>> {
     static INTERNED: OnceLock<Mutex<HashMap<String, &'static Identifier>>> = OnceLock::new();
     match name.as_str() {
-        "agent.commands" => return Ok(AgentTopic::Commands),
-        "agent.responses" => return Ok(AgentTopic::Responses),
-        "agent.tool_calls" => return Ok(AgentTopic::ToolCalls),
-        "agent.tool_results" => return Ok(AgentTopic::ToolResults),
-        "agent.llm_io" => return Ok(AgentTopic::LlmIo),
-        "agent.human_input" => return Ok(AgentTopic::HumanInput),
+        "agent.sessions" => return Ok(AgentTopic::Sessions),
+        "agent.streams" => return Ok(AgentTopic::Streams),
+        "agent.heartbeats" => return Ok(AgentTopic::Heartbeats),
+        "agent.control" => return Ok(AgentTopic::Control),
+        "agent.memory" => return Ok(AgentTopic::Memory),
         "agent.audit" => return Ok(AgentTopic::Audit),
+        "agent.registry" => return Ok(AgentTopic::Registry),
+        "agent.workflow_journal" => return Ok(AgentTopic::WorkflowJournal),
         "agent.dlq" => return Ok(AgentTopic::Dlq),
         _ => {}
     }
@@ -182,7 +183,7 @@ impl PyConversationState {
         init: Py<PyAny>,
         fold: Py<PyAny>,
         last_n: Option<usize>,
-        from_offsets: Option<BTreeMap<u32, u64>>,
+        from_offsets: Option<BTreeMap<String, BTreeMap<u32, u64>>>,
         from_checkpoint: Option<Py<PyAny>>,
         at: Option<Py<PyAny>>,
         full: bool,
@@ -390,6 +391,8 @@ impl AgentHandler for PyHandler {
         let py_message = PyAgentMessage::from_inner(message.clone());
         let py_ctx = PyAgentCtx {
             laser,
+            session: ctx.session(),
+            request_at: ctx.request_at(),
             agent: self.agent.clone(),
             respond_on: self.respond_on.clone(),
             message: message.clone(),
@@ -539,12 +542,14 @@ impl PyLaser {
     /// `governor_mode` (`"enforce"` | `"observe"`), replacing any
     /// connection-level governor for this agent. Returns a handle to await
     /// readiness and stop it. Requires a default stream.
-    /// `fixed_inbox` sets the handler's default fan-out route. `governor_retention=(capacity, idle_ttl_secs)` bounds evidence heads.
+    /// `fixed_inbox` sets the handler's default fan-out route. `governor_retention=(capacity, idle_ttl_ms)` bounds evidence heads.
     /// Capabilities accept skill names or descriptor dicts. Consolidation requires both `consolidate_every_ms` and `consolidator`.
     /// Each pass receives a scope dict that names this agent when it has an id and leaves every other field `None`.
     /// Shutdown cancels the active asynchronous consolidation callback and stops new passes.
     /// `agent_id=None` opens an unscoped reliable consumer and requires `consumer_group`. It cannot advertise capabilities.
-    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, poll_interval_ms=None, warm_dedup=false, dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None))]
+    /// `operations` lists the command operations the handler serves. Omit it to serve every operation.
+    /// `sessions` is a `Sessions` factory whose config the runtime applies: the lens `ctx.session()` opens and whether a dead letter fails its session.
+    #[pyo3(signature = (agent_id, listen_on, handler, *, consumer_group=None, respond_on=None, fixed_inbox=None, poll_interval_ms=None, warm_dedup=false, dedup=None, dedup_window=None, consolidate_every_ms=None, consolidator=None, capabilities=None, ack_on_pickup=false, health=None, max_partitions=None, max_queued_records=None, max_queued_bytes=None, understood_features=0, shutdown_grace_ms=None, dead_letter=None, middleware=None, retry_max_attempts=None, retry_base_delay_ms=None, governor=None, governor_mode="enforce", governor_retention=None, signing_key=None, verifier=None, operations=None, sessions=None))]
     #[allow(clippy::too_many_arguments)]
     fn spawn_agent(
         &self,
@@ -578,7 +583,10 @@ impl PyLaser {
         governor_retention: Option<(usize, f64)>,
         signing_key: Option<&PySigningKey>,
         verifier: Option<&PyKeyRegistry>,
+        operations: Option<Vec<String>>,
+        sessions: Option<&crate::session::PySessions>,
     ) -> PyResult<PyAgentHandle> {
+        let sessions = sessions.map(|sessions| sessions.inner.config().clone());
         let agent = agent_id
             .map(AgentId::new)
             .transpose()
@@ -587,10 +595,10 @@ impl PyLaser {
         // handler publishes through its ctx is governed (mirrors the Rust
         // `Agent::builder().governor(..)`).
         let retention = governor_retention
-            .map(|(capacity, idle_ttl_secs)| {
+            .map(|(capacity, idle_ttl_ms)| {
                 Ok::<_, PyErr>(laser_sdk::govern::GovernorRetention {
                     capacity,
-                    idle_ttl: duration_seconds(idle_ttl_secs, "governor idle ttl")?,
+                    idle_ttl: duration_ms(idle_ttl_ms, "governor idle_ttl_ms")?,
                 })
             })
             .transpose()?;
@@ -774,6 +782,8 @@ impl PyLaser {
                 .ack_on_pickup(ack_on_pickup)
                 .maybe_signing_key(signing_key)
                 .maybe_verifier(verifier)
+                .maybe_operations(operations)
+                .maybe_sessions(sessions)
                 .build()
                 .run(&laser, py_handler, ready_tx, shutdown_rx)
                 .await
@@ -794,10 +804,12 @@ impl PyLaser {
     /// presence command). Omit it to resolve each agent's advertised inbox.
     /// `expire_if_not_consumed_ms` lets an unpicked task expire, so a caller can
     /// tell `not_consumed` from `timed_out` (the agent must emit pickup status
-    /// with `ack_on_pickup`). `reply_on`, `conversation`, `fence`, and
-    /// `registered` mirror the Rust contract builder. Returns the terminal
+    /// with `ack_on_pickup`). `reply_on`, `conversation`, and `fence` mirror
+    /// the Rust contract builder. `parent` runs the contract as a child
+    /// session of that session id, in the tree rooted at `root` (the parent
+    /// when omitted). Returns the terminal
     /// `Contract`, whose `Completed` and `Failed` variants carry the reply.
-    #[pyo3(signature = (skill, payload, *, source, agent=None, deadline_ms=30_000, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, registered=false, policy=None))]
+    #[pyo3(signature = (skill, payload, *, source, agent=None, deadline_ms=30_000, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, parent=None, root=None, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn contract<'py>(
         &self,
@@ -813,7 +825,8 @@ impl PyLaser {
         reply_on: Option<String>,
         conversation: Option<String>,
         fence: Option<u64>,
-        registered: bool,
+        parent: Option<String>,
+        root: Option<String>,
         policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let request = ContractRequest::new(
@@ -828,7 +841,7 @@ impl PyLaser {
             reply_on,
             conversation,
             fence,
-            registered,
+            parent_pair(parent, root)?,
             policy,
         )?;
         let laser = self.inner.clone();
@@ -840,8 +853,9 @@ impl PyLaser {
 
     /// Scatter a directed task to every agent advertising `skill`, concurrently,
     /// and return the reply body of each that completed (a verifier or diagnostic
-    /// panel). Unavailable and quarantined agents are excluded.
-    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None, principal=None, policy=None))]
+    /// panel). Unavailable and quarantined agents are excluded. `deadline_ms` is
+    /// required and bounds the whole scatter.
+    #[pyo3(signature = (skill, payload, *, source, deadline_ms, fixed_inbox=None, principal=None, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn scatter<'py>(
         &self,
@@ -882,7 +896,7 @@ impl PyLaser {
     /// Scatter like [`scatter`](Self::scatter), but return every contracted
     /// agent's terminal outcome, not only the completed replies, so an all-failed
     /// scatter is a report of failures rather than an empty list.
-    #[pyo3(signature = (skill, payload, *, source, deadline_ms=30_000, fixed_inbox=None, principal=None, policy=None))]
+    #[pyo3(signature = (skill, payload, *, source, deadline_ms, fixed_inbox=None, principal=None, policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn scatter_report<'py>(
         &self,
@@ -964,8 +978,8 @@ impl PyLaser {
         crate::workflow::PyWorkflow::new(self.inner.clone(), name, fixed_inbox)
     }
 
-    /// Replay a conversation's history off the log: read `topics` (default the
-    /// command and response topics), order by timestamp, and apply a policy.
+    /// Replay a conversation's history off the log: read `topics` (default
+    /// `agent.sessions`), order by timestamp, and apply a policy.
     /// `roles` keeps only messages from those agents. Otherwise the last
     /// `last_n` messages are kept (default 50). `token_budget` then trims the
     /// selection to an estimated token count. Returns the selected messages.
@@ -1058,6 +1072,8 @@ impl PyLaser {
 #[pyclass(name = "AgentCtx")]
 pub struct PyAgentCtx {
     laser: Laser,
+    session: laser_sdk::agent::Session,
+    request_at: Option<laser_sdk::wire::agent::LogPosition>,
     agent: Option<AgentId>,
     respond_on: Option<String>,
     message: AgentMessage,
@@ -1074,16 +1090,31 @@ impl PyAgentCtx {
         PyAgentMessage::from_inner(self.message.clone())
     }
 
+    /// The session of the handled record, written as this agent and acting on
+    /// the handled record: graph writes take it as source and remembered
+    /// items as origin. A lens only: it holds no lease and starts no
+    /// heartbeat.
+    fn session(&self) -> crate::session::PySession {
+        crate::session::PySession::new(self.session.clone())
+    }
+
     /// The full client, for operations the ctx helpers do not cover (kv, query, ...).
     fn laser(&self) -> PyLaser {
         PyLaser::from_inner(self.laser.clone())
     }
 
     /// A child conversation of the handled message, linked by parent / root ids.
-    fn spawn_subconversation(&self) -> PyProvenance {
-        PyProvenance {
-            inner: self.laser.spawn_subconversation(&self.message.provenance),
-        }
+    fn spawn_subconversation(&self) -> PyResult<PyProvenance> {
+        let author = self.agent.as_ref().ok_or_else(|| {
+            to_pyerr(LaserError::HandlerConfig(
+                "spawn_subconversation: the agent has no id".to_owned(),
+            ))
+        })?;
+        Ok(PyProvenance {
+            inner: self
+                .laser
+                .spawn_subconversation(&self.message.provenance, author),
+        })
     }
 
     /// Resolve an AGDX request by publishing a correlated AGDX `response` on
@@ -1132,10 +1163,11 @@ impl PyAgentCtx {
     }
 
     /// Reply on the agent's configured respond_on topic, chaining causality and
-    /// routing back to the sender. An agent spawned with a signing key answers a
-    /// correlated AGDX command with a signed response instead, so a verifying
-    /// caller accepts this agent's terminal and no one else's. Raises ConfigError
-    /// if no respond_on was set.
+    /// routing back to the sender. A typed AGDX command gets a typed response:
+    /// correlated, addressed to the requester, caused by the request's log
+    /// position, and signed when the agent was spawned with a signing key. A
+    /// plain request gets a plain reply matched by its correlation. Raises
+    /// ConfigError if no respond_on was set.
     fn respond<'py>(
         &self,
         py: Python<'py>,
@@ -1147,28 +1179,30 @@ impl PyAgentCtx {
         let message = self.message.clone();
         let respond_on = self.respond_on.clone();
         let signing_key = self.signing_key.clone();
+        let request_at = self.request_at;
         future_into_py(py, async move {
             let name = respond_on.ok_or_else(|| to_pyerr(LaserError::NoRespondTopic))?;
-            if let Some(key) = &signing_key
-                && let Some(envelope) = &message.envelope
+            if let Some(envelope) = &message.envelope
                 && let Some(correlation) = envelope.correlation
             {
                 let source = agent
                     .as_ref()
                     .ok_or_else(|| {
                         to_pyerr(LaserError::HandlerConfig(
-                            "a signing agent must have an id".to_owned(),
+                            "a responding agent must have an id".to_owned(),
                         ))
                     })?
                     .wire_id();
-                let producer = laser.agdx(
-                    static_topic(name)?,
-                    source,
-                    message.provenance.conversation_id.into(),
-                );
-                let mut send = producer.respond(correlation, payload).signed_by(key);
-                if let Some(target) = &message.provenance.agent {
-                    send = send.with_target(target.wire_id());
+                let producer = laser.agdx(static_topic(name)?, source, envelope.conversation);
+                let mut send = producer
+                    .respond(correlation, payload)
+                    .with_target(envelope.source.clone())
+                    .with_ancestry(envelope.parent, envelope.root);
+                if let Some(record) = envelope.record {
+                    send = send.with_cause(record, request_at);
+                }
+                if let Some(key) = &signing_key {
+                    send = send.signed_by(key);
                 }
                 return send.send().await.map(|_| ()).map_err(to_pyerr);
             }
@@ -1182,6 +1216,14 @@ impl PyAgentCtx {
                 .await
                 .map_err(to_pyerr)
         })
+    }
+
+    /// Where the handled record sits on the log, as a `LogPosition`, when the
+    /// runtime knows it.
+    #[getter]
+    fn request_at(&self) -> Option<crate::agdx::PyLogPosition> {
+        self.request_at
+            .map(|inner| crate::agdx::PyLogPosition { inner })
     }
 
     /// Reply on an explicit topic, chained off the handled message.
@@ -1226,7 +1268,7 @@ impl PyAgentCtx {
     }
 
     /// Send a request and await its correlated reply (see Laser.request).
-    #[pyo3(signature = (request_topic, reply_topic, payload, provenance, *, timeout_secs=30.0))]
+    #[pyo3(signature = (request_topic, reply_topic, payload, provenance, *, timeout_ms))]
     fn request<'py>(
         &self,
         py: Python<'py>,
@@ -1234,7 +1276,7 @@ impl PyAgentCtx {
         reply_topic: String,
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
-        timeout_secs: f64,
+        timeout_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let payload = payload_bytes(payload)?;
@@ -1248,7 +1290,7 @@ impl PyAgentCtx {
                     AgentTopic::Custom(&reply_id),
                     payload,
                     &provenance,
-                    duration_seconds(timeout_secs, "timeout_secs")?,
+                    duration_ms(timeout_ms, "timeout_ms")?,
                 )
                 .await
                 .map_err(to_pyerr)?;
@@ -1257,25 +1299,25 @@ impl PyAgentCtx {
     }
 
     /// Fan out a task to every agent advertising `skill`, gathering replies under
-    /// `policy` within `deadline_ms`. `policy` is `"require_all"` (default, wait
+    /// `policy` within `deadline_ms`, which is required. `policy` is `"require_all"` (default, wait
     /// for every branch), `"quorum"` (stop once `quorum` branches succeed), or
     /// `"best_effort"` (take whatever landed by the deadline). Replies land on
     /// this handler's own `respond_on` topic, so the agent must have been spawned
-    /// with one. `fixed_inbox` routes every branch to a fixed topic instead of
-    /// each agent's advertised inbox. Returns a `Gather` of attributed replies
-    /// and failures. A target that resolves no inbox is a `failures` entry,
+    /// with one. Branches follow the agent's inbox route (`spawn_agent`
+    /// `fixed_inbox=`), and `principal` and `route_policy` refine the
+    /// capability selector, like Rust's `CapabilitySelector`. Returns a
+    /// `Gather` of attributed replies and failures. A target that resolves no inbox is a `failures` entry,
     /// never silently rerouted.
-    #[pyo3(signature = (skill, payload, *, policy="require_all", quorum=None, deadline_ms=30_000, fixed_inbox=None, principal=None, route_policy=None))]
+    #[pyo3(signature = (skill, payload, *, deadline_ms, policy="require_all", quorum=None, principal=None, route_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn fan_out<'py>(
         &self,
         py: Python<'py>,
         skill: String,
         payload: &Bound<'_, PyAny>,
+        deadline_ms: u64,
         policy: &str,
         quorum: Option<usize>,
-        deadline_ms: u64,
-        fixed_inbox: Option<String>,
         principal: Option<u32>,
         route_policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1287,10 +1329,7 @@ impl PyAgentCtx {
         let message = self.message.clone();
         let agent = self.agent.clone();
         let respond_on = self.respond_on.clone().map(static_topic).transpose()?;
-        let route = match fixed_inbox {
-            Some(topic) => inbox_route(Some(topic))?,
-            None => self.inbox_route.clone(),
-        };
+        let route = self.inbox_route.clone();
         let payload = payload_bytes(payload)?;
         let gather_policy = parse_gather_policy(policy, quorum)?;
         future_into_py(py, async move {
@@ -1314,16 +1353,16 @@ impl PyAgentCtx {
 
     /// Pause this handler on a human decision: publish `prompt` as an interrupt on
     /// the human-input topic and await the approver's correlated reply on
-    /// `reply_topic`, up to `timeout_secs`, chained to the handled conversation.
+    /// `reply_topic`, up to `timeout_ms`, chained to the handled conversation.
     /// Returns the decision body on approval, or raises on rejection (the
     /// approver answers with `respond_input`). The agent must have an id.
-    #[pyo3(signature = (reply_topic, prompt, *, timeout_secs=30.0))]
+    #[pyo3(signature = (reply_topic, prompt, *, timeout_ms))]
     fn approval_gate<'py>(
         &self,
         py: Python<'py>,
         reply_topic: String,
         prompt: &Bound<'_, PyAny>,
-        timeout_secs: f64,
+        timeout_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let message = self.message.clone();
@@ -1342,7 +1381,7 @@ impl PyAgentCtx {
                 .approval_gate(
                     static_topic(reply_topic)?,
                     prompt,
-                    duration_seconds(timeout_secs, "timeout_secs")?,
+                    duration_ms(timeout_ms, "timeout_ms")?,
                 )
                 .await
                 .map_err(to_pyerr)?;
@@ -1387,8 +1426,17 @@ pub fn agent_ctx(
         .map(AgentId::new)
         .transpose()
         .map_err(|e| to_pyerr(e.into()))?;
+    let mut session = laser
+        .inner
+        .sessions()
+        .open(message.inner.provenance.conversation_id);
+    if let Some(agent) = &agent {
+        session = session.as_agent(agent.wire_id());
+    }
     Ok(PyAgentCtx {
         laser: laser.inner.clone(),
+        session,
+        request_at: None,
         agent,
         respond_on,
         message: message.inner.clone(),
@@ -1566,8 +1614,39 @@ pub(crate) struct ContractRequest {
     reply_on: Option<AgentTopic<'static>>,
     conversation: Option<laser_sdk::types::ConversationId>,
     fence: Option<u64>,
-    registered: bool,
+    parent: Option<(
+        laser_sdk::types::ConversationId,
+        laser_sdk::types::ConversationId,
+    )>,
     route_failure: RouteFailure,
+}
+
+// The `parent=`/`root=` keywords of a contract: the root defaults to the
+// parent, and a root alone is refused.
+pub(crate) fn parent_pair(
+    parent: Option<String>,
+    root: Option<String>,
+) -> PyResult<
+    Option<(
+        laser_sdk::types::ConversationId,
+        laser_sdk::types::ConversationId,
+    )>,
+> {
+    let parse = |value: &str| {
+        laser_sdk::types::ConversationId::from_str(value).map_err(|e| to_pyerr(e.into()))
+    };
+    match (parent, root) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(crate::errors::InvalidError::new_err("root= needs parent=")),
+        (Some(parent), root) => {
+            let parent = parse(&parent)?;
+            let root = match root {
+                Some(root) => parse(&root)?,
+                None => parent,
+            };
+            Ok(Some((parent, root)))
+        }
+    }
 }
 
 impl ContractRequest {
@@ -1584,7 +1663,10 @@ impl ContractRequest {
         reply_on: Option<String>,
         conversation: Option<String>,
         fence: Option<u64>,
-        registered: bool,
+        parent: Option<(
+            laser_sdk::types::ConversationId,
+            laser_sdk::types::ConversationId,
+        )>,
         policy: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let ParsedRoutePolicy {
@@ -1627,7 +1709,7 @@ impl ContractRequest {
             reply_on: reply_on.map(static_topic).transpose()?,
             conversation,
             fence,
-            registered,
+            parent,
             route_failure,
         })
     }
@@ -1651,8 +1733,8 @@ impl ContractRequest {
         if let Some(fence) = self.fence {
             builder = builder.fence(fence);
         }
-        if self.registered {
-            builder = builder.registered();
+        if let Some((parent, root)) = self.parent {
+            builder = builder.parent(parent, root);
         }
         route_result(builder.send().await, &self.route_failure)
     }

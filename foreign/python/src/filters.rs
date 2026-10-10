@@ -317,6 +317,18 @@ impl PyConsumerFilter {
             .into())
     }
 
+    /// A copy whose `schema_refs` resolve in the schema registry of `stream`.
+    fn with_schema_stream(&self, stream: String) -> Self {
+        self.inner.clone().with_schema_stream(stream).into()
+    }
+
+    /// The stream whose schema registry resolves `schema_refs`, or None for
+    /// the deployment registry.
+    #[getter]
+    fn schema_stream(&self) -> Option<String> {
+        self.inner.schema_stream.clone()
+    }
+
     /// A copy with the malformed-payload policy: stop, pass, or drop.
     fn with_fault_policy(&self, fault_policy: &str) -> PyResult<Self> {
         Ok(self
@@ -770,11 +782,11 @@ impl PyFilteredReader {
         )
     }
 
-    /// How long this reader waits, in seconds, when nothing is new.
-    fn idle_interval<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// How long this reader waits, in milliseconds, when nothing is new.
+    fn idle_interval_ms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         future_into_py(py, async move {
-            Ok(state.lock().await.open()?.idle_interval().as_secs_f64())
+            Ok(state.lock().await.open()?.idle_interval().as_secs_f64() * 1000.0)
         })
     }
 

@@ -187,12 +187,11 @@ void test("given_never_expire_when_a_producer_provisions_then_should_create_the_
 void test("given_never_expire_and_an_expiry_when_a_producer_is_built_then_should_reject", () => {
   const { transport } = recordingProducerTransport()
   assert.throws(
-    () =>
-      Producer.create(transport, "fleet", "readings", { neverExpire: true, expireAfterMicros: 1n }),
+    () => Producer.create(transport, "fleet", "readings", { neverExpire: true, expireAfterMs: 1 }),
     InvalidError
   )
   assert.throws(
-    () => Producer.create(transport, "fleet", "readings", { expireAfterMicros: 0n }),
+    () => Producer.create(transport, "fleet", "readings", { expireAfterMs: 0 }),
     InvalidError
   )
 })
@@ -295,4 +294,16 @@ void test("given_a_json_record_when_a_cursor_polls_then_should_decode_its_payloa
     1
   )
   assert.throws(() => broken.json(), CodecError)
+})
+
+void test("given_both_unlimited_and_bounded_topic_size_when_configured_then_should_refuse_it", () => {
+  const transport = {} as LaserTransport
+  assert.throws(
+    () =>
+      Producer.create(transport, "fleet", "readings", {
+        unlimitedTopicSize: true,
+        maxTopicBytes: 1_024n
+      }),
+    InvalidError
+  )
 })

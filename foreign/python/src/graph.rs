@@ -123,6 +123,41 @@ pub struct PyGraph {
     laser: Laser,
     name: String,
     traversal: Traversal,
+    stamp: Stamp,
+}
+
+// What every upsert from this handle is linked to and stamped with. A handle
+// from `Session.linked_graph` opens the graph through its session, which
+// links the session and stamps its agent and current record.
+#[derive(Clone, Default)]
+struct Stamp {
+    linked: Option<laser_sdk::agent::Session>,
+    session: Option<laser_sdk::wire::agent::SessionRef>,
+    producer: Option<laser_sdk::wire::graph::ProducerInfo>,
+    source: Option<SourceRef>,
+}
+
+impl Stamp {
+    fn open<'a>(
+        &'a self,
+        laser: &'a Laser,
+        name: &str,
+    ) -> PyResult<laser_sdk::graph::GraphHandle<'a>> {
+        let mut graph = match &self.linked {
+            Some(session) => session.linked_graph(name).map_err(to_pyerr)?,
+            None => laser.graph(name),
+        };
+        if let Some(session) = &self.session {
+            graph = graph.in_session(session.clone());
+        }
+        if let Some(producer) = &self.producer {
+            graph = graph.produced_by(producer.clone());
+        }
+        if let Some(source) = &self.source {
+            graph = graph.sourced_from(source.clone());
+        }
+        Ok(graph)
+    }
 }
 
 impl PyGraph {
@@ -131,13 +166,50 @@ impl PyGraph {
             laser,
             name,
             traversal: Traversal::default(),
+            stamp: Stamp::default(),
         }
+    }
+
+    pub(crate) fn linked(session: laser_sdk::agent::Session, name: String) -> Self {
+        let mut graph = Self::new(session.scope().laser().clone(), name);
+        graph.stamp.linked = Some(session);
+        graph
     }
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyGraph {
+    /// Link every upsert to `session`, a `{"stream", "session"}` dict as
+    /// `Session.reference` returns.
+    fn in_session<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        session: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.stamp.session = Some(py_to_de(session)?);
+        Ok(slf)
+    }
+
+    /// Stamp `producer`, a `{"name", "version"}` dict, on every upserted
+    /// element that has none.
+    fn produced_by<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        producer: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.stamp.producer = Some(py_to_de(producer)?);
+        Ok(slf)
+    }
+
+    /// Stamp `source`, a source reference dict, on every upserted element
+    /// that has none.
+    fn sourced_from<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        source: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.stamp.source = Some(py_to_de(source)?);
+        Ok(slf)
+    }
+
     /// Narrow the traversal to elements the conversation asserted. Applies to
     /// `fetch` and `neighbors`.
     fn conversation(
@@ -285,9 +357,10 @@ impl PyGraph {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
+        let stamp = self.stamp.clone();
         future_into_py(py, async move {
-            laser
-                .graph(&name)
+            stamp
+                .open(&laser, &name)?
                 .link(from_, relation, to)
                 .await
                 .map_err(to_pyerr)
@@ -306,9 +379,10 @@ impl PyGraph {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
+        let stamp = self.stamp.clone();
         future_into_py(py, async move {
-            laser
-                .graph(&name)
+            stamp
+                .open(&laser, &name)?
                 .unlink(from_, relation, to)
                 .await
                 .map_err(to_pyerr)
@@ -328,9 +402,10 @@ impl PyGraph {
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
+        let stamp = self.stamp.clone();
         future_into_py(py, async move {
-            laser
-                .graph(&name)
+            stamp
+                .open(&laser, &name)?
                 .relink(from_, relation, to)
                 .await
                 .map_err(to_pyerr)
@@ -350,9 +425,10 @@ impl PyGraph {
         let edges: Vec<GraphEdge> = py_to_de(edges)?;
         let laser = self.laser.clone();
         let name = self.name.clone();
+        let stamp = self.stamp.clone();
         future_into_py(py, async move {
-            laser
-                .graph(name)
+            stamp
+                .open(&laser, &name)?
                 .upsert(nodes, edges)
                 .await
                 .map_err(to_pyerr)

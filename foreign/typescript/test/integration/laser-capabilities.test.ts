@@ -23,15 +23,20 @@ function probeObserver(onProbe: () => void): LaserObserver {
   }
 }
 
-void test("given_no_managed_plane_when_probing_capabilities_then_should_report_native_filters_not_managed", async (context) => {
+void test("given_no_managed_plane_when_refreshing_capabilities_then_should_preserve_the_detected_filter_profile", async (context) => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {
     const capabilities = await laser.capabilities()
     if (!openOnly(capabilities, context)) return
     assert.equal(capabilities.managed, false)
     assert.deepEqual(capabilities.backends, [])
-    assert.equal(capabilities.filters.native, true)
     assert.equal(capabilities.filters.catalog, false)
+    const refreshed = await laser.refreshCapabilities()
+    assert.equal(refreshed.managed, false)
+    assert.deepEqual(refreshed.backends, [])
+    assert.equal(refreshed.filters.native, capabilities.filters.native)
+    assert.equal(refreshed.filters.groupPolicyReads, capabilities.filters.groupPolicyReads)
+    assert.equal(refreshed.filters.catalog, false)
   } finally {
     await laser.close()
   }

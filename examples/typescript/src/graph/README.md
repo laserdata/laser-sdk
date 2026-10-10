@@ -1,4 +1,4 @@
-# graph - the relationships your messages imply
+# graph: the Graph primitive
 
 A graph connects entities through named relationships. This example writes a relationship and reads the neighboring entities.
 
@@ -25,4 +25,4 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:graph
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/graph
-- Full system built on this primitive: [`memory`](../memory) - the same graph primitive used alongside durable memory in one woven scenario.
+- Full system built on this primitive: [`memory`](../memory): the same graph primitive used alongside durable memory in one woven scenario.

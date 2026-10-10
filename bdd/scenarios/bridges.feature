@@ -25,3 +25,14 @@ Feature: External protocols preserve AGDX lifecycle
   Scenario: A chunked chat renders a complete AG-UI stream
     When I stream chat chunks "hello " and "world"
     Then AG-UI renders the chat lifecycle in order
+
+  Scenario: Addressed bridge calls and input requests reach only their addressee
+    Given responders "alpha" and "beta" answer every command with their own name
+    When I submit an A2A task to "beta"
+    And I call the MCP tool "search" on "alpha"
+    And I request input from "beta"
+    Then the A2A task completes with "beta"
+    And the MCP tool result is "alpha"
+    And the input decision is "beta"
+    And responder "alpha" answered exactly "tool"
+    And responder "beta" answered exactly "task", "input"

@@ -236,14 +236,9 @@ impl TestIggy {
     }
 
     pub async fn client(&self) -> Result<IggyClient, IggyError> {
-        let client = IggyClientBuilder::new()
-            .with_tcp()
-            .with_server_address(format!("127.0.0.1:{}", self.tcp_port))
-            .build()?;
+        let client =
+            IggyClientBuilder::from_connection_string(&self.connection_string())?.build()?;
         client.connect().await?;
-        client
-            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-            .await?;
         Ok(client)
     }
 
@@ -358,7 +353,7 @@ fn spawn_server(
     let stdout = File::create(&log_path).expect("create Iggy test server log");
     let stderr = stdout.try_clone().expect("clone Iggy test server log");
     let child = Command::new(binary)
-        .env("IGGY_PATH", data_dir)
+        .env("IGGY_PATH", data_dir.join("data"))
         .env("IGGY_TCP_ADDRESS", format!("127.0.0.1:{tcp_port}"))
         .env("IGGY_HTTP_ENABLED", "false")
         .env("IGGY_QUIC_ENABLED", "false")

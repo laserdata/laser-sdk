@@ -212,3 +212,43 @@ async def test_given_a_deleted_stream_when_a_producer_sends_then_should_name_cau
     assert failure.value.not_found
     assert failure.value.code == "NotFound"
     assert not failure.value.retryable
+
+
+async def test_given_unconfirmed_records_when_resent_through_batch_then_should_keep_their_ids(
+    paused_transport,
+):
+    endpoint, forwarding, pause_after_reply = paused_transport
+    stream = f"resend-{uuid.uuid4().hex[:12]}"
+    laser = await ls.Laser.connect(
+        endpoint, stream=stream, publish_timeout_ms=200, publish_max_retries=0
+    )
+    resender = None
+    try:
+        topic = laser.topic("pulse")
+        producer = topic.producer(batch_length=1, partition=0)
+        await producer.init()
+        pause_after_reply[0] = 1
+        with pytest.raises(ls.PublishFailedError) as failure:
+            await asyncio.wait_for(
+                producer.send_batch([b"first", (b"second", {"kind": "retry"})]), 2
+            )
+        unconfirmed = failure.value.unconfirmed
+        assert all(isinstance(message.message_id, int) for message in unconfirmed)
+        forwarding.set()
+        # The timed-out connection is retired, so the resend dials afresh.
+        resender = await ls.Laser.connect(endpoint, stream=stream)
+        topic = resender.topic("pulse")
+        await topic.batch(unconfirmed, partition_key=None)
+        consumer = topic.consumer(
+            "resend-reader", partition=0, polling="first", auto_commit="disabled"
+        )
+        records = [await asyncio.wait_for(consumer.next(), 10) for _ in range(2)]
+        resent = records[-1]
+        assert resent.payload == b"second"
+        assert resent.message_id == unconfirmed[0].message_id
+        assert resent.headers == {"kind": "retry"}
+    finally:
+        forwarding.set()
+        await laser.close()
+        if resender is not None:
+            await resender.close()

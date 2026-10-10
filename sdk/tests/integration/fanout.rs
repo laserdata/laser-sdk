@@ -23,21 +23,31 @@ async fn given_fanned_out_subconversations_when_aggregating_then_should_collect_
     let laser = harness::laser().await;
     let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .handler(Worker)
         .build()
         .spawn(laser.clone());
 
     let root = Provenance::builder()
         .conversation_id(ConversationId::new())
+        .agent("upstream".parse().expect("upstream is a valid agent id"))
         .build();
     let root_id = root.conversation_id;
     for i in 1..=3 {
-        let subtask = laser.spawn_subconversation(&root);
+        let subtask = laser.spawn_subconversation(
+            &root,
+            &"orchestrator"
+                .parse()
+                .expect("orchestrator is a valid agent id"),
+        );
+        assert_eq!(
+            subtask.agent.as_ref().map(ToString::to_string).as_deref(),
+            Some("orchestrator")
+        );
         laser
             .send_agent(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 Bytes::from(format!("sub{i}")),
                 &subtask,
             )
@@ -51,11 +61,20 @@ async fn given_fanned_out_subconversations_when_aggregating_then_should_collect_
             let results = ContextAssembler::builder()
                 .conversation_id(root_id)
                 .across_subconversations(true)
-                .topics(vec![AgentTopic::Responses])
+                .topics(vec![AgentTopic::Sessions])
                 .build()
                 .assemble(&laser)
                 .await
-                .expect("aggregating across subconversations should succeed");
+                .expect("aggregating across subconversations should succeed")
+                .into_iter()
+                .filter(|message| {
+                    message
+                        .provenance
+                        .agent
+                        .as_ref()
+                        .is_some_and(|agent| agent.as_str() == "worker")
+                })
+                .collect::<Vec<_>>();
             (results.len() == 3).then_some(results)
         }
     })
@@ -148,8 +167,8 @@ async fn given_agents_advertising_a_capability_when_the_orchestrator_fans_out_th
         let connection = harness::reconnect(&laser).await;
         let mut handle = Agent::builder()
             .id(id.parse().expect("worker id is valid"))
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .capabilities(diagnose_card().capabilities)
             .handler(DiagnoseWorker { id: id.to_owned() })
             .build()
@@ -163,9 +182,9 @@ async fn given_agents_advertising_a_capability_when_the_orchestrator_fans_out_th
     // branch is target-filtered to one worker.
     let mut orchestrator = Agent::builder()
         .id("orchestrator".parse().expect("orchestrator id is valid"))
-        .listen_on(AgentTopic::ToolCalls)
-        .respond_on(AgentTopic::Responses)
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .handler(Orchestrator)
         .build()
         .spawn(laser.clone());
@@ -181,7 +200,7 @@ async fn given_agents_advertising_a_capability_when_the_orchestrator_fans_out_th
         .build();
     let conversation = trigger.conversation_id;
     laser
-        .send_agent(AgentTopic::ToolCalls, Bytes::from("go"), &trigger)
+        .send_agent(AgentTopic::Sessions, Bytes::from("go"), &trigger)
         .await
         .expect("the trigger should be sent");
 
@@ -228,8 +247,8 @@ async fn given_an_unavailable_agent_when_fanning_out_then_should_route_around_it
     for id in healthy {
         let mut handle = Agent::builder()
             .id(id.parse().expect("worker id is valid"))
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .capabilities(diagnose_card().capabilities)
             .handler(DiagnoseWorker { id: id.to_owned() })
             .build()
@@ -239,8 +258,8 @@ async fn given_an_unavailable_agent_when_fanning_out_then_should_route_around_it
     }
     let mut sick = Agent::builder()
         .id("sick".parse().expect("worker id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(diagnose_card_with(Some(Health::Unavailable)).capabilities)
         .handler(DiagnoseWorker {
             id: "sick".to_owned(),
@@ -251,9 +270,9 @@ async fn given_an_unavailable_agent_when_fanning_out_then_should_route_around_it
 
     let mut orchestrator = Agent::builder()
         .id("orchestrator".parse().expect("orchestrator id is valid"))
-        .listen_on(AgentTopic::ToolCalls)
-        .respond_on(AgentTopic::Responses)
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .handler(Orchestrator)
         .build()
         .spawn(laser.clone());
@@ -267,7 +286,7 @@ async fn given_an_unavailable_agent_when_fanning_out_then_should_route_around_it
         .build();
     let conversation = trigger.conversation_id;
     laser
-        .send_agent(AgentTopic::ToolCalls, Bytes::from("go"), &trigger)
+        .send_agent(AgentTopic::Sessions, Bytes::from("go"), &trigger)
         .await
         .expect("the trigger should be sent");
 
@@ -315,8 +334,8 @@ async fn given_a_quarantined_agent_when_fanning_out_then_should_exclude_it() {
         // Its own connection: one advertised agent per connection.
         let mut handle = Agent::builder()
             .id(id.parse().expect("worker id is valid"))
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .capabilities(diagnose_card().capabilities)
             .handler(DiagnoseWorker { id: id.to_owned() })
             .build()
@@ -334,9 +353,9 @@ async fn given_a_quarantined_agent_when_fanning_out_then_should_exclude_it() {
 
     let mut orchestrator = Agent::builder()
         .id("orchestrator".parse().expect("orchestrator id is valid"))
-        .listen_on(AgentTopic::ToolCalls)
-        .respond_on(AgentTopic::Responses)
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .handler(Orchestrator)
         .build()
         .spawn(laser.clone());
@@ -350,7 +369,7 @@ async fn given_a_quarantined_agent_when_fanning_out_then_should_exclude_it() {
         .build();
     let conversation = trigger.conversation_id;
     laser
-        .send_agent(AgentTopic::ToolCalls, Bytes::from("go"), &trigger)
+        .send_agent(AgentTopic::Sessions, Bytes::from("go"), &trigger)
         .await
         .expect("the trigger should be sent");
 

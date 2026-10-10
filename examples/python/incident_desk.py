@@ -8,7 +8,8 @@ story, each platform feature doing the job it exists for:
                  and ts convention fields.
   2. MEMORY      past resolution notes are remembered semantically, the desk
                  recalls the closest ones when the incident arrives.
-  3. THE DESK    four agents on the agent topics: triage queries the index as a
+  3. THE DESK    four agents on the shared `agent.sessions` topic, each request
+                 addressed to the agent it is for: triage queries the index as a
                  tool and fans one diagnostic angle per specialist call under a
                  deadline, the specialist answers each angle from recalled
                  memory plus the LLM, the resolver applies capacity grants
@@ -197,8 +198,8 @@ def make_triage(llm, index: str):
     # synthesizes the findings into a diagnosis with the LLM. The diagnosis and
     # findings ride back on the conversation, durable on the log.
     async def triage(ctx, message):
-        # The resolver shares the Commands topic. Grants are its traffic, free
-        # text is ours. Never fail on foreign messages.
+        # Grants are addressed to the resolver. Ignore a stray one rather than
+        # fail on it.
         try:
             payload = json.loads(message.payload)
         except ValueError:
@@ -229,14 +230,15 @@ def make_triage(llm, index: str):
             correlation = ls.Provenance(
                 conversation_id=ls.new_conversation_id(),
                 agent="triage",
+                target_agent_id="specialist",
                 deadline_micros=deadline_micros,
             )
             reply = await ctx.request(
-                ls.AgentTopic.ToolCalls,
-                ls.AgentTopic.ToolResults,
+                ls.AgentTopic.Sessions,
+                ls.AgentTopic.Sessions,
                 f"{angle} for: {incident}".encode(),
                 correlation,
-                timeout_secs=TOOL_TIMEOUT,
+                timeout_ms=TOOL_TIMEOUT * 1000,
             )
             return bytes(reply.payload).decode("utf-8", "replace")
 
@@ -278,7 +280,7 @@ def make_resolver(grants_namespace: str):
     # read-modify-write, which is exactly why the dedup gate in front of it
     # matters. Grants at or above the threshold hold for a durable approval.
     async def resolver(ctx, message):
-        # Triage shares the Commands topic. Free text is its traffic.
+        # Free text is addressed to triage. Ignore a stray message.
         try:
             grant = json.loads(message.payload)
         except ValueError:
@@ -307,16 +309,18 @@ async def approver(ctx, message):
     await ctx.respond(b"approved")
 
 
-# Hold a large grant for approval: ask on the human-input topic and block on the
-# decision. Returns whether to apply it.
+# Hold a large grant for approval: ask the approver on `agent.sessions` and block
+# on the decision. Returns whether to apply it.
 async def _approved(ctx, grant) -> bool:
-    request = ls.Provenance(conversation_id=ls.new_conversation_id(), agent="resolver")
+    request = ls.Provenance(
+        conversation_id=ls.new_conversation_id(), agent="resolver", target_agent_id="approver"
+    )
     decision = await ctx.request(
-        ls.AgentTopic.HumanInput,
-        ls.AgentTopic.Responses,
+        ls.AgentTopic.Sessions,
+        ls.AgentTopic.Sessions,
         f"approve a {grant['units']} unit capacity grant to {grant['cluster']}?".encode(),
         request,
-        timeout_secs=APPROVAL_TIMEOUT,
+        timeout_ms=APPROVAL_TIMEOUT * 1000,
     )
     return bytes(decision.payload) == b"approved"
 
@@ -339,7 +343,7 @@ def make_kv_deduplicator(laser, namespace: str, ttl: float):
             print(f"  dedup: duplicate {key}, skipping")
             return False
         try:
-            await store.set(key).bytes(b"1").ttl(ttl).send()
+            await store.set(key).bytes(b"1").ttl(ttl * 1000).send()
         except ls.LaserError as error:
             print(f"  dedup: write failed ({error}), processing anyway (at-least-once)")
         return True
@@ -408,9 +412,11 @@ async def remember_resolution(semantic, diagnosis: str) -> None:
 
 async def send_grants(laser, conversation: str, grants) -> None:
     for key, cluster, units in grants:
-        provenance = ls.Provenance(conversation_id=conversation, idempotency_key=key)
+        provenance = ls.Provenance(
+            conversation_id=conversation, idempotency_key=key, target_agent_id="resolver"
+        )
         await laser.send_agent(
-            ls.AgentTopic.Commands,
+            ls.AgentTopic.Sessions,
             json.dumps({"cluster": cluster, "units": units}).encode(),
             provenance,
         )
@@ -533,13 +539,13 @@ async def speculative_bulk_resolve(laser) -> None:
 
 
 async def recover_incident(laser, conversation: str) -> dict:
-    # Rebuild the incident by folding its steps off the Responses topic, scoped
+    # Rebuild the incident by folding its steps off `agent.sessions`, scoped
     # to this one conversation. This is the recovery and audit path: state
     # lives in the stream, so any agent can reconstruct it with no side
     # database. An incident conversation is a few dozen steps, so a generous
     # bound is the honest full walk here.
     recovered = {"diagnosis": "", "findings": []}
-    trail = await laser.context(conversation).fetch(topics=[ls.AgentTopic.Responses], n=200)
+    trail = await laser.context(conversation).fetch(topics=[ls.AgentTopic.Sessions], n=200)
     for message in trail:
         try:
             step = json.loads(message.payload)
@@ -560,7 +566,9 @@ async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
         _common.phase("warming up")
-        await laser.bootstrap(_common.PARTITIONS)
+        await laser.bootstrap(
+            _common.PARTITIONS, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
         await laser.topic(TICKETS_TOPIC).ensure(partitions=_common.PARTITIONS)
 
         caps = await laser.capabilities()
@@ -597,28 +605,28 @@ async def main() -> None:
         grants_namespace = f"desk-grants-{run}"
         triage = laser.spawn_agent(
             "triage",
-            ls.AgentTopic.Commands,
+            ls.AgentTopic.Sessions,
             make_triage(llm, TICKETS_INDEX),
-            respond_on=ls.AgentTopic.Responses,
+            respond_on=ls.AgentTopic.Sessions,
             poll_interval_ms=10,
         )
         specialist = laser.spawn_agent(
             "specialist",
-            ls.AgentTopic.ToolCalls,
+            ls.AgentTopic.Sessions,
             make_specialist(llm, semantic),
-            respond_on=ls.AgentTopic.ToolResults,
+            respond_on=ls.AgentTopic.Sessions,
             poll_interval_ms=10,
         )
         approver_agent = laser.spawn_agent(
             "approver",
-            ls.AgentTopic.HumanInput,
+            ls.AgentTopic.Sessions,
             approver,
-            respond_on=ls.AgentTopic.Responses,
+            respond_on=ls.AgentTopic.Sessions,
             poll_interval_ms=10,
         )
         resolver = laser.spawn_agent(
             "resolver",
-            ls.AgentTopic.Commands,
+            ls.AgentTopic.Sessions,
             make_resolver(grants_namespace),
             poll_interval_ms=10,
             dedup=make_kv_deduplicator(laser, dedup_namespace, DEDUP_TTL),
@@ -632,11 +640,14 @@ async def main() -> None:
             incident = ls.new_conversation_id()
             print(f"  incident on conversation {incident}: {INCIDENT}")
             reply = await laser.request(
-                ls.AgentTopic.Commands,
-                ls.AgentTopic.Responses,
+                ls.AgentTopic.Sessions,
+                ls.AgentTopic.Sessions,
                 INCIDENT.encode(),
-                ls.Provenance(conversation_id=incident),
-                timeout_secs=DESK_TIMEOUT,
+                # Every desk agent reads `agent.sessions`, so each request
+                # names the agent it is for. An unaddressed request would be
+                # work for all four.
+                ls.Provenance(conversation_id=incident, target_agent_id="triage"),
+                timeout_ms=DESK_TIMEOUT * 1000,
             )
             diagnosed = json.loads(reply.payload)
             print(f"  diagnosis: {diagnosed['diagnosis']}")

@@ -15,7 +15,7 @@ import { AgentId, ConversationId } from "../types/ids.js"
 import { MEMORY_APP, MEMORY_NAMESPACE, MEMORY_USER } from "../wire/headers.js"
 import { decodeOne } from "../wire/cbor.js"
 import { decodeMemoryRecord, encodeMemoryRecordFrame, type MemoryRecord } from "../wire/memory.js"
-import type { SourceRef } from "../wire/graph.js"
+import type { ProducerInfo, SourceRef } from "../wire/graph.js"
 import type { KvEntry } from "../wire/kv.js"
 import {
   MemoryId,
@@ -27,6 +27,7 @@ import {
   type MemoryQuery,
   type MemoryScope
 } from "./types.js"
+import { keywordScore, tokenize } from "./vector-memory.js"
 
 const READ_BATCH = 1000
 
@@ -45,9 +46,11 @@ interface RecordTarget {
 
 export class LogMemory implements Memory {
   private readonly items = new Map<string, FoldedItem>()
+  // Tombstones and feedback keyed by target and the conversation they are
+  // limited to, with an empty conversation for any. Feedback stays apart from
+  // the items so a weight folded before its item (a cross-partition reorder)
+  // still applies.
   private readonly forgotten = new Set<string>()
-  // Feedback weight per target, kept apart from the items so a weight folded
-  // before its item (a cross-partition reorder) still applies.
   private readonly feedback = new Map<string, number>()
   private readonly named = new Map<string, Uint8Array>()
   private readonly offsets = new Map<number, bigint>()
@@ -60,12 +63,12 @@ export class LogMemory implements Memory {
   /** @internal */
   readonly stream: string | undefined
 
-  /** A log-backed memory on `topic` (the audit topic by default). The named
+  /** A log-backed memory on `topic` (the memory topic by default). The named
    * items key on `namespace`, which defaults to the topic's name. */
   constructor(
     private readonly laser: Laser,
     namespace?: string,
-    topic: string = AgentTopic.Audit,
+    topic: string = AgentTopic.Memory,
     stream: string | undefined = laser.defaultStream
   ) {
     this.topic = topic
@@ -89,7 +92,13 @@ export class LogMemory implements Memory {
     await this.send(
       target,
       scope,
-      encodeMemoryRecordFrame({ kind: "item", id: id.toString(), memoryKind: kind, body })
+      encodeMemoryRecordFrame({
+        kind: "item",
+        id: id.toString(),
+        memoryKind: kind,
+        body,
+        ...lineage(scope)
+      })
     )
     return id
   }
@@ -100,12 +109,14 @@ export class LogMemory implements Memory {
   async recall(scope: MemoryScope, query: MemoryQuery): Promise<readonly MemoryItem[]> {
     const limit = recallLimit(query)
     if (limit === 0 || (scope.stream !== undefined && scope.stream !== this.stream)) return []
-    const selected = new Map<string, MemoryItem>()
+    const selected = new Map<string, { readonly arrival: ArrivalKey; readonly item: MemoryItem }>()
     const agent = query.agent ?? scope.agent
     let cursor: Uint8Array | undefined
     for (;;) {
-      const scan = this.laser.kv(this.namespace).scan()
-      if (scope.conversation !== undefined) scan.conversation(scope.conversation.toString())
+      const scan = this.laser.kv(this.resourceNamespace()).scan()
+      if (scope.conversation !== undefined) {
+        scan.conversation(scope.conversation.toString()).lensStream(this.resourceStream())
+      }
       if (cursor !== undefined) scan.cursor(cursor)
       const page = await scan.fetch()
       for (const entry of page.entries) {
@@ -120,14 +131,17 @@ export class LogMemory implements Memory {
         const item = itemFromEntry(scope.conversation, entry)
         if (
           item === undefined ||
+          !matchesQueryText(query, item.payload) ||
           (scope.conversation !== undefined &&
             !item.provenance.conversationId.equals(scope.conversation))
         )
           continue
-        selected.set(item.id.toString(), item)
+        selected.set(item.id.toString(), { arrival: arrivalKey(entry, item.id), item })
         if (selected.size > limit) {
-          const oldest = [...selected.keys()].sort()[0]
-          if (oldest !== undefined) selected.delete(oldest)
+          const oldest = [...selected].sort(([, left], [, right]) =>
+            compareArrival(left.arrival, right.arrival)
+          )[0]
+          if (oldest !== undefined) selected.delete(oldest[0])
         }
       }
       if (page.cursor === undefined) break
@@ -138,9 +152,9 @@ export class LogMemory implements Memory {
         throw new ProtocolError("memory scan cursor did not advance")
       cursor = page.cursor
     }
-    return [...selected.values()].sort((left, right) =>
-      left.id.asU128() > right.id.asU128() ? -1 : left.id.asU128() < right.id.asU128() ? 1 : 0
-    )
+    return [...selected.values()]
+      .sort((left, right) => compareArrival(right.arrival, left.arrival))
+      .map(({ item }) => item)
   }
 
   /** Recall by folding the memory topic in process, the opt-in path for a small
@@ -155,11 +169,12 @@ export class LogMemory implements Memory {
     const newestFirst = [...this.items.values()]
       .filter((entry) => matchesScope(entry.scope, scope, agent))
       .map((entry) => entry.item)
+      .filter((item) => matchesQueryText(query, item.payload))
       .reverse()
     if (query.strategy === RecallStrategy.Recent || this.feedback.size === 0)
       return newestFirst.slice(0, limit).map(copyItem)
     return newestFirst
-      .map((item) => ({ item, weight: this.feedback.get(item.id.toString()) }))
+      .map((item) => ({ item, weight: this.feedbackFor(item) }))
       .sort((left, right) => (right.weight ?? 0) - (left.weight ?? 0))
       .slice(0, limit)
       .map(({ item, weight }, rank) =>
@@ -178,13 +193,18 @@ export class LogMemory implements Memory {
     await this.publish(scope, id.toString(), {
       kind: "feedback",
       target: feedback.target.toString(),
-      weight: feedback.weight
+      weight: feedback.weight,
+      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
     })
     return id
   }
 
   async forget(scope: MemoryScope, id: MemoryId): Promise<void> {
-    await this.publish(scope, id.toString(), { kind: "forget", target: id.toString() })
+    await this.publish(scope, id.toString(), {
+      kind: "forget",
+      target: id.toString(),
+      ...(scope.conversation !== undefined ? { conversation: scope.conversation.toString() } : {})
+    })
   }
 
   /** Writes named point state: a keyed item on the topic, reflected in the
@@ -203,7 +223,7 @@ export class LogMemory implements Memory {
   /** Reads named point state from the managed key-value view, like {@link LogMemory.recall}.
    * Folding the topic is the opt-in {@link LogMemory.fetchNamedFolded}. */
   async fetchNamed(key: string): Promise<Uint8Array | undefined> {
-    return this.laser.kv(this.namespace).get(new TextEncoder().encode(this.namedKey(key)))
+    return this.laser.kv(this.resourceNamespace()).get(new TextEncoder().encode(this.namedKey(key)))
   }
 
   /** Reads named point state by folding the topic in process. */
@@ -268,7 +288,7 @@ export class LogMemory implements Memory {
         idempotencyKey: target.idempotencyKey
       })
     )
-    headers.set(MEMORY_NAMESPACE, stringHeader(this.namespace))
+    headers.set(MEMORY_NAMESPACE, stringHeader(this.resourceNamespace()))
     if (scope.user !== undefined) headers.set(MEMORY_USER, stringHeader(scope.user))
     if (scope.app !== undefined) headers.set(MEMORY_APP, stringHeader(scope.app))
     await this.laser[INTERNAL_TRANSPORT]().sendMessageWithHeaders(
@@ -288,6 +308,7 @@ export class LogMemory implements Memory {
 
   private async drain(): Promise<void> {
     const stream = this.requireStream()
+    const namespace = this.resourceNamespace()
     const transport = this.laser[INTERNAL_TRANSPORT]()
     const partitions = await transport.findTopicPartitionCount(stream, this.topic)
     // A memory topic that does not exist yet folds as empty.
@@ -306,7 +327,7 @@ export class LogMemory implements Memory {
       if (messages.length === 0) break
       for (const message of messages) {
         this.offsets.set(message.partitionId, message.offset + 1n)
-        if (headerString(message.headers, MEMORY_NAMESPACE) !== this.namespace) continue
+        if (headerString(message.headers, MEMORY_NAMESPACE) !== namespace) continue
         let record: MemoryRecord
         let provenance: Provenance
         try {
@@ -341,14 +362,20 @@ export class LogMemory implements Memory {
   ): void {
     if (record.kind === "forget") {
       const target = canonicalId(record.target)
-      this.items.delete(target)
-      this.forgotten.add(target)
-      this.named.delete(record.target)
+      const conversation = canonicalConversation(record.conversation)
+      const existing = this.items.get(target)
+      if (
+        conversation === "" ||
+        existing?.item.provenance.conversationId.toString() === conversation
+      )
+        this.items.delete(target)
+      this.forgotten.add(scopedKey(target, conversation))
+      if (conversation === "") this.named.delete(record.target)
       return
     }
     if (record.kind === "feedback") {
-      const target = canonicalId(record.target)
-      this.feedback.set(target, (this.feedback.get(target) ?? 0) + record.weight)
+      const key = scopedKey(canonicalId(record.target), canonicalConversation(record.conversation))
+      this.feedback.set(key, (this.feedback.get(key) ?? 0) + record.weight)
       return
     }
     const id = parseMemoryId(record.id)
@@ -358,7 +385,7 @@ export class LogMemory implements Memory {
       return
     }
     const key = id.toString()
-    if (this.forgotten.has(key) || this.items.has(key)) return
+    if (this.isForgotten(key, provenance.conversationId.toString()) || this.items.has(key)) return
     const user = headerString(headers, MEMORY_USER)
     const app = headerString(headers, MEMORY_APP)
     const scope: MemoryScope = {
@@ -375,6 +402,8 @@ export class LogMemory implements Memory {
         provenance,
         kind: parseKind(record.memoryKind),
         signals: [],
+        ...(record.origin !== undefined ? { origin: record.origin } : {}),
+        ...(record.producer !== undefined ? { producer: record.producer } : {}),
         ...(source === undefined
           ? {}
           : {
@@ -388,6 +417,28 @@ export class LogMemory implements Memory {
       },
       scope
     })
+  }
+
+  private isForgotten(id: string, conversation: string): boolean {
+    return this.forgotten.has(scopedKey(id, "")) || this.forgotten.has(scopedKey(id, conversation))
+  }
+
+  private feedbackFor(item: MemoryItem): number | undefined {
+    const id = item.id.toString()
+    const any = this.feedback.get(scopedKey(id, ""))
+    const scoped = this.feedback.get(scopedKey(id, item.provenance.conversationId.toString()))
+    return any === undefined && scoped === undefined ? undefined : (any ?? 0) + (scoped ?? 0)
+  }
+
+  // The namespace the records' header and the key-value read view carry,
+  // scoped to the stream the records ride, so the fold writes where recall
+  // reads.
+  private resourceNamespace(): string {
+    return this.laser.resourceNameIn(this.stream, this.namespace)
+  }
+
+  private resourceStream(): string | undefined {
+    return this.laser.resourceScope(this.stream)
   }
 
   private namedKey(key: string): string {
@@ -425,6 +476,19 @@ function canonicalId(text: string): string {
   return parseMemoryId(text)?.toString() ?? text
 }
 
+function canonicalConversation(text: string | undefined): string {
+  if (text === undefined) return ""
+  try {
+    return ConversationId.parse(text).toString()
+  } catch {
+    return text
+  }
+}
+
+function scopedKey(id: string, conversation: string): string {
+  return `${id}\0${conversation}`
+}
+
 function stringHeader(value: string): HeaderValue {
   return { kind: "string", value }
 }
@@ -442,6 +506,29 @@ function parseKind(word: string): MemoryKind {
 
 // Rebuild a memory item from a read-view row, or `undefined` when the key is a
 // named-item key rather than a recall id, or the row carries no memory scope.
+// Arrival order of a memory view row across partitions: the broker append time,
+// then the source address, then the id. Offsets from different topics or
+// partitions are never compared alone. A row without a broker time sorts as the
+// oldest.
+type ArrivalKey = readonly [bigint, number, number, bigint, bigint]
+
+function arrivalKey(entry: KvEntry, id: MemoryId): ArrivalKey {
+  const source = entry.scope?.source
+  const timestamp = entry.scope?.timestampMicros ?? 0n
+  return source?.kind === "message"
+    ? [timestamp, source.topic, source.partition, source.offset, id.asU128()]
+    : [timestamp, 0, 0, 0n, id.asU128()]
+}
+
+function compareArrival(left: ArrivalKey, right: ArrivalKey): number {
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index] ?? 0
+    const b = right[index] ?? 0
+    if (a !== b) return a < b ? -1 : 1
+  }
+  return 0
+}
+
 function itemFromEntry(
   conversation: ConversationId | undefined,
   entry: KvEntry
@@ -500,6 +587,12 @@ function matchesScope(
   )
 }
 
+function matchesQueryText(query: MemoryQuery, payload: Uint8Array): boolean {
+  if (query.strategy === RecallStrategy.Recent || query.semantic === undefined) return true
+  const tokens = tokenize(query.semantic)
+  return tokens.size === 0 || keywordScore(tokens, payload) > 0
+}
+
 function parseJson(bytes: Uint8Array, what: string): unknown {
   try {
     return JSON.parse(new TextDecoder().decode(bytes))
@@ -529,4 +622,14 @@ function mergePatch(base: unknown, patch: unknown): unknown {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function lineage(scope: MemoryScope): {
+  readonly origin?: SourceRef
+  readonly producer?: ProducerInfo
+} {
+  return {
+    ...(scope.origin !== undefined ? { origin: scope.origin } : {}),
+    ...(scope.producer !== undefined ? { producer: scope.producer } : {})
+  }
 }

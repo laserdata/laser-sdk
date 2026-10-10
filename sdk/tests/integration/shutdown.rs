@@ -22,7 +22,7 @@ async fn given_a_running_agent_when_shut_down_then_should_stop_cleanly() {
     let handled = Arc::new(AtomicUsize::new(0));
     let handle = Agent::builder()
         .id("counter".parse().expect("counter is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Counter {
             handled: handled.clone(),
         })
@@ -34,7 +34,7 @@ async fn given_a_running_agent_when_shut_down_then_should_stop_cleanly() {
         .build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"tick"),
             &provenance,
         )

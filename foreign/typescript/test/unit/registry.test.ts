@@ -393,3 +393,27 @@ void test("given_live_presence_when_refreshed_within_ttl_then_should_reuse_the_c
   assert.equal(await registry.refreshPresence(), 1)
   assert.equal(transport.managedQueries.length, 1)
 })
+
+void test("given_cards_in_any_insertion_order_when_listed_then_should_order_by_agent_id", async () => {
+  const transport = new RegistryTransport()
+  transport.pollPages.push([
+    polled(cardEnvelope("worker-b", ["diagnose"]), 0n),
+    polled(cardEnvelope("planner", ["plan"]), 1n),
+    polled(cardEnvelope("worker-a", ["diagnose"]), 2n)
+  ])
+  const registry = AgentRegistry.create(
+    Cursor.create(transport, "stream", "agent.registry", [0]),
+    newRegistryCache(),
+    () => ClientMetadataRequest.create(transport),
+    () => 100n
+  )
+  await registry.refresh()
+  assert.deepEqual(
+    registry.agents().map((card) => card.agent.asStr()),
+    ["planner", "worker-a", "worker-b"]
+  )
+  assert.deepEqual(
+    registry.resolve("diagnose").map((card) => card.agent.asStr()),
+    ["worker-a", "worker-b"]
+  )
+})

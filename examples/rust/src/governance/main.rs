@@ -7,8 +7,6 @@ use laser_sdk::prelude::full::*;
 use laser_sdk::rbac::{
     Action, Effect, Feature, Grant, ResourcePattern, Role, delegated_allow, grants_allow,
 };
-use laser_sdk::wire::agent_workflow::RunBudget;
-use tracing::{info, warn};
 
 // The live role and binding calls need server-side `authz`. The pure decision
 // pieces run everywhere and mirror the Python example.
@@ -31,7 +29,14 @@ async fn main() -> Result<(), LaserError> {
     let stream = stream_for(EXAMPLE);
     let laser = laser(&stream, Capabilities::OPEN).await?;
     fresh_run(&laser, &stream, async {
-        laser.bootstrap(PARTITIONS).await?;
+        laser
+            .bootstrap(
+                PARTITIONS,
+                laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(
+                    86_400,
+                )),
+            )
+            .await?;
 
         phase("Capability RBAC: roles bound to a server-stamped user");
         let capabilities = laser.capabilities().await;
@@ -49,16 +54,12 @@ async fn main() -> Result<(), LaserError> {
         phase("External edge: audience validation and step-up");
         demonstrate_edge_auth();
 
-        phase("Run governor: submit a budgeted managed run when served");
-        if capabilities.agent_workflow {
-            submit_budgeted_run(&laser).await?;
-        } else {
-            warn!("agent_workflow is not advertised, so the live budgeted-run submit is skipped.");
-        }
+        phase("Session governor: submit a budgeted session");
+        submit_budgeted_session(&laser).await?;
 
-        info!(
-            "governance: role grants, deny-wins matching, on-behalf-of intersection, \
-             external-edge step-up, and budgeted run submission share one governance model."
+        println!(
+            "\ngovernance: role grants, deny-wins matching, on-behalf-of intersection,\n\
+             external-edge step-up, and budgeted session submission share one governance model."
         );
         Ok(())
     })
@@ -86,8 +87,9 @@ async fn demo_user_id(laser: &Laser) -> Result<u32, LaserError> {
 
 async fn install_roles(laser: &Laser, target_user: u32) -> Result<(), LaserError> {
     for role in roles() {
-        info!(role = %role.name, "defining role");
+        let name = role.name.clone();
         laser.define_role(role).await?;
+        println!("defined role: {name}");
     }
     let bound = vec![
         "support-reader".to_owned(),
@@ -99,14 +101,14 @@ async fn install_roles(laser: &Laser, target_user: u32) -> Result<(), LaserError
     laser.bind_roles(target_principal, bound.clone()).await?;
 
     let who = laser.whoami().await?;
-    info!(
+    println!(
         "caller roles: [{}], effective grants: {}",
         who.roles.join(", "),
         who.grants.len()
     );
 
-    let support_roles = laser.list_roles(Some("support")).await?;
-    info!(
+    let support_roles = laser.list_roles(Some("support"), None).await?;
+    println!(
         "roles with prefix `support`: [{}]",
         support_roles
             .iter()
@@ -115,12 +117,12 @@ async fn install_roles(laser: &Laser, target_user: u32) -> Result<(), LaserError
             .join(", ")
     );
 
-    let bindings = laser.get_bindings(target_principal).await?;
-    info!("user {target_user} is bound to: [{}]", bindings.join(", "));
-
     if laser.get_role("support-reader").await?.is_none() {
-        warn!("support-reader role was not visible after define");
+        println!("support-reader role was not visible after define");
     }
+
+    let bindings = laser.get_bindings(target_principal).await?;
+    println!("user {target_user} is bound to: [{}]", bindings.join(", "));
     Ok(())
 }
 
@@ -205,10 +207,10 @@ fn demonstrate_intersection() {
         Some("support/tickets/acme"),
     );
 
-    info!("delegated read support/tickets/acme: {read_ticket}");
-    info!("delegated write support/tickets/acme: {write_ticket}");
-    info!("delegated delete support/tickets/acme: {delete_ticket}");
-    info!(
+    println!("delegated read support/tickets/acme: {read_ticket}");
+    println!("delegated write support/tickets/acme: {write_ticket}");
+    println!("delegated delete support/tickets/acme: {delete_ticket}");
+    println!(
         "direct user delete support/tickets/acme: {}",
         grants_allow(
             &user,
@@ -233,45 +235,38 @@ fn demonstrate_edge_auth() {
         scopes: vec!["tool:write".to_owned()],
     };
 
-    info!(
+    println!(
         "edge read authorized: {}",
         authorize_edge(&ok, "mcp.laserdata", "tool:read").is_ok()
     );
     match authorize_edge(&missing_scope, "mcp.laserdata", "tool:write") {
-        Ok(()) => warn!("edge write authorized unexpectedly"),
-        Err(denial) => info!("edge write step-up challenge: {:?}", denial.challenge()),
+        Ok(()) => println!("edge write authorized unexpectedly"),
+        Err(denial) => println!(
+            "edge write step-up challenge: {}",
+            denial.challenge().unwrap_or_default()
+        ),
     }
-    info!(
+    println!(
         "foreign audience rejected: {}",
         authorize_edge(&wrong_audience, "mcp.laserdata", "tool:write").is_err()
     );
 }
 
-async fn submit_budgeted_run(laser: &Laser) -> Result<(), LaserError> {
-    let budget = RunBudget {
-        max_events: Some(8),
-        max_model_calls: Some(1),
-        max_tool_calls: Some(2),
-        max_patches: None,
-        max_depth: None,
-        max_wall_clock_micros: Some(30_000_000),
-        max_cost_usd: None,
-    };
-    match laser
-        .runs()
-        .submit_budgeted(
-            "governance-auditor",
-            Some(b"audit this incident".to_vec()),
-            budget,
+async fn submit_budgeted_session(laser: &Laser) -> Result<(), LaserError> {
+    let submitted = laser
+        .sessions()
+        .submit(
+            "governance-auditor".parse::<laser_sdk::types::AgentId>()?,
+            b"audit this incident".to_vec(),
         )
-        .await
-    {
-        Ok(run) => info!("submitted budgeted run: {}", run.run_id),
-        Err(error) if error.is_unsupported() => {
-            warn!("budgeted run submit returned unsupported: {error}")
-        }
-        Err(error) => return Err(error),
-    }
+        .from("governance".parse::<laser_sdk::types::AgentId>()?)
+        .budget(laser_sdk::wire::agent::Budget {
+            tokens: Some(4_000),
+            cost_micros: None,
+        })
+        .send()
+        .await?;
+    println!("submitted budgeted session: {}", submitted.session);
     Ok(())
 }
 

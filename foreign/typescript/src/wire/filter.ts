@@ -35,8 +35,11 @@ import {
   MAX_FILTERED_PAGE_RECORDS
 } from "./limits.js"
 import type { CmpOp, Predicate } from "./query.js"
+import { RustRegex } from "./regex.js"
 import { type ResultCode, resultCodeFromWord, resultCodeWord } from "./result.js"
 import { type TypedValue, decodeTypedValue } from "./schema.js"
+
+export { unportableRegexConstruct } from "./regex.js"
 
 /** The catalog byte limit a command logged before the field existed replays with. */
 const DEFAULT_MAX_CATALOG_BYTES = 64n * 1024n * 1024n
@@ -380,6 +383,10 @@ export interface ConsumerFilter {
   /** Default `reject`. */
   readonly mismatchPolicy?: RecordPolicy
   readonly schemaRefs: readonly number[]
+  /** The stream whose writer-schema registry holds `schemaRefs`. Absent
+   * resolves them in the deployment-wide registry and leaves the encoding and
+   * the digest unchanged. */
+  readonly schemaStream?: string
 }
 
 /** Builders for the `ConsumerFilter` type. */
@@ -426,6 +433,11 @@ export const ConsumerFilter = {
   /** The same filter under another policy for a field of an unexpected type. */
   withMismatchPolicy(filter: ConsumerFilter, mismatchPolicy: RecordPolicy): ConsumerFilter {
     return { ...filter, mismatchPolicy }
+  },
+  /** The same filter resolving `schemaRefs` in the writer-schema registry of
+   * `stream`. */
+  withSchemaStream(filter: ConsumerFilter, stream: string): ConsumerFilter {
+    return { ...filter, schemaStream: stream }
   },
   /**
    * SHA-256 over a domain tag and the canonical JSON encoding of the filter.
@@ -556,6 +568,17 @@ export function validateConsumerFilter(filter: ConsumerFilter): void {
       throw new InvalidError("schema_refs must be sorted distinct uint32 values")
     }
   })
+  const stream = filter.schemaStream
+  if (stream !== undefined) {
+    if (filter.schemaRefs.length === 0) {
+      throw new InvalidError("schema_stream applies only to a filter with schema_refs")
+    }
+    if (stream.length === 0 || stream.includes("/") || hasControlCharacter(stream)) {
+      throw new InvalidError(
+        "schema_stream must be a non-empty stream name without '/' or control characters"
+      )
+    }
+  }
   const encodedBytes = UTF8.encode(consumerFilterJson(filter)).byteLength
   if (encodedBytes > MAX_FILTER_BYTES) {
     throw new InvalidError(
@@ -644,9 +667,8 @@ function validateHeaderKey(key: string): void {
   }
 }
 
-// The server compiles regexes with the Rust engine and is the authority on
-// their syntax. These checks refuse what no SDK accepts, so a filter fails here
-// before it travels.
+// Compiling the regex with the Rust syntax and bounds is the validation, as in
+// Rust, so a filter fails here before it travels.
 export function textPredicateValidate(predicate: TextPredicate): void {
   if (UTF8.encode(predicate.pattern).byteLength > MAX_FILTER_STRING_BYTES) {
     throw new InvalidError(`a text pattern exceeds ${String(MAX_FILTER_STRING_BYTES)}B`)
@@ -654,12 +676,8 @@ export function textPredicateValidate(predicate: TextPredicate): void {
   if (predicate.kind === "glob" && globTokens(predicate.pattern) === undefined) {
     throw new InvalidError("a glob pattern cannot end with an unescaped backslash")
   }
-  if (predicate.kind === "regex") {
-    const construct = unportableRegexConstruct(predicate.pattern)
-    if (construct !== undefined) {
-      throw new InvalidError(`regex ${construct} is not supported, write the pattern without it`)
-    }
-  }
+  if (predicate.kind === "regex")
+    RustRegex.compile(predicate.pattern, predicate.caseInsensitive === true)
 }
 
 /** One glob element after escapes are resolved: any run, any one, or a literal. */
@@ -683,26 +701,6 @@ export function globTokens(pattern: string): GlobToken[] | undefined {
     } else tokens.push({ kind: "literal", value: character ?? "" })
   }
   return tokens
-}
-
-export function unportableRegexConstruct(pattern: string): string | undefined {
-  const characters = Array.from(pattern)
-  let inClass = false
-  for (let index = 0; index < characters.length; index += 1) {
-    const character = characters[index]
-    if (character === "\\") {
-      const escaped = characters[index + 1] ?? ""
-      if (escaped >= "1" && escaped <= "9") return "backreferences"
-      if (escaped === "k") return "named backreferences"
-      index += 1
-    } else if (character === "[") inClass = true
-    else if (character === "]") inClass = false
-    else if (character === "(" && !inClass && characters[index + 1] === "?") {
-      if (characters[index + 2] !== ":") return "groups starting with (? other than (?:"
-      index += 1
-    }
-  }
-  return undefined
 }
 
 function countNodes(nodes: { count: number }, added: number): void {
@@ -2061,6 +2059,7 @@ function encodeConsumerFilterTree(filter: ConsumerFilter, mode: TreeMode): Map<s
   if (filter.foreignPolicy === "pass") map.set("foreign_policy", "pass")
   if (filter.mismatchPolicy === "pass") map.set("mismatch_policy", "pass")
   if (filter.schemaRefs.length > 0) map.set("schema_refs", [...filter.schemaRefs])
+  if (filter.schemaStream !== undefined) map.set("schema_stream", filter.schemaStream)
   return map
 }
 
@@ -3045,8 +3044,23 @@ export function decodeConsumerFilter(value: unknown, context: string): ConsumerF
     ...recordPolicyOf(map, "mismatch_policy", "mismatchPolicy", context),
     schemaRefs: field.optionalArray(map, "schema_refs", context, (item, index) =>
       u32(item, `${context}.schema_refs[${String(index)}]`)
-    )
+    ),
+    ...schemaStreamOf(map, context)
   }
+}
+
+// Rust `char::is_control`: the C0 and C1 control ranges.
+function hasControlCharacter(text: string): boolean {
+  for (const character of text) {
+    const point = character.codePointAt(0) ?? 0
+    if (point <= 0x1f || (point >= 0x7f && point <= 0x9f)) return true
+  }
+  return false
+}
+
+function schemaStreamOf(map: CborMap, context: string): { readonly schemaStream?: string } {
+  const schemaStream = field.optionalString(map, "schema_stream", context)
+  return schemaStream === undefined ? {} : { schemaStream }
 }
 
 export function decodeFilterSource(value: unknown, context: string): FilterSource {

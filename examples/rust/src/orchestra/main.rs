@@ -1,16 +1,15 @@
-use laser_examples::{PARTITIONS, fresh_run, init_tracing, laser, phase, stream_for};
+use laser_examples::{PARTITIONS, env_bool, fresh_run, init_tracing, laser, phase, stream_for};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentCard, CapabilityDescriptor, Health};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::info;
 
 // THE orchestration example: one orchestrator coordinating a pool of long-running
 // capability agents, entirely over the log, never a direct call. It is
 // INTERACTIVE and paced: it stops at each phase and waits for Enter, so you can
 // open the LaserData console's Orchestration view (`/orchestration`) and watch every
 // transition happen live, presence, the registry, contracts, and the workflow
-// journal.
+// journal. `LASER_NON_INTERACTIVE=1` runs it straight through.
 //
 // The agents connect once at the start and stay up for the whole run, so the
 // console shows a live, populated fabric the entire time. Each phase:
@@ -28,13 +27,10 @@ use tracing::info;
 //   7. EXPIRY       a tight-deadline task to a slow agent times out, and the
 //                   orchestrator recovers by re-dispatching to a healthy one.
 //
-// Routing uses a fixed inbox topic so it runs against Apache Iggy:
-// every branch is target-filtered to its agent on the shared commands topic. A
-// managed deployment advertises per-agent inboxes and uses the default
-// `InboxRoute::Advertised` with no example change. Presence advertisement is the
-// one capability-gated piece: a managed deployment records it, and it is a
-// no-op against Apache Iggy (the registry, contracts, and workflows work on
-// both).
+// Routing uses a fixed inbox topic so it runs against Apache Iggy: every
+// branch is addressed to its agent on `agent.sessions`. Presence advertisement
+// is best-effort: a managed deployment records it, and it is a no-op against
+// Apache Iggy. The registry, contracts, and workflows work on both.
 //
 //   cargo run --release --example orchestra
 
@@ -52,7 +48,12 @@ async fn main() -> Result<(), LaserError> {
     let stream = stream_for(EXAMPLE);
     let laser = laser(&stream, Capabilities::OPEN).await?;
     fresh_run(&laser, &stream, async {
-        laser.bootstrap(PARTITIONS).await?;
+        laser
+            .bootstrap(
+                PARTITIONS,
+                laser_sdk::agent::TopicRetention::expire_after(Duration::from_secs(86_400)),
+            )
+            .await?;
 
         phase("Discovery: a pool of long-running capability agents connects");
         // Kept alive for the whole run so the console stays populated. Health is a
@@ -101,42 +102,41 @@ async fn main() -> Result<(), LaserError> {
             )
             .await?,
         ];
-        info!("six agents connected and advertised their capability cards");
+        println!("six agents connected and advertised their capability cards");
         pause("DISCOVERY: six agents are live in the registry (one unavailable)").await;
 
         phase("Contract: a directed task to one capable agent, with a deadline");
         // The orchestrator names a capability, not an agent. Routing resolves the one
         // classifier from the registry and waits for the reply or the deadline.
-        match contract_skill(&laser, CLASSIFY, secs(10)).await? {
-            Contract::Completed(reply) => {
-                info!(result = %String::from_utf8_lossy(reply.body()), "classifier replied")
-            }
-            other => info!(?other, "the contract did not complete"),
-        }
+        let classified = completed_body(contract_skill(&laser, CLASSIFY, secs(10)).await?);
+        println!(
+            "classifier replied: {}",
+            classified.as_deref().unwrap_or("<did not complete>")
+        );
         pause("CONTRACT: a directed task completed (see it in the Contracts panel)").await;
 
         phase("Fan-out: a panel scattered to every capable agent");
         // Three agents advertise diagnose, but one is Unavailable, so the scatter
         // reaches the two healthy ones without the orchestrator knowing their ids.
         let findings = diagnose_panel(&laser).await?;
-        info!(
-            findings = findings.len(),
-            "panel gathered findings (the unavailable agent was skipped)"
+        println!(
+            "panel gathered {} findings (the unavailable agent was skipped)",
+            findings.len()
         );
         pause("FAN-OUT: two healthy diagnosers answered, the unavailable one was skipped").await;
 
         phase("Workflow: triage, then a diagnose panel, then remediate (journalled)");
-        // Register the run in the managed run registry when the plane serves it (the
-        // Runs panel then shows its lifecycle), and run log-native otherwise.
-        let registry_served = laser.capabilities().await.agent_workflow;
-        let mut workflow = laser
+        // The run is a session and every step a child session of it, so the
+        // sessions view shows the whole tree on any deployment.
+        let workflow = laser
             .workflow("incident-response")
-            .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+            .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
             // Cap the dispatches and wall clock so a runaway fan-out cannot spin.
-            .budget(Budget::unlimited().invocations(8).wall_clock(secs(60)));
-        if registry_served {
-            workflow = workflow.registered();
-        }
+            .budget(
+                WorkflowBudget::unlimited()
+                    .invocations(8)
+                    .wall_clock(secs(60)),
+            );
         let run = workflow
             .step(
                 "triage",
@@ -166,11 +166,12 @@ async fn main() -> Result<(), LaserError> {
             .after("diagnose")
             .run()
             .await?;
-        info!(
-            steps = run.outputs.len(),
-            "workflow completed and journalled"
+        println!(
+            "workflow completed and journalled: {} steps",
+            run.outputs.len()
         );
-        pause("WORKFLOW: the run journalled triage -> diagnose -> remediate (Workflow panel)").await;
+        pause("WORKFLOW: the run journalled triage -> diagnose -> remediate (Workflow panel)")
+            .await;
 
         phase("Quarantine: an operator pulls a misbehaving agent");
         // Quarantine is a registry fact every fused registry folds, so the next
@@ -179,9 +180,9 @@ async fn main() -> Result<(), LaserError> {
             .quarantine(operator(), &agent_id("diag-alpha"))
             .await?;
         let after = diagnose_panel(&laser).await?;
-        info!(
-            findings = after.len(),
-            "panel after quarantine (alpha routed around)"
+        println!(
+            "panel after quarantine: {} findings (alpha routed around)",
+            after.len()
         );
         pause("QUARANTINE: diag-alpha is quarantined in the registry, the panel routes around it")
             .await;
@@ -191,9 +192,9 @@ async fn main() -> Result<(), LaserError> {
             .unquarantine(operator(), &agent_id("diag-alpha"))
             .await?;
         let reinstated = diagnose_panel(&laser).await?;
-        info!(
-            findings = reinstated.len(),
-            "panel after un-quarantine (alpha is back)"
+        println!(
+            "panel after un-quarantine: {} findings (alpha is back)",
+            reinstated.len()
         );
         pause("RECOVERY: diag-alpha is reinstated, the panel is whole again").await;
 
@@ -201,21 +202,21 @@ async fn main() -> Result<(), LaserError> {
         // The slow agent acks pickup but cannot finish inside the one-second deadline,
         // so the contract expires. The orchestrator recovers by re-dispatching to a
         // healthy fast agent, the pattern any real coordinator uses for a stuck task.
-        match contract_skill(&laser, SLOW_TASK, secs(1)).await? {
-            Contract::Completed(reply) => {
-                info!(result = %String::from_utf8_lossy(reply.body()), "unexpectedly fast")
-            }
-            other => {
-                info!(?other, "the slow agent missed the deadline, recovering");
-                if let Contract::Completed(reply) = contract_skill(&laser, REMEDIATE, secs(10)).await? {
-                    info!(result = %String::from_utf8_lossy(reply.body()), "recovered on a healthy agent");
-                }
-            }
+        let slow = contract_skill(&laser, SLOW_TASK, secs(1)).await?;
+        if let Some(body) = completed_body(slow) {
+            println!("unexpectedly fast: {body}");
+        } else {
+            println!("the slow agent missed the deadline, recovering on a healthy agent");
+            let recovered = completed_body(contract_skill(&laser, REMEDIATE, secs(10)).await?);
+            println!(
+                "recovered: {}",
+                recovered.as_deref().unwrap_or("<did not complete>")
+            );
         }
         pause("EXPIRY: the slow agent timed out, the task recovered on a healthy agent").await;
 
-        info!(
-            "orchestra: discovery, routing, fan-out, a journalled workflow, health, \
+        println!(
+            "\norchestra: discovery, routing, fan-out, a journalled workflow, health,\n\
              reversible quarantine, and deadline recovery, all coordinated over the log."
         );
 
@@ -267,8 +268,8 @@ async fn spawn_worker(
     let connection = laser(stream, Capabilities::OPEN).await?;
     let mut handle = Agent::builder()
         .id(agent_id(id))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(card(skill, health).capabilities)
         // Ack on pickup so the orchestrator can tell a consumed task from an
         // expired one, which is what makes the expiry phase legible.
@@ -310,7 +311,7 @@ async fn contract_skill(
         .contract(Router::to_capable(skill, RoutePolicy::Any))
         .from(agent_id(ORCHESTRATOR))
         .payload(INCIDENT.as_bytes())
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .deadline(deadline)
         .send()
         .await
@@ -325,17 +326,29 @@ async fn diagnose_panel(laser: &Laser) -> Result<Vec<Vec<u8>>, LaserError> {
             agent_id(ORCHESTRATOR),
             &CapabilitySelector::new(DIAGNOSE, RoutePolicy::Any),
             INCIDENT.as_bytes(),
-            &InboxRoute::Fixed(AgentTopic::Commands),
+            &InboxRoute::Fixed(AgentTopic::Sessions),
             secs(10),
         )
         .await
 }
 
+// The reply text of a completed contract, or `None` for any other outcome.
+fn completed_body(outcome: Contract) -> Option<String> {
+    match outcome {
+        Contract::Completed(reply) => Some(String::from_utf8_lossy(reply.body()).into_owned()),
+        _ => None,
+    }
+}
+
 // Print what to watch, then block on Enter so the operator can flip to the
 // LaserData console and observe the phase live. The read is async, so the
 // spawned agents keep handling while the orchestrator waits.
+// `LASER_NON_INTERACTIVE=1` skips the wait.
 async fn pause(prompt: &str) {
     println!("\n  >>> {prompt}\n      (watch the console's /orchestration view, then press Enter)");
+    if env_bool("LASER_NON_INTERACTIVE", false) {
+        return;
+    }
     let mut line = String::new();
     let _ = BufReader::new(tokio::io::stdin())
         .read_line(&mut line)

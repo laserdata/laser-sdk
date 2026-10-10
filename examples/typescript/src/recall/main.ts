@@ -1,5 +1,5 @@
 import { ConversationId, type Laser } from "@laserdata/laser-sdk"
-import { PARTITIONS, decodeUtf8, phase, runExample, utf8 } from "../common.js"
+import { decodeUtf8, PARTITIONS, phase, runExample, SESSION_RETENTION, utf8 } from "../common.js"
 
 export const EXAMPLE = "recall"
 const NAMESPACE = "host:node-7"
@@ -7,8 +7,8 @@ const FACT = "node-7 sits in the eu-west pool, rotates keys monthly"
 
 /** The recalled fact texts. */
 export async function run(laser: Laser, _signal: AbortSignal): Promise<readonly string[]> {
-  // Memory records ride the well-known agent topics, created once here.
-  await laser.bootstrap(PARTITIONS)
+  // Memory records ride the agent memory topic, created once here.
+  await laser.bootstrap(PARTITIONS, SESSION_RETENTION)
   const conversation = ConversationId.new()
 
   phase("all four verbs: remember, recall, improve, forget")

@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "laser-sdk"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2028,7 +2028,6 @@ dependencies = [
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
- "json-patch",
  "laser-wire",
  "secrecy",
  "serde",
@@ -2044,12 +2043,13 @@ dependencies = [
 
 [[package]]
 name = "laser-wire"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "apache-avro",
  "bon",
  "bson",
  "ciborium",
+ "json-patch",
  "memchr",
  "ouroboros",
  "prost-reflect",

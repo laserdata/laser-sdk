@@ -1,7 +1,6 @@
 import { code } from "../client/error-classify.js"
 import {
   CancelledError,
-  CodecError,
   ConsumerGroupSetupError,
   FilterExecutionError,
   FilterFaultError,
@@ -14,37 +13,67 @@ import {
   TransportError,
   publishCause
 } from "../client/errors.js"
-import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../client/internals.js"
+import {
+  INTERNAL_ASSIGNED_PARTITIONS,
+  INTERNAL_COMMIT_HANDLED,
+  INTERNAL_DIALED,
+  INTERNAL_NATIVE_CONSUMER,
+  INTERNAL_TRANSPORT
+} from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import type { LaserTransport } from "../iggy/apache-iggy.js"
 import type { HeaderValue } from "../stream/header-value.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
-import { decodeProvenanceHeaders, type Provenance } from "../provenance/provenance.js"
+import type { Provenance } from "../provenance/provenance.js"
 import { SystemClock, type Clock } from "../runtime/clock.js"
+import { warn } from "../runtime/warn.js"
 import type { KeyRegistry, SigningKey } from "../signing.js"
-import { AgentId, ConversationId, type ConsumerGroupName, type MessageId } from "../types/ids.js"
+import type { SessionConfig, Sessions } from "../session.js"
+import {
+  type AgentId,
+  ConversationId,
+  type ConsumerGroupName,
+  type MessageId
+} from "../types/ids.js"
 import {
   AgentKind,
   OPERATION_TASK,
   TaskStateName,
-  decodeAgentEnvelope,
   encodeAgentDeadLetter,
+  METADATA_SUBMITTED,
+  deadLetterReasonCode,
+  parseAgentId,
   taskStateFromCode,
-  unmetRequirements,
-  validateAgentEnvelope,
   type AgentDeadLetter,
-  type AgentEnvelope,
-  type DeadLetterReasonName,
-  type SignatureContext
+  type AgentId as WireAgentId,
+  type DeadLetterReasonName
 } from "../wire/agent.js"
-import { AGENT_OP_VERSION } from "../wire/codes.js"
 import { resultCodeIsRetryable } from "../wire/result.js"
-import { decodeOne, encodeNamed, expectMap } from "../wire/cbor.js"
-import { type ContentType, contentTypeFromCode } from "../wire/content.js"
-import { AGENT_VERSION, CONTENT_TYPE, FENCE } from "../wire/headers.js"
-import type { LogPosition } from "../wire/ids.js"
+import { encodeNamed } from "../wire/cbor.js"
+import { type Dispatch, addresseeFilter, classify, classifyGeneric } from "../wire/dispatch.js"
+import { CONVERSATION_ID } from "../wire/headers.js"
+import { type LogPosition, crockfordEncode } from "../wire/ids.js"
+import { AGENT_CONTROL, AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consumer, ConsumerMessage } from "../stream/consumer.js"
+import { policyAware } from "../stream/consumer-group.js"
 import { AgentCtx } from "./context.js"
+import {
+  type AgentMessage,
+  type ReceivedAgentMessage,
+  decodeAgentMessage,
+  headersMalformed
+} from "./decode.js"
+import { BudgetGate } from "./budget.js"
+import { ControlBook } from "./control.js"
+import {
+  ControlFollower,
+  PauseDriver,
+  PauseRequests,
+  PauseRuntime,
+  type SourceTopic,
+  loadControl
+} from "./pause.js"
+import type { SessionLease } from "./lease.js"
 import { ADVERTISED_INBOX_ROUTE, type InboxRoute } from "./router.js"
 
 const DEDUP_SCOPE_SEP = "\u001f"
@@ -58,153 +87,22 @@ const FENCE_SWEEP_INTERVAL_MICROS = 1_000_000n
 // How many verified record ids a consumer remembers to refuse a replay of the
 // exact signed bytes, sized like the fence map.
 const VERIFIED_RECORD_WINDOW = 16_384
+// The addressee an agentless consumer classifies an untargeted record as.
+const ANONYMOUS_AGENT = "anonymous"
 
-function tryAgentId(value: string): AgentId | undefined {
-  try {
-    return AgentId.new(value)
-  } catch {
-    return undefined
-  }
-}
-
-function fenceFromMetadata(
-  metadata: ReadonlyMap<string, { readonly kind: string; readonly value?: unknown }> | undefined
-): bigint | undefined {
-  const entry = metadata?.get(FENCE)
-  if (entry?.kind !== "int" && entry?.kind !== "uint") return undefined
-  const value = entry.value
-  return typeof value === "bigint" && value >= 0n ? value : undefined
-}
-
-export function provenanceFromEnvelope(envelope: AgentEnvelope): Provenance {
-  const agent = tryAgentId(envelope.source)
-  const targetAgentId = envelope.target !== undefined ? tryAgentId(envelope.target) : undefined
-  const fenceToken = fenceFromMetadata(envelope.metadata)
-  return {
-    conversationId: ConversationId.parse(envelope.conversation.toString()),
-    ...(agent !== undefined ? { agent } : {}),
-    ...(targetAgentId !== undefined ? { targetAgentId } : {}),
-    ...(envelope.idempotencyKey !== undefined ? { idempotencyKey: envelope.idempotencyKey } : {}),
-    ...(envelope.correlation !== undefined
-      ? { correlationId: envelope.correlation.toString() }
-      : {}),
-    ...(envelope.deadlineMicros !== undefined ? { deadlineMicros: envelope.deadlineMicros } : {}),
-    ...(fenceToken !== undefined ? { fenceToken } : {})
-  }
-}
-
-export interface ReceivedAgentMessage {
-  readonly payload: Uint8Array
-  readonly partitionId: number
-  readonly offset: bigint
-  readonly timestampMicros?: bigint
-  readonly headers: ReadonlyMap<string, HeaderValue>
-}
-
-export interface ProvenanceAndEnvelope {
-  readonly provenance: Provenance
-  readonly envelope?: AgentEnvelope
-  readonly signatureContext?: SignatureContext
-}
-
-export function provenanceAndEnvelope(
-  message: ReceivedAgentMessage,
-  understoodFeatures = 0n
-): ProvenanceAndEnvelope {
-  const version = message.headers.get(AGENT_VERSION)
-  if (version !== undefined) {
-    if (version.kind !== "uint32" || version.value !== AGENT_OP_VERSION) {
-      throw new CodecError("unsupported agent envelope version", "agent", AGENT_VERSION)
-    }
-    const context = "agent envelope"
-    const envelope = decodeAgentEnvelope(
-      expectMap(decodeOne(message.payload, context), context),
-      context
-    )
-    validateAgentEnvelope(envelope)
-    const unmet = unmetRequirements(envelope, understoodFeatures)
-    if (unmet !== 0n) {
-      throw new CodecError(
-        `agent envelope requires unsupported features 0x${unmet.toString(16).padStart(16, "0")}`,
-        "agent",
-        "must_understand"
-      )
-    }
-    const contentType = message.headers.get(CONTENT_TYPE)
-    if (contentType !== undefined && contentType.kind !== "uint8") {
-      throw new CodecError("invalid content-type header", "agent", CONTENT_TYPE)
-    }
-    return {
-      provenance: provenanceFromEnvelope(envelope),
-      envelope,
-      signatureContext: {
-        ...(contentType?.kind === "uint8" ? { contentType: contentType.value } : {}),
-        agentVersion: version.value
-      }
-    }
-  }
-  return { provenance: decodeProvenanceHeaders(message.headers) }
-}
-
-export function contentTypeOf(message: ReceivedAgentMessage): ContentType | undefined {
-  const header = message.headers.get(CONTENT_TYPE)
-  return header?.kind === "uint8" ? contentTypeFromCode(header.value) : undefined
-}
-
-export interface AgentMessage {
-  readonly provenance: Provenance
-  readonly payload: Uint8Array
-  readonly id: MessageId
-  readonly envelope?: AgentEnvelope
-  readonly contentType?: ContentType
-  readonly verifiedPrincipal?: string
-}
-
-export function agentMessageBody(message: AgentMessage): Uint8Array {
-  return message.envelope !== undefined ? message.envelope.body : message.payload
-}
-
-export type DecodedAgentMessage =
-  | {
-      readonly kind: "message"
-      readonly message: AgentMessage
-      readonly signatureContext?: SignatureContext
-      readonly observedAtMicros?: bigint
-    }
-  | { readonly kind: "error"; readonly error: CodecError; readonly payload: Uint8Array }
-
-export function decodeAgentMessage(
-  received: ReceivedAgentMessage,
-  understoodFeatures = 0n
-): DecodedAgentMessage {
-  try {
-    const { provenance, envelope, signatureContext } = provenanceAndEnvelope(
-      received,
-      understoodFeatures
-    )
-    const contentType = contentTypeOf(received)
-    return {
-      kind: "message",
-      message: {
-        provenance,
-        payload: received.payload,
-        id: { partitionId: received.partitionId, offset: received.offset },
-        ...(envelope !== undefined ? { envelope } : {}),
-        ...(contentType !== undefined ? { contentType } : {})
-      },
-      ...(signatureContext !== undefined ? { signatureContext } : {}),
-      ...(received.timestampMicros !== undefined
-        ? { observedAtMicros: received.timestampMicros }
-        : {})
-    }
-  } catch (cause) {
-    return {
-      kind: "error",
-      error: new CodecError("failed to decode agent message", "agent", "decode", { cause }),
-      payload: received.payload
-    }
-  }
-}
+export {
+  agentMessageBody,
+  contentTypeOf,
+  decodeAgentMessage,
+  provenanceAndEnvelope,
+  provenanceFromEnvelope
+} from "./decode.js"
+export type {
+  AgentMessage,
+  DecodedAgentMessage,
+  ProvenanceAndEnvelope,
+  ReceivedAgentMessage
+} from "./decode.js"
 
 export interface RetryPolicy {
   readonly maxAttempts: number
@@ -336,6 +234,14 @@ export interface ReliableConsumerOptions {
   readonly warmDedup?: boolean
   readonly middleware?: readonly AgentMiddleware[]
   readonly onDeadLetter?: DeadLetterSink
+  /** The command operations the handler serves. Unset serves every operation.
+   * A command for another operation is skipped, so a model or tool record an
+   * agent writes for itself never becomes its own work. */
+  readonly operations?: readonly string[]
+  /** The session configuration the runtime applies: the session lens handlers
+   * read through `AgentCtx.session`, and `SessionConfig.failOnDeadLetter`.
+   * Defaults to `new SessionConfig()`. */
+  readonly sessions?: SessionConfig
   /** Deadline and fence checks read this clock, the system clock by default.
    * @internal */
   readonly clock?: Clock
@@ -404,8 +310,8 @@ export function isRetryable(error: LaserError): boolean {
     case "kv":
     case "fork":
     case "graph":
-    case "agent-workflow":
     case "checkpoint":
+    case "session":
       return resultCodeIsRetryable(code(cause))
     case "filter":
       if (cause instanceof ConsumerGroupSetupError) {
@@ -447,7 +353,9 @@ function received(message: ConsumerMessage): ReceivedAgentMessage {
     partitionId: message.partitionId,
     offset: message.position.offset,
     timestampMicros: message.timestampMicros,
-    headers: message.headers
+    headers: message.headers,
+    headersMalformed: message.headersMalformed,
+    currentOffset: message.currentOffset
   }
 }
 
@@ -548,6 +456,8 @@ class ReliableWorker {
   // A signature binds the envelope to no log position, so the exact signed
   // bytes verify again wherever a writer replays them.
   private readonly verifiedRecords = new SlidingWindow(VERIFIED_RECORD_WINDOW)
+  // The budget check before a session's work reaches the handler.
+  private readonly budget = new BudgetGate()
 
   constructor(
     private readonly laser: Laser,
@@ -566,8 +476,14 @@ class ReliableWorker {
     > &
       Pick<
         ReliableConsumerOptions,
-        "agent" | "onDeadLetter" | "respondOn" | "signingKey" | "verifier"
-      > & { readonly hardSignal: AbortSignal },
+        "agent" | "onDeadLetter" | "operations" | "respondOn" | "signingKey" | "verifier"
+      > & {
+        readonly hardSignal: AbortSignal
+        readonly topic: string
+        readonly sessions: Sessions
+        readonly control: ControlBook
+        readonly pause?: PauseRuntime
+      },
     private readonly streamId: number,
     private readonly topicId: number
   ) {}
@@ -576,7 +492,50 @@ class ReliableWorker {
     return this.options.hardSignal.aborted
   }
 
+  // A consumer without an agent id accepts records for any addressee, so it
+  // classifies each record as its own addressee would.
+  private dispatch(message: AgentMessage): Dispatch {
+    const me =
+      this.options.agent?.wireId() ??
+      message.provenance.targetAgentId?.wireId() ??
+      parseAgentId(ANONYMOUS_AGENT)
+    const envelope = message.envelope
+    if (envelope !== undefined) {
+      return classify(envelope, this.options.topic, me, this.options.operations ?? "any")
+    }
+    return classifyGeneric(
+      message.provenance.targetAgentId?.asStr(),
+      message.provenance.causalParent !== undefined,
+      message.provenance.correlationId !== undefined,
+      this.options.topic,
+      me
+    )
+  }
+
   async consume(received: ReceivedAgentMessage): Promise<void> {
+    await this.deliver(received, true)
+  }
+
+  /** Handle a held record again after the resume, without the pause check. */
+  async replay(received: ReceivedAgentMessage): Promise<void> {
+    await this.deliver(received, false)
+  }
+
+  // Tell the pause runtime which partitions the consumer reads, when it
+  // knows.
+  observeAssignment(consumer: Consumer): void {
+    this.options.pause?.observeAssignment(consumer[INTERNAL_ASSIGNED_PARTITIONS]())
+  }
+
+  // The consumer was reopened: the pause runtime reads the lane again before
+  // the next dispatch.
+  invalidatePause(): void {
+    this.options.pause?.invalidate()
+  }
+
+  // Handle one record. A live record passes the pause check, a held record
+  // replayed after the resume does not.
+  private async deliver(received: ReceivedAgentMessage, live: boolean): Promise<void> {
     if (this.cancelled()) return
     const decoded = decodeAgentMessage(received, this.options.understoodFeatures)
     if (decoded.kind === "error") {
@@ -592,6 +551,10 @@ class ReliableWorker {
     ) {
       return
     }
+    // Only work for an operation this handler serves reaches it. Replies,
+    // status, events, control, and records for another agent are skipped and
+    // still committed. The author is never a discriminator.
+    if (this.dispatch(message) !== "work") return
     if (this.options.verifier !== undefined) {
       try {
         const envelope = message.envelope
@@ -613,6 +576,43 @@ class ReliableWorker {
       }
       const record = message.envelope?.record
       if (record !== undefined && !(await this.verifiedRecords.observe(record.toString()))) return
+    }
+    // The pause check, before the fence and dedup gates so a held record
+    // keeps its slot for the resume. Work for a paused session is parked on
+    // the session lane and committed. A resumed session handles its held
+    // records first. The session gate stays held through the handler, so a
+    // pause acknowledgment follows the record in flight.
+    const pause = this.options.pause
+    if (!live || pause === undefined) {
+      await this.gated(received, message)
+      return
+    }
+    const release = await pause.gate(message.provenance.conversationId.toString())
+    try {
+      if ((await pause.hold(this, message)) === "commit") return
+      await this.gated(received, message)
+    } finally {
+      release()
+    }
+  }
+
+  // The budget check, the fence and dedup gates, the deadline, and the
+  // handler.
+  private async gated(received: ReceivedAgentMessage, message: AgentMessage): Promise<void> {
+    // The budget check, on a deployment that indexes sessions: work for a
+    // session over its budget ends the session failed with reason `budget`,
+    // once, and is committed without reaching the handler.
+    const agent = this.options.agent
+    if (agent !== undefined) {
+      const session = message.provenance.conversationId
+      const admitted = await this.budget.admit(
+        this.options.sessions,
+        session.toString(),
+        received.partitionId,
+        received.currentOffset ?? received.offset,
+        () => this.options.sessions.open(session).asAgent(agent).withControl(this.options.control)
+      )
+      if (!admitted) return
     }
     const fence = message.provenance.fenceToken
     if (
@@ -638,11 +638,26 @@ class ReliableWorker {
     }
     if (this.cancelled()) return
     await this.ackOnPickup(message)
+    // Picking up the first command of a submitted session marks the session
+    // working and keeps it listed in this process's heartbeat while the
+    // handler runs.
+    const pickup = await this.pickUpSubmitted(message)
+    try {
+      await this.handle(message)
+    } finally {
+      pickup?.release()
+    }
+  }
+
+  private async handle(message: AgentMessage): Promise<void> {
     const context = AgentCtx.create(this.laser, message, {
       ...(this.options.agent !== undefined ? { agent: this.options.agent } : {}),
       ...(this.options.respondOn !== undefined ? { respondOn: this.options.respondOn } : {}),
       ...(this.options.signingKey !== undefined ? { signingKey: this.options.signingKey } : {}),
-      inboxRoute: this.options.inboxRoute
+      inboxRoute: this.options.inboxRoute,
+      requestAt: this.position(message.id),
+      sessions: this.options.sessions,
+      control: this.options.control
     })
     for (const middleware of this.options.middleware) {
       if (this.cancelled()) return
@@ -682,6 +697,29 @@ class ReliableWorker {
         return
       }
       await sleep(retryDelayMs(this.options.retry, attempt), this.options.hardSignal)
+    }
+  }
+
+  private async pickUpSubmitted(message: AgentMessage): Promise<SessionLease | undefined> {
+    const envelope = message.envelope
+    const agent = this.options.agent
+    const submitted = envelope?.metadata?.get(METADATA_SUBMITTED)
+    if (
+      envelope?.kind !== AgentKind.Command ||
+      agent === undefined ||
+      submitted?.kind !== "bool" ||
+      !submitted.value
+    ) {
+      return undefined
+    }
+    try {
+      return await this.options.sessions
+        .open(message.provenance.conversationId)
+        .asAgent(agent)
+        .pickUp()
+    } catch {
+      // A failed pickup mark never blocks the handler.
+      return undefined
     }
   }
 
@@ -739,31 +777,55 @@ class ReliableWorker {
         detail,
         payload: message.payload
       },
-      message
+      message,
+      message.provenance.conversationId
     )
   }
 
+  // The capsule keeps the record's own conversation when its header still
+  // reads, so the dead letter stays on its session's timeline. A record
+  // without one gets a conversation derived from its log position, stable
+  // across redeliveries.
   private async deadLetterUndecodable(
     received: ReceivedAgentMessage,
     payload: Uint8Array
   ): Promise<void> {
     const id = { partitionId: received.partitionId, offset: received.offset }
+    const source = this.position(id)
+    const conversation = headersMalformed(received)
+      ? undefined
+      : originalConversation(received.headers)
     await this.publishDeadLetter(
-      { conversationId: ConversationId.new(), causalParent: id },
       {
-        source: this.position(id),
+        conversationId:
+          conversation ??
+          ConversationId.derive(
+            [
+              "dead-letter",
+              String(source.streamId),
+              String(source.topicId),
+              String(source.partitionId),
+              source.offset.toString()
+            ].join(DEDUP_SCOPE_SEP)
+          ),
+        causalParent: id
+      },
+      {
+        source,
         reason: { kind: "known", name: "DecodeFailed" },
         attempts: 0,
         payload
       },
-      undefined
+      undefined,
+      conversation
     )
   }
 
   private async publishDeadLetter(
     provenance: Provenance,
     capsule: AgentDeadLetter,
-    message: AgentMessage | undefined
+    message: AgentMessage | undefined,
+    session: ConversationId | undefined
   ): Promise<void> {
     let publishError: LaserError | undefined
     try {
@@ -782,7 +844,71 @@ class ReliableWorker {
       // Dead-letter sinks observe the terminal delivery decision.
     }
     if (publishError !== undefined) throw publishError
+    if (session !== undefined) await this.failSessionOnDeadLetter(session, capsule)
   }
+
+  // Under `SessionConfig.failOnDeadLetter`, a dead-lettered record fails its
+  // session. Best effort: the dead letter is already published, so a failed
+  // status write leaves the record to commit.
+  private async failSessionOnDeadLetter(
+    session: ConversationId,
+    capsule: AgentDeadLetter
+  ): Promise<void> {
+    const agent = this.options.agent
+    if (!this.options.sessions.config.failsOnDeadLetter || agent === undefined) return
+    const reason =
+      capsule.reason.kind === "known" ? capsule.reason.name : String(capsule.reason.code)
+    const { source } = capsule
+    try {
+      await this.options.sessions
+        .open(session)
+        .asAgent(agent)
+        .fail({
+          code: { kind: "known", name: "Internal" },
+          message:
+            capsule.detail === undefined
+              ? `a record of this session was dead-lettered (${reason})`
+              : `a record of this session was dead-lettered (${reason}): ${capsule.detail}`,
+          retryable: false,
+          detail: new Map([
+            [
+              "dead_letter_reason",
+              { kind: "int", value: BigInt(deadLetterReasonCode(capsule.reason)) }
+            ],
+            [
+              "source",
+              {
+                kind: "str",
+                value: `${String(source.streamId)}/${String(source.topicId)}/${String(source.partitionId)}/${source.offset.toString()}`
+              }
+            ]
+          ])
+        })
+    } catch {
+      // The dead letter is published, so the record still commits.
+    }
+  }
+}
+
+// The conversation a record's header names, in either encoding the wire
+// allows, when the rest of the record does not decode.
+function originalConversation(
+  headers: ReadonlyMap<string, HeaderValue>
+): ConversationId | undefined {
+  const value = headers.get(CONVERSATION_ID)
+  try {
+    if (value?.kind === "string") return ConversationId.parse(value.value)
+    if (value?.kind === "uint128") {
+      let id = 0n
+      for (let index = value.value.byteLength - 1; index >= 0; index -= 1) {
+        id = (id << 8n) | BigInt(value.value[index] ?? 0)
+      }
+      return ConversationId.parse(crockfordEncode(id))
+    }
+  } catch {
+    // An unreadable header leaves the record without a conversation.
+  }
+  return undefined
 }
 
 export class ReliableConsumer {
@@ -809,6 +935,17 @@ export class ReliableConsumer {
     this.options = options
   }
 
+  /**
+   * Consume until shutdown, dispatching each message to `handler`. Delivery
+   * runs on the group consumer, so a server that resolves group policies
+   * reads through the group-aware engine. On `agent.sessions` and
+   * `agent.control`, when the server serves filtered reads and the filter
+   * catalog, the group is bound to the addressee filter
+   * `agdx.to In [<agent>, "*"]` before it reads. A group bound to another
+   * filter is refused. On Apache Iggy the group stays unbound and records are
+   * classified on the client. A capability probe that established nothing is
+   * an error.
+   */
   async run(
     laser: Laser,
     handler: AgentHandler,
@@ -819,18 +956,106 @@ export class ReliableConsumer {
     const pollIntervalMs = this.options.pollIntervalMs ?? 10
     const deduplicator =
       this.options.deduplicator ?? new SlidingWindow(this.options.dedupWindow ?? 10_000)
-    // The runtime owns its delivery contract over the native group consumer.
-    const group = laser.topic(this.options.topic).consumerGroup(this.options.group.asStr())
-    const openConsumer = (): Promise<Consumer> =>
-      group[INTERNAL_NATIVE_CONSUMER](
-        { commitPolicy: { kind: "disabled" }, pollIntervalMs },
-        "propagate"
-      )
-    let consumer = await openConsumer()
-    if (this.options.warmDedup === true) {
-      await this.warmDedup(laser, deduplicator, this.options.dedupWindow ?? 10_000)
+    const engine = await resolveEngine(laser)
+    const group = this.options.group.asStr()
+    const me = this.options.agent?.wireId()
+    if (me !== undefined) await bindAddressee(laser, engine, this.options.topic, group, me)
+    const opener = new Opener(laser, this.options.topic, group, pollIntervalMs, engine.native)
+    const consumer = await opener.open()
+    let follower: ControlFollower | undefined
+    let started = false
+    try {
+      if (this.options.warmDedup === true) {
+        await this.warmDedup(laser, deduplicator, this.options.dedupWindow ?? 10_000)
+      }
+      const ids = await laserTransportIds(laser, stream, this.options.topic)
+      const sessions = laser.sessions(this.options.sessions)
+      // The control subscription: a bounded read of `agent.control` loads the
+      // requests already on the log, and the follower reads every partition
+      // from where it ended, so each instance of the role sees every pause,
+      // resume, and cancel request whatever partitions its group assigns it.
+      // Handlers read the requests through their session lens. An agent with
+      // an id also runs the pause runtime. A stream without the topic has no
+      // operator control.
+      const book = new ControlBook()
+      const requests = new PauseRequests()
+      let pause: PauseRuntime | undefined
+      const feed =
+        this.options.topic === AGENT_CONTROL ? undefined : await loadControl(laser, me, book)
+      if (feed !== undefined) {
+        const source = await sourceTopic(laser, stream, this.options.topic)
+        const agent = this.options.agent
+        if (agent !== undefined && source !== undefined) {
+          pause = new PauseRuntime(
+            laser,
+            sessions,
+            agent,
+            book,
+            [feed.streamId, feed.topicId],
+            feed.truncated,
+            source,
+            (session) => {
+              requests.request(session)
+            }
+          )
+        }
+        follower = new ControlFollower(
+          laserTransport(laser),
+          stream,
+          feed,
+          me,
+          book,
+          pause === undefined
+            ? undefined
+            : (session) => {
+                requests.request(session)
+              },
+          pollIntervalMs
+        )
+      }
+      started = true
+      await this.consume(laser, handler, control, opener, consumer, deduplicator, ids, {
+        sessions,
+        book,
+        requests,
+        ...(pause !== undefined ? { pause } : {})
+      })
+    } catch (error) {
+      if (!started) {
+        try {
+          await consumer.shutdown()
+        } catch {
+          // Preserve the setup failure.
+        }
+      }
+      throw error
+    } finally {
+      if (control.hardAborted?.() === true || control.hardSignal?.aborted === true) {
+        follower?.abort()
+      } else {
+        await follower?.stop()
+      }
     }
-    const ids = await laserTransportIds(laser, stream, this.options.topic)
+  }
+
+  private async consume(
+    laser: Laser,
+    handler: AgentHandler,
+    control: ReliableConsumerControl,
+    opener: Opener,
+    first: Consumer,
+    deduplicator: Deduplicator,
+    ids: { readonly streamId: number; readonly topicId: number },
+    sessionRuntime: {
+      readonly sessions: Sessions
+      readonly book: ControlBook
+      readonly requests: PauseRequests
+      readonly pause?: PauseRuntime
+    }
+  ): Promise<void> {
+    let consumer = first
+    const pollIntervalMs = opener.pollIntervalMs
+    const { sessions, book, requests, pause } = sessionRuntime
     const shutdown = shutdownControl(control, this.options.shutdownGraceMs ?? 30_000)
     const runtime = shutdown.runtime
     const worker = new ReliableWorker(
@@ -845,6 +1070,11 @@ export class ReliableConsumer {
         middleware: this.options.middleware ?? [],
         ackOnPickup: this.options.ackOnPickup ?? false,
         deduplicator,
+        topic: this.options.topic,
+        sessions,
+        control: book,
+        ...(pause !== undefined ? { pause } : {}),
+        ...(this.options.operations !== undefined ? { operations: this.options.operations } : {}),
         ...(this.options.agent !== undefined ? { agent: this.options.agent } : {}),
         ...(this.options.respondOn !== undefined ? { respondOn: this.options.respondOn } : {}),
         ...(this.options.onDeadLetter !== undefined
@@ -856,7 +1086,15 @@ export class ReliableConsumer {
       ids.streamId,
       ids.topicId
     )
+    let driver: PauseDriver | undefined
     try {
+      // Rebuild the pause state from the log before the first dispatch, then
+      // let the pause driver bring each session a request names up to date.
+      if (pause !== undefined) {
+        await pause.recover()
+        driver = new PauseDriver(pause, worker)
+        requests.attach(driver)
+      }
       control.ready?.()
       for (;;) {
         try {
@@ -867,9 +1105,12 @@ export class ReliableConsumer {
               : this.runPerPartition(
                   consumer,
                   worker,
-                  concurrency.maxPartitions,
-                  this.options.maxQueuedRecords ?? 4_096,
-                  this.options.maxQueuedBytes ?? 64 * 1024 * 1024,
+                  {
+                    maxPartitions: Math.max(1, concurrency.maxPartitions),
+                    maxQueuedRecords: Math.max(1, this.options.maxQueuedRecords ?? 4_096),
+                    maxQueuedBytes: Math.max(1, this.options.maxQueuedBytes ?? 64 * 1024 * 1024),
+                    probeIntervalMs: sessions.config.heartbeatValue
+                  },
                   runtime,
                   pollIntervalMs
                 )
@@ -887,12 +1128,19 @@ export class ReliableConsumer {
           }
           await sleep(pollIntervalMs, runtime.signal)
           if (shutdown.stopped()) return
-          consumer = await openConsumer()
+          consumer = await opener.open()
+          worker.invalidatePause()
         }
       }
     } finally {
       shutdown.dispose()
-      if (!runtime.hardAborted()) {
+      if (!runtime.hardAborted()) await driver?.stop()
+      if (runtime.hardAborted()) {
+        // The record in flight stays uncommitted. The consumer leaves in the
+        // background, so a group-aware member hands its partitions over
+        // without the caller waiting for work it abandoned.
+        void consumer.shutdown().catch(() => undefined)
+      } else {
         try {
           await consumer.shutdown()
         } catch {
@@ -911,67 +1159,89 @@ export class ReliableConsumer {
     while (control.signal?.aborted !== true) {
       const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
       if (message === undefined) continue
+      worker.observeAssignment(consumer)
       if (!(await consumeUntilDone(worker.consume(received(message)), control.hardSignal))) return
       if (control.hardAborted?.() !== true) await consumer.commit(message)
     }
   }
 
+  // One lane per partition, each a serial chain of records committed once
+  // handled. A lane whose dead-letter publish fails stops its chain, so its
+  // queued successors are never committed. The assignment probe closes the
+  // lane of a partition this member no longer reads, and a later lane of the
+  // same partition waits for it, so a partition is never handled by two lanes
+  // at once.
   private async runPerPartition(
     consumer: Consumer,
     worker: ReliableWorker,
-    maxPartitions: number,
-    maxQueuedRecords: number,
-    maxQueuedBytes: number,
+    limits: LaneLimits,
     control: ReliableConsumerControl,
     pollIntervalMs: number
   ): Promise<void> {
-    const limit = Math.max(1, maxPartitions)
     const lanes = new Map<number, Promise<void>>()
+    const retiring = new Map<number, Promise<void>>()
     const scheduled = new Set<string>()
+    const pending = (): Promise<void>[] => [...lanes.values(), ...retiring.values()]
     let queuedRecords = 0
     let queuedBytes = 0
     let failure: LaserError | undefined
+    let probedAt = Date.now()
     const currentFailure = (): LaserError | undefined => failure
-    while (control.signal?.aborted !== true && failure === undefined) {
-      const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
-      if (message === undefined) continue
-      const position = `${String(message.partitionId)}:${message.position.offset.toString()}`
-      if (scheduled.has(position)) continue
-      const messageBytes = message.payload.byteLength + headerBytes(message.headers)
-      while (
-        lanes.size > 0 &&
-        (queuedRecords >= Math.max(1, maxQueuedRecords) ||
-          queuedBytes + messageBytes > Math.max(1, maxQueuedBytes))
-      ) {
-        await Promise.race(lanes.values())
+    try {
+      while (control.signal?.aborted !== true && failure === undefined) {
+        if (Date.now() - probedAt >= limits.probeIntervalMs) {
+          probedAt = Date.now()
+          dropRevoked(consumer, lanes, retiring)
+        }
+        const message = await nextOrIdle(consumer, pollIntervalMs, control.signal)
+        if (message === undefined) continue
+        worker.observeAssignment(consumer)
+        const position = `${String(message.partitionId)}:${message.position.offset.toString()}`
+        if (scheduled.has(position)) continue
+        const messageBytes = message.payload.byteLength + headerBytes(message.headers)
+        while (
+          pending().length > 0 &&
+          (queuedRecords >= limits.maxQueuedRecords ||
+            queuedBytes + messageBytes > limits.maxQueuedBytes)
+        ) {
+          await Promise.race(pending())
+        }
+        let existing = lanes.get(message.partitionId)
+        while (
+          existing === undefined &&
+          lanes.size >= limits.maxPartitions &&
+          currentFailure() === undefined
+        ) {
+          await Promise.race(lanes.values())
+          existing = lanes.get(message.partitionId)
+        }
+        if (currentFailure() !== undefined) break
+        const predecessor = existing ?? retiring.get(message.partitionId) ?? Promise.resolve()
+        retiring.delete(message.partitionId)
+        scheduled.add(position)
+        queuedRecords += 1
+        queuedBytes += messageBytes
+        const lane: Promise<void> = predecessor
+          .then(async () => {
+            if (currentFailure() !== undefined || control.hardAborted?.() === true) return
+            await worker.consume(received(message))
+            if (control.hardAborted?.() !== true) await consumer[INTERNAL_COMMIT_HANDLED](message)
+          })
+          .catch((error: unknown) => {
+            failure ??= handlerError(error)
+          })
+          .finally(() => {
+            scheduled.delete(position)
+            queuedRecords -= 1
+            queuedBytes -= messageBytes
+            if (lanes.get(message.partitionId) === lane) lanes.delete(message.partitionId)
+            if (retiring.get(message.partitionId) === lane) retiring.delete(message.partitionId)
+          })
+        lanes.set(message.partitionId, lane)
       }
-      let existing = lanes.get(message.partitionId)
-      while (existing === undefined && lanes.size >= limit && currentFailure() === undefined) {
-        await Promise.race(lanes.values())
-        existing = lanes.get(message.partitionId)
-      }
-      if (currentFailure() !== undefined) break
-      scheduled.add(position)
-      queuedRecords += 1
-      queuedBytes += messageBytes
-      const lane = (existing ?? Promise.resolve())
-        .then(async () => {
-          if (currentFailure() !== undefined || control.hardAborted?.() === true) return
-          await worker.consume(received(message))
-          if (control.hardAborted?.() !== true) await consumer.commit(message)
-        })
-        .catch((error: unknown) => {
-          failure ??= handlerError(error)
-        })
-        .finally(() => {
-          scheduled.delete(position)
-          queuedRecords -= 1
-          queuedBytes -= messageBytes
-          if (lanes.get(message.partitionId) === lane) lanes.delete(message.partitionId)
-        })
-      lanes.set(message.partitionId, lane)
+    } finally {
+      if (control.hardSignal?.aborted !== true) await Promise.all(pending())
     }
-    if (control.hardSignal?.aborted !== true) await Promise.all(lanes.values())
     if (failure !== undefined) throw failure
   }
 
@@ -1009,6 +1279,126 @@ export class ReliableConsumer {
         if (key !== undefined) await deduplicator.observe(key)
       }
     }
+  }
+}
+
+// The per-partition scheduler's bounds.
+interface LaneLimits {
+  readonly maxPartitions: number
+  readonly maxQueuedRecords: number
+  readonly maxQueuedBytes: number
+  // How often the assignment probe drops lanes of partitions this member no
+  // longer reads.
+  readonly probeIntervalMs: number
+}
+
+// The assignment probe. The lane of a partition this member no longer reads
+// retires: it finishes the records it holds and no longer counts against the
+// lane cap.
+function dropRevoked(
+  consumer: Consumer,
+  lanes: Map<number, Promise<void>>,
+  retiring: Map<number, Promise<void>>
+): void {
+  const assigned = consumer[INTERNAL_ASSIGNED_PARTITIONS]()
+  if (assigned === undefined) return
+  for (const [partition, lane] of lanes) {
+    if (assigned.has(partition)) continue
+    lanes.delete(partition)
+    retiring.set(partition, lane)
+  }
+}
+
+// How the runtime reads its groups, decided once at start from the server's
+// capabilities.
+interface DeliveryEngine {
+  // Read groups natively. Only when no group policy can apply.
+  readonly native: boolean
+  // The server serves filtered reads and the catalog that binds a group to
+  // its filter.
+  readonly filters: boolean
+}
+
+async function resolveEngine(laser: Laser): Promise<DeliveryEngine> {
+  let capabilities = await laser.capabilities()
+  if (capabilities.hello === "unknown") capabilities = await laser.refreshCapabilities()
+  // An uncertain probe, or a server that serves filters without group-aware
+  // reads, is an error here, never a native fallback.
+  if (!policyAware(capabilities)) return { native: true, filters: false }
+  // The group-aware engine opens its own connections, which a client brought
+  // by the caller cannot. Such a runtime reads natively and binds no filter:
+  // delivery stays correct because the runtime still classifies every record
+  // by its addressee, it only examines more.
+  if (!laser[INTERNAL_DIALED]()) {
+    if (capabilities.managed) {
+      warn(
+        "the agent reads natively because its client was not built from a connection string, so no group filter is bound"
+      )
+    }
+    return { native: true, filters: false }
+  }
+  return {
+    native: false,
+    filters: capabilities.filters.native && capabilities.filters.catalog
+  }
+}
+
+// Bind the role group of `topic` to the addressee filter. Only the session
+// topics carry `agdx.to` on every record, so a filter on any other topic
+// would drop untargeted records.
+async function bindAddressee(
+  laser: Laser,
+  engine: DeliveryEngine,
+  topic: string,
+  group: string,
+  me: WireAgentId
+): Promise<void> {
+  if (!engine.filters || (topic !== AGENT_SESSIONS && topic !== AGENT_CONTROL)) return
+  await laser
+    .topic(topic)
+    .consumerGroup(group)
+    .create({ filter: addresseeFilter(me) })
+}
+
+// Opens the runtime's consumer of one topic, again after a recoverable failure.
+class Opener {
+  constructor(
+    private readonly laser: Laser,
+    readonly topic: string,
+    private readonly group: string,
+    readonly pollIntervalMs: number,
+    private readonly native: boolean
+  ) {}
+
+  open(): Promise<Consumer> {
+    const group = this.laser.topic(this.topic).consumerGroup(this.group)
+    const options = {
+      commitPolicy: { kind: "disabled" },
+      pollIntervalMs: this.pollIntervalMs
+    } as const
+    return this.native
+      ? group[INTERNAL_NATIVE_CONSUMER](options, "propagate")
+      : group.consumer({ ...options, createGroup: true })
+  }
+}
+
+// The source topic of a runtime's work records, with the creation time that
+// proves its numeric id. `undefined` when the ids do not resolve.
+async function sourceTopic(
+  laser: Laser,
+  stream: string,
+  topic: string
+): Promise<SourceTopic | undefined> {
+  const transport = laserTransport(laser)
+  const ids = await transport.resolveStreamTopicIds?.(stream, topic)
+  const details = await transport.findSnapshotTopic?.(stream, topic)
+  if (ids === undefined || details === undefined) return undefined
+  return {
+    stream,
+    topic,
+    streamId: ids.streamId,
+    topicId: ids.topicId,
+    generation: details.createdAtMicros
   }
 }
 

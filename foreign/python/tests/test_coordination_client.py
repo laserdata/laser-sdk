@@ -73,10 +73,10 @@ async def test_given_a_stalled_acquisition_when_timed_out_then_should_report_rec
             await asyncio.sleep(0)
 
     transport = Stalled()
-    client = ls.FencedLeaseClient(transport).with_attempt_timeout(0.005)
+    client = ls.FencedLeaseClient(transport).with_attempt_timeout(5)
     operation = client.prepare_acquire(ACQUIRE)
-    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.wait_for_lease_expiry(1.0)
-    assert operation.ambiguous_recovery != ls.AmbiguousMutationRecovery.wait_for_lease_expiry(2.0)
+    assert operation.ambiguous_recovery == ls.AmbiguousMutationRecovery.wait_for_lease_expiry(1_000)
+    assert operation.ambiguous_recovery != ls.AmbiguousMutationRecovery.wait_for_lease_expiry(2_000)
     assert operation.ambiguous_recovery.kind == "wait_for_lease_expiry"
     with pytest.raises(ls.LaserError) as failure:
         await client.acquire(operation)

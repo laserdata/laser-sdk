@@ -36,8 +36,8 @@ async fn given_a_capable_target_when_a_contract_is_sent_then_should_complete_wit
     let laser = harness::laser().await;
     let mut worker = Agent::builder()
         .id("rotator".parse().expect("rotator id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(rotate_card().capabilities)
         .ack_on_pickup(true)
         .handler(Rotator)
@@ -51,7 +51,7 @@ async fn given_a_capable_target_when_a_contract_is_sent_then_should_complete_wit
         .contract(Router::to_capable("rotate_credentials", RoutePolicy::Any))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
         .payload(Bytes::from("rotate-42"))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .deadline(Duration::from_secs(10))
         .send()
         .await
@@ -59,7 +59,7 @@ async fn given_a_capable_target_when_a_contract_is_sent_then_should_complete_wit
 
     match outcome {
         Contract::Completed(reply) => {
-            assert_eq!(reply.payload, b"rotated");
+            assert_eq!(reply.body(), b"rotated");
         }
         other => panic!("expected Completed, got {other:?}"),
     }
@@ -79,7 +79,7 @@ async fn given_no_responder_when_a_contract_is_sent_then_should_time_out() {
         .contract(Router::to("ghost".parse().expect("ghost id is valid")))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
         .payload(Bytes::from("noop"))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .deadline(Duration::from_secs(2))
         .send()
         .await
@@ -100,7 +100,7 @@ async fn given_no_pickup_when_a_contract_has_an_expiry_then_should_report_not_co
         .contract(Router::to("ghost".parse().expect("ghost id is valid")))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
         .payload(Bytes::from("noop"))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .expire_if_not_consumed(Duration::from_secs(1))
         .deadline(Duration::from_secs(20))
         .send()
@@ -153,8 +153,8 @@ async fn given_a_verifier_when_the_target_signs_its_reply_then_should_complete_o
 
     let mut worker = Agent::builder()
         .id("rotator".parse().expect("rotator id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(rotate_card().capabilities)
         .ack_on_pickup(true)
         .signing_key(Arc::new(rotator_key))
@@ -168,7 +168,7 @@ async fn given_a_verifier_when_the_target_signs_its_reply_then_should_complete_o
         .contract(Router::to("rotator".parse().expect("rotator id is valid")))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
         .payload(Bytes::from("rotate-42"))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .deadline(Duration::from_secs(10))
         .send()
         .await
@@ -197,8 +197,8 @@ async fn given_a_verified_slow_agent_when_pickup_expires_then_should_honor_its_s
 
     let mut worker = Agent::builder()
         .id("slow-rotator".parse().expect("slow-rotator id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .ack_on_pickup(true)
         .signing_key(Arc::new(rotator_key))
         .handler(SlowSignedRotator)
@@ -213,7 +213,7 @@ async fn given_a_verified_slow_agent_when_pickup_expires_then_should_honor_its_s
         ))
         .from("orchestrator".parse().expect("orchestrator id is valid"))
         .payload(Bytes::from("rotate-43"))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .expire_if_not_consumed(Duration::from_millis(100))
         .deadline(Duration::from_secs(2))
         .send()

@@ -1,248 +1,143 @@
-# SDK 0.6.0 client behavior
+# SDK client behavior
 
-0.6.0 is a minor release with breaking changes in all three clients. Read [Upgrading from 0.5](#upgrading-from-05) before you bump the version. The wire contract does not change. Operation versions and conversation derivation stay at version 1.
+This guide describes how the Rust, Python, and TypeScript clients behave. Operation and envelope versions are 1.
 
 Rust, Python, and TypeScript share the features and defaults listed in [the parity matrix](parity.md). The matrix covers inherent and trait methods, generated builder controls, and standalone SDK functions. Names and construction follow each language.
 
-## Upgrading from 0.5
+## Agents and sessions
 
-Each item is one breaking change. Names that only moved keep working under their new path.
+All three clients implement agent sessions. The [AGDX specification](agdx.md#a15-agent-sessions) defines the session records, topics, and reads.
 
-### All clients
+### Sessions
 
-- `Capabilities` no longer has `sessions` or `durable_dedup` (TypeScript `durableDedup`). No server ever set them, so they were always false. Rust also drops `Capabilities::with_sessions` and `with_durable_dedup`, and Python drops the `sessions=` and `durable_dedup=` keywords of `with_capabilities`.
-- Two scenario examples were replaced: `incident-desk` and `fleet-tape` take their place in all three languages. Fixture payloads were updated. A project that embeds the fixture corpus must take the regenerated files.
-- Periodic agent consolidation passes the agent's own scope, with the agent id set and every other field empty. It used to pass an empty scope and summarize the whole namespace. A consolidator with a summarizer now writes one durable `Summary` per conversation, scoped and attributed to that conversation, instead of one summary per pass. Pruning still covers the whole consolidation scope.
-- Deduplicated memory content ids now include the user and the application in the owner. An id minted by 0.5 `dedup` no longer matches, so re-remembering a 0.5 item with dedup stores a second item.
-- Folded memory recall skips 0.5 memory records, because they lack the `agdx.mem.ns` header. There is no fallback. Re-remember anything you still need from 0.5.
-- A batching producer's `send` reports a failed timer flush. It adds its own record to that failure's unconfirmed records and returns the failure without queueing the record.
-- `Recent` recall orders by recency only. Feedback no longer reorders it, and its items carry no feedback score or signal.
-- Feedback-derived recall signals report the `Auto` strategy in every backend.
-- `ConversationState` replay folds the whole requested range for a full, offset, checkpoint, or position bound. It used to stop at the newest 10,000 records per partition. A `Last(n)` bound stays windowed.
-- A query above `MAX_PAGE_SIZE` fails with an invalid-argument error before any round trip, not a too-large query error.
-- Both bridges expose transport-independent JSON-RPC dispatch: `handle_rpc(request)` in Rust and Python and `handleRpc(input)` in TypeScript. Malformed input returns a public error response.
-- Native TypeScript group polling preserves exact microsecond timestamps and raw header blocks. Avro bytes and fixed fields encode and decode as arrays of byte values in Rust and TypeScript.
+Session writes retain lane identity and reject changed stream or topic generations and partition counts before publication. On managed deployments, a metadata-only Sources check compares the registration using native lane send permission. Aggregate reads keep their existing grants. Explicit registration recovery creates a fresh reference, while old handles remain stale. A refused state snapshot stays pending for retry, and old-generation leases do not heartbeat into a recreated stream.
 
-### Rust
+A session is one conversation with a recorded lifecycle. Its id is the conversation id. `laser.sessions()` returns the session factory. Python takes the configuration as keywords on `laser.sessions(...)`, and TypeScript takes an optional `SessionConfig`.
 
-- Keep the `AgentHandle` until `shutdown` or `join`. Dropping it now signals a graceful worker shutdown and stops periodic consolidation. Call `shutdown().await` to see drain failures.
-- A fork row's `embedding` takes `impl IntoIterator<Item = f32>` instead of a string.
-- `A2aBridge` and `McpBridge` append their id to `bridge_hops` on submit, cancel, and tool calls, like TypeScript. `with_bridge_hops(previous)` continues an upstream hop list and fails on a loop.
-- `laser_sdk::stream::producer_statistics` is no longer public. `ProducerRecorder` and `ProducerObservation` are gone from the API. See [producer statistics](producer-statistics.md).
-- `Consumer::stored_offset(partition)` returns the stored `StoredOffset`, or `None`.
-- `LaserError::StepUpRequired(scope)` is the struct variant `LaserError::StepUpRequired { scope }`.
-- `laser_sdk::query` no longer re-exports the browse, control, and query protocol frames (`BrowseReply`, `ControlEnvelope`, `QueryEnvelope`, `QueryReply`, and the rest). Import them from `laser_sdk::wire::{browse, control, query}`.
-- `laser_sdk::fork` no longer re-exports `ForkCreate`, `ForkDelete`, `ForkList`, `ForkOutcome`, `ForkPromote`, `ForkPut`, or `ForkReply`. They live in `laser_sdk::wire::fork`.
-- `laser_sdk::kv` no longer re-exports the request and reply frames (`KvSet`, `KvCas`, `KvOutcome`, `KvReply`, `KvScan`, and the rest). They live in `laser_sdk::wire::kv`.
-- `laser_sdk::rbac` no longer re-exports the authorization request and reply frames (`WhoamiReq`, `BindRolesReq`, `AuthzReply`, `RoleBinding`, and the rest). They live in `laser_sdk::wire::authz`.
-- `laser_sdk::filters` no longer re-exports the saved-filter catalog frames (`FilterRef`, `FilterMutation`, `FilterPage`, `FilterSummary`, `FilteredPage`, `RecordFault`, and the rest) or `ExactDecimal`. They live in `laser_sdk::wire::filter`. `FilterAnnounce` moved to `laser_sdk::capabilities`.
-- `laser_sdk::stream::GroupTarget` is private.
-- `laser_sdk::prelude::full` no longer exports `SourceCut` or `SourcePartitionCut`. They live in `laser_sdk::wire::source`. The prelude now exports `RunBudget`.
+- `create(label)` derives the session id from the stream, the namespace, and the label, so the same label reaches the same session. `start()` makes a fresh id. Both return a builder that needs `.agent(id)` and ends with `begin()`. `begin()` writes the start record on `agent.sessions` and returns the session and a `SessionLease`. Python also supports `async with builder as session:`.
+- `open(id)` is a lens. It does no I/O, takes no lease, and has no author until `as_agent(id)` names one.
+- `end()`, `fail(error)`, and `cancel()` write the terminal record. Every clone of a handle shares one terminal latch. The first verb fixes the terminal state and record id, a repeated call resends that same record, and a different verb fails with an invalid error. `end()` first writes a state snapshot when the session state changed since the last one.
+- Rust `Session::run(lease, work)` ends the session by the outcome. A panic is written as a failure with `panic: true` in its detail and then re-raised. Python `async with` fails the session with the exception type and traceback when the block raises and ends it otherwise. The original exception wins when the terminal write also fails. TypeScript `session.run(lease, work)` catches synchronous throws and awaited rejections. Detached promises stay application-owned, and the SDK installs no process-wide rejection listener. No guard captures a dropped future, process death, or a Rust `panic = "abort"` build. Such a session shows idle once its heartbeat stops.
+- A held lease lists the session in the process heartbeat on `agent.heartbeats`. The defaults are a 5-minute idle timeout and a 60-second heartbeat. Drop or release the lease when the process stops working on the session.
+- `sessions().submit(agent, input).from(submitter)` (Python `from_`) writes a submitted session and its first command, addressed to the agent. Chain `label`, `namespace`, `budget`, `tag`, and `operation` as needed. `send()` returns `Submitted { session, correlation }`. The agent's reliable consumer marks the session working when it picks the command up and holds a lease while the handler runs. Inside the handler, `ctx.session()` returns the handled record's session, writing as the handling agent, with no lease of its own.
+- `sessions().control(stream, id).as_operator(op)` writes `pause`, `resume`, `cancel`, and `force_cancel` records on `agent.control`. The account needs send permission on that topic. `signed_by(key)` (TypeScript `signedBy`) signs each control record, and `Session::signed_by(key)` signs the session's terminal record. The managed index reports a verified signer as `verified_actor` on the event. Untargeted control records carry `agdx.to = *`. `Session::cancel_requested()` reads the session's control records, so it also answers on open Apache Iggy.
+- The reliable consumer follows `agent.control` and records pause and cancel requests for each session it handles, rebuilt from the retained control records on first sight. The follower reads every control partition directly, outside any consumer group, so every instance of a role sees every request. `Session::pending_control()` (TypeScript `pendingControl`) returns them. The runtime never interrupts a handler, so the handler decides when to stop.
+- `assemble(policy)`, `model(request, assembled)`, `tool(name, args)`, `record_model_call`, `record_retrieval`, and `record_compaction` record context, model, and tool facts. The SDK never calls a model. The application calls its provider and completes or fails the returned call. Tool arguments and JSON model request bodies pass the session's redactor first. The default drops the values of `authorization`, `api_key`, `token`, `password`, `secret`, and `cookie`. `redact(fn)` replaces it. Redaction is a convenience, not a guarantee.
+- `state()` returns the session state document. `set`, `patch`, and `replace` append JSON Patch deltas, `snapshot` writes the whole document, and `get` folds the retained lane. A handle starts from the folded lane before its first write, so a lens such as `ctx.session()` writes against the current revision. The SDK writes a snapshot after every 64 deltas and before `end`. A successful append does not prove a patch applied.
+- `context()`, `checkpoint()`, `turns_at`, `turns_since`, `state_at`, and `replay` read the session lane. Each turn carries its display type, such as `session.started` or `tool.call`.
+- `Sessions::bootstrap(partitions, retention)` bootstraps the agent topics. When the server announces `sessions` and source registration is on, it also registers the stream as a session source. It waits until the session reads see that registration, retrying temporary read failures until the publish timeout. A refused registration is logged and reported as `registered: false`, never an error, because provisioning can register a stream for an account without session administration rights.
 
-### Python
+The `sessions` capability is set by the server only when it serves the managed session reads. A client starts with it off and must not infer support from the SDK version. Without it, every write and lane read above works on open Apache Iggy.
 
-#### Errors
+### Session reads
 
-- A publish that gives up raises `PublishFailedError` with `stream`, `topic`, `committed`, and `unconfirmed`, a list of `IggyMessage`. The original failure is its `__cause__`. Every other exception lost `committed` and `unconfirmed_count`.
-- Each Rust error variant has its own exception class with its fields, and every class carries class-level `code` and `retryable` defaults. A handler rejection raises `RejectedError`, no longer an `InvalidError`. `FenceViolationError` calls the held token `held`.
-- A callback that raises an SDK exception keeps its class and fields across the SDK. `asyncio.CancelledError` becomes a non-retryable cancellation and the builtin `TimeoutError` a retryable timeout.
-- `IdError` and `ProvenanceError` carry `kind` with class constants. Intent failures raise `IntentError` and envelope validity failures raise `ValidateError`, both with `kind`.
-- `SendMessagesConfirmation` is `SendMessagesConfirmationResponse`, and `UnconfirmedMessage` is `IggyMessage`.
+- `Sessions::get(id)`, `list()`, `events(id)`, `state(id, history_limit)`, `links(id, surface)`, `sources(id)`, `changes(after, limit)`, and `watch(poll_every)` read the managed session index of the factory's stream, and `Session::status()` reads one summary. Python returns the replies as dicts and takes the list and event filters as keywords. TypeScript uses the same names. Without the `sessions` capability they fail with an unsupported error before sending.
+- A failed session read is `LaserError::Session` in Rust and `SessionError` in Python and TypeScript, classified by its result code.
+- `list()` also filters by `root(id)`, the tree rooted at one session, and `label_prefix(prefix)` (TypeScript `labelPrefix`, Python `root=` and `label_prefix=`).
+- `SessionInfo.held` counts the records held while the session was paused and not yet handled. `SessionFlags.liveness_unknown` is set while the server's heartbeat tail has not caught up, so `idle` is not meaningful yet. `SessionEvent.verified_actor` names the principal whose key verified a signed record.
+- `watch` starts from now and reports the changed session ids of each poll, or a resync when it fell below the retained change floor.
+- `Laser::read_at(source)` (TypeScript `readAt`) reads the one record a message source reference names with a standard poll. It returns nothing when the record is gone or the topic was recreated, and works on open Apache Iggy.
+- [Session sizing](session-sizing.md) reports what a local managed stack measured for role scans, filtered page admission, fold rate, state history growth, and the change feed.
 
-#### Connection and capabilities
+### Pause and resume
 
-- `Laser.with_stream(name)` is `Laser.with_default_stream(name)`.
-- `Capabilities.query`, `kv`, `filters`, and `destinations` are `QueryCaps`, `KvCaps`, `FilterCaps`, and `DestinationCaps` objects. Read `caps.query.available`, `caps.query.consistency`, `caps.kv.cas`, `caps.kv.fenced_leases`, `caps.filters.catalog`, `caps.filters.evaluates(version, codec)`, and `caps.destinations.consistency`. The flat `query_consistency`, `kv_cas`, `filters_catalog`, and similar attributes and `Capabilities.evaluation` are gone.
-- `BackendDescriptor.kind`, `version`, `ready`, and `observed_runtime_configuration_revision` are gone. Read `implementation`, `readiness`, and `runtime_configuration_revision`.
+- `sessions().control(stream, id).as_operator(op).pause()` writes a pause request that names its participants: the agents given to `participants(..)`, or else the agents the session lane shows working on the session. `resume()` lifts it.
+- Each named participant acknowledges the request with a `Paused` status that names the request's exact position. An agent outside the set acknowledges when it first receives work for the paused session.
+- An agent holds work that arrives while the session is paused. It writes a `session_parked` record on the lane before it commits the source, and never treats parked work as handled. After the resume it acknowledges with a `Working` status, handles each held record at least once before new work, and writes `session_unparked` after each one. A crash between the effect and that record can repeat the effect, so effects still need an idempotency key or a fenced write.
+- A cancel while paused ends the session as canceled. Held records are not handled. `Session::parked()` lists them with a `complete` flag that is false when the bounded read could not prove the list complete, and the managed index counts them as `SessionInfo.held`.
+- The handler is never interrupted. Recovery after a restart, rebalance, or reconnect rebuilds the held set from the lane and reports incomplete recovery instead of dropping work.
+- Timelines show the holds as `session.parked` and `session.unparked`. No capability advertises the pause runtime yet.
 
-#### Messages and publishing
+### Session budgets
 
-- `Message.message_id` is `Message.id`, a `MessageId` with `partition_id`, `offset`, and the `p:o` string form.
-- `ConsumerMessage.offset` is gone. `ConsumerMessage.position` is a `MessageId`, so read `message.position.offset`.
-- `new_correlation_id()` is `mint_ulid()`.
-- `laser.topic(name, cls=Reading)` is `laser.topic(name).json(Reading)`. `TypedTopic.name` is gone.
-- Publish builders name their argument like Rust: `json(body)`, `msgpack(body)`, `avro(body)`, `encode_with(body, ...)`, `payload(payload)`, `raw_bytes(payload)`, and `arrow_ipc(payload)`. Batch `add_*` methods follow, as do `Producer.send_batch(messages)` and `Topic.batch(messages)`. A `value=` keyword no longer works.
-- `Topic.producer(background=True, background_shards=n)` is gone. `background=True` takes Apache Iggy's background defaults, and `background=BackgroundConfig(...)` sets shards, sharding, flush limits, the byte budget, in-flight writes, the failure mode, and an `error_callback`. Without a callback a failed background write is logged on the `laser_sdk` logger and dropped.
-- `Producer.shutdown` waits for sends in flight instead of raising `InvalidError`. A second call returns at once.
-- `Consumer.name` is gone. `Consumer.stored_offset(partition)` returns the stored offset, or `None`.
-- Consumers default to `commit_interval_ms=0`. The default `auto_commit="polling"` now stores offsets on each poll only, without the extra one-second timer. `auto_commit="interval"` needs an explicit `commit_interval_ms` greater than zero.
-- `Laser.consumed(position, *, group=, consumer=)` is `Laser.consumed(target, at)`. `target` is `ConsumerRef.Group(name)` or `ConsumerRef.Consumer(id)`, `at` is a `LogPosition`, and the result is `ConsumptionStatus.Consumed(committed, head)` or `ConsumptionStatus.NotYetConsumed(behind_by)` instead of a dict.
-- A watch reader raises `UnsupportedError` when it is opened on a deployment without the change feed, not on each `poll()`.
+`Session::over_budget()` reports whether a session passed the budget in its start record: the summed input and output tokens of its records over `Budget.tokens`, or their summed `cost_micros` over `Budget.cost_micros`. With the `sessions` capability it reads `SessionInfo.over_budget` from the index. On open Apache Iggy, and for a session the index does not know yet, it folds the retained lane by the same rule. A workflow checks its run session after the cancel check at every step boundary, compensates the completed steps, and returns a budget exceeded error, and every budget breach of a workflow ends the run session failed with reason `budget`. The reliable consumer checks a session before handing its work to the handler, once per session per poll batch, and only on a deployment that serves sessions, because folding the lane for every record would cost too much on open Apache Iggy. Work for a session over its budget ends the session failed with reason `budget` and an error naming the ceiling, and is committed without reaching the handler. The terminal latch keeps that failure to one record, and later work for the session is committed the same way. Budget reads are eventually consistent, so a budget is a cooperative limit, not a hard spending cap.
 
-#### Queries, projections, and schemas
+### Stream-scoped resource names
 
-- `QueryRequest.rows()` and `rows_typed()` return `QueryRows` and `TypedQueryRows` async iterators instead of awaitables that return a list. Write `async for row in request.max_rows(n).rows()`. Without `max_rows` they raise `InvalidError` at once, and `max_rows(0)` yields nothing without a round trip.
-- `rows_typed`, `fetch_typed`, and `fetch_one` raise `ConfigError` for a row without its original payload and `ProtocolError` for a non-binary payload.
-- `QueryFilter` is `Filter`.
-- `QueryResult.offset`, `limit`, `total`, `has_more`, and `next_cursor` moved to `QueryResult.page`, a `Page`. Read `result.page.total`.
-- `QueryRequest.to_dict()` is `QueryRequest.into_query()`.
-- `Laser.register_schema(..)` is `laser.schemas().register(..)`.
-- `Laser.list_projections(topics=, search=)` is `laser.projections().list(topics=, search=)`. `register_projection` and `apply_binding` are `laser.projections().register(..)` and `laser.bindings().apply(..)`.
+- A `Laser` with a default stream scopes every managed resource name it sends to that stream as `stream:<stream>/<name>`: key-value and memory namespaces, lease and fence namespaces, the key registry, graph names, projection IDs and index names, query indexes, fork IDs, and the change-feed index filter. A name that already starts with `stream:` is sent as is. A `Laser` without a default stream sends bare names.
+- `Laser::resource_name(name)` (TypeScript `resourceName`) returns the name a handle sends. `Kv::resource_namespace()` and `ForkHandle::resource_id()` (TypeScript `resourceNamespace` and `resourceId`) return a handle's scoped name.
+- Listings of namespaces, projections, and forks return only the handle's own scoped names, with the prefix stripped.
+- The projection selector header `agdx.ref` on a published record keeps the local projection ID. The managed backend resolves it against the bindings of the record's own stream and topic, first as written and then as `stream:<stream>/<ref>` with the stream the record was read from, so a scoped projection matches a bare header and a record can never select another stream's projection.
+- Consumer filter catalog names are never chosen by the client. A group's own filter is named from the group's verified identity, which includes the stream ID and the stream creation time, so two streams cannot share one. A raw catalog `Register` request sent through the low-level `mutate` call carries its name as written: the streaming server authorizes a scoped name against the named stream, and a deployment in stream tenancy mode refuses a bare one.
+- Schema requests carry the default stream, so a writer schema ID resolves in that stream's registry. `ConsumerFilter::with_schema_stream(stream)` names the registry a filter's `schema_refs` resolve in.
+- Python `Laser.query(index)`, `Laser.query_target` with an operational index, and `QueryRequest.fork(id)` scope their names like Rust and TypeScript. Python `Kv.namespace` and `ForkHandle.id` return the caller's local name, also when the caller passed a scoped one.
+- `ResourceNaming::Bare` opts out and sends every name exactly as written: Rust `LaserBuilder::resource_naming(ResourceNaming::Bare)` or `laser.with_resource_naming(ResourceNaming::Bare)`, Python `Laser.connect(..., resource_naming="bare")` or `with_resource_naming("bare")`, and TypeScript `resourceNaming("bare")` on the builder or `withResourceNaming("bare")`.
+- `Capabilities.stream_tenancy` (TypeScript `streamTenancy`) is set when the deployment scopes every managed name to one stream. On such a deployment a scoped `watch` reads its stream's own change topic, and a role grant that spans streams fails with `AuthzError::TenancyViolation`.
 
-#### Agents and runs
+### Wire
 
-- `ls.Topics.COMMANDS` and the other `Topics` constants are `ls.AgentTopic.Commands`, `Responses`, `ToolCalls`, `ToolResults`, `LlmIo`, `HumanInput`, `Audit`, and `Dlq`.
-- `AgentMessage.message_id` is `AgentMessage.id`, a `MessageId`. `AgentMessage.topic` is gone.
-- `AgentMessage.conversation_id`, `agent`, `idempotency_key`, and `correlation_id` are gone. Read them on `message.provenance`.
-- `AgentMessage.agdx_body` is gone. Call `message.body()` or read `message.envelope["body"]`. `AgentMessage.json()` is gone. Use `json.loads(message.payload)`.
-- `Provenance.deadline_micros` is `Provenance.deadline`. `Provenance.input_tokens`, `output_tokens`, and `cost_usd` moved to `Provenance.usage`, an `LlmUsage` or `None`.
-- `Laser.contract` and `AgentHandle.contract` return a `Contract`: `Contract.Completed(reply)`, `Contract.Failed(reply)`, `Contract.NotConsumed()`, or `Contract.TimedOut()`. They used to return the body or a dict. `Laser.contract_report` is gone.
-- `contract` waits 30 seconds by default instead of 10, the same as Rust and TypeScript.
-- `Laser.scatter_report` returns a `ScatterReport` with `outcomes`, `completed()`, and `failures()`.
-- `AgentCtx.fan_out` returns a `Gather` with `ok`, `failures`, and `replies()`.
-- `Workflow.run` returns a `WorkflowOutcome` with `outputs` and `run_id`.
-- `AgentRegistry.agents`, `lookup`, and `resolve` return `RegisteredCard` objects with `agent`, `card`, and `observed_at_micros`. `AgentRegistry.card_is_fresh`, `card_serves`, and `card_available_for` are gone. Call `is_fresh`, `serves`, and `available_for` on the card.
-- Route scorer callbacks receive `RouteCandidate` objects with `agent`, `card`, and `capability` instead of dicts.
-- `Laser.client_metadata` returns a `ClientMetadataPage` with `clients` and `next_cursor`.
-- `cause_at=` takes `ls.LogPosition(stream_id, topic_id, partition_id, offset)` instead of a tuple.
-- `RunInfo` is `AgentRunInfo`. `Runs.list(agent_id=)` is `Runs.list(agent=)`.
-- `ChunkAssembler.feed(envelope)` takes the envelope, either `message.envelope` or its encoded bytes, not the message. A finished event carries `usage` instead of `input_tokens` and `output_tokens`, and a failed event carries `body` instead of `bytes`.
-- `Agdx.status(task_state=)` takes `ls.TaskState.Working` and the other `TaskState` values, not a string.
-- `agent_event_is_understood()` is gone. Build the event with `event_envelope(..., requiring=)` and check `unmet_requirements`.
-- Hooks take a plain callable or an object with the hook method (`handle`, `observe`, `on_dead_letter`, `consolidate`, `embed`, `rerank`, `summarize`, `build`, `verify`), each sync or async. Anything else raises `InvalidError` when the hook is registered. An async hook runs on the event loop of the call that reached it, or the registering loop for agent lanes, with the caller's context variables. A sync hook runs on an SDK worker thread in a copy of the caller's context, so it must not block or call event-loop APIs.
-- The `spawn_agent` consolidator receives a scope dict naming the agent id, with the other keys `None`, instead of an empty dict.
-- Middleware `after_handle(message, result, attempt)` receives a dict with `ok` and `error` in place of the old boolean `ok`.
-- The dead-letter callback is `dead_letter(message, capsule, publish_error)`. It receives the complete capsule as a dict, and `publish_error` is a typed SDK exception when publishing the dead letter failed, otherwise `None`. The old form was `(message, reason, attempts, published)`.
-- Asynchronous callbacks must let `asyncio.CancelledError` propagate. Shutdown cancels them.
-- `Laser.a2a_bridge(...)` is `A2aBridge(laser, ...)` and `Laser.mcp_bridge(...)` is `McpBridge(laser, ...)`. `A2aBridge.submit(params_json)` and `McpBridge.call_tool(name, params_json)` take raw JSON.
-- `A2aBridge` and `McpBridge` stamp `bridge_hops` and gain `with_bridge_hops(previous)`.
+- Codes 1_000_700 to 1_000_703 and feature bit `1 << 4` are reserved and never reused.
+- The display types include `invalid` for a record whose header and body name different identities, and `session.parked` and `session.unparked`.
+- `ChangeRecord.stream` names the stream a change record belongs to when the deployment publishes per stream.
+- The HTTP path helpers percent-encode every name they place in a path: fork IDs, KV namespaces and keys, graph names, graph nodes, graph IDs, and projection IDs. A scoped name is one path segment. Pass names unencoded, or they are encoded twice.
+- `Capabilities::from_versions` sets `sessions` from the `SESSIONS` feature bit, so `GET /agdx/capabilities` reports session reads when the deployment serves them.
 
-#### Governance and signing
+### Topics and bootstrap
 
-- `ActionDecision.verdict` returns a `Verdict` instead of a string. Compare with `Verdict.block()` or read `verdict.as_str()`. `ActionDecision.scope` and `body` moved to `decision.verdict.scope` and `decision.verdict.body`.
-- `ActionDecision.with_policy(pack_id, pack_version, rule_ids)` is `ActionDecision.with_policy(PolicyRef(pack_id, pack_version, rule_ids))`. `ActionDecision.policy` and `PolicyEvidence.policy` return a `PolicyRef` instead of a tuple.
-- `GovernedAction.sends`, `requests`, and `bytes_sent` moved to `GovernedAction.counters`, an `ActionCounters`.
-- `Laser.with_governor_retention(governor, mode, capacity=, idle_ttl_secs=)` is `Laser.with_governor_retention(governor, mode, GovernorRetention(capacity=, idle_ttl_secs=))`.
-- `KeyRecord.verifying_key` is `KeyRecord.verifying`. `KeyRegistry.enroll`, `enroll_operator`, `KvKeyRegistry.enroll`, and `verify_card` name the key argument `verifying`.
-- `KeyRegistry.verify_at` and `verify_observed_at` return a `VerifiedPrincipal` with `principal` and `kind` instead of a dict.
-- `Grant(feature, action, *, effect, resource=ResourcePattern.prefix(...))` replaces the `resource_kind=` and `resource_value=` keywords. `AuthzEvent.op` is a dict.
-- `authz_history_all`, `authz_history_role`, and `authz_history_binding` are one `laser.authz_history(target, after_revision=, limit=)`, where `target` is `"all"`, `{"role": name}`, or `{"binding": {"user_id": id}}`.
-- `authorize_edge` returns an `EdgeDenial` or `None` instead of a tuple.
+- `AgentTopic` has `Sessions`, `Streams`, `Heartbeats`, `Control`, `Memory`, `Audit`, `Registry`, `WorkflowJournal`, `Dlq`, and `Custom`. Every agent record rides `agent.sessions` unless the caller names another topic.
+- `Laser::bootstrap(partitions, retention)` requires a `TopicRetention` for `agent.sessions`. `TopicRetention::expire_after(age)` is the usual choice. A policy that never expires and has no size bound is refused. Bootstrap also creates `agent.heartbeats` with a one-hour expiry and `agent.streams`, `agent.memory`, `agent.dlq`, `agent.audit`, and `agent.workflow_journal`. The first agent card creates `agent.registry`. Bootstrap never creates `agent.control`, which provisioning creates with an operator-only send grant. A stream that already exists is used as it is.
+- The default memory topic is `agent.memory`.
+- `ContextAssembler` and `ContextScope` read `agent.sessions` by default.
 
-#### Memory and context
+### Dispatch and replies
 
-- The `Memory` class is `MemoryHandle`. `LogMemory`, `VectorMemory`, and `RerankedMemory` subclass it.
-- `Laser.vector_memory(...)` is gone. Use `VectorMemory.governed(laser, embedder)`, or `VectorMemory(embedder)` without a connection.
-- `Memory.to_context_block`, `Memory.content_id`, and `Memory.kind_class` are the module functions `to_context_block`, `memory_id_content`, and `memory_kind_class`. `memory_id_content` takes `user=` and `application=`.
-- `MemoryHandle.backend_name` is `MemoryHandle.backend`. `forget` and `append` name their first argument `id`, and `improve` names it `target`, instead of `memory_id`.
-- `MemoryItem.signals` returns `RecallSignal` objects with `strategy`, `rank`, and `score` instead of tuples. `MemoryItem.text()` is a method and decodes lossily like Rust. `MemoryItem.conversation_id` is gone. Read `item.provenance.conversation_id`.
-- `MemoryHandler(inner, memory)` names its first argument `inner` instead of `handler`.
-- `ContextScope.fetch` and `block` take `n=` instead of `last_n=`. `ContextScope.state` and `state_with` take `init` instead of `initial`, as do `Session.replay` and `state_at`.
-- Context reads, folds, custom policies, and token estimators receive `ContextMessage` objects (`id`, `provenance`, `payload`, `envelope`, `topic`) instead of `AgentMessage`. `Laser.assemble_context` and `SessionTurn.message` return them too. `SessionTurn.payload` is gone. Read `turn.message.payload`.
-- `laser.topic_snapshot_store(topic=)` and `laser.kv_snapshot_store(namespace=)` are `TopicSnapshotStore.on_topic(laser, topic)` and `KvSnapshotStore.in_namespace(laser, namespace)`.
-- A blob store exception keeps its SDK class instead of becoming `CodecError`, and a wrong return type raises `ConfigError`.
+- The reliable consumer classifies every record before dispatch as work, observational, reply, lifecycle, control, or foreign. Only work for the handler's operations reaches the handler. Everything else is skipped and committed, and `Laser::consumed` reports it as `Skipped`. The author never decides the class, so an agent can send work to itself. Rust `Agent::builder().operations(..)`, Python `spawn_agent(operations=)`, and TypeScript `AgentBuilder.operations(..)` limit the command operations a handler serves.
+- A panic in a Rust handler becomes a non-retryable error. The record dead-letters as rejected and the consumer keeps running.
+- Delivery runs on the consumer-group consumer with explicit commits. Each agent id has its own group, named after the agent id unless the builder names another. On `agent.sessions` and `agent.control`, when the server resolves group policies and serves filtered reads and the filter catalog, and the `Laser` was built from a connection string, the runtime binds the agent's group to the addressee filter `agdx.to In [<agent>, "*"]` before it reads, and refuses a group bound to another filter. Otherwise, on open Apache Iggy or with a client the application brought, the group stays unbound and the client classifies every record.
+- A record that `send_agent`, `request`, or their Python and TypeScript forms (`send_agent`/`sendAgent`, `request`) publish on `agent.sessions` or `agent.control` without a target carries `agdx.to = *`, the same rule the envelope path applies, so an agent whose group is bound to the addressee filter still receives it. A named target rides unchanged, and other topics keep the caller's headers verbatim.
+- A record on a shared session topic that carries no `agdx.to` at all, such as a raw `topic("agent.sessions").send(...)`, never passes the addressee filter of an agent whose group is bound to it. A server with group-aware reads keeps the record on the log, and that agent neither handles nor dead-letters it. Open Apache Iggy classifies on the client and dead-letters the malformed record.
+- A dead letter keeps the record's conversation, also for a record that did not decode. A dead letter never fails its session unless the agent runs with `fail_on_dead_letter`: Rust `Agent::builder().sessions(SessionConfig::new().fail_on_dead_letter(true))`, Python `spawn_agent(..., sessions=laser.sessions(fail_on_dead_letter=True))`, and TypeScript `AgentBuilder.sessions(new SessionConfig().failOnDeadLetter(true))`. That configuration also shapes the `ctx.session()` handles.
+- A request waiter accepts a reply only when it carries the request's correlation, belongs to the request's session, is a response or error when it has an envelope, and is addressed to the requester when the request named one. The request's own record never answers it, even on the same topic.
+- `respond`, `reply_on`, and `respond_input` address the requester and carry the request's record id and full log position as the cause. A generic reply always carries a correlation, the request's own or its message id.
 
-#### Key-value, graph, forks, and filters
+### Partition routing
 
-- `KvSetRequest.payload()` is gone. Use `bytes()`.
-- `Kv.exists` returns a `KvMetadata` with `version`, `expires_at_micros`, and `size_bytes` instead of a tuple.
-- `PreparedMutation.ambiguous_recovery` returns an `AmbiguousMutationRecovery` instead of a dict.
-- `Kv.cas_fenced`, `copy_to`, and `move_to` return request builders. Awaiting the returned object still runs the call.
-- `ForkHandle.fork_id` is `ForkHandle.id`.
-- `graph_node` and `graph_edge` are `graph_node_entity` and `graph_edge_relate`. Graph nodes, edges, results, and `SourceRef` are dicts. `laser.graph(name).query(match_label=, hops=)` is the fluent `laser.graph(name).start_match(..).out(..).fetch()`.
-- `ConsumerFilter.evaluate` and `explain` are gone. Use `CompiledFilter.compile(filter).evaluate(..)` and `explain(..)`.
-- `FilterExpr.text` and `header_text` lost `case_insensitive=`. Chain `.case_insensitive()`.
-- `ConsumerGroup.reader(start=)` takes `"next"`, `"first"`, `"last"`, `{"offset": n}`, or `{"timestamp": micros}`. The `start_offset=` and `start_timestamp_micros=` keywords are gone.
-- `FilteredReader.owns(page)` takes a `MatchedPage`.
-- `ConsumerGroup.create()` and `info()` return a `ConsumerGroupInfo` with `id`, `name`, `identity`, and `filter` instead of a dict.
+- A stream's layout is `SessionLayout::Shared` (the default), `PerAgentTopic(map)`, `PerAgentPartition(map)`, or `SinglePartition`. Python spells them `SessionLayout.Shared()` and the others, and TypeScript uses `{ kind: "shared" }` and the other kinds. Declare a layout through the session configuration. It then holds for every later send on that stream through the same connection.
+- Lifecycle and state always ride the session's partition on `agent.sessions`. In the per-agent partition layout, a command, response, error, or chunk addressed to a declared agent lands on that agent's partition. A command is keyed by its addressee and a reply by its requester. Every other record rides the session partition. Partition ids are zero-based, and the mapping must be declared because hashing agent names can collide.
+- In the per-agent topic layout, the map names each declared agent's own topic. On `agent.sessions` sends, a command addressed to a declared agent goes to that agent's topic, and a response, error, or chunk goes to its addressee's declared topic, keyed by session. Plain records sent with a target follow the same rule. Lifecycle, state, broadcast records, and records for an undeclared agent stay on the session lane. `Sessions::bootstrap` creates the declared topics with the lane's partition count and retention and refuses a declared `agent.sessions` or `agent.control`. A reliable consumer for a declared agent that listens on `agent.sessions` reads its own topic plus `agent.control`. A request, contract, input request, or MCP tool call by a declared requester awaits its reply on the requester's topic. Session reads cover the declared topics because bootstrap registers every topic of the stream. Python spells it `SessionLayout.PerAgentTopic(topics={"planner": "planner.inbox"})`, TypeScript `{ kind: "perAgentTopic", topics: new Map([["planner", "planner.inbox"]]) }`.
+- `SinglePartition` bootstraps every agent topic with one partition.
+- Every record on `agent.sessions` carries `agdx.to`, with `*` when it is addressed to every agent.
 
-### TypeScript
+### Context, memory, and lineage
 
-#### Errors
+- `ContextMessage` carries `timestamp_micros`, the broker append time, and the numeric `stream_id` and `topic_id` beside the topic name, so a reader can build a source reference without a lookup.
+- `ContextPolicy` has `name()`, `version()`, and `selection(history)`, which returns the kept and dropped records and the reason. A context manifest records the policy name and version.
+- Every SDK uses one token estimate: the byte count divided by four, rounded up.
+- `ScopedMemory::with_lineage(origin, producer)` stamps remembered items with the record that motivated them and the agent or policy that wrote them. `Session::linked_memory()` does this for the session's current record.
+- `Kv::in_session(reference)` and `GraphHandle::in_session`, `produced_by`, and `sourced_from` link key-value and graph writes to a session. `Session::kv(namespace)` and `Session::linked_graph(name)` return handles that are already linked.
 
-- A publish that gives up throws `PublishFailedError`, so an `instanceof TransportError` check around a publish no longer matches. `publishCause()`, or the free `publishCause(error)`, returns the original error, and classifiers such as `isRetryable` and `isPermissionDenied` answer for that cause.
-- Every publish path throws `PublishFailedError`, including `sendAgent`, `request`, the AGDX verbs, memory writes, and `redriveDeadLetter`. Agent-level sends used to throw a bare `TransportError`.
-- `LaserErrorKind` is no longer exported. Read `error.kind`, which adds `publish-failed`, `fence-violation`, `quarantined`, `no-respond-topic`, and `checkpoint`. An exhaustive `switch` needs the new cases.
-- Id parse failures throw `IdError` and provenance header failures throw `ProvenanceError`, not `InvalidError` or `CodecError`.
-- `RoutingError` and `RoutingErrorReason` are gone. Catch `NoCapableAgentError`, `NoInboxError`, or `RoutePrincipalMismatchError`, or use `isNoCapableAgent` and `isPermissionDenied`.
-- `ProtocolError.resultCode`, `ProtocolError.commandCode`, and `TransportError.retryable` are internal. Use `iggyErrorCode()` and `isRetryable()`.
-- `FilterStopError` is gone. A stop throws `FilterFaultError` or `FilterOversizedRecordError`. `FilterFaultError.faultReason` is `reason`.
-- `FilterExecutionError.reason` and `ConsumerGroupSetupError.reason` are gone. Use `filterReason(error)`, or `filterReason(error.cause)` for a setup error.
+### Workflows and child sessions
 
-#### Connection and capabilities
+- `Workflow::run` is a root session whose id is the run id. Each step and compensation is a child session with an id derived from the run and the step label. The engine checks `agent.control` for a cancel request at every step boundary, compensates, and returns a cancelled error. It then checks whether the run session is over its budget, as [Session budgets](#session-budgets) describes.
+- `ContractBuilder::parent(parent, root)` runs a contract as a child session. It writes the child's submitted start before the command and ends the child by the outcome.
+- `A2aBridge::submit_in(parent, root, params)` and `McpBridge::call_tool_in(parent, root, name, params)` run a bridge call as a child session. Python takes `root=` as a keyword, and TypeScript names them `submitIn` and `callToolIn`. MCP ends the child by the tool result. A2A leaves that to the handling agent.
+- A bridge call and an input request are addressed to every agent (`agdx.to = *`) unless the caller names one, so on a shared `agent.sessions` topic every listening agent receives them. `A2aBridge::submit_to` and `submit_in_to`, `McpBridge::call_tool_to` and `call_tool_in_to`, and `Agdx::request_input_from` take a target agent and address the command to it alone. Python takes `target=` on `submit`, `submit_in`, `call_tool`, `call_tool_in`, and `request_input`. TypeScript takes a `{ target }` option on `submit`, `submitIn`, `callTool`, `callToolIn`, and `requestInput`. The JSON-RPC bridge routes stay unaddressed.
 
-- `LaserBuilder.connect()` is async. A configuration error rejects the promise instead of throwing synchronously.
-- `Laser.iggyClient` is `Laser.client` and `Laser.fromIggyClient` is `Laser.fromClient`. `fromClient` options keep only `ownership`. Set the default stream, capabilities, and observer with `withDefaultStream`, `withCapabilities`, and `withObserver`.
-- `Laser.deadLetterTopic` and `withDeadLetterTopic` are `dlqTopic` and `withDlqTopic`. `LaserBuilder.iggyClient`, `defaultStream`, and `deadLetterTopic` are `client`, `stream`, and `dlqTopic`.
-- `LaserBuilder.token`, `Laser.withVerifier`, and `Laser.policyEvidence` are gone. Pass credentials in the connection string, set the verifier on `LaserBuilder.verifier`, and read policy evidence from the audit topic.
-- `QueryCapabilities`, `KvCapabilities`, `DestinationCapabilities`, and `FilterCapabilities` are `QueryCaps`, `KvCaps`, `DestinationCaps`, and `FilterCaps`. The hello `Feature` bit set is `feature`.
-- `Capabilities.topology` is gone. `Capabilities.destinations.checkpointVersion` is gone, use `versions.checkpoint`. `destinations.consistency` is new.
+### Other behavior
 
-#### Ids and codecs
+`Laser::spawn_subconversation(parent, author)`, Python `Laser.spawn_subconversation(parent, author)`, and TypeScript `Laser.spawnSubconversation(parent, author)` require the spawning agent's identity. A handler context supplies its own agent identity when it creates a child conversation, so the child's author is the spawning agent and never the incoming sender.
 
-- `AgentId.asString` and `ConsumerGroupName.asString` are `asStr`. `parseWireAgentId` is gone from the root. Use `AgentId.new(name).wireId()`.
-- `jsonCodec(f)`, `cborCodec(f)`, and `messagePackCodec(f)` are `new Json(f)`, `new Cbor(f)`, and `new Msgpack(f)`. `ValueDecoder` is no longer exported, and a custom `Codec<T>` declares `contentType`.
-- `CompiledSchema.encode` and `CompiledSchema.codec` are not public. Encode Avro with `encodeAvro(body)` and publish other schemas through `topic.schema(id, decode)`.
-- `utf8` and `decodeUtf8` are no longer exported. Use `TextEncoder` and `TextDecoder`.
-- `IggyHeaderValue` is `HeaderValue`. `BackgroundFailureMode` is no longer a named export.
-- Wire `Value` kinds spell strings `"str"` instead of `"string"`, and integers past the signed 64-bit range decode as `"uint"`.
-- `validateTypedValue`, `validateTypedValueAgainst`, and `canonicalSchemaBytes` are `typedValueValidateCanonical`, `typedValueValidateAgainst`, and `logicalSchemaCanonicalFingerprintBytes`.
+Log memory searches use the supplied text to filter items before applying the result limit. Keyword, semantic, and hybrid searches use lexical matching on log memory. Recent recall ignores query text and orders by recency only. This applies to the managed memory view and the folded log view in all three clients.
 
-#### Messages and publishing
+A forget or feedback call with a conversation in its scope acts only on an item remembered in that conversation. `ScopedMemory.forget` and `improve` always pass their conversation, so they never remove or reweight another conversation's item. A call without a conversation acts on the item in any conversation. The log fold, the in-process vector index, and the managed memory view apply the same rule in all three clients.
 
-- `ConsumerMessage.offset` is gone. Read `message.position.offset`. `ConsumedMessage` is gone, and `Cursor.poll()` and `stream()` yield `Message`, so read `message.id.offset`.
-- `TypedRecord` has `position` only, without `partitionId` or `offset`.
-- `ConsumerOptions.autoCommit` is gone. `commitPolicy: { kind: "disabled" }` replaces `autoCommit: false`.
-- `Consumer.nextWithin(ms)` throws a typed `TimeoutError` instead of returning `null`.
-- The native consumer polls with no wait by default (`pollIntervalMs` 0, was 250 ms), like Rust.
-- `Topic.replay()` and `TypedTopic.records(readerName)` take no options. Size polls with `cursor.batch(n)` and `records.batch(n)`. `CursorOptions` is gone.
-- `Topic.ensure` takes only the partition count. `TopicEnsureOptions` is gone.
-- Topics created by `ensure`, bootstrap, and the agent registry never expire, like Rust. `ensure` no longer changes an existing topic's expiry.
-- `PublishRequest.encode`, `messagePack`, and `metadata` are `encodeWith`, `msgpack`, and `header`. `BatchPublishRequest.metadata` and `addMessagePack` are `header` and `addMsgpack`.
-- `Producer.flush` is no longer public. A background producer drains and reports a kept failure on `shutdown()`.
-- `Producer.isBackground`, `PublishRequest.partition`, `Topic.sendRecords`, `partitionCount`, `tailOffsets`, and `streamName` are internal. To resend unconfirmed records with their ids, pass `PublishFailedError.unconfirmed` to `Topic.batch`.
-- `UNLIMITED_TOPIC_SIZE`, `ProducerSendOptions`, `RawSendOptions`, `RecordSnapshot`, `TypedTopicKind`, and `TypedPollResult` are no longer exported.
-- `Topic`, `Stream`, `Producer`, `Consumer`, `Cursor`, `QueryRequest`, `Runs`, `Projections`, `Schemas`, `Watch`, `Sessions`, `Session`, `ScopedMemory`, `MemoryHandle`, `TypedTopic`, and their builders have no public constructor. Obtain them from `Laser`, as in Rust.
+Managed memory recall orders items by the broker append time of their source record, then by source position. Consolidation keeps the newest items by the same arrival order in all three clients. The memory view row carries the broker time as `timestamp_micros`. Periodic agent consolidation passes the agent's own scope, with the agent id set and every other field empty. A consolidator with a summarizer writes one durable `Summary` per conversation, scoped and attributed to that conversation.
 
-#### Queries, projections, and key-value
+`Laser::consumed` (Python `consumed`, TypeScript `consumed`) returns `Skipped` when an agent's consumer group has committed past a record that is not work for that agent, such as a record addressed to another agent, a reply, or a status record. The status names the classification, for example `foreign`. Records that the group handled report `Consumed`. A probe of a named consumer, or of a record that is gone or does not decode, keeps the offset-only answer.
 
-- `QueryRequest.executionId(value)` is gone. `executionId()` returns the request's id.
-- `QueryRequest.aggregateAs` is `aggAs`, `stdDev` is `stddev`, and the `byKey` alias is gone. Use `whereEq`.
-- `kvEntryKeyString` is `kvEntryKeyStr`.
-- `Kv.expire(key, ttlMicros, nowMicros?)` takes a relative lifetime, like Rust and Python. Use `expireAt(key, expiresAtMicros)` for an absolute time.
-- `KvKeyRegistry.enroll(principal, verifyingKey)` enrolls an agent key, like Rust. Pass a `KeyRecord` to `enrollRecord`.
-- `KeyRecord.verifyingKey` is `KeyRecord.verifying`.
-- `Fork` is `ForkHandle`, and its `forkId` property is `id`.
-- `Checkpoint.toJSON()` writes `{"per_topic": {...}}` with integer offsets, the shape Rust and Python write. A checkpoint saved by TypeScript 0.5 no longer loads, and invalid input throws `InvalidError`.
-- `Checkpoint.capture`, `Checkpoint.empty()`, and `Checkpoint.topics` are gone. Use `contextCheckpoint(laser, topics)`.
-- The filter catalog frames (`FilterRef`, `FilterMutation`, `FilterPage`, `FilterSummary`, `FilteredPage`, and the rest), `ExactDecimal`, `KvOutcome`, `ForkOutcome`, `GraphStart`, `Hop`, `GraphError`, `JsonValue`, and `DEFAULT_DECODE_LIMITS` left the root export. Import `wire` from `@laserdata/laser-sdk/full`.
-- `ExactDecimal.fromDouble` is `fromF64`. `timestampFromText` and `timestampFromInteger` are `timestampFormatMicrosFromText` and `timestampFormatMicrosFromInteger`. `nextFilteredStart` is `wire.filteredPageNextStart`.
-- `CompiledFilter.outcomeOf` is `evaluateWithFault`, and `needsHeaders` is `headerNeed`, which returns `"none"`, `"content_type"`, or `"all"`. `CompiledFilter.faultReason` is gone. Read `evaluateWithFault(...).fault`.
-- `GroupFilter.revisions(page?, pageSize?)` takes positional arguments instead of an options object.
-- `MatchedRecord` keeps the consumed record in `record.message`. Read `record.message.payload` and `record.message.headers` instead of `record.payload` and `record.headers`.
+All three clients stamp record headers through one shared encoder. Generic records carry the fence, deadline, and token counts as typed `u64` headers and the cost as a typed `f64`. Envelope records also carry their author as `gen_ai.agent.id`. An `agdx.to` value of `*` addresses every agent and decodes as no single target.
 
-#### Agents and workflows
+A group reader that reads from partition primaries asks the coordinator for the cluster topology and the partition route before its first read. A transient refusal of either request is retried with the connection's publish retry count and backoff, as [publish recovery](publish-recovery.md) describes, before it reaches the caller. This applies to Rust and TypeScript. Python reads through the Rust reader.
 
-- `Agent.builder()...spawn(laser)` is `Agent.builder()...build().spawn(laser)`.
-- `AgentContext` is `AgentCtx`, and the testing helper `agentContext` is `agentCtx`.
-- `AgentBuilder.deadLetterSink` and `ReliableConsumerOptions.deadLetterSink` are `onDeadLetter`.
-- `AgentBuilder.governor(policy, mode)` takes one `[policy, mode]` tuple. Set retention with `governorRetention(retention)`.
-- `FULL_REPLAY`, `ANY_ROUTE_POLICY`, `ADVERTISED_INBOX_ROUTE`, `BEST_EFFORT`, `REQUIRE_ALL`, and `SERIAL_CONCURRENCY` are gone. Write `{ kind: "full" }`, `{ kind: "any" }`, `{ kind: "advertised" }`, `{ kind: "bestEffort" }`, `{ kind: "requireAll" }`, and `{ kind: "serial" }`. `DEFAULT_RETRY_POLICY` is gone, and the default stays `{ maxAttempts: 5, baseDelayMs: 200 }`.
-- `new QuorumGovernor("all" | "any" | n)` takes `{ kind: "all" }`, `{ kind: "any" }`, or `{ kind: "at-least", required: n }`.
-- `new Workflow(...)` is gone. Use `laser.workflow(name)`. `StepBuilder` is `StepHandle`, and `StepHandle.done()` is gone. `WorkflowVerifier` is `Verifier`.
-- `AgentHandle`, `AgentRegistry`, `ClientMetadataRequest`, `AgentScope`, `ContextScope`, `ContractBuilder`, `ContextAssembler`, and `AgentCtx` have no public constructor. Get them from `Agent.spawn`, `Laser.registry`, `Laser.clientMetadata`, `Laser.agent`, `Laser.context`, `Laser.contract`, `ContextAssembler.builder()`, and the `agentCtx` testing helper.
-- `laser.advertisePresence({ agent, inbox })` takes the wire `AgentPresence`. Write `laser.advertisePresence(newAgentPresence(agent.wireId(), inbox))`. `AgentPresenceInput` is gone.
-- `AgentDefinition` is no longer exported. `AgentErrorCodeName`, `FilterLiteral`, and `GraphAttr` left the root export and live under `wire` in `@laserdata/laser-sdk/full`.
-- Root `AgentCard` is the A2A Agent Card, which was `A2aAgentCard`. The AGDX registry card is `wire.AgentCard` in `@laserdata/laser-sdk/full`. `A2aTask` is `Task`.
-- `A2aBridge.submitJson` is folded into `submit`, which takes bytes or a string as raw JSON. `McpBridge.callToolJson` is gone, and `callTool(name, bytes)` sends raw JSON. `McpContent.type` is `kind` on returned objects.
-- `OPERATION_*`, `METADATA_BRIDGE_HOPS`, `WireConversationId`, `NodeId`, `Path`, `TokenUsage`, `RunBudget`, and `TaskStateName` left the root export. Import `wire` from `@laserdata/laser-sdk/full`.
-- `signingInput`, `topologicalOrder`, `selectRoute`, `applyJsonPatch`, `envelopesToAgUi`, and the free AG-UI functions are no longer exported. `Laser.aguiEvents`, `publishStateSnapshot`, `publishStateDelta`, and `reconstructState` remain.
+Rust keeps an agent running only while its `AgentHandle` lives. Dropping the handle signals a graceful worker shutdown and stops periodic consolidation. Call `shutdown().await` to see drain failures.
 
-#### Memory, sessions, and context
+Python `Laser.close()` does not print the Iggy producer's `Client has been shutdown` warning. That one record, which every cached producer writes when its own client closes, reaches Python logging at debug. Every other Rust log record keeps its level.
 
-- `laser.sessions({ stream, topics, memoryNamespace, contextTurns, contextTokens })` is `laser.sessions(new SessionConfig().stream(..).topic(kind, topic).memoryNamespace(..).contextTurns(..).contextTokens(..))`. `SessionOptions` is gone. The `SessionConfig` getters are `streamName`, `memoryNamespaceName`, `contextTurnBound`, `contextTokenBound`, and `topics()`.
-- `ContextAssembler.builder(conversation)` is `ContextAssembler.builder().conversationId(conversation)`. `ContextChain` is `Chain`. `ContextScope.stateWith` takes `decodeState` last and defaults it to JSON.
-- `LogMemory.set`, `fetch`, `fetchFolded`, `update`, and `remove` are `setNamed`, `fetchNamed`, `fetchNamedFolded`, `updateNamed`, and `forgetNamed`. `MemoryHandle` keeps the short names.
-- `MemoryScope.application` is `MemoryScope.app`. Builders keep `.application()`.
-- `memory.remember(..).conversation(c)` is `.scope(c)`. `memory.recall().conversation(c)` is `memory.recall(c)`. `RecallBuilder.tokenBudget(n)` is `block(n)`.
-- `ScopedMemory.context(tokenBudget)` is `block(tokenBudget)`.
-- `MemoryHandle.custom`, `log`, `logTopic`, and `logBackend` are internal. Use `laser.memoryCustom`, `laser.memory`, and `laser.memoryOnTopic`.
-- `ConsolidationReport` has `summarized`, `reweighted`, `pruned`, and `derived`. Use `pruned` where you read `forgotten`. `scanned` and `kept` are gone.
-- `Consolidator.consolidate(scope, signal?)` no longer receives a memory argument. The consolidator holds its own memory handle. The `AgentConsolidator` alias is gone.
-- `ZeroEmbedder` is gone. `MemoryHandle.vector(embedder)` and `new VectorMemory(embedder)` require an embedder.
-- A fork row's `embedding` takes `Iterable<number>` instead of a string.
-- `TestClock` rejects values outside the unsigned 64-bit range, and `advance` wraps like Rust.
-- Context assembly reads the newest 10,000 raw records per partition before it filters by conversation, the same window as Rust and Python. Earlier releases scanned whole topics and kept the newest 10,000 matching records. To reach older turns, end the read at an earlier checkpoint with `toCheckpoint`, which anchors the window there.
+AG-UI rendering emits `RUN_ERROR` for failed or rejected task status. It uses the status detail when available. Completed and canceled task status emits `RUN_FINISHED`.
+
+Fold snapshots name the stream, its creation time, the fold, and each topic generation. Built-in snapshot stores require a fold name. Managed snapshots use the stream, conversation, and fold in their key. State replay checks source generations and resumes each topic at its own saved offsets. `ConversationState` replay folds the whole requested range for a full, offset, checkpoint, or position bound. A `Last(n)` bound stays windowed.
+
+A query above `MAX_PAGE_SIZE` fails with an invalid-argument error before any round trip.
 
 ## Publication and reads
 
@@ -296,8 +191,8 @@ Python takes full memory scopes and queries as keywords. `to_context_block` rend
 | Card predicates | `RegisteredCard::is_fresh`, `serves`, `available_for` | `RegisteredCard.is_fresh`, `serves`, `available_for` | `cardIsFresh`, `cardServes`, `cardAvailableFor` |
 | Cause position | `with_cause(cause, Some(position))` | `cause_at=LogPosition(stream_id, topic_id, partition_id, offset)` | `withCause(cause, causeAt)` |
 | Agent route | `Agent::builder().inbox_route(..)` | `spawn_agent(..., fixed_inbox=)` | `AgentBuilder.inboxRoute` |
-| Governor retention | `governor_retention(GovernorRetention)` | `spawn_agent(..., governor_retention=(capacity, idle_ttl_secs))` | `AgentBuilder.governorRetention(retention)` |
-| Periodic memory | `consolidate_every(Duration)`, `consolidator(..)` | `consolidate_every_ms=`, `consolidator=` | `consolidateEvery(milliseconds)`, `consolidator` |
+| Governor retention | `governor_retention(GovernorRetention)` | `spawn_agent(..., governor_retention=(capacity, idle_ttl_ms))` | `AgentBuilder.governorRetention(retention)` |
+| Periodic memory | `consolidate_every(Duration)`, `consolidator(..)` | `consolidate_every_ms=`, `consolidator=` | `consolidateEvery(intervalMs)`, `consolidator` |
 | Arrow fingerprint | `Record::logical_schema_fingerprint` | `BatchPublishRequest.add_record(logical_schema_fingerprint=)` | `Record.logicalSchemaFingerprint` |
 
 Python send verbs take envelope refinements as keywords. A cause position requires a cause ID, and per-kind validation still applies. A claim check moves a body to the supplied store when it reaches the threshold. Request-input helpers and chunk writers do not sign records.

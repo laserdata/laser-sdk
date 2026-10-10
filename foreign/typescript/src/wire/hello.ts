@@ -11,6 +11,7 @@ export const feature = {
   READ_YOUR_WRITES: 1n << 1n,
   STRONG_CONSISTENCY: 1n << 2n,
   KV_CAS_FENCED: 1n << 3n,
+  // Retired with the run registry. No server sets it and the bit is never reused.
   AGENT_WORKFLOW: 1n << 4n,
   KEYWORD_SEARCH: 1n << 5n,
   WATCH: 1n << 6n,
@@ -18,7 +19,12 @@ export const feature = {
   DESTINATIONS: 1n << 8n,
   KV_FENCED_LEASES: 1n << 9n,
   CONSUMER_FILTERS: 1n << 10n,
-  GROUP_POLICY_READS: 1n << 11n
+  GROUP_POLICY_READS: 1n << 11n,
+  SESSIONS: 1n << 12n,
+  // The managed backend runs in stream tenancy: every managed name is scoped
+  // to one stream, and the change feed and dead letters of each stream ride
+  // their own ops topics.
+  STREAM_TENANCY: 1n << 13n
 } as const
 
 export interface OpVersions {

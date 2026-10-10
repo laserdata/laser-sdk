@@ -15,18 +15,21 @@ bdd/
 ├── scenarios/
 │   ├── agent.feature                  the AGDX agent envelope + conversation threading
 │   ├── agent_must_understand.feature  the must-understand feature-bit rejection rule
+│   ├── bridges.feature                A2A, MCP, and AG-UI keep the AGDX lifecycle, streaming, and state
 │   ├── capabilities.feature           negotiation + the Unsupported boundary
 │   ├── capabilities_injected.feature  the read-consistency pre-gate under injected caps
+│   ├── context_window.feature         the bounded context read window per partition
 │   ├── data_stack.feature              schemas, typed query, destinations, checkpoints, and Arrow
 │   ├── filters.feature                consumer-filter evaluation rules (shared evaluator)
 │   ├── filters_live.feature           server-side filtered reads + the catalog Unsupported boundary
 │   ├── governance.feature             action governance at the effect boundary
 │   ├── graph.feature                  knowledge graph traversal semantics (reference engine)
 │   ├── kv_cas.feature                 compare-and-swap semantics (reference engine)
+│   ├── managed_sessions.feature       the managed session index: layouts, child rollup, links, state history, liveness, change feed, reads, budget enforcement
 │   ├── memory.feature                 agentic memory recall semantics (reference engine)
 │   ├── provenance.feature             provenance + causality round-trip
 │   ├── query.feature                  the query DSL semantics (reference engine)
-│   ├── runs.feature                   the managed run registry + the Unsupported boundary
+│   ├── session.feature                sessions on the lane over open Apache Iggy: lifecycle and the terminal latch, state, model and tool records, submit, control, layouts, heartbeats
 │   └── streaming.feature              typed publish on the log
 ├── rust/                              Rust reference runner (cucumber-rs)
 ├── python/                            Python runner (pytest-bdd), same scenarios
@@ -35,7 +38,7 @@ bdd/
 └── README.md
 ```
 
-Streaming, provenance, and agent scenarios run against open Apache Iggy. Managed query, key-value, graph, memory, and run semantics use deterministic transport-free reference engines. The production query client uses the managed `AGDX_QUERY` command and does not use a request topic.
+Streaming, provenance, agent, bridge, session, and context window scenarios run against open Apache Iggy. Managed query, key-value, graph, and memory semantics use deterministic transport-free reference engines. The production query client uses the managed `AGDX_QUERY` command and does not use a request topic.
 
 ## What is NOT here, and why
 
@@ -68,6 +71,18 @@ scripts/run-bdd-tests.sh typescript
 ```
 
 Set `LASER_BDD_URL` to a connection string or `LASER_BDD_ADDR` to `host:port` for an existing server. The supplied test scripts otherwise start the versioned native server. Query, KV, graph, and memory scenarios use reference engines. Iggy-backed steps use the public SDK API.
+
+## Managed scenarios
+
+Scenarios tagged `@plane`, on the scenario or on its feature, need a server with a managed plane and run only when `LASER_BDD_PLANE=1` is set. `managed_sessions.feature` is tagged `@sessions @plane` and reads the session index the plane folds. `scripts/run-managed-bdd.sh` builds the Iggy fork and the plane from the source checkouts named by `LASER_IGGY_REPO` and `LASER_CLOUD_CORE_REPO`, starts them wired together as the plane's own end-to-end tests do, and runs the named runners against them:
+
+```sh
+scripts/run-managed-bdd.sh all              # rust, python, and typescript
+scripts/run-managed-bdd.sh --postgres rust  # the plane stores sessions in Postgres (needs Docker)
+scripts/run-managed-bdd.sh stack            # start the stack and wait, for runs by hand
+```
+
+`LASER_MANAGED_IGGY_SERVER` and `LASER_MANAGED_PLANE` point at prebuilt binaries, and `LASER_MANAGED_SKIP_SDK_BUILD=1` reuses the Python extension and the TypeScript package as they are already built.
 
 ## Adding a language
 

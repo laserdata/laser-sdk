@@ -1,3 +1,5 @@
+import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
+import { publishOptions, retryTransientRead } from "../client/publish-options.js"
 import { resultCodeIsRetryable } from "../wire/result.js"
 import { Json } from "../stream/codecs.js"
 import { decodeBrowseReply, encodeGetSchema } from "../wire/browse.js"
@@ -48,7 +50,7 @@ import {
   ListFilterRevisionsCommand,
   ListFiltersCommand
 } from "../wire/commands.js"
-import { CompiledFilter, usesRegex, type DecodeLimits } from "../wire/filter-eval.js"
+import { CompiledFilter, type DecodeLimits } from "../wire/filter-eval.js"
 import {
   type AppliedPolicy,
   type CatalogPosition,
@@ -158,6 +160,7 @@ export type FilterTransport = Pick<
   | "joinExistingConsumerGroup"
   | "openNodeConnection"
   | "clusterNodeCount"
+  | "publishOptions"
   | "openCoordinator"
   | "connectsNodes"
 >
@@ -224,10 +227,27 @@ export interface ConfiguredGroup {
  * plane. Either missing throws `UnsupportedError`.
  */
 export class Filters {
+  /** @internal */
   constructor(
     private readonly transport: FilterTransport,
-    private readonly capabilities: () => Promise<Capabilities>
+    private readonly capabilities: () => Promise<Capabilities>,
+    private readonly scope: ResourceScope = BARE_SCOPE
   ) {}
+
+  /** The stream whose schema registry this handle resolves writer schemas in.
+   * @internal */
+  schemaStream(): string | undefined {
+    return this.scope.stream
+  }
+
+  // A filter with writer schemas resolves them in the registry this handle
+  // registers schemas in, unless the caller named one.
+  private scopedFilter(filter: ConsumerFilter): ConsumerFilter {
+    const stream = this.scope.stream
+    return filter.schemaRefs.length > 0 && filter.schemaStream === undefined && stream !== undefined
+      ? { ...filter, schemaStream: stream }
+      : filter
+  }
 
   /** Throws `UnsupportedError` unless the group filter catalog is served. */
   async requireCatalog(): Promise<void> {
@@ -371,7 +391,12 @@ export class Filters {
     expectedRevision: number,
     filter: ConsumerFilter
   ): Promise<FilterRevisionRef> {
-    const applied = await this.apply({ kind: "revise", filterId, expectedRevision, filter })
+    const applied = await this.apply({
+      kind: "revise",
+      filterId,
+      expectedRevision,
+      filter: this.scopedFilter(filter)
+    })
     if (applied.result.kind === "revised") return applied.result.revision
     throw unexpected("revise")
   }
@@ -396,8 +421,12 @@ export class Filters {
   ): Promise<ConfiguredGroup> {
     const identity =
       expectedIdentity ?? (await nativeGroup(this.transport, group, group.group)).identity
+    const scoped: GroupFilterSpec =
+      policy.kind === "definition"
+        ? { kind: "definition", filter: this.scopedFilter(policy.filter) }
+        : policy
     const applied = await this.apply(
-      { kind: "configure_group", group, policy, expectedIdentity: identity },
+      { kind: "configure_group", group, policy: scoped, expectedIdentity: identity },
       operationId
     )
     if (applied.result.kind === "bound") return bound(applied.result.binding, applied)
@@ -641,10 +670,10 @@ export class FilteredReaderBuilder {
    * How long `nextPage` waits after a round that found nothing new, and how
    * long a failing or blocked partition waits before it is read again.
    */
-  idleInterval(milliseconds: number): this {
-    if (!Number.isFinite(milliseconds) || milliseconds < 0)
+  idleInterval(intervalMs: number): this {
+    if (!Number.isFinite(intervalMs) || intervalMs < 0)
       throw new InvalidError("the idle interval must be finite and non-negative")
-    this.idleMs = milliseconds
+    this.idleMs = intervalMs
     return this
   }
 
@@ -660,11 +689,14 @@ export class FilteredReaderBuilder {
     const capabilities = await this.capabilities()
     if (this.filter.kind === "group" && !capabilities.filters.groupPolicyReads) {
       throw new UnsupportedError(
-        "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK"
+        "this server serves consumer filters but not group-aware reads, upgrade it before reading groups through the Laser SDK",
+        { surface: "filters", feature: "group_policy_reads" }
       )
     }
     if (this.filter.kind !== "group" && !capabilities.filters.native) {
-      throw new UnsupportedError("consumer filters are not served by this server")
+      throw new UnsupportedError("consumer filters are not served by this server", {
+        surface: "filters"
+      })
     }
     if (this.mode === "primary" && this.transport.connectsNodes !== true) {
       throw new ConfigError(
@@ -1114,7 +1146,8 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
       if (this.settings.guardEnabled && this.guard === undefined) {
         this.guard = await compileGuard(
           this.settings.transport,
-          await boundDefinition(this.settings.filters, request.source, page)
+          await boundDefinition(this.settings.filters, request.source, page),
+          this.settings.filters.schemaStream()
         )
       }
       if (this.guard !== undefined) {
@@ -1589,18 +1622,31 @@ class Routes {
         "primary filtered reads need a transport that can open node connections"
       )
     }
+    const retry = this.transport.publishOptions?.() ?? publishOptions()
     const route = decodePollRouting(
-      await this.coordinator.send(
-        acknowledgment ? GET_CONSUMER_OFFSET_ROUTING_CODE : GET_POLL_ROUTING_CODE,
-        acknowledgment
-          ? encodeOffsetRouting(source, consumer, partitionId)
-          : encodePollRouting(source, consumer, partitionId)
+      await retryTransientRead(
+        retry,
+        () =>
+          this.coordinator.send(
+            acknowledgment ? GET_CONSUMER_OFFSET_ROUTING_CODE : GET_POLL_ROUTING_CODE,
+            acknowledgment
+              ? encodeOffsetRouting(source, consumer, partitionId)
+              : encodePollRouting(source, consumer, partitionId)
+          ),
+        isTransientRefusal
       )
     )
     this.requireOpen()
     if (this.singleNode === undefined) {
       const count = this.transport.clusterNodeCount
-      this.singleNode = count === undefined ? false : (await count.call(this.transport)) <= 1
+      this.singleNode =
+        count === undefined
+          ? false
+          : (await retryTransientRead(
+              retry,
+              () => count.call(this.transport),
+              isTransientRefusal
+            )) <= 1
     }
     const dial: PollRoute = this.singleNode ? { ...route, ip: "", tcpPort: 0 } : route
     const endpoint = this.singleNode ? "caller" : `${route.ip}:${String(route.tcpPort)}`
@@ -2176,18 +2222,21 @@ function filterHeaders(headers: ReadonlyMap<string, HeaderValue>): FilterHeader[
 
 async function compileGuard(
   transport: FilterTransport,
-  filter: ConsumerFilter
+  filter: ConsumerFilter,
+  defaultSchemaStream: string | undefined
 ): Promise<CompiledFilter> {
-  if (usesRegex(filter.expr)) {
-    throw new ConfigError(
-      "the TypeScript local guard cannot verify regex predicates, disable localGuard or use Rust or Python"
-    )
-  }
+  const schemaStream = filter.schemaStream ?? defaultSchemaStream
   const schemas: SchemaDef[] = []
   for (const id of filter.schemaRefs) {
     const bytes = await transport.sendManaged(
       AGDX_GET_SCHEMA_CODE,
-      encodeNamed(encodeGetSchema({ v: QUERY_OP_VERSION, id }))
+      encodeNamed(
+        encodeGetSchema({
+          v: QUERY_OP_VERSION,
+          id,
+          ...(schemaStream !== undefined ? { stream: schemaStream } : {})
+        })
+      )
     )
     const reply = decodeBrowseReply(decodeOne(bytes, "writer schema"), "writer schema")
     if (reply.kind === "err")
@@ -2298,6 +2347,12 @@ function isNotYetApplied(error: unknown): boolean {
     (error instanceof FilterExecutionError && resultCodeIsRetryable(error.detail.code)) ||
     (error instanceof TransportError && error.retryable)
   )
+}
+
+// A transport failure the next attempt can clear, the TypeScript peer of the
+// Rust transient Iggy classification.
+function isTransientRefusal(error: unknown): boolean {
+  return error instanceof TransportError && error.retryable
 }
 
 function isTransient(error: unknown): boolean {
