@@ -60,12 +60,12 @@ def test_given_each_verdict_when_naming_it_then_should_read_its_evidence_name():
 def test_given_no_arguments_when_building_retention_then_should_keep_the_sdk_defaults():
     defaults = ls.GovernorRetention()
     assert defaults.capacity == 4096
-    assert defaults.idle_ttl_secs == 3600.0
-    tuned = ls.GovernorRetention(capacity=16, idle_ttl_secs=1.5)
+    assert defaults.idle_ttl_ms == 3_600_000.0
+    tuned = ls.GovernorRetention(capacity=16, idle_ttl_ms=1_500)
     assert tuned.capacity == 16
-    assert tuned.idle_ttl_secs == 1.5
+    assert tuned.idle_ttl_ms == 1_500
     with pytest.raises(ls.InvalidError):
-        ls.GovernorRetention(idle_ttl_secs=-1.0)
+        ls.GovernorRetention(idle_ttl_ms=-1.0)
 
 
 def test_given_an_intent_without_voters_when_building_it_then_should_raise_its_variant():
@@ -161,23 +161,28 @@ def test_given_an_agent_owner_when_deriving_a_content_id_then_should_match_the_p
 async def test_given_session_options_when_reading_the_config_then_should_report_the_layout(laser):
     sessions = laser.sessions(
         stream="support",
-        topics={"instruction": "support.turns"},
+        idle_timeout_ms=120_000,
+        heartbeat_ms=30_000,
+        register_source=False,
+        fail_on_dead_letter=True,
         memory_namespace="support.memory",
         context_turns=7,
         context_tokens=900,
     )
     config = sessions.config
     assert config.stream_name == "support"
+    assert config.idle_timeout_ms == 120_000
+    assert config.heartbeat_ms == 30_000
+    assert config.registers_source is False
+    assert config.fails_on_dead_letter is True
     assert config.memory_namespace_name == "support.memory"
     assert config.context_turn_bound == 7
     assert config.context_token_bound == 900
-    assert config.topic_for("instruction") == "support.turns"
-    assert config.kind_for("support.turns") == "instruction"
-    assert config.kind_for("agent.commands") is None
-    assert "support.turns" in config.topics
-    assert sessions.start().config.context_turn_bound == 7
+    assert sessions.open(ls.new_conversation_id()).config.context_turn_bound == 7
     defaults = laser.sessions().config
     assert defaults.stream_name is None
+    assert (defaults.idle_timeout_ms, defaults.heartbeat_ms) == (300_000, 60_000)
+    assert defaults.registers_source is True
     assert defaults.memory_namespace_name == "agent.session"
     assert (defaults.context_turn_bound, defaults.context_token_bound) == (50, 4000)
 
@@ -212,22 +217,22 @@ async def test_given_a_note_when_improving_through_a_scope_then_should_reach_the
 
 @pytest.mark.integration
 async def test_given_upstream_hops_when_a_bridge_submits_then_should_stamp_the_path(laser):
-    await laser.bootstrap(partitions=1)
-    bridge = ls.A2aBridge(laser, "a2a-edge", "agent.commands", "agent.responses")
+    await laser.bootstrap(partitions=1, retention=ls.TopicRetention.expire_after(86_400_000))
+    bridge = ls.A2aBridge(laser, "a2a-edge", "agent.sessions", "agent.sessions")
     assert bridge.with_bridge_hops(["mcp-edge"]) is bridge
     task = await bridge.submit(
         {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}}
     )
-    messages = await laser.context(task["id"]).fetch(topics=["agent.commands"], n=1)
+    messages = await laser.context(task["id"]).fetch(topics=["agent.sessions"], n=1)
     assert messages[0].envelope["metadata"]["bridge_hops"] == ["mcp-edge", "a2a-edge"]
 
 
 @pytest.mark.integration
 async def test_given_a_path_holding_the_bridge_when_continued_then_should_refuse_the_loop(laser):
-    a2a = ls.A2aBridge(laser, "edge", "agent.commands", "agent.responses")
+    a2a = ls.A2aBridge(laser, "edge", "agent.sessions", "agent.sessions")
     with pytest.raises(ls.InvalidError):
         a2a.with_bridge_hops(["edge"])
-    mcp = ls.McpBridge(laser, "edge", "agent.tools", "agent.responses", "fleet")
+    mcp = ls.McpBridge(laser, "edge", "agent.tools", "agent.sessions", "fleet")
     with pytest.raises(ls.InvalidError):
         mcp.with_bridge_hops(["upstream", "edge"])
     assert mcp.with_bridge_hops(["upstream"]) is mcp
@@ -262,6 +267,6 @@ def test_given_session_policies_when_mapping_a_key_then_should_derive_or_mint_co
 
 def test_given_inbox_routes_when_resolving_then_should_pick_fixed_or_advertised_topics():
     assert ls.inbox_route_resolve(None, "worker", "worker.inbox") == "worker.inbox"
-    assert ls.inbox_route_resolve("agent.commands", "worker", "worker.inbox") == "agent.commands"
+    assert ls.inbox_route_resolve("agent.sessions", "worker", "worker.inbox") == "agent.sessions"
     with pytest.raises(ls.LaserError):
         ls.inbox_route_resolve(None, "worker")

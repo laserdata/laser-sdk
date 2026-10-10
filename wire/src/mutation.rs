@@ -46,6 +46,9 @@ pub struct MutationCommandEnvelope {
     pub operation_id: u128,
     pub timestamp_micros: u64,
     pub command_code: u32,
+    /// Trusted stream identity carried through durable replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::forward::ForwardedScope>,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub payload: Vec<u8>,
 }
@@ -75,6 +78,7 @@ mod tests {
             operation_id: 42,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
+            scope: None,
             payload: vec![0, 1, 2, 255],
         };
         let bytes = encode_named(&envelope).expect("encodes");
@@ -114,6 +118,7 @@ mod tests {
             operation_id: 0,
             timestamp_micros: 1,
             command_code: AGDX_KV_SET_CODE,
+            scope: None,
             payload: Vec::new(),
         };
 

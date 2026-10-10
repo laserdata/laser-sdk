@@ -1,8 +1,8 @@
 import type { ResultCode, ResultCodeName } from "../wire/result.js"
 import type { FilterErrorReason } from "../wire/filter.js"
 import {
-  AgentWorkflowExecutionError,
   AmbiguousMutationError,
+  AuthzExecutionError,
   BudgetExceededError,
   CheckpointExecutionError,
   ConsumerGroupSetupError,
@@ -12,6 +12,7 @@ import {
   FilterOversizedRecordError,
   ForkExecutionError,
   GraphExecutionError,
+  SessionError,
   KvExecutionError,
   LaserError,
   NoCapableAgentError,
@@ -24,6 +25,8 @@ import {
   UnsupportedError,
   publishCause
 } from "./errors.js"
+import { sessionErrorResultCode } from "../wire/session.js"
+import { type AuthzError, authzErrorResultCode } from "../wire/authz.js"
 
 // Apache Iggy server error codes the classifiers read.
 const IGGY_RESOURCE_NOT_FOUND = 20
@@ -40,8 +43,7 @@ function detailKind(error: unknown): string | undefined {
     error instanceof QueryExecutionError ||
     error instanceof KvExecutionError ||
     error instanceof ForkExecutionError ||
-    error instanceof GraphExecutionError ||
-    error instanceof AgentWorkflowExecutionError
+    error instanceof GraphExecutionError
   ) {
     const detail = error.detail as { readonly kind?: unknown } | undefined
     return typeof detail?.kind === "string" ? detail.kind : undefined
@@ -177,9 +179,7 @@ export function isStale(error: unknown): boolean {
 export function isNotLeader(error: unknown): boolean {
   const cause = publishCause(error)
   return (
-    (cause instanceof KvExecutionError ||
-      cause instanceof ForkExecutionError ||
-      cause instanceof AgentWorkflowExecutionError) &&
+    (cause instanceof KvExecutionError || cause instanceof ForkExecutionError) &&
     detailKind(cause) === "notLeader"
   )
 }
@@ -273,16 +273,6 @@ const GRAPH_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
   version: "VersionSkew"
 }
 
-const AGENT_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
-  unsupported: "Unsupported",
-  notFound: "NotFound",
-  invalid: "InvalidArgument",
-  backend: "Backend",
-  unavailable: "Unavailable",
-  version: "VersionSkew",
-  notLeader: "Unavailable"
-}
-
 const CHECKPOINT_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
   invalid: "InvalidArgument",
   not_found: "NotFound",
@@ -320,8 +310,9 @@ export function code(error: unknown): ResultCode {
   if (cause instanceof KvExecutionError) return surfaceCode(KV_CODES, detailKind(cause))
   if (cause instanceof ForkExecutionError) return surfaceCode(FORK_CODES, detailKind(cause))
   if (cause instanceof GraphExecutionError) return surfaceCode(GRAPH_CODES, detailKind(cause))
-  if (cause instanceof AgentWorkflowExecutionError) {
-    return surfaceCode(AGENT_CODES, detailKind(cause))
+  if (cause instanceof SessionError) return sessionErrorResultCode(cause.detail)
+  if (cause instanceof AuthzExecutionError && isAuthzError(cause.detail)) {
+    return authzErrorResultCode(cause.detail)
   }
   if (cause instanceof CheckpointExecutionError) {
     return surfaceCode(CHECKPOINT_CODES, detailKind(cause))
@@ -362,9 +353,9 @@ export function code(error: unknown): ResultCode {
     case "kv":
     case "fork":
     case "graph":
+    case "session":
     case "authz":
     case "filter":
-    case "agent-workflow":
     case "routing":
     case "handler":
     case "state-store":
@@ -392,4 +383,8 @@ export function publicErrorMessage(error: unknown): string {
     NotFound: "not found"
   }
   return messages[result.name] ?? "internal error"
+}
+
+function isAuthzError(detail: unknown): detail is AuthzError {
+  return typeof detail === "object" && detail !== null && "kind" in detail
 }

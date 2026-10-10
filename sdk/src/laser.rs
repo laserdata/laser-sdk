@@ -35,6 +35,20 @@ type ProducerCell = Arc<OnceCell<Arc<IggyProducer>>>;
 const TRANSIENT_SEND_ATTEMPTS: usize = 10;
 const PUBLISH_BATCH_LENGTH: usize = 1000;
 
+/// How a [`Laser`] names the managed resources it sends: KV, memory, lease,
+/// and fence namespaces, the key registry, graph names, projection ids and
+/// index names, and fork ids.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ResourceNaming {
+    /// Scope every managed resource name to the default stream,
+    /// `stream:<stream>/<name>`. A name that already starts with `stream:` is
+    /// sent as is. A handle without a default stream sends bare names.
+    #[default]
+    Stream,
+    /// Send every name exactly as the caller wrote it, deployment wide.
+    Bare,
+}
+
 /// The Laser client. Cheap to `clone`, since the connection and producer cache
 /// are shared via an internal `Arc`, so one connection is reused across tasks.
 /// Build it through [`Laser::connect`] or [`Laser::builder`]. Never wrap it in
@@ -62,6 +76,7 @@ pub struct Laser {
     // `with_default_stream` re-scopes cheaply, sharing the one connection across
     // any number of streams. `stream(name).topic(name)` ignores it.
     stream: Option<String>,
+    resource_naming: ResourceNaming,
     // Optional pre-effect policy hook. Per-handle (like `stream`) so
     // `with_governor` re-scopes cheaply, while the state inside is shared by
     // every clone of the governed handle (one session's counters and evidence
@@ -91,11 +106,20 @@ struct LaserInner {
     producers: DashMap<ProducerKey, ProducerCell>,
     pub(crate) producer_statistics: Arc<crate::stream::producer_statistics::ProducerRegistry>,
     negotiated: std::sync::RwLock<NegotiatedState>,
+    // Lets one caller at a time re-probe an unmanaged capability set.
+    reprobe_gate: tokio::sync::Mutex<()>,
     // The agent registry read model's per-stream cache, so a fresh `AgentRegistry`
     // resumes the card fold instead of re-reading the registry topic from offset 0.
     // Keyed by data stream (the isolation boundary the registry topic lives on).
     #[cfg(feature = "agent")]
     registry_caches: DashMap<String, Arc<std::sync::Mutex<crate::agent::registry::RegistryCache>>>,
+    // The session leases this connection holds, read by its heartbeat task.
+    #[cfg(feature = "agent")]
+    leases: Arc<crate::agent::lease::LeaseRegistry>,
+    // The session layout declared per data stream, read at the agent send
+    // boundary to pick each record's partition.
+    #[cfg(feature = "agent")]
+    layouts: DashMap<String, crate::agent::SessionLayout>,
     // Connection metadata has one slot. Reserve it for one logical agent across
     // every clone so a second advertisement cannot overwrite the first route.
     // Presence rides the managed metadata command, so the slot exists only
@@ -120,7 +144,13 @@ struct NegotiatedState {
     configured_capabilities: Capabilities,
     capabilities: Capabilities,
     topology: laser_wire::topology::WireTopology,
+    // When the server was last probed. `None` until the first probe.
+    probed_at: Option<tokio::time::Instant>,
 }
+
+// How long a set without a managed plane is trusted before `capabilities()`
+// probes again, so a plane that becomes ready after connect is picked up.
+const UNMANAGED_REPROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Laser {
     #[cfg(all(feature = "agent", feature = "query"))]
@@ -143,7 +173,7 @@ impl Laser {
     /// Connect using an Iggy connection string. The connection string is the
     /// only thing required. For a `*.laserdata.cloud` or `*.laserdata.com`
     /// host with no `tls_ca_file=` already set, TLS is auto-attached with
-    /// LaserData's public root CA, bundled in the SDK itself. Set `LASER_TLS_CERT=<path>` to enable TLS with an explicit CA for any host or to override the bundled CA. Disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings when neither variable is set. Connection strings use the bare `user:password@host:port` form because `Laser::connect` supplies the TCP scheme.
+    /// LaserData's public root CA, bundled in the SDK itself. Set `LASER_TLS_CERT=<path>` to enable TLS with an explicit CA for any host or to override the bundled CA. Disable automatic TLS with `LASER_NO_TLS=1`. Other hosts keep their Apache Iggy TLS settings when neither variable is set. Connection strings use the bare `user:password@host[:port]` form because `Laser::connect` supplies the TCP scheme, and the port defaults to 8090.
     ///
     /// Connecting gives up after 30 seconds, or `LASER_CONNECT_TIMEOUT_MS`, with a [`LaserError::Timeout`] that says whether the server never accepted the connection or never answered the login. Set another budget with [`LaserBuilder::connect_timeout`].
     ///
@@ -234,7 +264,7 @@ impl Laser {
     /// [`with_default_stream`](Self::with_default_stream) to pin a default
     /// stream. The fenced-lease convenience methods need a separately owned
     /// coordination connection, so a bring-your-own client uses an explicit
-    /// [`FencedLeaseClient`](crate::kv::FencedLeaseClient) for those mutations.
+    /// `FencedLeaseClient` for those mutations.
     pub fn from_client(client: IggyClient) -> Self {
         Self {
             inner: Arc::new(LaserInner {
@@ -253,9 +283,15 @@ impl Laser {
                     configured_capabilities: Capabilities::OPEN,
                     capabilities: Capabilities::OPEN,
                     topology: laser_wire::topology::WireTopology::default(),
+                    probed_at: None,
                 }),
+                reprobe_gate: tokio::sync::Mutex::new(()),
                 #[cfg(feature = "agent")]
                 registry_caches: DashMap::new(),
+                #[cfg(feature = "agent")]
+                leases: Arc::default(),
+                #[cfg(feature = "agent")]
+                layouts: DashMap::new(),
                 #[cfg(feature = "agent")]
                 #[cfg(all(feature = "agent", any(feature = "query", test)))]
                 advertised_agent: std::sync::Mutex::new(None),
@@ -270,6 +306,7 @@ impl Laser {
             dlq_topic_override: None,
             changes_topic_override: None,
             stream: None,
+            resource_naming: ResourceNaming::default(),
             #[cfg(feature = "agent")]
             governor: None,
         }
@@ -368,6 +405,67 @@ impl Laser {
         let mut scoped = self.clone();
         scoped.stream = Some(stream.into());
         scoped
+    }
+
+    /// A clone of this `Laser` that names managed resources under `naming`,
+    /// sharing the one connection. [`ResourceNaming::Bare`] opts out of the
+    /// default stream scoping.
+    #[must_use]
+    pub fn with_resource_naming(&self, naming: ResourceNaming) -> Self {
+        let mut renamed = self.clone();
+        renamed.resource_naming = naming;
+        renamed
+    }
+
+    /// How this handle names the managed resources it sends.
+    pub fn resource_naming(&self) -> ResourceNaming {
+        self.resource_naming
+    }
+
+    /// The name this handle sends for the managed resource `name`:
+    /// `stream:<default stream>/<name>` under [`ResourceNaming::Stream`] with a
+    /// default stream, else `name` unchanged. A name that already starts with
+    /// `stream:` is returned unchanged.
+    pub fn resource_name(&self, name: &str) -> String {
+        self.resource_name_in(self.default_stream(), name)
+    }
+
+    // The default stream when this handle scopes its resources to it.
+    pub(crate) fn resource_stream(&self) -> Option<&str> {
+        self.resource_scope(self.default_stream())
+    }
+
+    // `stream` when this handle scopes its resources, the gate every scoped name
+    // and every lens `stream` field passes through.
+    pub(crate) fn resource_scope<'a>(&self, stream: Option<&'a str>) -> Option<&'a str> {
+        match self.resource_naming {
+            ResourceNaming::Stream => stream.filter(|stream| !stream.is_empty()),
+            ResourceNaming::Bare => None,
+        }
+    }
+
+    // `name` scoped to `stream` under this handle's naming. An empty name stays
+    // empty so the caller's validation still rejects it.
+    pub(crate) fn resource_name_in(&self, stream: Option<&str>, name: &str) -> String {
+        match self.resource_scope(stream) {
+            Some(stream) if !name.is_empty() => laser_wire::authz::scoped_resource(stream, name),
+            _ => name.to_owned(),
+        }
+    }
+
+    // The caller's name for `name` returned by a listing: the local part when it
+    // sits under this handle's own prefix, `None` when it belongs to another
+    // stream or, while scoping is active, to no stream. A handle that does not
+    // scope keeps every name unchanged.
+    #[cfg(any(feature = "kv", feature = "fork", feature = "projections", test))]
+    pub(crate) fn local_resource_name<'a>(&self, name: &'a str) -> Option<&'a str> {
+        let Some(stream) = self.resource_stream() else {
+            return Some(name);
+        };
+        match laser_wire::authz::split_scoped_resource(name) {
+            Some((owner, local)) if owner == stream => Some(local),
+            _ => None,
+        }
     }
 
     pub(crate) fn publish_options(&self) -> PublishOptions {
@@ -497,6 +595,44 @@ impl Laser {
         self.default_stream().ok_or(LaserError::NoStream)
     }
 
+    #[cfg(feature = "agent")]
+    pub(crate) fn declare_layout(&self, stream: &str, layout: crate::agent::SessionLayout) {
+        self.inner.layouts.insert(stream.to_owned(), layout);
+    }
+
+    #[cfg(feature = "agent")]
+    pub(crate) fn layout(&self, stream: &str) -> Option<crate::agent::SessionLayout> {
+        self.inner.layouts.get(stream).map(|layout| layout.clone())
+    }
+
+    // The topic a record sent on `topic` lands on under the default stream's
+    // declared per-agent topic layout, or `None` to keep `topic`.
+    #[cfg(feature = "agent")]
+    pub(crate) fn agent_destination(
+        &self,
+        topic: &str,
+        kind: Option<laser_wire::agent::AgentKind>,
+        target: Option<&laser_wire::agent::AgentId>,
+    ) -> Option<String> {
+        let layout = self.default_stream().and_then(|stream| self.layout(stream));
+        crate::agent::partitioning::destination_topic(layout.as_ref(), topic, kind, target)
+    }
+
+    // The topic `agent` reads its addressed work and replies on under the
+    // default stream's declared per-agent topic layout, or `None` when the
+    // agent is not declared.
+    #[cfg(feature = "agent")]
+    pub(crate) fn declared_topic(&self, agent: &laser_wire::agent::AgentId) -> Option<String> {
+        let layout = self.default_stream().and_then(|stream| self.layout(stream));
+        crate::agent::partitioning::declared_topic(layout.as_ref(), agent)
+    }
+
+    /// The session leases this connection holds.
+    #[cfg(feature = "agent")]
+    pub(crate) fn lease_registry(&self) -> &Arc<crate::agent::lease::LeaseRegistry> {
+        &self.inner.leases
+    }
+
     /// The shared agent-registry cache for the default stream, created on first
     /// use. Per-stream because the registry topic is scoped to the data stream
     /// (the isolation boundary).
@@ -573,11 +709,37 @@ impl Laser {
         })
     }
 
-    /// The capability set this laser was built with (default
-    /// [`Capabilities::OPEN`]). Async to reserve a future capability negotiation
-    /// round-trip. Open features work regardless of the result.
+    /// The negotiated capability set (default [`Capabilities::OPEN`]). A set
+    /// without a managed plane is probed again when it is at least one second
+    /// old, so a plane that was not ready at connect is picked up without an
+    /// explicit [`refresh_capabilities`](Self::refresh_capabilities). A managed
+    /// set and an explicit override are returned as they are. Open features
+    /// work regardless of the result.
     pub async fn capabilities(&self) -> Capabilities {
-        self.current_capabilities()
+        if let Some(capabilities) = &self.capability_override {
+            return capabilities.clone();
+        }
+        if !self.reprobe_due() {
+            return self.current_capabilities();
+        }
+        let _gate = self.inner.reprobe_gate.lock().await;
+        // Another caller may have probed while this one waited.
+        if !self.reprobe_due() {
+            return self.current_capabilities();
+        }
+        self.refresh_capabilities().await
+    }
+
+    fn reprobe_due(&self) -> bool {
+        let negotiated = self
+            .inner
+            .negotiated
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !negotiated.capabilities.managed
+            && negotiated
+                .probed_at
+                .is_none_or(|at| at.elapsed() >= UNMANAGED_REPROBE_INTERVAL)
     }
 
     pub(crate) fn current_capabilities(&self) -> Capabilities {
@@ -619,6 +781,7 @@ impl Laser {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         negotiated.capabilities = capabilities;
+        negotiated.probed_at = Some(tokio::time::Instant::now());
         if let Some(topology) = topology {
             negotiated.topology = topology;
         }
@@ -739,7 +902,7 @@ impl Laser {
         &self,
         stream: &str,
         topic: &str,
-        mut messages: Vec<IggyMessage>,
+        messages: Vec<IggyMessage>,
         partition_key: Option<&str>,
     ) -> Result<SendMessagesResponse, LaserError> {
         if messages.is_empty() {
@@ -747,11 +910,49 @@ impl Laser {
                 confirmations: Vec::new(),
             });
         }
-        prepare_publish_messages(&mut messages);
-        let partitioning = Arc::new(match partition_key {
+        let partitioning = match partition_key {
             Some(key) => Partitioning::messages_key_str(key)?,
             None => Partitioning::balanced(),
-        });
+        };
+        self.send_batch_partitioned_on(stream, topic, messages, partitioning)
+            .await
+    }
+
+    /// Like [`send_batch_on`](Self::send_batch_on) with an explicit
+    /// `partitioning`, such as one declared partition.
+    pub(crate) async fn send_batch_partitioned_on(
+        &self,
+        stream: &str,
+        topic: &str,
+        messages: Vec<IggyMessage>,
+        partitioning: Partitioning,
+    ) -> Result<SendMessagesResponse, LaserError> {
+        self.send_batch_partitioned_on_checked(stream, topic, messages, partitioning, || async {
+            Ok(None)
+        })
+        .await
+    }
+
+    pub(crate) async fn send_batch_partitioned_on_checked<F, Fut>(
+        &self,
+        stream: &str,
+        topic: &str,
+        mut messages: Vec<IggyMessage>,
+        partitioning: Partitioning,
+        check: F,
+    ) -> Result<SendMessagesResponse, LaserError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<(u32, u32, Partitioning)>, LaserError>>,
+    {
+        if messages.is_empty() {
+            return Ok(SendMessagesResponse {
+                confirmations: Vec::new(),
+            });
+        }
+        let first = std::sync::Mutex::new(Some(check().await?));
+        prepare_publish_messages(&mut messages);
+        let partitioning = Arc::new(partitioning);
         let mut confirmations = Vec::new();
         let observed = std::sync::atomic::AtomicU64::new(0);
         for (index, chunk) in messages.chunks(PUBLISH_BATCH_LENGTH).enumerate() {
@@ -764,13 +965,46 @@ impl Laser {
                             self.publish_generation(),
                             std::sync::atomic::Ordering::Release,
                         );
+                        let cached = first.lock().expect("first publish source").take();
+                        let source = match cached {
+                            Some(source) => source,
+                            None => check().await?,
+                        };
+                        if let Some((stream_id, topic_id, route)) = source {
+                            let mut batch: Vec<_> = chunk.iter().map(clone_iggy_message).collect();
+                            return Ok(self
+                                .client()
+                                .send_messages(
+                                    &Identifier::numeric(stream_id)?,
+                                    &Identifier::numeric(topic_id)?,
+                                    &route,
+                                    &mut batch,
+                                )
+                                .await?);
+                        }
                         let producer = self.producer_on(stream, topic).await?;
-                        Ok(producer
+                        let sent = producer
                             .send_with_partitioning(
                                 chunk.iter().map(clone_iggy_message).collect(),
                                 Some(partitioning.clone()),
                             )
-                            .await?)
+                            .await;
+                        match sent {
+                            // A cached producer can outlive a deleted and
+                            // recreated stream or topic. Rebuild it once.
+                            Err(error) if is_missing_resource(&error) => {
+                                self.reconnect_for_publish(self.publish_generation())
+                                    .await?;
+                                let producer = self.producer_on(stream, topic).await?;
+                                Ok(producer
+                                    .send_with_partitioning(
+                                        chunk.iter().map(clone_iggy_message).collect(),
+                                        Some(partitioning.clone()),
+                                    )
+                                    .await?)
+                            }
+                            other => Ok(other?),
+                        }
                     },
                     || {
                         self.reconnect_for_publish(
@@ -950,19 +1184,8 @@ impl Laser {
                     )
                     .send_retries(Some(0), None)
                     .build();
-                for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
-                    match producer.init().await {
-                        Ok(()) => return Ok::<_, LaserError>(Arc::new(producer)),
-                        Err(error)
-                            if is_idempotent_create_race(&error)
-                                && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
-                        {
-                            sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                unreachable!("producer init retry returns success or the last error")
+                init_producer(&producer).await?;
+                Ok::<_, LaserError>(Arc::new(producer))
             })
             .await?;
         Ok(producer.clone())
@@ -1062,6 +1285,24 @@ pub(crate) fn clone_iggy_message(message: &IggyMessage) -> IggyMessage {
     }
 }
 
+/// Initialize a producer, treating a concurrent creation of its stream or topic
+/// as success. Apache Iggy's init reads, then creates, so two producers racing
+/// on a new topic see `AlreadyExists` on the loser. The retry reads the stream
+/// and topic the winner created.
+pub(crate) async fn init_producer(producer: &IggyProducer) -> Result<(), IggyError> {
+    for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
+        match producer.init().await {
+            Err(error)
+                if is_idempotent_create_race(&error) && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("producer init retry returns success or the last error")
+}
+
 fn is_idempotent_create_race(error: &IggyError) -> bool {
     matches!(
         error,
@@ -1086,6 +1327,7 @@ pub struct LaserBuilder {
     publish_max_retries: Option<u32>,
     publish_retry_backoff: Option<Duration>,
     stream: Option<String>,
+    resource_naming: ResourceNaming,
     ops_stream: Option<String>,
     control_topic: Option<String>,
     dlq_topic: Option<String>,
@@ -1135,9 +1377,10 @@ impl LaserBuilder {
         self
     }
 
-    /// Connect using an Iggy connection string
-    /// (`iggy+tcp://user:pass@host:port`, `iggy+quic://...`, `iggy+http://...`,
-    /// `iggy+ws://...`). The most ergonomic option.
+    /// Connect using an Iggy TCP connection string: `user:password@host[:port]`,
+    /// `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`.
+    /// The port defaults to 8090. Other transports are refused. The most
+    /// ergonomic option.
     pub fn connection_string(mut self, value: impl Into<String>) -> Self {
         if matches!(
             self.connection,
@@ -1151,7 +1394,7 @@ impl LaserBuilder {
         self
     }
 
-    /// Connect over TCP to `address` (`host:port`). Requires `credentials`.
+    /// Connect over TCP to `address` (`host` or `host:port`, the port defaults to 8090). Requires `credentials`.
     pub fn address(mut self, value: impl Into<String>) -> Self {
         if matches!(
             self.connection,
@@ -1229,6 +1472,14 @@ impl LaserBuilder {
     /// handle that names the stream per operation (`publish_on(stream, topic)`).
     pub fn stream(mut self, value: impl Into<String>) -> Self {
         self.stream = Some(value.into());
+        self
+    }
+
+    /// How the client names the managed resources it sends. Default
+    /// [`ResourceNaming::Stream`] scopes them to the default stream.
+    /// [`ResourceNaming::Bare`] sends names exactly as written.
+    pub fn resource_naming(mut self, value: ResourceNaming) -> Self {
+        self.resource_naming = value;
         self
     }
 
@@ -1354,7 +1605,9 @@ impl LaserBuilder {
                 // reconnect, so a dropped connection resumes transparently. A
                 // plain `with_tcp` + manual `login_user` reconnects the socket
                 // but leaves it unauthenticated after a server restart.
-                let with_tls = resolve_tls(format!("iggy+tcp://{username}:{password}@{address}"))?;
+                let with_tls = normalize_connection_string(&format!(
+                    "iggy+tcp://{username}:{password}@{address}"
+                ))?;
                 let client = IggyClientBuilder::from_connection_string(&with_tls)?.build()?;
                 connect_before(&client, connect_deadline).await?;
                 (client, Some(with_tls))
@@ -1407,9 +1660,15 @@ impl LaserBuilder {
                     configured_capabilities,
                     capabilities,
                     topology,
+                    probed_at: Some(tokio::time::Instant::now()),
                 }),
+                reprobe_gate: tokio::sync::Mutex::new(()),
                 #[cfg(feature = "agent")]
                 registry_caches: DashMap::new(),
+                #[cfg(feature = "agent")]
+                leases: Arc::default(),
+                #[cfg(feature = "agent")]
+                layouts: DashMap::new(),
                 #[cfg(feature = "agent")]
                 #[cfg(all(feature = "agent", any(feature = "query", test)))]
                 advertised_agent: std::sync::Mutex::new(None),
@@ -1426,6 +1685,7 @@ impl LaserBuilder {
             dlq_topic_override: self.dlq_topic,
             changes_topic_override: self.changes_topic,
             stream,
+            resource_naming: self.resource_naming,
             #[cfg(feature = "agent")]
             governor: self.governor,
         })
@@ -1536,8 +1796,7 @@ fn merge_announcement(
         feature = "kv",
         feature = "projections",
         feature = "query",
-        feature = "rbac",
-        feature = "runs"
+        feature = "rbac"
     )
 ))]
 mod announcement_tests {
@@ -1632,7 +1891,7 @@ mod announcement_tests {
                     feature::KV_CAS
                         | feature::KV_CAS_FENCED
                         | feature::STRONG_CONSISTENCY
-                        | feature::AGENT_WORKFLOW
+                        | feature::SESSIONS
                         | feature::KEYWORD_SEARCH
                         | feature::WATCH
                         | feature::AUTHZ,
@@ -1652,7 +1911,7 @@ mod announcement_tests {
         assert!(!capabilities.kv.cas_fenced);
         assert!(!capabilities.graph);
         assert!(!capabilities.forks);
-        assert!(!capabilities.agent_workflow);
+        assert!(!capabilities.sessions);
         assert!(!capabilities.watch);
         assert!(capabilities.authz, "server-native authz remains available");
         assert_eq!(capabilities.backends, announce.backends);
@@ -1667,7 +1926,7 @@ mod announcement_tests {
         let announce = BackendAnnounce::new(
             OpVersions::new(1, 1, 1, 1)
                 .with_graph(1)
-                .with_features(feature::KV_CAS | feature::AGENT_WORKFLOW),
+                .with_features(feature::KV_CAS | feature::SESSIONS),
         )
         .with_backends(vec![backend(1, true)]);
         let mut capabilities = Capabilities::OPEN;
@@ -1680,25 +1939,170 @@ mod announcement_tests {
         assert!(capabilities.kv.cas);
         assert!(capabilities.graph);
         assert!(capabilities.forks);
-        assert!(capabilities.agent_workflow);
+        assert!(capabilities.sessions);
         assert_eq!(capabilities.backends, announce.backends);
     }
 }
 
-/// Normalize a connection string: if no `iggy` scheme is present (`iggy://` or
-/// `iggy+<protocol>://`), prepend `iggy://` so a raw `user:pass@host:port` from
-/// e.g. a LaserData Cloud bootstrap endpoint works as-is. Then, for a
-/// LaserData Cloud host that does not already name a `tls_ca_file=`, attach
-/// `tls=true` plus LaserData's bundled public CA so a bare connection string
-/// is enough. `LASER_TLS_CERT=<path>` enables TLS with that CA for any host or overrides the bundled CA. `LASER_NO_TLS=1` disables automatic TLS setup. The connection string's own `tls_ca_file=` remains authoritative.
+// Apache Iggy's TCP port. A connection string or address may omit it.
+const DEFAULT_TCP_PORT: u16 = 8090;
+
+// The query parameters Apache Iggy's TCP transport reads. Any other key is
+// refused, so a misspelled option fails at connect instead of being ignored.
+const CONNECTION_OPTIONS: [&str; 8] = [
+    "tls",
+    "tls_domain",
+    "tls_ca_file",
+    "reconnection_retries",
+    "reconnection_interval",
+    "reestablish_after",
+    "heartbeat_interval",
+    "nodelay",
+];
+
+/// Validate and normalize a connection string. The scheme is optional and
+/// must be `iggy://` or `iggy+tcp://`, so a raw `user:pass@host:port` from a
+/// LaserData Cloud bootstrap endpoint works as-is. Credentials are required,
+/// either `user:password@` or `token@`, and are taken verbatim. A missing port
+/// defaults to 8090, the Apache Iggy TCP port. Only Apache Iggy's TCP options
+/// are accepted, each at most once. `tls_ca_file=` without `tls=` turns TLS on,
+/// and `tls=false` next to `tls_ca_file=` is refused. Then, for a LaserData
+/// Cloud host that does not already name a `tls_ca_file=`, attach `tls=true`
+/// plus LaserData's bundled public CA so a bare connection string is enough.
+/// `LASER_TLS_CERT=<path>` enables TLS with that CA for any host or overrides
+/// the bundled CA. `LASER_NO_TLS=1` and an explicit `tls=false` disable
+/// automatic TLS setup. The connection string's own `tls_ca_file=` remains
+/// authoritative.
 fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
     let trimmed = value.trim();
-    let scheme_applied = if trimmed.starts_with("iggy://") || trimmed.starts_with("iggy+") {
-        trimmed.to_owned()
-    } else {
-        format!("iggy://{trimmed}")
+    let (scheme, rest) = split_scheme(trimmed)?;
+    let authority = authority_start(rest);
+    if authority == 0 {
+        return Err(LaserError::Config(
+            "connection string missing credentials: use user:password@host or token@host",
+        ));
+    }
+    let userinfo = &rest[..authority - 1];
+    validate_credentials(userinfo)?;
+    let (address, query) = match rest[authority..].split_once('?') {
+        Some((address, query)) => (address, Some(query)),
+        None => (&rest[authority..], None),
     };
-    resolve_tls(scheme_applied)
+    let address = with_default_port(address)?;
+    let mut normalized = format!("{scheme}{userinfo}@{address}");
+    if let Some(query) = query {
+        let options = validate_options(query)?;
+        normalized = format!("{normalized}?{query}");
+        if options.contains(&"tls_ca_file") && !options.contains(&"tls") {
+            normalized.push_str("&tls=true");
+        }
+    }
+    resolve_tls(normalized)
+}
+
+// Split off the scheme. A string with no scheme gets `iggy://`. A `://` after
+// the userinfo has begun belongs to a password, not to a scheme.
+fn split_scheme(value: &str) -> Result<(&'static str, &str), LaserError> {
+    if let Some(rest) = value.strip_prefix("iggy://") {
+        return Ok(("iggy://", rest));
+    }
+    if let Some(rest) = value.strip_prefix("iggy+tcp://") {
+        return Ok(("iggy+tcp://", rest));
+    }
+    match value.split_once("://") {
+        Some((scheme, _)) if !scheme.contains([':', '@']) => Err(LaserError::Config(
+            "unsupported connection string scheme: use iggy:// or iggy+tcp://",
+        )),
+        _ => Ok(("iggy://", value)),
+    }
+}
+
+// Credentials are `user:password` or a personal access token, both non-empty.
+// Apache Iggy splits them on `:` and `@` without percent-decoding, so neither
+// character can appear inside a credential.
+fn validate_credentials(userinfo: &str) -> Result<(), LaserError> {
+    if userinfo.contains('@') {
+        return Err(LaserError::Config(
+            "connection string credentials cannot contain `@`",
+        ));
+    }
+    let mut parts = userinfo.split(':');
+    let first = parts.next().unwrap_or_default();
+    match (parts.next(), parts.next()) {
+        (None, _) if first.is_empty() => Err(LaserError::Config(
+            "connection string has an empty access token",
+        )),
+        (None, _) => Ok(()),
+        (Some(password), None) if first.is_empty() || password.is_empty() => Err(
+            LaserError::Config("connection string has an empty username or password"),
+        ),
+        (Some(_), None) => Ok(()),
+        (Some(_), Some(_)) => Err(LaserError::Config(
+            "connection string credentials cannot contain more than one `:`",
+        )),
+    }
+}
+
+// `host` or `host:port`. A missing port becomes 8090. IPv6 literals are refused
+// because Apache Iggy's connection string cannot carry them.
+fn with_default_port(address: &str) -> Result<String, LaserError> {
+    if address.contains(['[', ']', '/', '#']) {
+        return Err(LaserError::Config(
+            "connection string address must be host or host:port, IPv6 literals and paths are not supported",
+        ));
+    }
+    let (host, port) = match address.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (address, None),
+    };
+    if host.is_empty() {
+        return Err(LaserError::Config("connection string missing host"));
+    }
+    match port {
+        None => Ok(format!("{host}:{DEFAULT_TCP_PORT}")),
+        Some(port) => match port.parse::<u16>() {
+            Ok(number) if number > 0 && !port.starts_with('+') => Ok(format!("{host}:{number}")),
+            _ => Err(LaserError::Config(
+                "connection string port must be a number from 1 to 65535",
+            )),
+        },
+    }
+}
+
+// Every option is `key=value`, names one of Apache Iggy's TCP options, and
+// appears once. Boolean options take `true` or `false` only. Returns the keys.
+fn validate_options(query: &str) -> Result<Vec<&str>, LaserError> {
+    let mut keys = Vec::new();
+    let mut tls_off = false;
+    for pair in query.split('&') {
+        let mut parts = pair.split('=');
+        let (Some(key), Some(value), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(LaserError::Config(
+                "connection string option must be key=value",
+            ));
+        };
+        if !CONNECTION_OPTIONS.contains(&key) {
+            return Err(LaserError::Config(
+                "connection string has an unknown option: supported are tls, tls_domain, tls_ca_file, reconnection_retries, reconnection_interval, reestablish_after, heartbeat_interval, nodelay",
+            ));
+        }
+        if keys.contains(&key) {
+            return Err(LaserError::Config("connection string repeats an option"));
+        }
+        if matches!(key, "tls" | "nodelay") && !matches!(value, "true" | "false") {
+            return Err(LaserError::Config(
+                "connection string tls and nodelay take true or false",
+            ));
+        }
+        tls_off |= key == "tls" && value == "false";
+        keys.push(key);
+    }
+    if tls_off && keys.contains(&"tls_ca_file") {
+        return Err(LaserError::Config(
+            "connection string sets tls=false together with tls_ca_file",
+        ));
+    }
+    Ok(keys)
 }
 
 /// True for a LaserData-operated host (`*.laserdata.cloud` or
@@ -1837,7 +2241,11 @@ fn resolve_tls_with(
     no_tls: bool,
     custom_cert: Option<std::path::PathBuf>,
 ) -> Result<String, LaserError> {
-    if no_tls || has_query_param(&connection_string, "tls_ca_file") {
+    if no_tls
+        || has_query_param(&connection_string, "tls_ca_file")
+        || query_of(&connection_string)
+            .is_some_and(|query| query.split('&').any(|pair| pair == "tls=false"))
+    {
         return Ok(connection_string);
     }
     if custom_cert.is_none() && !is_laserdata_host(host_of(&connection_string)) {
@@ -1975,6 +2383,17 @@ pub(crate) async fn ensure_stream(client: &IggyClient, stream: &str) -> Result<(
     Ok(())
 }
 
+fn is_missing_resource(error: &IggyError) -> bool {
+    matches!(
+        error,
+        IggyError::ResourceNotFound(_)
+            | IggyError::StreamIdNotFound(_)
+            | IggyError::StreamNameNotFound(_)
+            | IggyError::TopicIdNotFound(_, _)
+            | IggyError::TopicNameNotFound(_, _)
+    )
+}
+
 pub(crate) async fn delete_stream(laser: &Laser, stream: &str) -> Result<bool, LaserError> {
     let client = laser.client();
     let identifier = Identifier::named(stream)?;
@@ -2018,6 +2437,26 @@ pub(crate) async fn ensure_topic_with(
     partitions: u32,
     expiry: IggyExpiry,
 ) -> Result<(), LaserError> {
+    ensure_topic_retained(
+        client,
+        stream,
+        topic,
+        partitions,
+        expiry,
+        MaxTopicSize::ServerDefault,
+    )
+    .await
+}
+
+/// Idempotently create `topic` with an explicit expiry and size bound.
+pub(crate) async fn ensure_topic_retained(
+    client: &IggyClient,
+    stream: &str,
+    topic: &str,
+    partitions: u32,
+    expiry: IggyExpiry,
+    max_size: MaxTopicSize,
+) -> Result<(), LaserError> {
     let stream_id = Identifier::named(stream)?;
     let topic_id = Identifier::named(topic)?;
     if client.get_topic(&stream_id, &topic_id).await?.is_some() {
@@ -2027,7 +2466,7 @@ pub(crate) async fn ensure_topic_with(
         partitions_count: Some(partitions),
         compression_algorithm: Some(CompressionAlgorithm::default()),
         message_expiry: Some(expiry),
-        max_topic_size: Some(MaxTopicSize::ServerDefault),
+        max_topic_size: Some(max_size),
         ..TopicCreateOptions::default()
     };
     let result = client.create_topic(&stream_id, topic, &options).await;
@@ -2236,6 +2675,36 @@ mod builder_conflict_tests {
         assert!(matches!(result, Err(LaserError::Config(_))));
     }
 
+    #[test]
+    fn given_an_unmanaged_set_when_it_ages_then_should_be_due_for_a_reprobe() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        assert!(laser.reprobe_due(), "a set never probed is due");
+        let set_probe = |at: tokio::time::Instant, managed: bool| {
+            let mut negotiated = laser.inner.negotiated.write().expect("not poisoned");
+            negotiated.probed_at = Some(at);
+            negotiated.capabilities.managed = managed;
+        };
+        let now = tokio::time::Instant::now();
+        set_probe(now, false);
+        assert!(!laser.reprobe_due(), "a fresh unmanaged set is trusted");
+        let aged = now
+            .checked_sub(super::UNMANAGED_REPROBE_INTERVAL)
+            .expect("the clock is past one second");
+        set_probe(aged, false);
+        assert!(laser.reprobe_due(), "an aged unmanaged set is probed again");
+        set_probe(aged, true);
+        assert!(!laser.reprobe_due(), "a managed set is never probed again");
+    }
+
+    #[tokio::test]
+    async fn given_a_capability_override_when_read_then_should_not_probe() {
+        let mut capabilities = crate::capabilities::Capabilities::OPEN;
+        capabilities.graph = true;
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_capabilities(capabilities.clone());
+        assert_eq!(laser.capabilities().await, capabilities);
+    }
+
     #[cfg(feature = "kv")]
     #[tokio::test]
     async fn given_a_closed_laser_when_acquiring_its_first_lease_then_should_not_open_a_connection()
@@ -2262,8 +2731,9 @@ mod builder_conflict_tests {
 #[cfg(test)]
 mod connection_string_tests {
     use super::{
-        PROD_CERT, endpoint_of, flag_value_enabled, has_query_param, host_of, install_cert,
-        is_laserdata_host, normalize_connection_string, resolve_tls, resolve_tls_with,
+        LaserError, PROD_CERT, endpoint_of, flag_value_enabled, has_query_param, host_of,
+        install_cert, is_laserdata_host, normalize_connection_string, resolve_tls,
+        resolve_tls_with,
     };
 
     #[test]
@@ -2321,6 +2791,129 @@ mod connection_string_tests {
             normalize_connection_string("  iggy:iggy@host:8090  ")
                 .expect("a padded endpoint normalizes"),
             "iggy://iggy:iggy@host:8090",
+        );
+    }
+
+    #[test]
+    fn given_an_address_without_a_port_when_normalized_then_should_default_to_8090() {
+        assert_eq!(
+            normalize_connection_string("iggy:iggy@localhost").expect("a portless address"),
+            "iggy://iggy:iggy@localhost:8090",
+        );
+        assert_eq!(
+            normalize_connection_string("iggy+tcp://token@127.0.0.1?nodelay=true")
+                .expect("a portless token address"),
+            "iggy+tcp://token@127.0.0.1:8090?nodelay=true",
+        );
+    }
+
+    #[test]
+    fn given_an_invalid_port_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "iggy:iggy@host:0",
+            "iggy:iggy@host:65536",
+            "iggy:iggy@host:",
+            "iggy:iggy@host:+1",
+            "iggy:iggy@host:80:81",
+            "iggy:iggy@[::1]:8090",
+            "iggy:iggy@host:8090/path",
+            "iggy:iggy@:8090",
+        ] {
+            assert!(
+                matches!(
+                    normalize_connection_string(value),
+                    Err(LaserError::Config(_))
+                ),
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_another_transport_scheme_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "iggy+quic://iggy:iggy@host:8080",
+            "iggy+ws://iggy:iggy@host:8092",
+            "iggy+http://iggy:iggy@host:3000",
+            "tcp://iggy:iggy@host:8090",
+        ] {
+            assert!(
+                matches!(
+                    normalize_connection_string(value),
+                    Err(LaserError::Config(_))
+                ),
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_missing_or_malformed_credentials_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "127.0.0.1:8090",
+            "iggy://127.0.0.1:8090",
+            "@host:8090",
+            ":pass@host:8090",
+            "user:@host:8090",
+            "a:b:c@host:8090",
+            "user:p@ss@host:8090",
+        ] {
+            assert!(
+                matches!(
+                    normalize_connection_string(value),
+                    Err(LaserError::Config(_))
+                ),
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_unknown_repeated_or_malformed_options_when_normalized_then_should_fail_as_config() {
+        for value in [
+            "iggy:iggy@host:8090?foo=bar",
+            "iggy:iggy@host:8090?TLS=true",
+            "iggy:iggy@host:8090?tls=true&tls=false",
+            "iggy:iggy@host:8090?tls",
+            "iggy:iggy@host:8090?",
+            "iggy:iggy@host:8090?tls=yes",
+            "iggy:iggy@host:8090?nodelay=1",
+            "iggy:iggy@host:8090?tls=false&tls_ca_file=/ca.crt",
+        ] {
+            assert!(
+                matches!(
+                    normalize_connection_string(value),
+                    Err(LaserError::Config(_))
+                ),
+                "{value} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_ca_file_without_tls_when_normalized_then_should_turn_tls_on() {
+        assert_eq!(
+            normalize_connection_string("iggy:iggy@host:8090?tls_ca_file=/ca.crt")
+                .expect("a CA file alone"),
+            "iggy://iggy:iggy@host:8090?tls_ca_file=/ca.crt&tls=true",
+        );
+        assert_eq!(
+            normalize_connection_string("iggy:iggy@host?tls=true&tls_ca_file=/ca.crt")
+                .expect("an explicit TLS flag"),
+            "iggy://iggy:iggy@host:8090?tls=true&tls_ca_file=/ca.crt",
+        );
+    }
+
+    #[test]
+    fn given_an_explicit_tls_false_when_resolving_tls_then_should_skip_automatic_tls() {
+        assert_eq!(
+            resolve_tls_with(
+                "iggy://u:p@h.laserdata.cloud:8090?tls=false".to_owned(),
+                false,
+                Some("/tmp/local-ca.crt".into()),
+            )
+            .expect("an explicit opt-out"),
+            "iggy://u:p@h.laserdata.cloud:8090?tls=false",
         );
     }
 
@@ -2543,5 +3136,77 @@ mod connection_string_tests {
             dir_mode, 0o700,
             "the cache directory must not be group or world writable"
         );
+    }
+}
+
+#[cfg(test)]
+mod resource_naming_tests {
+    use super::{Laser, ResourceNaming};
+
+    fn laser() -> Laser {
+        Laser::from_client(iggy::prelude::IggyClient::default())
+    }
+
+    #[test]
+    fn given_a_default_stream_when_naming_a_resource_then_should_scope_it_to_the_stream() {
+        let laser = laser().with_default_stream("acme");
+        assert_eq!(laser.resource_naming(), ResourceNaming::Stream);
+        assert_eq!(laser.resource_name("agent.keys"), "stream:acme/agent.keys");
+        assert_eq!(laser.resource_stream(), Some("acme"));
+    }
+
+    #[test]
+    fn given_a_prefixed_name_when_naming_it_then_should_send_it_as_is() {
+        let laser = laser().with_default_stream("acme");
+        assert_eq!(
+            laser.resource_name("stream:other/sessions"),
+            "stream:other/sessions"
+        );
+    }
+
+    #[test]
+    fn given_bare_naming_when_naming_a_resource_then_should_send_the_name_unchanged() {
+        let laser = laser()
+            .with_default_stream("acme")
+            .with_resource_naming(ResourceNaming::Bare);
+        assert_eq!(laser.resource_name("agent.keys"), "agent.keys");
+        assert_eq!(laser.resource_stream(), None);
+        assert_eq!(
+            laser.local_resource_name("stream:acme/x"),
+            Some("stream:acme/x")
+        );
+    }
+
+    #[test]
+    fn given_no_default_stream_when_naming_a_resource_then_should_send_the_name_unchanged() {
+        let laser = laser();
+        assert_eq!(laser.resource_name("agent.keys"), "agent.keys");
+        assert_eq!(laser.local_resource_name("agent.keys"), Some("agent.keys"));
+    }
+
+    #[test]
+    fn given_an_empty_name_when_naming_it_then_should_stay_empty_for_validation() {
+        assert_eq!(laser().with_default_stream("acme").resource_name(""), "");
+    }
+
+    #[test]
+    fn given_listed_names_when_localized_then_should_strip_the_own_prefix_and_drop_the_rest() {
+        let laser = laser().with_default_stream("acme");
+        assert_eq!(
+            laser.local_resource_name("stream:acme/sessions"),
+            Some("sessions")
+        );
+        assert_eq!(laser.local_resource_name("stream:other/sessions"), None);
+        assert_eq!(laser.local_resource_name("sessions"), None);
+    }
+
+    #[test]
+    fn given_an_explicit_stream_when_naming_in_it_then_should_scope_to_that_stream() {
+        let laser = laser().with_default_stream("acme");
+        assert_eq!(
+            laser.resource_name_in(Some("fleet"), "memory"),
+            "stream:fleet/memory"
+        );
+        assert_eq!(laser.resource_name_in(None, "memory"), "memory");
     }
 }

@@ -6,7 +6,6 @@ import {
   DEFAULT_FORK_MUTATIONS_TOPIC,
   DEFAULT_GRAPH_MUTATIONS_TOPIC,
   DEFAULT_KV_MUTATIONS_TOPIC,
-  DEFAULT_RUN_MUTATIONS_TOPIC,
   defaultWireTopology,
   wireTopologyFromPartial
 } from "../../src/wire/topology.js"
@@ -19,7 +18,6 @@ void test("given_no_config_when_defaulting_then_should_match_todays_topic_consta
   assert.equal(topology.changesTopic, CHANGES_TOPIC)
   assert.equal(topology.kvMutationsTopic, DEFAULT_KV_MUTATIONS_TOPIC)
   assert.equal(topology.forkMutationsTopic, DEFAULT_FORK_MUTATIONS_TOPIC)
-  assert.equal(topology.runMutationsTopic, DEFAULT_RUN_MUTATIONS_TOPIC)
   assert.equal(topology.graphMutationsTopic, DEFAULT_GRAPH_MUTATIONS_TOPIC)
   assert.equal(topology.checkpointMutationsTopic, DEFAULT_CHECKPOINT_MUTATIONS_TOPIC)
 })

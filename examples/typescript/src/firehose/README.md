@@ -1,4 +1,4 @@
-# firehose - bounded multi-organization ingest
+# firehose: bounded multi-organization ingest
 
 This example generates telemetry records across several organization topics. It tests publication volume, projection, queries, and storage use. Use its message-count and payload-size controls to bound a run.
 
@@ -21,22 +21,22 @@ npm run example:firehose
 
 Every firehose control is explicit.
 
-| Variable                       | Default | Meaning                                   |
-| ------------------------------ | ------- | ----------------------------------------- |
-| `LASER_FIREHOSE_ORGS`          | `4`     | Organization topics                       |
-| `LASER_FIREHOSE_MESSAGES`      | `10000` | Records per organization                  |
-| `LASER_FIREHOSE_CONCURRENCY`   | `4`     | Organization publishers running at once   |
-| `LASER_FIREHOSE_PAYLOAD_BYTES` | `128`   | Padding bytes in each JSON body           |
-| `LASER_FIREHOSE_BATCH`         | `500`   | Records generated and sent per batch      |
-| `LASER_FIREHOSE_PARTITIONS`    | `4`     | Partitions per topic                      |
-| `LASER_FIREHOSE_REGISTER`      | `true`  | Register managed projections and bindings |
-| `LASER_FIREHOSE_QUERY`         | `true`  | Run the trailing sample query             |
+| Variable                       | Default | Meaning                                          |
+| ------------------------------ | ------- | ------------------------------------------------ |
+| `LASER_FIREHOSE_ORGS`          | `8`     | Organization topics                              |
+| `LASER_FIREHOSE_MESSAGES`      | `20000` | Records in total, split across the organizations |
+| `LASER_FIREHOSE_CONCURRENCY`   | `4`     | Organization publishers running at once          |
+| `LASER_FIREHOSE_PAYLOAD_BYTES` | `4096`  | Padding bytes in each JSON body                  |
+| `LASER_FIREHOSE_BATCH`         | `500`   | Records generated and sent per batch             |
+| `LASER_FIREHOSE_PARTITIONS`    | `8`     | Partitions per topic                             |
+| `LASER_FIREHOSE_REGISTER`      | `true`  | Register managed projections and bindings        |
+| `LASER_FIREHOSE_QUERY`         | `true`  | Run the trailing sample query                    |
 
 Run a larger managed workload.
 
 ```sh
 LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
-LASER_FIREHOSE_MESSAGES=1000000 \
+LASER_FIREHOSE_MESSAGES=16000000 \
 LASER_FIREHOSE_ORGS=16 \
 LASER_FIREHOSE_CONCURRENCY=8 \
 LASER_FIREHOSE_BATCH=1000 \
@@ -66,3 +66,5 @@ LASER_FIREHOSE_QUERY=false \
 - One projection per organization exercises many managed indexes without inventing unrelated schemas.
 - The same command remains useful on Apache Iggy because registration and query are independently capability-gated.
 - Throughput output uses the actual sent count and elapsed wall time rather than a generic completion message.
+
+With managed queries enabled, the example waits for every populated index to reach its expected row count before it runs analytics and exits. This lets a second run recreate the stream after the first run finishes materializing.

@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
-pub mod agent_workflow;
 pub mod arrow;
 pub mod authz;
 pub mod batch;
@@ -14,6 +13,8 @@ pub mod commands;
 pub mod content;
 pub mod control;
 pub mod destination;
+#[cfg(feature = "cbor")]
+pub mod dispatch;
 pub(crate) mod encoding;
 pub mod error;
 pub mod filter;
@@ -32,6 +33,7 @@ pub mod mutation;
 pub mod query;
 pub mod result;
 pub mod schema;
+pub mod session;
 pub mod snapshot;
 pub mod source;
 pub mod topics;

@@ -156,3 +156,29 @@ void test(
     await laser.close()
   }
 )
+
+void test("given_an_unmanaged_set_polled_faster_than_a_second_when_a_second_passes_then_should_probe_again_once", async (t) => {
+  let probes = 0
+  const client = {
+    clientProvider: () => Promise.resolve({}),
+    sendBinaryRequest: () => {
+      probes += 1
+      return Promise.resolve(new Uint8Array())
+    }
+  } as unknown as IggyClient
+  const laser = await Laser.builder().client(client).connect()
+  const perProbe = probes
+  assert.ok(perProbe > 0)
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() })
+  for (let call = 0; call < 4; call += 1) {
+    assert.equal((await laser.capabilities()).managed, false)
+    t.mock.timers.tick(300)
+  }
+  assert.equal(probes, perProbe)
+  await laser.capabilities()
+  assert.equal(probes, 2 * perProbe)
+  t.mock.timers.tick(1_000)
+  await Promise.all([laser.capabilities(), laser.capabilities(), laser.capabilities()])
+  assert.equal(probes, 3 * perProbe)
+  await laser.close()
+})

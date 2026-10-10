@@ -275,9 +275,10 @@ impl<'a> AgentRegistry<'a> {
         true
     }
 
-    /// Every agent with a folded card, newest observation kept.
+    /// Every agent with a folded card, newest observation kept, ordered by
+    /// agent id (byte order), so every SDK lists and routes in the same order.
     pub fn agents(&self) -> impl Iterator<Item = &RegisteredCard> {
-        self.cards.values()
+        by_agent_id(self.cards.values()).into_iter()
     }
 
     /// The latest card for `agent`, if any.
@@ -288,10 +289,11 @@ impl<'a> AgentRegistry<'a> {
     /// Every agent that advertises `skill_id`, is still fresh at `now_micros`, and
     /// is not advertising itself `Unavailable` for it. The capability-resolution
     /// primitive the router builds on, so a stale or self-declared-unavailable
-    /// agent is never routed to.
+    /// agent is never routed to. Ordered by agent id (byte order), so
+    /// [`RoutePolicy::Any`](crate::agent::RoutePolicy::Any) and ranking ties pick
+    /// the same agent in every SDK.
     pub fn resolve(&self, skill_id: &str, now_micros: u64) -> Vec<&RegisteredCard> {
-        self.cards
-            .values()
+        self.agents()
             .filter(|card| {
                 card.available_for(skill_id)
                     && card.is_fresh(now_micros)
@@ -752,6 +754,14 @@ fn apply_card(
 /// Apply one envelope to the quarantine set: a `status`/`quarantine` record whose
 /// body is a valid agent id marks that agent quarantined. Returns whether one was
 /// applied. Pure, so the fold is unit-testable without a live log.
+// Cards ordered by agent id in byte order, the order every SDK lists and
+// resolves them in.
+fn by_agent_id<'a>(cards: impl Iterator<Item = &'a RegisteredCard>) -> Vec<&'a RegisteredCard> {
+    let mut cards: Vec<&RegisteredCard> = cards.collect();
+    cards.sort_by(|left, right| left.agent.as_str().cmp(right.agent.as_str()));
+    cards
+}
+
 fn apply_quarantine(quarantined: &mut HashSet<AgentId>, envelope: &AgentEnvelope) -> bool {
     let Ok(body) = std::str::from_utf8(&envelope.body) else {
         return false;
@@ -856,6 +866,23 @@ mod tests {
             .unwrap();
         assert!(worker.is_fresh(150));
         assert!(!worker.is_fresh(151));
+    }
+
+    #[test]
+    fn given_cards_in_any_insertion_order_when_listed_then_should_order_by_agent_id() {
+        let mut cards = HashMap::new();
+        for name in ["zeta", "alpha", "mid", "Beta"] {
+            assert!(apply_card(
+                &mut cards,
+                &card_envelope(name, &["diagnose"], None),
+                100
+            ));
+        }
+        let order: Vec<&str> = by_agent_id(cards.values())
+            .into_iter()
+            .map(|card| card.agent.as_str())
+            .collect();
+        assert_eq!(order, ["Beta", "alpha", "mid", "zeta"]);
     }
 
     #[test]

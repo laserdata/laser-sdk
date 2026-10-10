@@ -5,6 +5,7 @@ use crate::iggy::prelude::{
     UserClient, WebSocketClient, WebSocketClientConfig,
 };
 use crate::laser::{endpoint_of, host_of, with_endpoint};
+use crate::publish_options::PublishOptions;
 use iggy_binary_protocol::codes::{
     ATTACH_CONSUMER_SESSION_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_POLL_ROUTING_CODE,
 };
@@ -93,6 +94,7 @@ impl Routes {
         route_to: &RouteTo<'_>,
         partition_id: u32,
         acknowledgment: bool,
+        retry: PublishOptions,
     ) -> Result<Arc<IggyClient>, LaserError> {
         if let Some(connection) = self
             .partitions
@@ -104,9 +106,11 @@ impl Routes {
         let connection_string = connection_string.ok_or(LaserError::Config(
             "primary filtered reads open data connections, so they need a Laser built from a connection string. Read in ReadMode::Local for a bring-your-own client",
         ))?;
-        let route = resolve(coordinator, route_to, partition_id, acknowledgment).await?;
+        let route = retry
+            .retry_transient_read(|| resolve(coordinator, route_to, partition_id, acknowledgment))
+            .await?;
         let endpoint = self
-            .endpoint(coordinator, connection_string, &route)
+            .endpoint(coordinator, connection_string, &route, retry)
             .await?;
         let session = route.consumer_session;
         let reuse = self
@@ -169,11 +173,17 @@ impl Routes {
         coordinator: &(impl ClusterClient + Sync),
         connection_string: &str,
         route: &PollRoutingResponse,
+        retry: PublishOptions,
     ) -> Result<String, LaserError> {
         let single_node = match self.single_node {
             Some(single_node) => single_node,
             None => {
-                let single_node = coordinator.get_cluster_metadata().await?.nodes.len() <= 1;
+                let metadata = retry
+                    .retry_transient_read(|| async {
+                        Ok(coordinator.get_cluster_metadata().await?)
+                    })
+                    .await?;
+                let single_node = metadata.nodes.len() <= 1;
                 self.single_node = Some(single_node);
                 single_node
             }
@@ -406,25 +416,32 @@ mod tests {
     use iggy_common::{ClusterMetadata, IggyError};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct RecoveringCluster {
+    struct RefusingCluster {
         calls: AtomicUsize,
+        refusals: usize,
         metadata: ClusterMetadata,
     }
 
     #[async_trait::async_trait]
-    impl ClusterClient for RecoveringCluster {
+    impl ClusterClient for RefusingCluster {
         async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
-            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            if self.calls.fetch_add(1, Ordering::Relaxed) < self.refusals {
                 return Err(IggyError::TransientNotAccepted);
             }
             Ok(self.metadata.clone())
         }
     }
 
-    #[tokio::test]
-    async fn given_a_failed_topology_probe_when_routing_again_then_should_recover_and_cache_the_endpoint()
-     {
-        let route = PollRoutingResponse {
+    fn retry() -> PublishOptions {
+        PublishOptions {
+            timeout: Duration::from_secs(1),
+            max_retries: 2,
+            retry_backoff: Duration::from_millis(1),
+        }
+    }
+
+    fn route() -> PollRoutingResponse {
+        PollRoutingResponse {
             consumer_session: session(7, 3, 10),
             primary: ClusterNodeResponse {
                 name: "node-1".to_owned(),
@@ -436,38 +453,61 @@ mod tests {
                 role: 1,
                 status: 1,
             },
-        };
+        }
+    }
+
+    fn cluster(nodes: usize, refusals: usize) -> RefusingCluster {
+        RefusingCluster {
+            calls: AtomicUsize::new(0),
+            refusals,
+            metadata: ClusterMetadata {
+                name: "cluster".to_owned(),
+                nodes: vec![ClusterNode::try_from(route().primary).expect("valid node"); nodes],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_transiently_refused_topology_probe_when_routing_then_should_probe_again_and_cache_the_endpoint()
+     {
         let connection_string = "iggy+tcp://iggy:iggy@127.0.0.1:18090";
         for (nodes, expected) in [(1, "127.0.0.1:18090"), (3, "127.0.0.1:8090")] {
-            let coordinator = RecoveringCluster {
-                calls: AtomicUsize::new(0),
-                metadata: ClusterMetadata {
-                    name: "cluster".to_owned(),
-                    nodes: vec![
-                        ClusterNode::try_from(route.primary.clone()).expect("valid node");
-                        nodes
-                    ],
-                },
-            };
+            let coordinator = cluster(nodes, 2);
             let mut routes = Routes::default();
-            assert!(matches!(
-                routes
-                    .endpoint(&coordinator, connection_string, &route)
-                    .await,
-                Err(LaserError::Iggy(IggyError::TransientNotAccepted))
-            ));
-            assert_eq!(routes.single_node, None);
             for _ in 0..2 {
                 assert_eq!(
                     routes
-                        .endpoint(&coordinator, connection_string, &route)
+                        .endpoint(&coordinator, connection_string, &route(), retry())
                         .await
-                        .expect("topology discovery recovers"),
+                        .expect("the probe recovers within the retry count"),
                     expected
                 );
             }
-            assert_eq!(coordinator.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(coordinator.calls.load(Ordering::Relaxed), 3);
         }
+    }
+
+    #[tokio::test]
+    async fn given_a_topology_probe_refused_past_the_retry_count_when_routing_then_should_fail_and_probe_again_next_time()
+     {
+        let connection_string = "iggy+tcp://iggy:iggy@127.0.0.1:18090";
+        let coordinator = cluster(1, 3);
+        let mut routes = Routes::default();
+        assert!(matches!(
+            routes
+                .endpoint(&coordinator, connection_string, &route(), retry())
+                .await,
+            Err(LaserError::Iggy(IggyError::TransientNotAccepted))
+        ));
+        assert_eq!(routes.single_node, None);
+        assert_eq!(coordinator.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            routes
+                .endpoint(&coordinator, connection_string, &route(), retry())
+                .await
+                .expect("a later route probes again"),
+            "127.0.0.1:18090"
+        );
     }
 
     fn session(

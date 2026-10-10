@@ -4,7 +4,6 @@
 // the SDK one generic send path and LaserData Cloud's dispatch table a fixture test
 // against the same pairings.
 
-use crate::agent_workflow::{AgentCancel, AgentList, AgentReply, AgentStatusReq, AgentSubmit};
 use crate::authz::{
     AuthzReply, BindRolesReq, DefineRoleReq, DeleteRoleReq, GetBindingsReq, GetRoleReq,
     ListRolesReq, WhoamiReq,
@@ -25,6 +24,7 @@ use crate::query::{
     QueryCancelEnvelope, QueryCancelReply, QueryEnvelope, QueryPageEnvelope, QueryReply,
     QueryStatusEnvelope, QueryStatusReply,
 };
+use crate::session::{SessionReply, request as session};
 
 /// A managed command: the request type, its wire code, and the reply type the
 /// other end answers with.
@@ -105,10 +105,25 @@ command!(ForkDelete, AGDX_FORK_DELETE_CODE, ForkReply);
 command!(ForkPromote, AGDX_FORK_PROMOTE_CODE, ForkReply);
 command!(ForkList, AGDX_FORK_LIST_CODE, ForkReply);
 command!(ForkPut, AGDX_FORK_PUT_CODE, ForkReply);
-command!(AgentSubmit, AGDX_AGENT_SUBMIT_CODE, AgentReply);
-command!(AgentCancel, AGDX_AGENT_CANCEL_CODE, AgentReply);
-command!(AgentStatusReq, AGDX_AGENT_STATUS_CODE, AgentReply);
-command!(AgentList, AGDX_AGENT_LIST_CODE, AgentReply);
+command!(session::SessionGet, AGDX_SESSION_GET_CODE, SessionReply);
+command!(session::SessionList, AGDX_SESSION_LIST_CODE, SessionReply);
+command!(
+    session::SessionEvents,
+    AGDX_SESSION_EVENTS_CODE,
+    SessionReply
+);
+command!(session::SessionState, AGDX_SESSION_STATE_CODE, SessionReply);
+command!(session::SessionLinks, AGDX_SESSION_LINKS_CODE, SessionReply);
+command!(
+    session::SessionSources,
+    AGDX_SESSION_SOURCES_CODE,
+    SessionReply
+);
+command!(
+    session::SessionChanges,
+    AGDX_SESSION_CHANGES_CODE,
+    SessionReply
+);
 
 #[cfg(test)]
 mod tests {
@@ -149,9 +164,12 @@ mod tests {
         assert_eq!(<ForkPromote as Command>::CODE, 1_000_402);
         assert_eq!(<ForkList as Command>::CODE, 1_000_403);
         assert_eq!(<ForkPut as Command>::CODE, 1_000_404);
-        assert_eq!(<AgentSubmit as Command>::CODE, 1_000_700);
-        assert_eq!(<AgentCancel as Command>::CODE, 1_000_701);
-        assert_eq!(<AgentStatusReq as Command>::CODE, 1_000_702);
-        assert_eq!(<AgentList as Command>::CODE, 1_000_703);
+        assert_eq!(<session::SessionGet as Command>::CODE, 1_000_710);
+        assert_eq!(<session::SessionList as Command>::CODE, 1_000_711);
+        assert_eq!(<session::SessionEvents as Command>::CODE, 1_000_712);
+        assert_eq!(<session::SessionState as Command>::CODE, 1_000_713);
+        assert_eq!(<session::SessionLinks as Command>::CODE, 1_000_714);
+        assert_eq!(<session::SessionSources as Command>::CODE, 1_000_715);
+        assert_eq!(<session::SessionChanges as Command>::CODE, 1_000_716);
     }
 }

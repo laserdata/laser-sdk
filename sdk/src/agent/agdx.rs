@@ -8,13 +8,12 @@ use laser_wire::agent::{
     AgentEnvelope, AgentErrorBody, AgentId, AgentKind, ChannelId, ConversationId, CorrelationId,
     IdempotencyKey, LogPosition, RecordId, TaskState, TokenUsage, validate,
 };
+#[cfg(feature = "sign")]
 use laser_wire::codes::AGENT_OP_VERSION;
 use laser_wire::content::ContentType;
 use laser_wire::framing::{decode_named, encode_named};
-use laser_wire::headers::{AGENT_VERSION, CONTENT_TYPE, CONVERSATION_ID, TARGET_AGENT_ID};
 use laser_wire::query::Value;
 use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::time::Duration;
 
 // Producer-side chunking guidance, DRAFT until the benchmark step pins them:
@@ -30,8 +29,8 @@ pub const MAX_CHUNK_BODY_BYTES: usize = 64 * 1024;
 /// The typed AGDX producer over one agent topic: every send is a validated
 /// [`AgentEnvelope`] (invalid envelopes are unrepresentable or rejected at
 /// publish time), encoded as named-field CBOR, stamped with the routing
-/// headers (`agdx.av` u32, `agdx.ct` u8, the conversation as a typed `Uint128` and
-/// the target as the agent's name string), and partition-keyed by the
+/// headers (`agdx.av` u32, `agdx.ct` u8, the conversation as a Crockford string,
+/// and the target as the agent's name string), and partition-keyed by the
 /// conversation's canonical base32 form so one conversation stays ordered.
 #[derive(Clone)]
 pub struct Agdx {
@@ -39,6 +38,8 @@ pub struct Agdx {
     topic: String,
     source: AgentId,
     conversation: ConversationId,
+    lane_guard: Option<std::sync::Arc<crate::agent::session::LaneGuard>>,
+    stream_generation: Option<u64>,
 }
 
 impl Laser {
@@ -48,19 +49,35 @@ impl Laser {
     pub fn agdx(
         &self,
         topic: AgentTopic<'_>,
-        source: AgentId,
+        source: impl Into<AgentId>,
         conversation: ConversationId,
     ) -> Agdx {
+        let source = source.into();
         Agdx {
             laser: self.clone(),
             topic: topic.topic_string(),
             source,
             conversation,
+            lane_guard: None,
+            stream_generation: None,
         }
     }
 }
 
 impl Agdx {
+    pub(crate) fn with_lane_guard(
+        mut self,
+        guard: std::sync::Arc<crate::agent::session::LaneGuard>,
+    ) -> Self {
+        self.lane_guard = Some(guard);
+        self
+    }
+
+    pub(crate) fn with_stream_generation(mut self, generation: u64) -> Self {
+        self.stream_generation = Some(generation);
+        self
+    }
+
     /// A `command`: expects a reply or effect under `correlation`.
     pub fn command(&self, correlation: CorrelationId, body: Vec<u8>) -> AgdxSend<'_> {
         self.send_of(AgentEnvelope::command(
@@ -151,17 +168,52 @@ impl Agdx {
     /// [`LaserError::Rejected`]. Composes existing verbs, so it adds nothing to
     /// the wire. It blocks the caller until the response lands or the timeout
     /// elapses, which is the point: the task is genuinely paused on a human.
+    /// The prompt is addressed to every agent (`agdx.to = *`), so on a shared
+    /// session topic every listening agent receives it. Use
+    /// [`request_input_from`](Self::request_input_from) to ask one agent.
     pub async fn request_input(
         &self,
         reply_topic: AgentTopic<'_>,
         prompt: impl Into<Vec<u8>>,
         timeout: Duration,
     ) -> Result<Vec<u8>, LaserError> {
+        self.request_input_addressed(None, reply_topic, prompt.into(), timeout)
+            .await
+    }
+
+    /// [`request_input`](Self::request_input) with the prompt addressed to
+    /// `target`, so only that agent answers it on a shared session topic.
+    pub async fn request_input_from(
+        &self,
+        target: impl Into<AgentId>,
+        reply_topic: AgentTopic<'_>,
+        prompt: impl Into<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, LaserError> {
+        let target = target.into();
+        self.request_input_addressed(Some(target), reply_topic, prompt.into(), timeout)
+            .await
+    }
+
+    async fn request_input_addressed(
+        &self,
+        target: Option<AgentId>,
+        reply_topic: AgentTopic<'_>,
+        prompt: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, LaserError> {
         let interrupt = CorrelationId::mint();
         // Seed the reply reader at the topic tail before sending the prompt, so it
         // reads only the human's response rather than the topic's history.
-        let mut reader = self.laser.agdx_reply_reader(reply_topic).await?;
-        self.command(interrupt, prompt.into()).send().await?;
+        let mut reader = self
+            .laser
+            .agdx_reply_reader(reply_topic, Some(&self.source))
+            .await?;
+        let command = self.command(interrupt, prompt);
+        match target {
+            Some(target) => command.with_target(target).send().await?,
+            None => command.send().await?,
+        };
         let reply = self
             .laser
             .await_agdx_reply(&mut reader, interrupt, timeout)
@@ -174,6 +226,14 @@ impl Agdx {
             return Err(LaserError::Rejected(message));
         }
         Ok(reply.body)
+    }
+
+    // Publish an envelope built elsewhere, unchanged, on this producer's topic.
+    pub(crate) async fn publish_envelope(
+        &self,
+        envelope: AgentEnvelope,
+    ) -> Result<AgdxReceipt, LaserError> {
+        self.publish(envelope, ContentType::Raw).await
     }
 
     fn send_of(&self, envelope: AgentEnvelope) -> AgdxSend<'_> {
@@ -192,34 +252,141 @@ impl Agdx {
         &self,
         envelope: AgentEnvelope,
         content_type: ContentType,
-    ) -> Result<Option<RecordId>, LaserError> {
+    ) -> Result<AgdxReceipt, LaserError> {
         let record = envelope.record;
-        let (message, partition_key) = self.assemble(envelope, content_type)?;
-        self.laser
-            .send_batch(&self.topic, vec![message], Some(&partition_key))
+        // A declared per-agent topic layout moves addressed work off the lane.
+        // The lane identity check covers lane records only.
+        let destination = self.laser.agent_destination(
+            &self.topic,
+            Some(envelope.kind),
+            envelope.target.as_ref(),
+        );
+        let (message, partitioning) = self.assemble(envelope, content_type)?;
+        let sent = self
+            .laser
+            .send_batch_partitioned_on_checked(
+                self.laser.stream_required()?,
+                destination.as_deref().unwrap_or(&self.topic),
+                vec![message],
+                partitioning.clone(),
+                || async {
+                    if destination.is_some() {
+                        return Ok(None);
+                    }
+                    let (stream_id, topic_id, partitions) = if let Some(guard) = &self.lane_guard {
+                        let identity = guard.check(&self.laser, self.conversation.into()).await?;
+                        (identity.stream_id, identity.topic_id, identity.partitions)
+                    } else if let Some(generation) = self.stream_generation {
+                        use iggy::prelude::StreamClient;
+                        let details = self
+                            .laser
+                            .client()
+                            .get_stream(&iggy::prelude::Identifier::named(
+                                self.laser.stream_required()?,
+                            )?)
+                            .await?
+                            .ok_or_else(|| {
+                                LaserError::Session(laser_wire::session::SessionError::Stale(
+                                    "the heartbeat stream does not exist".to_owned(),
+                                ))
+                            })?;
+                        if details.created_at.as_micros() != generation {
+                            return Err(LaserError::Session(
+                                laser_wire::session::SessionError::Stale(
+                                    "the heartbeat stream generation changed".to_owned(),
+                                ),
+                            ));
+                        }
+                        let topic = details
+                            .topics
+                            .iter()
+                            .find(|topic| topic.name == self.topic)
+                            .filter(|topic| topic.partitions_count > 0)
+                            .ok_or_else(|| {
+                                LaserError::Session(laser_wire::session::SessionError::Stale(
+                                    "the heartbeat topic does not exist".to_owned(),
+                                ))
+                            })?;
+                        (details.id, topic.id, topic.partitions_count)
+                    } else {
+                        return Ok(None);
+                    };
+                    let route = if partitioning.kind == iggy_common::PartitioningKind::MessagesKey {
+                        iggy::prelude::Partitioning::partition_id(
+                            iggy_common::calculate_32(&partitioning.value) % partitions,
+                        )
+                    } else {
+                        partitioning.clone()
+                    };
+                    Ok(Some((stream_id, topic_id, route)))
+                },
+            )
             .await?;
-        Ok(record)
+        let confirmation = sent.confirmations.first();
+        Ok(AgdxReceipt {
+            record,
+            partition_id: confirmation.map(|confirmation| confirmation.partition_id),
+            offset: confirmation.map(|confirmation| confirmation.base_offset),
+        })
     }
 
     // Validate and encode one envelope into a ready message plus its
-    // partition key: the single assembly the per-send publish and the
+    // partitioning: the single assembly the per-send publish and the
     // buffered stream's batch append share, so buffering changes when bytes
     // move, never what they are.
     fn assemble(
         &self,
         envelope: AgentEnvelope,
         content_type: ContentType,
-    ) -> Result<(iggy::prelude::IggyMessage, String), LaserError> {
+    ) -> Result<(iggy::prelude::IggyMessage, iggy::prelude::Partitioning), LaserError> {
         validate(&envelope)?;
         let payload = encode_named(&envelope)?;
-        let headers = agdx_headers(&envelope, content_type)?;
-        let partition_key = envelope.conversation.to_string();
+        // The session topics carry an addressee on every record, `*` when
+        // untargeted, so the addressee filter of a role group keeps them.
+        let headers = agdx_headers(
+            &envelope,
+            content_type,
+            self.topic == laser_wire::topics::AGENT_SESSIONS
+                || self.topic == laser_wire::topics::AGENT_CONTROL,
+        )?;
+        let partitioning = self.partitioning(envelope.kind, envelope.target.as_ref())?;
         let message = iggy::prelude::IggyMessage::builder()
             .payload(bytes::Bytes::from(payload))
             .user_headers(headers)
             .build()?;
-        Ok((message, partition_key))
+        Ok((message, partitioning))
     }
+
+    // The partition a record of `kind` addressed to `target` lands on under
+    // this stream's declared layout.
+    fn partitioning(
+        &self,
+        kind: laser_wire::agent::AgentKind,
+        target: Option<&AgentId>,
+    ) -> Result<iggy::prelude::Partitioning, LaserError> {
+        let layout = self
+            .laser
+            .default_stream()
+            .and_then(|stream| self.laser.layout(stream));
+        crate::agent::partitioning::AgentPartitioning::resolve(
+            layout.as_ref(),
+            &self.topic,
+            kind,
+            target,
+        )
+        .into_partitioning(self.conversation)
+    }
+}
+
+/// Where one published envelope was committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgdxReceipt {
+    /// The envelope's record id. Chunks have none.
+    pub record: Option<RecordId>,
+    /// The partition the record landed on, when the server confirmed it.
+    pub partition_id: Option<u32>,
+    /// The record's offset, when the server confirmed it.
+    pub offset: Option<u64>,
 }
 
 /// One pending AGDX send: the envelope built by its verb, refined by the
@@ -242,9 +409,28 @@ pub struct AgdxSend<'a> {
 }
 
 impl<'a> AgdxSend<'a> {
+    /// Use `record` as the envelope's record id, so a retried send repeats the
+    /// same record.
+    pub(crate) fn with_record(mut self, record: RecordId) -> Self {
+        self.envelope.record = Some(record);
+        self
+    }
+
+    /// Mark the envelope as part of a child session whose parent is `parent`
+    /// and whose tree is rooted at `root`.
+    pub fn with_ancestry(
+        mut self,
+        parent: Option<laser_wire::agent::ConversationId>,
+        root: Option<laser_wire::agent::ConversationId>,
+    ) -> Self {
+        self.envelope.parent = parent;
+        self.envelope.root = root;
+        self
+    }
+
     /// Narrow delivery to one agent within the shared topic (routing, never an ACL).
-    pub fn with_target(mut self, target: AgentId) -> Self {
-        self.envelope = self.envelope.with_target(target);
+    pub fn with_target(mut self, target: impl Into<AgentId>) -> Self {
+        self.envelope = self.envelope.with_target(target.into());
         self
     }
 
@@ -284,6 +470,12 @@ impl<'a> AgdxSend<'a> {
         self
     }
 
+    /// Set why the model stopped generating.
+    pub fn with_finish_reason(mut self, reason: impl Into<String>) -> Self {
+        self.envelope.finish_reason = Some(reason.into());
+        self
+    }
+
     /// Set the OTel tool name.
     pub fn with_tool(mut self, tool: impl Into<String>) -> Self {
         self.envelope = self.envelope.with_tool(tool);
@@ -308,7 +500,9 @@ impl<'a> AgdxSend<'a> {
         self
     }
 
-    /// Declare the body's codec (`agdx.ct`). Defaults to raw.
+    /// Declare the body's codec (`agdx.ct`). Defaults to raw. An `error`
+    /// envelope always carries a CBOR [`AgentErrorBody`], so any other content
+    /// type on [`Agdx::fail`] fails at send.
     pub fn content_type(mut self, content_type: ContentType) -> Self {
         self.content_type = content_type;
         self
@@ -353,8 +547,20 @@ impl<'a> AgdxSend<'a> {
     /// key, the envelope is signed here, last, so the signature covers every
     /// refinement.
     pub async fn send(self) -> Result<Option<RecordId>, LaserError> {
+        Ok(self.send_receipt().await?.record)
+    }
+
+    /// Like [`send`](Self::send), and also return where the record was
+    /// committed.
+    pub async fn send_receipt(self) -> Result<AgdxReceipt, LaserError> {
         let mut envelope = self.envelope;
         let mut content_type = self.content_type;
+        if envelope.kind == AgentKind::Error && content_type != ContentType::Cbor {
+            return Err(LaserError::Invalid(
+                "an error envelope carries a CBOR AgentErrorBody, so its content type cannot change"
+                    .to_owned(),
+            ));
+        }
         // The pre-effect policy hook, before claim-check and signing so a
         // modified body is what gets externalized and what the signature covers.
         #[cfg(feature = "sign")]
@@ -515,10 +721,18 @@ impl AgdxStream {
         }
         let batch = std::mem::take(&mut buffer.messages);
         buffer.first_at = None;
-        let partition_key = self.agdx.conversation.to_string();
+        let partitioning = self
+            .agdx
+            .partitioning(laser_wire::agent::AgentKind::Chunk, self.target.as_ref())?;
+        let destination = self.destination();
         self.agdx
             .laser
-            .send_batch(&self.agdx.topic, batch, Some(&partition_key))
+            .send_batch_partitioned_on(
+                self.agdx.laser.stream_required()?,
+                &destination,
+                batch,
+                partitioning,
+            )
             .await
             .map(|_| ())
     }
@@ -567,17 +781,36 @@ impl AgdxStream {
                 self.agdx.publish(envelope, content_type).await?;
             }
             Some(buffer) => {
-                let (message, partition_key) = self.agdx.assemble(envelope, content_type)?;
+                let (message, partitioning) = self.agdx.assemble(envelope, content_type)?;
                 buffer.messages.push(message);
                 let batch = std::mem::take(&mut buffer.messages);
                 buffer.first_at = None;
+                let destination = self.destination();
                 self.agdx
                     .laser
-                    .send_batch(&self.agdx.topic, batch, Some(&partition_key))
+                    .send_batch_partitioned_on(
+                        self.agdx.laser.stream_required()?,
+                        &destination,
+                        batch,
+                        partitioning,
+                    )
                     .await?;
             }
         }
         Ok(())
+    }
+
+    // Where this stream's buffered chunks land: the addressee's declared
+    // topic under a per-agent topic layout, else the producer's topic.
+    fn destination(&self) -> String {
+        self.agdx
+            .laser
+            .agent_destination(
+                &self.agdx.topic,
+                Some(laser_wire::agent::AgentKind::Chunk),
+                self.target.as_ref(),
+            )
+            .unwrap_or_else(|| self.agdx.topic.clone())
     }
 
     fn chunk(
@@ -648,35 +881,19 @@ fn ensure_chunk_body_within_cap(body: &[u8]) -> Result<(), LaserError> {
     Ok(())
 }
 
-// The AGDX routing headers: `agdx.av` selects the decoder before any body byte
-// is read, `agdx.ct` names the inner body codec, the conversation id rides as a
-// typed Uint128 (little-endian on the server wire, per Iggy's header encoding),
-// and the target rides as the agent's name string, so projections and plain
-// consumers route without decoding the CBOR body.
+// The AGDX routing headers from the shared wire encoder: `agdx.av` selects the
+// decoder before any body byte is read, `agdx.ct` names the inner body codec,
+// the conversation and its ancestry ride as canonical strings, and the author
+// and addressee ride as agent names, so projections and plain consumers route
+// without decoding the CBOR body.
 pub(crate) fn agdx_headers(
     envelope: &AgentEnvelope,
     content_type: ContentType,
+    broadcast: bool,
 ) -> Result<BTreeMap<HeaderKey, HeaderValue>, LaserError> {
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        HeaderKey::from_str(AGENT_VERSION)?,
-        HeaderValue::from(AGENT_OP_VERSION),
-    );
-    headers.insert(
-        HeaderKey::from_str(CONTENT_TYPE)?,
-        HeaderValue::from(content_type.code()),
-    );
-    headers.insert(
-        HeaderKey::from_str(CONVERSATION_ID)?,
-        HeaderValue::from(envelope.conversation.as_u128()),
-    );
-    if let Some(target) = &envelope.target {
-        headers.insert(
-            HeaderKey::from_str(TARGET_AGENT_ID)?,
-            HeaderValue::from_str(target.as_str())?,
-        );
-    }
-    Ok(headers)
+    let headers =
+        laser_wire::headers::RecordHeaders::for_envelope(envelope, content_type, broadcast);
+    Ok(crate::provenance::header_map(&headers)?)
 }
 
 #[cfg(test)]
@@ -684,11 +901,40 @@ mod tests {
     use super::*;
     use laser_wire::agent::OPERATION_CHAT;
     use laser_wire::fixtures::assert_matches;
+    use laser_wire::headers::{
+        AGENT_ID, AGENT_VERSION, CONTENT_TYPE, CONVERSATION_ID, PARENT_CONVERSATION_ID,
+        ROOT_CONVERSATION_ID, TARGET_AGENT_ID,
+    };
     use serde::Serialize;
     use serde::Serializer;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn given_a_fail_with_another_content_type_when_sent_then_should_refuse_it() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default())
+            .with_default_stream("agdx-fail");
+        let agdx = laser.agdx(
+            AgentTopic::Sessions,
+            AgentId::from_str("worker").expect("a valid agent id"),
+            ConversationId::mint(),
+        );
+        let error = AgentErrorBody {
+            code: laser_wire::agent::AgentErrorCode::Internal,
+            message: Some("boom".to_owned()),
+            retryable: false,
+            detail: None,
+        };
+        let result = agdx
+            .fail(CorrelationId::mint(), &error)
+            .expect("the error body encodes")
+            .content_type(ContentType::Json)
+            .send_receipt()
+            .await;
+        assert!(matches!(result, Err(LaserError::Invalid(_))));
+    }
 
     // Record conformance, the header half: the typed header encodings the
     // runtime stamps, asserted byte-for-byte. The payload half is pinned
@@ -699,7 +945,7 @@ mod tests {
         let envelope =
             AgentEnvelope::command(record, conversation, source, correlation, b"x".to_vec())
                 .with_target("target-agent".parse().expect("valid agent id"));
-        let headers = agdx_headers(&envelope, ContentType::Json).expect("headers stamp");
+        let headers = agdx_headers(&envelope, ContentType::Json, false).expect("headers stamp");
 
         let value = |key: &str| {
             headers
@@ -710,24 +956,41 @@ mod tests {
         assert_eq!(value(AGENT_VERSION).as_bytes(), [1, 0, 0, 0]);
         // agdx.ct: one byte, json = 1.
         assert_eq!(value(CONTENT_TYPE).as_bytes(), [1]);
-        // The conversation routing id: Uint128, little-endian 16 bytes (the
-        // HEADER encoding, and the payload rides the same id big-endian as a
-        // 16-byte CBOR byte string).
         assert_eq!(
-            value(CONVERSATION_ID).as_uint128().expect("uint128"),
-            conversation.as_u128()
-        );
-        assert_eq!(
-            value(CONVERSATION_ID).as_bytes(),
-            conversation.as_u128().to_le_bytes()
+            value(CONVERSATION_ID).as_str().expect("string"),
+            conversation.to_string()
         );
         // The agent routing id is a string (the agent's name), not a numeric id.
         assert_eq!(
             value(TARGET_AGENT_ID).as_str().expect("string"),
             "target-agent"
         );
+        // The author rides beside the addressee so a header filter selects both.
+        assert_eq!(
+            value(AGENT_ID).as_str().expect("string"),
+            envelope.source.as_str()
+        );
         // The partition key is the conversation's canonical base32 form.
         assert_eq!(envelope.conversation.to_string().len(), 26);
+    }
+
+    #[test]
+    fn given_child_session_envelope_when_stamped_then_should_carry_canonical_ancestry_headers() {
+        let (record, conversation, source, correlation) = ids();
+        let mut envelope =
+            AgentEnvelope::command(record, conversation, source, correlation, b"x".to_vec());
+        envelope.parent = Some(laser_wire::agent::ConversationId::from_u128(2));
+        envelope.root = Some(laser_wire::agent::ConversationId::from_u128(1));
+        let headers = agdx_headers(&envelope, ContentType::Cbor, false).expect("headers stamp");
+        for (name, expected) in [
+            (PARENT_CONVERSATION_ID, envelope.parent.expect("parent")),
+            (ROOT_CONVERSATION_ID, envelope.root.expect("root")),
+        ] {
+            let value = headers
+                .get(&HeaderKey::from_str(name).expect("key"))
+                .expect("header");
+            assert_eq!(value.as_str().expect("string"), expected.to_string());
+        }
     }
 
     // The payload half of record conformance: the verb path's encoding is
@@ -773,7 +1036,7 @@ mod tests {
         .with_deadline_micros(1_717_171_777_000_000)
         .with_operation(OPERATION_CHAT)
         .with_metadata("priority", "high");
-        let headers = agdx_headers(&envelope, ContentType::Json).expect("headers stamp");
+        let headers = agdx_headers(&envelope, ContentType::Json, false).expect("headers stamp");
         let payload = encode_named(&envelope).expect("payload encodes");
         let record =
             CanonicalAlpRecord::from_headers(envelope.conversation.to_string(), headers, payload);
@@ -800,8 +1063,7 @@ mod tests {
                 let kind = match key.as_str() {
                     AGENT_VERSION => "u32",
                     CONTENT_TYPE => "u8",
-                    CONVERSATION_ID => "uint128",
-                    TARGET_AGENT_ID => "string",
+                    CONVERSATION_ID | TARGET_AGENT_ID | AGENT_ID => "string",
                     _ => "bytes",
                 };
                 canonical_headers.insert(

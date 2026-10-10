@@ -8,6 +8,33 @@ import type { Laser } from "../../src/client/laser.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import { routeTo } from "../../src/agent/router.js"
 
+// A run session that records its lifecycle verbs.
+function fakeSessions(verbs: string[] = [], cancelRequested = false): () => { start(): unknown } {
+  const session = {
+    cancelRequested: () => Promise.resolve(cancelRequested),
+    budgetBreach: () => Promise.resolve(undefined),
+    end: () => {
+      verbs.push("end")
+      return Promise.resolve()
+    },
+    cancel: () => {
+      verbs.push("cancel")
+      return Promise.resolve()
+    },
+    fail: () => {
+      verbs.push("fail")
+      return Promise.resolve()
+    }
+  }
+  const builder = {
+    withId: () => builder,
+    agent: () => builder,
+    budget: () => builder,
+    begin: () => Promise.resolve({ session, lease: { release: () => undefined } })
+  }
+  return () => ({ start: () => builder })
+}
+
 void test("given_a_linear_workflow_when_ordered_then_should_follow_dependencies", () => {
   const steps = [
     { label: "credit", after: ["diagnose"] },
@@ -57,6 +84,7 @@ void test("given_an_exclusive_namespace_when_dispatched_then_should_propagate_it
     inboxRoute: () => contract,
     deadline: () => contract,
     conversation: () => contract,
+    parent: () => contract,
     fence: (value: bigint) => {
       fences.push(value)
       return contract
@@ -79,7 +107,7 @@ void test("given_an_exclusive_namespace_when_dispatched_then_should_propagate_it
         leaseNamespaces.push(namespace)
         return Promise.resolve({
           token: 41n,
-          grantedTtlMicros: 60_000_000n,
+          grantedTtlMs: 60_000,
           position: { topicGeneration: 1n, partition: 0, offset: 1n }
         })
       },
@@ -91,6 +119,7 @@ void test("given_an_exclusive_namespace_when_dispatched_then_should_propagate_it
       }
     }),
     contract: () => contract,
+    sessions: fakeSessions(),
     sendAgent: () => {
       events.push("journal")
       return Promise.resolve()
@@ -132,6 +161,7 @@ void test(
       inboxRoute: () => contract,
       deadline: () => contract,
       conversation: () => contract,
+      parent: () => contract,
       fence: () => contract,
       send: () => contractResult
     }
@@ -142,7 +172,7 @@ void test(
         lease: () =>
           Promise.resolve({
             token: 41n,
-            grantedTtlMicros: 100_000n,
+            grantedTtlMs: 100,
             position: { topicGeneration: 1n, partition: 0, offset: 1n }
           }),
         renewLease: async () => {
@@ -152,7 +182,7 @@ void test(
           events.push("renew-finish")
           return {
             token: 41n,
-            grantedTtlMicros: 60_000_000n,
+            grantedTtlMs: 60_000,
             position: { topicGeneration: 1n, partition: 0, offset: 2n }
           }
         },
@@ -162,6 +192,7 @@ void test(
         }
       }),
       contract: () => contract,
+      sessions: fakeSessions(),
       sendAgent: () => {
         events.push("journal")
         return Promise.resolve()
@@ -206,6 +237,7 @@ void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_
     inboxRoute: () => contract,
     deadline: () => contract,
     conversation: () => contract,
+    parent: () => contract,
     fence: (value: bigint) => {
       fences.push(value)
       return contract
@@ -231,7 +263,7 @@ void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_
         holders.push(holder)
         return Promise.resolve({
           token: BigInt(holders.length),
-          grantedTtlMicros: 60_000_000n,
+          grantedTtlMs: 60_000,
           position: { topicGeneration: 1n, partition: 0, offset: BigInt(holders.length) }
         })
       },
@@ -242,6 +274,7 @@ void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_
       }
     }),
     contract: () => contract,
+    sessions: fakeSessions(),
     sendAgent: () => Promise.resolve()
   } as unknown as Laser
 
@@ -257,32 +290,19 @@ void test("given_a_timed_out_exclusive_step_when_reassigned_then_should_release_
   assert.deepEqual(fences, [1n, 2n])
 })
 
-void test("given_a_registered_run_with_a_cancel_request_when_executed_then_should_name_the_run", async () => {
-  const states: string[] = []
-  const status = {
-    withCorrelation: () => status,
-    withTaskState: (state: { readonly name: string }) => {
-      states.push(state.name)
-      return status
-    },
-    withMetadata: () => status,
-    send: () => Promise.resolve()
-  }
+void test("given_a_cancel_request_on_the_run_session_when_executed_then_should_cancel_and_name_the_run", async () => {
+  const verbs: string[] = []
   const fake = {
-    capabilities: () => Promise.resolve({ agentWorkflow: true }),
     context: () => ({ fetch: () => Promise.resolve([]) }),
-    runs: () => ({
-      submitWith: () => Promise.resolve({ runId: "run-9" }),
-      status: () => Promise.resolve({ cancelRequested: true })
-    }),
-    agdx: () => ({ status: () => status })
+    sessions: fakeSessions(verbs, true)
   } as unknown as Laser
+  const runId = ConversationId.new()
   await assert.rejects(
     Workflow.create(fake, "orchestrator")
+      .runId(runId)
       .step("effect", routeTo(AgentId.new("worker")), () => new TextEncoder().encode("apply"))
-      .registered()
       .run(),
-    (error: unknown) => error instanceof CancelledError && error.run === "run-9"
+    (error: unknown) => error instanceof CancelledError && error.run === runId.toString()
   )
-  assert.deepEqual(states, ["Working", "Canceled"])
+  assert.deepEqual(verbs, ["cancel"])
 })

@@ -16,6 +16,7 @@ import {
 } from "../../src/wire/hello.js"
 
 void test("feature checks require every advertised bit", () => {
+  assert.equal(feature.SESSIONS, 1n << 12n)
   const versions = {
     ...newOpVersions(2, 2, 1, 1),
     features: feature.KV_CAS | feature.READ_YOUR_WRITES

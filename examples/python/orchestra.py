@@ -5,7 +5,7 @@ coordinates a pool of long-running capability agents entirely over the log, neve
 a direct call. It is INTERACTIVE and paced: it stops at each phase and waits for
 Enter, so you can open the LaserData console's Orchestration view (`/orchestration`) and
 watch every transition happen live, presence, the registry, contracts, and the
-workflow journal.
+workflow journal. `LASER_NON_INTERACTIVE=1` runs it straight through.
 
 The agents connect once at the start and stay up for the whole run, so the
 console shows a live, populated fabric the entire time. Each phase:
@@ -42,8 +42,7 @@ CLASSIFY = "classify"
 DIAGNOSE = "diagnose"
 REMEDIATE = "remediate"
 SLOW_TASK = "slow-task"
-COMMANDS = ls.AgentTopic.Commands
-RESPONSES = ls.AgentTopic.Responses
+SESSIONS = ls.AgentTopic.Sessions
 INCIDENT = b"auth API latency spike"
 ORCHESTRATOR = "orchestrator"
 
@@ -51,7 +50,9 @@ ORCHESTRATOR = "orchestrator"
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
-        await laser.bootstrap(_common.PARTITIONS)
+        await laser.bootstrap(
+            _common.PARTITIONS, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
 
         _common.phase("Discovery: a pool of long-running capability agents connects")
         # Kept alive for the whole run so the console stays populated. Health is a
@@ -72,7 +73,7 @@ async def main() -> None:
         # The orchestrator names a capability, not an agent. Routing resolves the one
         # classifier from the registry and waits for the reply or the deadline.
         reply = await laser.contract(
-            CLASSIFY, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
+            CLASSIFY, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=10_000
         )
         print("classifier replied:", completed_body(reply) or "<did not complete>")
         await pause("CONTRACT: a directed task completed (see it in the Contracts panel)")
@@ -85,14 +86,11 @@ async def main() -> None:
         await pause("FAN-OUT: two healthy diagnosers answered, the unavailable one was skipped")
 
         _common.phase("Workflow: triage, then a diagnose panel, then remediate (journalled)")
-        wf = laser.workflow("incident-response", fixed_inbox=COMMANDS)
+        wf = laser.workflow("incident-response", fixed_inbox=SESSIONS)
         # Cap the dispatches and wall clock so a runaway fan-out cannot spin.
-        wf.budget(invocations=8, wall_clock_ms=60_000)
-        # Register the run in the managed run registry when the plane serves it (the
-        # Runs panel then shows its lifecycle), and run log-native otherwise.
-        caps = await laser.capabilities()
-        if caps.agent_workflow:
-            wf.registered()
+        wf.budget(ls.WorkflowBudget.unlimited().invocations(8).wall_clock(60_000))
+        # The run is a session and every step a child session of it, so the
+        # sessions view shows the whole tree on any deployment.
         wf.step("triage", to_capable=CLASSIFY, build=lambda outputs: INCIDENT)
         wf.step(
             "diagnose",
@@ -134,12 +132,12 @@ async def main() -> None:
         # so the contract expires. The orchestrator recovers by re-dispatching to a
         # healthy fast agent, the pattern any real coordinator uses for a stuck task.
         slow = await laser.contract(
-            SLOW_TASK, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=1_000
+            SLOW_TASK, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=1_000
         )
         if not isinstance(slow, ls.Contract.Completed):
             print("the slow agent missed the deadline, recovering on a healthy agent")
             recovered = await laser.contract(
-                REMEDIATE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
+                REMEDIATE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=10_000
             )
             print("recovered:", completed_body(recovered) or "<did not complete>")
         else:
@@ -183,12 +181,12 @@ async def spawn(agent_id: str, skill: str, health: str, delay: float):
     distinct live presence in the console (presence is per connection). It
     advertises its card on start, and the returned handle keeps the connection
     alive until the run ends."""
-    laser = await _common.connect(EXAMPLE)
+    laser = await _common.connect(EXAMPLE, reset=False)
     handle = laser.spawn_agent(
         agent_id,
-        COMMANDS,
+        SESSIONS,
         worker(agent_id, skill, delay),
-        respond_on=RESPONSES,
+        respond_on=SESSIONS,
         capabilities=[skill],
         # Ack on pickup so the orchestrator can tell a consumed task from an
         # expired one, which is what makes the expiry phase legible.
@@ -205,7 +203,7 @@ async def diagnose_panel(laser) -> int:
     answered. Unavailable agents are left out by capability resolution, so the
     count reflects who could actually answer."""
     bodies = await laser.scatter(
-        DIAGNOSE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=COMMANDS, deadline_ms=10_000
+        DIAGNOSE, INCIDENT, source=ORCHESTRATOR, fixed_inbox=SESSIONS, deadline_ms=10_000
     )
     return len(bodies)
 
@@ -220,11 +218,12 @@ def completed_body(outcome) -> str | None:
 async def pause(prompt: str) -> None:
     """Print what to watch, then block on Enter so the operator can flip to the
     LaserData console and observe the phase live. The read runs in an executor, so
-    the asyncio loop (and the spawned agents) keep running while it waits."""
-    message = (
-        f"\n  >>> {prompt}\n      (watch the console's /orchestration view, then press Enter) "
-    )
-    await asyncio.get_event_loop().run_in_executor(None, input, message)
+    the asyncio loop (and the spawned agents) keep running while it waits.
+    ``LASER_NON_INTERACTIVE=1`` skips the wait."""
+    print(f"\n  >>> {prompt}\n      (watch the console's /orchestration view, then press Enter)")
+    if _common.env_bool("LASER_NON_INTERACTIVE", False):
+        return
+    await asyncio.get_running_loop().run_in_executor(None, input)
 
 
 if __name__ == "__main__":

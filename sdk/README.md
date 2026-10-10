@@ -7,8 +7,8 @@
 Laser SDK ships in independently adoptable layers:
 
 - **Streaming** (`streaming` feature, default), streams, topics, raw and typed publish, batches, resumable cursors, and JSON/CBOR/MessagePack codecs on Apache Iggy.
-- **Managed platform** (`managed` feature), projections, query, key-value state, forks, graph, watch, and the run registry against LaserData Cloud or Laser Stack. Consumer-group policies and reads are part of `streaming`.
-- **Agentic** (`agent` feature), reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
+- **Managed platform** (`managed` feature), projections, query, key-value state, forks, graph, and watch against LaserData Cloud or Laser Stack. Consumer-group policies and reads are part of `streaming`.
+- **Agentic** (`agent` feature), sessions, reliable consumer + DLQ, conversation and causality, request/reply, routing, memory, handlers, typed AGDX verbs, workflows, effect governance, and durable intent records.
 - **Edges**, the optional A2A, MCP, and AG-UI adapters.
 
 The SDK carries `gen_ai.*` provenance describing model calls but never makes them. It moves and coordinates messages only.
@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.6.0" # typed streaming plus provenance
+laser-sdk = "0.7.0" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.6.0", features = ["agent", "managed"] }
+laser-sdk = { version = "0.7.0", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -64,7 +64,7 @@ while let Some(record) = records.next().await {
 # Ok(()) }
 ```
 
-This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy.
+This example uses only the default `streaming` and `provenance` features and runs against Apache Iggy. One connection addresses every stream on the server. `Laser::connect_with_stream` only pins a default stream so `laser.topic(name)` can be used as a shortcut. It does not limit the connection to that stream. `Laser::connect_env()` reads `LASER_CONNECTION_STRING` and the optional `LASER_STREAM`, and `Laser::local()` targets local Apache Iggy. A connection string is `user:password@host[:port]` or `token@host[:port]`, optionally prefixed with `iggy://` or `iggy+tcp://`, and the port defaults to 8090. Credentials are required. Other schemes, unknown or repeated options, and malformed credentials or ports return `LaserError::Config` before dialing.
 
 Direct producers, topic sends, and publish builders return `SendMessagesResponse`. Each confirmation identifies the stream, topic, partition, and first offset in a batch. A server that does not report offsets returns an empty list. Completion follows the topic durability policy. An offset identifies a position only within its stream, topic, and partition.
 
@@ -72,7 +72,7 @@ Apache Iggy retries a failed dial and reconnects a dropped connection, by defaul
 
 For `*.laserdata.cloud` and `*.laserdata.com`, `connect` and `connect_with_stream` enable TLS with the bundled LaserData root CA. A CA is a certificate authority used to establish trust. The SDK stores this certificate in a directory that only the current user can access. It reuses the file only when its bytes match the bundled certificate.
 
-Set `LASER_TLS_CERT=<path>` to use an explicit CA with any host. Set `LASER_NO_TLS=1` to disable automatic TLS. Values `0` and `false` do not disable it. Other hosts retain their connection-string TLS configuration when neither variable is set.
+A connection string's own `tls_ca_file=<path>` turns TLS on without `tls=true`, and `tls=false` next to it is refused. Set `LASER_TLS_CERT=<path>` to use an explicit CA with any host. Set `LASER_NO_TLS=1` to disable automatic TLS. An explicit `tls=false` does the same for one connection string. Values `0` and `false` do not disable it. Other hosts retain their connection-string TLS configuration when neither variable is set.
 
 ## Batch and any payload
 
@@ -275,8 +275,8 @@ One connection can advertise one agent. A second advertisement receives `LaserEr
 | `laser.graph(name)` | the knowledge graph | traversal, neighbors, upsert, link/unlink |
 | `laser.memory(scope)` | agentic memory | remember / recall / improve / forget |
 | `laser.context(conversation)` | one conversation's working record | append, bounded fetch, prompt block, state folds |
-| `laser.sessions().create(id)` | one agent's conversation | typed turns, context for a model, scoped memory, saved offsets through `checkpoint`, reads through `turns_at` / `turns_since`, state through `state_at` / `replay` |
-| `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(name)` / `laser.runs()` | the fabric | directed asks, deadline-bound contracts, dependency-ordered workflows, the run registry |
+| `laser.sessions()` | one unit of agent work | `create(label)` / `start()` then `.agent(id).begin()`, `end` / `fail` / `cancel` / `run`, `model` / `tool` / `assemble` records, `state()`, `submit(agent, input)`, operator `control(stream, id)`, and lane reads through `context`, `checkpoint`, `turns_at` / `turns_since`, `state_at` / `replay` |
+| `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(name)` | the fabric | directed asks, deadline-bound contracts, dependency-ordered workflows whose run is a root session with a child session per step |
 
 A lease gives one holder temporary permission to coordinate an operation. A connection-backed `Laser` acquires it through a dedicated coordination connection. An application-supplied `IggyClient` uses an explicit `FencedLeaseClient` with its own transport. A timed-out attempt retires that connection. If the outcome is unknown, the call waits through the requested lifetime before returning an error.
 
@@ -287,6 +287,33 @@ Requested lifetimes must fall within `MIN_LEASE_TTL_MICROS ..= MAX_LEASE_TTL_MIC
 One connection can address every stream that its user can access. `connect_with_stream` selects an optional default for `laser.topic(name)`. Without a default, this shortcut returns `NoStream`. Apache Iggy controls access to streams and topics. Use `is_permission_denied()` and `is_stream_or_topic_not_found()` to identify access failures.
 
 Managed read models can retain the originating conversation from `gen_ai.conversation.id`. Use `laser.query(index).conversation(id)` or `laser.graph(name).conversation(id).neighbors(..)` to narrow reads. A memory-view namespace also supports `laser.kv(ns).scan().conversation(id)` and `.delete_many().conversation(id)`. These filters use record metadata and do not create an access boundary. A key-value entry without conversation metadata is excluded from a conversation-filtered scan.
+
+## Sessions
+
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics with a retention for `agent.sessions`, then begin a session as an agent:
+
+```rust,ignore
+use laser_sdk::agent::{ModelRequest, ModelResponse, TopicRetention};
+use std::time::Duration;
+
+laser.sessions().bootstrap(4, TopicRetention::expire_after(Duration::from_secs(86_400))).await?;
+let (session, lease) = laser.sessions().create("ticket-42").agent("triage".parse::<AgentId>()?).begin().await?;
+let answer = session
+    .run(lease, |session| async move {
+        let call = session.model(ModelRequest::new("gpt-4o", prompt), None).await?;
+        let body = provider.complete(&call).await?; // your model client
+        call.complete(ModelResponse { body: body.clone(), ..Default::default() }).await?;
+        session.state().set("status", serde_json::json!("triaged")).await?;
+        Ok(body)
+    })
+    .await?;
+```
+
+`run` ends the session as completed on success and as failed on an error or a panic, then re-raises the panic. Lifecycle and state records ride the session's partition of `agent.sessions`. Every record there carries its addressee in `agdx.to`, with `*` for every agent. `SessionConfig::layout` picks a per-agent partition, per-agent topic, or single-partition layout instead of the shared default, and [Agents, groups, and layouts](../docs/building-agents.md#agents-groups-and-layouts) explains the choice. `laser.sessions().submit(agent, input).from(me).send()` hands a new session to an agent, whose handler reaches it through `ctx.session()`. `laser.sessions().control(stream, id).as_operator(op).cancel()` writes on `agent.control`, which only operators can send to. `pause()` names the participants that must acknowledge (`participants(..)` sets them), agents hold work that arrives while the session is paused and replay it after `resume()`, and `session.parked()` lists held work that was never handled. `session.over_budget()` reports whether the session's usage passed the budget in its start record. On a deployment that indexes sessions, an agent with an id fails an over-budget session once with reason `budget` instead of calling its handler, and a workflow stops at the next step boundary with `LaserError::BudgetExceeded` and ends the run session failed with reason `budget`. On a deployment that announces `sessions`, `laser.sessions().list()`, `get(id)`, `events(id)`, `state(id, history_limit)`, `links(id, surface)`, `sources(id)`, `changes(after, limit)`, and `watch(poll_every)` read the managed session index, and `laser.read_at(source)` fetches the one record a timeline row points at. The [client behavior guide](../docs/client-behavior.md) and the [AGDX specification](../docs/agdx.md) describe the details.
+
+## Stream-scoped names
+
+A `Laser` with a default stream scopes every managed resource name it sends to that stream, `stream:<stream>/<name>`. That covers KV and memory namespaces, lease and fence namespaces, the key registry, graph names, projection and index ids, query indexes, fork ids, and the change-feed index filter. A name that already starts with `stream:` is sent as is, listings return your local names, and schema requests carry the stream. `laser.resource_name(name)`, `Kv::resource_namespace()`, and `ForkHandle::resource_id()` show the scoped name. `LaserBuilder::resource_naming(ResourceNaming::Bare)` or `laser.with_resource_naming(ResourceNaming::Bare)` sends names exactly as written, which is how 0.6 named them. `capabilities().stream_tenancy` reports a deployment that enforces the scoping.
 
 ## The read ladder
 
@@ -354,9 +381,9 @@ For an application checkpoint inside a filtered page, call `reader.ack_through(r
 - `default = ["streaming", "provenance"]`
 - `streaming`, the open Apache Iggy foundation: `Laser`, streams, topics, direct producers, live partition and consumer-group streams, server offsets, raw and typed publish, batches, explicit-offset cursors, and JSON/CBOR/MessagePack codecs. The SDK uses Iggy's native VSR transport. Managed reads use the non-replicated extension path, and managed authorization writes use dedicated replicated operation codes.
 - `provenance`, wire contract + provenance encoding/decoding
-- `agent`, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
+- `agent`, sessions, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
-- `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, `runs`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
+- `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
 - `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent()`, then `.commit()`. `.send()` is unconditional and refuses a builder that carries a precondition with `LaserError::Invalid`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
 - `streaming` includes consumer-group policies, group-aware consumers, explicit acknowledgment readers and group filter administration. The supporting server selects matching records for a bound group and returns all records for an unbound group. Configuration needs a ready catalog. `filters` adds only the local evaluator and the advanced reader's optional `local_guard` check. A reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset.
 - capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
@@ -390,10 +417,6 @@ tracing::subscriber::set_global_default(
 ## Connect and publish limits
 
 `Laser::connect` gives up after 30 seconds. The budget covers the TCP dial, the TLS handshake, the login, and the capability probe, and an expired budget returns `LaserError::Timeout` naming the stage that stalled. Each publish attempt times out after 60 seconds and is retried three times, with delays that start at 250 milliseconds, double after each failure, and stop growing at 30 seconds. `LaserBuilder::connect_timeout`, `publish_timeout`, `publish_max_retries`, and `publish_retry_backoff` change these limits and override `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` variables. A publish that gives up returns `LaserError::PublishFailed` with the committed ranges and the unconfirmed records. `stream(name).delete()` removes a stream you no longer need, and `Laser::close` ends the shared connection. See [connect timeout and cleanup](../docs/connect-timeout.md) and [publish recovery](../docs/publish-recovery.md).
-
-## Upgrading to 0.6.0
-
-0.6.0 is a minor release with breaking changes. Keep each `AgentHandle` until `shutdown` or `join`, because dropping it now stops the agent. `Capabilities::sessions` and `durable_dedup` are gone, and fork row embeddings take `f32` values instead of a string. The [client behavior guide](../docs/client-behavior.md) lists every change across the three clients.
 
 ## Documentation
 

@@ -33,7 +33,7 @@ async fn given_a_message_in_flight_when_shut_down_then_should_drain_before_retur
     let finished = Arc::new(AtomicBool::new(false));
     let handle = Agent::builder()
         .id("drainer".parse().expect("valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(SlowHandler {
             started: started.clone(),
             finished: finished.clone(),
@@ -47,7 +47,7 @@ async fn given_a_message_in_flight_when_shut_down_then_should_drain_before_retur
         .build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"tick"),
             &provenance,
         )
@@ -124,7 +124,7 @@ async fn given_a_rejected_message_when_dead_lettered_then_should_notify_the_sink
     let after = Arc::new(AtomicUsize::new(0));
     let handle = Agent::builder()
         .id("rejecter".parse().expect("valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(RejectingHandler)
         .on_dead_letter(Arc::new(RecordingSink {
             capsules: capsules.clone(),
@@ -140,7 +140,7 @@ async fn given_a_rejected_message_when_dead_lettered_then_should_notify_the_sink
         .build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"work"),
             &provenance,
         )
@@ -194,7 +194,7 @@ async fn given_serial_per_partition_when_one_partition_blocks_then_others_still_
     let fast_during_slow = Arc::new(AtomicUsize::new(0));
     let handle = Agent::builder()
         .id("lanes".parse().expect("valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(LaneHandler {
             slow_in_flight: slow_in_flight.clone(),
             fast_during_slow: fast_during_slow.clone(),
@@ -210,7 +210,7 @@ async fn given_serial_per_partition_when_one_partition_blocks_then_others_still_
         .conversation_id(ConversationId::new())
         .build();
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"slow"), &slow)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"slow"), &slow)
         .await
         .expect("send slow");
 
@@ -225,7 +225,7 @@ async fn given_serial_per_partition_when_one_partition_blocks_then_others_still_
             .conversation_id(ConversationId::new())
             .build();
         laser
-            .send_agent(AgentTopic::Commands, Bytes::from_static(b"fast"), &fast)
+            .send_agent(AgentTopic::Sessions, Bytes::from_static(b"fast"), &fast)
             .await
             .expect("send fast");
     }

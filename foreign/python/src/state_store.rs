@@ -29,6 +29,13 @@ pub struct PyInMemoryStore;
 #[pyclass(name = "FileStore", extends = PyStateStore, frozen)]
 pub struct PyFileStore;
 
+/// A `StateStore` over a managed key-value handle, the durable managed point
+/// store. `set` never expires: use `Kv.set(..).ttl(..)` directly for a TTL.
+/// Richer operations (`scan`, `delete_many`) stay on `Kv`.
+#[gen_stub_pyclass]
+#[pyclass(name = "KvStore", extends = PyStateStore, frozen)]
+pub struct PyKvStore;
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyStateStore {
@@ -77,6 +84,18 @@ impl PyInMemoryStore {
 
 #[gen_stub_pymethods]
 #[pymethods]
+impl PyKvStore {
+    #[new]
+    fn new(kv: PyRef<'_, crate::kv::PyKv>) -> PyClassInitializer<PyKvStore> {
+        PyClassInitializer::from(PyStateStore {
+            inner: Store::Kv(Arc::new(kv.rust_handle())),
+        })
+        .add_subclass(PyKvStore)
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
 impl PyFileStore {
     #[new]
     fn new(root: String) -> PyClassInitializer<PyFileStore> {
@@ -93,6 +112,7 @@ impl PyFileStore {
 enum Store {
     Memory(Arc<InMemoryStore>),
     File(Arc<FileStore>),
+    Kv(Arc<laser_sdk::kv::Kv>),
 }
 
 impl Store {
@@ -100,6 +120,7 @@ impl Store {
         match self {
             Self::Memory(store) => store.get(key).await,
             Self::File(store) => store.get(key).await,
+            Self::Kv(store) => StateStore::get(store.as_ref(), key).await,
         }
     }
 
@@ -107,6 +128,7 @@ impl Store {
         match self {
             Self::Memory(store) => store.set(key, value).await,
             Self::File(store) => store.set(key, value).await,
+            Self::Kv(store) => StateStore::set(store.as_ref(), key, value).await,
         }
     }
 
@@ -114,6 +136,7 @@ impl Store {
         match self {
             Self::Memory(store) => store.delete(key).await,
             Self::File(store) => store.delete(key).await,
+            Self::Kv(store) => StateStore::delete(store.as_ref(), key).await,
         }
     }
 }

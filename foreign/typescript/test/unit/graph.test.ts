@@ -10,7 +10,14 @@ import {
   GraphUpsertCommand
 } from "../../src/wire/commands.js"
 import type { GraphEdge, GraphReply, GraphResult } from "../../src/wire/graph.js"
-import { encodeGraphReplyFrame, graphEdgeRelate, graphNodeEntity } from "../../src/wire/graph.js"
+import {
+  encodeGraphReplyFrame,
+  encodeGraphUpsertFrame,
+  graphEdgeRelate,
+  graphEdgeWithSource,
+  graphNodeEntity
+} from "../../src/wire/graph.js"
+import { ConversationId } from "../../src/wire/ids.js"
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
   versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: 0n },
@@ -136,4 +143,44 @@ void test("given_an_err_reply_when_fetch_fails_then_should_wrap_it_as_a_graph_ex
     replyFrame({ kind: "err", error: { kind: "notFound", message: "no such graph" } })
   ])
   await assert.rejects(() => handle.fetch(), GraphExecutionError)
+})
+
+void test("given_session_lineage_when_upserting_then_should_stamp_only_elements_without_their_own", async () => {
+  const { graph: handle, transport } = graph("kg", [okFrame(EMPTY_RESULT)])
+  const session = { stream: "agents", session: ConversationId.fromU128(9n) }
+  const producer = { name: "sdk:planner", version: "0.7.0" }
+  const source = { kind: "memory" as const, id: "m-1" }
+  const own = { name: "importer", version: "1" }
+  const node = graphNodeEntity("host", "node-7")
+  const stamped = { ...graphNodeEntity("ticket", "7"), producer: own }
+  const edge = graphEdgeRelate(node, "opened", stamped)
+  await handle
+    .inSession(session)
+    .producedBy(producer)
+    .sourcedFrom(source)
+    .upsert([node, stamped], [edge])
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    encodeGraphUpsertFrame({
+      graph: "kg",
+      session,
+      nodes: [
+        { ...node, producer, source },
+        { ...stamped, source }
+      ],
+      edges: [{ ...edge, producer, source }]
+    })
+  )
+})
+
+void test("given_an_edge_when_a_source_is_attached_then_should_keep_its_id_and_carry_the_source", () => {
+  const edge = graphEdgeRelate(
+    graphNodeEntity("person", "ada"),
+    "knows",
+    graphNodeEntity("person", "alan")
+  )
+  const sourced = graphEdgeWithSource(edge, { kind: "kv", namespace: "people", key: "ada" })
+  assert.equal(sourced.id.toString(), edge.id.toString())
+  assert.deepEqual(sourced.source, { kind: "kv", namespace: "people", key: "ada" })
+  assert.equal(edge.source, undefined)
 })

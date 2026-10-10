@@ -20,18 +20,18 @@ use tracing::{info, warn};
 //                  `message_type` + `ts` convention fields.
 //   2. MEMORY      past resolution notes are remembered semantically, the
 //                  desk recalls the closest ones when the incident arrives.
-//   3. THE DESK    four agents on the agent topics:
-//                    triage     (Commands -> fan-out -> Responses) queries
-//                               the index as a tool, fans one diagnostic
-//                               angle per specialist call under a deadline,
-//                               and synthesizes a diagnosis with the LLM
-//                    specialist (ToolCalls -> ToolResults) answers each
-//                               angle from recalled memory plus the LLM
-//                    resolver   (Commands, KV-deduplicated) executes
-//                               capacity grants effectively once, large
-//                               ones gated behind a durable approval
-//                    approver   (HumanInput -> Responses) stands in for the
-//                               human behind that gate
+//   3. THE DESK    four agents on `agent.sessions`, each request addressed
+//                  to the agent it is for:
+//                    triage     queries the index as a tool, fans one
+//                               diagnostic angle per specialist call under
+//                               a deadline, and synthesizes a diagnosis
+//                               with the LLM
+//                    specialist answers each angle from recalled memory
+//                               plus the LLM
+//                    resolver   (KV-deduplicated) executes capacity grants
+//                               effectively once, large ones gated behind
+//                               a durable approval
+//                    approver   stands in for the human behind that gate
 //   4. SPECULATION the diagnosis proposes bulk-resolving the matching
 //                  backlog. The desk tries it in a copy-on-write fork,
 //                  compares the forked backlog against the trunk, and
@@ -153,7 +153,7 @@ async fn main() -> Result<(), LaserError> {
     phase("warming up");
     let laser = laser(&stream_for("incident-desk"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("incident-desk"), async {
-        laser.bootstrap(PARTITIONS).await?;
+        laser.bootstrap(PARTITIONS, laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400))).await?;
         laser.topic(TICKETS_TOPIC).ensure(PARTITIONS).await?;
         let capabilities = laser.capabilities().await;
         if !managed_feature_ready(capabilities.managed, "the agentic desk", "incident-desk") {
@@ -196,8 +196,8 @@ async fn main() -> Result<(), LaserError> {
         let llm = default_llm();
         let mut triage = Agent::builder()
             .id("triage".parse()?)
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .handler(Triage {
                 llm: llm.clone(),
                 index: index.clone(),
@@ -206,8 +206,8 @@ async fn main() -> Result<(), LaserError> {
             .spawn(laser.clone());
         let mut specialist = Agent::builder()
             .id("specialist".parse()?)
-            .listen_on(AgentTopic::ToolCalls)
-            .respond_on(AgentTopic::ToolResults)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .handler(Specialist {
                 llm: llm.clone(),
                 semantic: semantic.clone(),
@@ -216,8 +216,8 @@ async fn main() -> Result<(), LaserError> {
             .spawn(laser.clone());
         let mut approver = Agent::builder()
             .id("approver".parse()?)
-            .listen_on(AgentTopic::HumanInput)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .handler(Approver)
             .build()
             .spawn(laser.clone());
@@ -227,7 +227,7 @@ async fn main() -> Result<(), LaserError> {
         let grants_namespace = format!("desk-grants-{run}");
         let mut resolver = Agent::builder()
             .id("resolver".parse()?)
-            .listen_on(AgentTopic::Commands)
+            .listen_on(AgentTopic::Sessions)
             .handler(Resolver {
                 grants: grants_namespace.clone(),
             })
@@ -244,14 +244,19 @@ async fn main() -> Result<(), LaserError> {
 
         phase("triaging the incident through the desk");
         let incident = ConversationId::new();
-        let task = Provenance::builder().conversation_id(incident).build();
+        // Every desk agent reads `agent.sessions`, so each request names the
+        // agent it is for. An unaddressed request would be work for all four.
+        let task = Provenance::builder()
+            .conversation_id(incident)
+            .target_agent_id("triage".parse()?)
+            .build();
         info!("incident on conversation {incident}: {INCIDENT}");
         let diagnosed: IncidentLog = serde_json::from_slice(
             &laser
                 .agent("orchestrator".parse()?)
                 .ask(
-                    AgentTopic::Commands,
-                    AgentTopic::Responses,
+                    AgentTopic::Sessions,
+                    AgentTopic::Sessions,
                     INCIDENT.as_bytes().to_vec(),
                     &task,
                     DESK_TIMEOUT,
@@ -501,13 +506,14 @@ struct Triage {
 
 impl AgentHandler for Triage {
     async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        // The resolver shares the Commands topic. Grants are its traffic,
-        // free text is ours. Never fail on foreign messages.
+        // Grants are addressed to the resolver. Ignore a stray one rather
+        // than fail on it.
         if serde_json::from_slice::<Grant>(&message.payload).is_ok() {
             return Ok(());
         }
         let incident = String::from_utf8_lossy(&message.payload).into_owned();
         let triage_id: AgentId = "triage".parse()?;
+        let specialist_id: AgentId = "specialist".parse()?;
 
         // Tool 1: the materialized index. The desk reads the live blast
         // radius the same way an on-call would.
@@ -534,13 +540,14 @@ impl AgentHandler for Triage {
             let correlation = Provenance::builder()
                 .conversation_id(ConversationId::new())
                 .agent(triage_id.clone())
+                .target_agent_id(specialist_id.clone())
                 .deadline(deadline)
                 .build();
             let query = Vec::<u8>::from(format!("{angle} for: {incident}"));
             async move {
                 ctx.request(
-                    AgentTopic::ToolCalls,
-                    AgentTopic::ToolResults,
+                    AgentTopic::Sessions,
+                    AgentTopic::Sessions,
                     query,
                     &correlation,
                     TOOL_TIMEOUT,
@@ -635,7 +642,7 @@ struct Resolver {
 
 impl AgentHandler for Resolver {
     async fn handle(&self, message: &AgentMessage, ctx: &AgentCtx<'_>) -> Result<(), LaserError> {
-        // Triage shares the Commands topic. Free text is its traffic.
+        // Free text is addressed to triage. Ignore a stray message.
         let Ok(grant) = serde_json::from_slice::<Grant>(&message.payload) else {
             return Ok(());
         };
@@ -670,12 +677,13 @@ impl AgentHandler for Resolver {
     }
 }
 
-// Hold a large grant for approval: ask on the human-input topic and block
-// on the decision. Returns whether to apply it.
+// Hold a large grant for approval: ask the approver on `agent.sessions` and
+// block on the decision. Returns whether to apply it.
 async fn approved(ctx: &AgentCtx<'_>, grant: &Grant) -> Result<bool, LaserError> {
     let request = Provenance::builder()
         .conversation_id(ConversationId::new())
         .agent("resolver".parse()?)
+        .target_agent_id("approver".parse()?)
         .build();
     let prompt = format!(
         "approve a {} unit capacity grant to {}?",
@@ -683,8 +691,8 @@ async fn approved(ctx: &AgentCtx<'_>, grant: &Grant) -> Result<bool, LaserError>
     );
     let decision = ctx
         .request(
-            AgentTopic::HumanInput,
-            AgentTopic::Responses,
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
             prompt.into_bytes(),
             &request,
             APPROVAL_TIMEOUT,
@@ -741,11 +749,12 @@ async fn send_grants(
         let provenance = Provenance::builder()
             .conversation_id(conversation)
             .idempotency_key(key.to_owned())
+            .target_agent_id("resolver".parse()?)
             .build();
         laser
             .agent("orchestrator".parse()?)
             .send(
-                AgentTopic::Commands,
+                AgentTopic::Sessions,
                 serde_json::to_vec(&grant).map_err(|error| LaserError::Codec(error.to_string()))?,
                 &provenance,
             )
@@ -989,7 +998,7 @@ async fn recover_incident(
     ConversationState::load(
         laser,
         conversation,
-        vec![AgentTopic::Responses],
+        vec![AgentTopic::Sessions],
         // An incident conversation is a few dozen steps, so the full walk is
         // the honest bound here, written out as the law requires.
         ReplayBound::Full,

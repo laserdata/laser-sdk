@@ -1,4 +1,4 @@
-# cdc - consumer-group filters
+# cdc: consumer-group filters
 
 This example publishes a satellite change feed and gives each consumer group its own server-side policy. Consumers use the group name or ID without repeating the filter definition.
 

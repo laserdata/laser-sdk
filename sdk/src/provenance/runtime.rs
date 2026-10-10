@@ -1,6 +1,7 @@
 use super::keys;
 use crate::types::{AgentId, ConversationId, MessageId};
-use iggy::prelude::{HeaderKey, HeaderValue, IggyError, IggyMessage, IggyTimestamp};
+use iggy::prelude::{HeaderKey, HeaderKind, HeaderValue, IggyError, IggyMessage, IggyTimestamp};
+use laser_wire::headers::{Addressee, HeaderField, RecordHeaders};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -92,63 +93,64 @@ impl TryFrom<&Provenance> for BTreeMap<HeaderKey, HeaderValue> {
     type Error = ProvenanceError;
 
     fn try_from(p: &Provenance) -> Result<Self, Self::Error> {
-        let mut map = BTreeMap::new();
-        put(
-            &mut map,
-            keys::CONVERSATION_ID,
-            &p.conversation_id.to_string(),
-        )?;
-        if let Some(parent) = &p.parent_conversation_id {
-            put(&mut map, keys::PARENT_CONVERSATION_ID, &parent.to_string())?;
-        }
-        if let Some(root) = &p.root_conversation_id {
-            put(&mut map, keys::ROOT_CONVERSATION_ID, &root.to_string())?;
-        }
-        if let Some(parent) = &p.causal_parent {
-            put(&mut map, keys::CAUSAL_PARENT, &parent.to_string())?;
-        }
-        if let Some(agent) = &p.agent {
-            put(&mut map, keys::AGENT_ID, agent.as_str())?;
-        }
-        if let Some(target) = &p.target_agent_id {
-            put(&mut map, keys::TARGET_AGENT_ID, target.as_str())?;
-        }
-        if let Some(key) = &p.idempotency_key {
-            put(&mut map, keys::IDEMPOTENCY_KEY, key)?;
-        }
-        if let Some(correlation) = &p.correlation_id {
-            put(&mut map, keys::CORRELATION_ID, correlation)?;
-        }
-        if let Some(fence) = p.fence_token {
-            put(&mut map, keys::FENCE, &fence.to_string())?;
-        }
-        if let Some(deadline) = &p.deadline {
-            put(&mut map, keys::DEADLINE, &deadline.as_micros().to_string())?;
-        }
+        let mut headers = RecordHeaders::new(p.conversation_id.into());
+        headers.parent = p.parent_conversation_id.map(Into::into);
+        headers.root = p.root_conversation_id.map(Into::into);
+        headers.agent = p.agent.as_ref().map(wire_agent).transpose()?;
+        headers.addressee = p
+            .target_agent_id
+            .as_ref()
+            .map(|target| wire_agent(target).map(Addressee::Agent))
+            .transpose()?;
+        headers.causal_parent = p.causal_parent.map(|parent| parent.to_string());
+        headers.idempotency_key = p.idempotency_key.clone();
+        headers.correlation = p.correlation_id.clone();
+        headers.fence = p.fence_token;
+        headers.deadline_micros = p.deadline.map(|deadline| deadline.as_micros());
         if let Some(usage) = &p.usage {
-            if let Some(tokens) = usage.input_tokens {
-                put(&mut map, keys::USAGE_INPUT_TOKENS, &tokens.to_string())?;
-            }
-            if let Some(tokens) = usage.output_tokens {
-                put(&mut map, keys::USAGE_OUTPUT_TOKENS, &tokens.to_string())?;
-            }
-            if let Some(cost) = usage.cost_usd {
-                put_finite(&mut map, keys::COST_USD, cost)?;
-            }
+            headers.input_tokens = usage.input_tokens;
+            headers.output_tokens = usage.output_tokens;
+            headers.cost_usd = usage.cost_usd;
         }
-
-        let size: usize = map
-            .iter()
-            .map(|(k, v)| k.as_bytes().len() + v.as_bytes().len() + HEADER_FRAMING_BYTES)
-            .sum();
-        if size > HEADER_SOFT_CAP {
-            return Err(ProvenanceError::TooLarge {
-                got: size,
-                cap: HEADER_SOFT_CAP,
-            });
-        }
-        Ok(map)
+        header_map(&headers)
     }
+}
+
+/// The Iggy header map of one record's header block, checked against the
+/// value and soft size caps.
+pub(crate) fn header_map(
+    headers: &RecordHeaders,
+) -> Result<BTreeMap<HeaderKey, HeaderValue>, ProvenanceError> {
+    let mut map = BTreeMap::new();
+    for (key, field) in headers.encode() {
+        let value = match field {
+            HeaderField::Text(text) => text_value(key, &text)?,
+            HeaderField::Uint8(value) => HeaderValue::from(value),
+            HeaderField::Uint32(value) => HeaderValue::from(value),
+            HeaderField::Uint64(value) => HeaderValue::from(value),
+            HeaderField::Float64(value) if value.is_finite() => HeaderValue::from(value),
+            HeaderField::Float64(_) => return Err(ProvenanceError::NonFinite(key)),
+        };
+        map.insert(HeaderKey::from_str(key)?, value);
+    }
+    let size: usize = map
+        .iter()
+        .map(|(k, v)| k.as_bytes().len() + v.as_bytes().len() + HEADER_FRAMING_BYTES)
+        .sum();
+    if size > HEADER_SOFT_CAP {
+        return Err(ProvenanceError::TooLarge {
+            got: size,
+            cap: HEADER_SOFT_CAP,
+        });
+    }
+    Ok(map)
+}
+
+fn wire_agent(agent: &AgentId) -> Result<laser_wire::agent::AgentId, ProvenanceError> {
+    agent
+        .as_str()
+        .parse()
+        .map_err(|_| ProvenanceError::InvalidValue(keys::AGENT_ID))
 }
 
 impl TryFrom<&IggyMessage> for Provenance {
@@ -187,13 +189,21 @@ pub(crate) fn provenance_from_headers(
             .as_str()
             .map_err(|err| ProvenanceError::MalformedHeaders(err.to_string()))?;
         // Match on the key first. A header outside the provenance dictionary
-        // (the AGDX `agdx.ct` u8, `agdx.av` u32, the `Uint128` routing duplicates,
-        // any app-custom key) is foreign and ignored. A known key carries its
-        // value as a string, and a non-string value there is corruption, not
-        // something to drop, so `str_value` makes it a decode error.
+        // (the AGDX `agdx.ct` u8, `agdx.av` u32, any app-custom key) is foreign
+        // and ignored. Ids ride as strings and numbers ride typed. A known key
+        // with another value kind is corruption, not something to drop, so it
+        // is a decode error.
         match key_str {
             keys::CONVERSATION_ID => {
-                conversation_id = Some(str_value(value, keys::CONVERSATION_ID)?.parse()?);
+                conversation_id = Some(match value.kind() {
+                    HeaderKind::Uint128 => laser_wire::agent::ConversationId::from_u128(
+                        value
+                            .as_uint128()
+                            .map_err(|_| ProvenanceError::InvalidValue(keys::CONVERSATION_ID))?,
+                    )
+                    .into(),
+                    _ => str_value(value, keys::CONVERSATION_ID)?.parse()?,
+                });
             }
             keys::CAUSAL_PARENT => {
                 causal_parent = Some(str_value(value, keys::CAUSAL_PARENT)?.parse()?);
@@ -207,7 +217,11 @@ pub(crate) fn provenance_from_headers(
             }
             keys::AGENT_ID => agent = Some(str_value(value, keys::AGENT_ID)?.parse()?),
             keys::TARGET_AGENT_ID => {
-                target_agent_id = Some(str_value(value, keys::TARGET_AGENT_ID)?.parse()?);
+                // Broadcast `*` addresses every agent and is never an agent id.
+                let target = str_value(value, keys::TARGET_AGENT_ID)?;
+                if target != laser_wire::headers::BROADCAST {
+                    target_agent_id = Some(target.parse()?);
+                }
             }
             keys::IDEMPOTENCY_KEY => {
                 idempotency_key = Some(str_value(value, keys::IDEMPOTENCY_KEY)?.to_owned());
@@ -218,35 +232,26 @@ pub(crate) fn provenance_from_headers(
             // A malformed fence must be a decode error, never `.ok()`-ed to `None`:
             // silently dropping it would skip the gate and let a tampered record
             // through as unfenced.
-            keys::FENCE => {
-                fence_token = Some(parse_value::<u64>(
-                    str_value(value, keys::FENCE)?,
-                    keys::FENCE,
-                )?);
-            }
+            keys::FENCE => fence_token = Some(u64_value(value, keys::FENCE)?),
             keys::DEADLINE => {
-                let micros = parse_value::<u64>(str_value(value, keys::DEADLINE)?, keys::DEADLINE)?;
-                deadline = Some(IggyTimestamp::from(micros));
+                deadline = Some(IggyTimestamp::from(u64_value(value, keys::DEADLINE)?));
             }
             keys::USAGE_INPUT_TOKENS => {
-                usage.input_tokens = Some(parse_value(
-                    str_value(value, keys::USAGE_INPUT_TOKENS)?,
-                    keys::USAGE_INPUT_TOKENS,
-                )?);
+                usage.input_tokens = Some(u64_value(value, keys::USAGE_INPUT_TOKENS)?);
                 has_usage = true;
             }
             keys::USAGE_OUTPUT_TOKENS => {
-                usage.output_tokens = Some(parse_value(
-                    str_value(value, keys::USAGE_OUTPUT_TOKENS)?,
-                    keys::USAGE_OUTPUT_TOKENS,
-                )?);
+                usage.output_tokens = Some(u64_value(value, keys::USAGE_OUTPUT_TOKENS)?);
                 has_usage = true;
             }
             keys::COST_USD => {
-                usage.cost_usd = Some(parse_value(
-                    str_value(value, keys::COST_USD)?,
-                    keys::COST_USD,
-                )?);
+                let cost = value
+                    .as_float64()
+                    .map_err(|_| ProvenanceError::InvalidValue(keys::COST_USD))?;
+                if !cost.is_finite() {
+                    return Err(ProvenanceError::NonFinite(keys::COST_USD));
+                }
+                usage.cost_usd = Some(cost);
                 has_usage = true;
             }
             _ => {}
@@ -269,11 +274,7 @@ pub(crate) fn provenance_from_headers(
     })
 }
 
-fn put(
-    map: &mut BTreeMap<HeaderKey, HeaderValue>,
-    key: &'static str,
-    value: &str,
-) -> Result<(), ProvenanceError> {
+fn text_value(key: &'static str, value: &str) -> Result<HeaderValue, ProvenanceError> {
     if value.is_empty() {
         return Err(ProvenanceError::EmptyValue(key));
     }
@@ -290,24 +291,14 @@ fn put(
     if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(ProvenanceError::InvalidValueBytes { key });
     }
-    map.insert(HeaderKey::from_str(key)?, HeaderValue::from_str(value)?);
-    Ok(())
+    Ok(HeaderValue::from_str(value)?)
 }
 
-fn put_finite(
-    map: &mut BTreeMap<HeaderKey, HeaderValue>,
-    key: &'static str,
-    value: f64,
-) -> Result<(), ProvenanceError> {
-    if !value.is_finite() {
-        return Err(ProvenanceError::NonFinite(key));
-    }
-    put(map, key, &value.to_string())
-}
-
-fn parse_value<T: FromStr>(value: &str, key: &'static str) -> Result<T, ProvenanceError> {
+// A malformed number must be a decode error, never dropped: a silently missing
+// fence would skip the gate and let a tampered record through as unfenced.
+fn u64_value(value: &HeaderValue, key: &'static str) -> Result<u64, ProvenanceError> {
     value
-        .parse()
+        .as_uint64()
         .map_err(|_| ProvenanceError::InvalidValue(key))
 }
 
@@ -401,6 +392,24 @@ mod tests {
     }
 
     #[test]
+    fn given_a_typed_conversation_header_when_decoded_then_should_preserve_the_id() {
+        let conversation = ConversationId::new();
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::from_str(keys::CONVERSATION_ID).expect("a valid header key"),
+            HeaderValue::from(conversation.as_u128()),
+        );
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"typed"))
+            .user_headers(headers)
+            .build()
+            .expect("the message should build");
+
+        let decoded = Provenance::try_from(&message).expect("typed conversation should decode");
+        assert_eq!(decoded.conversation_id, conversation);
+    }
+
+    #[test]
     fn given_a_typed_non_string_header_when_decoded_then_should_skip_it_not_error() {
         let conversation = ConversationId::new();
         let mut headers = BTreeMap::new();
@@ -424,18 +433,18 @@ mod tests {
     }
 
     #[test]
-    fn given_a_known_key_with_a_non_string_value_when_decoded_then_should_error() {
+    fn given_a_known_key_with_the_wrong_value_kind_when_decoded_then_should_error() {
         let conversation = ConversationId::new();
         let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::from_str(keys::CONVERSATION_ID).expect("a valid header key"),
             HeaderValue::from_str(&conversation.to_string()).expect("a valid header value"),
         );
-        // `agdx.deadline` is a known provenance key, so a typed (non-string) value
-        // there is corruption, not a header to silently drop.
+        // `agdx.deadline` is a known provenance key that rides as a typed u64, so
+        // a text value there is corruption, not a header to silently drop.
         headers.insert(
             HeaderKey::from_str(keys::DEADLINE).expect("a valid header key"),
-            HeaderValue::from(42u64),
+            HeaderValue::from_str("42").expect("a valid header value"),
         );
         let message = IggyMessage::builder()
             .payload(Bytes::from_static(b"x"))

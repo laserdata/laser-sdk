@@ -1,40 +1,43 @@
-# governance
+# governance: roles, delegation, and budgets
 
-This example applies managed access roles and agent policies. It shows which requests the deployment permits and how the SDK records policy decisions.
+This example defines access roles on a managed deployment and shows the policy decisions the SDK makes without a server. It ends by submitting a session with a token budget.
 
 ## What it does
 
-`governance` installs a small role set when the connected deployment advertises `authz`, binds those roles to an Iggy user, and reads back `whoami`, role browse, and bindings through the SDK.
+1. Capability RBAC. When the deployment advertises `authz`, the example defines four roles: `support-reader`, `projection-operator`, `agent-runner`, and `safety-deny`. It binds them to a dedicated `governance-demo` Iggy user that it creates on the first run, or to `LASER_GOVERNANCE_USER_ID` when set. It never binds them to the caller, because `safety-deny` holds a deny-wins grant that would restrict every later run. It then reads back `whoami`, the roles that start with `support`, and the user's bindings.
+2. Permission intersection. An agent acting for a user may do only what both grant sets allow. The example checks a read, a write, and a delete with `delegated_allow`, and a direct delete with `grants_allow`.
+3. External edge. `authorize_edge` accepts a token with the right audience and scope, asks for step-up when the scope is missing, and rejects a foreign audience.
+4. Session governor. `laser.sessions().submit(..).budget(Budget { tokens: Some(4_000), .. })` submits a session to `governance-auditor` with a token ceiling.
 
-It also demonstrates the governance decisions that do not need a server: deny-wins grant matching, on-behalf-of permission intersection, and external-edge audience plus step-up checks. When the managed run registry is advertised, it submits a run with a multi-dimensional `RunBudget`.
+The decision checks and the session submission run on Apache Iggy. The RBAC phase prints the missing capability there and skips.
 
 ## Run it
 
 Run from `examples/rust`:
 
 ```sh
-cargo run --release --example governance
+just up && cargo run --example governance
 ```
 
-On Apache Iggy the live RBAC and run-registry phases skip cleanly. Point the same binary at LaserData Cloud to exercise the full managed path:
+Run the RBAC phase against Laser Stack or LaserData Cloud:
 
 ```sh
 LASER_CONNECTION_STRING='user:pwd@your-host' \
-LASER_GOVERNANCE_USER_ID=42 \
-  cargo run --release --example governance
+  cargo run --example governance
 ```
 
 ## Where to look (LaserData Cloud)
 
-In LaserData Cloud, open the access or roles view to see:
-
-- `support-reader`, `projection-operator`, `agent-runner`, and `safety-deny`
-- the configured binding for `LASER_GOVERNANCE_USER_ID`
-- the effective grant preview with the deny applied
+- Roles: `support-reader`, `projection-operator`, `agent-runner`, and `safety-deny`.
+- Bindings: the four roles on `governance-demo`, or on `LASER_GOVERNANCE_USER_ID`.
+- Sessions: the submitted `governance-auditor` session with its token budget.
 
 ## Highlights
 
-- Managed surfaces use `effect feature:action [on resource-pattern]`, assembled through roles bound to the server-stamped Iggy user.
-- An agent acting on behalf of a user is allowed only where both grant sets allow the operation.
-- External MCP/A2A edge requests distinguish a wrong audience from a missing scope that can step up.
-- Run budgets are a governor, not a grant.
+- A grant is `effect feature:action [on resource-pattern]`. Roles bound to the server-stamped Iggy user carry the grants.
+- Deny wins whenever an allow and a deny match the same operation.
+- Delegation never exceeds the agent's grants or the user's grants.
+- Edge authorization tells a wrong audience apart from a missing scope that can step up.
+- A session budget is a ceiling the runtime compares usage with. It does not grant permission.
+
+The Python and TypeScript `governance` examples run the same phases. Python has no Iggy user management, so it binds the roles only when `LASER_GOVERNANCE_USER_ID` is set.

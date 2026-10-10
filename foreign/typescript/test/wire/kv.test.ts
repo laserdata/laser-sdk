@@ -7,6 +7,7 @@ import {
   decodeKvCas,
   decodeKvCasFenced,
   decodeKvCopy,
+  decodeKvDelete,
   decodeKvDeleteMany,
   decodeKvEntry,
   decodeKvGet,
@@ -21,6 +22,7 @@ import {
   encodeKvCas,
   encodeKvCasFenced,
   encodeKvCopy,
+  encodeKvDelete,
   encodeKvDeleteMany,
   encodeKvEntry,
   encodeKvGet,
@@ -43,6 +45,36 @@ import {
   MAX_LEASE_TTL_MICROS,
   MIN_LEASE_TTL_MICROS
 } from "../../src/wire/limits.js"
+
+async function assertSessionLinkedFixture<T>(
+  name: string,
+  decode: (map: ReturnType<typeof expectMap>, context: string) => T,
+  encode: (value: T) => Map<string, unknown>
+): Promise<T> {
+  const bytes = await readFixture(name)
+  const decoded = decode(expectMap(decodeOne(bytes, name), name), name)
+  assert.deepEqual(Buffer.from(encodeNamed(encode(decoded))), Buffer.from(bytes))
+  return decoded
+}
+
+void test("given_session_linked_kv_fixtures_when_decoded_then_should_preserve_the_session", async () => {
+  const set = await assertSessionLinkedFixture("kv_set_session.bin", decodeKvSet, encodeKvSet)
+  const cas = await assertSessionLinkedFixture("kv_cas_session.bin", decodeKvCas, encodeKvCas)
+  const del = await assertSessionLinkedFixture(
+    "kv_delete_session.bin",
+    decodeKvDelete,
+    encodeKvDelete
+  )
+  const patch = await assertSessionLinkedFixture(
+    "kv_patch_session.bin",
+    decodeKvPatch,
+    encodeKvPatch
+  )
+  for (const request of [set, cas, del, patch]) {
+    assert.equal(request.session?.stream, "alpha")
+    assert.equal(request.session.session.asU128(), 3n)
+  }
+})
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
 
@@ -410,4 +442,14 @@ void test("given_a_versioned_entry_when_round_tripped_then_should_preserve_versi
     "test"
   )
   assert.equal(unversionedBack.version, 0n, "version 0 must be omitted")
+})
+
+void test("given_the_memory_view_entry_fixture_when_decoded_then_should_keep_broker_time", async () => {
+  const bytes = await readFixture("kv_entry_memory_scope.bin")
+  const entry = decodeKvEntry(expectMap(decodeOne(bytes, "kv_entry"), "kv_entry"), "kv_entry")
+  const scope = entry.scope
+  assert.ok(scope !== undefined)
+  assert.equal(scope.timestampMicros, 1_717_171_717_000_009n)
+  assert.equal(scope.source?.kind, "message")
+  assert.deepEqual(Buffer.from(encodeNamed(encodeKvEntry(entry))), Buffer.from(bytes))
 })

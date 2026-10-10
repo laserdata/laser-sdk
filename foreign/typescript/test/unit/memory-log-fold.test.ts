@@ -13,6 +13,12 @@ import { ConversationId } from "../../src/types/ids.js"
 import { MEMORY_NAMESPACE } from "../../src/wire/headers.js"
 import { encodeMemoryRecordFrame, type MemoryRecord } from "../../src/wire/memory.js"
 
+// A fake client that sends every resource name as written.
+const BARE_NAMING = {
+  resourceNameIn: (_stream: string | undefined, name: string) => name,
+  resourceScope: () => undefined
+}
+
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -65,6 +71,7 @@ class FakeTopic {
     }
     const laser = {
       defaultStream: "records",
+      ...BARE_NAMING,
       [INTERNAL_TRANSPORT]: () => transport,
       [INTERNAL_GOVERN]: (action: { readonly payload: Uint8Array }) => {
         this.governed.push(action.payload.slice())
@@ -163,11 +170,28 @@ void test("given_feedback_when_recalled_folded_then_should_order_recent_by_recen
   assert.deepEqual(keyword[0]?.signals, [{ strategy: RecallStrategy.Auto, rank: 0, score: 5 }])
 })
 
+void test("given_folded_log_memory_when_searched_then_should_exclude_unrelated_items_before_limiting", async () => {
+  const topic = new FakeTopic([
+    [
+      item(MemoryId.fromU128(1n), "apple"),
+      item(MemoryId.fromU128(2n), "orange"),
+      item(MemoryId.fromU128(3n), "pear")
+    ]
+  ])
+  const memory = topic.memory()
+  for (const strategy of [RecallStrategy.Keyword, RecallStrategy.Semantic, RecallStrategy.Hybrid]) {
+    assert.deepEqual(
+      bodies(await memory.recallFolded({}, { semantic: "apple", strategy, limit: 1 })),
+      ["apple"]
+    )
+  }
+})
+
 void test("given_no_namespace_when_a_log_memory_is_opened_then_should_key_named_items_on_the_topic_name", () => {
-  const laser = { defaultStream: "records" } as unknown as Laser
-  const audit = new LogMemory(laser)
-  assert.equal(audit.topic, AgentTopic.Audit)
-  assert.equal(audit.namespace, AgentTopic.Audit)
+  const laser = { defaultStream: "records", ...BARE_NAMING } as unknown as Laser
+  const memory = new LogMemory(laser)
+  assert.equal(memory.topic, AgentTopic.Memory)
+  assert.equal(memory.namespace, AgentTopic.Memory)
   assert.equal(new LogMemory(laser, undefined, "incidents").namespace, "incidents")
   assert.equal(new LogMemory(laser, "notes", "incidents").namespace, "notes")
 })
@@ -200,4 +224,38 @@ void test("given_reserved_object_keys_when_merge_patching_then_should_keep_them_
     decoder.decode(merged),
     '{"keep":true,"constructor":1,"prototype":2,"__proto__":{"a":1}}'
   )
+})
+
+void test("given_scoped_tombstones_and_feedback_when_folded_then_should_touch_only_their_conversation", async () => {
+  const owner = ConversationId.derive("owner")
+  const other = ConversationId.derive("other")
+  const id = MemoryId.fromU128(7n)
+  const topic = new FakeTopic([
+    [
+      record(
+        {
+          kind: "item",
+          id: id.toString(),
+          memoryKind: MemoryKind.Fact,
+          body: encoder.encode("kept")
+        },
+        owner
+      ),
+      record(
+        { kind: "feedback", target: id.toString(), weight: 4, conversation: other.toString() },
+        other
+      ),
+      record({ kind: "forget", target: id.toString(), conversation: other.toString() }, other),
+      record(
+        { kind: "feedback", target: id.toString(), weight: 2, conversation: owner.toString() },
+        owner
+      )
+    ]
+  ])
+  const memory = topic.memory()
+  const kept = await memory.recallFolded({}, { strategy: RecallStrategy.Keyword })
+  assert.deepEqual(bodies(kept), ["kept"])
+  assert.equal(kept[0]?.score, 2)
+  await memory.forget({ conversation: owner }, id)
+  assert.deepEqual(await memory.recallFolded({}, {}), [])
 })

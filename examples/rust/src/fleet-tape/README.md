@@ -1,4 +1,4 @@
-# fleet-tape - live fleet view + reading-tape analytics
+# fleet-tape: live fleet view and reading-tape analytics
 
 This example sends host CPU readings to a live fleet-view reader and a reading-history topic. Managed deployments also support analytics and schema-based publication.
 

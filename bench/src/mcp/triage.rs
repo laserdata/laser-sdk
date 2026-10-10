@@ -58,7 +58,7 @@ impl AgentHandler for TriageEcho {
             LaserError::Handler("triage command has no AGDX correlation".to_owned())
         })?;
         let producer = ctx.laser().agdx(
-            AgentTopic::Responses,
+            AgentTopic::Sessions,
             self.source.clone(),
             envelope.conversation,
         );
@@ -83,7 +83,7 @@ pub async fn run_agdx_triage_evidence(
 ) -> Result<AgdxTriageEvidence, BenchError> {
     let stream = format!("bench-mcp-triage-{seed:016x}");
     let scoped = laser.with_default_stream(&stream);
-    for topic in [AgentTopic::Commands, AgentTopic::Responses] {
+    for topic in [AgentTopic::Sessions, AgentTopic::Sessions] {
         scoped
             .topic(topic.topic_string())
             .ensure(case.partitions)
@@ -99,8 +99,8 @@ pub async fn run_agdx_triage_evidence(
         .with_default_stream(&stream);
     let mut agent = Agent::builder()
         .id(worker.clone())
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .handler(TriageEcho {
             source: worker.wire_id(),
         })
@@ -182,8 +182,8 @@ fn triage_operation(
                 .contract(Router::to(worker.clone()))
                 .from(source.clone())
                 .payload(body.clone())
-                .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
-                .reply_on(AgentTopic::Responses)
+                .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+                .reply_on(AgentTopic::Sessions)
                 .conversation(ConversationId::derive(&format!(
                     "laser-bench-triage-{seed}-{sequence}"
                 )))

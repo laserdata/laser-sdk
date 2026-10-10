@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { StateStoreError } from "./client/errors.js"
+import type { Kv } from "./managed/kv.js"
 
 export interface StateStore {
   get(key: string): Promise<Uint8Array | undefined>
@@ -27,6 +28,27 @@ export class InMemoryStore implements StateStore {
     return Promise.resolve()
   }
 }
+
+/** The managed `Kv` as a `StateStore`, like Rust's `impl StateStore for Kv`
+ * and Python `KvStore`. Keys are stored as their UTF-8 bytes and `set` never
+ * expires: use the `Kv` builder for a TTL. */
+export class KvStore implements StateStore {
+  constructor(private readonly kv: Kv) {}
+
+  get(key: string): Promise<Uint8Array | undefined> {
+    return this.kv.get(UTF8.encode(key))
+  }
+
+  async set(key: string, value: Uint8Array): Promise<void> {
+    await this.kv.set(UTF8.encode(key)).bytes(value).send()
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.kv.delete(UTF8.encode(key))
+  }
+}
+
+const UTF8 = new TextEncoder()
 
 function hexKey(key: string): string {
   return [...new TextEncoder().encode(key)]

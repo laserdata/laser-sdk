@@ -1,11 +1,13 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
+import { INTERNAL_TRANSPORT } from "../../src/client/internals.js"
 import { Laser } from "../../src/client/laser.js"
 import { AgentTopic } from "../../src/provenance/agent-topic.js"
 import { TopicSnapshotStore } from "../../src/snapshot.js"
 import { AgentId, ConversationId } from "../../src/types/ids.js"
 import { ConversationId as WireConversationId } from "../../src/wire/ids.js"
+import { TopicRetention } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 const encoder = new TextEncoder()
@@ -60,7 +62,7 @@ void test("given_durable_memory_when_a_fresh_handle_folds_then_should_rebuild_fe
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(2)
+    await laser.bootstrap(2, TopicRetention.expireAfter(86_400_000))
     const namespace = `support-${randomUUID()}`
     const conversation = ConversationId.new()
     const agent = AgentId.new("memory-agent")
@@ -106,30 +108,47 @@ void test("given_a_topic_snapshot_when_state_is_loaded_then_should_resume_after_
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     await laser.topic("agent.snapshots").ensure(1)
     const conversation = ConversationId.new()
     const scope = laser.context(conversation)
-    await scope.append(AgentTopic.Commands, encoder.encode("1"))
-    await scope.append(AgentTopic.Commands, encoder.encode("2"))
+    await scope.append(AgentTopic.Sessions, encoder.encode("1"))
+    await scope.append(AgentTopic.Sessions, encoder.encode("2"))
     const history = await eventually(async () => {
-      const messages = await scope.fetch([AgentTopic.Commands], 10)
+      const messages = await scope.fetch([AgentTopic.Sessions], 10)
       return messages.length === 2 ? messages : undefined
     })
-    const asOf = new Map<number, bigint>()
-    for (const message of history) asOf.set(message.id.partitionId, message.id.offset)
-    const snapshots = new TopicSnapshotStore(laser)
+    const offsets = new Map<number, bigint>()
+    for (const message of history) offsets.set(message.id.partitionId, message.id.offset)
+    const transport = laser[INTERNAL_TRANSPORT]()
+    const source = await transport.findSnapshotStream?.(stream)
+    const topic = await transport.findSnapshotTopic?.(stream, AgentTopic.Sessions)
+    assert.ok(source !== undefined && topic !== undefined)
+    assert.ok(source.createdAtMicros % 1000n !== 0n || topic.createdAtMicros % 1000n !== 0n)
+    const asOf = [...offsets]
+      .sort(([left], [right]) => left - right)
+      .map(([partitionId, offset]) => ({
+        topicId: topic.id,
+        topicCreatedAtMicros: topic.createdAtMicros,
+        partitionId,
+        offset
+      }))
+    const snapshots = new TopicSnapshotStore(laser, "planner")
     await snapshots.save({
+      stream,
+      streamId: source.id,
+      streamCreatedAtMicros: source.createdAtMicros,
       conversation: WireConversationId.parse(conversation.toString()),
+      fold: "planner",
       asOf,
       state: encoder.encode("3")
     })
-    await scope.append(AgentTopic.Commands, encoder.encode("3"))
+    await scope.append(AgentTopic.Sessions, encoder.encode("3"))
 
     const resumed = await eventually(async () => {
       const total = await scope.stateWith(
-        new TopicSnapshotStore(laser),
-        [AgentTopic.Commands],
+        new TopicSnapshotStore(laser, "planner"),
+        [AgentTopic.Sessions],
         0,
         (sum, message) => sum + Number(decoder.decode(message.payload)),
         (bytes) => Number(decoder.decode(bytes))

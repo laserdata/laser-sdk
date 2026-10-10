@@ -9,6 +9,13 @@ export const MAX_SCAN_LIMIT = 1000
 export const DEFAULT_SCAN_LIMIT = 100
 export const DEFAULT_NAMESPACE = "default"
 export const MAX_NAMESPACE_BYTES = 128
+export const MAX_SESSION_LABEL_BYTES = 256
+/** Most session ids one heartbeat record lists. A process with more leases in
+ * one stream splits them over several records. */
+export const MAX_HEARTBEAT_SESSIONS = 2048
+export const MAX_STATE_PATCH_OPS = 256
+export const MAX_STATE_DOCUMENT_BYTES = 8 * 1024 * 1024
+export const MAX_MANIFEST_FRAGMENTS = 1024
 export const MAX_HOLDER_ID_BYTES = 128
 export const MIN_LEASE_TTL_MICROS = 1_000_000
 export const MAX_LEASE_TTL_MICROS = 300_000_000

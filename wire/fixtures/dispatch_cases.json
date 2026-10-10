@@ -1,0 +1,649 @@
+{
+  "agent": "planner",
+  "cases": [
+    {
+      "dispatch": "lifecycle",
+      "display": "session.submitted",
+      "handled": "any",
+      "name": "submitted session",
+      "record": {
+        "body": "start",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "submitted"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.started",
+      "handled": "any",
+      "name": "first working status",
+      "record": {
+        "body": "start",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "working"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.resumed",
+      "handled": "any",
+      "name": "working after a pause",
+      "record": {
+        "body": "transition",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "working"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.paused",
+      "handled": "any",
+      "name": "paused session",
+      "record": {
+        "body": "transition",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "paused"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.completed",
+      "handled": "any",
+      "name": "completed session",
+      "record": {
+        "body": "end",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "completed"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.failed",
+      "handled": "any",
+      "name": "failed session",
+      "record": {
+        "body": "end",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "failed"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.failed",
+      "handled": "any",
+      "name": "rejected session",
+      "record": {
+        "body": "end",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "rejected"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.canceled",
+      "handled": "any",
+      "name": "canceled session",
+      "record": {
+        "body": "end",
+        "kind": "status",
+        "operation": "session",
+        "task_state": "canceled"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "session.heartbeat",
+      "handled": "any",
+      "name": "heartbeat",
+      "record": {
+        "kind": "status",
+        "operation": "progress"
+      },
+      "topic": "agent.heartbeats"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "agent.message",
+      "handled": "any",
+      "name": "progress outside the heartbeat topic",
+      "record": {
+        "kind": "status",
+        "operation": "progress"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "lifecycle",
+      "display": "task.status",
+      "handled": "any",
+      "name": "inner task status",
+      "record": {
+        "kind": "status",
+        "operation": "task",
+        "task_state": "working"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "control",
+      "display": "session.control",
+      "handled": "any",
+      "name": "cancel on the control topic",
+      "record": {
+        "kind": "command",
+        "operation": "session_cancel",
+        "target": "planner"
+      },
+      "topic": "agent.control"
+    },
+    {
+      "dispatch": "control",
+      "display": "session.control",
+      "handled": "any",
+      "name": "broadcast pause on the control topic",
+      "record": {
+        "kind": "command",
+        "operation": "session_pause"
+      },
+      "topic": "agent.control"
+    },
+    {
+      "dispatch": "observational",
+      "display": "unauthorized_control",
+      "handled": "any",
+      "name": "cancel on the session lane",
+      "record": {
+        "kind": "command",
+        "operation": "session_cancel"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "unauthorized_control",
+      "handled": "any",
+      "name": "force cancel on the session lane",
+      "record": {
+        "kind": "command",
+        "operation": "force_cancel",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "foreign",
+      "display": "agent.message",
+      "handled": "any",
+      "name": "work on the control topic",
+      "record": {
+        "kind": "command",
+        "operation": "summarize"
+      },
+      "topic": "agent.control"
+    },
+    {
+      "dispatch": "work",
+      "display": "user.message",
+      "handled": "any",
+      "name": "user turn for a handler of every operation",
+      "record": {
+        "kind": "command",
+        "operation": "chat",
+        "role": "user",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "model.request",
+      "handled": [
+        "summarize"
+      ],
+      "name": "model call outside the handled operations",
+      "record": {
+        "kind": "command",
+        "operation": "chat",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "foreign",
+      "display": "model.request",
+      "handled": "any",
+      "name": "model call addressed to another agent",
+      "record": {
+        "kind": "command",
+        "operation": "chat",
+        "target": "critic"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "work",
+      "display": "model.request",
+      "handled": "any",
+      "name": "untargeted completion",
+      "record": {
+        "kind": "command",
+        "operation": "text_completion"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "model.request",
+      "handled": [
+        "summarize"
+      ],
+      "name": "content generation outside the handled operations",
+      "record": {
+        "kind": "command",
+        "operation": "generate_content",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "work",
+      "display": "tool.call",
+      "handled": [
+        "execute_tool"
+      ],
+      "name": "tool call the handler serves",
+      "record": {
+        "kind": "command",
+        "operation": "execute_tool",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "work",
+      "display": "agent.handoff",
+      "handled": "any",
+      "name": "broadcast handoff",
+      "record": {
+        "kind": "command",
+        "operation": "invoke_agent"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "work",
+      "display": "agent.message",
+      "handled": [
+        "summarize"
+      ],
+      "name": "broadcast work",
+      "record": {
+        "kind": "command",
+        "operation": "summarize"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "foreign",
+      "display": "agent.message",
+      "handled": [
+        "summarize"
+      ],
+      "name": "work for another agent",
+      "record": {
+        "kind": "command",
+        "operation": "summarize",
+        "target": "critic"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "state.updated",
+      "handled": "any",
+      "name": "state delta",
+      "record": {
+        "kind": "event",
+        "operation": "state_delta"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "state.updated",
+      "handled": "any",
+      "name": "state snapshot",
+      "record": {
+        "kind": "event",
+        "operation": "state_snapshot"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "context.assembled",
+      "handled": "any",
+      "name": "assembled context",
+      "record": {
+        "kind": "event",
+        "operation": "context_assembled"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "context.compacted",
+      "handled": "any",
+      "name": "compacted context",
+      "record": {
+        "kind": "event",
+        "operation": "context_compacted"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "context.retrieved",
+      "handled": "any",
+      "name": "retrieved context",
+      "record": {
+        "kind": "event",
+        "operation": "context_retrieved"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "policy.decision",
+      "handled": "any",
+      "name": "policy decision",
+      "record": {
+        "kind": "event",
+        "operation": "policy_decision"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "user.message",
+      "handled": "any",
+      "name": "observed user turn",
+      "record": {
+        "kind": "event",
+        "operation": "note",
+        "role": "user"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "agent.message",
+      "handled": "any",
+      "name": "plain event",
+      "record": {
+        "kind": "event",
+        "operation": "note"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "model.response",
+      "handled": "any",
+      "name": "model response",
+      "record": {
+        "kind": "response",
+        "operation": "chat",
+        "target": "planner"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "tool.result",
+      "handled": "any",
+      "name": "tool result",
+      "record": {
+        "kind": "response",
+        "operation": "execute_tool"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "tool.result",
+      "handled": "any",
+      "name": "tool failure",
+      "record": {
+        "kind": "error",
+        "operation": "execute_tool"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "error",
+      "handled": "any",
+      "name": "work failure",
+      "record": {
+        "kind": "error",
+        "operation": "summarize"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "model.stream",
+      "handled": "any",
+      "name": "answer chunk",
+      "record": {
+        "kind": "chunk",
+        "operation": "chat"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "model.stream",
+      "handled": "any",
+      "name": "reasoning chunk",
+      "record": {
+        "kind": "chunk",
+        "operation": "reasoning"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "reply",
+      "display": "agent.message",
+      "handled": "any",
+      "name": "tool argument chunk",
+      "record": {
+        "kind": "chunk",
+        "operation": "tool_args"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "display": "memory.created",
+      "name": "remembered item",
+      "record": {
+        "memory": "item"
+      },
+      "topic": "agent.memory"
+    },
+    {
+      "display": "memory.forgotten",
+      "name": "forgotten item",
+      "record": {
+        "memory": "forget"
+      },
+      "topic": "agent.memory"
+    },
+    {
+      "display": "memory.feedback",
+      "name": "memory feedback",
+      "record": {
+        "memory": "feedback"
+      },
+      "topic": "agent.memory"
+    },
+    {
+      "display": "dead_letter",
+      "name": "dead letter",
+      "record": {
+        "other": "dead_letter"
+      },
+      "topic": "agent.dlq"
+    },
+    {
+      "display": "workflow.step",
+      "name": "workflow journal",
+      "record": {
+        "other": "journal"
+      },
+      "topic": "agent.journal"
+    },
+    {
+      "display": "kv.set",
+      "name": "session KV write",
+      "record": {
+        "other": "kv_mutation"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "display": "graph.upsert",
+      "name": "session graph write",
+      "record": {
+        "other": "graph_mutation"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "display": "undecodable",
+      "name": "undecodable record",
+      "record": {
+        "other": "undecodable"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "session.parked",
+      "handled": "any",
+      "name": "held work record",
+      "record": {
+        "kind": "event",
+        "operation": "session_parked"
+      },
+      "topic": "agent.sessions"
+    },
+    {
+      "dispatch": "observational",
+      "display": "session.unparked",
+      "handled": "any",
+      "name": "held work record handled after resume",
+      "record": {
+        "kind": "event",
+        "operation": "session_unparked"
+      },
+      "topic": "agent.sessions"
+    }
+  ],
+  "filters": [
+    {
+      "agent": "planner",
+      "digest": "a1acd1e2e35f3ae5b66f70ed8ba96ae6e1e89f696fee65a55edbbd8398a3a39d"
+    },
+    {
+      "agent": "critic",
+      "digest": "3ef1621a2775c7c243ee2391a8982eb903d829855046343898f636e95046a1c1"
+    },
+    {
+      "broadcast": true,
+      "digest": "fd200228a824458ecd65b73a751cda52244c46bd9a1d23640e984bfd9a9edc65"
+    }
+  ],
+  "generic": [
+    {
+      "cause": false,
+      "correlation": true,
+      "dispatch": "work",
+      "name": "untargeted request",
+      "to": null,
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": false,
+      "correlation": true,
+      "dispatch": "work",
+      "name": "request for this agent",
+      "to": "planner",
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": false,
+      "correlation": false,
+      "dispatch": "work",
+      "name": "broadcast record",
+      "to": "*",
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": true,
+      "correlation": false,
+      "dispatch": "work",
+      "name": "handoff for this agent",
+      "to": "planner",
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": true,
+      "correlation": true,
+      "dispatch": "reply",
+      "name": "reply to this agent",
+      "to": "planner",
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": true,
+      "correlation": true,
+      "dispatch": "reply",
+      "name": "untargeted reply",
+      "to": null,
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": false,
+      "correlation": false,
+      "dispatch": "foreign",
+      "name": "record for another agent",
+      "to": "critic",
+      "topic": "agent.sessions"
+    },
+    {
+      "cause": false,
+      "correlation": false,
+      "dispatch": "foreign",
+      "name": "generic record on the control topic",
+      "to": null,
+      "topic": "agent.control"
+    }
+  ]
+}

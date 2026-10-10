@@ -1,6 +1,6 @@
 use crate::harness;
 use bytes::Bytes;
-use iggy::prelude::{Identifier, IggyTimestamp, TopicClient};
+use iggy::prelude::{HeaderKey, HeaderValue, Identifier, IggyTimestamp, StreamClient, TopicClient};
 use laser_sdk::agent::{ConsumerRef, ConsumptionStatus};
 use laser_sdk::prelude::full::*;
 use laser_sdk::wire::agent::{AgentDeadLetter, DeadLetterReason};
@@ -44,7 +44,7 @@ async fn given_a_duplicate_and_a_poison_message_when_consumed_then_should_dedupe
 
     let _agent_lifetime_1 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Worker {
             handled: handled.clone(),
         })
@@ -57,11 +57,11 @@ async fn given_a_duplicate_and_a_poison_message_when_consumed_then_should_dedupe
         .idempotency_key("job-1".to_owned())
         .build();
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"work"), &good)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"work"), &good)
         .await
         .expect("the first job should be sent");
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"work"), &good)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"work"), &good)
         .await
         .expect("the duplicate job should be sent");
 
@@ -70,7 +70,7 @@ async fn given_a_duplicate_and_a_poison_message_when_consumed_then_should_dedupe
         .idempotency_key("job-2".to_owned())
         .build();
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"poison"), &poison)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"poison"), &poison)
         .await
         .expect("the poison message should be sent");
 
@@ -123,7 +123,7 @@ async fn given_an_agent_restarted_on_its_group_when_a_new_message_arrives_then_s
 
     let mut first = Agent::builder()
         .id("resumer".parse().expect("resumer is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions: 8 })
         .handler(Worker {
             handled: handled.clone(),
@@ -141,7 +141,7 @@ async fn given_an_agent_restarted_on_its_group_when_a_new_message_arrives_then_s
         .idempotency_key("resume-1".to_owned())
         .build();
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"work"), &before)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"work"), &before)
         .await
         .expect("the pre-restart job should be sent");
     harness::eventually(|| {
@@ -161,7 +161,7 @@ async fn given_an_agent_restarted_on_its_group_when_a_new_message_arrives_then_s
     let restarted = harness::reconnect(&laser).await;
     let mut second = Agent::builder()
         .id("resumer".parse().expect("resumer is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions: 8 })
         .handler(Worker {
             handled: handled.clone(),
@@ -178,7 +178,7 @@ async fn given_an_agent_restarted_on_its_group_when_a_new_message_arrives_then_s
         .idempotency_key("resume-2".to_owned())
         .build();
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from_static(b"work"), &after)
+        .send_agent(AgentTopic::Sessions, Bytes::from_static(b"work"), &after)
         .await
         .expect("the post-restart job should be sent");
     harness::eventually(|| {
@@ -200,7 +200,7 @@ async fn given_a_rejected_message_when_consumed_then_should_dead_letter_without_
 
     let _agent_lifetime_2 = Agent::builder()
         .id("rejecter".parse().expect("rejecter is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Worker {
             handled: handled.clone(),
         })
@@ -214,7 +214,7 @@ async fn given_a_rejected_message_when_consumed_then_should_dead_letter_without_
         .build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"reject"),
             &provenance,
         )
@@ -272,7 +272,7 @@ async fn given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_befo
     let attempts = Arc::new(AtomicUsize::new(0));
     let mut first = Agent::builder()
         .id("dlq-outage".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(RejectingWorker {
             attempts: attempts.clone(),
         })
@@ -284,7 +284,7 @@ async fn given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_befo
     let provenance = Provenance::builder().conversation_id(conversation).build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"reject"),
             &provenance,
         )
@@ -295,7 +295,11 @@ async fn given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_befo
         .join()
         .await
         .expect_err("a required DLQ publish failure stops the worker");
-    assert!(matches!(failure, LaserError::Iggy(_)));
+    // The worker stops with the dead-letter publish failure itself.
+    assert!(
+        matches!(failure, LaserError::PublishFailed(_)),
+        "{failure:?}"
+    );
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
     laser
@@ -306,7 +310,7 @@ async fn given_a_missing_dlq_topic_when_publish_fails_then_should_redeliver_befo
     let restarted = harness::reconnect(&laser).await;
     let mut second = Agent::builder()
         .id("dlq-outage".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(RejectingWorker {
             attempts: attempts.clone(),
         })
@@ -364,7 +368,7 @@ async fn given_a_message_past_its_deadline_when_consumed_then_should_dead_letter
 
     let _agent_lifetime_3 = Agent::builder()
         .id("worker".parse().expect("worker is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Worker {
             handled: handled.clone(),
         })
@@ -379,7 +383,7 @@ async fn given_a_message_past_its_deadline_when_consumed_then_should_dead_letter
         .build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"work"),
             &provenance,
         )
@@ -419,7 +423,7 @@ async fn given_a_dead_letter_when_redriven_then_should_reinject_the_original_to_
 
     let _agent_lifetime_4 = Agent::builder()
         .id("rejecter".parse().expect("rejecter is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Worker {
             handled: handled.clone(),
         })
@@ -435,7 +439,7 @@ async fn given_a_dead_letter_when_redriven_then_should_reinject_the_original_to_
         .build();
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"reject"),
             &provenance,
         )
@@ -536,7 +540,7 @@ async fn given_a_poison_record_inside_a_batch_when_dead_lettered_then_should_sta
     // poll returns the batch: valid, undecodable, valid. The capsule must
     // carry the poison record's own offset, not the batch high-water mark.
     laser
-        .agdx(AgentTopic::Commands, source.clone(), wire_conversation)
+        .agdx(AgentTopic::Sessions, source.clone(), wire_conversation)
         .command(WireCorrelationId::from_u128(0x0501), b"first".to_vec())
         .send()
         .await
@@ -547,12 +551,12 @@ async fn given_a_poison_record_inside_a_batch_when_dead_lettered_then_should_sta
         HeaderValue::from(AGENT_OP_VERSION),
     );
     laser
-        .topic(AgentTopic::Commands.topic_string())
+        .topic(AgentTopic::Sessions.topic_string())
         .send(garbage.clone(), headers, Some(&conversation.to_string()))
         .await
         .expect("the poison record should publish");
     laser
-        .agdx(AgentTopic::Commands, source, wire_conversation)
+        .agdx(AgentTopic::Sessions, source, wire_conversation)
         .command(WireCorrelationId::from_u128(0x0502), b"second".to_vec())
         .send()
         .await
@@ -562,7 +566,7 @@ async fn given_a_poison_record_inside_a_batch_when_dead_lettered_then_should_sta
     let capsules = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut worker = Agent::builder()
         .id("batcher".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(Worker {
             handled: handled.clone(),
         })
@@ -616,4 +620,343 @@ async fn given_a_poison_record_inside_a_batch_when_dead_lettered_then_should_sta
         (capsule.source.partition_id, capsule.source.offset),
     );
     worker.shutdown().await.expect("the worker should drain");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_record_for_another_agent_when_its_group_commits_past_it_then_should_report_skipped()
+ {
+    let laser = harness::laser().await;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let mut agent = Agent::builder()
+        .id("skipper".parse().expect("skipper is a valid agent id"))
+        .listen_on(AgentTopic::Sessions)
+        .handler(Worker {
+            handled: handled.clone(),
+        })
+        .build()
+        .spawn(laser.clone());
+    agent.ready().await.expect("the worker becomes ready");
+
+    let conversation = ConversationId::new();
+    let mut provenance = Provenance::builder().conversation_id(conversation).build();
+    provenance.target_agent_id = Some("someone-else".parse().expect("valid agent id"));
+    laser
+        .send_agent(
+            AgentTopic::Sessions,
+            Bytes::from_static(b"not mine"),
+            &provenance,
+        )
+        .await
+        .expect("the foreign record is published");
+    let record = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let found = ContextAssembler::builder()
+                .conversation_id(conversation)
+                .topics(vec![AgentTopic::Sessions])
+                .build()
+                .assemble(&laser)
+                .await
+                .expect("assembling the command topic should succeed");
+            found.into_iter().next()
+        }
+    })
+    .await;
+    let stream = Identifier::named(laser.default_stream().expect("stream")).expect("stream id");
+    let topic = laser
+        .client()
+        .get_topic(
+            &stream,
+            &Identifier::named(&AgentTopic::Sessions.topic_string()).expect("topic id"),
+        )
+        .await
+        .expect("topic read")
+        .expect("topic exists");
+    let stream_id = laser
+        .client()
+        .get_stream(&stream)
+        .await
+        .expect("stream read")
+        .expect("stream exists")
+        .id;
+    let at = laser_sdk::wire::agent::LogPosition::new(
+        stream_id,
+        topic.id,
+        record.id.partition_id,
+        record.id.offset,
+    );
+    let status = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let status = laser
+                .consumed(
+                    ConsumerRef::Group("skipper".parse().expect("valid group name")),
+                    at,
+                )
+                .await
+                .expect("the committed offset can be read");
+            (!matches!(status, ConsumptionStatus::NotYetConsumed { .. })).then_some(status)
+        }
+    })
+    .await;
+    assert!(
+        matches!(
+            status,
+            ConsumptionStatus::Skipped {
+                dispatch: laser_sdk::wire::dispatch::Dispatch::Foreign,
+                ..
+            }
+        ),
+        "{status:?}"
+    );
+    assert_eq!(handled.load(Ordering::SeqCst), 0);
+    agent.shutdown().await.expect("the worker drains cleanly");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_connected_runtime_when_records_are_handled_then_should_commit_through_the_group_consumer()
+ {
+    // A connection string lets the runtime read through the group-aware
+    // engine the server advertises, with one commit per handled record.
+    let laser = harness::connected_laser().await;
+    for (id, concurrency) in [
+        ("group-serial", ConcurrencyPolicy::Serial),
+        (
+            "group-lanes",
+            ConcurrencyPolicy::SerialPerPartition { max_partitions: 4 },
+        ),
+    ] {
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let mut first = Agent::builder()
+            .id(id.parse().expect("the agent id is valid"))
+            .listen_on(AgentTopic::Sessions)
+            .concurrency(concurrency)
+            .handler(Worker {
+                handled: first_count.clone(),
+            })
+            .build()
+            .spawn(laser.clone());
+        first.ready().await.expect("the first worker becomes ready");
+        let target: AgentId = id.parse().expect("the agent id is valid");
+        for _ in 0..3 {
+            let provenance = Provenance::builder()
+                .conversation_id(ConversationId::new())
+                .target_agent_id(target.clone())
+                .build();
+            laser
+                .send_agent(
+                    AgentTopic::Sessions,
+                    Bytes::from_static(b"work"),
+                    &provenance,
+                )
+                .await
+                .expect("the work is published");
+        }
+        harness::eventually(|| async { (first_count.load(Ordering::SeqCst) == 3).then_some(()) })
+            .await;
+        first.shutdown().await.expect("the first worker drains");
+
+        let second_count = Arc::new(AtomicUsize::new(0));
+        let mut second = Agent::builder()
+            .id(id.parse().expect("the agent id is valid"))
+            .listen_on(AgentTopic::Sessions)
+            .concurrency(concurrency)
+            .handler(Worker {
+                handled: second_count.clone(),
+            })
+            .build()
+            .spawn(laser.clone());
+        second
+            .ready()
+            .await
+            .expect("the second worker becomes ready");
+        let provenance = Provenance::builder()
+            .conversation_id(ConversationId::new())
+            .target_agent_id(target)
+            .build();
+        laser
+            .send_agent(
+                AgentTopic::Sessions,
+                Bytes::from_static(b"work"),
+                &provenance,
+            )
+            .await
+            .expect("the work is published");
+        harness::eventually(|| async { (second_count.load(Ordering::SeqCst) >= 1).then_some(()) })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            second_count.load(Ordering::SeqCst),
+            1,
+            "{id}: committed records are not delivered again"
+        );
+        second.shutdown().await.expect("the second worker drains");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_failed_dead_letter_in_a_lane_when_the_worker_stops_then_should_not_commit_the_queued_successor()
+ {
+    let laser = harness::laser().await;
+    let stream = Identifier::named(
+        laser
+            .default_stream()
+            .expect("the test laser names its stream"),
+    )
+    .expect("the stream name is valid");
+    let dlq = Identifier::named(&AgentTopic::Dlq.topic_string()).expect("the DLQ name is valid");
+    laser
+        .client()
+        .delete_topic(&stream, &dlq)
+        .await
+        .expect("the DLQ topic is removed");
+    let target: AgentId = "lane-outage".parse().expect("the agent id is valid");
+    // One conversation keys both records onto one partition, so the
+    // successor queues behind the record whose dead letter fails.
+    let conversation = ConversationId::new();
+    let provenance = Provenance::builder()
+        .conversation_id(conversation)
+        .target_agent_id(target.clone())
+        .build();
+    for payload in [b"reject".as_slice(), b"after".as_slice()] {
+        laser
+            .send_agent(
+                AgentTopic::Sessions,
+                Bytes::copy_from_slice(payload),
+                &provenance,
+            )
+            .await
+            .expect("the record is published");
+    }
+
+    let handled = Arc::new(AtomicUsize::new(0));
+    let first = Agent::builder()
+        .id(target.clone())
+        .listen_on(AgentTopic::Sessions)
+        .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions: 4 })
+        .handler(Worker {
+            handled: handled.clone(),
+        })
+        .build()
+        .spawn(laser.clone());
+    let failure = first
+        .join()
+        .await
+        .expect_err("a required DLQ publish failure stops the worker");
+    assert!(
+        matches!(failure, LaserError::PublishFailed(_)),
+        "{failure:?}"
+    );
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        0,
+        "the lane stops before its queued successor"
+    );
+
+    laser
+        .topic(AgentTopic::Dlq.topic_string())
+        .ensure(4)
+        .await
+        .expect("the DLQ topic is restored");
+    let restarted = harness::reconnect(&laser).await;
+    let mut second = Agent::builder()
+        .id(target)
+        .listen_on(AgentTopic::Sessions)
+        .concurrency(ConcurrencyPolicy::SerialPerPartition { max_partitions: 4 })
+        .handler(Worker {
+            handled: handled.clone(),
+        })
+        .build()
+        .spawn(restarted);
+    second
+        .ready()
+        .await
+        .expect("the replacement worker is ready");
+    harness::eventually(|| async { (handled.load(Ordering::SeqCst) == 1).then_some(()) }).await;
+    let dead = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let dead = ContextAssembler::builder()
+                .conversation_id(conversation)
+                .topics(vec![AgentTopic::Dlq])
+                .build()
+                .assemble(&laser)
+                .await
+                .ok()?;
+            (dead.len() == 1).then_some(dead)
+        }
+    })
+    .await;
+    let capsule = decode_named::<AgentDeadLetter>(&dead[0].payload)
+        .expect("the dead-letter payload is a capsule");
+    assert_eq!(capsule.payload, b"reject");
+    second
+        .shutdown()
+        .await
+        .expect("the replacement worker drains");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_an_undecodable_record_with_a_conversation_header_when_dead_lettered_then_should_keep_its_conversation()
+ {
+    let laser = harness::laser().await;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let mut worker = Agent::builder()
+        .id("decoder".parse().expect("the agent id is valid"))
+        .listen_on(AgentTopic::Sessions)
+        .handler(Worker {
+            handled: handled.clone(),
+        })
+        .build()
+        .spawn(laser.clone());
+    worker.ready().await.expect("the worker is ready");
+
+    let conversation = ConversationId::new();
+    let producer = laser
+        .topic(AgentTopic::Sessions.topic_string())
+        .producer()
+        .build()
+        .await
+        .expect("the producer builds");
+    let message = ProducerMessage::new(b"not an envelope".as_slice())
+        .header(
+            HeaderKey::try_from(laser_sdk::wire::headers::AGENT_VERSION).expect("a valid key"),
+            HeaderValue::from(laser_sdk::wire::codes::AGENT_OP_VERSION),
+        )
+        .header(
+            HeaderKey::try_from(laser_sdk::wire::headers::CONVERSATION_ID).expect("a valid key"),
+            conversation
+                .to_string()
+                .parse::<HeaderValue>()
+                .expect("a valid header value"),
+        );
+    producer
+        .send_batch_with_routing([message], None)
+        .await
+        .expect("the undecodable record is published");
+
+    let dead = harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let dead = ContextAssembler::builder()
+                .conversation_id(conversation)
+                .topics(vec![AgentTopic::Dlq])
+                .build()
+                .assemble(&laser)
+                .await
+                .ok()?;
+            (dead.len() == 1).then_some(dead)
+        }
+    })
+    .await;
+    let capsule = decode_named::<AgentDeadLetter>(&dead[0].payload)
+        .expect("the dead-letter payload is a capsule");
+    assert_eq!(capsule.reason, DeadLetterReason::DecodeFailed);
+    assert_eq!(capsule.payload, b"not an envelope");
+    assert_eq!(handled.load(Ordering::SeqCst), 0);
+    worker.shutdown().await.expect("the worker drains");
 }

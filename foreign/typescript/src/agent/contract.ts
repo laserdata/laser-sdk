@@ -1,18 +1,25 @@
+import { millisToMicros } from "../client/duration.js"
 import { ownedBytes, type BytesLike } from "../client/bytes.js"
-import { InvalidError, TimeoutError, UnsupportedError, type LaserError } from "../client/errors.js"
+import { InvalidError, TimeoutError, type LaserError } from "../client/errors.js"
 import { INTERNAL_REPLY_HUB, INTERNAL_VERIFIER } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
 import { ConversationId, type AgentId } from "../types/ids.js"
 import {
   AgentKind,
-  METADATA_RUN,
-  OPERATION_TASK,
-  type TaskState,
-  type AgentEnvelope
+  type AgentEnvelope,
+  type AgentErrorBody,
+  METADATA_SUBMITTED,
+  OPERATION_SESSION,
+  TaskStateName,
+  encodeSessionStart,
+  taskStateFromCode
 } from "../wire/agent.js"
+import { encodeNamed } from "../wire/cbor.js"
+import { ContentType } from "../wire/content.js"
+import type { Session } from "../session.js"
 import { FENCE } from "../wire/headers.js"
-import { CorrelationId } from "../wire/ids.js"
+import { ConversationId as WireConversationId, CorrelationId } from "../wire/ids.js"
 import { agentMessageBody, type AgentMessage } from "./reliable-consumer.js"
 import type { ReplyStreamTicket } from "./replies.js"
 import {
@@ -75,11 +82,11 @@ function duration(name: string, value: number): number {
 
 function durationMicros(name: string, value: number): bigint {
   duration(name, value)
-  const micros = value * 1_000
-  if (!Number.isSafeInteger(micros)) {
+  const micros = millisToMicros(value)
+  if (micros > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new InvalidError(`${name} must fit in a safe whole number of microseconds`)
   }
-  return BigInt(micros)
+  return micros
 }
 
 async function resolveContract(
@@ -126,37 +133,69 @@ function isWorking(envelope: AgentEnvelope | undefined): boolean {
   )
 }
 
-export async function markRun(
+// Write a child session's submitted start as `source` and return its lens,
+// which carries the child's parent and root on every record it writes.
+/** @internal */
+export async function startChild(
   laser: Laser,
   source: AgentId,
+  target: AgentId,
   conversation: ConversationId,
-  run: string,
-  state: TaskState,
-  detail?: string
-): Promise<void> {
-  const correlation = CorrelationId.parse(conversation.toString())
-  let status = laser
-    .agdx(AgentTopic.Responses, source, conversation)
-    .status(OPERATION_TASK)
-    .withCorrelation(correlation)
-    .withTaskState(state)
-    .withMetadata(METADATA_RUN, { kind: "str", value: run })
-  if (detail !== undefined) {
-    status = status.withMetadata("detail", { kind: "str", value: detail })
+  parent: ConversationId,
+  root: ConversationId
+): Promise<Session> {
+  const sessions = laser.sessions()
+  const wireParent = WireConversationId.parse(parent.toString())
+  const wireRoot = WireConversationId.parse(root.toString())
+  const start = encodeNamed(
+    encodeSessionStart({
+      agent: target.wireId(),
+      sdk: sessions.config.sdkInfo,
+      parent: wireParent,
+      root: wireRoot,
+      idleTimeoutMicros: millisToMicros(sessions.config.idleTimeoutValue),
+      tags: []
+    })
+  )
+  const session = sessions.open(conversation).asAgent(source).withAncestry(parent, root)
+  await session
+    .lane()
+    .status(OPERATION_SESSION)
+    .withTaskState(taskStateFromCode(TaskStateName.Submitted))
+    .body(start)
+    .contentType(ContentType.Cbor)
+    .withAncestry(wireParent, wireRoot)
+    .send()
+  return session
+}
+
+function failureReason(outcome: Contract): string {
+  switch (outcome.kind) {
+    case "completed":
+      return "completed"
+    case "failed":
+      return "the target replied with a terminal error"
+    case "notConsumed":
+      return "the command was not consumed within the expiry"
+    case "timedOut":
+      return "no terminal reply landed within the deadline"
   }
-  await status.send()
+}
+
+function contractFailure(message: string): AgentErrorBody {
+  return { code: { kind: "known", name: "Internal" }, message, retryable: false }
 }
 
 export class ContractBuilder {
   private source: AgentId | undefined
   private body: Uint8Array = new Uint8Array()
   private route: InboxRoute = ADVERTISED_INBOX_ROUTE
-  private replyTopic: string = AgentTopic.Responses
+  private replyTopic: string = AgentTopic.Sessions
   private expiryMicros: bigint | undefined
   private deadlineMs = DEFAULT_DEADLINE_MS
   private fenceToken: bigint | undefined
   private conversationId: ConversationId | undefined
-  private registerRun = false
+  private parentIds: { readonly parent: ConversationId; readonly root: ConversationId } | undefined
 
   private constructor(
     private readonly laser: Laser,
@@ -212,8 +251,14 @@ export class ContractBuilder {
     return this
   }
 
-  registered(): this {
-    this.registerRun = true
+  /** Run the contract as a child session of `parent`, in the tree rooted at
+   * `root` (the parent itself when it has no parent). `send` writes the
+   * child's submitted start on `agent.sessions` before the command, stamps the
+   * ancestry on the command, and ends the child by the outcome: completed on a
+   * reply, failed otherwise. A lifecycle record that fails to publish surfaces
+   * as the error unless the contract itself already erred. */
+  parent(parent: ConversationId, root: ConversationId): this {
+    this.parentIds = { parent, root }
     return this
   }
 
@@ -222,22 +267,26 @@ export class ContractBuilder {
     if (source === undefined) {
       throw new InvalidError("a contract requires `.from(source agent id)`")
     }
-    if (this.registerRun && !(await this.laser.capabilities()).agentWorkflow) {
-      throw new UnsupportedError(
-        "a registered contract requires a plane that serves the run registry"
-      )
-    }
     const resolved = await resolveContract(this.laser, this.router, this.route, this.nowMicros())
     const conversation = this.conversationId ?? ConversationId.new()
     const actualCorrelation = CorrelationId.parse(ConversationId.new().toString())
-    const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic)
+    // A child session's start lands before its command, so a reader never sees
+    // work for a session that does not exist yet.
+    const ancestry = this.parentIds
+    const child =
+      ancestry === undefined
+        ? undefined
+        : await startChild(
+            this.laser,
+            source,
+            resolved.target,
+            conversation,
+            ancestry.parent,
+            ancestry.root
+          )
+    const hub = await this.laser[INTERNAL_REPLY_HUB](this.replyTopic, source)
     const ticket = hub.subscribeStream(actualCorrelation.toString(), resolved.expectedSigner)
-    let run: string | undefined
     try {
-      if (this.registerRun) {
-        run = (await this.laser.runs().submitWith(resolved.target.asStr(), { input: this.body }))
-          .runId
-      }
       let command = this.laser
         .agdx(resolved.inbox, source, conversation)
         .command(actualCorrelation, this.body)
@@ -245,27 +294,31 @@ export class ContractBuilder {
       if (this.fenceToken !== undefined) {
         command = command.withMetadata(FENCE, { kind: "uint", value: this.fenceToken })
       }
-      if (run !== undefined)
-        command = command.withMetadata(METADATA_RUN, { kind: "str", value: run })
+      if (ancestry !== undefined) {
+        command = command
+          .withAncestry(
+            WireConversationId.parse(ancestry.parent.toString()),
+            WireConversationId.parse(ancestry.root.toString())
+          )
+          .withMetadata(METADATA_SUBMITTED, { kind: "bool", value: true })
+      }
       if (this.expiryMicros !== undefined) {
         command = command.withDeadlineMicros(this.nowMicros() + this.expiryMicros)
       }
       await command.send()
-      if (run !== undefined) {
-        await markRun(this.laser, source, conversation, run, { kind: "known", name: "Working" })
+      let outcome: Contract
+      try {
+        outcome = await this.watch(ticket, resolved.expectedSigner)
+      } catch (error) {
+        // The contract error wins over a lifecycle error.
+        await child
+          ?.fail(contractFailure(error instanceof Error ? error.message : String(error)))
+          .catch(() => undefined)
+        throw error
       }
-      const outcome = await this.watch(ticket, resolved.expectedSigner)
-      if (run !== undefined) {
-        const state = outcome.kind === "completed" ? "Completed" : "Failed"
-        const detail =
-          outcome.kind === "failed"
-            ? "the target replied with a terminal error"
-            : outcome.kind === "notConsumed"
-              ? "the command was not consumed within the expiry"
-              : outcome.kind === "timedOut"
-                ? "no terminal reply landed within the deadline"
-                : undefined
-        await markRun(this.laser, source, conversation, run, { kind: "known", name: state }, detail)
+      if (child !== undefined) {
+        if (outcome.kind === "completed") await child.end()
+        else await child.fail(contractFailure(failureReason(outcome)))
       }
       return outcome
     } finally {

@@ -19,6 +19,39 @@ async function freshTopic(laser: Laser) {
   return topic
 }
 
+void test("given_native_offset_history_when_rewound_and_deleted_then_should_follow_the_replay_option", async () => {
+  await using laser = await Laser.connect(CONNECTION_STRING)
+  const topic = await freshTopic(laser)
+  for (const payload of ["zero", "one", "two"]) await topic.send(utf8(payload))
+  for (const allowReplay of [false, true]) {
+    await using consumer = topic.consumer(`native-offset-history-${String(allowReplay)}`, 0, {
+      startAt: { kind: "first" },
+      commitPolicy: { kind: "disabled" },
+      allowReplay
+    })
+    const records = []
+    for (let index = 0; index < 3; index += 1) records.push(await consumer.nextWithin(3_000))
+    const [zero, one, two] = records
+    assert.ok(zero && one && two)
+    await consumer.commit(two)
+    await consumer.commit(one)
+    const expected = allowReplay ? 1n : 2n
+    assert.equal(consumer.lastStoredOffset(0), expected)
+    await consumer.storeOffset(2n, 0)
+    await consumer.storeOffset(2n, 0)
+    await consumer.storeOffset(1n, 0)
+    assert.equal((await consumer.storedOffset(0))?.storedOffset, expected)
+    await consumer.deleteOffset(0)
+    assert.equal(await consumer.storedOffset(0), undefined)
+    assert.equal(consumer.lastStoredOffset(0), expected)
+    await consumer.storeOffset(1n, 0)
+    assert.equal((await consumer.storedOffset(0))?.storedOffset, allowReplay ? 1n : undefined)
+    await consumer.storeOffset(0n, 0)
+    assert.equal((await consumer.storedOffset(0))?.storedOffset, 0n)
+    assert.equal(consumer.lastStoredOffset(0), 0n)
+  }
+})
+
 void test("given_several_sent_messages_when_consumed_with_next_within_then_should_return_them_in_order", async () => {
   const laser = await Laser.connect(CONNECTION_STRING)
   try {

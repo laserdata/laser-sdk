@@ -47,7 +47,7 @@ async fn send_governed(world: &mut LaserWorld, payload: String) {
         .governed
         .as_ref()
         .expect("a governed laser")
-        .send_agent(AgentTopic::Commands, payload.into_bytes(), &provenance)
+        .send_agent(AgentTopic::Sessions, payload.into_bytes(), &provenance)
         .await;
     world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }

@@ -24,9 +24,9 @@ The maintained artifact versions are:
 
 | Binary | Version |
 | --- | --- |
-| Iggy server | `0.9.2-ld` |
+| Iggy server | `0.9.3-ld` |
 | `iggy-bench` | `0.6.0` |
-| plane | `0.21.0` |
+| plane | `0.22.0` |
 
 ## Default Campaign
 
@@ -121,9 +121,9 @@ Artifact mode downloads binaries and adjacent Minisign signatures from `https://
 [provisioning]
 mode = "artifact"
 cpu_target = "skylake"
-iggy_server_version = "0.9.2-ld"
+iggy_server_version = "0.9.3-ld"
 iggy_bench_version = "0.6.0"
-plane_version = "0.21.0"
+plane_version = "0.22.0"
 ```
 
 Path mode runs caller-provided native binaries and records their digests:
@@ -179,3 +179,7 @@ Zed loads both the published workspace and the detached benchmark workspace thro
 `cargo bench --manifest-path bench/Cargo.toml --bench filter_paths` measures every case in the shared JSON and codec corpora. Each case checks its frozen expected verdict before measurement. Compilation stays outside the measured loop. This covers typed headers, fields, boolean expressions, missing values, coercions, text predicates, and codec error paths. These are evaluator component costs, not network latency or server throughput.
 
 `cargo bench --manifest-path bench/Cargo.toml --bench glob` compares the compiled glob matcher with the preserved original algorithm on identical inputs. It includes a normal event name, Unicode, and repeated-prefix rejection at 1 KiB and 64 KiB. The comparison asserts identical results before timing.
+
+## Session sizing
+
+`cargo run --release --manifest-path bench/Cargo.toml --example session_sizing -- <host:port> <measurement> ...` measures the managed session index against a running stack, for example one started with `scripts/run-managed-bdd.sh stack`. The measurements are `scan` (records a role examines per record it receives on the shared lane), `admission` (filtered page rounds under concurrent readers), `fold` (session records folded per second after registration, and the change feed's sequence), and `state` (state document and history growth per delta). Each prints JSON lines. The results and their setup are in [session sizing](../docs/session-sizing.md).

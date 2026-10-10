@@ -313,10 +313,10 @@ async fn prepare_stream(
 ) -> Result<Laser, BenchError> {
     let stream = format!("bench-{}-{seed:016x}", kind.label());
     for topic in [
-        AgentTopic::Commands,
-        AgentTopic::Responses,
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
         AgentTopic::Registry,
-        AgentTopic::ToolCalls,
+        AgentTopic::Sessions,
     ] {
         laser
             .stream(&stream)
@@ -374,8 +374,8 @@ async fn start_workers(
             .with_ops_stream(ops_stream.clone());
         let mut handle = Agent::builder()
             .id(agent)
-            .listen_on(AgentTopic::Commands)
-            .respond_on(AgentTopic::Responses)
+            .listen_on(AgentTopic::Sessions)
+            .respond_on(AgentTopic::Sessions)
             .capabilities(vec![CapabilityDescriptor {
                 skill_id: SKILL.to_owned(),
                 ..CapabilityDescriptor::default()
@@ -405,9 +405,9 @@ async fn start_orchestrator(
         .map_err(|error| BenchError::Invalid(format!("invalid orchestrator id: {error}")))?;
     let mut handle = Agent::builder()
         .id(id)
-        .listen_on(AgentTopic::ToolCalls)
-        .respond_on(AgentTopic::Responses)
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .handler(FanOutHandler {
             recipients,
             ledger,
@@ -457,7 +457,7 @@ fn operation(
                         .build();
                     provenance.agent = Some(source.clone());
                     if let Err(error) = laser
-                        .send_agent(AgentTopic::ToolCalls, body, &provenance)
+                        .send_agent(AgentTopic::Sessions, body, &provenance)
                         .await
                     {
                         ledger.cancel(id).await;
@@ -474,7 +474,7 @@ fn operation(
                             source,
                             &CapabilitySelector::new(SKILL, RoutePolicy::Any),
                             &body,
-                            &InboxRoute::Fixed(AgentTopic::Commands),
+                            &InboxRoute::Fixed(AgentTopic::Sessions),
                             timeout,
                         )
                         .await

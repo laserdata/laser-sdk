@@ -1935,3 +1935,118 @@ async fn given_typed_custom_headers_when_filtered_then_should_preserve_types_and
     );
     reader.close().await.expect("close");
 }
+
+struct AddresseeRecorder(Arc<Mutex<Vec<String>>>);
+
+impl laser_sdk::agent::AgentHandler for AddresseeRecorder {
+    async fn handle(
+        &self,
+        message: &laser_sdk::agent::AgentMessage,
+        _ctx: &laser_sdk::agent::AgentCtx<'_>,
+    ) -> Result<(), LaserError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(String::from_utf8_lossy(message.body()).into_owned());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn given_a_filtering_server_when_an_agent_spawns_on_the_session_topic_then_should_bind_its_group_to_the_addressee_filter()
+ {
+    use laser_sdk::types::MintUlid;
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let me: laser_sdk::wire::agent::AgentId = "triage".parse().expect("valid agent id");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = laser_sdk::agent::Agent::builder()
+        .id("triage".parse().expect("valid agent id"))
+        .listen_on(laser_sdk::provenance::AgentTopic::Sessions)
+        .handler(AddresseeRecorder(Arc::clone(&seen)))
+        .build()
+        .spawn(laser.clone());
+    agent.ready().await.expect("the agent is ready");
+
+    let info = laser
+        .topic(laser_sdk::wire::topics::AGENT_SESSIONS)
+        .consumer_group("triage")
+        .info()
+        .await
+        .expect("the role group exists");
+    assert_eq!(
+        info.filter.map(|binding| binding.digest),
+        Some(laser_sdk::wire::dispatch::addressee_filter(&me).digest()),
+        "the role group runs the addressee filter"
+    );
+
+    let conversation = laser_sdk::wire::agent::ConversationId::mint();
+    let client: laser_sdk::wire::agent::AgentId = "client".parse().expect("valid agent id");
+    for (target, body) in [
+        (Some("triage"), "mine"),
+        (Some("critic"), "theirs"),
+        (None, "everyone"),
+    ] {
+        let producer = laser.agdx(
+            laser_sdk::provenance::AgentTopic::Sessions,
+            client.clone(),
+            conversation,
+        );
+        let command = producer.command(
+            laser_sdk::wire::agent::CorrelationId::mint(),
+            body.as_bytes().to_vec(),
+        );
+        let command = match target {
+            Some(target) => command.with_target(
+                target
+                    .parse::<laser_sdk::types::AgentId>()
+                    .expect("valid agent id"),
+            ),
+            None => command,
+        };
+        command.send().await.expect("the command is sent");
+    }
+    harness::eventually(|| async {
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (seen.len() >= 2).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut seen = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    seen.sort();
+    assert_eq!(seen, vec!["everyone".to_owned(), "mine".to_owned()]);
+    agent.shutdown().await.expect("the agent stops");
+}
+
+#[tokio::test]
+async fn given_a_role_group_bound_to_another_filter_when_an_agent_spawns_then_should_refuse_to_run()
+{
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    laser
+        .topic(laser_sdk::wire::topics::AGENT_SESSIONS)
+        .consumer_group("auditor")
+        .create()
+        .filter(laser_sdk::wire::dispatch::broadcast_filter())
+        .build()
+        .await
+        .expect("the group is bound to the broadcast filter");
+    let agent = laser_sdk::agent::Agent::builder()
+        .id("auditor".parse().expect("valid agent id"))
+        .listen_on(laser_sdk::provenance::AgentTopic::Sessions)
+        .handler(AddresseeRecorder(Arc::default()))
+        .build()
+        .spawn(laser.clone());
+    let error = agent
+        .join()
+        .await
+        .expect_err("a group bound to another digest is refused");
+    assert!(
+        matches!(error, LaserError::ConsumerGroupSetup { .. }),
+        "{error:?}"
+    );
+}

@@ -23,7 +23,8 @@ pub mod feature {
     pub const STRONG_CONSISTENCY: u64 = 1 << 2;
     /// The key-value store serves fenced compare-and-swap (`AGDX_KV_CAS_FENCED`).
     pub const KV_CAS_FENCED: u64 = 1 << 3;
-    /// The plane serves the agent and workflow control band (`AGDX_AGENT_*`).
+    /// Retired with the run registry. No server sets it and the bit is never
+    /// reused.
     pub const AGENT_WORKFLOW: u64 = 1 << 4;
     /// The query surface serves lexical relevance search (`Query.text`).
     pub const KEYWORD_SEARCH: u64 = 1 << 5;
@@ -56,6 +57,12 @@ pub mod feature {
     /// examined records and wait for a catalog position. A client must not send
     /// the automatic selector to a server without this bit.
     pub const GROUP_POLICY_READS: u64 = 1 << 11;
+    /// The managed backend serves session reads for one named stream.
+    pub const SESSIONS: u64 = 1 << 12;
+    /// The managed backend runs in stream tenancy: every managed name is
+    /// scoped to one stream, and the change feed and dead letters of each
+    /// stream ride their own ops topics.
+    pub const STREAM_TENANCY: u64 = 1 << 13;
 }
 
 /// The wire op versions a server accepts, one per surface, plus the capability

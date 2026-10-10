@@ -1,5 +1,6 @@
 import { CodecError } from "../client/errors.js"
 import { type CborMap, field } from "./cbor.js"
+import { decodeForwardedScope, encodeForwardedScope, type ForwardedScope } from "./forward.js"
 
 export const MANAGED_REQUEST_VERSION = 1
 
@@ -68,19 +69,22 @@ export interface MutationCommandEnvelope {
   readonly operationId: bigint
   readonly timestampMicros: bigint
   readonly commandCode: number
+  readonly scope?: ForwardedScope
   readonly payload: Uint8Array
 }
 
 export function encodeMutationCommandEnvelope(
   envelope: MutationCommandEnvelope
 ): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["v", BigInt(envelope.v)],
     ["operation_id", envelope.operationId],
     ["timestamp_micros", envelope.timestampMicros],
-    ["command_code", BigInt(envelope.commandCode)],
-    ["payload", envelope.payload]
+    ["command_code", BigInt(envelope.commandCode)]
   ])
+  if (envelope.scope !== undefined) map.set("scope", encodeForwardedScope(envelope.scope))
+  map.set("payload", envelope.payload)
+  return map
 }
 
 export function decodeMutationCommandEnvelope(
@@ -92,6 +96,7 @@ export function decodeMutationCommandEnvelope(
     throw new CodecError("mutation command version must not be zero", "mutation", "v")
   }
   const operationId = field.requiredU128(map, "operation_id", context)
+  const scopeMap = field.optionalMap(map, "scope", context)
   if (operationId === 0n) {
     throw new CodecError(
       "mutation command operation id must not be zero",
@@ -104,6 +109,9 @@ export function decodeMutationCommandEnvelope(
     operationId,
     timestampMicros: field.requiredU64(map, "timestamp_micros", context),
     commandCode: field.requiredU32(map, "command_code", context),
+    ...(scopeMap !== undefined
+      ? { scope: decodeForwardedScope(scopeMap, `${context}.scope`) }
+      : {}),
     payload: field.requiredBytes(map, "payload", context)
   }
 }

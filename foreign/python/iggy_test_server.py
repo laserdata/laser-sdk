@@ -44,7 +44,7 @@ class IggyTestServer:
         env = os.environ.copy()
         env.update(
             {
-                "IGGY_PATH": str(data_path),
+                "IGGY_PATH": str(data_path / "data"),
                 "IGGY_TCP_ADDRESS": f"127.0.0.1:{self._port}",
                 "IGGY_HTTP_ENABLED": "false",
                 "IGGY_QUIC_ENABLED": "false",
@@ -230,7 +230,7 @@ class IggyTestCluster:
         env = os.environ.copy()
         env.update(
             {
-                "IGGY_PATH": str(data_path),
+                "IGGY_PATH": str(data_path / "data"),
                 "IGGY_CLUSTER_ENABLED": "true",
                 "IGGY_CLUSTER_NAME": "laser-sdk-rolling-restart",
                 "IGGY_MESSAGE_BUS_RECONNECT_PERIOD": "100ms",

@@ -92,7 +92,8 @@ pub struct Query {
     #[cfg_attr(feature = "builders", builder(into))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_type: Option<String>,
-    // (start, end) in epoch microseconds.
+    // (start, end) in epoch microseconds, both bounds inclusive: the plane
+    // keeps rows with `start <= ts <= end`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_range: Option<(u64, u64)>,
     // Predicate tree. `None` plus empty sugar is an unfiltered scan. Build
@@ -285,7 +286,7 @@ impl Validate for Query {
             && start >= end
         {
             return Err(InvalidError::new(
-                "query time range must be a nonempty half-open interval",
+                "query time range start must be before its end, and both bounds are inclusive",
             ));
         }
         for sort in &self.order {

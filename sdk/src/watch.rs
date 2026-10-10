@@ -28,10 +28,11 @@ pub struct Watch<'a> {
 }
 
 impl<'a> Watch<'a> {
-    /// Keep only advancements of this materialized index.
+    /// Keep only advancements of this materialized index, named as
+    /// [`Laser::resource_name`] names it.
     #[must_use]
     pub fn index(mut self, index: impl Into<String>) -> Self {
-        self.index = Some(index.into());
+        self.index = Some(self.laser.resource_name(&index.into()));
         self
     }
 
@@ -48,7 +49,14 @@ impl<'a> Watch<'a> {
             ));
         }
         let ops_stream = self.laser.ops_stream();
-        let changes_topic = self.laser.changes_topic();
+        // Under stream tenancy each stream's change feed rides its own ops
+        // topic, so a scoped handle reads its stream's topic.
+        let changes_topic = match self.laser.resource_stream() {
+            Some(stream) if self.laser.current_capabilities().stream_tenancy => {
+                laser_wire::topics::stream_ops_topic(stream, laser_wire::topics::CHANGES_TOPIC)
+            }
+            _ => self.laser.changes_topic(),
+        };
         let cursor = self.laser.reader_on(&ops_stream, &changes_topic)?;
         Ok(WatchReader {
             cursor,
@@ -121,5 +129,18 @@ impl WatchReader {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::laser::Laser;
+
+    #[test]
+    fn given_a_default_stream_when_watching_an_index_then_should_match_the_scoped_name() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_default_stream("acme");
+        let watch = laser.watch().index("readings");
+        assert_eq!(watch.index.as_deref(), Some("stream:acme/readings"));
     }
 }

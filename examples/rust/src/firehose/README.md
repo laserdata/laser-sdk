@@ -1,4 +1,4 @@
-# firehose - millions of messages, many orgs, gigabytes of data
+# firehose: millions of messages across many organizations
 
 This example generates telemetry records across several organization topics. It tests publication volume, projection, queries, and storage use. Use its message-count and payload-size controls to bound a run.
 
@@ -20,16 +20,16 @@ All load controls use the `LASER_FIREHOSE_` prefix within the SDK `LASER_` names
 | variable | default | meaning |
 | --- | --- | --- |
 | `LASER_FIREHOSE_ORGS` | `8` | number of org indexes to fan across |
-| `LASER_FIREHOSE_MESSAGES` | `2000000` | total messages to publish |
+| `LASER_FIREHOSE_MESSAGES` | `20000` | total messages to publish |
 | `LASER_FIREHOSE_PAYLOAD_BYTES` | `4096` | approximate JSON body size per message |
-| `LASER_FIREHOSE_BATCH` | `1000` | records per send call |
-| `LASER_FIREHOSE_CONCURRENCY` | `12` | orgs published in parallel |
+| `LASER_FIREHOSE_BATCH` | `500` | records per send call |
+| `LASER_FIREHOSE_CONCURRENCY` | `4` | orgs published in parallel |
 | `LASER_FIREHOSE_PARTITIONS` | `8` | partitions per topic |
 | `LASER_FIREHOSE_REGISTER` | `true` | register projections (set `false` for publish only) |
 | `LASER_FIREHOSE_QUERY` | `true` | run trailing analytics queries |
-| `LASER_FIREHOSE_PROGRESS_EVERY` | `100000` | progress log cadence in messages |
+| `LASER_FIREHOSE_PROGRESS_EVERY` | `5000` | progress log cadence in messages |
 
-Approximate payload volume is `LASER_FIREHOSE_MESSAGES` multiplied by `LASER_FIREHOSE_PAYLOAD_BYTES`. Defaults produce 2 million messages of 4 KB across 8 organization indexes, about 8 GB of payload. LaserData Cloud handles projection and queries. Apache Iggy runs publication and skips managed phases.
+Approximate payload volume is `LASER_FIREHOSE_MESSAGES` multiplied by `LASER_FIREHOSE_PAYLOAD_BYTES`. Defaults produce 20,000 messages of 4 KB across 8 organization indexes, about 8 GB of payload. LaserData Cloud handles projection and queries. Apache Iggy runs publication and skips managed phases.
 
 ```sh
 # defaults: about 2M messages across 8 org indexes, 4 KB payloads, about 8 GB
@@ -56,3 +56,5 @@ cargo run --release --example firehose
 - Inline payloads padded to a configurable size, so the run exercises real storage pressure rather than tiny bodies.
 - Body-first indexing: 16 typed columns extracted from the body, plus the `message_type` and `ts` convention fields, no `agdx.idx.*` headers duplicating the payload.
 - Trailing aggregate queries (`count` / `group_by` / ordering) across every index, best-effort so the run stays green on an open server.
+
+With managed queries enabled, the example waits for every populated index to reach its expected row count before it runs analytics and exits. This lets a second run recreate the stream after the first run finishes materializing.

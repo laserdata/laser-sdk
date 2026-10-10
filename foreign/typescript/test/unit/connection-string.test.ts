@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { test } from "node:test"
-import { TransportError } from "../../src/client/errors.js"
+import { ConfigError, TransportError } from "../../src/client/errors.js"
 import { LASERDATA_ROOT_CA } from "../../src/client/laserdata-ca.js"
 import { ApacheIggyTransport, parseConnectionString } from "../../src/iggy/apache-iggy.js"
 
@@ -93,10 +93,122 @@ void test("given_a_connection_string_without_a_scheme_when_parsed_then_should_pr
   assert.deepEqual(parsed.reconnection, { intervalMs: 1_000, maxRetries: undefined })
 })
 
-void test("given_an_ipv6_authority_when_parsed_then_should_preserve_the_host_and_port", () => {
-  const parsed = parseConnectionString("iggy://user:password@[2001:db8::7]:9080", {})
-  assert.equal(parsed.host, "[2001:db8::7]")
-  assert.equal(parsed.port, 9080)
+void test("given_an_ipv6_authority_or_a_path_when_parsed_then_should_refuse_it", () => {
+  for (const value of [
+    "iggy://user:password@[2001:db8::7]:9080",
+    "iggy://user:password@host/path",
+    "iggy://user:password@host#frag"
+  ]) {
+    assert.throws(() => parseConnectionString(value, {}), ConfigError, value)
+  }
+})
+
+void test("given_no_port_when_parsed_then_should_default_to_8090", () => {
+  assert.equal(parseConnectionString("user:password@host", {}).port, 8090)
+  assert.equal(parseConnectionString("iggy://user:password@host?nodelay=true", {}).port, 8090)
+})
+
+void test("given_an_out_of_range_port_when_parsed_then_should_refuse_it", () => {
+  for (const port of ["0", "65536", "+80", "8o90", ""]) {
+    assert.throws(
+      () => parseConnectionString(`iggy://user:password@host:${port}`, {}),
+      ConfigError,
+      port
+    )
+  }
+  assert.equal(parseConnectionString("iggy://user:password@host:65535", {}).port, 65_535)
+})
+
+void test("given_a_scheme_other_than_iggy_tcp_when_parsed_then_should_refuse_it", () => {
+  for (const value of ["iggy+quic://u:p@host", "iggy+http://u:p@host", "http://u:p@host"]) {
+    assert.throws(() => parseConnectionString(value, {}), ConfigError, value)
+  }
+  assert.equal(parseConnectionString("iggy+tcp://u:p@host", {}).host, "host")
+})
+
+void test("given_missing_or_malformed_credentials_when_parsed_then_should_refuse_them", () => {
+  for (const value of [
+    "host:8090",
+    "iggy://host:8090",
+    "iggy://@host",
+    "iggy://:password@host",
+    "iggy://user:@host",
+    "iggy://a:b:c@host"
+  ]) {
+    assert.throws(() => parseConnectionString(value, {}), ConfigError, value)
+  }
+})
+
+void test("given_credentials_with_percent_signs_or_slashes_when_parsed_then_should_keep_them_verbatim", () => {
+  assert.deepEqual(parseConnectionString("iggy://user:p%40ss/w0rd@host", {}).credentials, {
+    username: "user",
+    password: "p%40ss/w0rd"
+  })
+  assert.deepEqual(parseConnectionString("tok%2Fen@host", {}).credentials, { token: "tok%2Fen" })
+})
+
+void test("given_unknown_repeated_or_malformed_options_when_parsed_then_should_refuse_them", () => {
+  for (const query of [
+    "x=1",
+    "TLS=true",
+    "tls=true&tls=true",
+    "tls",
+    "tls=true=false",
+    "",
+    "tls=yes",
+    "nodelay=1"
+  ]) {
+    assert.throws(
+      () => parseConnectionString(`iggy://user:password@host?${query}`, {}),
+      ConfigError,
+      query
+    )
+  }
+})
+
+void test("given_transport_options_when_parsed_then_should_apply_them", () => {
+  const parsed = parseConnectionString(
+    "iggy://user:password@host?heartbeat_interval=2s&nodelay=true&reestablish_after=100ms&tls=true&tls_domain=node.example",
+    {}
+  )
+  assert.equal(parsed.heartbeatIntervalMs, 2_000)
+  assert.equal(parsed.noDelay, true)
+  assert.equal(parsed.reestablishAfterMs, 100)
+  assert.equal(parsed.tls, true)
+  assert.equal(parsed.servername, "node.example")
+})
+
+void test("given_a_ca_file_without_tls_when_parsed_then_should_turn_tls_on_even_under_no_tls", () => {
+  for (const env of [{}, { LASER_NO_TLS: "1" }]) {
+    const parsed = parseConnectionString(
+      "iggy://user:password@host?tls_ca_file=../../sdk/certs/laserdata.crt",
+      env
+    )
+    assert.equal(parsed.tls, true)
+    assert.equal(parsed.ca, LASERDATA_ROOT_CA)
+  }
+})
+
+void test("given_tls_false_with_a_ca_file_when_parsed_then_should_refuse_it", () => {
+  assert.throws(
+    () =>
+      parseConnectionString(
+        "iggy://user:password@host?tls=false&tls_ca_file=../../sdk/certs/laserdata.crt",
+        {}
+      ),
+    ConfigError
+  )
+})
+
+void test("given_an_explicit_tls_false_when_parsed_then_should_disable_automatic_tls", () => {
+  const managed = parseConnectionString("iggy://token@api.laserdata.cloud?tls=false", {})
+  assert.equal(managed.tls, false)
+  assert.equal(managed.ca, undefined)
+  const custom = parseConnectionString("iggy://token@demo.localhost?tls=false", {
+    LASER_TLS_CERT: "../../sdk/certs/laserdata.crt"
+  })
+  assert.equal(custom.tls, false)
+  assert.equal(custom.ca, undefined)
 })
 
 void test("given_reconnection_options_when_parsed_then_should_match_the_rust_grammar", () => {

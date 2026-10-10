@@ -482,7 +482,7 @@ impl Laser {
         .with_operation(POLICY_DECISION_OPERATION);
         validate(&envelope)?;
         let payload = encode_named(&envelope)?;
-        let headers = crate::agent::agdx_headers(&envelope, ContentType::Cbor)?;
+        let headers = crate::agent::agdx_headers(&envelope, ContentType::Cbor, false)?;
         let message = iggy::prelude::IggyMessage::builder()
             .payload(bytes::Bytes::from(payload))
             .user_headers(headers)
@@ -1147,7 +1147,7 @@ mod tests {
         let action = GovernedAction {
             kind: ActionKind::Send,
             stream: "laser",
-            topic: "agent.commands",
+            topic: "agent.sessions",
             source: Some("planner"),
             target: None,
             conversation: Some(conversation),
@@ -1254,7 +1254,7 @@ mod tests {
             mode: "enforce".to_owned(),
             kind: "command".to_owned(),
             stream: "laser".to_owned(),
-            topic: "agent.commands".to_owned(),
+            topic: "agent.sessions".to_owned(),
             source: Some("planner".to_owned()),
             target: Some("worker".to_owned()),
             conversation: None,
@@ -1305,7 +1305,7 @@ mod tests {
         GovernedAction {
             kind: ActionKind::Send,
             stream: "laser",
-            topic: "agent.commands",
+            topic: "agent.sessions",
             source: Some("planner"),
             target: None,
             conversation: None,

@@ -1,0 +1,37 @@
+[
+  {
+    "key": "agdx.av",
+    "kind": "uint32",
+    "value": 1
+  },
+  {
+    "key": "agdx.ct",
+    "kind": "uint8",
+    "value": 1
+  },
+  {
+    "key": "agdx.parent_conv",
+    "kind": "text",
+    "value": "00000000000000000000000004"
+  },
+  {
+    "key": "agdx.root_conv",
+    "kind": "text",
+    "value": "00000000000000000000000005"
+  },
+  {
+    "key": "agdx.to",
+    "kind": "text",
+    "value": "*"
+  },
+  {
+    "key": "gen_ai.agent.id",
+    "kind": "text",
+    "value": "planner"
+  },
+  {
+    "key": "gen_ai.conversation.id",
+    "kind": "text",
+    "value": "00000000000000000000000002"
+  }
+]

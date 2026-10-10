@@ -65,6 +65,7 @@ time = { workspace = true, optional = true }
 apache-avro = { workspace = true, optional = true }
 bon = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
+json-patch = { workspace = true }
 memchr = { workspace = true }
 ouroboros = { workspace = true, optional = true }
 prost-reflect = { workspace = true, optional = true }

@@ -1,3 +1,4 @@
+import { microsToMillis } from "../client/duration.js"
 import { managedCapabilitiesFrom } from "../client/capabilities.js"
 import { decodeManagedReply } from "../client/managed.js"
 import { isRetryable } from "../agent/reliable-consumer.js"
@@ -56,7 +57,7 @@ export interface ManagedKvTransport {
 }
 
 export type AmbiguousMutationRecovery =
-  | { readonly kind: "waitForLeaseExpiry"; readonly ttlMicros: bigint }
+  | { readonly kind: "waitForLeaseExpiry"; readonly ttlMs: number }
   | { readonly kind: "repeatPrepared" }
   | { readonly kind: "reconcileTargetPrecondition" }
 
@@ -125,7 +126,7 @@ function lease(value: KvOutcome, expected: "leased" | "renewed"): Lease {
     throw new ProtocolError(`kv coordination ${expected}: unexpected outcome ${value.kind}`)
   return {
     token: value.leaseToken,
-    grantedTtlMicros: value.grantedTtlMicros,
+    grantedTtlMs: microsToMillis(value.grantedTtlMicros),
     position: value.position
   }
 }
@@ -239,18 +240,18 @@ export class FencedLeaseClient implements AsyncDisposable {
     return new FencedLeaseClient(new DedicatedKvTransport(connectionString))
   }
 
-  withAttemptTimeout(milliseconds: number): this {
-    if (!Number.isFinite(milliseconds) || milliseconds < 0)
+  withAttemptTimeout(timeoutMs: number): this {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0)
       throw new InvalidError("coordination attempt timeout must be a non-negative finite number")
     if (this.active !== 0) throw new InvalidError("cannot change the timeout during an attempt")
-    this.attemptTimeoutMs = milliseconds
+    this.attemptTimeoutMs = timeoutMs
     return this
   }
 
   prepareAcquire(request: KvLease): PreparedMutation {
     return this.prepare(AGDX_KV_LEASE_CODE, encodeKvLease(request), {
       kind: "waitForLeaseExpiry",
-      ttlMicros: request.leaseTtlMicros
+      ttlMs: Number(request.leaseTtlMicros) / 1_000
     })
   }
 

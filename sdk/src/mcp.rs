@@ -1,8 +1,10 @@
 use crate::agent::Laser;
-use crate::bridge_hops::{enter_bridge, hops_metadata};
+pub use crate::bridge_hops::enter_bridge;
+use crate::bridge_hops::hops_metadata;
 use crate::error::LaserError;
 use crate::provenance::AgentTopic;
 use crate::types::ConversationId;
+
 #[cfg(feature = "mcp-http")]
 use axum::Router;
 #[cfg(feature = "mcp-http")]
@@ -150,6 +152,16 @@ pub fn tool_result_from_envelope(envelope: &AgentEnvelope) -> McpToolResult {
     }
 }
 
+// A failed tool call's error body for its child session.
+fn tool_failure(message: &str) -> laser_wire::agent::AgentErrorBody {
+    laser_wire::agent::AgentErrorBody {
+        code: laser_wire::agent::AgentErrorCode::Internal,
+        message: Some(message.to_owned()),
+        retryable: false,
+        detail: None,
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -194,11 +206,12 @@ impl McpBridge {
     /// [`AgentTopic`], including `AgentTopic::Custom` for an arbitrary name.
     pub fn new(
         laser: Laser,
-        source: AgentId,
+        source: impl Into<AgentId>,
         tool_topic: AgentTopic<'static>,
         reply_topic: AgentTopic<'static>,
         server_name: impl Into<String>,
     ) -> Self {
+        let source = source.into();
         let hops = vec![source.as_str().to_owned()];
         Self {
             laser,
@@ -252,8 +265,24 @@ impl McpBridge {
         self
     }
 
-    /// Advertise a tool in `tools/list`. `input_schema` is the raw JSON Schema.
+    /// Advertise a tool in `tools/list`. `input_schema` is the raw JSON Schema,
+    /// which MCP requires to be an object. Any other JSON value is refused with
+    /// [`LaserError::Invalid`].
     pub fn with_tool(
+        self,
+        name: impl Into<String>,
+        description: Option<String>,
+        input_schema: JsonValue,
+    ) -> Result<Self, LaserError> {
+        if !input_schema.is_object() {
+            return Err(LaserError::Invalid(
+                "MCP tool input schema must be a JSON object".to_owned(),
+            ));
+        }
+        Ok(self.push_tool(name, description, input_schema))
+    }
+
+    fn push_tool(
         mut self,
         name: impl Into<String>,
         description: Option<String>,
@@ -279,7 +308,7 @@ impl McpBridge {
     ///
     /// [`Memory`]: crate::memory::Memory
     pub fn with_memory_tools(self) -> Self {
-        self.with_tool(
+        self.push_tool(
             "remember",
             Some("Store a memory item for later recall.".to_owned()),
             json!({
@@ -290,7 +319,7 @@ impl McpBridge {
                 "required": ["text"]
             }),
         )
-        .with_tool(
+        .push_tool(
             "recall",
             Some("Retrieve the memory items most relevant to a query.".to_owned()),
             json!({
@@ -379,37 +408,149 @@ impl McpBridge {
     }
 
     /// `tools/call`: map onto an AGDX `command`, await the correlated terminal,
-    /// render the MCP tool result.
+    /// render the MCP tool result. The command is addressed to every agent
+    /// (`agdx.to = *`), so on a shared session topic every listening agent
+    /// receives it. Use [`call_tool_to`](Self::call_tool_to) to address one
+    /// agent.
     pub async fn call_tool(
         &self,
         name: &str,
         params_json: Vec<u8>,
     ) -> Result<McpToolResult, LaserError> {
+        self.call_tool_addressed(None, name, params_json).await
+    }
+
+    /// [`call_tool`](Self::call_tool) addressed to `target`, so only that
+    /// agent runs the tool on a shared session topic.
+    pub async fn call_tool_to(
+        &self,
+        target: impl Into<AgentId>,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<McpToolResult, LaserError> {
+        let target = target.into();
+        self.call_tool_addressed(Some(target), name, params_json)
+            .await
+    }
+
+    /// `tools/call` as a child session of `parent`, in the tree rooted at
+    /// `root`: the call's submitted start lands on `agent.sessions` with the
+    /// ancestry before the command, and the child ends by the result,
+    /// completed on a tool result and failed on a tool error. The command is
+    /// addressed to every agent, like [`call_tool`](Self::call_tool).
+    pub async fn call_tool_in(
+        &self,
+        parent: ConversationId,
+        root: ConversationId,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<McpToolResult, LaserError> {
+        self.call_tool_in_addressed(None, parent, root, name, params_json)
+            .await
+    }
+
+    /// [`call_tool_in`](Self::call_tool_in) addressed to `target`.
+    pub async fn call_tool_in_to(
+        &self,
+        target: impl Into<AgentId>,
+        parent: ConversationId,
+        root: ConversationId,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<McpToolResult, LaserError> {
+        let target = target.into();
+        self.call_tool_in_addressed(Some(target), parent, root, name, params_json)
+            .await
+    }
+
+    async fn call_tool_addressed(
+        &self,
+        target: Option<AgentId>,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<McpToolResult, LaserError> {
         let conversation = ConversationId::new();
+        let envelope = self
+            .send_tool_call(conversation, target, None, name, params_json)
+            .await?;
+        Ok(tool_result_from_envelope(&envelope))
+    }
+
+    async fn call_tool_in_addressed(
+        &self,
+        target: Option<AgentId>,
+        parent: ConversationId,
+        root: ConversationId,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<McpToolResult, LaserError> {
+        let conversation = ConversationId::new();
+        let child = crate::agent::contract::start_child(
+            &self.laser,
+            &self.source,
+            &self.source,
+            conversation.into(),
+            parent.into(),
+            root.into(),
+        )
+        .await?;
+        let outcome = self
+            .send_tool_call(
+                conversation,
+                target,
+                Some((parent, root)),
+                name,
+                params_json,
+            )
+            .await;
+        let ended = match &outcome {
+            Ok(envelope) if envelope.kind != laser_wire::agent::AgentKind::Error => {
+                child.end().await
+            }
+            Ok(_) => child.fail(tool_failure("the tool returned an error")).await,
+            Err(error) => child.fail(tool_failure(&error.to_string())).await,
+        };
+        let envelope = outcome?;
+        ended?;
+        Ok(tool_result_from_envelope(&envelope))
+    }
+
+    // Publish one tool call command and await its correlated terminal. The
+    // reply reader is seeded at the topic tail before sending, so it reads
+    // only the reply rather than the topic's history.
+    async fn send_tool_call(
+        &self,
+        conversation: ConversationId,
+        target: Option<AgentId>,
+        ancestry: Option<(ConversationId, ConversationId)>,
+        name: &str,
+        params_json: Vec<u8>,
+    ) -> Result<AgentEnvelope, LaserError> {
         let correlation = CorrelationId::from_u128(conversation.as_u128());
-        // Seed the reply reader at the topic tail before sending, so it reads only
-        // the reply rather than the topic's history.
         let mut reader = self
             .laser
-            .agdx_reply_reader(self.reply_topic.clone())
+            .agdx_reply_reader(self.reply_topic.clone(), Some(&self.source))
             .await?;
-        self.laser
-            .agdx(
-                self.tool_topic.clone(),
-                self.source.clone(),
-                conversation.into(),
-            )
+        let producer = self.laser.agdx(
+            self.tool_topic.clone(),
+            self.source.clone(),
+            conversation.into(),
+        );
+        let mut command = producer
             .command(correlation, params_json)
             .with_tool(name.to_owned())
             .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(&self.hops))
-            .content_type(ContentType::Json)
-            .send()
-            .await?;
-        let envelope = self
-            .laser
+            .content_type(ContentType::Json);
+        if let Some((parent, root)) = ancestry {
+            command = command.with_ancestry(Some(parent.into()), Some(root.into()));
+        }
+        if let Some(target) = target {
+            command = command.with_target(target);
+        }
+        command.send().await?;
+        self.laser
             .await_agdx_reply(&mut reader, correlation, self.timeout)
-            .await?;
-        Ok(tool_result_from_envelope(&envelope))
+            .await
     }
 
     pub async fn handle_rpc(&self, request: JsonValue) -> McpRpcResponse {
@@ -574,9 +715,9 @@ mod tests {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
         McpBridge::new(
             laser,
-            "mcp-edge".parse().expect("valid agent id"),
-            AgentTopic::Commands,
-            AgentTopic::Responses,
+            "mcp-edge".parse::<AgentId>().expect("valid agent id"),
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
             "tools",
         )
     }

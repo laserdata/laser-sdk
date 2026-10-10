@@ -5,6 +5,7 @@ use crate::laser::Laser;
 use crate::stream::Topic;
 use crate::stream::transport::ConsumerBuilder;
 use iggy::prelude::{ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError};
+use laser_wire::authz::scoped_resource;
 use laser_wire::filter::{
     CatalogPosition, ConsumerFilter, FilterBinding, FilterConsumer, FilterError, FilterErrorReason,
     FilterGroupIdentity, FilterGroupRef, FilterHeader, FilterMutation, FilterRef,
@@ -502,6 +503,7 @@ impl GroupFilter {
         let details = self.group.native().await?;
         let identity = self.group.identity_of(details.id).await?;
         let name = group_filter_name(&identity);
+        let scoped_name = scoped_resource(&self.group.source()?.stream, &name);
         let filters = self.group.laser().filters();
         let mut before_id = None;
         loop {
@@ -510,7 +512,11 @@ impl GroupFilter {
                 .await?;
             let next = page.items.last().map(|summary| summary.id);
             let count = page.items.len();
-            if let Some(own) = page.items.into_iter().find(|summary| summary.name == name) {
+            if let Some(own) = page
+                .items
+                .into_iter()
+                .find(|summary| summary.name == name || summary.name == scoped_name)
+            {
                 let position = filters.drop_filter(own.id).await?;
                 self.group.remember_position(position);
                 return Ok(true);
@@ -592,7 +598,8 @@ impl GroupFilter {
 }
 
 // The catalog names a group's own filter by the ids of the group incarnation
-// it was configured for.
+// it was configured for. A catalog that scopes names to streams prefixes it
+// with the group's stream.
 fn group_filter_name(identity: &FilterGroupIdentity) -> String {
     format!(
         "group:{}:{}:{}:{}:{}",

@@ -1,4 +1,4 @@
-# memory - remembered, durable, and connected knowledge
+# memory: vector memory, durable memory, and a knowledge graph
 
 This example stores incident facts, retrieves related facts, and records feedback. It also demonstrates durable memory and graph relationships on managed deployments.
 
@@ -16,7 +16,7 @@ Vector memory runs in process and demonstrates the four memory verbs over a dete
 Durable memory runs when the deployment advertises graph and KV support.
 
 5. Configures the `incidents` memory topic with four partitions and a one-day message expiry.
-6. Remembers the same eight facts durably under the original conversation and recalls the three most recent.
+6. Remembers the same eight facts under the original conversation and waits a bounded time for the managed view to return the three most recent.
 7. Prints each recalled fact's source stream, topic, partition, and offset.
 8. Appends an audit message, binds the same durable memory handle to `laser.context(conversation)`, and reads both through one scope.
 
@@ -45,7 +45,7 @@ The vector phase needs no server. Durable memory and graph traversal require Las
 Run every phase against Laser Stack.
 
 ```sh
-LASER_CONNECTION_STRING=iggy:laser@127.0.0.1:8090 \
+LASER_CONNECTION_STRING=user:pwd@your-host \
   npm run example:memory
 ```
 

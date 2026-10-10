@@ -1,3 +1,5 @@
+import { scopedResource } from "../wire/authz.js"
+import type { ResourceScope } from "../client/resource-scope.js"
 import type { Capabilities } from "../client/capabilities.js"
 import { isStreamOrTopicNotFound, isUnavailable } from "../client/error-classify.js"
 import {
@@ -48,6 +50,9 @@ export interface GroupContext {
   readonly capabilities: () => Promise<Capabilities>
   /** Probes the server again, for a consumer built before any probe answered. */
   readonly refreshCapabilities?: () => Promise<Capabilities>
+  /** How the client names the managed resources it sends.
+   * @internal */
+  readonly scope?: ResourceScope
 }
 
 /** A consumer group by name or by its native numeric id. */
@@ -313,7 +318,7 @@ export class ConsumerGroup {
         surface: "filters"
       })
     }
-    return new Filters(context.transport, context.capabilities)
+    return new Filters(context.transport, context.capabilities, context.scope)
   }
 
   /** @internal */
@@ -504,11 +509,12 @@ export class GroupFilter {
     await this.group.filters().requireCatalog()
     const native = await this.group.native()
     const name = groupFilterName(native.identity)
+    const scopedName = scopedResource(this.group.streamName, name)
     const filters = this.group.filters()
     let beforeId: number | undefined
     for (;;) {
       const page = await filters.list(name, { pageSize: GROUP_FILTER_LOOKUP_PAGE }, beforeId)
-      const own = page.items.find((summary) => summary.name === name)
+      const own = page.items.find((summary) => summary.name === name || summary.name === scopedName)
       if (own !== undefined) {
         this.group.remember(await filters.dropFilter(own.id))
         return true

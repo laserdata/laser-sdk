@@ -201,9 +201,9 @@ create_exception!(
 );
 create_exception!(
     laser_sdk,
-    AgentError,
+    SessionError,
     LaserError,
-    "An agent or workflow control operation returned a typed failure. `detail` is the typed cause."
+    "A session read returned a typed failure. `detail` is the typed cause."
 );
 create_exception!(
     laser_sdk,
@@ -441,13 +441,35 @@ impl From<&IggyMessage> for PyUnconfirmedMessage {
     }
 }
 
+impl PyUnconfirmedMessage {
+    /// The same record with the message id the failed attempts used, so a
+    /// resend through `Topic.batch` stays deduplicated on the server.
+    pub(crate) fn to_iggy_message(&self) -> PyResult<IggyMessage> {
+        let headers = self
+            .headers
+            .iter()
+            .map(|(key, value)| {
+                let key = iggy::prelude::HeaderKey::try_from(key.as_str())
+                    .map_err(|error| to_pyerr(error.into()))?;
+                Ok((key, value.clone()))
+            })
+            .collect::<PyResult<std::collections::BTreeMap<_, _>>>()?;
+        IggyMessage::builder()
+            .id(self.message_id)
+            .payload(self.payload.clone())
+            .user_headers(headers)
+            .build()
+            .map_err(|error| to_pyerr(error.into()))
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyUnconfirmedMessage {
-    /// The message id the publish attempts used.
+    /// The 128-bit message id the publish attempts used.
     #[getter]
-    fn message_id(&self) -> String {
-        self.message_id.to_string()
+    fn message_id(&self) -> u128 {
+        self.message_id
     }
 
     /// Raw payload bytes.
@@ -904,7 +926,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         class(py.get_type::<KvError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<ForkError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<GraphError>(), None, None, &[], &[DETAIL]),
-        class(py.get_type::<AgentError>(), None, None, &[], &[DETAIL]),
+        class(py.get_type::<SessionError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<AuthzError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<CheckpointError>(), None, None, &[], &[DETAIL]),
         class(
@@ -975,7 +997,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
             None,
             &[],
             &[
-                ("position", "builtins.str | None"),
+                ("position", "MessageId | None"),
                 ("source", "builtins.BaseException"),
             ],
         ),
@@ -1124,7 +1146,7 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
         SdkError::Kv(_) => py.get_type::<KvError>(),
         SdkError::Fork(_) => py.get_type::<ForkError>(),
         SdkError::Graph(_) => py.get_type::<GraphError>(),
-        SdkError::Agent(_) => py.get_type::<AgentError>(),
+        SdkError::Session(_) => py.get_type::<SessionError>(),
         SdkError::Authz(_) => py.get_type::<AuthzError>(),
         SdkError::Filter(_) => py.get_type::<FilterError>(),
         SdkError::FilterFault { .. } => py.get_type::<FilterFaultError>(),
@@ -1198,7 +1220,7 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
         SdkError::Kv(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Fork(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Graph(error) => value.setattr("detail", ser_to_py(py, error)?)?,
-        SdkError::Agent(error) => value.setattr("detail", ser_to_py(py, error)?)?,
+        SdkError::Session(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Authz(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Checkpoint(error) => value.setattr("detail", ser_to_py(py, error.as_ref())?)?,
         SdkError::Id(error) => value.setattr("kind", id_kind(error))?,
@@ -1360,8 +1382,8 @@ fn typed_detail(
         py_to_de(&detail).ok().map(SdkError::Fork)
     } else if is(py.get_type::<GraphError>()) {
         py_to_de(&detail).ok().map(SdkError::Graph)
-    } else if is(py.get_type::<AgentError>()) {
-        py_to_de(&detail).ok().map(SdkError::Agent)
+    } else if is(py.get_type::<SessionError>()) {
+        py_to_de(&detail).ok().map(SdkError::Session)
     } else if is(py.get_type::<AuthzError>()) {
         py_to_de(&detail).ok().map(SdkError::Authz)
     } else if is(py.get_type::<CheckpointError>()) {

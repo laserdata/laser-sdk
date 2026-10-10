@@ -58,6 +58,7 @@ For a LaserData host (`*.laserdata.cloud` or `*.laserdata.com`) TLS and the SDK-
 | `LASER_USERNAME`, `LASER_PASSWORD` | username and password auth |
 | `LASER_TLS_CERT` | path to a CA cert, enables TLS for any host or overrides the embedded CA |
 | `LASER_NO_TLS=1` | disable TLS |
+| `LASER_NON_INTERACTIVE=1` | runs `orchestra` without waiting for Enter between phases |
 | `LASER_STREAM` | overrides the data stream for every example (default: `laser-<example>-rust`, reset at the start of each run and kept afterwards). Set it to your provisioned stream on a managed deployment so the SDK uses it and does not auto-create one, at the cost of repeat runs sharing its state |
 
 `event-analytics`, `fleet-tape`, and `incident-desk` also read two volume knobs, so the same binary runs a ten-record smoke test or a multi-million-record soak without a code edit. Each example picks its own default, and the variable wins when set. `fleet-tape` reads only `LASER_MESSAGES`.
@@ -67,11 +68,11 @@ For a LaserData host (`*.laserdata.cloud` or `*.laserdata.com`) TLS and the SDK-
 | `LASER_MESSAGES` | total records to publish |
 | `LASER_BATCH` | records per send call |
 
-The firehose reads its own `LASER_FIREHOSE_*` knobs, the incident desk reads `LASER_DESK_GRANT_TIMEOUT_SECS` (the grant-apply deadline in seconds), and the governance example reads `LASER_GOVERNANCE_USER_ID`.
+The firehose reads its own `LASER_FIREHOSE_*` knobs, the incident desk reads `LASER_DESK_GRANT_TIMEOUT_SECS` (the grant-apply deadline in seconds), and the governance example reads `LASER_GOVERNANCE_USER_ID` (the user its roles are bound to, by default a `governance-demo` user it creates).
 
-Each example uses `laser-<example>-rust` unless `LASER_STREAM` supplies a name, so different examples never share agent topics or offsets. Managed indexes carry a per-run token so a rerun counts only its own rows. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. A stream supplied through `LASER_STREAM` is never deleted.
+Each example uses `laser-<example>-rust` unless `LASER_STREAM` supplies a name, so different examples never share agent topics or offsets. Managed indexes carry a per-run token so a rerun counts only its own rows. A run deletes the previous run's stream first and keeps its own result on the server, so you can inspect it afterwards with the SDK, the Iggy CLI, or the LaserData Cloud Console. A stream supplied through `LASER_STREAM` is never deleted. Key-value entries, leases, forks, and memory views live under the stream's scoped names and belong to that stream, so a rerun of a managed example on a recreated stream starts from empty state.
 
-## Primitives - start here
+## Primitives: start here
 
 Nine focused examples cover the core data and agent primitives. Unsupported managed phases report the missing capability and exit cleanly.
 
@@ -102,8 +103,8 @@ Nine deep-dive scenarios follow, for eighteen runnable programs with the primiti
 | [`incident-desk`](src/incident-desk/README.md) | agentic | an AI incident desk operating a live incident: ticket firehose into a queryable index, semantic memory recall, a four-agent desk (triage fans deadline-bounded specialist calls and synthesizes with the LLM, a KV-deduplicated resolver applies capacity grants effectively once behind a durable approval gate), a coordination demo (a quota-ledger compare-and-swap with a conflict-retry loop, a read-your-writes query, and the unified `ResultCode` classifying every outcome), speculative bulk-resolution in a fork promoted only when it clears the backlog, and the whole incident rebuilt from its conversation as the audit trail |
 | [`memory`](src/memory/README.md) | agentic | in-process recall, durable memory, and graph traversal over one incident domain. Durable memory and graph operations run on Laser Stack or LaserData Cloud |
 | [`interop`](src/interop/README.md) | agentic | edge interoperability over the log: one LLM-backed agent reached as an A2A agent (`SendMessage` -> `GetTask`), an MCP tool server (`tools/list` / `tools/call`), and an AG-UI event stream (`agui_events`), all bridged onto the Agent Data Exchange Protocol. It runs on the mock model or a real backend with the `llm-*` features |
-| [`orchestra`](src/orchestra/README.md) | agentic | the orchestration showcase, 1:1 with the Python `orchestra`: an interactive, paced run (press Enter per phase) you watch live in the LaserData console's Orchestration view. Six long-running agents each on their own connection, then discovery, a directed contract, an all-capable fan-out (an unavailable agent routed around), a journalled triage/diagnose/remediate workflow with a budget and a verifier, operator quarantine and un-quarantine, and a deadline expiry that recovers on a healthy agent |
-| [`governance`](src/governance/README.md) | agentic | capability RBAC and agent governance, 1:1 with the Python `governance`: define roles and bind them to an Iggy user when `authz` is served, then show deny-wins matching, on-behalf-of permission intersection, external-edge audience and step-up decisions, and budgeted run submission when the run registry is served |
+| [`orchestra`](src/orchestra/README.md) | agentic | the orchestration showcase, matching the Python and TypeScript `orchestra`: an interactive, paced run (press Enter per phase, or set `LASER_NON_INTERACTIVE=1`) you watch live in the LaserData console's Orchestration view. Six long-running agents each on their own connection, then discovery, a directed contract, an all-capable fan-out (an unavailable agent routed around), a journalled triage/diagnose/remediate workflow with a budget and a verifier, operator quarantine and un-quarantine, and a deadline expiry that recovers on a healthy agent |
+| [`governance`](src/governance/README.md) | agentic | capability RBAC and agent governance, matching the Python and TypeScript `governance`: define roles and bind them to a dedicated Iggy user when `authz` is served, then show deny-wins matching, on-behalf-of permission intersection, external-edge audience and step-up decisions, and budgeted session submission |
 
 ## Real LLM (optional)
 
@@ -126,3 +127,7 @@ On Laser Stack or LaserData Cloud, `laser.fork(id)` branches the materialized re
 LASER_CONNECTION_STRING=user:pwd@your-laserdata-cloud-host \
 LASER_APPLY_PLAN=1 cargo run --example incident-desk
 ```
+
+## Sessions
+
+The sessions example records an incident root, two child tasks, and an independent maintenance root in one stream. It prints the recorded event and managed resource link counts for each session. Child results are collected explicitly, and child state stays separate.

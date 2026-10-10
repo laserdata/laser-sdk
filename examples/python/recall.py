@@ -38,8 +38,10 @@ FACT = "node-7 sits in the eu-west pool, rotates keys monthly"
 async def main() -> None:
     laser = await _common.connect(EXAMPLE)
     try:
-        # Memory records ride the well-known agent topics, created once here.
-        await laser.bootstrap(_common.PARTITIONS)
+        # Memory records ride `agent.memory`, created once here with the other agent topics.
+        await laser.bootstrap(
+            _common.PARTITIONS, retention=ls.TopicRetention.expire_after(86_400_000)
+        )
         conversation = ls.new_conversation_id()
 
         _common.phase("all four verbs: remember, recall, improve, forget")

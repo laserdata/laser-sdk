@@ -86,7 +86,6 @@ async fn given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refu
 #[tokio::test]
 async fn given_no_catalog_when_a_group_consumes_then_should_read_every_record_unfiltered() {
     let laser = harness::connected_laser().await;
-    assert!(laser.capabilities().await.filters.group_policy_reads);
     publish(&laser, &[SAFE_MODE, GROUND_STATION, DECOMMISSION]).await;
     let group = laser.topic(TOPIC).consumer_group("plain-desk");
 
@@ -197,7 +196,11 @@ async fn given_each_commit_policy_when_a_group_consumer_shuts_down_after_zero_th
 
 #[tokio::test]
 async fn given_a_server_without_consumer_filters_when_building_a_reader_then_should_refuse() {
-    let open = Laser::from_client(harness::client().await).with_default_stream("any");
+    // A bring-your-own client probes on its first capabilities read, so the
+    // open-only set is pinned as an explicit override.
+    let open = Laser::from_client(harness::client().await)
+        .with_default_stream("any")
+        .with_capabilities(Capabilities::OPEN);
     assert_eq!(open.capabilities().await, Capabilities::OPEN);
 
     let refused = open

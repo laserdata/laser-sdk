@@ -44,6 +44,10 @@ impl LocalGuard {
             let payload = encode_named(&GetSchema {
                 v: QUERY_OP_VERSION,
                 id: *id,
+                stream: filter
+                    .schema_stream
+                    .clone()
+                    .or_else(|| laser.resource_stream().map(str::to_owned)),
             })?;
             let reply = laser
                 .send_raw_with_response(AGDX_GET_SCHEMA_CODE, payload)

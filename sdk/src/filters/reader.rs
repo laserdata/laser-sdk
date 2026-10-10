@@ -985,6 +985,7 @@ impl FilteredReader {
                         &route_to,
                         partition_id,
                         code == AGDX_FILTERED_ACK_CODE,
+                        self.laser.publish_options(),
                     )
                     .await?;
                 match connection.send_binary_request(code, payload).await {

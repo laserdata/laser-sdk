@@ -28,7 +28,7 @@ pub enum LaserError {
     #[error(transparent)]
     PublishFailed(Box<PublishFailure>),
     /// A transient handler-side failure a handler may return to request a retry
-    /// (the reliable consumer retries it under the [`RetryPolicy`](crate::agent::RetryPolicy)).
+    /// (the reliable consumer retries it under the `RetryPolicy`).
     /// Deterministic wiring, startup, and configuration failures use
     /// [`HandlerConfig`](Self::HandlerConfig) instead, which never retries.
     #[error("handler error: {0}")]
@@ -70,12 +70,12 @@ pub enum LaserError {
     /// LaserData Cloud answered a fork op with a typed failure.
     #[error("fork: {0}")]
     Fork(#[from] ForkError),
+    /// LaserData Cloud answered a session read with a typed failure.
+    #[error("session: {0}")]
+    Session(#[from] laser_wire::session::SessionError),
     /// LaserData Cloud answered a graph op with a typed failure.
     #[error("graph: {0}")]
     Graph(#[from] laser_wire::graph::GraphError),
-    /// LaserData Cloud answered an agent or workflow control op with a typed failure.
-    #[error("agent: {0}")]
-    Agent(#[from] laser_wire::agent_workflow::AgentError),
     /// The streaming server answered an authorization op with a typed failure.
     #[error("authz: {0}")]
     Authz(#[from] laser_wire::authz::AuthzError),
@@ -161,14 +161,14 @@ pub enum LaserError {
     /// gate, never retryable.
     #[error("signature: {0}")]
     Signature(String),
-    /// The enrolled [`ActionGovernor`](crate::govern::ActionGovernor) rejected
+    /// The enrolled `ActionGovernor` rejected
     /// the action before the effect ran. Never retryable: the policy, not the
     /// transport, said no.
     #[error("policy blocked: {0}")]
     PolicyBlocked(String),
     /// The enrolled governor paused the action on a stronger approval.
     /// `scope` names the scope the approval must grant, so a handler can run an
-    /// [`approval_gate`](crate::agent::AgentCtx::approval_gate) and re-send.
+    /// `approval_gate` and re-send.
     /// Never retryable as-is.
     #[error("step-up required: {scope}")]
     StepUpRequired { scope: String },
@@ -183,7 +183,7 @@ pub enum LaserError {
     /// An advertised inbox route resolved a capable agent but the agent advertises
     /// no inbox topic in its live presence, so there is nowhere to address it. The
     /// caller waits for the agent to advertise, supplies an explicit
-    /// [`InboxRoute::Fixed`](crate::agent::InboxRoute::Fixed), or routes elsewhere.
+    /// `InboxRoute::Fixed`, or routes elsewhere.
     /// Never falls back to a shared topic name.
     #[error("agent has no advertised inbox: {agent}")]
     NoInbox { agent: String },
@@ -422,7 +422,7 @@ impl LaserError {
             Self::Query(error) => ResultCode::from(error).is_retryable(),
             Self::Kv(error) => ResultCode::from(error).is_retryable(),
             Self::Fork(error) => ResultCode::from(error).is_retryable(),
-            Self::Agent(error) => ResultCode::from(error).is_retryable(),
+            Self::Session(error) => ResultCode::from(error).is_retryable(),
             Self::Graph(error) => ResultCode::from(error).is_retryable(),
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()).is_retryable(),
             Self::Filter(error) => error.code.is_retryable(),
@@ -451,9 +451,7 @@ impl LaserError {
     pub fn is_not_leader(&self) -> bool {
         matches!(
             self.publish_cause(),
-            Self::Kv(KvError::NotLeader)
-                | Self::Fork(ForkError::NotLeader)
-                | Self::Agent(laser_wire::agent_workflow::AgentError::NotLeader)
+            Self::Kv(KvError::NotLeader) | Self::Fork(ForkError::NotLeader)
         )
     }
 
@@ -656,8 +654,8 @@ impl LaserError {
             Self::Query(error) => ResultCode::from(error),
             Self::Kv(error) => ResultCode::from(error),
             Self::Fork(error) => ResultCode::from(error),
+            Self::Session(error) => ResultCode::from(error),
             Self::Graph(error) => ResultCode::from(error),
-            Self::Agent(error) => ResultCode::from(error),
             Self::Checkpoint(error) => ResultCode::from(error.as_ref()),
             Self::Unsupported { .. } | Self::NoStream | Self::NoRespondTopic => {
                 ResultCode::Unsupported

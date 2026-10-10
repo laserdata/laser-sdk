@@ -23,11 +23,11 @@ async fn given_an_enforcing_governor_when_an_action_is_blocked_then_should_rejec
         .build();
 
     governed
-        .send_agent(AgentTopic::Commands, "status report", &provenance)
+        .send_agent(AgentTopic::Sessions, "status report", &provenance)
         .await
         .expect("a benign send passes the governor");
     let error = governed
-        .send_agent(AgentTopic::Commands, "wire-funds to acct 7", &provenance)
+        .send_agent(AgentTopic::Sessions, "wire-funds to acct 7", &provenance)
         .await
         .expect_err("the governor blocks the wire transfer");
     assert!(matches!(error, LaserError::PolicyBlocked(_)));
@@ -46,7 +46,7 @@ async fn given_an_enforcing_governor_when_an_action_is_blocked_then_should_rejec
 
     // The blocked payload never reached the log.
     let mut reader = laser
-        .topic(AgentTopic::Commands.topic_string())
+        .topic(AgentTopic::Sessions.topic_string())
         .replay()
         .expect("reader");
     let landed = reader.poll().await.expect("poll commands");
@@ -69,7 +69,7 @@ async fn given_observe_mode_when_a_block_decides_then_should_record_and_let_the_
         .build();
 
     governed
-        .send_agent(AgentTopic::Commands, "wire-funds to acct 7", &provenance)
+        .send_agent(AgentTopic::Sessions, "wire-funds to acct 7", &provenance)
         .await
         .expect("observe mode never blocks");
 
@@ -83,7 +83,7 @@ async fn given_observe_mode_when_a_block_decides_then_should_record_and_let_the_
 
     let landed = eventually(|| async {
         let mut reader = laser
-            .topic(AgentTopic::Commands.topic_string())
+            .topic(AgentTopic::Sessions.topic_string())
             .replay()
             .expect("reader");
         let messages = reader.poll().await.expect("poll commands");
@@ -106,7 +106,7 @@ async fn given_a_modifying_governor_when_the_purpose_matches_then_should_publish
     let source: laser_sdk::wire::agent::AgentId = "planner".parse().expect("agent id");
 
     governed
-        .agdx(AgentTopic::LlmIo, source, conversation.into())
+        .agdx(AgentTopic::Sessions, source, conversation.into())
         .emit(b"operator notes here".to_vec())
         .with_metadata(METADATA_PURPOSE, "marketing")
         .send()
@@ -115,7 +115,7 @@ async fn given_a_modifying_governor_when_the_purpose_matches_then_should_publish
 
     let envelope = eventually(|| async {
         let mut reader = laser
-            .topic(AgentTopic::LlmIo.topic_string())
+            .topic(AgentTopic::Sessions.topic_string())
             .replay()
             .expect("reader");
         let messages = reader.poll().await.expect("poll llm io");
@@ -148,8 +148,8 @@ async fn given_a_step_up_governor_when_a_request_runs_then_should_surface_the_sc
 
     let error = governed
         .request(
-            AgentTopic::Commands,
-            AgentTopic::Responses,
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
             "do the thing",
             &provenance,
             Duration::from_secs(2),

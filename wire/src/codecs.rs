@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 /// Encoding strategy for a typed body. Four first-party codecs ship here, all
 /// self-describing so LaserData Cloud's projector can index their fields without a
 /// schema: [`Json`] (`serde_json`), [`Msgpack`] (`rmp_serde`), [`Cbor`]
-/// (`ciborium`), and [`Bson`] (`bson`, native-only feature). For a
+/// (`ciborium`), and `Bson` (`bson`, native-only feature). For a
 /// schema-first format (Avro or Protobuf), Arrow, or your own framing,
 /// implement `Codec` on a marker type. The codec advertises its
 /// `ContentType` so consumers can decode downstream.

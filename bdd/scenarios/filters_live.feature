@@ -27,9 +27,9 @@ Feature: Consumer filters on a streaming server
     When the anomaly desk reads every record through an unbound consumer group
     Then it receives every original feed record
 
-  Scenario: An advanced unbound group reader receives every original record
+  Scenario: An advanced unbound group reader follows the advertised capability
     When the anomaly desk reads every record through an unbound group reader
-    Then it receives every original feed record
+    Then the advanced reader follows the group-aware read capability
 
   @plane
   Scenario: A bounded sparse scan continues through an empty selection

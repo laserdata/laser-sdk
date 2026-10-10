@@ -55,7 +55,7 @@ impl Topic {
 
 /// One topic seen through one body type: encode, validate, and stamp on the
 /// way in, decode with the log position attached on the way out. Build it with
-/// [`Topic::json`], [`Topic::cbor`], or [`Topic::schema`]. The handle is a
+/// [`Topic::json`], [`Topic::cbor`], or `Topic::schema`. The handle is a
 /// plain wrapper over [`Topic`], so it is free to construct and clone, and the
 /// raw verbs on the untyped handle stay one accessor away.
 #[derive(Clone)]
@@ -149,7 +149,7 @@ impl<T> TypedTopic<T> {
 /// new records.
 ///
 /// The reliable consumer path composes instead of duplicating this: an
-/// [`Agent`](crate::agent::Agent) handler decodes inside the handler with the
+/// `Agent` handler decodes inside the handler with the
 /// same error shape, and an undecodable record routes to the existing
 /// dead-letter policy.
 pub struct TypedRecords<T> {

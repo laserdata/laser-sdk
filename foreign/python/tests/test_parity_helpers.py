@@ -1,3 +1,4 @@
+import json
 import pathlib
 import time
 
@@ -30,10 +31,12 @@ def test_given_a_test_clock_when_advanced_then_should_use_native_unsigned_time()
     clock.advance(1)
     assert clock.now_micros() == 0
     assert ls.TestClock().now_micros() == 0
-    with pytest.raises(OverflowError):
+    with pytest.raises(ls.InvalidError):
         clock.set(-1)
-    with pytest.raises(OverflowError):
+    with pytest.raises(ls.InvalidError):
         clock.advance(U64_MAX + 1)
+    with pytest.raises(ls.InvalidError):
+        ls.TestClock(-5)
 
 
 def test_given_a_signed_card_when_changed_then_should_refuse_the_signature():
@@ -84,17 +87,137 @@ def test_given_the_golden_snapshot_when_reencoded_then_should_keep_exact_bytes()
 
 def test_given_snapshot_offsets_when_resumed_then_should_skip_folded_records():
     snapshot = {
+        "stream": "agents",
+        "stream_id": 0,
+        "stream_created_at_micros": 100,
         "conversation": CONVERSATION,
-        "as_of": {0: 41, 1: U64_MAX},
+        "fold": "planner",
+        "as_of": [(2, 20, 0, 41), (2, 20, 1, U64_MAX)],
         "state": b"\x00\xff",
     }
-    assert ls.resume_offsets(snapshot) == {0: 42, 1: U64_MAX}
+    assert ls.resume_offsets(snapshot) == [(2, 20, 0, 42), (2, 20, 1, U64_MAX)]
     assert ls.decode_snapshot(ls.encode_snapshot(snapshot)) == snapshot
 
 
 def test_given_invalid_snapshot_bytes_when_decoded_then_should_raise_a_typed_error():
     with pytest.raises(ls.LaserError):
         ls.decode_snapshot(b"invalid snapshot")
+
+
+@pytest.mark.parametrize(
+    ("name", "decode", "encode"),
+    [
+        ("context_manifest.bin", ls.decode_context_manifest, ls.encode_context_manifest),
+        ("context_compaction.bin", ls.decode_context_compaction, ls.encode_context_compaction),
+        ("context_retrieval.bin", ls.decode_context_retrieval, ls.encode_context_retrieval),
+        ("state_delta.bin", ls.decode_state_delta, ls.encode_state_delta),
+        ("state_snapshot.bin", ls.decode_state_snapshot, ls.encode_state_snapshot),
+    ],
+)
+def test_given_context_or_state_fixture_when_reencoded_then_should_keep_exact_bytes(
+    name, decode, encode
+):
+    payload = FIXTURES.joinpath(name).read_bytes()
+    assert encode(decode(payload)) == payload
+
+
+def test_given_oversize_context_or_state_when_encoded_then_should_reject():
+    manifest = ls.decode_context_manifest(FIXTURES.joinpath("context_manifest.bin").read_bytes())
+    manifest["fragments"] = [manifest["fragments"][0]] * 1_025
+    with pytest.raises(ls.InvalidError):
+        ls.encode_context_manifest(manifest)
+
+    delta = ls.decode_state_delta(FIXTURES.joinpath("state_delta.bin").read_bytes())
+    delta["patch"] = [{"op": "remove", "path": "/x"}] * 257
+    with pytest.raises(ls.InvalidError):
+        ls.encode_state_delta(delta)
+
+    snapshot = ls.decode_state_snapshot(FIXTURES.joinpath("state_snapshot.bin").read_bytes())
+    snapshot["document"] = {"large": "x" * (8 * 1024 * 1024)}
+    with pytest.raises(ls.InvalidError):
+        ls.encode_state_snapshot(snapshot)
+
+
+def test_given_invalid_context_digest_or_patch_op_when_encoded_then_should_reject():
+    manifest = ls.decode_context_manifest(FIXTURES.joinpath("context_manifest.bin").read_bytes())
+    memory = next(fragment["Memory"] for fragment in manifest["fragments"] if "Memory" in fragment)
+    memory["digest"] = b"x" * 31
+    with pytest.raises(ls.LaserError):
+        ls.encode_context_manifest(manifest)
+    delta = ls.decode_state_delta(FIXTURES.joinpath("state_delta.bin").read_bytes())
+    delta["patch"] = [{"op": "unknown", "path": "/a"}]
+    with pytest.raises(ls.LaserError):
+        ls.encode_state_delta(delta)
+
+
+def test_given_shared_json_patch_cases_when_applied_then_should_match_rust_and_typescript():
+    cases = json.loads(FIXTURES.joinpath("json_patch/cases.json").read_text())
+    for case in cases:
+        if case.get("error"):
+            with pytest.raises(ls.InvalidError):
+                ls.apply_json_patch(case["document"], case["patch"])
+        else:
+            assert ls.apply_json_patch(case["document"], case["patch"]) == case["result"]
+
+
+def test_given_state_patch_limits_when_applied_then_should_reject():
+    with pytest.raises(ls.InvalidError):
+        ls.apply_json_patch({"a": 1}, [{"op": "remove", "path": "/a"}] * 257)
+    with pytest.raises(ls.InvalidError):
+        ls.apply_json_patch({"large": "x" * (8 * 1024 * 1024)}, [])
+
+
+def test_given_inexact_state_integer_when_encoded_or_applied_then_should_reject():
+    large = 9_007_199_254_740_992
+    with pytest.raises(ls.InvalidError):
+        ls.encode_state_snapshot({"base_revision": 0, "document": {"large": large}})
+    with pytest.raises(ls.InvalidError):
+        ls.encode_state_delta(
+            {
+                "base_revision": 0,
+                "patch": [{"op": "add", "path": "/large", "value": large}],
+                "op_id": "patch-1",
+            }
+        )
+    with pytest.raises(ls.InvalidError):
+        ls.apply_json_patch({"large": large}, [])
+
+
+@pytest.mark.parametrize(
+    ("name", "decode", "encode"),
+    [
+        ("session_get.bin", ls.decode_session_get, ls.encode_session_get),
+        ("session_list.bin", ls.decode_session_list, ls.encode_session_list),
+        ("session_events.bin", ls.decode_session_events, ls.encode_session_events),
+        ("session_state.bin", ls.decode_session_state, ls.encode_session_state),
+        ("session_links.bin", ls.decode_session_links, ls.encode_session_links),
+        ("session_sources.bin", ls.decode_session_sources, ls.encode_session_sources),
+        ("session_changes.bin", ls.decode_session_changes, ls.encode_session_changes),
+    ],
+)
+def test_given_session_read_request_when_reencoded_then_should_match_rust_and_typescript(
+    name, decode, encode
+):
+    payload = FIXTURES.joinpath(name).read_bytes()
+    request = decode(payload)
+    assert request["stream"] == "agents"
+    assert encode(request) == payload
+    del request["stream"]
+    with pytest.raises(ls.LaserError):
+        encode(request)
+
+
+@pytest.mark.parametrize(
+    "name", ["info", "page", "events", "state", "links", "sources", "changes", "error"]
+)
+def test_given_session_read_reply_when_reencoded_then_should_match_rust_and_typescript(name):
+    payload = FIXTURES.joinpath(f"session_reply_{name}.bin").read_bytes()
+    reply = ls.decode_session_reply(payload)
+    assert ls.encode_session_reply(reply) == payload
+    if name == "error":
+        assert reply == {"Err": {"NotRegistered": "agents"}}
+    if name == "state":
+        assert reply["Ok"]["State"]["document"] == {"tasks": ["triage"]}
 
 
 def test_given_a2a_params_when_converted_then_should_preserve_exact_body_bytes():
@@ -202,3 +325,22 @@ def test_given_the_clock_base_when_subclassed_then_should_share_the_clock_type()
     assert FixedClock().now_micros() == 42
     with pytest.raises(NotImplementedError):
         ls.Clock().now_micros()
+
+
+@pytest.mark.parametrize(
+    ("name", "decode", "encode"),
+    [
+        ("agent_session_start.bin", ls.decode_session_start, ls.encode_session_start),
+        (
+            "agent_session_transition.bin",
+            ls.decode_session_transition,
+            ls.encode_session_transition,
+        ),
+        ("agent_session_end.bin", ls.decode_session_end, ls.encode_session_end),
+    ],
+)
+def test_given_a_session_lifecycle_fixture_when_round_tripped_then_should_match_rust(
+    name, decode, encode
+):
+    payload = FIXTURES.joinpath(name).read_bytes()
+    assert encode(decode(payload)) == payload

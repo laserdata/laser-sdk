@@ -15,12 +15,17 @@ use std::time::Duration;
 
 const MAX_DECIMAL_PRECISION: u32 = 38;
 
-pub(crate) fn duration_seconds(value: f64, name: &str) -> PyResult<Duration> {
-    Duration::try_from_secs_f64(value).map_err(|_| {
-        InvalidError::new_err(format!(
-            "{name} must be a finite, non-negative number of seconds"
-        ))
-    })
+/// A relative duration given in milliseconds. Fractions below one millisecond
+/// are kept. Negative, non-finite, and out-of-range values raise
+/// `InvalidError`.
+pub(crate) fn duration_ms(value: f64, name: &str) -> PyResult<Duration> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(InvalidError::new_err(format!(
+            "{name} must be a finite, non-negative number of milliseconds"
+        )));
+    }
+    Duration::try_from_secs_f64(value / 1000.0)
+        .map_err(|_| InvalidError::new_err(format!("{name} is out of range")))
 }
 
 // Convert a Python scalar (or list/tuple of scalars) into a query `Value`.

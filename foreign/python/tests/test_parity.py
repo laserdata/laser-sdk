@@ -419,18 +419,12 @@ def test_given_a_registered_card_when_checking_it_then_should_answer_freshness_a
         ls.RegisteredCard("", {}, 1)
 
 
-@pytest.mark.parametrize(
-    "kind",
-    ["instruction", "response", "model.response", "tool.call", "tool.result", "human.input"],
-)
-def test_given_a_turn_kind_when_mapping_to_its_topic_then_should_map_back(kind):
-    assert ls.Sessions.turn_kind(ls.Sessions.turn_topic(kind)) == kind
-
-
-def test_given_an_unknown_turn_word_when_mapping_then_should_reject_it():
-    assert ls.Sessions.turn_kind("readings") is None
-    with pytest.raises(ls.InvalidError):
-        ls.Sessions.turn_topic("nope")
+def test_given_a_session_builder_when_inspecting_then_should_offer_the_lifecycle_settings():
+    settings = ["agent", "namespace", "parent", "with_id", "idle_timeout", "budget", "tag", "id"]
+    for name in [*settings, "begin"]:
+        assert hasattr(ls.SessionBuilder, name)
+    for name in ["end", "fail", "cancel", "append", "as_agent", "context", "checkpoint"]:
+        assert hasattr(ls.Session, name)
 
 
 def test_given_spawn_agent_when_inspecting_the_binding_then_should_accept_a_dedup_window():
@@ -560,3 +554,43 @@ def test_given_two_minted_ulids_when_compared_then_should_differ_and_be_ulids():
 def test_given_a_provenance_when_reading_the_partition_key_then_should_be_the_conversation():
     provenance = ls.Provenance(agent="planner")
     assert provenance.partition_key() == provenance.conversation_id
+
+
+def test_given_a_group_filter_when_inspected_then_should_mirror_the_rust_configure_verbs():
+    configure = inspect.signature(ls.GroupFilter.configure)
+    assert list(configure.parameters)[1:] == ["filter"]
+    configure_with = inspect.signature(ls.GroupFilter.configure_with)
+    assert list(configure_with.parameters)[1:] == ["filter", "filter_id", "revision"]
+    configure_as = inspect.signature(ls.GroupFilter.configure_as)
+    assert list(configure_as.parameters)[1:] == ["operation_id", "filter", "filter_id", "revision"]
+
+
+def test_given_the_agdx_verbs_when_inspected_then_should_offer_every_rust_send_refinement():
+    for verb in ("command", "respond", "emit", "status", "fail"):
+        parameters = inspect.signature(getattr(ls.Agdx, verb)).parameters
+        for refinement in ("operation", "target", "task_state", "last", "correlation"):
+            assert refinement in parameters, f"Agdx.{verb} lacks {refinement}="
+    assert "content_type" not in inspect.signature(ls.Agdx.fail).parameters
+
+
+def test_given_budget_values_when_built_then_should_carry_every_dimension():
+    budget = ls.Budget(tokens=4_000, cost_micros=250)
+    assert (budget.tokens, budget.cost_micros) == (4_000, 250)
+    assert ls.Budget() == ls.Budget(tokens=None, cost_micros=None)
+    workflow = ls.WorkflowBudget.tokens(100).wall_clock(1.5).invocations(3)
+    assert (
+        repr(workflow)
+        == "WorkflowBudget(tokens=Some(100), wall_clock_ms=Some(1.5), invocations=Some(3))"
+    )
+    assert ls.WorkflowBudget.unlimited() == ls.WorkflowBudget.unlimited()
+    with pytest.raises(ls.InvalidError):
+        ls.WorkflowBudget.unlimited().wall_clock(-1)
+
+
+def test_given_durations_when_passed_then_should_take_milliseconds():
+    retention = ls.TopicRetention.expire_after(86_400_000)
+    assert retention.expiry_ms == 86_400_000
+    assert ls.GovernorRetention(idle_ttl_ms=250).idle_ttl_ms == 250
+    for value in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ls.InvalidError):
+            ls.TopicRetention.expire_after(value)

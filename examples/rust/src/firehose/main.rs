@@ -1,5 +1,6 @@
 use laser_examples::{
     env_bool, env_u64, env_usize, fresh_run, index_for, init_tracing, laser, phase, stream_for,
+    wait_for_rows,
 };
 use laser_sdk::prelude::full::*;
 use laser_sdk::query::{Projection, ProjectionBinding};
@@ -21,7 +22,7 @@ use tracing::{info, warn};
 // Every knob is read from the environment (see `Config`), so the same binary
 // scales from a quick smoke run to a multi gigabyte soak:
 //
-//   # defaults: about 2M events across 8 org indexes, 4 KB payloads (about 8 GB)
+//   # defaults: about 20k events across 8 org indexes, 4 KB payloads
 //   just up && cargo run --release --example firehose
 //
 //   # bigger: about 10M events, 32 orgs, 16 producers, let LaserData Cloud project
@@ -269,10 +270,17 @@ async fn main() -> Result<(), LaserError> {
             (total_bytes as f64 / 1e6) / elapsed,
         );
 
-        // Analytics, best effort.
         if config.query && query_available {
+            let mut populated_indexes = Vec::new();
+            for (org, index) in indexes.iter().enumerate() {
+                let expected = per_org + u64::from((org as u64) < remainder);
+                if expected > 0 {
+                    wait_for_rows(&laser, index, expected).await?;
+                    populated_indexes.push(index.clone());
+                }
+            }
             phase("sample analytics over the firehose");
-            run_sample_queries(&laser, &indexes).await;
+            run_sample_queries(&laser, &populated_indexes).await;
         } else if config.query {
             info!(
                 "sample analytics needs Laser Stack or LaserData Cloud, streaming run completed without it"
@@ -302,14 +310,14 @@ impl Config {
     fn from_env() -> Self {
         Self {
             orgs: env_usize("LASER_FIREHOSE_ORGS", 8).max(1),
-            messages: env_u64("LASER_FIREHOSE_MESSAGES", 2_000_000).max(1),
+            messages: env_u64("LASER_FIREHOSE_MESSAGES", 20_000).max(1),
             payload_bytes: env_usize("LASER_FIREHOSE_PAYLOAD_BYTES", 4096),
-            batch: env_usize("LASER_FIREHOSE_BATCH", 1000).max(1),
-            concurrency: env_usize("LASER_FIREHOSE_CONCURRENCY", 12).max(1),
+            batch: env_usize("LASER_FIREHOSE_BATCH", 500).max(1),
+            concurrency: env_usize("LASER_FIREHOSE_CONCURRENCY", 4).max(1),
             partitions: env_usize("LASER_FIREHOSE_PARTITIONS", 8).max(1) as u32,
             register: env_bool("LASER_FIREHOSE_REGISTER", true),
             query: env_bool("LASER_FIREHOSE_QUERY", true),
-            progress_every: env_u64("LASER_FIREHOSE_PROGRESS_EVERY", 100_000).max(1),
+            progress_every: env_u64("LASER_FIREHOSE_PROGRESS_EVERY", 5_000).max(1),
         }
     }
 }
@@ -340,6 +348,7 @@ async fn register_index(
         .allow(projection_id.clone())
         .default_projection(projection_id)
         .index(index)
+        .notify()
         .build();
     laser.bindings().apply(binding).await?;
     Ok(())

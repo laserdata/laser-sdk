@@ -32,9 +32,10 @@ mod query;
 mod rbac;
 mod reader;
 mod registry;
-mod runs;
 mod schema;
 mod session;
+mod session_ops;
+mod session_reads;
 mod sign;
 mod snapshot;
 mod state_store;
@@ -51,12 +52,61 @@ use pyo3_stub_gen::define_stub_info_gatherer;
 
 pub use errors::exception_stub;
 
+// The Iggy producer warns that its client has been shut down whenever a Laser
+// closes, because every cached producer watches the client it publishes
+// through. That record is the expected end of a producer, so it reaches Python
+// at debug. Every other record, the producer's disconnect warning included,
+// keeps its level.
+struct PythonLogger(pyo3_log::Logger);
+
+const PRODUCER_TARGET: &str = "iggy::clients::producer";
+const PRODUCER_SHUTDOWN: &str = "Client has been shutdown";
+
+fn is_producer_shutdown(record: &log::Record<'_>) -> bool {
+    record.level() == log::Level::Warn
+        && record.target().starts_with(PRODUCER_TARGET)
+        && record.args().to_string() == PRODUCER_SHUTDOWN
+}
+
+impl log::Log for PythonLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if is_producer_shutdown(record) {
+            self.0.log(
+                &log::Record::builder()
+                    .level(log::Level::Debug)
+                    .target(record.target())
+                    .module_path(record.module_path())
+                    .file(record.file())
+                    .line(record.line())
+                    .args(*record.args())
+                    .build(),
+            );
+        } else {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+fn install_logger() -> Result<(), log::SetLoggerError> {
+    log::set_boxed_logger(Box::new(PythonLogger(pyo3_log::Logger::default())))?;
+    log::set_max_level(log::LevelFilter::Debug);
+    Ok(())
+}
+
 #[pymodule]
 fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Bridge Rust `log` records to Python's `logging`, so the runtime's
     // diagnostics land on the `laser_sdk` logger a host app already configures
     // instead of on stderr. Best effort: a second import must not fail the module.
-    let _ = pyo3_log::try_init();
+    let _ = install_logger();
     errors::register(py, module)?;
     client::register_constants(module)?;
     module.add_class::<client::PyLaser>()?;
@@ -128,6 +178,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<context::PyTokenBudget>()?;
     module.add_class::<context::PyRoleFilter>()?;
     module.add_class::<context::PyChain>()?;
+    module.add_class::<context::PySelection>()?;
     module.add_class::<destinations::PyDestinations>()?;
     module.add_class::<projections::PyProjections>()?;
     module.add_class::<projections::PyBindings>()?;
@@ -215,10 +266,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<registry::PyConsumptionStatus>()?;
     module.add_class::<workflow::PyWorkflowOutcome>()?;
     module.add_class::<workflow::PyWorkflow>()?;
-    module.add_class::<runs::PyRuns>()?;
-    module.add_class::<runs::PyAgentRunInfo>()?;
-    module.add_class::<runs::PyRunPage>()?;
-    module.add_class::<runs::PyRunBudget>()?;
+    module.add_class::<workflow::PyWorkflowBudget>()?;
     module.add_class::<rbac::PyGrant>()?;
     module.add_class::<rbac::PyRole>()?;
     module.add_class::<rbac::PyResourcePattern>()?;
@@ -268,10 +316,33 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<context::PyContextMessage>()?;
     module.add_function(wrap_pyfunction!(context::context_checkpoint, module)?)?;
     module.add_class::<session::PySessions>()?;
+    module.add_class::<session::PySessionBuilder>()?;
+    module.add_class::<session::PyTopicRetention>()?;
+    module.add_class::<session::PyBudget>()?;
+    module.add_class::<session::PySessionLayout>()?;
+    module.add_class::<session::PySdkInfo>()?;
+    module.add_class::<session::PySessionBootstrap>()?;
+    module.add_class::<agdx::PyAgdxReceipt>()?;
+    module.add_class::<session::PySessionLease>()?;
+    module.add_function(wrap_pyfunction!(session::derive_session_id, module)?)?;
     module.add_class::<session::PySessionConfig>()?;
     module.add_class::<session::PySession>()?;
     module.add_class::<session::PySessionTurn>()?;
     module.add_class::<session::PyCheckpoint>()?;
+    module.add_class::<session_ops::PyModelRequest>()?;
+    module.add_class::<session_ops::PyModelResponse>()?;
+    module.add_class::<session_ops::PyAssembledContext>()?;
+    module.add_class::<session_ops::PyModelCall>()?;
+    module.add_class::<session_ops::PyToolCall>()?;
+    module.add_class::<session_ops::PySessionState>()?;
+    module.add_class::<session_ops::PySubmitBuilder>()?;
+    module.add_class::<session_ops::PySubmitted>()?;
+    module.add_class::<session_ops::PySessionControl>()?;
+    module.add_class::<session_ops::PyPendingControl>()?;
+    module.add_class::<session_ops::PyParkedRecords>()?;
+    module.add_class::<session_reads::PySessionChange>()?;
+    module.add_class::<session_reads::PySessionWatch>()?;
+    module.add_function(wrap_pyfunction!(session_ops::default_redact, module)?)?;
     module.add_function(wrap_pyfunction!(
         session::session_policy_conversation_for,
         module
@@ -294,6 +365,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<state_store::PyStateStore>()?;
     module.add_class::<state_store::PyInMemoryStore>()?;
     module.add_class::<state_store::PyFileStore>()?;
+    module.add_class::<state_store::PyKvStore>()?;
     module.add_class::<interop::PyA2aBridge>()?;
     module.add_class::<interop::PyMcpBridge>()?;
     module.add_class::<registry::PyAgentRegistry>()?;
@@ -332,7 +404,6 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(graph::graph_edge_valid_at, module)?)?;
     module.add_function(wrap_pyfunction!(graph::edge_dir_is_out, module)?)?;
     module.add_function(wrap_pyfunction!(graph::graph_return_is_nodes, module)?)?;
-    module.add_function(wrap_pyfunction!(runs::agent_run_state_is_terminal, module)?)?;
     module.add_function(wrap_pyfunction!(
         snapshot::fold_snapshot_resume_offset,
         module
@@ -358,7 +429,144 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(parity_helpers::verify_delegation, module)?)?;
     module.add_function(wrap_pyfunction!(parity_helpers::encode_snapshot, module)?)?;
     module.add_function(wrap_pyfunction!(parity_helpers::decode_snapshot, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_context_manifest,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_context_manifest,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_context_compaction,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_context_compaction,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_context_retrieval,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_context_retrieval,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_state_delta,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_state_delta,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_state_snapshot,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_state_snapshot,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(parity_helpers::apply_json_patch, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_get,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_get,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_list,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_list,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_events,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_events,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_start,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_start,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_transition,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_transition,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_end,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_end,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_state,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_state,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_links,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_links,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_sources,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_sources,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_changes,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_changes,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::encode_session_reply,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::decode_session_reply,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(parity_helpers::resume_offsets, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::snapshot_from_checkpoint,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        parity_helpers::checkpoint_from_snapshot,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         parity_helpers::fuse_reciprocal_rank,
         module
@@ -385,3 +593,46 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 define_stub_info_gatherer!(stub_info);
+
+#[cfg(test)]
+mod tests {
+    use super::{PRODUCER_SHUTDOWN, PRODUCER_TARGET, is_producer_shutdown};
+
+    fn record_matches(level: log::Level, target: &str, message: &str) -> bool {
+        is_producer_shutdown(
+            &log::Record::builder()
+                .level(level)
+                .target(target)
+                .args(format_args!("{message}"))
+                .build(),
+        )
+    }
+
+    #[test]
+    fn given_the_producer_shutdown_warning_when_logged_then_should_be_demoted() {
+        assert!(record_matches(
+            log::Level::Warn,
+            PRODUCER_TARGET,
+            PRODUCER_SHUTDOWN
+        ));
+    }
+
+    #[test]
+    fn given_any_other_record_when_logged_then_should_keep_its_level() {
+        assert!(!record_matches(
+            log::Level::Warn,
+            PRODUCER_TARGET,
+            "Disconnected from the server"
+        ));
+        assert!(!record_matches(
+            log::Level::Error,
+            PRODUCER_TARGET,
+            PRODUCER_SHUTDOWN
+        ));
+        assert!(!record_matches(
+            log::Level::Warn,
+            "laser_sdk::agent",
+            PRODUCER_SHUTDOWN
+        ));
+    }
+}

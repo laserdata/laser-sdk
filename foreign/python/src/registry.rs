@@ -673,8 +673,8 @@ impl PyAgentScope {
     }
 
     /// Request and reply as this agent: publish to `request_topic` and await
-    /// the correlated reply on `reply_topic` up to `timeout_secs`.
-    #[pyo3(signature = (request_topic, reply_topic, payload, provenance, *, timeout_secs=30.0))]
+    /// the correlated reply on `reply_topic` up to `timeout_ms`.
+    #[pyo3(signature = (request_topic, reply_topic, payload, provenance, *, timeout_ms))]
     fn ask<'py>(
         &self,
         py: Python<'py>,
@@ -682,14 +682,14 @@ impl PyAgentScope {
         reply_topic: String,
         payload: &Bound<'_, PyAny>,
         provenance: &PyProvenance,
-        timeout_secs: f64,
+        timeout_ms: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let scope = self.inner.clone();
         let request_topic = static_topic(request_topic)?;
         let reply_topic = static_topic(reply_topic)?;
         let payload = payload_bytes(payload)?;
         let provenance = provenance.inner.clone();
-        let timeout = crate::convert::duration_seconds(timeout_secs, "timeout_secs")?;
+        let timeout = crate::convert::duration_ms(timeout_ms, "timeout_ms")?;
         future_into_py(py, async move {
             let reply = scope
                 .ask(request_topic, reply_topic, payload, &provenance, timeout)
@@ -704,7 +704,7 @@ impl PyAgentScope {
     /// `Contract`, as `Laser.contract` does. Use
     /// `Laser.contract` for capability routing. Pass `agent=None` with `skill`
     /// to route by capability under the route `policy` word.
-    #[pyo3(signature = (agent, payload, *, deadline_ms=30_000, skill=None, policy=None, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, registered=false))]
+    #[pyo3(signature = (agent, payload, *, deadline_ms=30_000, skill=None, policy=None, fixed_inbox=None, principal=None, expire_if_not_consumed_ms=None, reply_on=None, conversation=None, fence=None, parent=None, root=None))]
     #[allow(clippy::too_many_arguments)]
     fn contract<'py>(
         &self,
@@ -720,7 +720,8 @@ impl PyAgentScope {
         reply_on: Option<String>,
         conversation: Option<String>,
         fence: Option<u64>,
-        registered: bool,
+        parent: Option<String>,
+        root: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let request = crate::agent_runtime::ContractRequest::new(
             skill,
@@ -734,7 +735,7 @@ impl PyAgentScope {
             reply_on,
             conversation,
             fence,
-            registered,
+            crate::agent_runtime::parent_pair(parent, root)?,
             policy,
         )?;
         let laser = self.laser.clone();
@@ -828,6 +829,13 @@ pub enum PyConsumptionStatus {
     /// The target has committed past the message: `committed` is its stored
     /// offset, `head` the partition head at the time of the probe.
     Consumed { committed: u64, head: u64 },
+    /// The agent's group committed past the record without handling it.
+    /// `dispatch` is the classification word, such as `foreign` or `reply`.
+    Skipped {
+        committed: u64,
+        head: u64,
+        dispatch: String,
+    },
 }
 
 impl From<ConsumptionStatus> for PyConsumptionStatus {
@@ -835,6 +843,15 @@ impl From<ConsumptionStatus> for PyConsumptionStatus {
         match status {
             ConsumptionStatus::NotYetConsumed { behind_by } => Self::NotYetConsumed { behind_by },
             ConsumptionStatus::Consumed { committed, head } => Self::Consumed { committed, head },
+            ConsumptionStatus::Skipped {
+                committed,
+                head,
+                dispatch,
+            } => Self::Skipped {
+                committed,
+                head,
+                dispatch: dispatch.as_str().to_owned(),
+            },
         }
     }
 }
@@ -858,6 +875,17 @@ mod tests {
         assert!(
             PyConsumptionStatus::from(ConsumptionStatus::NotYetConsumed { behind_by: 3 })
                 == PyConsumptionStatus::NotYetConsumed { behind_by: 3 }
+        );
+        assert!(
+            PyConsumptionStatus::from(ConsumptionStatus::Skipped {
+                committed: 4,
+                head: 5,
+                dispatch: laser_sdk::wire::dispatch::Dispatch::Foreign,
+            }) == PyConsumptionStatus::Skipped {
+                committed: 4,
+                head: 5,
+                dispatch: "foreign".to_owned(),
+            }
         );
     }
 

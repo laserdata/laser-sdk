@@ -1,4 +1,8 @@
-import { INTERNAL_RETURN_DELIVERY } from "../client/internals.js"
+import {
+  INTERNAL_ASSIGNED_PARTITIONS,
+  INTERNAL_COMMIT_HANDLED,
+  INTERNAL_RETURN_DELIVERY
+} from "../client/internals.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
 import {
@@ -246,6 +250,9 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   private lastFlushAt = Date.now()
   private pendingCommit: CommitPoint | undefined
   private moreScanned = false
+  // Records handled out of band, acknowledged in order before the next read.
+  private readonly deferred: MatchedRecord[] = []
+  private groupRead = false
   private readonly consumedOffsets = new Map<number, bigint>()
   private readonly explicitOffsets = new Map<number, bigint>()
   // The consumed offset a partition had when its server offset was deleted.
@@ -397,15 +404,40 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       this.storedOffsets.set(message.partitionId, message.position.offset)
       return
     }
-    await this.transport.storeOffset(
-      this.streamName,
-      this.topicName,
-      this.target,
-      message.partitionId,
-      message.position.offset
-    )
-    this.explicitOffsets.set(message.partitionId, message.position.offset)
-    this.storedOffsets.set(message.partitionId, message.position.offset)
+    await this.storeOffset(message.position.offset, message.partitionId)
+  }
+
+  /**
+   * Commit a handled message without waiting for a read in flight. A group
+   * consumer queues the acknowledgment and sends it before its next read, so
+   * the read is never cancelled. A native consumer stores the offset at once.
+   *
+   * @internal
+   */
+  async [INTERNAL_COMMIT_HANDLED](message: ConsumerMessage): Promise<void> {
+    if (this.reader === undefined) {
+      await this.commit(message)
+      return
+    }
+    const record = this.delivered.get(message)
+    if (record === undefined) {
+      throw new InvalidError("the record was not delivered by this group consumer")
+    }
+    this.deferred.push(record)
+  }
+
+  /**
+   * The partitions this group consumer reads now. A native consumer knows the
+   * assignment its last group sync returned. `undefined` before the first
+   * read, and for a native consumer that never syncs.
+   *
+   * @internal
+   */
+  [INTERNAL_ASSIGNED_PARTITIONS](): ReadonlySet<number> | undefined {
+    if (this.reader === undefined) {
+      return this.assignmentSeen ? new Set(this.assignedPartitions) : undefined
+    }
+    return this.groupRead ? new Set(this.reader.partitions()) : undefined
   }
 
   lastConsumedOffset(partitionId: number): bigint | undefined {
@@ -429,6 +461,9 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     this.requireNative("storeOffset")
     if (offset < 0n) throw new InvalidError("offset must be non-negative")
     const partition = this.currentPartition(partitionId)
+    if (!this.allowReplay && offset >= 1n && offset <= (this.storedOffsets.get(partition) ?? 0n)) {
+      return
+    }
     await this.transport.storeOffset(
       this.streamName,
       this.topicName,
@@ -452,7 +487,6 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     const partition = this.currentPartition(partitionId)
     await this.transport.deleteOffset(this.streamName, this.topicName, this.target, partition)
     this.explicitOffsets.delete(partition)
-    this.storedOffsets.delete(partition)
     const consumed = this.consumedOffsets.get(partition)
     if (consumed === undefined) this.deletedAt.delete(partition)
     else this.deletedAt.set(partition, consumed)
@@ -497,6 +531,8 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     }
     if (this.reader !== undefined) {
       try {
+        if (this.deferred.length > 0) await this.polling?.catch(() => undefined)
+        this.polling = undefined
         await this.finishDelivery()
       } finally {
         this.records.length = 0
@@ -729,16 +765,42 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   private async finishDelivery(): Promise<void> {
     if (this.reader === undefined) return
     const delivery = this.lastDelivery
-    if (delivery !== undefined) {
-      this.lastDelivery = undefined
+    this.lastDelivery = undefined
+    // A disabled policy completes only what the caller commits.
+    if (delivery !== undefined && this.commitPolicy.kind !== "disabled") {
       this.reader.handled(delivery.record)
       this.yieldedSinceFlush += 1
       this.pendingCommit = { kind: "delivered", lastOfPage: delivery.lastOfPage }
     }
     const point = this.pendingCommit
-    if (point === undefined) return
-    await this.flushIfDue(this.reader, point)
-    this.pendingCommit = undefined
+    if (point !== undefined) {
+      await this.flushIfDue(this.reader, point)
+      this.pendingCommit = undefined
+    }
+    // A read in flight sends the queued acknowledgments before its next read.
+    if (this.polling === undefined) await this.applyDeferred(this.reader)
+  }
+
+  // Acknowledge the records handled out of band, in the order they were
+  // handled. A failed acknowledgment stays queued with the ones after it, so
+  // the next attempt sends it again. A partition this member lost refuses its
+  // acknowledgment, and the new owner reads those records again, so that one
+  // is dropped.
+  private async applyDeferred(reader: FilteredReader): Promise<void> {
+    for (let record = this.deferred[0]; record !== undefined; record = this.deferred[0]) {
+      try {
+        await reader.ackThrough(record)
+        this.explicitOffsets.set(record.partitionId, record.offset)
+        this.storedOffsets.set(record.partitionId, record.offset)
+      } catch (error) {
+        if (!(
+          error instanceof FilterExecutionError && error.detail.reason === "membership_stale"
+        )) {
+          throw error
+        }
+      }
+      this.deferred.shift()
+    }
   }
 
   // Stores the handled prefix when the commit policy says so at this point.
@@ -772,8 +834,10 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
   // prefix first, so a crash redelivers the current batch instead of
   // skipping it.
   private async fillFromGroup(reader: FilteredReader): Promise<void> {
+    await this.applyDeferred(reader)
     await this.flushIfDue(reader, { kind: "poll" })
     const [page, more] = await reader.readRound()
+    this.groupRead = true
     this.moreScanned = more
     if (page !== undefined) this.records.push(...page.records)
   }

@@ -99,7 +99,7 @@ pub async fn run_context_fetch_evidence(
     let stream = format!("bench-context-fetch-{seed:016x}");
     laser
         .stream(&stream)
-        .topic(AgentTopic::Commands.topic_string())
+        .topic(AgentTopic::Sessions.topic_string())
         .ensure(case.partitions)
         .await
         .map_err(|error| sdk_error(&error))?;
@@ -143,7 +143,7 @@ pub async fn run_context_fetch_evidence(
     let selected = scoped
         .context(conversation)
         .fetch_with(
-            vec![AgentTopic::Commands],
+            vec![AgentTopic::Sessions],
             build_policy(
                 policy,
                 context_limit,
@@ -164,7 +164,7 @@ pub async fn run_context_fetch_evidence(
         policy,
         configuration: serde_json::json!({
             "source": "conversation-log",
-            "topics": [AgentTopic::Commands.topic_string()],
+            "topics": [AgentTopic::Sessions.topic_string()],
             "policy": policy.label(),
             "history_messages": history_messages,
             "context_limit": context_limit,
@@ -190,7 +190,7 @@ async fn populate_history(
         });
         let body = record_payload(payload, id).map_err(BenchError::Invalid)?;
         laser
-            .send_agent(AgentTopic::Commands, body, &provenance)
+            .send_agent(AgentTopic::Sessions, body, &provenance)
             .await
             .map_err(|error| sdk_error(&error))?;
     }
@@ -211,7 +211,7 @@ fn fetch_operation(
             laser
                 .context(conversation)
                 .fetch_with(
-                    vec![AgentTopic::Commands],
+                    vec![AgentTopic::Sessions],
                     build_policy(policy, context_limit, role),
                 )
                 .await

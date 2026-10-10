@@ -129,6 +129,11 @@ pub struct GraphQuery {
     /// lens: "show me only what this conversation put in the graph."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The stream the lens conversation belongs to. Set alongside
+    /// `conversation` by a client that scopes its resources to a stream.
+    /// Absent on the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 impl GraphReturn {
@@ -161,6 +166,9 @@ pub struct GraphNeighbors {
     /// [`GraphQuery::conversation`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The stream the lens conversation belongs to. See [`GraphQuery::stream`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Where a graph element was last observed: the source record an extraction came
@@ -185,6 +193,9 @@ pub enum SourceRef {
         topic: u32,
         partition: u32,
         offset: u64,
+        /// Topic creation timestamp, proving the numeric topic id's generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
     },
@@ -192,6 +203,13 @@ pub enum SourceRef {
     Kv { namespace: String, key: String },
     /// A managed memory item, by its id.
     Memory { id: String },
+}
+
+/// The component that produced a memory or graph fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerInfo {
+    pub name: String,
+    pub version: String,
 }
 
 /// One node: its id, labels, attributes, optional embedding, and optional source.
@@ -207,6 +225,9 @@ pub struct GraphNode {
     /// The source this node was first observed in, if known. See [`SourceRef`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceRef>,
+    /// The component that first produced this node, excluded from its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<ProducerInfo>,
 }
 
 impl GraphNode {
@@ -225,6 +246,7 @@ impl GraphNode {
             attrs: vec![("value".to_owned(), Value::from(value))],
             embedding: None,
             source: None,
+            producer: None,
         }
     }
 }
@@ -254,6 +276,9 @@ pub struct GraphEdge {
     /// [`SourceRef`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceRef>,
+    /// The component that last produced this edge, excluded from its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<ProducerInfo>,
 }
 
 impl GraphEdge {
@@ -272,6 +297,7 @@ impl GraphEdge {
             valid_from: None,
             valid_to: None,
             source: None,
+            producer: None,
         }
     }
 
@@ -325,6 +351,8 @@ pub struct GraphResult {
 pub struct GraphUpsert {
     pub v: u32,
     pub graph: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::agent::SessionRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<GraphNode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -421,6 +449,7 @@ mod tests {
             consistency: Consistency::Eventual,
             as_of: Some(1_900_000_000_000_000),
             conversation: None,
+            stream: None,
         };
         let bytes = encode_named(&query).expect("serializes");
         let back: GraphQuery = decode_named(&bytes).expect("deserializes");
@@ -434,6 +463,7 @@ mod tests {
     fn given_a_graph_result_when_round_tripped_then_should_preserve_nodes_and_edges() {
         let reply = GraphReply::Ok(GraphResult {
             nodes: vec![GraphNode {
+                producer: None,
                 id: NodeId::from_u128(1),
                 labels: vec!["Person".to_owned()],
                 attrs: vec![("name".to_owned(), Value::from("Alice"))],
@@ -441,6 +471,7 @@ mod tests {
                 source: None,
             }],
             edges: vec![GraphEdge {
+                producer: None,
                 id: EdgeId::from_u128(2),
                 from: NodeId::from_u128(1),
                 to: NodeId::from_u128(3),
@@ -480,6 +511,7 @@ mod tests {
             consistency: Consistency::Eventual,
             as_of: None,
             conversation: None,
+            stream: None,
         };
         let bytes = encode_named(&query).expect("serializes");
         let back: GraphQuery = decode_named(&bytes).expect("deserializes");
@@ -574,6 +606,7 @@ mod tests {
     fn given_a_node_with_a_source_when_round_tripped_then_should_preserve_it_and_keep_identity() {
         let mut node = GraphNode::entity("Component", "cache");
         node.source = Some(SourceRef::Message {
+            generation: None,
             stream: 7,
             topic: 2,
             partition: 3,
@@ -611,6 +644,7 @@ mod tests {
     #[test]
     fn given_a_source_without_a_conversation_when_serialized_then_should_omit_it() {
         let source = SourceRef::Message {
+            generation: None,
             stream: 1,
             topic: 1,
             partition: 0,
@@ -628,6 +662,7 @@ mod tests {
     fn given_a_source_with_a_conversation_when_round_tripped_then_should_preserve_it() {
         let mut node = GraphNode::entity("Ticket", "7");
         node.source = Some(SourceRef::Message {
+            generation: None,
             stream: 4,
             topic: 6,
             partition: 2,
@@ -662,6 +697,7 @@ mod tests {
             consistency: Consistency::Eventual,
             as_of: None,
             conversation: Some("01KWM3K3XEP3NP5TN850J17YBP".to_owned()),
+            stream: Some("acme".to_owned()),
         };
         let back: GraphQuery =
             decode_named(&encode_named(&query).expect("serializes")).expect("deserializes");
@@ -669,15 +705,51 @@ mod tests {
             back.conversation.as_deref(),
             Some("01KWM3K3XEP3NP5TN850J17YBP")
         );
+        assert_eq!(back.stream.as_deref(), Some("acme"));
         // The default (no filter) stays omitted on the wire.
         let unfiltered = GraphQuery {
             conversation: None,
+            stream: None,
             ..query
         };
         let json = serde_json::to_string(&unfiltered).expect("serializes");
         assert!(
-            !json.contains("conversation"),
+            !json.contains("conversation") && !json.contains("stream"),
             "an unset filter is omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn given_a_neighbors_read_with_and_without_a_stream_when_round_tripped_then_should_omit_it_only_when_unset()
+     {
+        let request = GraphNeighbors {
+            v: GRAPH_OP_VERSION,
+            graph: "knowledge".to_owned(),
+            node: NodeId::from_u128(1),
+            dir: EdgeDir::Out,
+            edge_type: None,
+            depth: 1,
+            limit: 10,
+            as_of: None,
+            conversation: Some("01KWM3K3XEP3NP5TN850J17YBP".to_owned()),
+            stream: Some("acme".to_owned()),
+        };
+        let back: GraphNeighbors =
+            decode_named(&encode_named(&request).expect("serializes")).expect("deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+        let bare = GraphNeighbors {
+            conversation: None,
+            stream: None,
+            ..request
+        };
+        let bytes = encode_named(&bare).expect("serializes");
+        let back: GraphNeighbors = decode_named(&bytes).expect("deserializes");
+        assert_eq!(back.stream, None);
+        assert!(
+            !serde_json::to_string(&bare)
+                .expect("serializes")
+                .contains("stream"),
+            "an unset stream is omitted"
         );
     }
 
@@ -685,6 +757,7 @@ mod tests {
     fn given_a_max_element_reply_with_source_when_encoded_then_should_fit_one_frame() {
         use crate::limits::{MAX_FRAME_BYTES, MAX_GRAPH_RESULT_ELEMENTS};
         let source = SourceRef::Message {
+            generation: None,
             stream: u32::MAX,
             topic: u32::MAX,
             partition: u32::MAX,
@@ -701,6 +774,7 @@ mod tests {
             .collect();
         let edges = (0..half)
             .map(|i| GraphEdge {
+                producer: None,
                 id: EdgeId::from_u128(i),
                 from: NodeId::from_u128(i),
                 to: NodeId::from_u128(i + 1),

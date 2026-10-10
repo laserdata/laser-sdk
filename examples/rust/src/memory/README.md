@@ -1,4 +1,4 @@
-# memory
+# memory: vector memory, durable memory, and a knowledge graph
 
 This example stores incident facts, retrieves related facts, and records feedback. It also demonstrates durable memory and graph relationships on managed deployments.
 
@@ -13,7 +13,7 @@ The local phase uses `VectorMemory` and needs no server:
 3. Apply positive feedback and make sure that the relevant fact ranks first.
 4. Forget a superseded fact and make sure that recall excludes it.
 
-The durable phase publishes memory records to a topic and reads the managed view. `memory_topic("incidents")` configures the partition count and message expiry. The topic retains the history under that policy.
+The durable phase publishes memory records to a topic and reads the managed view. `memory_topic("incidents")` configures the partition count and message expiry. The topic retains the history under that policy. The managed view folds the topic asynchronously, so the example polls it for a bounded time until the new facts appear.
 
 `laser.context(conversation)` selects the incident conversation. The scope appends and reads messages without repeating the ID. `scope.memory("incidents")` uses that conversation for session memory. Durable facts and graph relationships can span conversations.
 
@@ -38,7 +38,7 @@ cargo run --release --example memory
 The memory half needs no server. Durable memory and graph traversal require Laser Stack or LaserData Cloud.
 
 ```sh
-LASER_CONNECTION_STRING=iggy:laser@127.0.0.1:8090 \
+LASER_CONNECTION_STRING=user:pwd@your-host \
   cargo run --release --example memory
 ```
 

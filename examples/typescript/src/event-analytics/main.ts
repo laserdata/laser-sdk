@@ -14,6 +14,7 @@ import {
 } from "@laserdata/laser-sdk"
 import {
   batchSize,
+  exampleStream,
   indexFor,
   managedGate,
   messages,
@@ -160,7 +161,7 @@ async function registerProjection(
     inlinePayloadDefault
   }
   const binding: ProjectionBinding = {
-    source: { stream: laser.defaultStream ?? "", topic },
+    source: { stream: exampleStream(laser), topic },
     allowedProjections: [id],
     defaultProjection: id,
     index,

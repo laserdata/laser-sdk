@@ -15,7 +15,7 @@ import { AgentId } from "../../src/types/ids.js"
 function builder(): AgentBuilder {
   return Agent.builder()
     .id(AgentId.new("configured-worker"))
-    .listenOn(AgentTopic.Commands)
+    .listenOn(AgentTopic.Sessions)
     .handler({ handle: () => Promise.resolve() })
 }
 
@@ -33,7 +33,7 @@ void test("given_invalid_numeric_policies_when_building_then_should_reject_befor
 
 void test("given_a_missing_handler_when_building_then_should_reject_with_handler_config", () => {
   assert.throws(
-    () => Agent.builder().id(AgentId.new("w")).listenOn(AgentTopic.Commands).build(),
+    () => Agent.builder().id(AgentId.new("w")).listenOn(AgentTopic.Sessions).build(),
     HandlerConfigError
   )
 })
@@ -43,7 +43,7 @@ void test("given_an_agent_literal_when_constructed_then_should_validate_like_the
     () =>
       new Agent({
         id: AgentId.new("literal-worker"),
-        listenOn: AgentTopic.Commands,
+        listenOn: AgentTopic.Sessions,
         handler: { handle: () => Promise.resolve() },
         shutdownGraceMs: -1,
         understoodFeatures: 0n,
@@ -83,5 +83,34 @@ void test(
       .spawn(laser)
     await handle.join()
     assert.deepEqual(calls, [[governor, GovernorMode.Enforce, { capacity: 8 }]])
+  }
+)
+
+void test(
+  "given_served_operations_when_spawning_then_should_hand_them_to_the_reliable_consumer",
+  { timeout: 1000 },
+  async (t) => {
+    let operations: readonly string[] | undefined
+    t.mock.method(
+      ReliableConsumer.prototype,
+      "run",
+      function (
+        this: ReliableConsumer,
+        _laser: Laser,
+        _handler: AgentHandler,
+        control: ReliableConsumerControl
+      ) {
+        operations = (this as unknown as { options: { operations?: readonly string[] } }).options
+          .operations
+        control.ready?.()
+        return Promise.resolve()
+      }
+    )
+    const handle = builder()
+      .operations(["summarize"])
+      .build()
+      .spawn({} as Laser)
+    await handle.join()
+    assert.deepEqual(operations, ["summarize"])
   }
 )

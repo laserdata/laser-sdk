@@ -1,4 +1,4 @@
-# query - queries that already ran
+# query: the Views primitive
 
 A projector turns topic records into a queryable view. This example waits for projection, then reads host readings that match a filter.
 
@@ -25,4 +25,4 @@ LASER_CONNECTION_STRING=user:pwd@your-host npm run example:query
 ## Learn more
 
 - Docs: https://docs.laserdata.cloud/laser-sdk/views
-- Full system built on this primitive: [`fleet-tape`](../fleet-tape) - the same projection pattern powering a live fleet view and materialized reading tape.
+- Full system built on this primitive: [`fleet-tape`](../fleet-tape): the same projection pattern powering a live fleet view and materialized reading tape.

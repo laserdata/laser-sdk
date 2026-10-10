@@ -133,18 +133,23 @@ def _resolve_connection_string() -> str:
     return _normalize_connection_string(f"iggy+tcp://{_resolve_credentials()}{server}")
 
 
-async def connect(example: str) -> ls.Laser:
-    """Connect over the resolved target, pinned to the example's stream. The
-    previous run's stream is deleted so the run starts clean, and the stream
-    the run creates is kept afterwards for inspection. A provisioned
+async def connect(example: str, *, reset: bool = True) -> ls.Laser:
+    """Connect over the resolved target, pinned to the example's stream. With
+    ``reset`` the previous run's stream is deleted and created again so the run
+    starts clean, and the stream is kept afterwards for inspection. A second
+    connection of the same run passes ``reset=False``. The stream must exist
+    before the first managed call, because a deployment refuses a
+    stream-scoped name whose stream it cannot resolve. A provisioned
     ``LASER_STREAM`` is never deleted."""
-    laser = await ls.Laser.connect(_resolve_connection_string(), stream=stream_for(example))
-    if not _env("LASER_STREAM"):
-        try:
-            await laser.stream(stream_for(example)).delete()
-        except BaseException:
-            await laser.close()
-            raise
+    stream = stream_for(example)
+    laser = await ls.Laser.connect(_resolve_connection_string(), stream=stream)
+    try:
+        if reset and not _env("LASER_STREAM"):
+            await laser.stream(stream).delete()
+        await laser.stream(stream).ensure()
+    except BaseException:
+        await laser.close()
+        raise
     return laser
 
 

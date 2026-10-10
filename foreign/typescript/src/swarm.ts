@@ -1,4 +1,5 @@
 import type { PolicyEvidence, Verdict } from "./govern.js"
+import { compareCodePoints } from "./runtime/compare.js"
 
 export class AgentActivity {
   private readonly byVerdict = new Map<Verdict["kind"], bigint>()
@@ -43,7 +44,7 @@ export class SwarmActivity {
   agents(): readonly (readonly [string, AgentActivity])[] {
     return [...this.byAgent.entries()].toSorted(
       ([leftName, left], [rightName, right]) =>
-        compareBigInt(right.decisions, left.decisions) || leftName.localeCompare(rightName)
+        compareBigInt(right.decisions, left.decisions) || compareCodePoints(leftName, rightName)
     )
   }
 }

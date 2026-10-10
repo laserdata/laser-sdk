@@ -32,7 +32,7 @@ async fn send_command(world: &mut LaserWorld, payload: &str, agent: &str, idempo
     let result = world
         .laser()
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             payload.as_bytes().to_vec(),
             &provenance,
         )
@@ -64,7 +64,7 @@ async fn send_with_correlation(
         .build();
     let result = world
         .laser()
-        .send_agent(AgentTopic::Commands, payload.into_bytes(), &provenance)
+        .send_agent(AgentTopic::Sessions, payload.into_bytes(), &provenance)
         .await;
     world.last_result = Some(result.map(|_| ()).map_err(|error| format!("{error:?}")));
 }
@@ -91,8 +91,10 @@ async fn agdx_command(world: &mut LaserWorld, payload: String) {
     let result = world
         .laser()
         .agdx(
-            AgentTopic::Commands,
-            "planner".parse().expect("a valid agent id"),
+            AgentTopic::Sessions,
+            "planner"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("a valid agent id"),
             conversation,
         )
         .command(correlation, payload.into_bytes())
@@ -104,7 +106,7 @@ async fn agdx_command(world: &mut LaserWorld, payload: String) {
 async fn assemble_conversation(world: &LaserWorld, conversation: ConversationId) -> Vec<Vec<u8>> {
     let messages = ContextAssembler::builder()
         .conversation_id(conversation)
-        .topics(vec![AgentTopic::Commands])
+        .topics(vec![AgentTopic::Sessions])
         .build()
         .assemble(world.laser())
         .await
@@ -137,7 +139,7 @@ async fn assemble(world: &mut LaserWorld) {
     // Re-read the typed provenance of the first message for the field asserts.
     let messages = ContextAssembler::builder()
         .conversation_id(conversation)
-        .topics(vec![AgentTopic::Commands])
+        .topics(vec![AgentTopic::Sessions])
         .build()
         .assemble(world.laser())
         .await

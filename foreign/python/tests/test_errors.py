@@ -29,7 +29,6 @@ def with_fields(error, **fields):
         ("RejectedError", "LaserError"),
         ("AmbiguousMutationError", "LaserError"),
         ("StateStoreError", "LaserError"),
-        ("AgentError", "LaserError"),
         ("CheckpointError", "LaserError"),
         ("FilterFaultError", "FilterError"),
         ("FilterOversizedRecordError", "FilterError"),

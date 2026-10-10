@@ -237,8 +237,47 @@ void test("given_a_server_without_group_reads_when_an_automatic_reader_is_built_
     { kind: "group", name: "anomaly-desk" },
     { kind: "group" }
   )
-  await assert.rejects(automatic.build(), UnsupportedError)
+  await assert.rejects(automatic.build(), (error: unknown) => {
+    assert.ok(error instanceof UnsupportedError)
+    assert.equal(error.surface, "filters")
+    assert.equal(error.feature, "group_policy_reads")
+    return true
+  })
   assert.equal(joined, false)
+})
+
+void test("given_a_server_without_native_filters_when_a_bound_reader_is_built_then_should_reject_before_transport", async () => {
+  let transportCalls = 0
+  const unexpectedTransport = (): Promise<never> => {
+    transportCalls += 1
+    return Promise.reject(new Error("no transport is needed"))
+  }
+  const transport: FilterTransport = {
+    ...baseTransport(unexpectedTransport),
+    joinConsumerGroup: unexpectedTransport,
+    openCoordinator: unexpectedTransport,
+    openNodeConnection: unexpectedTransport
+  }
+  const withoutNative = (): Promise<Capabilities> =>
+    Promise.resolve({
+      ...capabilities,
+      filters: { native: false, catalog: false, groupPolicyReads: true }
+    })
+  const bound = FilteredReaderBuilder.create(
+    transport,
+    withoutNative,
+    new Filters(transport, withoutNative),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "bound" }
+  )
+  await assert.rejects(bound.build(), (error: unknown) => {
+    assert.ok(error instanceof UnsupportedError)
+    assert.equal(error.surface, "filters")
+    assert.equal(error.feature, undefined)
+    return true
+  })
+  assert.equal(transportCalls, 0)
 })
 
 void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_group_read_that_delivered_everything", async () => {
@@ -623,16 +662,23 @@ void test("given_a_single_node_when_a_primary_is_routed_then_should_dial_the_end
   assert.notEqual(dialed[0]?.[1], 0, "a cluster: the primary's advertised endpoint")
 })
 
-void test("given_a_failed_topology_probe_when_reading_again_then_should_recover_the_mapped_endpoint_and_cache_success", async () => {
-  const failure = new TransportError("cluster metadata is temporarily unavailable", true)
+function probedTransport(refusals: number): {
+  readonly transport: FilterTransport
+  readonly probes: () => number
+  readonly dialed: (readonly [string, number])[]
+  loseRoute: () => void
+} {
   let probes = 0
   let loseRoute = false
   const dialed: (readonly [string, number])[] = []
   const transport: FilterTransport = {
     ...baseTransport(() => Promise.resolve(route())),
+    publishOptions: () => ({ timeoutMs: 1_000, maxRetries: 2, retryBackoffMs: 1 }),
     clusterNodeCount: () => {
       probes += 1
-      return probes === 1 ? Promise.reject(failure) : Promise.resolve(1)
+      return probes <= refusals
+        ? Promise.reject(new TransportError("cluster metadata is temporarily unavailable", true))
+        : Promise.resolve(1)
     },
     openNodeConnection: (ip, port) => {
       dialed.push([ip, port])
@@ -657,24 +703,50 @@ void test("given_a_failed_topology_probe_when_reading_again_then_should_recover_
       })
     }
   }
-  const filtered = reader(transport, "primary", undefined, { idleIntervalMs: 0 })
-  try {
-    await assert.rejects(filtered.tryNextPage(), failure)
-    assert.deepEqual(dialed, [], "failed discovery must not dial an unverified endpoint")
-    const recovered = await filtered.tryNextPage()
-    assert.equal(recovered?.records[0]?.offset, 0n)
-    assert.deepEqual(dialed, [["", 0]])
-    assert.equal(probes, 2)
+  return {
+    transport,
+    probes: () => probes,
+    dialed,
+    loseRoute: () => {
+      loseRoute = true
+    }
+  }
+}
 
-    loseRoute = true
+void test("given_a_transiently_refused_topology_probe_when_reading_then_should_probe_again_and_cache_success", async () => {
+  const probed = probedTransport(2)
+  const filtered = reader(probed.transport, "primary", undefined, { idleIntervalMs: 0 })
+  try {
+    const first = await filtered.tryNextPage()
+    assert.equal(first?.records[0]?.offset, 0n)
+    assert.deepEqual(probed.dialed, [["", 0]])
+    assert.equal(probed.probes(), 3, "two refusals and the probe that answers")
+
+    probed.loseRoute()
     assert.equal(await filtered.tryNextPage(), undefined)
     const rerouted = await filtered.tryNextPage()
     assert.equal(rerouted?.records[0]?.offset, 1n)
-    assert.deepEqual(dialed, [
+    assert.deepEqual(probed.dialed, [
       ["", 0],
       ["", 0]
     ])
-    assert.equal(probes, 2, "successful topology discovery stays cached after rerouting")
+    assert.equal(probed.probes(), 3, "successful topology discovery stays cached after rerouting")
+  } finally {
+    await filtered.close()
+  }
+})
+
+void test("given_a_topology_probe_refused_past_the_retry_count_when_reading_again_then_should_recover_the_mapped_endpoint", async () => {
+  const probed = probedTransport(3)
+  const filtered = reader(probed.transport, "primary", undefined, { idleIntervalMs: 0 })
+  try {
+    await assert.rejects(filtered.tryNextPage(), TransportError)
+    assert.equal(probed.probes(), 3, "the first probe and two retries")
+    assert.deepEqual(probed.dialed, [], "failed discovery must not dial an unverified endpoint")
+    const recovered = await filtered.tryNextPage()
+    assert.equal(recovered?.records[0]?.offset, 0n)
+    assert.deepEqual(probed.dialed, [["", 0]])
+    assert.equal(probed.probes(), 4)
   } finally {
     await filtered.close()
   }

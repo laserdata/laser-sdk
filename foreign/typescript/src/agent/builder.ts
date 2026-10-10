@@ -1,9 +1,12 @@
 import { HandlerConfigError, TimeoutError } from "../client/errors.js"
+import { INTERNAL_LAYOUTS } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { ConsumerGroupName, type AgentId } from "../types/ids.js"
 import type { ActionGovernor, GovernorMode, GovernorRetention } from "../govern.js"
+import type { SessionConfig } from "../session.js"
 import type { KeyRegistry, SigningKey } from "../signing.js"
 import type { CapabilityDescriptor } from "../wire/agent.js"
+import { AGENT_SESSIONS } from "../wire/topics.js"
 import type { Consolidator } from "../memory/types.js"
 import {
   ReliableConsumer,
@@ -16,6 +19,7 @@ import {
 } from "./reliable-consumer.js"
 import type { InboxRoute } from "./router.js"
 import { longTimeout } from "./timer.js"
+import { declaredAgentTopic } from "./partitioning.js"
 
 export interface AgentDefinition {
   readonly id: AgentId
@@ -33,6 +37,10 @@ export interface AgentDefinition {
   readonly warmDedup: boolean
   readonly middleware: readonly AgentMiddleware[]
   readonly onDeadLetter?: DeadLetterSink
+  /** The command operations the handler serves. Unset serves every operation. */
+  readonly operations?: readonly string[]
+  /** The session configuration the runtime applies. */
+  readonly sessions?: SessionConfig
   readonly dedupWindow?: number
   readonly retry?: RetryPolicy
   readonly deduplicator?: Deduplicator
@@ -212,9 +220,19 @@ export class AgentHandle implements AsyncDisposable {
       if (definition.capabilities.length > 0) {
         await scoped.agent(definition.id).advertise(definition.listenOn, definition.capabilities)
       }
+      // The agent's session configuration declares its stream's layout on this
+      // connection, and a declared agent of a per-agent topic layout reads its
+      // own topic in place of the lane.
+      if (definition.sessions !== undefined) scoped.sessions(definition.sessions)
+      const stream = scoped.defaultStream
+      const topic =
+        definition.listenOn === AGENT_SESSIONS && stream !== undefined
+          ? (declaredAgentTopic(scoped[INTERNAL_LAYOUTS]().get(stream), definition.id.asStr()) ??
+            definition.listenOn)
+          : definition.listenOn
       const consumer = new ReliableConsumer({
         group: definition.consumerGroup ?? ConsumerGroupName.forAgent(definition.id),
-        topic: definition.listenOn,
+        topic,
         agent: definition.id,
         shutdownGraceMs: definition.shutdownGraceMs,
         ...(definition.respondOn !== undefined ? { respondOn: definition.respondOn } : {}),
@@ -231,6 +249,8 @@ export class AgentHandle implements AsyncDisposable {
           : {}),
         understoodFeatures: definition.understoodFeatures,
         ...(definition.onDeadLetter !== undefined ? { onDeadLetter: definition.onDeadLetter } : {}),
+        ...(definition.operations !== undefined ? { operations: definition.operations } : {}),
+        ...(definition.sessions !== undefined ? { sessions: definition.sessions } : {}),
         ...(definition.dedupWindow !== undefined ? { dedupWindow: definition.dedupWindow } : {}),
         ...(definition.retry !== undefined ? { retry: definition.retry } : {}),
         ...(definition.deduplicator !== undefined ? { deduplicator: definition.deduplicator } : {}),
@@ -277,6 +297,8 @@ export class AgentBuilder {
   private shouldWarmDedup = false
   private readonly middlewareList: AgentMiddleware[] = []
   private sink: DeadLetterSink | undefined
+  private servedOperations: readonly string[] | undefined
+  private sessionConfig: SessionConfig | undefined
   private window: number | undefined
   private retryPolicy: RetryPolicy | undefined
   private dedup: Deduplicator | undefined
@@ -320,13 +342,13 @@ export class AgentBuilder {
     return this
   }
 
-  pollInterval(ms: number): this {
-    this.pollMs = ms
+  pollInterval(intervalMs: number): this {
+    this.pollMs = intervalMs
     return this
   }
 
-  shutdownGrace(ms: number): this {
-    this.graceMs = ms
+  shutdownGrace(graceMs: number): this {
+    this.graceMs = graceMs
     return this
   }
 
@@ -385,6 +407,21 @@ export class AgentBuilder {
     return this
   }
 
+  /** The command operations the handler serves. Unset serves every operation.
+   * A command for another operation is skipped. */
+  operations(operations: readonly string[]): this {
+    this.servedOperations = [...operations]
+    return this
+  }
+
+  /** The session configuration the runtime applies: the session lens
+   * handlers read through `AgentCtx.session`, and
+   * `SessionConfig.failOnDeadLetter`. Defaults to `new SessionConfig()`. */
+  sessions(config: SessionConfig): this {
+    this.sessionConfig = config
+    return this
+  }
+
   ackOnPickup(value = true): this {
     this.pickupAck = value
     return this
@@ -413,8 +450,8 @@ export class AgentBuilder {
     return this
   }
 
-  consolidateEvery(milliseconds: number): this {
-    this.consolidationIntervalMs = milliseconds
+  consolidateEvery(intervalMs: number): this {
+    this.consolidationIntervalMs = intervalMs
     return this
   }
 
@@ -448,6 +485,8 @@ export class AgentBuilder {
       warmDedup: this.shouldWarmDedup,
       middleware: [...this.middlewareList],
       ...(this.sink !== undefined ? { onDeadLetter: this.sink } : {}),
+      ...(this.servedOperations !== undefined ? { operations: this.servedOperations } : {}),
+      ...(this.sessionConfig !== undefined ? { sessions: this.sessionConfig } : {}),
       ...(this.window !== undefined ? { dedupWindow: this.window } : {}),
       ...(this.retryPolicy !== undefined ? { retry: this.retryPolicy } : {}),
       ...(this.dedup !== undefined ? { deduplicator: this.dedup } : {}),
@@ -475,6 +514,14 @@ function validateDefinition(definition: AgentDefinition): void {
     (!Number.isFinite(definition.pollIntervalMs) || definition.pollIntervalMs < 0)
   ) {
     throw new HandlerConfigError("pollInterval must be a non-negative finite number")
+  }
+  if (
+    definition.consolidateEveryMs !== undefined &&
+    (!Number.isFinite(definition.consolidateEveryMs) || definition.consolidateEveryMs <= 0)
+  ) {
+    throw new HandlerConfigError(
+      "consolidateEvery must be a positive finite number of milliseconds"
+    )
   }
   if (
     definition.dedupWindow !== undefined &&

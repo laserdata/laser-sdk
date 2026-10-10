@@ -53,3 +53,14 @@ void test("given_the_forwarded_command_fixture_when_decoded_then_should_preserve
   assert.deepEqual(Buffer.from(command.payload), Buffer.from([9, 9, 9]))
   assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
 })
+
+void test("given_a_scoped_forwarded_command_when_decoded_then_should_keep_zero_stream_id", async () => {
+  const bytes = await readFixture("forwarded_command_scoped.bin")
+  const command = decodeForwardedCommand(
+    expectMap(decodeOne(bytes, "forwarded_command_scoped"), "forwarded_command_scoped"),
+    "forwarded_command_scoped"
+  )
+  assert.equal(command.scope?.streamId, 0)
+  assert.equal(command.scope.stream, "alpha")
+  assert.deepEqual(Buffer.from(encodeNamed(encodeForwardedCommand(command))), Buffer.from(bytes))
+})

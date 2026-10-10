@@ -74,6 +74,8 @@ pub enum Feature {
     /// describe (`write`), archive and drop (`delete`), and group bindings or
     /// revision pause/resume (`admin`). Filtered reads themselves need only native source permission.
     Filter,
+    /// Managed reads of one stream's agent sessions.
+    Session,
     /// A feature name a newer peer used that this build does not know. An unknown
     /// `feature` string decodes here instead of failing the whole grant set, and
     /// it matches no request (requests only ever carry a known feature), so an
@@ -83,6 +85,35 @@ pub enum Feature {
     /// into this same deny sink.
     #[serde(other)]
     Unrecognized,
+}
+
+/// The prefix of a resource name scoped to one stream, `stream:<name>` or
+/// `stream:<name>/<local>`.
+pub const STREAM_RESOURCE_PREFIX: &str = "stream:";
+
+/// The resource name of `stream` itself.
+pub fn stream_resource(stream: &str) -> String {
+    format!("{STREAM_RESOURCE_PREFIX}{stream}")
+}
+
+/// The name of the managed resource `local` inside `stream`,
+/// `stream:<stream>/<local>`. A `local` that already starts with `stream:` is
+/// returned unchanged, so scoping is idempotent and a caller-scoped name is
+/// never scoped twice.
+pub fn scoped_resource(stream: &str, local: &str) -> String {
+    if local.starts_with(STREAM_RESOURCE_PREFIX) {
+        local.to_owned()
+    } else {
+        format!("{STREAM_RESOURCE_PREFIX}{stream}/{local}")
+    }
+}
+
+/// The stream and local part of a scoped resource name. `None` for a bare name,
+/// for the stream resource itself, and for a name with an empty stream or local
+/// part. Stream names never contain `/`, so the first `/` ends the stream.
+pub fn split_scoped_resource(name: &str) -> Option<(&str, &str)> {
+    let (stream, local) = name.strip_prefix(STREAM_RESOURCE_PREFIX)?.split_once('/')?;
+    (!stream.is_empty() && !local.is_empty()).then_some((stream, local))
 }
 
 pub const SUPERVISOR_ASSERTION_VERSION: u32 = 1;
@@ -347,9 +378,13 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
         AGDX_FORK_DELETE_CODE => (Feature::Fork, Action::Delete),
         AGDX_GRAPH_QUERY_CODE | AGDX_GRAPH_NEIGHBORS_CODE => (Feature::Graph, Action::Read),
         AGDX_GRAPH_UPSERT_CODE => (Feature::Graph, Action::Write),
-        AGDX_AGENT_STATUS_CODE | AGDX_AGENT_LIST_CODE => (Feature::Agent, Action::Read),
-        AGDX_AGENT_SUBMIT_CODE => (Feature::Agent, Action::Write),
-        AGDX_AGENT_CANCEL_CODE => (Feature::Agent, Action::Delete),
+        AGDX_SESSION_GET_CODE
+        | AGDX_SESSION_LIST_CODE
+        | AGDX_SESSION_EVENTS_CODE
+        | AGDX_SESSION_STATE_CODE
+        | AGDX_SESSION_LINKS_CODE
+        | AGDX_SESSION_SOURCES_CODE
+        | AGDX_SESSION_CHANGES_CODE => (Feature::Session, Action::Read),
         AGDX_GET_FILTER_CODE
         | AGDX_LIST_FILTERS_CODE
         | AGDX_LIST_FILTER_REVISIONS_CODE
@@ -609,12 +644,72 @@ pub enum AuthzError {
     Conflict { current_revision: u64 },
     #[error("unsupported authz op version (expected {expected}, got {got})")]
     Version { expected: u32, got: u32 },
+    /// A grant refused because it reaches past one stream while the server
+    /// runs with stream tenancy, for example a wildcard or a prefix spanning
+    /// streams.
+    #[error("refused by stream tenancy: {0}")]
+    TenancyViolation(String),
 }
 
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
     use crate::framing::{decode_named, encode_named};
+
+    #[test]
+    fn given_a_tenancy_violation_when_round_tripped_then_should_keep_the_reason() {
+        let reply = AuthzReply::Err(AuthzError::TenancyViolation("prefix acme".to_owned()));
+        let back: AuthzReply =
+            decode_named(&encode_named(&reply).expect("reply serializes")).expect("deserializes");
+        assert!(matches!(
+            back,
+            AuthzReply::Err(AuthzError::TenancyViolation(reason)) if reason == "prefix acme"
+        ));
+    }
+
+    #[test]
+    fn given_a_local_name_when_scoped_then_should_prefix_the_stream() {
+        assert_eq!(
+            scoped_resource("acme", "agent.keys"),
+            "stream:acme/agent.keys"
+        );
+        assert_eq!(scoped_resource("acme", "a/b"), "stream:acme/a/b");
+    }
+
+    #[test]
+    fn given_a_scoped_name_when_scoped_again_then_should_return_it_unchanged() {
+        let scoped = scoped_resource("acme", "sessions");
+        assert_eq!(scoped_resource("acme", &scoped), scoped);
+        assert_eq!(
+            scoped_resource("other", "stream:acme/sessions"),
+            "stream:acme/sessions"
+        );
+    }
+
+    #[test]
+    fn given_scoped_names_when_split_then_should_return_stream_and_local_part() {
+        assert_eq!(
+            split_scoped_resource("stream:acme/agent.keys"),
+            Some(("acme", "agent.keys"))
+        );
+        assert_eq!(
+            split_scoped_resource("stream:acme/a/b"),
+            Some(("acme", "a/b"))
+        );
+        assert_eq!(
+            split_scoped_resource(&scoped_resource("acme", "graph")),
+            Some(("acme", "graph"))
+        );
+    }
+
+    #[test]
+    fn given_unscoped_names_when_split_then_should_return_none() {
+        assert_eq!(split_scoped_resource("agent.keys"), None);
+        assert_eq!(split_scoped_resource("stream:acme"), None);
+        assert_eq!(split_scoped_resource("stream:/local"), None);
+        assert_eq!(split_scoped_resource("stream:acme/"), None);
+        assert_eq!(split_scoped_resource("streams:acme/local"), None);
+    }
 
     #[test]
     fn given_a_role_when_round_tripped_then_should_preserve_grants() {
@@ -781,6 +876,7 @@ mod tests {
         }
         assert_eq!(action_index(Feature::Destination, Action::Read), 40);
         assert_eq!(action_index(Feature::Checkpoint, Action::Admin), 48);
+        assert_eq!(action_index(Feature::Session, Action::Read), 70);
     }
 
     #[test]

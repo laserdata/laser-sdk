@@ -8,6 +8,7 @@ mod agdx_consume;
 mod agdx_stream;
 #[cfg(feature = "agui")]
 mod agui;
+mod budget;
 mod context;
 mod contract;
 mod deadletter;
@@ -25,6 +26,7 @@ mod managed_unsupported;
 #[cfg(feature = "mcp-bridge")]
 mod mcp;
 mod memory;
+mod pause;
 mod provenance;
 mod queue_pressure;
 mod reconnect;

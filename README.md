@@ -93,7 +93,7 @@ const messages = await (await topic.replay()).poll()
 console.log(`read ${messages.length} message(s)`)
 ```
 
-The examples use open streaming. Add `managed` for projections, queries, KV, forks, graphs, and the run registry on Laser Stack or LaserData Cloud. Add `agent` for handlers, memory, contracts, and workflows.
+The examples use open streaming. Add `managed` for projections, queries, KV, forks, and graphs on Laser Stack or LaserData Cloud. Add `agent` for handlers, memory, contracts, and workflows.
 
 Streaming sends return Apache Iggy commit confirmations. A confirmation identifies the stream, topic, partition, and first offset in a batch. The list can be empty when the server does not report offsets. Completion follows the topic durability policy. Use the stream, topic, and partition together with the offset.
 
@@ -114,8 +114,8 @@ An accessor selects a feature on the connected client. A method performs an acti
 | `laser.kv(namespace)` / `laser.fork(id)` | State | point reads and writes, CAS, leases, copy-on-write branches |
 | `laser.memory(scope)` | Memory | remember, recall (semantic / keyword / hybrid), consolidate |
 | `laser.context(id)` | Context | append and assemble one conversation's record, and scope its memory to that conversation |
-| `laser.sessions().create(id)` | Session | typed conversation turns, context for a model, scoped memory, and replay from saved offsets |
-| `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(..)` / `laser.runs()` | Fabric | directed asks, deadline contracts, ordered workflows, the run registry |
+| `laser.sessions()` | Session | start and end a unit of work, record model and tool calls, keep state, hand work to an agent, and replay from saved offsets |
+| `laser.agent(id)` / `laser.contract(..)` / `laser.workflow(..)` | Fabric | directed asks, deadline contracts, ordered workflows whose steps are child sessions |
 
 The Rust form follows:
 
@@ -153,27 +153,31 @@ laser
     .await?;
 let draft = laser.fork("what-if");
 
-// Fabric: identities, context, memory, coordination, runs.
+// Fabric: identities, context, memory, coordination.
 let reply = laser.agent(id).ask(commands, replies, task, &prov, timeout).await?;
 
 // Context: one task streams its messages, keeps its memory, resolves its deps.
 let ctx = laser.context(conversation);
-ctx.append(AgentTopic::Audit, b"step done").await?;
+ctx.append(AgentTopic::Sessions, b"step done").await?;
 let facts = ctx.memory("support").recall().semantic("rollout incidents").fetch().await?;
 let deps = ctx.graph("services").neighbors(node, EdgeDir::Out, None, 2).await?;
 
-// Session: the same conversation as typed turns, context, memory, and replay.
-let session = laser.sessions().create("agent-42");
-session.append(SessionTurnKind::Instruction, b"summarize the ticket").await?;
-session.append(SessionTurnKind::ModelResponse, b"it is a login bug").await?;
-let turns = session.context().await?; // kinds and payloads, last 50 turns within 4000 tokens
+// Session: one unit of work with a recorded lifecycle, model and tool calls, and state.
+let (session, lease) = laser.sessions().create("ticket-42").agent("triage".parse::<AgentId>()?).begin().await?;
+let call = session.model(ModelRequest::new("gpt-4o", prompt), None).await?;
+call.complete(ModelResponse { body: answer, ..Default::default() }).await?; // the SDK never calls a model
+session.state().set("status", serde_json::json!("triaged")).await?;
+let turns = session.context().await?; // the session lane, last 50 records within 4000 tokens
 let facts = session.memory().search("login bug").await?;
 let checkpoint = session.checkpoint().await?; // serializable, persist it anywhere
-let later = session.replay(checkpoint, Vec::new(), |mut acc, turn| { acc.push(turn.text()); acc }).await?;
+session.end().await?;
+drop(lease);
+
+// Hand work to another agent as a submitted session.
+let submitted = laser.sessions().submit("worker".parse::<AgentId>()?, task).from("triage".parse::<AgentId>()?).send().await?;
 
 laser.memory("notes").set("current-plan", plan_json).await?; // named point state, an event on the memory topic
-let run = laser.workflow("rollback").registered().step(/* .. */).run().await?;
-let page = laser.runs().list().state(AgentRunState::Running).fetch().await?;
+let outcome = laser.workflow("rollback").step(/* .. */).run().await?; // a root session, each step a child
 ```
 
 The Python form follows:
@@ -193,24 +197,24 @@ nearby = await laser.graph("kg").neighbors(node, dir="out", depth=2)
 feed = laser.watch(index="readings_v1")
 
 # State
-await laser.kv("sessions").set("user:42").json(session).ttl(300).send()
+await laser.kv("sessions").set("user:42").json(session).ttl(300_000).send()
 
 # Fabric: one task streams its messages, keeps its memory, resolves its deps
 ctx = laser.context(conversation)
-await ctx.append("audit", b"step done")
+await ctx.append(ls.AgentTopic.Sessions, b"step done")
 facts = await ctx.memory("support").recall(semantic="rollout incidents")
 turns = await ctx.fetch(n=20, token_budget=4_000)
 deps = await ctx.graph("services").neighbors(node, dir="out", depth=2)
 
-# Session: the same conversation as typed turns, context, memory, and replay
-session = laser.sessions().create("agent-42")
-await session.append("instruction", b"summarize the ticket")
-await session.append("model.response", b"it is a login bug")
-turns = await session.context()
-facts = await session.memory().search("login bug")
-checkpoint = await session.checkpoint()
-later = await session.turns_since(checkpoint)
-run = await laser.runs().submit("rollback", task)
+# Session: one unit of work with a recorded lifecycle, model and tool calls, and state
+async with laser.sessions().create("ticket-42").agent("triage") as session:
+    call = await session.model(ls.ModelRequest("gpt-4o", prompt))
+    await call.complete(ls.ModelResponse(answer))  # the SDK never calls a model
+    await session.state().set("status", "triaged")
+    turns = await session.context()
+    checkpoint = await session.checkpoint()
+# The block ended the session, or failed it with the traceback if it raised.
+submitted = await laser.sessions().submit("worker", task).from_("triage").send()
 ```
 
 The TypeScript form uses camelCase method names:
@@ -239,23 +243,24 @@ const draft = laser.fork("what-if")
 
 // Fabric: one task streams its messages, keeps its memory, resolves its deps
 const ctx = laser.context(conversation)
-await ctx.append("audit", new TextEncoder().encode("step done"))
+await ctx.append(AgentTopic.Sessions, new TextEncoder().encode("step done"))
 const facts = await ctx
   .memory("support")
   .recall()
   .semantic("rollout incidents")
   .fetch()
 
-// Session: the same conversation as typed turns, context, memory, and replay
-const session = laser.sessions().create("agent-42")
+// Session: one unit of work with a recorded lifecycle, model and tool calls, and state
 const encode = (text: string) => new TextEncoder().encode(text)
-await session.append("instruction", encode("summarize the ticket"))
-await session.append("model.response", encode("it is a login bug"))
+const { session, lease } = await laser.sessions().create("ticket-42").agent(AgentId.new("triage")).begin()
+const call = await session.model(new ModelRequest("gpt-4o", encode(prompt)))
+await call.complete({ body: encode(answer) }) // the SDK never calls a model
+await session.state().set("status", "triaged")
 const turns = await session.context()
-const hits = await session.memory().search("login bug")
 const checkpoint = await session.checkpoint()
-const later = await session.turnsSince(checkpoint)
-const run = await laser.runs().submit("rollback", task)
+await session.end()
+lease.release()
+const submitted = await laser.sessions().submit(AgentId.new("worker"), task).from(AgentId.new("triage")).send()
 ```
 
 ### Streaming contract
@@ -284,11 +289,11 @@ Agent fabric (opt in with the `agent` feature):
 | Primitive | What you get |
 | --- | --- |
 | Reliable runtime | A consumer with **dedup, retry, and dead-letter**, request/reply correlation, conversation and causality tracking, routing, sessions, and context assembly. |
-| Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` publish to a memory topic (the versioned audit) that materializes to a versioned key-value read view and recalls by recency. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add semantic / keyword / hybrid ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
+| Agentic memory | One durable model: `remember` / `recall` / `improve` / `forget` publish to the memory topic (`agent.memory` by default) that materializes to a versioned key-value read view and recalls by recency. The topic is configurable (`memory_topic(name).stream(..).partitions(n).ttl(d)`). The in-process vector backend and rerank seam add semantic / keyword / hybrid ranking. Consolidation, token-budgeted `to_context_block`, and content-addressed dedup compose above both. Vector memory created from a `Laser` inherits its action governor even though the index itself stays local. A scan over the read view narrows to one conversation with `conversation(id)`, the same lens the query and graph reads carry. |
 | Discovery | Agents advertise a capability card and a live inbox, fused into one cached registry with health-aware resolution and reversible operator `quarantine` / `unquarantine`. One connection may advertise one agent. Sensitive routes can require the presence's server-authenticated principal. |
 | Coordination | `contract` (a directed task with a deadline and a real consumed / completed / timed-out answer), `fan_out` / `scatter` (ask every capable agent, gather under a policy), and `approval_gate` (pause for a human). With signing enabled, terminals fail closed on unsigned or wrongly signed replies and expose the verified principal. |
 | Workflow engine | `laser.workflow(..).step(..)`: dependency-ordered steps, budgets, verifier panels, saga compensation, **crash-recovery replay from a journal**, and per-step fenced leases. Use `.exclusive_in(namespace)` when the handler commits an external effect with `kv(target_namespace).cas_fenced(key, namespace, ..)`. The engine races bounded renewal against completion, keeps the lease through verification and completion journaling, then releases it before `OnTimeout::Reassign` gives a fresh holder a new fence. |
-| Run registry | `laser.runs()`: submit a run, read its state, list runs (filtered, paged), record a cancel intent. A managed read model folded from the status records a `.registered()` workflow or contract stamps, so "what happened to that task" is one call, and the log stays the truth. |
+| Sessions | `laser.sessions()`: one conversation with a recorded lifecycle on `agent.sessions`. Start, end, fail, or cancel it, record model and tool calls with the context they received, keep a JSON state document, hand work to an agent with a budget that agents and workflows enforce, and stop it through the operator-only `agent.control` topic. Workflows run as root sessions with a child session per step. A registered stream gets a managed session index that `laser.sessions()` reads with `list`, `get`, `events`, `state`, `links`, `sources`, `changes`, and `watch`, and the log stays the truth. |
 | AGDX envelope | A typed, versioned, fixture-pinned agent message format on the log, with producer verbs, resumable token streams, and deterministic reassembly. ([notes](docs/agdx.md)) |
 | Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, typed or raw topic publish, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
 | Durable intent | SDK-level typed records for asynchronous effect approval, not an AGDX wire extension. Fallible `Intent::builder().build()` validates the frozen voter set, threshold, deadline, and body digest. Fallible `Vote::cast` binds an eligible voter to that digest and policy version. `decide` ignores invalid, early, late, and future ballots, then returns a canonical commit or abort. Mandatory voters must allow, conflicting repeats abort, and `Decision::authorizes` verifies the exact intent before an effect runs. Voter identity is trusted only under a signed-principal or topology-isolated deployment profile. |
@@ -312,7 +317,7 @@ Agent routing, contracts, fan-out, and workflows run as client-side state machin
 | Deployment | Available surfaces |
 | --- | --- |
 | Apache Iggy | Streaming, provenance, AGDX, the agent runtime, log-backed memory, contracts, and workflows |
-| Laser Stack | Everything above, plus consumer filters, query, projections, KV, forks, graph, durable memory, the run registry, and fenced leases |
+| Laser Stack | Everything above, plus consumer filters, query, projections, KV, forks, graph, durable memory, the managed session index, and fenced leases |
 | LaserData Cloud | The complete SDK surface with managed deployment and UI services |
 
 Capability negotiation runs during connection setup. A managed call against Apache Iggy without a managed backend returns `LaserError::Unsupported`. The underlying client remains available through `topic.iggy_producer()`, `topic.iggy_consumer(..)`, and `laser.client()`.
@@ -337,10 +342,6 @@ Provision a filtered group once, then consume it by name or ID. Every consumer i
 ## Connect and publish limits
 
 Connecting gives up after 30 seconds. Each publish attempt times out after 60 seconds and is retried three times with exponential backoff. Every client can change these limits on its builder or connect call, or through `LASER_CONNECT_TIMEOUT_MS` and the `LASER_PUBLISH_*` environment variables. A publish that gives up returns an error listing the committed and unconfirmed records, and it never exits the process. See [connect timeout and cleanup](docs/connect-timeout.md) and [publish recovery](docs/publish-recovery.md).
-
-## Upgrading to 0.6.0
-
-0.6.0 is a minor release with breaking changes in all three clients. The [client behavior guide](docs/client-behavior.md) lists each one with the code change it needs.
 
 ## Documentation
 

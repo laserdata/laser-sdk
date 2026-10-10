@@ -2,11 +2,11 @@ use crate::agent_runtime::static_topic;
 use crate::async_bridge::future_into_py;
 use crate::blob::PyBlobStore;
 use crate::client::PyLaser;
-use crate::convert::{duration_seconds, payload_bytes, py_to_de, py_to_value, ser_to_py};
+use crate::convert::{duration_ms, payload_bytes, py_to_de, py_to_value, ser_to_py};
 use crate::errors::{InvalidError, to_pyerr};
 use crate::sign::envelope_of;
 use laser_sdk::LaserError;
-use laser_sdk::agent::{Agdx, AgdxSend, AgdxStream};
+use laser_sdk::agent::{Agdx, AgdxReceipt, AgdxSend, AgdxStream};
 use laser_sdk::wire::agent::{
     AgentEnvelope, AgentErrorBody, AgentId, ChannelId, ConversationId, CorrelationId,
     IdempotencyKey, LogPosition, RecordId, Signature, TaskState, TokenUsage,
@@ -58,9 +58,41 @@ struct SendOptions {
     usage: Option<TokenUsage>,
     claim_check: Option<(PyBlobStore, usize)>,
     signed_by: Option<Arc<laser_sdk::sign::SigningKey>>,
+    parent: Option<ConversationId>,
+    root: Option<ConversationId>,
+    finish_reason: Option<String>,
+    receipt: bool,
+    correlation: Option<CorrelationId>,
+    task_state: Option<TaskState>,
+    last: bool,
 }
 
 impl SendOptions {
+    // The refinements every Rust send builder offers on every verb.
+    fn refining(
+        mut self,
+        correlation: Option<String>,
+        task_state: Option<PyTaskState>,
+        last: bool,
+    ) -> PyResult<Self> {
+        self.correlation = correlation.as_deref().map(wire_correlation).transpose()?;
+        self.task_state = task_state.map(|state| state.inner);
+        self.last = last;
+        Ok(self)
+    }
+
+    fn with_ancestry(
+        mut self,
+        parent: Option<String>,
+        root: Option<String>,
+        receipt: bool,
+    ) -> PyResult<Self> {
+        self.parent = parent.as_deref().map(wire_conversation).transpose()?;
+        self.root = root.as_deref().map(wire_conversation).transpose()?;
+        self.receipt = receipt;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         cause: Option<String>,
@@ -106,7 +138,19 @@ impl SendOptions {
             usage: usage.map(py_to_de).transpose()?,
             claim_check: claim_check.map(|(hooks, threshold)| (PyBlobStore { hooks }, threshold)),
             signed_by: signed_by.map(|key| key.inner.clone()),
+            parent: None,
+            root: None,
+            finish_reason: None,
+            receipt: false,
+            correlation: None,
+            task_state: None,
+            last: false,
         })
+    }
+
+    fn finishing(mut self, finish_reason: Option<String>) -> Self {
+        self.finish_reason = finish_reason;
+        self
     }
 
     fn apply<'a>(&'a self, mut send: AgdxSend<'a>) -> AgdxSend<'a> {
@@ -135,7 +179,86 @@ impl SendOptions {
         if let Some(key) = &self.signed_by {
             send = send.signed_by(key);
         }
+        if self.parent.is_some() || self.root.is_some() {
+            send = send.with_ancestry(self.parent, self.root);
+        }
+        if let Some(reason) = &self.finish_reason {
+            send = send.with_finish_reason(reason.clone());
+        }
+        if let Some(correlation) = self.correlation {
+            send = send.with_correlation(correlation);
+        }
+        if let Some(state) = self.task_state {
+            send = send.with_task_state(state);
+        }
+        if self.last {
+            send = send.last();
+        }
         send
+    }
+}
+
+// The record id of a send, or its full receipt when the caller asked for one.
+fn send_result(receipt: AgdxReceipt, wants_receipt: bool) -> PyResult<Py<PyAny>> {
+    Python::attach(|py| {
+        if wants_receipt {
+            Ok(Py::new(py, PyAgdxReceipt::from(receipt))?.into_any())
+        } else {
+            Ok(receipt
+                .record
+                .map(|id| id.to_string())
+                .into_pyobject(py)?
+                .unbind())
+        }
+    })
+}
+
+/// Where one published envelope was committed.
+#[gen_stub_pyclass]
+#[pyclass(name = "AgdxReceipt", frozen, eq)]
+#[derive(PartialEq)]
+pub struct PyAgdxReceipt {
+    record: Option<String>,
+    partition_id: Option<u32>,
+    offset: Option<u64>,
+}
+
+impl From<AgdxReceipt> for PyAgdxReceipt {
+    fn from(receipt: AgdxReceipt) -> Self {
+        Self {
+            record: receipt.record.map(|id| id.to_string()),
+            partition_id: receipt.partition_id,
+            offset: receipt.offset,
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAgdxReceipt {
+    /// The envelope's record id. Chunks have none.
+    #[getter]
+    fn record(&self) -> Option<&str> {
+        self.record.as_deref()
+    }
+
+    /// The partition the record landed on, when the server confirmed it.
+    #[getter]
+    fn partition_id(&self) -> Option<u32> {
+        self.partition_id
+    }
+
+    /// The record's offset, when the server confirmed it.
+    #[getter]
+    fn offset(&self) -> Option<u64> {
+        self.offset
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AgdxReceipt(record={:?}, partition_id={:?}, offset={:?})",
+            self.record, self.partition_id, self.offset
+        )
     }
 }
 
@@ -228,6 +351,12 @@ impl PyTaskState {
     #[pyo3(name = "Unknown")]
     fn unknown() -> PyTaskState {
         PyTaskState::from(TaskState::Unknown)
+    }
+
+    #[classattr]
+    #[pyo3(name = "Paused")]
+    fn paused() -> PyTaskState {
+        PyTaskState::from(TaskState::Paused)
     }
 
     /// A code this build does not know: passed through, treated as
@@ -707,7 +836,7 @@ impl PyAgdx {
     /// `claim_check=(store, threshold_bytes)` externalizes a large body.
     /// `signed_by` signs this one send, in place of the producer's
     /// `signing_key`, on every verb that publishes an envelope.
-    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None))]
+    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn command<'py>(
         &self,
@@ -717,6 +846,8 @@ impl PyAgdx {
         operation: Option<String>,
         content_type: Option<String>,
         target: Option<String>,
+        task_state: Option<PyTaskState>,
+        last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
         deadline_micros: Option<u64>,
@@ -726,6 +857,10 @@ impl PyAgdx {
         usage: Option<&Bound<'_, PyAny>>,
         claim_check: Option<(Py<PyAny>, usize)>,
         signed_by: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        parent: Option<String>,
+        root: Option<String>,
+        finish_reason: Option<String>,
+        receipt: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
@@ -738,7 +873,10 @@ impl PyAgdx {
             usage,
             claim_check,
             signed_by,
-        )?;
+        )?
+        .with_ancestry(parent, root, receipt)?
+        .finishing(finish_reason)
+        .refining(None, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let correlation = wire_correlation(&correlation)?;
         let body = payload_bytes(body)?;
@@ -759,13 +897,14 @@ impl PyAgdx {
                 send = send.with_target(target);
             }
             send = options.apply(send);
-            let record = send.send().await.map_err(to_pyerr)?;
-            Ok(record.map(|id| id.to_string()))
+            let wants_receipt = options.receipt;
+            let sent = send.send_receipt().await.map_err(to_pyerr)?;
+            send_result(sent, wants_receipt)
         })
     }
 
     /// Publish a `response` (the paired answer to a command, same `correlation`).
-    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None))]
+    #[pyo3(signature = (correlation, body, *, operation=None, content_type=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn respond<'py>(
         &self,
@@ -775,6 +914,8 @@ impl PyAgdx {
         operation: Option<String>,
         content_type: Option<String>,
         target: Option<String>,
+        task_state: Option<PyTaskState>,
+        last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
         deadline_micros: Option<u64>,
@@ -784,6 +925,10 @@ impl PyAgdx {
         usage: Option<&Bound<'_, PyAny>>,
         claim_check: Option<(Py<PyAny>, usize)>,
         signed_by: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        parent: Option<String>,
+        root: Option<String>,
+        finish_reason: Option<String>,
+        receipt: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
@@ -796,7 +941,10 @@ impl PyAgdx {
             usage,
             claim_check,
             signed_by,
-        )?;
+        )?
+        .with_ancestry(parent, root, receipt)?
+        .finishing(finish_reason)
+        .refining(None, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let correlation = wire_correlation(&correlation)?;
         let body = payload_bytes(body)?;
@@ -817,13 +965,14 @@ impl PyAgdx {
                 send = send.with_target(target);
             }
             send = options.apply(send);
-            let record = send.send().await.map_err(to_pyerr)?;
-            Ok(record.map(|id| id.to_string()))
+            let wants_receipt = options.receipt;
+            let sent = send.send_receipt().await.map_err(to_pyerr)?;
+            send_result(sent, wants_receipt)
         })
     }
 
     /// Publish an `event` (expects nothing back).
-    #[pyo3(signature = (body, *, operation=None, content_type=None, target=None, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None))]
+    #[pyo3(signature = (body, *, operation=None, content_type=None, target=None, correlation=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn emit<'py>(
         &self,
@@ -832,6 +981,9 @@ impl PyAgdx {
         operation: Option<String>,
         content_type: Option<String>,
         target: Option<String>,
+        correlation: Option<String>,
+        task_state: Option<PyTaskState>,
+        last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
         deadline_micros: Option<u64>,
@@ -841,6 +993,10 @@ impl PyAgdx {
         usage: Option<&Bound<'_, PyAny>>,
         claim_check: Option<(Py<PyAny>, usize)>,
         signed_by: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        parent: Option<String>,
+        root: Option<String>,
+        finish_reason: Option<String>,
+        receipt: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
@@ -853,7 +1009,10 @@ impl PyAgdx {
             usage,
             claim_check,
             signed_by,
-        )?;
+        )?
+        .with_ancestry(parent, root, receipt)?
+        .finishing(finish_reason)
+        .refining(correlation, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let body = payload_bytes(body)?;
         let content_type = parse_content_type(content_type)?;
@@ -873,14 +1032,15 @@ impl PyAgdx {
                 send = send.with_target(target);
             }
             send = options.apply(send);
-            let record = send.send().await.map_err(to_pyerr)?;
-            Ok(record.map(|id| id.to_string()))
+            let wants_receipt = options.receipt;
+            let sent = send.send_receipt().await.map_err(to_pyerr)?;
+            send_result(sent, wants_receipt)
         })
     }
 
     /// Publish a `status` signal. Task status updates require both
     /// `correlation` and `task_state`. Set `last` for a terminal update.
-    #[pyo3(signature = (operation, *, correlation=None, task_state=None, body=None, content_type=None, target=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None))]
+    #[pyo3(signature = (operation, *, correlation=None, task_state=None, body=None, content_type=None, target=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn status<'py>(
         &self,
@@ -901,6 +1061,10 @@ impl PyAgdx {
         usage: Option<&Bound<'_, PyAny>>,
         claim_check: Option<(Py<PyAny>, usize)>,
         signed_by: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        parent: Option<String>,
+        root: Option<String>,
+        finish_reason: Option<String>,
+        receipt: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
@@ -913,7 +1077,9 @@ impl PyAgdx {
             usage,
             claim_check,
             signed_by,
-        )?;
+        )?
+        .with_ancestry(parent, root, receipt)?
+        .finishing(finish_reason);
         let correlation = correlation
             .map(|value| wire_correlation(&value))
             .transpose()?;
@@ -946,20 +1112,26 @@ impl PyAgdx {
                 send = send.last();
             }
             send = options.apply(send);
-            let record = send.send().await.map_err(to_pyerr)?;
-            Ok(record.map(|id| id.to_string()))
+            let wants_receipt = options.receipt;
+            let sent = send.send_receipt().await.map_err(to_pyerr)?;
+            send_result(sent, wants_receipt)
         })
     }
 
-    /// Publish a structured `error` terminal for `correlation`.
-    #[pyo3(signature = (correlation, error, *, target=None, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None))]
+    /// Publish a structured `error` terminal for `correlation`. The body is
+    /// the CBOR-encoded `error` dict (an `AgentErrorBody`), so its content
+    /// type is fixed.
+    #[pyo3(signature = (correlation, error, *, operation=None, target=None, task_state=None, last=false, cause=None, cause_at=None, deadline_micros=None, idempotency_key=None, metadata=None, tool=None, usage=None, claim_check=None, signed_by=None, parent=None, root=None, finish_reason=None, receipt=false))]
     #[allow(clippy::too_many_arguments)]
     fn fail<'py>(
         &self,
         py: Python<'py>,
         correlation: String,
         error: &Bound<'_, PyAny>,
+        operation: Option<String>,
         target: Option<String>,
+        task_state: Option<PyTaskState>,
+        last: bool,
         cause: Option<String>,
         cause_at: Option<PyLogPosition>,
         deadline_micros: Option<u64>,
@@ -969,6 +1141,10 @@ impl PyAgdx {
         usage: Option<&Bound<'_, PyAny>>,
         claim_check: Option<(Py<PyAny>, usize)>,
         signed_by: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        parent: Option<String>,
+        root: Option<String>,
+        finish_reason: Option<String>,
+        receipt: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let agdx = self.inner.clone();
         let options = SendOptions::new(
@@ -981,7 +1157,10 @@ impl PyAgdx {
             usage,
             claim_check,
             signed_by,
-        )?;
+        )?
+        .with_ancestry(parent, root, receipt)?
+        .finishing(finish_reason)
+        .refining(None, task_state, last)?;
         let signing_key = self.signing_key.clone();
         let correlation = wire_correlation(&correlation)?;
         let error: AgentErrorBody = py_to_de(error)?;
@@ -991,12 +1170,16 @@ impl PyAgdx {
             if let Some(key) = signing_key.as_ref() {
                 send = send.signed_by(key);
             }
+            if let Some(operation) = operation {
+                send = send.with_operation(operation);
+            }
             if let Some(target) = target {
                 send = send.with_target(target);
             }
             send = options.apply(send);
-            let record = send.send().await.map_err(to_pyerr)?;
-            Ok(record.map(|id| id.to_string()))
+            let wants_receipt = options.receipt;
+            let sent = send.send_receipt().await.map_err(to_pyerr)?;
+            send_result(sent, wants_receipt)
         })
     }
 
@@ -1011,30 +1194,35 @@ impl PyAgdx {
 
     /// Human-in-the-loop interrupt/resume: publish a prompt `command` under a
     /// fresh correlation on this producer's topic, then await the human's
-    /// correlated `response` on `reply_topic` up to `timeout_secs` and return
+    /// correlated `response` on `reply_topic` up to `timeout_ms` and return
     /// its body bytes. A responder answers with `AgentCtx.respond_input`, or
     /// rejects with an error which raises here. Blocks the caller until the
     /// response lands or the timeout elapses, which is the point: the task is
-    /// genuinely paused on a human.
-    #[pyo3(signature = (reply_topic, prompt, *, timeout_secs=30.0))]
+    /// genuinely paused on a human. `target` addresses the prompt to one
+    /// agent. Without it every agent on a shared session topic receives it.
+    #[pyo3(signature = (reply_topic, prompt, *, timeout_ms, target=None))]
     fn request_input<'py>(
         &self,
         py: Python<'py>,
         reply_topic: String,
         prompt: &Bound<'_, PyAny>,
-        timeout_secs: f64,
+        timeout_ms: f64,
+        target: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let agdx = self.inner.clone();
         let prompt = payload_bytes(prompt)?;
+        let target = target.as_deref().map(wire_agent).transpose()?;
         future_into_py(py, async move {
-            let body = agdx
-                .request_input(
-                    static_topic(reply_topic)?,
-                    prompt,
-                    duration_seconds(timeout_secs, "timeout_secs")?,
-                )
-                .await
-                .map_err(to_pyerr)?;
+            let reply_topic = static_topic(reply_topic)?;
+            let timeout = duration_ms(timeout_ms, "timeout_ms")?;
+            let body = match target {
+                Some(target) => {
+                    agdx.request_input_from(target, reply_topic, prompt, timeout)
+                        .await
+                }
+                None => agdx.request_input(reply_topic, prompt, timeout).await,
+            }
+            .map_err(to_pyerr)?;
             Python::attach(|py| Ok(PyBytes::new(py, &body).into_any().unbind()))
         })
     }
@@ -1121,11 +1309,10 @@ impl PyAgdxStream {
     fn buffered(
         slf: PyRef<'_, Self>,
         max_chunks: usize,
-        linger_ms: u64,
+        linger_ms: f64,
     ) -> PyResult<PyRef<'_, Self>> {
-        slf.configure(|stream| {
-            stream.buffered(max_chunks, std::time::Duration::from_millis(linger_ms))
-        })?;
+        let linger = duration_ms(linger_ms, "linger_ms")?;
+        slf.configure(|stream| stream.buffered(max_chunks, linger))?;
         Ok(slf)
     }
 

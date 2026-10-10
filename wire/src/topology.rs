@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 /// `WireTopology`'s shape is frozen ahead of the code that uses them.
 pub const DEFAULT_KV_MUTATIONS_TOPIC: &str = "kv.mutations";
 pub const DEFAULT_FORK_MUTATIONS_TOPIC: &str = "fork.mutations";
-pub const DEFAULT_RUN_MUTATIONS_TOPIC: &str = "run.mutations";
 pub const DEFAULT_GRAPH_MUTATIONS_TOPIC: &str = "graph.mutations";
 pub const DEFAULT_CHECKPOINT_MUTATIONS_TOPIC: &str = "checkpoint.mutations";
 
@@ -31,10 +30,6 @@ fn default_kv_mutations_topic() -> String {
 
 fn default_fork_mutations_topic() -> String {
     DEFAULT_FORK_MUTATIONS_TOPIC.to_owned()
-}
-
-fn default_run_mutations_topic() -> String {
-    DEFAULT_RUN_MUTATIONS_TOPIC.to_owned()
 }
 
 fn default_graph_mutations_topic() -> String {
@@ -69,9 +64,6 @@ pub struct WireTopology {
     /// Log-first fork mutation topic.
     #[serde(default = "default_fork_mutations_topic")]
     pub fork_mutations_topic: String,
-    /// Log-first run mutation topic.
-    #[serde(default = "default_run_mutations_topic")]
-    pub run_mutations_topic: String,
     /// Log-first graph mutation topic.
     #[serde(default = "default_graph_mutations_topic")]
     pub graph_mutations_topic: String,
@@ -89,7 +81,6 @@ impl Default for WireTopology {
             changes_topic: default_changes_topic(),
             kv_mutations_topic: default_kv_mutations_topic(),
             fork_mutations_topic: default_fork_mutations_topic(),
-            run_mutations_topic: default_run_mutations_topic(),
             graph_mutations_topic: default_graph_mutations_topic(),
             checkpoint_mutations_topic: default_checkpoint_mutations_topic(),
         }
@@ -109,7 +100,6 @@ mod tests {
         assert_eq!(topology.changes_topic, CHANGES_TOPIC);
         assert_eq!(topology.kv_mutations_topic, DEFAULT_KV_MUTATIONS_TOPIC);
         assert_eq!(topology.fork_mutations_topic, DEFAULT_FORK_MUTATIONS_TOPIC);
-        assert_eq!(topology.run_mutations_topic, DEFAULT_RUN_MUTATIONS_TOPIC);
         assert_eq!(
             topology.graph_mutations_topic,
             DEFAULT_GRAPH_MUTATIONS_TOPIC

@@ -117,6 +117,7 @@ fn request(arm: UdsArm) -> Result<Vec<u8>, BenchError> {
                 correlation: None,
                 operation_id: None,
                 read_all: false,
+                scope: None,
                 command_code: AGDX_KV_GET_CODE,
                 payload,
                 grants: Vec::new(),

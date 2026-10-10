@@ -97,7 +97,7 @@ impl From<ConversationId> for String {
 
 /// A durable intent's id (a fresh, time-ordered ULID), naming one proposed
 /// effect across its `Intent`/`Vote`/`Decision` records (see
-/// [`crate::intent`]).
+/// `crate::intent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct IntentId(Ulid);
@@ -562,6 +562,20 @@ impl AgentId {
     pub fn wire_id(&self) -> laser_wire::agent::AgentId {
         laser_wire::agent::AgentId::from_str(&self.0)
             .expect("a valid SDK agent id is a valid wire agent id")
+    }
+}
+
+// The SDK and wire agent ids share one rule set, so an SDK id passes wherever
+// the public API takes the wire id.
+impl From<AgentId> for laser_wire::agent::AgentId {
+    fn from(id: AgentId) -> Self {
+        id.wire_id()
+    }
+}
+
+impl From<&AgentId> for laser_wire::agent::AgentId {
+    fn from(id: &AgentId) -> Self {
+        id.wire_id()
     }
 }
 

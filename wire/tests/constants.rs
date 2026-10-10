@@ -73,10 +73,13 @@ fn given_managed_command_codes_when_compared_then_should_match_the_dictionary() 
     assert_eq!(AGDX_GRAPH_UPSERT_CODE, 1_000_601);
     assert_eq!(AGDX_GRAPH_NEIGHBORS_CODE, 1_000_602);
     assert_eq!(AGDX_AGENT_BASE, 1_000_700);
-    assert_eq!(AGDX_AGENT_SUBMIT_CODE, 1_000_700);
-    assert_eq!(AGDX_AGENT_CANCEL_CODE, 1_000_701);
-    assert_eq!(AGDX_AGENT_STATUS_CODE, 1_000_702);
-    assert_eq!(AGDX_AGENT_LIST_CODE, 1_000_703);
+    assert_eq!(AGDX_SESSION_GET_CODE, 1_000_710);
+    assert_eq!(AGDX_SESSION_LIST_CODE, 1_000_711);
+    assert_eq!(AGDX_SESSION_EVENTS_CODE, 1_000_712);
+    assert_eq!(AGDX_SESSION_STATE_CODE, 1_000_713);
+    assert_eq!(AGDX_SESSION_LINKS_CODE, 1_000_714);
+    assert_eq!(AGDX_SESSION_SOURCES_CODE, 1_000_715);
+    assert_eq!(AGDX_SESSION_CHANGES_CODE, 1_000_716);
     assert_eq!(AGDX_DELIVERY_BASE, 1_000_800);
     assert_eq!(AGDX_FILTERED_POLL_CODE, 1_000_800);
     assert_eq!(AGDX_FILTERED_ACK_CODE, 1_000_801);
@@ -104,7 +107,6 @@ fn given_op_versions_when_compared_then_should_match_the_pinned_values() {
     assert_eq!(FORK_OP_VERSION, 1);
     assert_eq!(GRAPH_OP_VERSION, 1);
     assert_eq!(AGENT_OP_VERSION, 1);
-    assert_eq!(AGENT_WORKFLOW_OP_VERSION, 1);
     assert_eq!(BATCH_OP_VERSION, 1);
     assert_eq!(CHANGE_OP_VERSION, 1);
     assert_eq!(CLIENT_METADATA_OP_VERSION, 1);
@@ -132,6 +134,8 @@ fn given_capability_feature_bits_when_compared_then_should_match_the_dictionary(
     assert_eq!(feature::DESTINATIONS, 1 << 8);
     assert_eq!(feature::KV_FENCED_LEASES, 1 << 9);
     assert_eq!(feature::CONSUMER_FILTERS, 1 << 10);
+    assert_eq!(feature::GROUP_POLICY_READS, 1 << 11);
+    assert_eq!(feature::SESSIONS, 1 << 12);
 }
 
 #[test]
@@ -153,6 +157,9 @@ fn given_header_keys_when_compared_then_should_match_the_dictionary() {
 fn given_provenance_keys_when_compared_then_should_match_the_dictionary() {
     assert_eq!(headers::CONVERSATION_ID, "gen_ai.conversation.id");
     assert_eq!(headers::AGENT_ID, "gen_ai.agent.id");
+    assert_eq!(headers::REQUEST_MODEL, "gen_ai.request.model");
+    assert_eq!(headers::RESPONSE_MODEL, "gen_ai.response.model");
+    assert_eq!(headers::PROVIDER_NAME, "gen_ai.provider.name");
     assert_eq!(headers::USAGE_INPUT_TOKENS, "gen_ai.usage.input_tokens");
     assert_eq!(headers::USAGE_OUTPUT_TOKENS, "gen_ai.usage.output_tokens");
     assert_eq!(headers::CAUSAL_PARENT, "agdx.cause");
@@ -173,6 +180,7 @@ fn given_provenance_keys_when_compared_then_should_match_the_dictionary() {
 #[test]
 fn given_agent_vocabulary_when_compared_then_should_match_the_dictionary() {
     assert_eq!(agent::OPERATION_TASK, "task");
+    assert_eq!(agent::OPERATION_SESSION, "session");
     assert_eq!(agent::OPERATION_CARD, "card");
     assert_eq!(agent::OPERATION_PROGRESS, "progress");
     assert_eq!(agent::OPERATION_QUARANTINE, "quarantine");
@@ -182,9 +190,10 @@ fn given_agent_vocabulary_when_compared_then_should_match_the_dictionary() {
     assert_eq!(agent::OPERATION_TOOL_ARGS, "tool_args");
     assert_eq!(agent::OPERATION_STATE_SNAPSHOT, "state_snapshot");
     assert_eq!(agent::OPERATION_STATE_DELTA, "state_delta");
+    assert_eq!(agent::OPERATION_SESSION_PARKED, "session_parked");
+    assert_eq!(agent::OPERATION_SESSION_UNPARKED, "session_unparked");
     assert_eq!(agent::METADATA_ROLE, "role");
     assert_eq!(agent::METADATA_BRIDGE_HOPS, "bridge_hops");
-    assert_eq!(agent::METADATA_RUN, "run");
     assert_eq!(agent::SIGNATURE_SCHEME_ED25519, 1);
     assert_eq!(agent::SIGNATURE_DOMAIN, b"agdx.signature.v1");
 }
@@ -195,6 +204,15 @@ fn given_topic_names_when_compared_then_should_match_the_dictionary() {
     assert_eq!(topics::CONTROL_TOPIC, "control.commands");
     assert_eq!(topics::DLQ_TOPIC, "dlq");
     assert_eq!(topics::CHANGES_TOPIC, "changes");
+    assert_eq!(topics::AGENT_SESSIONS, "agent.sessions");
+    assert_eq!(topics::AGENT_STREAMS, "agent.streams");
+    assert_eq!(topics::AGENT_HEARTBEATS, "agent.heartbeats");
+    assert_eq!(topics::AGENT_CONTROL, "agent.control");
+    assert_eq!(topics::AGENT_MEMORY, "agent.memory");
+    assert_eq!(topics::AGENT_DLQ, "agent.dlq");
+    assert_eq!(topics::AGENT_AUDIT, "agent.audit");
+    assert_eq!(topics::AGENT_JOURNAL, "agent.workflow_journal");
+    assert_eq!(topics::AGENT_REGISTRY, "agent.registry");
 }
 
 #[test]
@@ -304,7 +322,29 @@ fn given_http_routes_when_compared_then_should_match_the_router() {
     assert_eq!(laser_wire::http::KV_PATH, "/agdx/kv");
     assert_eq!(laser_wire::http::FORKS_PATH, "/agdx/forks");
     assert_eq!(laser_wire::http::CLIENTS_PATH, "/agdx/clients");
-    assert_eq!(laser_wire::http::RUNS_PATH, "/agdx/runs");
+    assert_eq!(laser_wire::http::SESSIONS_PATH, "/agdx/sessions");
+    let session = laser_wire::agent::ConversationId::from_u128(3);
+    assert_eq!(
+        laser_wire::http::sessions_path("a/b?!"),
+        "/agdx/sessions/a%2Fb%3F%21"
+    );
+    assert_eq!(
+        laser_wire::http::session_path("a/b?!", session),
+        "/agdx/sessions/a%2Fb%3F%21/00000000000000000000000003"
+    );
+    assert_eq!(
+        laser_wire::http::session_changes_path("a/b?!"),
+        "/agdx/sessions/a%2Fb%3F%21/changes"
+    );
+    assert_eq!(
+        laser_wire::http::session_events_path("a/b?!", session),
+        "/agdx/sessions/a%2Fb%3F%21/00000000000000000000000003/events"
+    );
+    assert_eq!(laser_wire::http::PARAM_STATUS, "status");
+    assert_eq!(laser_wire::http::PARAM_AGENT, "agent");
+    assert_eq!(laser_wire::http::PARAM_SURFACE, "surface");
+    assert_eq!(laser_wire::http::PARAM_AFTER, "after");
+    assert_eq!(laser_wire::http::PARAM_TOTAL, "total");
     assert_eq!(laser_wire::http::AUTHZ_WHOAMI_PATH, "/agdx/authz/whoami");
     assert_eq!(laser_wire::http::AUTHZ_ROLES_PATH, "/agdx/authz/roles");
     assert_eq!(
@@ -315,9 +355,38 @@ fn given_http_routes_when_compared_then_should_match_the_router() {
         laser_wire::http::authz_user_roles_path(42),
         "/agdx/authz/users/42/roles"
     );
-    assert_eq!(laser_wire::http::run_path("run-7"), "/agdx/runs/run-7");
+}
+
+#[test]
+fn given_session_queries_when_decoded_then_should_take_the_stream_from_the_path() {
+    let query: laser_wire::http::SessionsQuery =
+        serde_json::from_str(r#"{"status":"active","total":true}"#).expect("session query decodes");
+    assert_eq!(query.status.as_deref(), Some("active"));
+    assert!(query.want_total);
+    let events: laser_wire::http::SessionEventsQuery =
+        serde_json::from_str(r#"{"fixed_frontier":true}"#).expect("events query decodes");
+    assert!(events.fixed_frontier);
+    assert_eq!(events.limit, None);
+    let changes: laser_wire::http::SessionChangesQuery =
+        serde_json::from_str("{}").expect("changes query decodes");
+    assert_eq!(changes.after, 0);
+    assert_eq!(laser_wire::http::PARAM_FIXED_FRONTIER, "fixed_frontier");
+    assert_eq!(laser_wire::http::PARAM_HISTORY_LIMIT, "history_limit");
+    assert_eq!(laser_wire::http::PARAM_TEXT, "text");
+    assert_eq!(laser_wire::http::PARAM_ROOT, "root");
     assert_eq!(
-        laser_wire::http::run_cancel_path("run-7"),
-        "/agdx/runs/run-7/cancel"
+        laser_wire::topics::stream_ops_topic("orders", laser_wire::topics::CHANGES_TOPIC),
+        "stream:orders/_agdx/changes"
+    );
+    assert_eq!(laser_wire::hello::feature::STREAM_TENANCY, 1 << 13);
+    assert_eq!(
+        laser_wire::http::fork_rows_path("stream:acme/try"),
+        "/agdx/forks/stream%3Aacme%2Ftry/rows"
+    );
+    assert_eq!(laser_wire::http::fork_path("exp-1"), "/agdx/forks/exp-1");
+    assert_eq!(laser_wire::http::PARAM_LABEL_PREFIX, "label_prefix");
+    assert_eq!(
+        laser_wire::authz::stream_resource("agents"),
+        "stream:agents"
     );
 }

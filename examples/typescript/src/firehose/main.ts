@@ -11,9 +11,9 @@ import {
   batchSize,
   envBoolean,
   envInteger,
+  exampleStream,
   indexFor,
   managedGate,
-  PARTITIONS,
   phase,
   Rng,
   runExample,
@@ -84,7 +84,7 @@ async function registerOrg(laser: Laser, topic: string, index: string): Promise<
     inlinePayloadDefault: false
   }
   const binding: ProjectionBinding = {
-    source: { stream: laser.defaultStream ?? "", topic },
+    source: { stream: exampleStream(laser), topic },
     allowedProjections: [id],
     defaultProjection: id,
     index,
@@ -103,7 +103,7 @@ async function publishOrg(
 ): Promise<number> {
   const org = `org_${String(orgIndex).padStart(2, "0")}`
   const topic = laser.topic(org)
-  await topic.ensure(Math.max(1, envInteger("LASER_FIREHOSE_PARTITIONS", PARTITIONS)))
+  await topic.ensure(Math.max(1, envInteger("LASER_FIREHOSE_PARTITIONS", 8)))
   const rng = new Rng(0x1000n + BigInt(orgIndex))
   let sent = 0
   while (sent < count) {
@@ -139,16 +139,17 @@ async function boundedMap<T>(
 }
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
-  const orgs = Math.max(1, envInteger("LASER_FIREHOSE_ORGS", 4))
-  const perOrg = Math.max(1, envInteger("LASER_FIREHOSE_MESSAGES", 10_000))
+  const orgs = Math.max(1, envInteger("LASER_FIREHOSE_ORGS", 8))
+  // The total is split across the organizations, the same as Rust and Python.
+  const messages = Math.max(1, envInteger("LASER_FIREHOSE_MESSAGES", 20_000))
   const concurrency = Math.max(1, envInteger("LASER_FIREHOSE_CONCURRENCY", 4))
-  const payloadBytes = Math.max(0, envInteger("LASER_FIREHOSE_PAYLOAD_BYTES", 128))
+  const payloadBytes = Math.max(0, envInteger("LASER_FIREHOSE_PAYLOAD_BYTES", 4096))
   const chunk = Math.max(1, envInteger("LASER_FIREHOSE_BATCH", batchSize(500)))
   const capabilities = await laser.capabilities()
   const topics = Array.from({ length: orgs }, (_, index) => `org_${String(index).padStart(2, "0")}`)
   phase("firehose: warming up")
   console.log(
-    `${String(orgs)} orgs x ${String(perOrg)} records, batch ${String(chunk)}, ` +
+    `${String(messages)} records across ${String(orgs)} orgs, batch ${String(chunk)}, ` +
       `concurrency ${String(concurrency)}, payload ${String(payloadBytes)} bytes`
   )
   if (envBoolean("LASER_FIREHOSE_REGISTER", true) && managedGate(capabilities, "query", EXAMPLE)) {
@@ -157,11 +158,13 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   }
 
   phase("firing the hose")
+  const perOrg = Math.floor(messages / orgs)
+  const remainder = messages % orgs
   const started = performance.now()
   const total = await boundedMap(
     Array.from({ length: orgs }, (_, index) => index),
     concurrency,
-    (index) => publishOrg(laser, index, perOrg, chunk, payloadBytes)
+    (index) => publishOrg(laser, index, perOrg + (index < remainder ? 1 : 0), chunk, payloadBytes)
   )
   const seconds = Math.max((performance.now() - started) / 1_000, 0.001)
   console.log(
@@ -170,11 +173,14 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   )
 
   if (capabilities.query.available && envBoolean("LASER_FIREHOSE_QUERY", true)) {
+    for (const [org, topic] of topics.entries()) {
+      const expected = perOrg + (org < remainder ? 1 : 0)
+      if (expected > 0) await waitForProjection(laser, indexFor(topic), expected)
+    }
     phase("sample analytics over the firehose")
     // Index names carry this run's token, so another run or another language's
     // firehose never shares an index (or its rows) with this one.
     const index = indexFor(topics[0] ?? "org_00")
-    await waitForProjection(laser, index, 1)
     const sample = await laser.query(index).withTotal().limit(5).fetch()
     console.log(`sample index total: ${(sample.page.total ?? 0n).toString()}`)
     const payload = await laser.query(index).fetchOne(TELEMETRY_CODEC)

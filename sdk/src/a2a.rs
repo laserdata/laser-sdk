@@ -292,10 +292,11 @@ impl A2aBridge {
     /// `AgentTopic::Custom` for an arbitrary name.
     pub fn new(
         laser: Laser,
-        source: AgentId,
+        source: impl Into<AgentId>,
         request_topic: AgentTopic<'static>,
         reply_topic: AgentTopic<'static>,
     ) -> Self {
+        let source = source.into();
         let hops = vec![source.as_str().to_owned()];
         Self {
             laser,
@@ -344,17 +345,85 @@ impl A2aBridge {
     /// task conversation, tunneling the foreign JSON byte-identical in the body
     /// (`agdx.ct = json`), and returns Submitted. The task id is the conversation, and
     /// the A2A task identity rides `correlation` (derived from it, so the lookup
-    /// stays stateless).
+    /// stays stateless). The command is addressed to every agent (`agdx.to = *`),
+    /// so on a shared session topic every listening agent receives it. Use
+    /// [`submit_to`](Self::submit_to) to address one agent.
     pub async fn submit(&self, params_json: Vec<u8>) -> Result<Task, LaserError> {
+        self.submit_addressed(None, None, params_json).await
+    }
+
+    /// [`submit`](Self::submit) addressed to `target`, so only that agent
+    /// handles the task on a shared session topic.
+    pub async fn submit_to(
+        &self,
+        target: impl Into<AgentId>,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
+        let target = target.into();
+        self.submit_addressed(Some(target), None, params_json).await
+    }
+
+    /// `message/send` as a child session of `parent`, in the tree rooted at
+    /// `root`: the task's submitted start lands on `agent.sessions` with the
+    /// ancestry before the command, and the command carries it too. The
+    /// agent that handles the task ends the child. The command is addressed to
+    /// every agent, like [`submit`](Self::submit).
+    pub async fn submit_in(
+        &self,
+        parent: ConversationId,
+        root: ConversationId,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
+        self.submit_addressed(None, Some((parent, root)), params_json)
+            .await
+    }
+
+    /// [`submit_in`](Self::submit_in) addressed to `target`.
+    pub async fn submit_in_to(
+        &self,
+        target: impl Into<AgentId>,
+        parent: ConversationId,
+        root: ConversationId,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
+        let target = target.into();
+        self.submit_addressed(Some(target), Some((parent, root)), params_json)
+            .await
+    }
+
+    async fn submit_addressed(
+        &self,
+        target: Option<AgentId>,
+        ancestry: Option<(ConversationId, ConversationId)>,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
         let task = ConversationId::new();
-        self.laser
-            .agdx(self.request_topic.clone(), self.source.clone(), task.into())
+        if let Some((parent, root)) = ancestry {
+            crate::agent::contract::start_child(
+                &self.laser,
+                &self.source,
+                &self.source,
+                task.into(),
+                parent.into(),
+                root.into(),
+            )
+            .await?;
+        }
+        let producer =
+            self.laser
+                .agdx(self.request_topic.clone(), self.source.clone(), task.into());
+        let mut command = producer
             .command(correlation_of(task), params_json)
             .with_operation(OPERATION_CHAT)
             .with_metadata(METADATA_BRIDGE_HOPS, hops_metadata(&self.hops))
-            .content_type(ContentType::Json)
-            .send()
-            .await?;
+            .content_type(ContentType::Json);
+        if let Some((parent, root)) = ancestry {
+            command = command.with_ancestry(Some(parent.into()), Some(root.into()));
+        }
+        if let Some(target) = target {
+            command = command.with_target(target);
+        }
+        command.send().await?;
         Ok(Task {
             id: task.to_string(),
             status: TaskStatus {
@@ -674,9 +743,9 @@ mod tests {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
         A2aBridge::new(
             laser,
-            "a2a-edge".parse().expect("valid agent id"),
-            AgentTopic::Commands,
-            AgentTopic::Responses,
+            "a2a-edge".parse::<AgentId>().expect("valid agent id"),
+            AgentTopic::Sessions,
+            AgentTopic::Sessions,
         )
     }
 

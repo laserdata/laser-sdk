@@ -221,7 +221,6 @@ jobs:
           - "--no-default-features --features graph"
           - "--no-default-features --features projections"
           - "--no-default-features --features watch"
-          - "--no-default-features --features runs"
           - "--no-default-features --features rbac"
           - "--no-default-features --features schema-codecs"
           - "--no-default-features --features managed"

@@ -35,7 +35,7 @@ impl AgentHandler for GatedWorker {
 async fn send(laser: &Laser, conversation: ConversationId, payload: String) {
     let provenance = Provenance::builder().conversation_id(conversation).build();
     laser
-        .send_agent(AgentTopic::Commands, Bytes::from(payload), &provenance)
+        .send_agent(AgentTopic::Sessions, Bytes::from(payload), &provenance)
         .await
         .expect("the message should publish");
 }
@@ -57,7 +57,7 @@ async fn given_a_blocked_partition_when_the_record_bound_fills_then_should_stall
     let handled = Arc::new(Mutex::new(Vec::new()));
     let mut worker = Agent::builder()
         .id("bounded".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(GatedWorker {
             gate: gate.clone(),
             entered: entered.clone(),
@@ -130,7 +130,7 @@ async fn given_a_blocked_partition_when_the_byte_bound_fills_then_should_stall_i
     let handled = Arc::new(Mutex::new(Vec::new()));
     let mut worker = Agent::builder()
         .id("byte-bounded".parse().expect("the agent id is valid"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(GatedWorker {
             gate: gate.clone(),
             entered: entered.clone(),

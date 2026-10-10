@@ -10,7 +10,8 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                // The Iggy client logs every connect and producer at info.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,iggy=warn")),
         )
         .try_init();
 }
@@ -25,12 +26,11 @@ pub fn phase(title: &str) {
 
 // Stream name prefix when `LASER_STREAM` is unset. Each example gets its own
 // stream (`laser-<example>`, see `stream_for`), never one shared stream.
-// AGDX isolates workloads by stream, never by partition: unrelated apps sharing
-// one stream would also share the well-known
-// agent topics (`agent.commands`, `agent.tool_calls`, ...), so each app's
-// freshly joined consumer group would replay the other app's traffic from
-// offset 0 and dead-letter every message it cannot decode. Per-example streams
-// let all examples run against one local server without colliding.
+// AGDX isolates workloads by stream, never by partition. Unrelated apps sharing
+// one stream would also share the well-known agent topics (`agent.sessions`,
+// `agent.control`, ...), so each app's freshly joined consumer group would
+// replay the other app's traffic. Per-example streams let all examples run
+// against one local server without colliding.
 pub const DEFAULT_STREAM: &str = "laser";
 pub const PARTITIONS: u32 = 4;
 
@@ -104,9 +104,11 @@ pub async fn laser(stream: &str, capabilities: Capabilities) -> Result<Laser, La
         .await
 }
 
-/// Delete the previous run's `stream`, then run `example` and keep the stream
-/// it creates, so the result stays on the server for inspection and the
-/// next run starts clean. A provisioned `LASER_STREAM` is never deleted.
+/// Delete the previous run's `stream` and create it again, then run `example`
+/// and keep the stream, so the result stays on the server for inspection and
+/// the next run starts clean. The stream must exist before the first managed
+/// call, because a deployment refuses a stream-scoped name whose stream it
+/// cannot resolve. A provisioned `LASER_STREAM` is never deleted.
 pub async fn fresh_run(
     laser: &Laser,
     stream: &str,
@@ -116,6 +118,7 @@ pub async fn fresh_run(
     if !provisioned {
         laser.stream(stream).delete().await?;
     }
+    laser.stream(stream).ensure().await?;
     example.await
 }
 

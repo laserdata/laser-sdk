@@ -211,22 +211,25 @@ pub const AGDX_GRAPH_UPSERT_CODE: u32 = AGDX_GRAPH_BASE + 1;
 /// Managed command code: one-hop neighbor read.
 pub const AGDX_GRAPH_NEIGHBORS_CODE: u32 = AGDX_GRAPH_BASE + 2;
 
-// Agent and workflow control band (1_000_700..=1_000_799). Plane-served control
-// operations over the agent and workflow surfaces, forwarded over the same
-// bridge. Distinct from the agent ENVELOPE (the on-the-log message form, carried
-// by `agdx.av`, not a command code): this band is the request-reply control
-// surface a coordinator drives. Whether it is served is advertised by the
-// `agent_workflow` feature bit.
-/// Base of the agent and workflow control band.
+// Agent band (1_000_700..=1_000_799). Codes 1_000_700 to 1_000_703 belonged to
+// the retired run registry and are never reused. The session reads start at
+// 1_000_710.
+/// Base of the agent band.
 pub const AGDX_AGENT_BASE: u32 = AGDX_COMMAND_BASE + 700;
-/// Managed command code: submit a task to an agent or workflow.
-pub const AGDX_AGENT_SUBMIT_CODE: u32 = AGDX_AGENT_BASE;
-/// Managed command code: cancel a submitted task.
-pub const AGDX_AGENT_CANCEL_CODE: u32 = AGDX_AGENT_BASE + 1;
-/// Managed command code: read a task's status.
-pub const AGDX_AGENT_STATUS_CODE: u32 = AGDX_AGENT_BASE + 2;
-/// Managed command code: list tasks.
-pub const AGDX_AGENT_LIST_CODE: u32 = AGDX_AGENT_BASE + 3;
+/// Managed command code: read one session summary.
+pub const AGDX_SESSION_GET_CODE: u32 = AGDX_AGENT_BASE + 10;
+/// Managed command code: list sessions in one stream.
+pub const AGDX_SESSION_LIST_CODE: u32 = AGDX_AGENT_BASE + 11;
+/// Managed command code: read a session timeline page.
+pub const AGDX_SESSION_EVENTS_CODE: u32 = AGDX_AGENT_BASE + 12;
+/// Managed command code: read folded session state.
+pub const AGDX_SESSION_STATE_CODE: u32 = AGDX_AGENT_BASE + 13;
+/// Managed command code: read links to derived facts.
+pub const AGDX_SESSION_LINKS_CODE: u32 = AGDX_AGENT_BASE + 14;
+/// Managed command code: read session source positions.
+pub const AGDX_SESSION_SOURCES_CODE: u32 = AGDX_AGENT_BASE + 15;
+/// Managed command code: read committed session changes.
+pub const AGDX_SESSION_CHANGES_CODE: u32 = AGDX_AGENT_BASE + 16;
 
 // Delivery band (1_000_800..=1_000_899). Consumer filters: a reader asks the
 // streaming server for only the records that match a declarative filter.
@@ -296,10 +299,6 @@ pub const GRAPH_OP_VERSION: u32 = 1;
 /// Wire version of the consumer-filter envelopes (reads, acknowledgments,
 /// previews, tests, catalog requests, and their replies).
 pub const FILTER_OP_VERSION: u32 = 1;
-/// Wire version of the agent and workflow control-band envelopes. Distinct from
-/// [`AGENT_OP_VERSION`] (the on-the-log envelope), this versions the request and
-/// reply types of the control band.
-pub const AGENT_WORKFLOW_OP_VERSION: u32 = 1;
 
 /// Wire version of the mixed-operation batch request and reply
 /// ([`crate::batch`]). The items inside version themselves: each rides its own
@@ -351,8 +350,6 @@ pub const fn is_idempotent_managed_request(code: u32) -> bool {
             | AGDX_FORK_PROMOTE_CODE
             | AGDX_FORK_PUT_CODE
             | AGDX_GRAPH_UPSERT_CODE
-            | AGDX_AGENT_SUBMIT_CODE
-            | AGDX_AGENT_CANCEL_CODE
             | AGDX_CHECKPOINT_CODE
     )
 }

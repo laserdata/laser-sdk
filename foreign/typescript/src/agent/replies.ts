@@ -2,8 +2,10 @@ import { CancelledError, TimeoutError } from "../client/errors.js"
 import type { ConsumerTarget, LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
 import { NOOP_OBSERVER, type LaserObserver } from "../observe.js"
 import type { KeyRegistry } from "../signing.js"
+import { Cursor } from "../stream/cursor.js"
 import { AgentKind, type AgentEnvelope } from "../wire/agent.js"
 import type { CorrelationId } from "../wire/ids.js"
+import type { ConversationId, MessageId } from "../types/ids.js"
 import {
   decodeAgentMessage,
   type AgentMessage,
@@ -21,6 +23,7 @@ const LOOKUP_BATCH = 1_000
 // Ceiling on replies buffered for one subscribed correlation with no consumer
 // pulling them. A flood must not be retained in full.
 const MAX_QUEUED_REPLIES = 1_000
+const MAX_PENDING_REQUEST_REPLIES = 64
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -64,6 +67,7 @@ function raceWithTimeout<T>(
 
 export interface ReplyTicket {
   wait(timeoutMs: number, signal?: AbortSignal): Promise<AgentMessage>
+  arm(request?: MessageId): void
   cancel(): void
 }
 
@@ -78,9 +82,40 @@ interface StreamWaiter {
   readonly expectedSigner?: string
 }
 
+/** What a record must carry to answer one request: the request's session, a
+ * reply kind, and, when the request named its sender, that sender as the
+ * addressee.
+ * @internal */
+export interface ExpectedReply {
+  readonly session: ConversationId
+  readonly requester?: string
+}
+
+function accepts(expected: ExpectedReply, message: AgentMessage): boolean {
+  if (!message.provenance.conversationId.equals(expected.session)) return false
+  const envelope = message.envelope
+  let addressee: string | undefined
+  if (envelope !== undefined) {
+    if (envelope.kind !== AgentKind.Response && envelope.kind !== AgentKind.Error) return false
+    addressee = envelope.target
+  } else {
+    addressee = message.provenance.targetAgentId?.asStr()
+  }
+  return expected.requester === undefined || expected.requester === addressee
+}
+
 interface ReplyWaiter {
   readonly settle: (message: AgentMessage) => void
   readonly expectedSigner?: string
+  readonly expected?: ExpectedReply
+  readonly deferred: boolean
+  readonly pending: AgentMessage[]
+  armed: boolean
+  request?: MessageId
+}
+
+function sameAddress(left: MessageId, right: MessageId): boolean {
+  return left.partitionId === right.partitionId && left.offset === right.offset
 }
 
 /** The first AGDX response or error carrying `correlation` on a reply topic,
@@ -95,30 +130,21 @@ export async function findAgdxReply(
 ): Promise<AgentEnvelope | undefined> {
   const partitions = await transport.findTopicPartitionCount(stream, topic)
   if (partitions === undefined) return undefined
-  const offsets = new Array<bigint>(partitions).fill(0n)
+  // Each pass drains every partition up to 10,000 records, like Rust's
+  // reply reader.
+  const cursor = Cursor.create(
+    transport,
+    stream,
+    topic,
+    Array.from({ length: partitions }, (_, partition) => partition)
+  ).batch(LOOKUP_BATCH)
   for (let pass = 0; pass < MAX_LOOKUP_PASSES; pass += 1) {
-    let readAny = false
-    for (let partitionId = 0; partitionId < partitions; partitionId += 1) {
-      const messages = await transport.pollMessages(
-        stream,
-        topic,
-        { kind: "single", partitionId },
-        { kind: "offset", value: offsets[partitionId] ?? 0n },
-        LOOKUP_BATCH,
-        false
-      )
-      for (const message of messages) {
-        readAny = true
-        offsets[partitionId] = message.offset + 1n
-        const envelope = matchingReply(
-          decodeAgentMessage({ ...message, partitionId }),
-          correlation,
-          verifier
-        )
-        if (envelope !== undefined) return envelope
-      }
+    const messages = await cursor.pollRecords()
+    if (messages.length === 0) return undefined
+    for (const message of messages) {
+      const envelope = matchingReply(decodeAgentMessage(message), correlation, verifier)
+      if (envelope !== undefined) return envelope
     }
-    if (!readAny) return undefined
   }
   return undefined
 }
@@ -168,18 +194,41 @@ export class ReplyHub {
     this.streamWaiters.clear()
   }
 
-  subscribe(correlation: string, expectedSigner?: string): ReplyTicket {
+  subscribe(
+    correlation: string,
+    expectedSigner?: string,
+    deferUntilArmed = false,
+    expected?: ExpectedReply
+  ): ReplyTicket {
     let settle: ((message: AgentMessage) => void) | undefined
     const reply = new Promise<AgentMessage>((resolve) => {
       settle = resolve
     })
-    this.waiters.set(correlation, {
+    const waiter: ReplyWaiter = {
       settle: settle as (message: AgentMessage) => void,
-      ...(expectedSigner !== undefined ? { expectedSigner } : {})
-    })
+      ...(expectedSigner !== undefined ? { expectedSigner } : {}),
+      ...(expected !== undefined ? { expected } : {}),
+      deferred: deferUntilArmed,
+      pending: [],
+      armed: !deferUntilArmed
+    }
+    this.waiters.set(correlation, waiter)
     return {
       wait: (timeoutMs: number, signal?: AbortSignal) =>
         raceWithTimeout(reply, timeoutMs, () => this.waiters.delete(correlation), signal),
+      arm: (request?: MessageId) => {
+        if (this.waiters.get(correlation) !== waiter) return
+        waiter.armed = true
+        if (request !== undefined) waiter.request = request
+        const found = waiter.pending.find(
+          (message) => request === undefined || !sameAddress(message.id, request)
+        )
+        waiter.pending.length = 0
+        if (found !== undefined) {
+          this.waiters.delete(correlation)
+          waiter.settle(found)
+        }
+      },
       cancel: () => this.waiters.delete(correlation)
     }
   }
@@ -292,11 +341,12 @@ export class ReplyHub {
     const decoded = decodeAgentMessage({ ...message, partitionId })
     if (decoded.kind === "error") return false
     let reply = decoded.message
+    if (reply.envelope?.kind === AgentKind.Command) return false
     const correlation = reply.provenance.correlationId
     if (correlation === undefined) return false
-    const waiter = this.waiters.get(correlation)
+    const subscribed = this.waiters.get(correlation)
     const streamWaiter = this.streamWaiters.get(correlation)
-    const expectedSigner = waiter?.expectedSigner ?? streamWaiter?.expectedSigner
+    const expectedSigner = subscribed?.expectedSigner ?? streamWaiter?.expectedSigner
     if (this.verifier !== undefined) {
       if (
         reply.envelope === undefined ||
@@ -317,9 +367,20 @@ export class ReplyHub {
         return false
       }
     }
+    // A request waiter takes only a reply to its own session, addressed to its
+    // requester when the request named one.
+    const waiter =
+      subscribed?.expected === undefined || accepts(subscribed.expected, reply)
+        ? subscribed
+        : undefined
     if (waiter !== undefined) {
-      this.waiters.delete(correlation)
-      waiter.settle(reply)
+      if (waiter.deferred && !waiter.armed) {
+        waiter.pending.push(reply)
+        if (waiter.pending.length > MAX_PENDING_REQUEST_REPLIES) waiter.pending.shift()
+      } else if (waiter.request === undefined || !sameAddress(reply.id, waiter.request)) {
+        this.waiters.delete(correlation)
+        waiter.settle(reply)
+      }
     }
     if (streamWaiter !== undefined) {
       const pending = streamWaiter.pending.shift()

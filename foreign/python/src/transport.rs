@@ -467,7 +467,7 @@ pub(crate) struct ProducerSettings {
     pub create_topic: bool,
     pub partitions: u32,
     pub expiry: IggyExpiry,
-    pub max_topic_size: u64,
+    pub max_topic_size: iggy::prelude::MaxTopicSize,
     pub background: Option<BackgroundSettings>,
 }
 
@@ -480,8 +480,14 @@ impl ProducerSettings {
             .routing(self.routing)
             .create_stream(self.create_stream)
             .create_topic(self.create_topic)
-            .partitions(self.partitions)
-            .max_topic_bytes(self.max_topic_size);
+            .partitions(self.partitions);
+        builder = match self.max_topic_size {
+            iggy::prelude::MaxTopicSize::Unlimited => builder.unlimited_topic_size(),
+            iggy::prelude::MaxTopicSize::Custom(bytes) => {
+                builder.max_topic_bytes(bytes.as_bytes_u64())
+            }
+            iggy::prelude::MaxTopicSize::ServerDefault => builder,
+        };
         if let Some(retries) = self.retries {
             builder = builder.retries(Some(retries), self.retry_interval);
         } else if let Some(interval) = self.retry_interval {
@@ -531,7 +537,7 @@ impl PyBackgroundConfig {
         sharding: &str,
         batch_length: Option<usize>,
         batch_size: Option<usize>,
-        linger_ms: Option<u64>,
+        linger_ms: Option<f64>,
         max_buffer_size: Option<u64>,
         max_in_flight: Option<usize>,
         failure_mode: &str,
@@ -583,7 +589,10 @@ impl PyBackgroundConfig {
                 batch_length: batch_length.unwrap_or(defaults.batch_length),
                 batch_size: batch_size.unwrap_or(defaults.batch_size),
                 linger: linger_ms
-                    .map(|linger| IggyDuration::from(Duration::from_millis(linger)))
+                    .map(|linger| {
+                        crate::convert::duration_ms(linger, "linger_ms").map(IggyDuration::from)
+                    })
+                    .transpose()?
                     .unwrap_or(defaults.linger),
                 max_buffer_size: max_buffer_size.unwrap_or(defaults.max_buffer_size),
                 max_in_flight: max_in_flight.unwrap_or(defaults.max_in_flight),
@@ -1038,7 +1047,7 @@ fn header_field<'a>(bytes: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
 #[pyclass(name = "ConsumerMessage", frozen)]
 pub struct PyConsumerMessage {
     payload: bytes::Bytes,
-    message_id: String,
+    message_id: u128,
     headers: BTreeMap<String, PyHeader>,
     user_headers: Option<bytes::Bytes>,
     #[pyo3(get)]
@@ -1075,7 +1084,7 @@ impl PyConsumerMessage {
                 .unwrap_or_else(|| (BTreeMap::new(), true));
         Ok(Self {
             payload: message.payload.clone(),
-            message_id: message.header.id.to_string(),
+            message_id: message.header.id,
             headers,
             user_headers: message.user_headers.clone(),
             headers_malformed,
@@ -1096,7 +1105,7 @@ impl PyConsumerMessage {
                 .unwrap_or_else(|| (BTreeMap::new(), true));
         Self {
             payload: message.payload.clone(),
-            message_id: message.message_id.to_string(),
+            message_id: message.message_id,
             headers,
             user_headers: message.user_headers.clone(),
             headers_malformed,
@@ -1120,10 +1129,10 @@ impl PyConsumerMessage {
         PyBytes::new(py, &self.payload)
     }
 
-    /// Iggy's 128-bit message identifier as decimal text.
+    /// Iggy's 128-bit message identifier.
     #[getter]
-    fn message_id(&self) -> String {
-        self.message_id.clone()
+    fn message_id(&self) -> u128 {
+        self.message_id
     }
 
     /// The record's log position (partition and offset).
@@ -1322,11 +1331,11 @@ impl PyConsumer {
         )
     }
 
-    /// Wait at most `wait_secs` for the next message. Raises `TimeoutError` when
-    /// none arrives in time and `InvalidError` when the consumer has shut down,
-    /// matching the Rust `next_within`.
-    fn next_within<'py>(&self, py: Python<'py>, wait_secs: f64) -> PyResult<Bound<'py, PyAny>> {
-        let wait = crate::convert::duration_seconds(wait_secs, "wait_secs")?;
+    /// Wait at most `wait_ms` milliseconds for the next message. Raises
+    /// `TimeoutError` when none arrives in time and `InvalidError` when the
+    /// consumer has shut down, matching the Rust `next_within`.
+    fn next_within<'py>(&self, py: Python<'py>, wait_ms: f64) -> PyResult<Bound<'py, PyAny>> {
+        let wait = crate::convert::duration_ms(wait_ms, "wait_ms")?;
         let receive = Self::receive(
             self.state.clone(),
             Arc::clone(&self.receiving),

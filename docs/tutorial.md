@@ -13,8 +13,8 @@ Laser SDK is a streaming substrate, a managed query layer over it, and an agenti
 | layer | what it is | when you need it |
 | --- | --- | --- |
 | streaming (`streaming` feature, default) | typed publish, direct producers, live async consumer groups with server offsets, and the resumable `Cursor`. No agent concepts, no managed backend. | anywhere you stream messages against Apache Iggy. |
-| managed (`managed` feature, or the granular `query` / `projections` / `destinations` / `filters` / `kv` / `fork` / `graph` / `watch` / `runs` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
-| agentic (`agent` feature) | reliable consumer + DLQ, conversation/causality, `Router`, `Memory`, `Agent::builder` handlers. Builds on the streaming layer. | When you are orchestrating LLM agents, not just observing traffic. |
+| managed (`managed` feature, or the granular `query` / `projections` / `destinations` / `filters` / `kv` / `fork` / `graph` / `watch` / `rbac`) | declared projections, query DSL with filters / aggregates / vector recall, served by Laser Stack or LaserData Cloud. | agent / LLM observability, analytics, audit logs, market data, IoT, anywhere you want to query what you streamed. |
+| agentic (`agent` feature) | reliable consumer + DLQ, sessions, conversation/causality, `Router`, `Memory`, `Agent::builder` handlers. Builds on the streaming layer. | When you are orchestrating LLM agents, not just observing traffic. |
 
 Chapters 1-8 use streaming and managed data operations. Chapter 9 adds the agent runtime.
 
@@ -504,15 +504,58 @@ The `agent` feature adds coordination to streaming. It supplies correlation, ret
 | reliable consumption | `Agent::builder().handler(H).build().spawn(..)`, `ReliableConsumer` | at-least-once + idempotent. Dedup window on `agdx.idem`, retries with backoff for transient errors, dead-letter for permanent + undecodable + deadline-exceeded. `AgentId` is logical identity, `ConsumerGroupName` is replica topology and defaults from the agent id unless explicitly overridden. |
 | reply correlation | `Laser::request(...).await`, `AgentCtx::respond(payload)` | request stamps a fresh `correlation_id` (Ulid) on `agdx.corr`, distinct from the business `idempotency_key` on `agdx.idem`. Responder echoes it back via `respond`. Reader filters on `agdx.corr`, so a forged reply that guesses the conversation id cannot hijack. |
 | conversation + causality | `ConversationId`, `MessageId`, `Provenance.causal_parent`, `spawn_subconversation(&parent)` | a conversation is one partition (total order). Sub-conversations carry `agdx.parent_conv` + `agdx.root_conv`. Replies carry `agdx.cause`. Walk one partition for a chat. Walk the causality tree for a multi-agent flow. |
-| routing | `Router::to(agent_id)` / `Router::broadcast()` | stamps / clears `agdx.to`. The reliable consumer skips messages addressed to another agent. |
-| session | `laser.sessions().create(id)` -> `Session`: `append(SessionTurnKind, data)`, `context()`, `memory().search(q)`, `checkpoint()`, `turns_at` / `turns_since`, `state_at` / `replay` | Each turn kind uses one conversation-level agent topic. `SessionConfig` selects the stream and topics. A `Checkpoint` stores offsets for reads before or from that point. |
+| routing | `Router::to(agent_id)` / `Router::broadcast()` | stamps `agdx.to` with the agent id, or `*` for every agent. The reliable consumer classifies each record and hands only work for its own operations to the handler. Replies, status, events, and records for other agents are skipped and committed. |
+| session | `laser.sessions().create(label).agent(id).begin()` -> `(Session, SessionLease)`: `end` / `fail` / `cancel` / `run`, `model` / `tool` / `assemble`, `state()`, `context()`, `checkpoint()`, `turns_at` / `turns_since`, `state_at` / `replay` | a session is one conversation with a recorded lifecycle on `agent.sessions`. `SessionConfig` selects the stream, the layout, the idle timeout, and the heartbeat. A `Checkpoint` stores lane offsets for reads before or from that point. |
 | session policy | `SessionPolicy::PerCall` / `SessionPolicy::PerUser` | per-user mode derives a stable `ConversationId` from the user key (versioned FNV-1a) so the same user keeps the same conversation across processes. |
 | context assembly | `ContextAssembler::builder().conversation_id(c).policy(Box::new(LastN(20))).build().assemble(&laser)` | read one partition (or walk the causality tree with `across_subconversations`) and apply a `ContextPolicy` (`LastN`, `RoleFilter`, or your own) to feed an LLM call. Each partition read examines at most its newest 10,000 raw records before the conversation filter runs, see [client behavior](client-behavior.md). |
 | log replay -> state | `ConversationState::load(laser, conv, topics, bound, init, fold)` | deterministic fold of the conversation back to current state, under an explicit `ReplayBound` (`FromOffsets` incremental, `Last(n)`, `Full` written out, or a `Checkpoint` bound through `FromCheckpoint` and `At`). `load_with(store, ..)` seeds from a `SnapshotStore` and folds only the tail past the snapshot. Same idea as event sourcing on the conversation partition. The same 10,000-record window applies, so `Full` covers a partition only when it holds no more than that. |
-| memory | `Laser::memory(ns)` -> `MemoryHandle`, the one model: every `remember` / `recall` / `improve` / `forget` rides a memory topic (the versioned audit) that materializes to a versioned key-value read view. `memory_topic(name).stream(..).partitions(n).ttl(d)` configures the topic. `memory_with(ns, MemoryBackend::Vector)` is the in-process similarity index for tests and offline recall. | one API, scope by agent / conversation. User isolation lives at the stream boundary. |
+| memory | `Laser::memory(ns)` -> `MemoryHandle`, the one model: every `remember` / `recall` / `improve` / `forget` rides the memory topic (`agent.memory` by default) that materializes to a versioned key-value read view. `memory_topic(name).stream(..).partitions(n).ttl(d)` configures the topic. `memory_with(ns, MemoryBackend::Vector)` is the in-process similarity index for tests and offline recall. | one API, scope by agent / conversation. User isolation lives at the stream boundary. |
 | state | `StateStore` trait (`get`/`set`/`delete`) + `InMemoryStore` / `FileStore`, and managed `Kv` (which implements `StateStore`) | one point-store seam for dedup persistence, checkpoints, per-agent state. `FileStore` does atomic `<file>.<ulid>.tmp` + rename. Swap in `laser.kv(ns)` for the managed durable backend, same trait. |
 | stream cursor | `laser.stream(stream).topic(topic).replay()` -> `Cursor` (`poll` / `offsets` / `from_offsets` / `stream`) | resumable, offset-addressable read over the log. Checkpoint `offsets()` into any `StateStore` to resume after a restart. `stream()` drives it as a `futures::Stream` (draining then ending when caught up, the shape the Python binding exposes as `async for`). The open primitive the `Agent` runtime sits above. |
 | A2A interop | `A2aBridge` (feature `a2a-bridge`, plus `a2a-http` for the axum router) | speaks Google's A2A JSON-RPC over the agent runtime. One axum route, the agent topology underneath. |
+
+### Sessions: one unit of work
+
+A session is one conversation with a recorded lifecycle. Its id is the conversation id, so every conversation read finds it. Bootstrap the agent topics once. `agent.sessions` needs an explicit retention, because it holds every session's records and there is no safe default.
+
+```rust
+use laser_sdk::agent::{ModelRequest, ModelResponse, TopicRetention};
+
+laser
+    .sessions()
+    .bootstrap(4, TopicRetention::expire_after(Duration::from_secs(7 * 86_400)))
+    .await?;
+
+let (session, lease) = laser
+    .sessions()
+    .create("ticket-4821")
+    .agent("planner".parse::<AgentId>()?)
+    .begin()
+    .await?;
+let summary = session
+    .run(lease, |session| async move {
+        let assembled = session.assemble(Box::new(LastN(20))).await?;
+        let call = session
+            .model(ModelRequest::new("gpt-4o", assembled.text()), Some(&assembled))
+            .await?;
+        let answer = b"it is a login bug".to_vec(); // your provider call goes here
+        call.complete(ModelResponse { body: answer.clone(), ..Default::default() })
+            .await?;
+        session.state().set("status", serde_json::json!("triaged")).await?;
+        Ok(answer)
+    })
+    .await?;
+```
+
+`create(label)` derives the id from the stream, the namespace, and the label, so the same label reaches the same session. `start()` makes a fresh one. `begin` writes the start record and returns a `SessionLease`, which keeps the session in this process's heartbeat on `agent.heartbeats`. `run` ends the session as completed on success and as failed on an error or a panic. `end`, `fail`, and `cancel` do the same by hand. Every clone of a handle shares one terminal latch, so a retried `end` resends the same record and a later `cancel` is refused.
+
+The SDK never calls a model. `model` writes the request, and the context manifest when you pass one, and `complete` writes the answer with its usage. `tool(name, args)` records a tool call the same way. Tool arguments and JSON request bodies pass a redactor first, which by default drops the values of keys such as `api_key` and `token`. `state()` keeps one JSON document per session as JSON Patch records on the lane.
+
+`laser.sessions().submit(agent, input).from(me).send()` hands a new session to an agent. Inside the handler, `ctx.session()` returns that session, and `ctx.session().end()` completes it. An operator stops a session with `laser.sessions().control(stream, id).as_operator(op).cancel()`, which writes on `agent.control`. Only accounts with send permission on that topic can do it. `laser.sessions().open(id)` reads any session's lane: `context()`, `checkpoint()`, `turns_since(checkpoint)`, and `state().get()`.
+
+On a deployment that announces the `sessions` capability, the factory also reads the managed session index: `laser.sessions().list().fetch()`, `get(id)`, `events(id).fetch()`, `state(id, 0)`, `links(id, None)`, `sources(id)`, and `watch(poll_every)`. `laser.read_at(&event.at)` fetches the record a timeline row points at, on open Apache Iggy too.
+
+Each stream picks a layout through `SessionConfig::layout`. The default `SessionLayout::Shared` puts all work on `agent.sessions`, keyed by session. `PerAgentPartition` gives each declared agent its own partition for the work addressed to it, `PerAgentTopic` gives each agent its own topic, and `SinglePartition` keeps everything on one partition. Lifecycle and state always stay on the session's partition of `agent.sessions`. [Agents, groups, and layouts](building-agents.md#agents-groups-and-layouts) explains how to choose one.
 
 ### A handler that responds
 
@@ -529,8 +572,8 @@ impl AgentHandler for Echo {
 
 let mut handle = Agent::builder()
     .id("echo".parse()?)
-    .listen_on(AgentTopic::Commands)
-    .respond_on(AgentTopic::Responses)
+    .listen_on(AgentTopic::Sessions)
+    .respond_on(AgentTopic::Sessions)
     .handler(Echo)
     .build()
     .spawn(laser.clone());
@@ -545,8 +588,8 @@ The caller does not poll. `request` stamps the correlation key, waits on the rep
 
 ```rust
 let reply = laser.request(
-    AgentTopic::Commands,
-    AgentTopic::Responses,
+    AgentTopic::Sessions,
+    AgentTopic::Sessions,
     b"summarize ticket #4821".to_vec(),
     &Provenance::builder()
         .conversation_id(ConversationId::new())
@@ -568,7 +611,7 @@ impl AgentHandler for Coordinator {
         // sub-conversation linked back to the root.
         for source in ["logs", "metrics", "traces"] {
             let child = ctx.spawn_subconversation();  // fresh conversation_id, links to root
-            ctx.send(AgentTopic::Commands, source.as_bytes().to_vec(), &child).await?;
+            ctx.send(AgentTopic::Sessions, source.as_bytes().to_vec(), &child).await?;
         }
         Ok(())
     }
@@ -602,7 +645,7 @@ Managed models can retain the source conversation from `gen_ai.conversation.id`.
 
 Streaming, agents, provenance, duplicate suppression, `Cursor`, `StateStore`, and locally folded memory run on Apache Iggy. Queries, projections, KV, and forks require a managed backend. Without it, calls return `LaserError::Unsupported`.
 
-Capabilities group support under `managed`, `query`, `destinations`, `kv`, `graph`, `forks`, `a2a_gateway`, `agent_workflow`, `watch`, `authz`, and `filters`. Query includes `available`, `consistency`, `keyword`, `cursor_paging`, `cancellation`, and `execution_status`. KV includes `available`, `cas`, `cas_fenced`, and `fenced_leases`. Memory combines query and graph capabilities rather than defining another group:
+Capabilities group support under `managed`, `query`, `destinations`, `kv`, `graph`, `forks`, `sessions`, `a2a_gateway`, `watch`, `authz`, and `filters`. The server sets `sessions` only when it serves the managed session reads. Query includes `available`, `consistency`, `keyword`, `cursor_paging`, `cancellation`, and `execution_status`. KV includes `available`, `cas`, `cas_fenced`, and `fenced_leases`. Memory combines query and graph capabilities rather than defining another group:
 
 | concern | open SDK (this crate, Apache Iggy) | managed runtime (LaserData Cloud or Laser Stack) |
 | --- | --- | --- |
@@ -610,7 +653,7 @@ Capabilities group support under `managed`, `query`, `destinations`, `kv`, `grap
 | query / projections | not available, returns `LaserError::Unsupported` | picks up `Projection` + `ProjectionBinding` configuration and materializes read models served off the log |
 | reliable consumption | `ReliableConsumer` with in-memory dedup + DLQ | the same `ReliableConsumer`. Effects that must happen once use a KV compare-and-swap or a fenced write |
 | memory | `Laser::memory(ns)` runs here: remember publishes to the memory topic, and folded recall (`recall().folded()`, Python `recall(folded=True)`) rebuilds memory from the log in process. In-process `VectorMemory<E>` (cosine recall, bring your own `Embedder`) needs no server either | the same `Laser::memory(ns)` - a deployment materializes the topic into a versioned key-value read view for fast recall. Memory itself has no capability flag |
-| sessions | `Laser::sessions` runs here: typed turns, context, checkpoints, and replay over the agent topics | the same `Laser::sessions`. Session memory recall reads the managed key-value view |
+| sessions | `Laser::sessions` runs here: lifecycle, model and tool records, state, context, checkpoints, replay, and operator control over the session lane | the same `Laser::sessions`. A registered stream also gets a session index with lists, timelines, folded state, and links. Session memory recall reads the managed key-value view |
 | forks | not available, returns `LaserError::Unsupported` | copy-on-write branches of the read model, surfaced through `Capabilities::forks` |
 | A2A | `A2aBridge` axum route you self-host | managed A2A gateway with auth, streaming, persisted task store, agent-card metadata, surfaced through `Capabilities::a2a_gateway` |
 
@@ -647,8 +690,8 @@ fn diagnose_card() -> AgentCard {
 
 let worker = Agent::builder()
     .id("diag-alpha".parse()?)
-    .listen_on(AgentTopic::Commands)
-    .respond_on(AgentTopic::Responses)
+    .listen_on(AgentTopic::Sessions)
+    .respond_on(AgentTopic::Sessions)
     .capabilities(diagnose_card().capabilities)  // auto-advertises the card on spawn
     .ack_on_pickup(true)                          // emit a Working signal when a task is taken
     .handler(handler)
@@ -667,7 +710,7 @@ let outcome = laser
     .contract(Router::to_capable("diagnose", RoutePolicy::Any))
     .from("orchestrator".parse()?)
     .payload(b"auth API latency spike".to_vec())
-    .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))  // a managed deployment uses the default Advertised
+    .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))  // a managed deployment uses the default Advertised
     .deadline(Duration::from_secs(10))
     .send()
     .await?;
@@ -683,12 +726,14 @@ The workflow engine runs steps in dependency order and passes results between th
 
 For protected external state, use `.exclusive_in(namespace)`. In the handler, use `kv(target_namespace).cas_fenced(key, namespace, run_id, token)` with the recorded token and run ID. This binds the effect to the same live lease and fence counter. Renewal starts halfway through the granted lifetime and remains bounded by lease expiry and the workflow deadline.
 
+A workflow run is a session whose id is the run id, and every step and compensation is a child session of it. Between steps the engine checks `agent.control` for a cancel request, then compensates and returns `LaserError::Cancelled`. A contract can run as a child session too, through `ContractBuilder::parent(parent, root)`.
+
 A completed step keeps its lease through verification and the durable journal write, then releases it. `.on_timeout(OnTimeout::Reassign)` acquires a new lease and fence before retrying with another holder. Reassignments are bounded. The default is `OnTimeout::Fail`.
 
 ```rust
 let result = laser
     .workflow("incident")
-    .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+    .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
     .step("triage", Router::to_capable("triage", RoutePolicy::Any), |_ctx: &StepContext<'_>| b"incident".to_vec())
     .step("diagnose", Router::all_capable("diagnose", RoutePolicy::Any),
           |ctx: &StepContext<'_>| ctx.outputs.get("triage").cloned().unwrap_or_default())

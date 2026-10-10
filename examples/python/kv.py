@@ -33,11 +33,11 @@ import laser_sdk as ls
 EXAMPLE = "kv"
 NAMESPACE = "config"
 KEY = "service:auth"
-TTL_SECS = 86_400
+TTL_MS = 86_400_000
 FORK_ID = "experiment-1"
 LEASE_KEY = "lease:service:auth"
 HOLDER = "worker-a"
-LEASE_TTL_SECS = 30
+LEASE_TTL_MS = 30_000
 
 
 async def main() -> None:
@@ -49,7 +49,7 @@ async def main() -> None:
 
         _common.phase("set and get keyed state")
         store = laser.kv(NAMESPACE)
-        await store.set(KEY).json({"log_level": "info"}).ttl(TTL_SECS).send()
+        await store.set(KEY).json({"log_level": "info"}).ttl(TTL_MS).send()
         config = await store.get_typed(KEY)
         print(f"  {KEY} logs at {config['log_level']}")
 
@@ -65,7 +65,7 @@ async def main() -> None:
 
         if caps.kv.fenced_leases:
             _common.phase("lease and fenced write: at most one effective writer")
-            lease = await store.lease(LEASE_KEY, HOLDER, LEASE_TTL_SECS)
+            lease = await store.lease(LEASE_KEY, HOLDER, LEASE_TTL_MS)
             print(f"  {HOLDER} holds {LEASE_KEY} at fence {lease.token}")
             # Barriered read: the answering fold has applied at least the grant, so a
             # holder that just took over never plans against its predecessor's state.
@@ -77,11 +77,11 @@ async def main() -> None:
                 lease.token,
                 json.dumps({"log_level": "trace"}).encode(),
                 expect_version=held.version,
-                ttl_secs=TTL_SECS,
+                ttl_ms=TTL_MS,
             )
             seen = json.loads(held.value)["log_level"]
             print(f"  barriered read saw {seen}, the fenced write landed as version {fenced}")
-            renewed = await store.renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL_SECS)
+            renewed = await store.renew_lease(LEASE_KEY, HOLDER, lease.token, LEASE_TTL_MS)
             await store.release(LEASE_KEY, HOLDER, renewed.token)
             print(f"  lease renewed at the same fence {renewed.token}, then released")
             # The gate holds without waiting for a successor: a released fence is

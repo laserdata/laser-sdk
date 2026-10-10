@@ -21,16 +21,18 @@ import {
 
 import {
   AsyncResourceGroup,
-  PARTITIONS,
-  Rng,
   batchSize,
   decodeUtf8,
   envBoolean,
+  exampleStream,
   indexFor,
   managedGate,
   messages,
+  PARTITIONS,
   phase,
+  Rng,
   runExample,
+  SESSION_RETENTION,
   utf8,
   waitForProjection
 } from "../common.js"
@@ -42,8 +44,8 @@ const TICKETS = "support_tickets"
 // same deployment never shares its rows.
 const TICKETS_INDEX = indexFor(TICKETS)
 const PLAN = "bulk-resolve-plan"
-const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Commands }
-const fixedTools = { kind: "fixed" as const, topic: AgentTopic.ToolCalls }
+const fixedCommands = { kind: "fixed" as const, topic: AgentTopic.Sessions }
+const fixedTools = { kind: "fixed" as const, topic: AgentTopic.Sessions }
 const ANGLES = ["most likely root cause", "fastest mitigation", "blast radius"] as const
 const NOTES = [
   "auth latency usually traces to database pool exhaustion",
@@ -108,7 +110,7 @@ class KvDeduplicator implements Deduplicator {
         .kv(this.namespace)
         .set(utf8(key))
         .bytes(Uint8Array.of(1))
-        .ttl(3_600_000_000n)
+        .ttl(3_600_000)
         .expectAbsent()
         .commit()
       return true
@@ -144,7 +146,7 @@ async function registerTickets(laser: Laser): Promise<void> {
     inlinePayloadDefault: false
   }
   const binding: ProjectionBinding = {
-    source: { stream: laser.defaultStream ?? "", topic: TICKETS },
+    source: { stream: exampleStream(laser), topic: TICKETS },
     allowedProjections: [id],
     defaultProjection: id,
     index: TICKETS_INDEX,
@@ -196,8 +198,8 @@ async function spawnDesk(
   const llm = defaultLlm()
   const triage = Agent.builder()
     .id(AgentId.new("triage"))
-    .listenOn(AgentTopic.Commands)
-    .respondOn(AgentTopic.Responses)
+    .listenOn(AgentTopic.Sessions)
+    .respondOn(AgentTopic.Sessions)
     .inboxRoute(fixedTools)
     .pollInterval(5)
     .handler({
@@ -210,8 +212,8 @@ async function spawnDesk(
             targetAgentId: AgentId.new("specialist")
           }
           const reply = await context.request(
-            AgentTopic.ToolCalls,
-            AgentTopic.ToolResults,
+            AgentTopic.Sessions,
+            AgentTopic.Sessions,
             utf8(`${angle}: ${incident}`),
             provenance,
             15_000
@@ -225,8 +227,8 @@ async function spawnDesk(
     .spawn(laser)
   const specialist = Agent.builder()
     .id(AgentId.new("specialist"))
-    .listenOn(AgentTopic.ToolCalls)
-    .respondOn(AgentTopic.ToolResults)
+    .listenOn(AgentTopic.Sessions)
+    .respondOn(AgentTopic.Sessions)
     .pollInterval(5)
     .handler({
       async handle(message, context): Promise<void> {
@@ -243,13 +245,17 @@ async function spawnDesk(
     })
     .build()
     .spawn(laser)
+  // The approver answers only the approval requests addressed to it. Every
+  // desk agent reads the shared session topic, so an unaddressed prompt would
+  // be work for all of them.
   const approver = Agent.builder()
     .id(AgentId.new("approver"))
-    .listenOn(AgentTopic.HumanInput)
+    .listenOn(AgentTopic.Sessions)
+    .respondOn(AgentTopic.Sessions)
     .pollInterval(5)
     .handler({
       handle(_message, context): Promise<void> {
-        return context.respondInput(AgentTopic.Responses, utf8("approved"))
+        return context.respond(utf8("approved"))
       }
     })
     .build()
@@ -257,7 +263,7 @@ async function spawnDesk(
   const grants = laser.kv(grantNamespace)
   const resolver = Agent.builder()
     .id(AgentId.new("resolver"))
-    .listenOn(AgentTopic.Commands)
+    .listenOn(AgentTopic.Sessions)
     .pollInterval(5)
     .deduplicator(new KvDeduplicator(laser, dedupNamespace))
     .handler({
@@ -267,12 +273,14 @@ async function spawnDesk(
           units: number
         }
         if (grant.units >= 100) {
-          const decision = await context.approvalGate(
-            AgentTopic.Responses,
+          const decision = await context.request(
+            AgentTopic.Sessions,
+            AgentTopic.Sessions,
             utf8(`approve a ${String(grant.units)} unit capacity grant to ${grant.cluster}?`),
+            { ...context.spawnSubconversation(), targetAgentId: AgentId.new("approver") },
             15_000
           )
-          if (decodeUtf8(decision) !== "approved") return
+          if (decodeUtf8(agentMessageBody(decision)) !== "approved") return
         }
         const key = utf8(grant.cluster)
         const current = Number(decodeUtf8((await grants.get(key)) ?? utf8("0")))
@@ -291,7 +299,7 @@ async function spawnDesk(
 
 export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   phase("warming up")
-  await laser.bootstrap(PARTITIONS)
+  await laser.bootstrap(PARTITIONS, SESSION_RETENTION)
   await laser.topic(TICKETS).ensure(PARTITIONS)
   const capabilities = await laser.capabilities()
   if (
@@ -336,7 +344,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   for (const grant of [...GRANTS, ...GRANTS]) {
     await laser
       .agent(AgentId.new("orchestrator"))
-      .send(AgentTopic.Commands, utf8(JSON.stringify(grant)), {
+      .send(AgentTopic.Sessions, utf8(JSON.stringify(grant)), {
         conversationId: incident,
         idempotencyKey: grant.key,
         targetAgentId: AgentId.new("resolver")
@@ -381,7 +389,7 @@ export async function run(laser: Laser, _signal: AbortSignal): Promise<void> {
   const rebuilt = await ConversationState.load(
     laser,
     incident,
-    [AgentTopic.Commands, AgentTopic.Responses, AgentTopic.ToolCalls, AgentTopic.ToolResults],
+    [AgentTopic.Sessions],
     { kind: "full" },
     0,
     (total) => total + 1

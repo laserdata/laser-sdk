@@ -372,14 +372,40 @@ export type ControlCommand =
   | { readonly kind: "dropSchema"; readonly id: number }
   | { readonly kind: "registerGraph"; readonly projection: Projection }
   | { readonly kind: "dropGraph"; readonly id: string }
-  | { readonly kind: "registerRunSource"; readonly source: SourceSelector }
-  | { readonly kind: "removeRunSource"; readonly source: SourceSelector }
+  | {
+      readonly kind: "registerSessionSource"
+      readonly stream: string
+      readonly topics: SessionTopics
+    }
+  | { readonly kind: "removeSessionSource"; readonly stream: string }
   | { readonly kind: "filterCatalog"; readonly command: FilterCatalogCommand }
+
+export type SessionTopics =
+  { readonly kind: "all" } | { readonly kind: "named"; readonly names: readonly string[] }
+
+export function encodeSessionTopics(topics: SessionTopics): unknown {
+  return topics.kind === "all" ? "All" : new Map([["Named", [...topics.names]]])
+}
+
+export function decodeSessionTopics(value: unknown, context: string): SessionTopics {
+  if (value === "All") return { kind: "all" }
+  const [tag, names] = singleVariantTag(value, context)
+  if (tag !== "Named" || !Array.isArray(names))
+    throw new CodecError("invalid session topics", context, "topics")
+  return {
+    kind: "named",
+    names: names.map((name, index) => expectString(name, `${context}.topics[${String(index)}]`))
+  }
+}
 
 export interface ControlEnvelope {
   readonly v: number
   readonly timestampMicros: bigint
   readonly command: ControlCommand
+  /** The stream the command's resource names belong to, set by a client that
+   * scopes its resources to a stream. The writer-schema registry keys
+   * `registerSchema` and `dropSchema` by stream and id when it is set. */
+  readonly stream?: string
 }
 
 const FIELD_TYPES: ReadonlySet<string> = new Set(["text", "int", "float", "bool"])
@@ -742,10 +768,20 @@ export function encodeControlCommand(command: ControlCommand): Map<string, unkno
       return new Map([["RegisterGraph", encodeProjection(command.projection)]])
     case "dropGraph":
       return new Map([["DropGraph", command.id]])
-    case "registerRunSource":
-      return new Map([["RegisterRunSource", encodeSourceSelector(command.source)]])
-    case "removeRunSource":
-      return new Map([["RemoveRunSource", encodeSourceSelector(command.source)]])
+    case "registerSessionSource":
+      return new Map([
+        [
+          "RegisterSessionSource",
+          new Map<string, unknown>([
+            ["stream", command.stream],
+            ["topics", encodeSessionTopics(command.topics)]
+          ])
+        ]
+      ])
+    case "removeSessionSource":
+      return new Map([
+        ["RemoveSessionSource", new Map<string, unknown>([["stream", command.stream]])]
+      ])
     case "filterCatalog":
       return new Map([["FilterCatalog", encodeFilterCatalogCommand(command.command)]])
   }
@@ -789,15 +825,18 @@ export function decodeControlCommand(value: unknown, context: string): ControlCo
       }
     case "DropGraph":
       return { kind: "dropGraph", id: expectString(inner, context) }
-    case "RegisterRunSource":
+    case "RegisterSessionSource": {
+      const fields = expectMap(inner, context)
       return {
-        kind: "registerRunSource",
-        source: decodeSourceSelector(expectMap(inner, context), context)
+        kind: "registerSessionSource",
+        stream: field.requiredString(fields, "stream", context),
+        topics: decodeSessionTopics(fields.get("topics"), context)
       }
-    case "RemoveRunSource":
+    }
+    case "RemoveSessionSource":
       return {
-        kind: "removeRunSource",
-        source: decodeSourceSelector(expectMap(inner, context), context)
+        kind: "removeSessionSource",
+        stream: field.requiredString(expectMap(inner, context), "stream", context)
       }
     case "FilterCatalog":
       return { kind: "filterCatalog", command: decodeFilterCatalogCommand(inner, context) }
@@ -807,19 +846,27 @@ export function decodeControlCommand(value: unknown, context: string): ControlCo
 }
 
 export function encodeControlEnvelope(envelope: ControlEnvelope): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["v", BigInt(envelope.v)],
     ["timestamp_micros", envelope.timestampMicros],
     ["command", encodeControlCommand(envelope.command)]
   ])
+  if (envelope.stream !== undefined) map.set("stream", envelope.stream)
+  return map
 }
 
 export function decodeControlEnvelope(map: CborMap, context: string): ControlEnvelope {
   return {
     v: field.requiredU32(map, "v", context),
     timestampMicros: field.requiredU64(map, "timestamp_micros", context),
-    command: decodeControlCommand(map.get("command"), `${context}.command`)
+    command: decodeControlCommand(map.get("command"), `${context}.command`),
+    ...optionalStream(map, context)
   }
+}
+
+function optionalStream(map: CborMap, context: string): { readonly stream?: string } {
+  const stream = field.optionalString(map, "stream", context)
+  return stream === undefined ? {} : { stream }
 }
 
 function decodeOptionalNullableString(

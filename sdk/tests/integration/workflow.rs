@@ -46,8 +46,8 @@ async fn worker(laser: &Laser, id: &str, skill: &str, tag: &str) -> AgentHandle 
     let connection = harness::reconnect(laser).await;
     Agent::builder()
         .id(id.parse().expect("worker id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(card(skill).capabilities)
         .handler(Tagger {
             tag: tag.to_owned(),
@@ -106,7 +106,7 @@ async fn given_a_two_step_workflow_when_run_then_should_dispatch_in_dependency_o
     // Each step is target-filtered to its worker on the shared topic.
     let outcome = laser
         .workflow("incidentflow")
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .step(
             "triage",
             Router::to_capable("triage", RoutePolicy::Any),
@@ -155,7 +155,7 @@ async fn given_an_all_capable_step_when_run_then_should_scatter_and_fold_every_r
 
     let outcome = laser
         .workflow("reviewflow")
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .step(
             "review",
             Router::all_capable("review", RoutePolicy::Any),
@@ -204,8 +204,8 @@ async fn given_a_completed_step_when_the_workflow_resumes_then_should_not_re_dis
     let calls = Arc::new(AtomicUsize::new(0));
     let mut counter = Agent::builder()
         .id("counter".parse().expect("counter id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(card("count").capabilities)
         .handler(Counter {
             calls: calls.clone(),
@@ -217,7 +217,7 @@ async fn given_a_completed_step_when_the_workflow_resumes_then_should_not_re_dis
     // First run dispatches the step once.
     let first = laser
         .workflow("countflow")
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .step(
             "count",
             Router::to_capable("count", RoutePolicy::Any),
@@ -233,7 +233,7 @@ async fn given_a_completed_step_when_the_workflow_resumes_then_should_not_re_dis
     let resumed = laser
         .workflow("countflow")
         .run_id(first.run_id)
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .step(
             "count",
             Router::to_capable("count", RoutePolicy::Any),
@@ -282,8 +282,8 @@ async fn given_a_budget_breach_after_a_completed_step_when_the_workflow_fails_th
     let compensated = Arc::new(AtomicUsize::new(0));
     let mut worker = Agent::builder()
         .id("saga-worker".parse().expect("worker id is valid"))
-        .listen_on(AgentTopic::Commands)
-        .respond_on(AgentTopic::Responses)
+        .listen_on(AgentTopic::Sessions)
+        .respond_on(AgentTopic::Sessions)
         .capabilities(card("saga").capabilities)
         .handler(SagaWorker {
             dispatched: dispatched.clone(),
@@ -295,8 +295,8 @@ async fn given_a_budget_breach_after_a_completed_step_when_the_workflow_fails_th
 
     let result = laser
         .workflow("budgetflow")
-        .budget(Budget::unlimited().invocations(1))
-        .inbox_route(InboxRoute::Fixed(AgentTopic::Commands))
+        .budget(WorkflowBudget::unlimited().invocations(1))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
         .step(
             "charge",
             Router::to_capable("saga", RoutePolicy::Any),
@@ -317,4 +317,105 @@ async fn given_a_budget_breach_after_a_completed_step_when_the_workflow_fails_th
     assert_eq!(compensated.load(Ordering::SeqCst), 1);
 
     worker.shutdown().await.expect("worker shuts down");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_workflow_when_run_then_should_record_the_run_as_a_root_session_with_child_steps() {
+    use laser_sdk::wire::agent::{SessionStart, TaskState};
+    use laser_sdk::wire::framing::decode_named;
+    let laser = harness::laser().await;
+    let mut triager = worker(&laser, "rooted-triager", "rooted-triage", "triaged").await;
+    triager.ready().await.expect("triager joins its group");
+    wait_for_capable(&laser, "rooted-triage", 1).await;
+    let outcome = laser
+        .workflow("rootedflow")
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .step(
+            "triage",
+            Router::to_capable("rooted-triage", RoutePolicy::Any),
+            |_ctx: &StepContext<'_>| b"incident".to_vec(),
+        )
+        .run()
+        .await
+        .expect("the workflow runs to completion");
+    let run = outcome.run_id;
+    let child = ConversationId::derive(&format!("{run}/triage/1"));
+    let states = |session: ConversationId| {
+        let laser = laser.clone();
+        async move {
+            let turns = laser.sessions().open(session).context().await.ok()?;
+            let states: Vec<(TaskState, Vec<u8>)> = turns
+                .into_iter()
+                .filter_map(|turn| {
+                    let envelope = turn.message.envelope?;
+                    if envelope.operation.as_deref() != Some("session") {
+                        return None;
+                    }
+                    Some((envelope.task_state?, envelope.body))
+                })
+                .collect();
+            Some(states)
+        }
+    };
+    let root = harness::eventually(|| async {
+        let found = states(run).await?;
+        (found.len() >= 2).then_some(found)
+    })
+    .await;
+    assert_eq!(root[0].0, TaskState::Working);
+    assert_eq!(root.last().map(|state| state.0), Some(TaskState::Completed));
+    let step = harness::eventually(|| async {
+        let found = states(child).await?;
+        found
+            .iter()
+            .any(|state| state.0 == TaskState::Completed)
+            .then_some(found)
+    })
+    .await;
+    assert_eq!(step[0].0, TaskState::Submitted);
+    let start: SessionStart = decode_named(&step[0].1).expect("the child start decodes");
+    assert_eq!(start.parent, Some(run.into()));
+    assert_eq!(start.root, Some(run.into()));
+    triager.shutdown().await.expect("triager stops");
+}
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_cancel_request_on_the_control_topic_when_a_workflow_runs_then_should_stop_as_cancelled()
+ {
+    let laser = harness::laser().await;
+    laser
+        .topic(AgentTopic::Control.topic_string())
+        .ensure(4)
+        .await
+        .expect("provisioning creates the control topic");
+    let run = ConversationId::new();
+    laser
+        .sessions()
+        .control(laser.default_stream().expect("stream"), run)
+        .as_operator(
+            "operator"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("valid agent id"),
+        )
+        .cancel()
+        .await
+        .expect("the cancel request is sent");
+    let result = harness::eventually(|| async {
+        let result = laser
+            .workflow("cancelledflow")
+            .run_id(run)
+            .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+            .step(
+                "never",
+                Router::to("nobody".parse().expect("valid agent id")),
+                |_ctx: &StepContext<'_>| b"x".to_vec(),
+            )
+            .run()
+            .await;
+        matches!(result, Err(LaserError::Cancelled { .. })).then_some(result)
+    })
+    .await;
+    assert!(matches!(result, Err(LaserError::Cancelled { .. })));
 }

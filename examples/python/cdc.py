@@ -416,7 +416,7 @@ async def main() -> None:
         delivered_bytes = 0
         try:
             for _ in range(strict_matches):
-                message = await consumer.next_within(READ_TIMEOUT)
+                message = await consumer.next_within(READ_TIMEOUT * 1000)
                 change = fleet_change(message.json())
                 print(
                     f"  partition {message.partition_id} offset {message.position.offset}: "

@@ -2,7 +2,14 @@ import { CodecError, InvalidError } from "../client/errors.js"
 import { type CborMap, encodeNamed, expectMap, field, singleVariantTag } from "./cbor.js"
 import { GRAPH_OP_VERSION } from "./codes.js"
 import { contentId } from "./hashing.js"
-import { bytes16ToBigInt, crockfordDecode, WireId } from "./ids.js"
+import {
+  bytes16ToBigInt,
+  crockfordDecode,
+  decodeSessionRef,
+  encodeSessionRef,
+  WireId,
+  type SessionRef
+} from "./ids.js"
 import { MAX_GRAPH_NAME_BYTES } from "./limits.js"
 import {
   consistencyToWord,
@@ -191,6 +198,9 @@ export interface GraphQuery {
   readonly consistency: Consistency
   readonly asOf?: bigint
   readonly conversation?: string
+  /** The stream the lens conversation belongs to, set alongside
+   * `conversation` by a client that scopes its resources to a stream. */
+  readonly stream?: string
 }
 
 export function encodeGraphQuery(query: GraphQuery): Map<string, unknown> {
@@ -211,6 +221,7 @@ export function encodeGraphQuery(query: GraphQuery): Map<string, unknown> {
   if (query.consistency !== "eventual") map.set("consistency", consistencyToWord(query.consistency))
   if (query.asOf !== undefined) map.set("as_of", query.asOf)
   if (query.conversation !== undefined) map.set("conversation", query.conversation)
+  if (query.stream !== undefined) map.set("stream", query.stream)
   return map
 }
 
@@ -223,6 +234,7 @@ export function decodeGraphQuery(map: CborMap, context: string): GraphQuery {
   const consistency = field.optionalString(map, "consistency", context)
   const asOf = field.optionalU64(map, "as_of", context)
   const conversation = field.optionalString(map, "conversation", context)
+  const stream = field.optionalString(map, "stream", context)
   return {
     graph: field.requiredString(map, "graph", context),
     start: decodeGraphStart(field.requiredMap(map, "start", context), `${context}.start`),
@@ -243,7 +255,8 @@ export function decodeGraphQuery(map: CborMap, context: string): GraphQuery {
     ...(fork !== undefined ? { fork } : {}),
     consistency: consistency !== undefined ? parseConsistency(consistency, context) : "eventual",
     ...(asOf !== undefined ? { asOf } : {}),
-    ...(conversation !== undefined ? { conversation } : {})
+    ...(conversation !== undefined ? { conversation } : {}),
+    ...(stream !== undefined ? { stream } : {})
   }
 }
 
@@ -260,6 +273,9 @@ export interface GraphNeighbors {
   readonly limit: number
   readonly asOf?: bigint
   readonly conversation?: string
+  /** The stream the lens conversation belongs to, set alongside
+   * `conversation` by a client that scopes its resources to a stream. */
+  readonly stream?: string
 }
 
 export function encodeGraphNeighbors(neighbors: GraphNeighbors): Map<string, unknown> {
@@ -273,6 +289,7 @@ export function encodeGraphNeighbors(neighbors: GraphNeighbors): Map<string, unk
   map.set("limit", neighbors.limit)
   if (neighbors.asOf !== undefined) map.set("as_of", neighbors.asOf)
   if (neighbors.conversation !== undefined) map.set("conversation", neighbors.conversation)
+  if (neighbors.stream !== undefined) map.set("stream", neighbors.stream)
   return map
 }
 
@@ -281,6 +298,7 @@ export function decodeGraphNeighbors(map: CborMap, context: string): GraphNeighb
   const edgeType = field.optionalString(map, "edge_type", context)
   const asOf = field.optionalU64(map, "as_of", context)
   const conversation = field.optionalString(map, "conversation", context)
+  const stream = field.optionalString(map, "stream", context)
   return {
     graph: field.requiredString(map, "graph", context),
     node: NodeId.fromBytes(field.requiredBytes(map, "node", context)),
@@ -289,7 +307,8 @@ export function decodeGraphNeighbors(map: CborMap, context: string): GraphNeighb
     depth: field.requiredU32(map, "depth", context),
     limit: field.requiredU32(map, "limit", context),
     ...(asOf !== undefined ? { asOf } : {}),
-    ...(conversation !== undefined ? { conversation } : {})
+    ...(conversation !== undefined ? { conversation } : {}),
+    ...(stream !== undefined ? { stream } : {})
   }
 }
 
@@ -300,6 +319,7 @@ export type SourceRef =
       readonly topic: number
       readonly partition: number
       readonly offset: bigint
+      readonly generation?: bigint
       readonly conversation?: string
     }
   | { readonly kind: "kv"; readonly namespace: string; readonly key: string }
@@ -314,6 +334,7 @@ export function encodeSourceRef(source: SourceRef): Map<string, unknown> {
         ["partition", BigInt(source.partition)],
         ["offset", source.offset]
       ])
+      if (source.generation !== undefined) inner.set("generation", source.generation)
       if (source.conversation !== undefined) inner.set("conversation", source.conversation)
       return new Map([["Message", inner]])
     }
@@ -338,12 +359,14 @@ export function decodeSourceRef(value: unknown, context: string): SourceRef {
     case "Message": {
       const innerMap = expectMap(inner, context)
       const conversation = field.optionalString(innerMap, "conversation", context)
+      const generation = field.optionalU64(innerMap, "generation", context)
       return {
         kind: "message",
         stream: field.requiredU32(innerMap, "stream", context),
         topic: field.requiredU32(innerMap, "topic", context),
         partition: field.requiredU32(innerMap, "partition", context),
         offset: field.requiredU64(innerMap, "offset", context),
+        ...(generation !== undefined ? { generation } : {}),
         ...(conversation !== undefined ? { conversation } : {})
       }
     }
@@ -361,6 +384,25 @@ export function decodeSourceRef(value: unknown, context: string): SourceRef {
     }
     default:
       throw new CodecError(`\`${tag}\` is not a recognized source ref variant`, context, "source")
+  }
+}
+
+export interface ProducerInfo {
+  readonly name: string
+  readonly version: string
+}
+
+export function encodeProducer(producer: ProducerInfo): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["name", producer.name],
+    ["version", producer.version]
+  ])
+}
+
+export function decodeProducer(map: CborMap, context: string): ProducerInfo {
+  return {
+    name: field.requiredString(map, "name", context),
+    version: field.requiredString(map, "version", context)
   }
 }
 
@@ -400,6 +442,7 @@ export interface GraphNode {
   readonly attrs: readonly GraphAttr[]
   readonly embedding?: readonly number[]
   readonly source?: SourceRef
+  readonly producer?: ProducerInfo
 }
 
 export function graphNodeEntity(label: string, value: string): GraphNode {
@@ -414,6 +457,7 @@ export function encodeGraphNode(node: GraphNode): Map<string, unknown> {
   if (node.attrs.length > 0) map.set("attrs", encodeAttrs(node.attrs))
   if (node.embedding !== undefined) map.set("embedding", [...node.embedding])
   if (node.source !== undefined) map.set("source", encodeSourceRef(node.source))
+  if (node.producer !== undefined) map.set("producer", encodeProducer(node.producer))
   return map
 }
 
@@ -431,6 +475,14 @@ export function decodeGraphNode(map: CborMap, context: string): GraphNode {
     ...(embedding.length > 0 ? { embedding } : {}),
     ...(map.has("source")
       ? { source: decodeSourceRef(map.get("source"), `${context}.source`) }
+      : {}),
+    ...(map.has("producer")
+      ? {
+          producer: decodeProducer(
+            field.requiredMap(map, "producer", context),
+            `${context}.producer`
+          )
+        }
       : {})
   }
 }
@@ -463,6 +515,7 @@ export interface GraphEdge {
   readonly validFrom?: bigint
   readonly validTo?: bigint
   readonly source?: SourceRef
+  readonly producer?: ProducerInfo
 }
 
 export function graphEdgeRelate(from: GraphNode, edgeType: string, to: GraphNode): GraphEdge {
@@ -485,6 +538,11 @@ export function graphEdgeValid(edge: GraphEdge, from?: bigint, to?: bigint): Gra
   }
 }
 
+/** `edge` with the source that asserted it. The edge id is unchanged. */
+export function graphEdgeWithSource(edge: GraphEdge, source: SourceRef): GraphEdge {
+  return { ...edge, source }
+}
+
 export function graphEdgeValidAt(edge: GraphEdge, at: bigint): boolean {
   return (
     (edge.validFrom === undefined || at >= edge.validFrom) &&
@@ -503,6 +561,7 @@ export function encodeGraphEdge(edge: GraphEdge): Map<string, unknown> {
   if (edge.validFrom !== undefined) map.set("valid_from", edge.validFrom)
   if (edge.validTo !== undefined) map.set("valid_to", edge.validTo)
   if (edge.source !== undefined) map.set("source", encodeSourceRef(edge.source))
+  if (edge.producer !== undefined) map.set("producer", encodeProducer(edge.producer))
   return map
 }
 
@@ -521,6 +580,14 @@ export function decodeGraphEdge(map: CborMap, context: string): GraphEdge {
     ...(validTo !== undefined ? { validTo } : {}),
     ...(map.has("source")
       ? { source: decodeSourceRef(map.get("source"), `${context}.source`) }
+      : {}),
+    ...(map.has("producer")
+      ? {
+          producer: decodeProducer(
+            field.requiredMap(map, "producer", context),
+            `${context}.producer`
+          )
+        }
       : {})
   }
 }
@@ -610,6 +677,7 @@ export function decodeGraphResult(map: CborMap, context: string): GraphResult {
 
 export interface GraphUpsert {
   readonly graph: string
+  readonly session?: SessionRef
   readonly nodes: readonly GraphNode[]
   readonly edges: readonly GraphEdge[]
 }
@@ -618,6 +686,7 @@ export function encodeGraphUpsert(upsert: GraphUpsert): Map<string, unknown> {
   const map = new Map<string, unknown>()
   map.set("v", BigInt(GRAPH_OP_VERSION))
   map.set("graph", upsert.graph)
+  if (upsert.session !== undefined) map.set("session", encodeSessionRef(upsert.session))
   if (upsert.nodes.length > 0)
     map.set(
       "nodes",
@@ -632,8 +701,10 @@ export function encodeGraphUpsert(upsert: GraphUpsert): Map<string, unknown> {
 }
 
 export function decodeGraphUpsert(map: CborMap, context: string): GraphUpsert {
+  const session = field.optionalMap(map, "session", context)
   return {
     graph: field.requiredString(map, "graph", context),
+    ...(session !== undefined ? { session: decodeSessionRef(session, `${context}.session`) } : {}),
     nodes: field.optionalArray(map, "nodes", context, (item, index) =>
       decodeGraphNode(
         expectMap(item, `${context}.nodes[${String(index)}]`),

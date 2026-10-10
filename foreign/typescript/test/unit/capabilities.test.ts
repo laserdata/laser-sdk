@@ -20,6 +20,26 @@ import { BackendResourceId } from "../../src/wire/ids.js"
 import { feature, newBackendDescriptor, newOpVersions } from "../../src/wire/hello.js"
 import { defaultWireTopology } from "../../src/wire/topology.js"
 
+void test("given_sessions_bit_when_announced_then_should_enable_session_capability", () => {
+  assert.equal(OPEN_CAPABILITIES.sessions, false)
+  const announced = managedCapabilitiesFrom({
+    versions: { ...newOpVersions(1, 1, 1, 1), features: feature.SESSIONS },
+    backends: []
+  })
+  assert.equal(announced.sessions, true)
+  assert.equal(announced.streamTenancy, false)
+})
+
+void test("given_the_stream_tenancy_bit_when_announced_then_should_enable_stream_tenancy", () => {
+  assert.equal(OPEN_CAPABILITIES.streamTenancy, false)
+  const announced = managedCapabilitiesFrom({
+    versions: { ...newOpVersions(1, 1, 1, 1), features: feature.STREAM_TENANCY },
+    backends: []
+  })
+  assert.equal(announced.streamTenancy, true)
+  assert.equal(feature.STREAM_TENANCY, 1n << 13n)
+})
+
 void test("given_group_reads_without_an_evaluator_when_announced_then_should_preserve_catalog_and_policy_aware_consumption", () => {
   const capabilities = managedCapabilitiesFrom({
     versions: { ...newOpVersions(1, 1, 1, 1), filter: 1, features: feature.GROUP_POLICY_READS },

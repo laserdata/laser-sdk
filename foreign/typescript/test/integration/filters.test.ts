@@ -16,6 +16,14 @@ import {
 } from "../../src/client/errors.js"
 import { filterReason } from "../../src/client/error-classify.js"
 import { Laser } from "../../src/client/laser.js"
+import { Agent } from "../../src/agent/builder.js"
+import { agentMessageBody } from "../../src/agent/reliable-consumer.js"
+import { AgentTopic } from "../../src/provenance/agent-topic.js"
+import { AgentId, ConversationId } from "../../src/types/ids.js"
+import { parseAgentId } from "../../src/wire/agent.js"
+import { addresseeFilter, broadcastFilter } from "../../src/wire/dispatch.js"
+import { CorrelationId } from "../../src/wire/ids.js"
+import { AGENT_SESSIONS } from "../../src/wire/topics.js"
 import type { ConsumerMessage } from "../../src/stream/consumer.js"
 import type { ConsumerGroup } from "../../src/stream/consumer-group.js"
 import { HeaderValue } from "../../src/stream/header-value.js"
@@ -310,7 +318,6 @@ void test("given_no_catalog_when_a_group_is_created_with_a_filter_then_should_re
       context.skip("this deployment serves the group filter catalog")
       return
     }
-    assert.equal(capabilities.filters.groupPolicyReads, true)
     const topic = laser.stream(stream).topic(TOPIC)
     const group = topic.consumerGroup("anomaly-desk")
     await assert.rejects(group.create({ filter: safeModeFilter() }), UnsupportedError)
@@ -337,25 +344,32 @@ void test("given_an_unbound_group_when_consumed_then_should_deliver_every_record
     })
     try {
       const delivered: bigint[] = []
+      let last: ConsumerMessage | undefined
       for (let index = 0; index < 3; index += 1) {
         const message = await consumer.nextWithin(READ_TIMEOUT_MS)
+        last = message
         delivered.push(message.position.offset)
         await consumer.commit(message)
       }
       assert.deepEqual(delivered, [0n, 1n, 2n], "a group without a filter receives everything")
       assert.equal(consumer.lastConsumedOffset(0), 2n)
       assert.equal((await consumer.storedOffset(0))?.storedOffset, 2n)
-      await assert.rejects(
-        consumer.commit({
-          payload: new Uint8Array(),
-          id: { partitionId: 0, offset: 1n },
-          partitionId: 0,
-          offset: 1n,
-          headers: new Map()
-        } as unknown as ConsumerMessage),
-        InvalidError,
-        "only a delivered message commits"
-      )
+      assert.ok(last)
+      const explicit: ConsumerMessage = {
+        ...last,
+        id: { ...last.id, offset: 1n },
+        position: { ...last.position, offset: 1n }
+      }
+      if ((await laser.capabilities()).filters.groupPolicyReads) {
+        await assert.rejects(
+          consumer.commit(explicit),
+          InvalidError,
+          "only a delivered message commits"
+        )
+      } else {
+        await consumer.commit(explicit)
+        assert.equal((await consumer.storedOffset(0))?.storedOffset, 2n)
+      }
     } finally {
       await consumer.shutdown()
     }
@@ -556,7 +570,12 @@ void test(
 void test(
   "given_a_partition_data_connection_to_a_follower_when_authenticating_then_should_stay_on_that_node",
   { timeout: 120_000 },
-  async () => {
+  async (context) => {
+    await using laser = await Laser.connect(CONNECTION_STRING)
+    if (!(await laser.capabilities()).filters.native) {
+      context.skip("this deployment does not serve native consumer filters")
+      return
+    }
     const cluster = await TestIggyCluster.start()
     let transport: ApacheIggyTransport | undefined
     try {
@@ -765,3 +784,89 @@ void test("given_a_recreated_topic_when_a_numeric_member_rejoins_then_should_lea
     }
   })
 })
+
+// An agent on its own stream, so its role group starts unbound.
+async function withAgentStream(
+  context: TestContext,
+  run: (laser: Laser) => Promise<void>
+): Promise<void> {
+  const stream = `laser-ts-agents-${randomUUID()}`
+  const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  try {
+    if (!(await laser.capabilities()).filters.catalog) throw new NeedsCatalog()
+    await laser.stream(stream).ensure()
+    await laser.topic(AGENT_SESSIONS).ensure(1)
+    await run(laser)
+  } catch (error) {
+    if (!(error instanceof NeedsCatalog)) throw error
+    context.skip("binding a role group needs a managed plane")
+  } finally {
+    await laser
+      .stream(stream)
+      .delete()
+      .catch(() => false)
+    await laser.close()
+  }
+}
+
+void test("given_a_filtering_server_when_an_agent_spawns_on_the_session_topic_then_should_bind_its_group_to_the_addressee_filter", async (context) => {
+  await withAgentStream(context, async (laser) => {
+    const seen: string[] = []
+    const agent = Agent.builder()
+      .id(AgentId.new("triage"))
+      .listenOn(AgentTopic.Sessions)
+      .handler({
+        handle(message): Promise<void> {
+          seen.push(new TextDecoder().decode(agentMessageBody(message)))
+          return Promise.resolve()
+        }
+      })
+      .build()
+      .spawn(laser)
+    try {
+      await agent.ready()
+      const info = await laser.topic(AGENT_SESSIONS).consumerGroup("triage").info()
+      assert.deepEqual(
+        info.filter?.digest,
+        consumerFilterDigest(addresseeFilter(parseAgentId("triage"))),
+        "the role group runs the addressee filter"
+      )
+      const conversation = ConversationId.new()
+      let correlation = 0n
+      for (const [target, body] of [
+        ["triage", "mine"],
+        ["critic", "theirs"],
+        [undefined, "everyone"]
+      ] as const) {
+        correlation += 1n
+        const command = laser
+          .agdx(AgentTopic.Sessions, AgentId.new("client"), conversation)
+          .command(CorrelationId.fromU128(correlation), new TextEncoder().encode(body))
+        await (target === undefined ? command : command.withTarget(AgentId.new(target))).send()
+      }
+      const deadline = Date.now() + READ_TIMEOUT_MS
+      while (seen.length < 2 && Date.now() < deadline) await delay(20)
+      await delay(300)
+      assert.deepEqual([...seen].sort(), ["everyone", "mine"])
+    } finally {
+      await agent.shutdown()
+    }
+  })
+})
+
+void test("given_a_role_group_bound_to_another_filter_when_an_agent_spawns_then_should_refuse_to_run", async (context) => {
+  await withAgentStream(context, async (laser) => {
+    await laser.topic(AGENT_SESSIONS).consumerGroup("auditor").create({ filter: broadcastFilter() })
+    const agent = Agent.builder()
+      .id(AgentId.new("auditor"))
+      .listenOn(AgentTopic.Sessions)
+      .handler({ handle: () => Promise.resolve() })
+      .build()
+      .spawn(laser)
+    await assert.rejects(agent.join(), ConsumerGroupSetupError)
+  })
+})
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}

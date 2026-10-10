@@ -116,7 +116,7 @@ export class TestIggy {
     this.child = spawn(this.binary, [], {
       env: {
         ...process.env,
-        IGGY_PATH: this.directory,
+        IGGY_PATH: join(this.directory, "data"),
         IGGY_TCP_ADDRESS: `127.0.0.1:${String(this.port)}`,
         IGGY_HTTP_ENABLED: "false",
         IGGY_QUIC_ENABLED: "false",
@@ -311,7 +311,7 @@ export class TestIggyCluster {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...this.overrides.get(replicaId),
-      IGGY_PATH: this.directories[replicaId],
+      IGGY_PATH: join(required(this.directories[replicaId], "cluster data directory"), "data"),
       IGGY_CLUSTER_ENABLED: "true",
       IGGY_CLUSTER_NAME: "laser-sdk-rolling-restart",
       IGGY_MESSAGE_BUS_RECONNECT_PERIOD: "100ms",

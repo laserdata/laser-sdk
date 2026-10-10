@@ -14,11 +14,9 @@ import { run as runCdc } from "../src/cdc/main.js"
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
 async function withLaser<T>(name: string, run: (laser: Laser) => Promise<T>): Promise<T> {
-  await using laser = await Laser.connectWithStream(
-    CONNECTION_STRING,
-    `laser-ts-example-${name}-${randomUUID()}`
-  )
-  const stream = laser.stream(laser.defaultStream ?? "")
+  const streamName = `laser-ts-example-${name}-${randomUUID()}`
+  await using laser = await Laser.connectWithStream(CONNECTION_STRING, streamName)
+  const stream = laser.stream(streamName)
   await stream.ensure()
   try {
     return await run(laser)
@@ -68,7 +66,7 @@ void test(
   { concurrency: false },
   async () => {
     const { readings, appended } = await withLaser("log", async (laser) => {
-      const topic = laser.stream("fleet").topic("readings")
+      const topic = laser.topic("readings")
       await topic.ensure(2)
       const count = async (): Promise<bigint> => {
         const cursor = await topic.replay()

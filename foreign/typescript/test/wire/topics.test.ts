@@ -10,7 +10,7 @@ void test("given_ported_topic_names_when_compared_to_wire_src_topics_rs_then_sho
   const rustStrings = await parseRustStringConstants(TOPICS_RS)
   assert.ok(rustStrings.size > 0, `expected to parse string constants from ${TOPICS_RS}`)
 
-  const ported = Object.entries(topics)
+  const ported = Object.entries(topics).filter(([, value]) => typeof value === "string")
   assert.ok(ported.length > 0, "expected topics.ts to export at least one constant")
 
   for (const [name, value] of ported) {
@@ -24,4 +24,9 @@ void test("given_ported_topic_names_when_compared_to_wire_src_topics_rs_then_sho
     rustStrings.size,
     "topics.ts must port every constant in wire/src/topics.rs, no more and no fewer"
   )
+})
+
+void test("given_a_stream_and_an_ops_surface_when_named_then_should_scope_the_ops_topic_to_the_stream", () => {
+  assert.equal(topics.streamOpsTopic("orders", topics.CHANGES_TOPIC), "stream:orders/_agdx/changes")
+  assert.equal(topics.streamOpsTopic("orders", topics.DLQ_TOPIC), "stream:orders/_agdx/dlq")
 })

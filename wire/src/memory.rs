@@ -14,11 +14,27 @@ pub enum MemoryRecord {
         id: String,
         kind: String,
         body: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::graph::SourceRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer: Option<crate::graph::ProducerInfo>,
     },
-    /// A tombstone removing an item from recall.
-    Forget { target: String },
-    /// A feedback signal reweighting an item's recall rank.
-    Feedback { target: String, weight: f32 },
+    /// A tombstone removing an item from recall. With `conversation`, it
+    /// removes the item only when the item was remembered in that conversation.
+    Forget {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
+    /// A feedback signal reweighting an item's recall rank. With
+    /// `conversation`, it counts only for an item remembered in that
+    /// conversation.
+    Feedback {
+        target: String,
+        weight: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
+    },
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -33,13 +49,17 @@ mod tests {
                 id: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
                 kind: "fact".to_owned(),
                 body: b"auth is slow".to_vec(),
+                origin: None,
+                producer: None,
             },
             MemoryRecord::Forget {
                 target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
+                conversation: Some("01KWM3K3XEP3NP5TN850J17YBQ".to_owned()),
             },
             MemoryRecord::Feedback {
                 target: "01KWM3K3XEP3NP5TN850J17YBP".to_owned(),
                 weight: 1.5,
+                conversation: None,
             },
         ] {
             let bytes = encode_named(&record).expect("encodes");

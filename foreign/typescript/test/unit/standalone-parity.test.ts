@@ -42,21 +42,22 @@ void test("given_foreign_request_bytes_when_converted_then_should_preserve_ids_f
 void test("given_the_rust_snapshot_fixture_when_public_helpers_round_trip_then_should_keep_exact_bytes", async () => {
   const bytes = new Uint8Array(await readFile("../../wire/fixtures/fold_snapshot.bin"))
   const snapshot = decodeSnapshot(bytes)
-  assert.deepEqual(
-    [...snapshot.asOf],
-    [
-      [0, 41n],
-      [1, 9n]
-    ]
-  )
-  assert.deepEqual(encodeSnapshot(snapshot), bytes)
+  assert.deepEqual(snapshot.asOf, [
+    { topicId: 2, topicCreatedAtMicros: 20n, partitionId: 0, offset: 41n },
+    { topicId: 2, topicCreatedAtMicros: 20n, partitionId: 1, offset: 9n }
+  ])
+  assert.deepEqual(Buffer.from(encodeSnapshot(snapshot)), Buffer.from(bytes))
   assert.throws(() => decodeSnapshot(new Uint8Array([0xff])), CodecError)
 })
 
 void test("given_a_snapshot_offset_above_u64_when_decoded_then_should_reject_it", () => {
   const map = new Map<string, unknown>([
+    ["stream", "agents"],
+    ["stream_id", 0n],
+    ["stream_created_at_micros", 100n],
     ["conversation", ConversationId.fromU128(1n).toBytes()],
-    ["as_of", new Map([[0, 1n << 64n]])],
+    ["fold", "planner"],
+    ["as_of", [[2n, 20n, 0n, 1n << 64n]]],
     ["state", new Uint8Array()]
   ])
   assert.throws(() => decodeFoldSnapshot(map, "snapshot"), CodecError)

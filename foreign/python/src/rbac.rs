@@ -111,17 +111,20 @@ impl PyLaser {
         })
     }
 
-    /// List defined roles, optionally filtered by name prefix.
-    #[pyo3(signature = (name_prefix=None))]
+    /// List defined roles, optionally filtered by name prefix and by a
+    /// `search` substring, the same bounded registry browse as listing
+    /// projections.
+    #[pyo3(signature = (name_prefix=None, *, search=None))]
     fn list_roles<'py>(
         &self,
         py: Python<'py>,
         name_prefix: Option<String>,
+        search: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
         future_into_py(py, async move {
             let roles = laser
-                .list_roles(name_prefix.as_deref())
+                .list_roles(name_prefix.as_deref(), search.as_deref())
                 .await
                 .map_err(to_pyerr)?;
             Ok(roles.into_iter().map(PyRole::from).collect::<Vec<_>>())
@@ -531,6 +534,25 @@ impl PyEdgeDenial {
     #[getter]
     fn challenge(&self) -> Option<String> {
         self.inner.challenge()
+    }
+
+    /// The audience the token should have been minted for, set for
+    /// `wrong_audience`, else `None`.
+    #[getter]
+    fn expected(&self) -> Option<String> {
+        match &self.inner {
+            EdgeDenial::WrongAudience { expected } => Some(expected.clone()),
+            EdgeDenial::StepUp { .. } => None,
+        }
+    }
+
+    /// The scope the token lacks, set for `step_up`, else `None`.
+    #[getter]
+    fn required_scope(&self) -> Option<String> {
+        match &self.inner {
+            EdgeDenial::StepUp { required_scope } => Some(required_scope.clone()),
+            EdgeDenial::WrongAudience { .. } => None,
+        }
     }
 
     fn __repr__(&self) -> String {

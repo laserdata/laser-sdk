@@ -275,7 +275,7 @@ pub async fn run_reliable_evidence(
     let stream = format!("bench-reliable-{}-{seed:016x}", case.variant.label());
     let topic = laser
         .stream(&stream)
-        .topic(AgentTopic::Commands.topic_string());
+        .topic(AgentTopic::Sessions.topic_string());
     topic
         .ensure(case.partitions)
         .await
@@ -409,7 +409,7 @@ async fn start_consumer(
         });
     let builder = Agent::builder()
         .id(worker)
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .handler(RecordingHandler {
             tracker: tracker.clone(),
             mode: handler_mode,
@@ -502,7 +502,7 @@ fn reliable_operation(
             let receiver = tracker
                 .register(id, idempotency.as_ref().map(ToString::to_string))
                 .await;
-            let producer = laser.agdx(AgentTopic::Commands, source, conversation(seed, id));
+            let producer = laser.agdx(AgentTopic::Sessions, source, conversation(seed, id));
             let mut request =
                 producer.command(correlation(seed, id), record_payload(&payload, id)?);
             if let Some(key) = idempotency {

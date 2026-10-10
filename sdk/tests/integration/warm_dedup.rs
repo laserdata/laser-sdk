@@ -36,7 +36,7 @@ async fn given_a_warmed_consumer_when_a_duplicate_arrives_after_restart_then_sho
     // First incarnation processes the original job and commits its offset.
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"first"),
             &job(conversation, "job"),
         )
@@ -45,7 +45,7 @@ async fn given_a_warmed_consumer_when_a_duplicate_arrives_after_restart_then_sho
 
     let first = Agent::builder()
         .id("warmer".parse().expect("warmer is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .warm_dedup(true)
         .handler(Counter {
             handled: handled.clone(),
@@ -66,7 +66,7 @@ async fn given_a_warmed_consumer_when_a_duplicate_arrives_after_restart_then_sho
     // While it is down, a duplicate of the original arrives plus a brand-new job.
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"dup"),
             &job(conversation, "job"),
         )
@@ -74,7 +74,7 @@ async fn given_a_warmed_consumer_when_a_duplicate_arrives_after_restart_then_sho
         .expect("the duplicate should be sent");
     laser
         .send_agent(
-            AgentTopic::Commands,
+            AgentTopic::Sessions,
             Bytes::from_static(b"third"),
             &job(conversation, "other"),
         )
@@ -85,7 +85,7 @@ async fn given_a_warmed_consumer_when_a_duplicate_arrives_after_restart_then_sho
     // the duplicate is skipped while the fresh job is handled: total stays at 2.
     let second = Agent::builder()
         .id("warmer".parse().expect("warmer is a valid agent id"))
-        .listen_on(AgentTopic::Commands)
+        .listen_on(AgentTopic::Sessions)
         .warm_dedup(true)
         .handler(Counter {
             handled: handled.clone(),

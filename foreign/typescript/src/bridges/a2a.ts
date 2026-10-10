@@ -1,4 +1,5 @@
 import { publicErrorMessage } from "../client/error-classify.js"
+import { startChild } from "../agent/contract.js"
 import { findAgdxReply } from "../agent/replies.js"
 import { CodecError, HandlerConfigError, NoStreamError } from "../client/errors.js"
 import { INTERNAL_TRANSPORT, INTERNAL_VERIFIER } from "../client/internals.js"
@@ -20,17 +21,14 @@ import {
   type TaskState
 } from "../wire/agent.js"
 import { ContentType } from "../wire/content.js"
-import {
-  type ConversationId as WireConversationId,
-  CorrelationId,
-  type RecordId
-} from "../wire/ids.js"
+import { ConversationId as WireConversationId, CorrelationId, type RecordId } from "../wire/ids.js"
 import { bridgeHopMetadata, enterBridge } from "./hops.js"
+import { SDK_VERSION } from "../version.js"
 
 export const A2A_PROTOCOL_VERSION = "1.0"
 export const A2A_JSONRPC_BINDING = "JSONRPC"
 const A2A_APP_ERROR_CODE = -32_000
-export const SDK_VERSION = "0.6.0"
+export { SDK_VERSION }
 
 export const A2aMethod = {
   MessageSend: "SendMessage",
@@ -182,6 +180,24 @@ export function taskToJson(task: Task): unknown {
   }
 }
 
+// Raw JSON as bytes or a string rides byte-identical, any other value is
+// encoded as JSON first.
+function paramsBytes(paramsJson: unknown): Uint8Array {
+  return paramsJson instanceof Uint8Array
+    ? paramsJson.slice()
+    : typeof paramsJson === "string"
+      ? new TextEncoder().encode(paramsJson)
+      : jsonBytes(paramsJson, "A2A message params")
+}
+
+function submittedTask(task: ConversationId): Task {
+  return {
+    id: task.toString(),
+    status: { state: { kind: "known", name: "Submitted" } },
+    artifacts: []
+  }
+}
+
 export class A2aBridge {
   private capabilities: readonly CapabilityDescriptor[] = []
   private signingKey: SigningKey | undefined
@@ -212,27 +228,52 @@ export class A2aBridge {
   }
 
   /** Publishes the params as a task. Raw JSON as bytes or a string rides
-   * byte-identical, any other value is encoded as JSON first. */
-  async submit(paramsJson: unknown): Promise<Task> {
-    const body =
-      paramsJson instanceof Uint8Array
-        ? paramsJson.slice()
-        : typeof paramsJson === "string"
-          ? new TextEncoder().encode(paramsJson)
-          : jsonBytes(paramsJson, "A2A message params")
+   * byte-identical, any other value is encoded as JSON first. `target`
+   * addresses the task to one agent. Without it every agent on a shared
+   * session topic receives the task. */
+  async submit(paramsJson: unknown, options: { readonly target?: AgentId } = {}): Promise<Task> {
+    return this.submitAddressed(paramsJson, undefined, options.target)
+  }
+
+  /** `submit` as a child session of `parent`, in the tree rooted at `root`:
+   * the task's submitted start lands on `agent.sessions` with the ancestry
+   * before the command, and the command carries it too. The agent that
+   * handles the task ends the child. `target` addresses the task to one
+   * agent, as in `submit`. */
+  async submitIn(
+    parent: ConversationId,
+    root: ConversationId,
+    paramsJson: unknown,
+    options: { readonly target?: AgentId } = {}
+  ): Promise<Task> {
+    return this.submitAddressed(paramsJson, { parent, root }, options.target)
+  }
+
+  private async submitAddressed(
+    paramsJson: unknown,
+    ancestry: { readonly parent: ConversationId; readonly root: ConversationId } | undefined,
+    target: AgentId | undefined
+  ): Promise<Task> {
     const task = ConversationId.new()
-    await this.laser
+    if (ancestry !== undefined) {
+      await startChild(this.laser, this.source, this.source, task, ancestry.parent, ancestry.root)
+    }
+    let command = this.laser
       .agdx(this.requestTopic, this.source, task)
-      .command(correlationOf(task), body)
+      .command(correlationOf(task), paramsBytes(paramsJson))
       .withOperation(OPERATION_CHAT)
+    if (ancestry !== undefined) {
+      command = command.withAncestry(
+        WireConversationId.parse(ancestry.parent.toString()),
+        WireConversationId.parse(ancestry.root.toString())
+      )
+    }
+    if (target !== undefined) command = command.withTarget(target)
+    await command
       .withMetadata(METADATA_BRIDGE_HOPS, bridgeHopMetadata(this.hops))
       .contentType(ContentType.Json)
       .send()
-    return {
-      id: task.toString(),
-      status: { state: { kind: "known", name: "Submitted" } },
-      artifacts: []
-    }
+    return submittedTask(task)
   }
 
   async task(id: string): Promise<Task> {

@@ -294,21 +294,50 @@ void test("given_an_each_policy_when_records_are_yielded_then_should_store_each_
 })
 
 void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_should_track_them", async () => {
-  const { transport, stored, deleted } = nativeTransport([polled(0n, {})])
-  const consumer = Consumer.create(
-    transport,
-    "fleet",
-    "readings",
-    { kind: "single", partitionId: 0, name: "metrics" },
-    { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0 }
-  )
-  await consumer.storeOffset(7n)
-  assert.deepEqual(stored, [[0, 7n]])
-  assert.equal(consumer.lastStoredOffset(0), 7n)
-  await consumer.deleteOffset()
-  assert.deepEqual(deleted, [0])
-  assert.equal(consumer.lastStoredOffset(0), undefined)
-  await consumer.shutdown()
+  for (const allowReplay of [false, true]) {
+    const { transport, stored, deleted } = nativeTransport([polled(1n, {})])
+    const consumer = Consumer.create(
+      transport,
+      "fleet",
+      "readings",
+      { kind: "single", partitionId: 0, name: "metrics" },
+      { commitPolicy: { kind: "disabled" }, pollIntervalMs: 0, allowReplay }
+    )
+    const message = await consumer.nextWithin(100)
+    await consumer.storeOffset(7n)
+    await consumer.storeOffset(7n)
+    await consumer.storeOffset(3n)
+    await consumer.commit(message)
+    assert.equal(consumer.lastStoredOffset(0), allowReplay ? 1n : 7n)
+    await consumer.deleteOffset()
+    assert.deepEqual(deleted, [0])
+    assert.equal(consumer.lastStoredOffset(0), allowReplay ? 1n : 7n)
+    await consumer.storeOffset(1n)
+    await consumer.storeOffset(0n)
+    await consumer.storeOffset(2n)
+    await consumer.storeOffset(2n)
+    assert.deepEqual(
+      stored,
+      allowReplay
+        ? [
+            [0, 7n],
+            [0, 7n],
+            [0, 3n],
+            [0, 1n],
+            [0, 1n],
+            [0, 0n],
+            [0, 2n],
+            [0, 2n]
+          ]
+        : [
+            [0, 7n],
+            [0, 0n],
+            [0, 2n]
+          ]
+    )
+    assert.equal(consumer.lastStoredOffset(0), 2n)
+    await consumer.shutdown()
+  }
 })
 
 void test("given_a_returned_delivery_when_reading_again_then_should_yield_it_first", async () => {
@@ -396,7 +425,7 @@ void test("given_turns_before_the_read_window_when_assembling_then_should_read_o
   const laser = contextLaser(conversation, total)
   const open = await ContextAssembler.builder()
     .conversationId(conversation)
-    .topics(["agent.commands"])
+    .topics(["agent.sessions"])
     .policy(new LastN(100))
     .build()
     .assemble(laser)
@@ -404,10 +433,10 @@ void test("given_turns_before_the_read_window_when_assembling_then_should_read_o
     open.map((message) => decodeUtf8(message.payload)),
     [`turn-${String(total - 1)}`]
   )
-  const atStart = Checkpoint.fromJSON({ per_topic: { "agent.commands": { "0": 5 } } })
+  const atStart = Checkpoint.fromJSON({ per_topic: { "agent.sessions": { "0": 5 } } })
   const before = await ContextAssembler.builder()
     .conversationId(conversation)
-    .topics(["agent.commands"])
+    .topics(["agent.sessions"])
     .policy(new LastN(100))
     .toCheckpoint(atStart)
     .build()

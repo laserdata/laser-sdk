@@ -158,9 +158,14 @@ async def main() -> None:
         )
 
         if config.query and _common.managed_gate(caps.query.available, "query", EXAMPLE):
-            await _common.wait_for_projection(laser, indexes[0], per_org + (1 if remainder else 0))
+            populated_indexes = []
+            for org, index in enumerate(indexes):
+                expected = per_org + (1 if org < remainder else 0)
+                if expected > 0:
+                    await _common.wait_for_projection(laser, index, expected)
+                    populated_indexes.append(index)
             _common.phase("sample analytics over the firehose")
-            await run_sample_queries(laser, indexes)
+            await run_sample_queries(laser, populated_indexes)
     finally:
         await laser.close()
 

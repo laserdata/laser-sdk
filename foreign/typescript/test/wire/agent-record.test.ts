@@ -92,11 +92,20 @@ void test("given_an_agent_envelope_when_canonicalized_then_should_pin_header_typ
   assert.deepEqual(agentVersion.bytes, Uint8Array.of(1, 0, 0, 0))
   assert.equal(contentType.kind, "u8")
   assert.deepEqual(contentType.bytes, Uint8Array.of(1))
-  assert.equal(conversation.kind, "uint128")
-  assert.deepEqual(
-    conversation.bytes,
-    Uint8Array.of(2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 170, 31, 60, 144, 1)
-  )
+  assert.equal(conversation.kind, "string")
+  assert.equal(new TextDecoder().decode(conversation.bytes), envelope.conversation.toString())
   assert.equal(target.kind, "string")
   assert.equal(new TextDecoder().decode(target.bytes), "target-agent")
+})
+
+void test("given_child_session_envelope_when_canonicalized_then_should_stamp_ancestry_headers", () => {
+  const parent = ConversationId.fromU128(2n)
+  const root = ConversationId.fromU128(1n)
+  const envelope = { ...canonicalCommand(), parent, root }
+  const headers = canonicalAgentRecord(envelope, ContentType.Json).headers
+  assert.deepEqual(
+    headers.get("agdx.parent_conv")?.bytes,
+    new TextEncoder().encode(parent.toString())
+  )
+  assert.deepEqual(headers.get("agdx.root_conv")?.bytes, new TextEncoder().encode(root.toString()))
 })

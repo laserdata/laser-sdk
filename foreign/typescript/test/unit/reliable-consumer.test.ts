@@ -19,7 +19,6 @@ import {
   type ReceivedAgentMessage
 } from "../../src/agent/reliable-consumer.js"
 import {
-  AgentWorkflowExecutionError,
   AmbiguousMutationError,
   AuthzExecutionError,
   GraphExecutionError,
@@ -28,7 +27,13 @@ import {
   TransportError
 } from "../../src/client/errors.js"
 import { CancelledError } from "../../src/client/errors.js"
-import { INTERNAL_NATIVE_CONSUMER, INTERNAL_TRANSPORT } from "../../src/client/internals.js"
+import {
+  INTERNAL_COMMIT_HANDLED,
+  INTERNAL_NATIVE_CONSUMER,
+  INTERNAL_TRANSPORT
+} from "../../src/client/internals.js"
+import { OPEN_CAPABILITIES } from "../../src/client/capabilities.js"
+import { SessionConfig } from "../../src/session.js"
 import type { Laser } from "../../src/client/laser.js"
 import type { HeaderValue } from "../../src/stream/header-value.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
@@ -43,7 +48,9 @@ import {
   commandEnvelope,
   encodeAgentEnvelope,
   parseAgentId,
-  withMetadata
+  responseEnvelope,
+  withMetadata,
+  withOperation
 } from "../../src/wire/agent.js"
 import { CorrelationId, ConversationId, RecordId } from "../../src/wire/ids.js"
 import { AGENT_VERSION, CONTENT_TYPE } from "../../src/wire/headers.js"
@@ -204,10 +211,6 @@ void test("given_permanent_and_transient_errors_when_classified_then_should_retr
   assert.equal(isRetryable(new QueryExecutionError("busy", { kind: "unavailable" })), true)
   assert.equal(isRetryable(new QueryExecutionError("fault", { kind: "backend" })), false)
   assert.equal(isRetryable(new GraphExecutionError("invalid", { kind: "invalidName" })), false)
-  assert.equal(
-    isRetryable(new AgentWorkflowExecutionError("redirect", { kind: "notLeader" })),
-    true
-  )
   assert.equal(isRetryable(new AuthzExecutionError("forbidden", { kind: "unauthorized" })), false)
 })
 
@@ -256,6 +259,7 @@ void test("given_a_replayed_signed_record_when_consumed_then_should_handle_it_on
       })
     },
     commit: () => Promise.resolve(),
+    [INTERNAL_COMMIT_HANDLED]: () => Promise.resolve(),
     shutdown: () => Promise.resolve()
   } as unknown as Consumer
   const laser = {
@@ -263,7 +267,13 @@ void test("given_a_replayed_signed_record_when_consumed_then_should_handle_it_on
     topic: () => ({
       consumerGroup: () => ({ [INTERNAL_NATIVE_CONSUMER]: () => Promise.resolve(consumer) })
     }),
+    capabilities: () => Promise.resolve({ ...OPEN_CAPABILITIES, hello: "rejected" }),
+    sessions: (config?: SessionConfig) => ({
+      config: config ?? new SessionConfig(),
+      indexesSessions: () => Promise.resolve(false)
+    }),
     [INTERNAL_TRANSPORT]: () => ({
+      findTopicPartitionCount: () => Promise.resolve(undefined),
       resolveStreamTopicIds: () => Promise.resolve({ streamId: 1, topicId: 2 })
     })
   } as unknown as Laser
@@ -284,4 +294,144 @@ void test("given_a_replayed_signed_record_when_consumed_then_should_handle_it_on
     { signal: stop.signal }
   )
   assert.equal(handled, 1)
+})
+
+void test("given_records_of_every_dispatch_when_consumed_then_only_work_for_a_served_operation_should_reach_the_handler", async () => {
+  const conversation = ConversationId.fromU128(9n)
+  const caller = parseAgentId("caller")
+  const command = (record: bigint, operation: string) =>
+    withOperation(
+      commandEnvelope(
+        RecordId.fromU128(record),
+        conversation,
+        caller,
+        CorrelationId.fromU128(record),
+        new TextEncoder().encode(operation)
+      ),
+      operation
+    )
+  const envelopeHeaders = new Map<string, HeaderValue>([
+    [AGENT_VERSION, { kind: "uint32", value: AGENT_OP_VERSION }],
+    [CONTENT_TYPE, { kind: "uint8", value: contentTypeCode(ContentType.Raw) }]
+  ])
+  const sdkConversation = SdkConversationId.parse(conversation.toString())
+  const generic = (provenance: Provenance, text: string) => ({
+    payload: new TextEncoder().encode(text),
+    headers: new Map(encodeProvenanceHeaders(provenance))
+  })
+  const records = [
+    { payload: envelopePayload(command(1n, "summarize")), headers: envelopeHeaders },
+    { payload: envelopePayload(command(2n, "chat")), headers: envelopeHeaders },
+    {
+      payload: encodeNamed(
+        encodeAgentEnvelope(
+          responseEnvelope(
+            RecordId.fromU128(3n),
+            conversation,
+            caller,
+            CorrelationId.fromU128(1n),
+            new TextEncoder().encode("answer")
+          )
+        )
+      ),
+      headers: envelopeHeaders
+    },
+    generic(
+      {
+        conversationId: sdkConversation,
+        causalParent: { partitionId: 0, offset: 0n },
+        correlationId: "0:0"
+      },
+      "reply"
+    ),
+    generic({ conversationId: sdkConversation, targetAgentId: AgentId.new("other") }, "other"),
+    generic({ conversationId: sdkConversation }, "plain")
+  ]
+  const deliveries = records.map(
+    (record, offset) =>
+      ({
+        partitionId: 0,
+        position: { partitionId: 0, offset: BigInt(offset) },
+        timestampMicros: BigInt(Date.now()) * 1000n,
+        ...record
+      }) as unknown as ConsumerMessage
+  )
+  const stop = new AbortController()
+  let committed = 0
+  const consumer = {
+    nextWithin: (_waitMs: number, options?: { signal?: AbortSignal }) => {
+      const next = deliveries.shift()
+      if (next !== undefined) return Promise.resolve(next)
+      stop.abort()
+      return new Promise<ConsumerMessage>((_resolve, reject) => {
+        const abort = (): void => {
+          reject(new CancelledError("stopped"))
+        }
+        options?.signal?.addEventListener("abort", abort, { once: true })
+        if (options?.signal?.aborted === true) abort()
+      })
+    },
+    commit: () => {
+      committed += 1
+      return Promise.resolve()
+    },
+    [INTERNAL_COMMIT_HANDLED]: () => {
+      committed += 1
+      return Promise.resolve()
+    },
+    shutdown: () => Promise.resolve()
+  } as unknown as Consumer
+  const laser = {
+    defaultStream: "agents",
+    topic: () => ({
+      consumerGroup: () => ({ [INTERNAL_NATIVE_CONSUMER]: () => Promise.resolve(consumer) })
+    }),
+    capabilities: () => Promise.resolve({ ...OPEN_CAPABILITIES, hello: "rejected" }),
+    sessions: (config?: SessionConfig) => ({
+      config: config ?? new SessionConfig(),
+      indexesSessions: () => Promise.resolve(false)
+    }),
+    [INTERNAL_TRANSPORT]: () => ({
+      findTopicPartitionCount: () => Promise.resolve(undefined),
+      resolveStreamTopicIds: () => Promise.resolve({ streamId: 1, topicId: 2 })
+    })
+  } as unknown as Laser
+  const handled: string[] = []
+  await new ReliableConsumer({
+    group: ConsumerGroupName.forAgent(AgentId.new("worker")),
+    topic: "agent.sessions",
+    agent: AgentId.new("worker"),
+    operations: ["summarize"],
+    shutdownGraceMs: 100
+  }).run(
+    laser,
+    {
+      handle: (message) => {
+        handled.push(new TextDecoder().decode(agentMessageBody(message)))
+        return Promise.resolve()
+      }
+    },
+    { signal: stop.signal }
+  )
+  assert.deepEqual(handled, ["summarize", "plain"])
+  assert.equal(committed, records.length)
+})
+
+void test("given_an_enveloped_child_record_when_decoded_then_should_carry_its_parent_and_root", () => {
+  const parent = ConversationId.fromU128(11n)
+  const root = ConversationId.fromU128(12n)
+  const envelope = {
+    ...commandEnvelope(
+      RecordId.fromU128(3n),
+      ConversationId.fromU128(1n),
+      parseAgentId("orchestrator"),
+      CorrelationId.fromU128(2n),
+      new Uint8Array()
+    ),
+    parent,
+    root
+  }
+  const provenance = provenanceFromEnvelope(envelope)
+  assert.equal(provenance.parentConversationId?.toString(), parent.toString())
+  assert.equal(provenance.rootConversationId?.toString(), root.toString())
 })

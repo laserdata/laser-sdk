@@ -40,11 +40,19 @@ impl Laser {
     /// # Ok(()) }
     /// ```
     pub fn query<'a>(&'a self, index: &'a str) -> QueryRequest<'a> {
-        QueryRequest::new(self, QueryTarget::operational(index))
+        QueryRequest::new(self, QueryTarget::operational(self.resource_name(index)))
     }
 
-    /// Start a query against an explicit operational or lakehouse target.
+    /// Start a query against an explicit operational or lakehouse target. An
+    /// operational index is sent as [`resource_name`](Self::resource_name)
+    /// names it.
     pub fn query_target(&self, target: QueryTarget) -> QueryRequest<'_> {
+        let target = match target {
+            QueryTarget::Operational { index } => {
+                QueryTarget::operational(self.resource_name(&index))
+            }
+            other => other,
+        };
         QueryRequest::new(self, target)
     }
 
@@ -347,7 +355,7 @@ impl<'a> QueryRequest<'a> {
     /// with the fork's speculative rows) instead of the trunk. Open the fork with
     /// [`Laser::fork`](crate::laser::Laser::fork).
     pub fn fork(mut self, fork_id: impl Into<String>) -> Self {
-        self.query.fork = Some(fork_id.into());
+        self.query.fork = Some(self.laser.resource_name(&fork_id.into()));
         self
     }
 
@@ -407,7 +415,8 @@ impl<'a> QueryRequest<'a> {
         self
     }
 
-    /// Filter rows whose `agdx.idx.ts` (epoch micros) falls in `[start, end]`.
+    /// Filter rows whose `agdx.idx.ts` (epoch micros) falls in `[start, end]`,
+    /// both bounds inclusive.
     pub fn time_range(mut self, start: u64, end: u64) -> Self {
         self.query.time_range = Some((start, end));
         self
@@ -1109,6 +1118,31 @@ mod tests {
             laser.execute_query(query).await,
             Err(LaserError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn given_a_default_stream_when_querying_then_should_scope_the_index_and_the_fork() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_default_stream("acme");
+        let query = laser.query("readings").fork("experiment").into_query();
+        assert_eq!(
+            query.target,
+            QueryTarget::operational("stream:acme/readings")
+        );
+        assert_eq!(query.fork.as_deref(), Some("stream:acme/experiment"));
+        let explicit = laser
+            .query_target(QueryTarget::operational("readings"))
+            .into_query();
+        assert_eq!(
+            explicit.target,
+            QueryTarget::operational("stream:acme/readings")
+        );
+        let bare = laser
+            .with_resource_naming(crate::laser::ResourceNaming::Bare)
+            .query("readings")
+            .into_query()
+            .target;
+        assert_eq!(bare, QueryTarget::operational("readings"));
     }
 
     #[test]

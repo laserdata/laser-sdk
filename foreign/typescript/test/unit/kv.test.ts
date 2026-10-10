@@ -14,16 +14,20 @@ import { Laser } from "../../src/client/laser.js"
 import type { IggyClient } from "../../src/iggy/apache-iggy.js"
 import { FencedLeaseClient, LeaseCoordinator } from "../../src/managed/coordination.js"
 import { Kv } from "../../src/managed/kv.js"
+import { KvStore, type StateStore } from "../../src/state-store.js"
 import { encodeBatchReply } from "../../src/wire/batch.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
   KvCasCommand,
   KvCasFencedCommand,
   KvCopyCommand,
+  KvDeleteCommand,
   KvExpireCommand,
   KvMoveCommand,
+  KvPatchCommand,
   KvSetCommand
 } from "../../src/wire/commands.js"
+import { ConversationId as WireConversationId } from "../../src/wire/ids.js"
 import { type KvOutcome, type KvReply, decodeKvScan, encodeKvReply } from "../../src/wire/kv.js"
 import { MAX_SCAN_LIMIT, MIN_LEASE_TTL_MICROS } from "../../src/wire/limits.js"
 import { encode as encodeMessagePack } from "@msgpack/msgpack"
@@ -31,7 +35,7 @@ import { encode as encodeMessagePack } from "@msgpack/msgpack"
 // The shortest lifetime the contract will accept, and twice it for a request the
 // store can plausibly clamp down from.
 const MIN_TTL_MICROS = BigInt(MIN_LEASE_TTL_MICROS)
-const REQUESTED_TTL_MICROS = 2n * MIN_TTL_MICROS
+const REQUESTED_TTL_MS = Number(2n * MIN_TTL_MICROS) / 1000
 
 const CAPS: Capabilities = managedCapabilitiesFrom({
   versions: { query: 1, control: 1, kv: 1, fork: 1, agent: 1, graph: 1, features: 0n },
@@ -127,7 +131,7 @@ void test("given_json_and_send_when_set_is_called_then_should_encode_and_send_th
 
 void test("given_a_pinned_clock_when_ttl_is_set_then_should_encode_an_absolute_expiry", async () => {
   const { kv: store, transport } = kv("sessions", [okFrame({ kind: "written" })])
-  await store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).ttl(50n, 100n).send()
+  await store.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).ttl(0.05, 100n).send()
   assert.deepEqual(
     transport.calls[0]?.payload,
     KvSetCommand.encode({
@@ -216,7 +220,7 @@ void test("given_a_metadata_outcome_when_exists_is_called_then_should_return_it"
 
 void test("given_a_versioned_outcome_when_expire_is_called_then_should_return_the_version", async () => {
   const { kv: store } = kv("sessions", [okFrame({ kind: "versioned", version: 6n })])
-  assert.equal(await store.expire(Uint8Array.of(1), 123n), 6n)
+  assert.equal(await store.expire(Uint8Array.of(1), 123), 6n)
 })
 
 void test("given_a_versioned_outcome_when_patch_is_called_then_should_return_the_version", async () => {
@@ -236,7 +240,7 @@ void test("given_an_injected_client_when_a_laser_kv_lease_is_acquired_then_shoul
     return Promise.reject(new Error("the shared connection must not acquire leases"))
   }
   await assert.rejects(
-    laser.kv("sessions").lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS),
+    laser.kv("sessions").lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS),
     ConfigError
   )
   assert.equal(sent, 0)
@@ -258,17 +262,14 @@ void test("given_a_lease_coordinator_when_lease_is_called_then_should_validate_a
   )
   const shared = fakeTransport([])
   const store = Kv.create(shared, () => Promise.resolve(CAS_CAPS), "sessions", coordinator)
-  const lease = await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS)
-  assert.deepEqual(lease, { token: 5n, grantedTtlMicros: MIN_TTL_MICROS, position })
+  const lease = await store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS)
+  assert.deepEqual(lease, { token: 5n, grantedTtlMs: MIN_LEASE_TTL_MICROS / 1_000, position })
   assert.equal(frames.length, 1)
   assert.equal(shared.calls.length, 0, "acquisition never rides the shared connection")
-  await assert.rejects(
-    store.lease(new Uint8Array(), "worker-1", REQUESTED_TTL_MICROS),
-    InvalidError
-  )
+  await assert.rejects(store.lease(new Uint8Array(), "worker-1", REQUESTED_TTL_MS), InvalidError)
   const unadvertised = Kv.create(shared, () => Promise.resolve(CAPS), "sessions", coordinator)
   await assert.rejects(
-    unadvertised.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS),
+    unadvertised.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS),
     UnsupportedError
   )
   assert.equal(frames.length, 1)
@@ -281,14 +282,14 @@ void test("given_a_renewed_outcome_when_renew_lease_is_called_then_should_return
     [okFrame({ kind: "renewed", leaseToken: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })],
     CAS_CAPS
   )
-  const lease = await store.renewLease(Uint8Array.of(1), "worker-1", 42n, REQUESTED_TTL_MICROS)
-  assert.deepEqual(lease, { token: 42n, grantedTtlMicros: MIN_TTL_MICROS, position })
+  const lease = await store.renewLease(Uint8Array.of(1), "worker-1", 42n, REQUESTED_TTL_MS)
+  assert.deepEqual(lease, { token: 42n, grantedTtlMs: MIN_LEASE_TTL_MICROS / 1_000, position })
 })
 
 void test("given_lease_not_advertised_when_lease_is_called_then_should_reject_as_unsupported", async () => {
   const { kv: store, transport } = kv("sessions", [])
   await assert.rejects(
-    () => store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MICROS),
+    () => store.lease(Uint8Array.of(1), "worker-1", REQUESTED_TTL_MS),
     UnsupportedError
   )
   assert.equal(transport.calls.length, 0)
@@ -397,7 +398,7 @@ void test("given_a_precondition_when_send_is_called_then_should_refuse_instead_o
 
 void test("given_a_ttl_when_expire_is_called_then_should_encode_now_plus_the_ttl", async () => {
   const { kv: store, transport } = kv("config", [okFrame({ kind: "versioned", version: 2n })])
-  assert.equal(await store.expire(Uint8Array.of(1), 50n, 100n), 2n)
+  assert.equal(await store.expire(Uint8Array.of(1), 0.05, 100n), 2n)
   assert.deepEqual(
     transport.calls[0]?.payload,
     KvExpireCommand.encode({ namespace: "config", key: Uint8Array.of(1), expiresAtMicros: 150n })
@@ -424,4 +425,75 @@ void test("given_msgpack_when_set_is_sent_then_should_encode_the_value_as_messag
       value: encodeMessagePack({ log_level: "debug" }, { useBigInt64: true })
     })
   )
+})
+
+void test("given_a_session_link_when_writing_then_should_stamp_the_session_on_every_mutation", async () => {
+  const session = { stream: "agents", session: WireConversationId.fromU128(7n) }
+  const { kv: store, transport } = kv(
+    "sessions",
+    [
+      okFrame({ kind: "written" }),
+      okFrame({ kind: "committed", version: 2n }),
+      okFrame({ kind: "deleted", removed: true }),
+      okFrame({ kind: "versioned", version: 3n })
+    ],
+    CAS_CAPS
+  )
+  const linked = store.inSession(session)
+  assert.equal(store.session(), undefined)
+  assert.equal(linked.session(), session)
+  await linked.set(Uint8Array.of(1)).bytes(Uint8Array.of(2)).send()
+  await linked.set(Uint8Array.of(1)).bytes(Uint8Array.of(3)).expectAbsent().commit()
+  await linked.delete(Uint8Array.of(1))
+  await linked.patch(Uint8Array.of(1), Uint8Array.of(4))
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    KvSetCommand.encode({
+      namespace: "sessions",
+      session,
+      key: Uint8Array.of(1),
+      value: Uint8Array.of(2)
+    })
+  )
+  assert.deepEqual(
+    transport.calls[1]?.payload,
+    KvCasCommand.encode({
+      namespace: "sessions",
+      session,
+      key: Uint8Array.of(1),
+      value: Uint8Array.of(3),
+      expect: { kind: "absent" }
+    })
+  )
+  assert.deepEqual(
+    transport.calls[2]?.payload,
+    KvDeleteCommand.encode({ namespace: "sessions", session, key: Uint8Array.of(1) })
+  )
+  assert.deepEqual(
+    transport.calls[3]?.payload,
+    KvPatchCommand.encode({
+      namespace: "sessions",
+      session,
+      key: Uint8Array.of(1),
+      patch: Uint8Array.of(4)
+    })
+  )
+})
+
+void test("given_a_kv_store_when_used_as_a_state_store_then_should_read_write_without_expiry_and_delete", async () => {
+  const key = new TextEncoder().encode("cursor/agent-1")
+  const { kv: store, transport } = kv("state", [
+    okFrame({ kind: "written" }),
+    okFrame({ kind: "value", entry: { key, value: Uint8Array.of(7), version: 1n } }),
+    okFrame({ kind: "deleted", removed: true })
+  ])
+  const states: StateStore = new KvStore(store)
+  await states.set("cursor/agent-1", Uint8Array.of(7))
+  assert.deepEqual(
+    transport.calls[0]?.payload,
+    KvSetCommand.encode({ namespace: "state", key, value: Uint8Array.of(7) })
+  )
+  assert.deepEqual(await states.get("cursor/agent-1"), Uint8Array.of(7))
+  await states.delete("cursor/agent-1")
+  assert.equal(transport.calls.length, 3)
 })

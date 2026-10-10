@@ -11,7 +11,12 @@ import {
   parseMessageId,
   messageIdToString
 } from "../../src/types/ids.js"
-import { RecordId } from "../../src/wire/ids.js"
+import {
+  RecordId,
+  logPositionFromBytes,
+  logPositionToBytes,
+  newLogPosition
+} from "../../src/wire/ids.js"
 
 void test("given_a_conversation_id_when_round_tripped_through_a_string_then_should_be_equal", () => {
   const id = ConversationId.new()
@@ -111,4 +116,12 @@ void test("given_a_wire_id_type_when_minted_then_should_be_distinct_ulids_from_t
     }
   }
   assert.equal(MintUlid.mint(RecordId, fixed).asU128(), 1n << 80n)
+})
+
+void test("given_log_position_fields_when_built_then_should_round_trip_and_refuse_out_of_range_values", () => {
+  const position = newLogPosition(1, 2, 3, 4n)
+  assert.deepEqual(logPositionFromBytes(logPositionToBytes(position)), position)
+  assert.throws(() => newLogPosition(-1, 2, 3, 4n), InvalidError)
+  assert.throws(() => newLogPosition(1, 0x1_0000_0000, 3, 4n), InvalidError)
+  assert.throws(() => newLogPosition(1, 2, 3, -1n), InvalidError)
 })

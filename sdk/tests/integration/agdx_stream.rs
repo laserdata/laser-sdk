@@ -12,8 +12,10 @@ async fn given_a_chunk_stream_when_reassembled_from_the_log_then_should_replay_i
     // Produce a token stream as AGDX chunks (opening chunk declares the purpose).
     let mut stream = laser
         .agdx(
-            AgentTopic::LlmIo,
-            "model".parse().expect("model is a valid agent id"),
+            AgentTopic::Sessions,
+            "model"
+                .parse::<laser_sdk::types::AgentId>()
+                .expect("model is a valid agent id"),
             WireConversationId::from(conversation),
         )
         .stream(correlation, OPERATION_CHAT);
@@ -36,7 +38,7 @@ async fn given_a_chunk_stream_when_reassembled_from_the_log_then_should_replay_i
         let laser = laser.clone();
         async move {
             let events = laser
-                .reassemble_channel(conversation, AgentTopic::LlmIo, channel)
+                .reassemble_channel(conversation, AgentTopic::Sessions, channel)
                 .await
                 .ok()?;
             events

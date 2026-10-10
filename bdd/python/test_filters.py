@@ -215,6 +215,15 @@ def read_unbound_reader(world):
     async def read():
         group = world.laser.topic(TOPIC).consumer_group("unbound-readers")
         await group.create()
+        if not (await world.laser.capabilities()).filters.group_policy_reads:
+            try:
+                await group.reader(count=2, max_examined=2)
+            except ls.UnsupportedError as error:
+                assert error.surface == "filters"
+                assert error.feature == "group_policy_reads"
+                world.error = error
+                return []
+            raise AssertionError("group-aware reads must be refused")
         reader = await group.reader(count=2, max_examined=2)
         delivered = []
         try:
@@ -231,6 +240,16 @@ def read_unbound_reader(world):
             await reader.close()
 
     world.filtered = world.run(read)
+
+
+@then("the advanced reader follows the group-aware read capability")
+def advanced_reader_capability(world):
+    if world.run(world.laser.capabilities).filters.group_policy_reads:
+        assert world.filtered == [RECORDS[name] for name in FEED]
+    else:
+        assert isinstance(world.error, ls.UnsupportedError)
+        assert world.error.surface == "filters"
+        assert world.error.feature == "group_policy_reads"
 
 
 @then("it receives every original feed record")

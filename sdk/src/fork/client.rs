@@ -18,23 +18,40 @@ impl Laser {
     /// A handle to one fork by id. Cheap to create, since it borrows the connection.
     /// Open the fork with [`ForkHandle::create`], then write rows, query it
     /// (`query(...).fork(id)`), and finally [`promote`](ForkHandle::promote) or
-    /// [`squash`](ForkHandle::squash) it.
+    /// [`squash`](ForkHandle::squash) it. The id is sent as
+    /// [`resource_name`](Self::resource_name) names it.
     pub fn fork<'a>(&'a self, fork_id: impl Into<String>) -> ForkHandle<'a> {
         ForkHandle {
             laser: self,
-            fork_id: fork_id.into(),
+            fork_id: self.resource_name(&fork_id.into()),
         }
     }
 
-    /// Every open fork for the authenticated user.
+    /// Every open fork for the authenticated user. A handle that scopes its
+    /// resources to a stream lists only that stream's forks, under the ids the
+    /// caller gave them.
     pub async fn forks(&self) -> Result<Vec<ForkInfo>, LaserError> {
         match self
             .execute_fork(AGDX_FORK_LIST_CODE, &ForkList { v: FORK_OP_VERSION })
             .await?
         {
-            ForkOutcome::List(forks) => Ok(forks),
+            ForkOutcome::List(forks) => Ok(self.local_forks(forks)),
             other => Err(unexpected("list", &other)),
         }
+    }
+
+    fn local_forks(&self, forks: Vec<ForkInfo>) -> Vec<ForkInfo> {
+        forks
+            .into_iter()
+            .filter_map(|mut fork| {
+                fork.fork_id = self.local_resource_name(&fork.fork_id)?.to_owned();
+                if let Some(parent) = fork.parent.take() {
+                    let local = self.local_resource_name(&parent).map(str::to_owned);
+                    fork.parent = Some(local.unwrap_or(parent));
+                }
+                Some(fork)
+            })
+            .collect()
     }
 
     // Send one fork command over the binary connection and decode the reply.
@@ -82,8 +99,17 @@ pub struct ForkHandle<'a> {
 }
 
 impl<'a> ForkHandle<'a> {
-    /// The fork id this handle is bound to.
+    /// The fork id this handle is bound to, as the caller named it.
     pub fn id(&self) -> &str {
+        self.laser
+            .local_resource_name(&self.fork_id)
+            .unwrap_or(&self.fork_id)
+    }
+
+    /// The fork id this handle sends, scoped by the connection's
+    /// [`ResourceNaming`](crate::laser::ResourceNaming). Pass it to
+    /// `query(..).fork(..)` or any other request naming this fork.
+    pub fn resource_id(&self) -> &str {
         &self.fork_id
     }
 
@@ -151,7 +177,7 @@ impl<'a> ForkHandle<'a> {
         ForkPutRequest {
             laser: self.laser,
             fork_id: self.fork_id.clone(),
-            table: table.into(),
+            table: self.laser.resource_name(&table.into()),
             partition_id,
             offset,
             projection_id: String::new(),
@@ -190,13 +216,16 @@ impl<'a> ForkCreateRequest<'a> {
 
     /// Record this fork's parent (audit only, the fork still branches off the trunk).
     pub fn parent(mut self, parent: impl Into<String>) -> Self {
-        self.parent = Some(parent.into());
+        self.parent = Some(self.laser.resource_name(&parent.into()));
         self
     }
 
     /// Narrow a severed snapshot to these tables. Empty captures every table.
     pub fn tables(mut self, tables: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.tables = tables.into_iter().map(Into::into).collect();
+        self.tables = tables
+            .into_iter()
+            .map(|table| self.laser.resource_name(&table.into()))
+            .collect();
         self
     }
 
@@ -241,7 +270,7 @@ pub struct ForkPutRequest<'a> {
 impl<'a> ForkPutRequest<'a> {
     /// Set the projection id/version this speculative row belongs to.
     pub fn projection(mut self, id: impl Into<String>, version: u32) -> Self {
-        self.projection_id = id.into();
+        self.projection_id = self.laser.resource_name(&id.into());
         self.projection_version = version;
         self
     }
@@ -334,6 +363,48 @@ fn embedding_literal(embedding: &[f32]) -> Result<String, LaserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(fork_id: &str, parent: Option<&str>) -> ForkInfo {
+        ForkInfo {
+            fork_id: fork_id.to_owned(),
+            parent: parent.map(str::to_owned),
+            kind: ForkKind::Continuous,
+            user_id: 1,
+            status: laser_wire::fork::ForkStatus::Open,
+            created_at_micros: 0,
+            row_count: 0,
+        }
+    }
+
+    #[test]
+    fn given_a_default_stream_when_opening_a_fork_then_should_scope_its_names() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_default_stream("acme");
+        let fork = laser.fork("experiment");
+        assert_eq!(fork.resource_id(), "stream:acme/experiment");
+        assert_eq!(fork.id(), "experiment");
+        validated_fork_id(fork.resource_id()).expect("a scoped fork id is valid");
+        let create = fork.create().parent("baseline").tables(["readings"]);
+        assert_eq!(create.parent.as_deref(), Some("stream:acme/baseline"));
+        assert_eq!(create.tables, ["stream:acme/readings"]);
+        let put = fork.put_row("readings", 0, 1).projection("reading.v1", 1);
+        assert_eq!(put.table, "stream:acme/readings");
+        assert_eq!(put.projection_id, "stream:acme/reading.v1");
+    }
+
+    #[test]
+    fn given_listed_forks_when_localized_then_should_keep_only_the_own_stream() {
+        let laser = Laser::from_client(crate::iggy::prelude::IggyClient::default())
+            .with_default_stream("acme");
+        let local = laser.local_forks(vec![
+            info("stream:acme/experiment", Some("stream:acme/baseline")),
+            info("stream:other/experiment", None),
+            info("legacy", None),
+        ]);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].fork_id, "experiment");
+        assert_eq!(local[0].parent.as_deref(), Some("baseline"));
+    }
 
     #[test]
     fn given_an_over_long_or_empty_fork_id_when_validated_then_should_reject() {

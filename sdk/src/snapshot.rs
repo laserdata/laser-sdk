@@ -1,6 +1,7 @@
 use crate::error::LaserError;
 use laser_wire::framing::{decode_named, encode_named};
 pub use laser_wire::snapshot::FoldSnapshot;
+use laser_wire::validate::Validate;
 
 /// The key-value namespace [`KvSnapshotStore::new`] uses.
 #[cfg(all(feature = "agent", feature = "kv"))]
@@ -42,20 +43,26 @@ pub trait LocalSnapshotStore {
 pub struct KvSnapshotStore {
     laser: crate::laser::Laser,
     namespace: String,
+    fold: String,
 }
 
 #[cfg(all(feature = "agent", feature = "kv"))]
 impl KvSnapshotStore {
     /// A store over the default `agent.snapshots` namespace.
-    pub fn new(laser: crate::laser::Laser) -> Self {
-        Self::in_namespace(laser, DEFAULT_SNAPSHOT_NAMESPACE)
+    pub fn new(laser: crate::laser::Laser, fold: impl Into<String>) -> Self {
+        Self::in_namespace(laser, DEFAULT_SNAPSHOT_NAMESPACE, fold)
     }
 
     /// A store over `namespace`, for keeping several folds' snapshots apart.
-    pub fn in_namespace(laser: crate::laser::Laser, namespace: impl Into<String>) -> Self {
+    pub fn in_namespace(
+        laser: crate::laser::Laser,
+        namespace: impl Into<String>,
+        fold: impl Into<String>,
+    ) -> Self {
         Self {
             laser,
             namespace: namespace.into(),
+            fold: fold.into(),
         }
     }
 }
@@ -67,17 +74,28 @@ impl SnapshotStore for KvSnapshotStore {
         conversation: laser_wire::agent::ConversationId,
     ) -> Result<Option<FoldSnapshot>, LaserError> {
         let kv = self.laser.kv(&self.namespace);
-        match kv.get(conversation.to_string()).await? {
-            Some(payload) => Ok(Some(decode(&payload)?)),
+        let key = snapshot_key(self.laser.stream_required()?, conversation, &self.fold);
+        match kv.get(key).await? {
+            Some(payload) => {
+                let snapshot = decode(&payload)?;
+                if snapshot.conversation != conversation || snapshot.fold != self.fold {
+                    return Err(LaserError::Invalid(
+                        "snapshot identity does not match the store".to_owned(),
+                    ));
+                }
+                Ok(Some(snapshot))
+            }
             None => Ok(None),
         }
     }
 
     async fn save(&self, snapshot: &FoldSnapshot) -> Result<(), LaserError> {
+        validate_store_identity(self.laser.stream_required()?, &self.fold, snapshot)?;
         let payload = encode(snapshot)?;
+        let key = snapshot_key(&snapshot.stream, snapshot.conversation, &snapshot.fold);
         self.laser
             .kv(&self.namespace)
-            .set(snapshot.conversation.to_string())
+            .set(key)
             .bytes(payload)
             .send()
             .await
@@ -97,20 +115,26 @@ impl SnapshotStore for KvSnapshotStore {
 pub struct TopicSnapshotStore {
     laser: crate::laser::Laser,
     topic: String,
+    fold: String,
 }
 
 #[cfg(feature = "agent")]
 impl TopicSnapshotStore {
     /// A store over the default `agent.snapshots` topic.
-    pub fn new(laser: crate::laser::Laser) -> Self {
-        Self::on_topic(laser, DEFAULT_SNAPSHOT_TOPIC)
+    pub fn new(laser: crate::laser::Laser, fold: impl Into<String>) -> Self {
+        Self::on_topic(laser, DEFAULT_SNAPSHOT_TOPIC, fold)
     }
 
     /// A store over `topic`, for keeping several folds' snapshots apart.
-    pub fn on_topic(laser: crate::laser::Laser, topic: impl Into<String>) -> Self {
+    pub fn on_topic(
+        laser: crate::laser::Laser,
+        topic: impl Into<String>,
+        fold: impl Into<String>,
+    ) -> Self {
         Self {
             laser,
             topic: topic.into(),
+            fold: fold.into(),
         }
     }
 }
@@ -122,7 +146,8 @@ impl SnapshotStore for TopicSnapshotStore {
         conversation: laser_wire::agent::ConversationId,
     ) -> Result<Option<FoldSnapshot>, LaserError> {
         use iggy::prelude::*;
-        let stream = Identifier::named(self.laser.stream_required()?)?;
+        let stream_name = self.laser.stream_required()?.to_owned();
+        let stream = Identifier::named(&stream_name)?;
         let topic = Identifier::named(&self.topic)?;
         let consumer = Consumer::new(Identifier::named("laser-snapshot-reader")?);
         let client = self.laser.client();
@@ -130,9 +155,7 @@ impl SnapshotStore for TopicSnapshotStore {
             // No topic yet means nothing was ever saved.
             return Ok(None);
         };
-        // The partitioner owns the conversation-to-partition mapping, so every
-        // partition's tail is walked and the newest match across them wins.
-        let mut newest: Option<(u64, FoldSnapshot)> = None;
+        let mut newest: Option<((u64, u32, u64), FoldSnapshot)> = None;
         for partition in 0..crate::poll::bounded_partitions(details.partitions_count) {
             let tail = client
                 .poll_messages(
@@ -173,12 +196,19 @@ impl SnapshotStore for TopicSnapshotStore {
                     .find_map(|message| {
                         decode(&message.payload)
                             .ok()
-                            .filter(|snapshot| snapshot.conversation == conversation)
-                            .map(|snapshot| (message.header.offset, snapshot))
+                            .filter(|snapshot| {
+                                snapshot.conversation == conversation
+                                    && snapshot.fold == self.fold
+                                    && snapshot.stream == stream_name
+                            })
+                            .map(|snapshot| {
+                                (message.header.timestamp, message.header.offset, snapshot)
+                            })
                     });
-                if let Some((offset, snapshot)) = found {
-                    if newest.as_ref().is_none_or(|(best, _)| offset > *best) {
-                        newest = Some((offset, snapshot));
+                if let Some((timestamp, offset, snapshot)) = found {
+                    let position = (timestamp, partition, offset);
+                    if newest.as_ref().is_none_or(|(best, _)| position > *best) {
+                        newest = Some((position, snapshot));
                     }
                     break;
                 }
@@ -189,14 +219,20 @@ impl SnapshotStore for TopicSnapshotStore {
     }
 
     async fn save(&self, snapshot: &FoldSnapshot) -> Result<(), LaserError> {
+        validate_store_identity(self.laser.stream_required()?, &self.fold, snapshot)?;
         let payload = encode(snapshot)?;
-        let conversation = snapshot.conversation.to_string();
+        let partition_key = format!(
+            "{}:{}:{}",
+            snapshot.conversation,
+            snapshot.fold.len(),
+            snapshot.fold
+        );
         self.laser
             .topic(&self.topic)
             .send(
                 payload,
                 std::collections::BTreeMap::new(),
-                Some(&conversation),
+                Some(&partition_key),
             )
             .await
             .map(|_| ())
@@ -206,30 +242,81 @@ impl SnapshotStore for TopicSnapshotStore {
 /// Encode a fold snapshot to its canonical bytes, for storage as a key-value
 /// value or a snapshot-topic body. The inverse of [`decode`].
 pub fn encode(snapshot: &FoldSnapshot) -> Result<Vec<u8>, LaserError> {
+    snapshot
+        .validate()
+        .map_err(|error| LaserError::Invalid(error.to_string()))?;
     encode_named(snapshot).map_err(|error| LaserError::Codec(format!("encode snapshot: {error}")))
 }
 
 /// Decode a fold snapshot from stored bytes. The inverse of [`encode`].
 pub fn decode(payload: &[u8]) -> Result<FoldSnapshot, LaserError> {
-    decode_named(payload).map_err(LaserError::from)
+    let snapshot: FoldSnapshot = decode_named(payload).map_err(LaserError::from)?;
+    snapshot
+        .validate()
+        .map_err(|error| LaserError::Invalid(error.to_string()))?;
+    Ok(snapshot)
+}
+
+#[cfg(all(feature = "agent", feature = "kv"))]
+fn snapshot_key(
+    stream: &str,
+    conversation: laser_wire::agent::ConversationId,
+    fold: &str,
+) -> String {
+    format!("{}:{stream}:{conversation}:{fold}", stream.len())
+}
+
+#[cfg(feature = "agent")]
+fn validate_store_identity(
+    stream: &str,
+    fold: &str,
+    snapshot: &FoldSnapshot,
+) -> Result<(), LaserError> {
+    if snapshot.stream != stream || snapshot.fold != fold {
+        return Err(LaserError::Invalid(
+            "snapshot identity does not match the store".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use laser_wire::agent::ConversationId;
-    use std::collections::BTreeMap;
+    use laser_wire::snapshot::SnapshotOffset;
 
     #[test]
     fn given_a_snapshot_when_round_tripped_through_bytes_then_should_be_unchanged() {
         let snapshot = FoldSnapshot {
+            stream: "agents".to_owned(),
+            stream_id: 0,
+            stream_created_at_micros: 100,
             conversation: ConversationId::from_u128(7),
-            as_of: BTreeMap::from([(0, 41), (1, 9)]),
+            fold: "planner".to_owned(),
+            as_of: vec![
+                SnapshotOffset::new(2, 20, 0, 41),
+                SnapshotOffset::new(2, 20, 1, 9),
+            ],
             state: br#"{"folded":true}"#.to_vec(),
         };
         assert_eq!(
             decode(&encode(&snapshot).expect("encodes")).expect("decodes"),
             snapshot
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "agent", feature = "kv"))]
+    fn given_two_folds_in_one_conversation_when_keyed_then_should_have_distinct_keys() {
+        let conversation = ConversationId::from_u128(7);
+        assert_ne!(
+            snapshot_key("agents", conversation, "planner"),
+            snapshot_key("agents", conversation, "worker")
+        );
+        assert_ne!(
+            snapshot_key("agents", conversation, "planner"),
+            snapshot_key("other", conversation, "planner")
         );
     }
 }

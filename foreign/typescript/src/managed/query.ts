@@ -1,3 +1,5 @@
+import { millisToMicros } from "../client/duration.js"
+import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import { ConfigError, InvalidError, ProtocolError } from "../client/errors.js"
 import { saturatingAdd } from "../runtime/clock.js"
 import { mintUlidValue } from "../runtime/ulid.js"
@@ -50,7 +52,8 @@ export class QueryRequest {
     indexOrTarget: string | QueryTarget,
     execute: QueryExecutor,
     readStatus?: QueryStatusExecutor,
-    cancelExecution?: QueryStatusExecutor
+    cancelExecution?: QueryStatusExecutor,
+    private readonly scope: ResourceScope = BARE_SCOPE
   ) {
     this.execute = execute
     this.readStatus = readStatus
@@ -65,9 +68,10 @@ export class QueryRequest {
     indexOrTarget: string | QueryTarget,
     execute: QueryExecutor,
     readStatus?: QueryStatusExecutor,
-    cancelExecution?: QueryStatusExecutor
+    cancelExecution?: QueryStatusExecutor,
+    scope: ResourceScope = BARE_SCOPE
   ): QueryRequest {
-    return new QueryRequest(indexOrTarget, execute, readStatus, cancelExecution)
+    return new QueryRequest(indexOrTarget, execute, readStatus, cancelExecution, scope)
   }
 
   /** The identity shared by execution, cursor pages, status, and cancellation. */
@@ -82,13 +86,13 @@ export class QueryRequest {
     return this
   }
 
-  /** A deadline `milliseconds` from now, the relative form of
+  /** A deadline `timeoutMs` from now, the relative form of
    * `deadlineMicros`. */
-  deadline(milliseconds: number): this {
-    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+  deadline(timeoutMs: number): this {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
       throw new InvalidError("query deadline must be a non-negative finite number")
     }
-    const micros = BigInt(Math.round(Math.min(milliseconds * 1000, Number.MAX_SAFE_INTEGER)))
+    const micros = millisToMicros(Math.min(timeoutMs, Number.MAX_SAFE_INTEGER / 1000))
     return this.deadlineMicros(saturatingAdd(BigInt(Date.now()) * 1000n, micros))
   }
 
@@ -125,8 +129,10 @@ export class QueryRequest {
     return this.whereEq(CONVERSATION_FIELD, conversationId)
   }
 
+  /** Resolve against a fork's copy-on-write view. The id is sent as the
+   * connection's `resourceName` names it. */
   fork(forkId: string): this {
-    this.queryValue = { ...this.queryValue, fork: forkId }
+    this.queryValue = { ...this.queryValue, fork: this.scope.name(forkId) }
     return this
   }
 
@@ -180,6 +186,7 @@ export class QueryRequest {
     this.queryValue = { ...this.queryValue, messageType: value }
     return this
   }
+  /** Filter rows whose timestamp (epoch micros) falls in `[startMicros, endMicros]`, both bounds inclusive. */
   timeRange(startMicros: bigint, endMicros: bigint): this {
     this.queryValue = { ...this.queryValue, timeRange: [startMicros, endMicros] }
     return this

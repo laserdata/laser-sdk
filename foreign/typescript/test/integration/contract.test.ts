@@ -9,6 +9,7 @@ import { AgentId } from "../../src/types/ids.js"
 import type { AgentHandle } from "../../src/agent/builder.js"
 import { routeTo } from "../../src/agent/router.js"
 import { KeyRegistry, SigningKey } from "../../src/signing.js"
+import { TopicRetention } from "../../src/session.js"
 
 const CONNECTION_STRING = process.env["LASER_CONNECTION_STRING"] ?? "iggy:iggy@127.0.0.1:8090"
 
@@ -21,12 +22,12 @@ void test("given_a_directed_contract_when_the_agent_replies_then_should_complete
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   let handle: AgentHandle | undefined
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const worker = AgentId.new("contract-worker")
     handle = Agent.builder()
       .id(worker)
-      .listenOn(AgentTopic.Commands)
-      .respondOn(AgentTopic.Responses)
+      .listenOn(AgentTopic.Sessions)
+      .respondOn(AgentTopic.Sessions)
       .ackOnPickup()
       .pollInterval(5)
       .handler({
@@ -42,7 +43,7 @@ void test("given_a_directed_contract_when_the_agent_replies_then_should_complete
       .contract(routeTo(worker))
       .from(AgentId.new("orchestrator"))
       .payload(new TextEncoder().encode("work"))
-      .inboxRoute(fixed(AgentTopic.Commands))
+      .inboxRoute(fixed(AgentTopic.Sessions))
       .expireIfNotConsumed(1_000)
       .deadline(2_000)
       .send()
@@ -59,12 +60,12 @@ void test("given_no_consumer_when_the_pickup_expiry_elapses_then_should_report_n
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const outcome = await laser
       .contract(routeTo(AgentId.new("absent-worker")))
       .from(AgentId.new("orchestrator"))
       .payload(new TextEncoder().encode("work"))
-      .inboxRoute(fixed(AgentTopic.Commands))
+      .inboxRoute(fixed(AgentTopic.Sessions))
       .expireIfNotConsumed(80)
       .deadline(1_000)
       .send()
@@ -79,12 +80,12 @@ void test("given_a_picked_up_contract_without_a_reply_when_deadline_elapses_then
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   let handle: AgentHandle | undefined
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const worker = AgentId.new("silent-worker")
     handle = Agent.builder()
       .id(worker)
-      .listenOn(AgentTopic.Commands)
-      .respondOn(AgentTopic.Responses)
+      .listenOn(AgentTopic.Sessions)
+      .respondOn(AgentTopic.Sessions)
       .ackOnPickup()
       .pollInterval(5)
       .handler({ handle: () => Promise.resolve() })
@@ -96,7 +97,7 @@ void test("given_a_picked_up_contract_without_a_reply_when_deadline_elapses_then
       .contract(routeTo(worker))
       .from(AgentId.new("orchestrator"))
       .payload(new TextEncoder().encode("work"))
-      .inboxRoute(fixed(AgentTopic.Commands))
+      .inboxRoute(fixed(AgentTopic.Sessions))
       .expireIfNotConsumed(500)
       .deadline(150)
       .send()
@@ -112,15 +113,15 @@ void test("given_a_verified_contract_when_the_target_signs_then_should_bind_the_
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
   let handle: AgentHandle | undefined
   try {
-    await laser.bootstrap(1)
+    await laser.bootstrap(1, TopicRetention.expireAfter(86_400_000))
     const worker = AgentId.new("signed-contract-worker")
     const key = SigningKey.fromBytes(new Uint8Array(32).fill(17))
     const registry = new KeyRegistry()
     registry.enroll(worker.asStr(), key.verifyingKey())
     handle = Agent.builder()
       .id(worker)
-      .listenOn(AgentTopic.Commands)
-      .respondOn(AgentTopic.Responses)
+      .listenOn(AgentTopic.Sessions)
+      .respondOn(AgentTopic.Sessions)
       .signingKey(key)
       .pollInterval(5)
       .handler({
@@ -142,7 +143,7 @@ void test("given_a_verified_contract_when_the_target_signs_then_should_bind_the_
         .contract(routeTo(worker))
         .from(AgentId.new("orchestrator"))
         .payload(new TextEncoder().encode("work"))
-        .inboxRoute(fixed(AgentTopic.Commands))
+        .inboxRoute(fixed(AgentTopic.Sessions))
         .deadline(2_000)
         .send()
       assert.equal(outcome.kind, "completed")

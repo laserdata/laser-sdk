@@ -2,7 +2,7 @@ use crate::agent_runtime::{route_policy, static_topic, take_route_failure};
 use crate::async_bridge::{HookLoop, call_hook, future_into_py, hook_callable};
 use crate::errors::to_pyerr;
 use laser_sdk::agent::{
-    Budget, InboxRoute, OnTimeout, Router, StepContext, StepFn, Verifier, Workflow,
+    InboxRoute, OnTimeout, Router, StepContext, StepFn, Verifier, Workflow, WorkflowBudget,
 };
 use laser_sdk::laser::Laser;
 use laser_sdk::types::{AgentId, ConversationId, PrincipalId};
@@ -93,6 +93,82 @@ struct StepSpec {
     compensate: Option<Arc<Py<PyAny>>>,
 }
 
+/// A workflow's spend ceiling: tokens summed across step replies, the
+/// wall-clock time of the whole run in milliseconds, and the number of step
+/// dispatches. A dimension left unset is unbounded. Build it with
+/// `WorkflowBudget.unlimited()` or `WorkflowBudget.tokens(n)`, then chain
+/// `wall_clock(ms)` and `invocations(n)`, each returning a new budget.
+#[gen_stub_pyclass]
+#[pyclass(name = "WorkflowBudget", frozen, eq, from_py_object)]
+#[derive(Clone, Copy, PartialEq, Default)]
+pub struct PyWorkflowBudget {
+    tokens: Option<u64>,
+    wall_clock: Option<Duration>,
+    invocations: Option<u32>,
+}
+
+impl PyWorkflowBudget {
+    fn to_rust(self) -> WorkflowBudget {
+        let mut budget = match self.tokens {
+            Some(tokens) => WorkflowBudget::tokens(tokens),
+            None => WorkflowBudget::unlimited(),
+        };
+        if let Some(wall_clock) = self.wall_clock {
+            budget = budget.wall_clock(wall_clock);
+        }
+        if let Some(invocations) = self.invocations {
+            budget = budget.invocations(invocations);
+        }
+        budget
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyWorkflowBudget {
+    /// An unbounded budget (the default).
+    #[staticmethod]
+    fn unlimited() -> Self {
+        Self::default()
+    }
+
+    /// A budget capping the summed input-plus-output tokens across step
+    /// replies.
+    #[staticmethod]
+    #[pyo3(name = "tokens")]
+    fn with_tokens(tokens: u64) -> Self {
+        Self {
+            tokens: Some(tokens),
+            ..Self::default()
+        }
+    }
+
+    /// This budget with the whole run capped at `wall_clock_ms` milliseconds.
+    fn wall_clock(&self, wall_clock_ms: f64) -> PyResult<Self> {
+        Ok(Self {
+            wall_clock: Some(crate::convert::duration_ms(wall_clock_ms, "wall_clock_ms")?),
+            ..*self
+        })
+    }
+
+    /// This budget with at most `invocations` step dispatches.
+    fn invocations(&self, invocations: u32) -> Self {
+        Self {
+            invocations: Some(invocations),
+            ..*self
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "WorkflowBudget(tokens={:?}, wall_clock_ms={:?}, invocations={:?})",
+            self.tokens,
+            self.wall_clock.map(|limit| limit.as_secs_f64() * 1000.0),
+            self.invocations
+        )
+    }
+}
+
 /// A journalled directed-acyclic workflow over the coordination primitives, the
 /// Python view of the Rust engine. Declare steps with [`step`](Self::step), set a
 /// [`budget`](Self::budget), then `await wf.run()`. Each step is a
@@ -104,9 +180,8 @@ struct StepSpec {
 pub struct PyWorkflow {
     laser: Laser,
     name: String,
-    budget: Budget,
+    budget: WorkflowBudget,
     fixed_inbox: Option<String>,
-    registered: bool,
     run_id: Option<ConversationId>,
     steps: Vec<StepSpec>,
 }
@@ -116,9 +191,8 @@ impl PyWorkflow {
         Self {
             laser,
             name,
-            budget: Budget::unlimited(),
+            budget: WorkflowBudget::unlimited(),
             fixed_inbox,
-            registered: false,
             run_id: None,
             steps: Vec::new(),
         }
@@ -128,17 +202,6 @@ impl PyWorkflow {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyWorkflow {
-    /// Register the run in the managed run registry: `run()` submits it before
-    /// the first publish (converging on the run's own id), stamps the pinned
-    /// `run` metadata key on the status records the engine emits, observes a
-    /// recorded cancel intent at every step boundary (raising `CancelledError`
-    /// after compensations), and reports the terminal state. Requires the
-    /// `agent_workflow` capability, else `run()` raises `UnsupportedError`
-    /// before any publish.
-    fn registered(&mut self) {
-        self.registered = true;
-    }
-
     /// Resume an earlier run: the engine replays that run's journal and skips
     /// the steps already recorded complete, re-dispatching only the unfinished
     /// ones. Omit it to start a fresh run with its own id.
@@ -150,26 +213,10 @@ impl PyWorkflow {
         Ok(())
     }
 
-    /// Cap the workflow's spend. Any dimension left `None` is unbounded. The token
-    /// ceiling counts only the usage an AGDX reply carries, so it is advisory.
-    #[pyo3(signature = (*, tokens=None, wall_clock_ms=None, invocations=None))]
-    fn budget(
-        &mut self,
-        tokens: Option<u64>,
-        wall_clock_ms: Option<u64>,
-        invocations: Option<u32>,
-    ) {
-        let mut budget = match tokens {
-            Some(tokens) => Budget::tokens(tokens),
-            None => Budget::unlimited(),
-        };
-        if let Some(ms) = wall_clock_ms {
-            budget = budget.wall_clock(Duration::from_millis(ms));
-        }
-        if let Some(invocations) = invocations {
-            budget = budget.invocations(invocations);
-        }
-        self.budget = budget;
+    /// Cap the workflow's spend with a `WorkflowBudget`. The token ceiling
+    /// counts only the usage an AGDX reply carries, so it is advisory.
+    fn budget(&mut self, budget: PyWorkflowBudget) {
+        self.budget = budget.to_rust();
     }
 
     /// Add a step. Exactly one target is required: `to` (a named agent),
@@ -266,7 +313,10 @@ impl PyWorkflow {
     /// outputs keyed by label and the run id.
     /// The workflow name is the orchestrator identity it dispatches as, so it must
     /// be a valid agent id. A failed step runs the compensations in reverse and
-    /// raises.
+    /// raises. The run is a session whose id is the run id, and each step and
+    /// compensation is a child session of it. A cancel request on
+    /// `agent.control` stops the run at the next step boundary with
+    /// `CancelledError` after the compensations.
     fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.laser.clone();
         let name = self.name.clone();
@@ -277,15 +327,11 @@ impl PyWorkflow {
             .map(|topic| static_topic(topic).map(InboxRoute::Fixed))
             .transpose()?;
         let specs = self.steps.clone();
-        let registered = self.registered;
         let run_id = self.run_id;
         future_into_py(py, async move {
             let mut workflow = laser.workflow(&name).budget(budget);
             if let Some(route) = route {
                 workflow = workflow.inbox_route(route);
-            }
-            if registered {
-                workflow = workflow.registered();
             }
             if let Some(run_id) = run_id {
                 workflow = workflow.run_id(run_id);

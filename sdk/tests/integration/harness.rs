@@ -34,7 +34,13 @@ pub async fn laser() -> Laser {
         .await
         .expect("connect")
         .with_ops_stream(ops_stream);
-    laser.bootstrap(4).await.expect("bootstrap");
+    laser
+        .bootstrap(
+            4,
+            laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400)),
+        )
+        .await
+        .expect("bootstrap");
     laser
 }
 
@@ -53,7 +59,13 @@ pub async fn connected_laser_on(server: &TestIggy) -> Laser {
         .await
         .expect("connect")
         .with_default_stream(stream);
-    laser.bootstrap(1).await.expect("bootstrap");
+    laser
+        .bootstrap(
+            1,
+            laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(86_400)),
+        )
+        .await
+        .expect("bootstrap");
     laser
 }
 

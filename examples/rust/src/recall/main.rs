@@ -14,8 +14,15 @@ async fn main() -> Result<(), LaserError> {
     init_tracing();
     let laser = laser(&stream_for("recall"), Capabilities::OPEN).await?;
     fresh_run(&laser, &stream_for("recall"), async {
-        // Memory records ride the well-known agent topics, created once here.
-        laser.bootstrap(PARTITIONS).await?;
+        // Memory records ride `agent.memory`, created once here with the other agent topics.
+        laser
+            .bootstrap(
+                PARTITIONS,
+                laser_sdk::agent::TopicRetention::expire_after(std::time::Duration::from_secs(
+                    86_400,
+                )),
+            )
+            .await?;
         let conversation = ConversationId::new();
         let scope = MemoryScope::builder().conversation(conversation).build();
 

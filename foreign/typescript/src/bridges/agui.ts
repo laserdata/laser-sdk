@@ -1,4 +1,4 @@
-import { CodecError, InvalidError } from "../client/errors.js"
+import { InvalidError } from "../client/errors.js"
 import type { Laser } from "../client/laser.js"
 import type { AgentId, ConversationId } from "../types/ids.js"
 import {
@@ -8,10 +8,15 @@ import {
   OPERATION_STATE_SNAPSHOT,
   OPERATION_TASK,
   OPERATION_TOOL_ARGS,
-  taskStateIsTerminal,
-  type AgentEnvelope
+  type AgentEnvelope,
+  type PatchOp,
+  decodeStateDelta,
+  decodeStateSnapshot,
+  taskStateIsTerminal
 } from "../wire/agent.js"
-import { ContentType } from "../wire/content.js"
+import { decodeOne, expectMap } from "../wire/cbor.js"
+
+export { applyJsonPatch } from "../wire/json-patch.js"
 
 export type AgUiEvent =
   | { readonly type: "RUN_STARTED"; readonly threadId: string; readonly runId: string }
@@ -35,215 +40,6 @@ export type AgUiEvent =
   | { readonly type: "RUN_ERROR"; readonly message: string }
 
 type ChunkKind = "chat" | "reasoning" | "toolArgs"
-
-function jsonBytes(value: unknown, operation: string): Uint8Array {
-  try {
-    const encoded: unknown = JSON.stringify(value)
-    if (typeof encoded !== "string") throw new Error("value is not JSON serializable")
-    return new TextEncoder().encode(encoded)
-  } catch (cause) {
-    throw new CodecError(`cannot encode ${operation}`, "agui", operation, { cause })
-  }
-}
-
-function parseJson(bytes: Uint8Array, operation: string): unknown {
-  try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown
-  } catch (cause) {
-    throw new CodecError(`cannot decode ${operation}`, "agui", operation, { cause })
-  }
-}
-
-// Tokens that address an object's internals rather than its data. A patch is
-// peer-supplied, so `/__proto__/...` must never reach a property write: `in`
-// resolves it on every object and the assignment would land on
-// `Object.prototype`, polluting every object in the process.
-const FORBIDDEN_TOKENS = new Set(["__proto__", "constructor", "prototype"])
-
-function decodePointer(path: string): readonly string[] {
-  if (path === "") return []
-  if (!path.startsWith("/")) throw new InvalidError(`invalid JSON Pointer \`${path}\``)
-  return path
-    .slice(1)
-    .split("/")
-    .map((part) => {
-      if (/~(?:[^01]|$)/.test(part)) throw new InvalidError(`invalid JSON Pointer \`${path}\``)
-      const token = part.replaceAll("~1", "/").replaceAll("~0", "~")
-      if (FORBIDDEN_TOKENS.has(token)) {
-        throw new InvalidError(`JSON Patch path \`${path}\` addresses a reserved property`)
-      }
-      return token
-    })
-}
-
-function arrayIndex(token: string, length: number, allowEnd: boolean): number {
-  if (token === "-" && allowEnd) return length
-  if (!/^(?:0|[1-9][0-9]*)$/.test(token)) {
-    throw new InvalidError(`invalid JSON Patch array index \`${token}\``)
-  }
-  const index = Number(token)
-  const maximum = allowEnd ? length : length - 1
-  if (!Number.isSafeInteger(index) || index < 0 || index > maximum) {
-    throw new InvalidError(`JSON Patch array index \`${token}\` is out of bounds`)
-  }
-  return index
-}
-
-function objectOf(value: unknown, path: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new InvalidError(`JSON Patch path \`${path}\` does not address a container`)
-  }
-  return value as Record<string, unknown>
-}
-
-function parentAt(document: unknown, tokens: readonly string[], path: string): [unknown, string] {
-  if (tokens.length === 0) throw new InvalidError("the document root has no parent")
-  let current = document
-  for (const token of tokens.slice(0, -1)) {
-    if (Array.isArray(current)) {
-      current = current[arrayIndex(token, current.length, false)]
-    } else {
-      const object = objectOf(current, path)
-      if (!Object.hasOwn(object, token)) {
-        throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
-      }
-      current = object[token]
-    }
-  }
-  return [current, tokens.at(-1) ?? ""]
-}
-
-function valueAt(document: unknown, path: string): unknown {
-  const tokens = decodePointer(path)
-  let current = document
-  for (const token of tokens) {
-    if (Array.isArray(current)) current = current[arrayIndex(token, current.length, false)]
-    else {
-      const object = objectOf(current, path)
-      if (!Object.hasOwn(object, token)) {
-        throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
-      }
-      current = object[token]
-    }
-  }
-  return current
-}
-
-function addValue(document: unknown, path: string, value: unknown): unknown {
-  const tokens = decodePointer(path)
-  if (tokens.length === 0) return value
-  const [parent, token] = parentAt(document, tokens, path)
-  if (Array.isArray(parent)) parent.splice(arrayIndex(token, parent.length, true), 0, value)
-  else objectOf(parent, path)[token] = value
-  return document
-}
-
-function removeValue(
-  document: unknown,
-  path: string
-): { readonly document: unknown; readonly value: unknown } {
-  const tokens = decodePointer(path)
-  if (tokens.length === 0) return { document: null, value: document }
-  const [parent, token] = parentAt(document, tokens, path)
-  if (Array.isArray(parent)) {
-    const index = arrayIndex(token, parent.length, false)
-    const value: unknown = parent[index]
-    parent.splice(index, 1)
-    return { document, value }
-  }
-  const object = objectOf(parent, path)
-  if (!Object.hasOwn(object, token)) {
-    throw new InvalidError(`JSON Patch path \`${path}\` does not exist`)
-  }
-  const value = object[token]
-  Reflect.deleteProperty(object, token)
-  return { document, value }
-}
-
-function equalJson(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true
-  if (Array.isArray(left) && Array.isArray(right)) {
-    return (
-      left.length === right.length && left.every((value, index) => equalJson(value, right[index]))
-    )
-  }
-  if (
-    typeof left === "object" &&
-    left !== null &&
-    !Array.isArray(left) &&
-    typeof right === "object" &&
-    right !== null &&
-    !Array.isArray(right)
-  ) {
-    const a = left as Readonly<Record<string, unknown>>
-    const b = right as Readonly<Record<string, unknown>>
-    const keys = Object.keys(a)
-    return (
-      keys.length === Object.keys(b).length &&
-      keys.every((key) => Object.hasOwn(b, key) && equalJson(a[key], b[key]))
-    )
-  }
-  return false
-}
-
-function patchObject(value: unknown): Readonly<Record<string, unknown>> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new InvalidError("each JSON Patch operation must be an object")
-  }
-  return value as Readonly<Record<string, unknown>>
-}
-
-export function applyJsonPatch(document: unknown, patch: unknown): unknown {
-  if (!Array.isArray(patch)) throw new InvalidError("a JSON Patch document must be an array")
-  let result = structuredClone(document)
-  for (const raw of patch) {
-    const operation = patchObject(raw)
-    const op = operation["op"]
-    const path = operation["path"]
-    if (typeof op !== "string" || typeof path !== "string") {
-      throw new InvalidError("a JSON Patch operation requires string `op` and `path`")
-    }
-    switch (op) {
-      case "add":
-        if (!("value" in operation)) throw new InvalidError("JSON Patch add requires `value`")
-        result = addValue(result, path, structuredClone(operation["value"]))
-        break
-      case "remove":
-        result = removeValue(result, path).document
-        break
-      case "replace":
-        if (!("value" in operation)) throw new InvalidError("JSON Patch replace requires `value`")
-        valueAt(result, path)
-        result = removeValue(result, path).document
-        result = addValue(result, path, structuredClone(operation["value"]))
-        break
-      case "move": {
-        const from = operation["from"]
-        if (typeof from !== "string") throw new InvalidError("JSON Patch move requires `from`")
-        if (path.startsWith(`${from}/`))
-          throw new InvalidError("JSON Patch cannot move a value into its child")
-        const removed = removeValue(result, from)
-        result = addValue(removed.document, path, removed.value)
-        break
-      }
-      case "copy": {
-        const from = operation["from"]
-        if (typeof from !== "string") throw new InvalidError("JSON Patch copy requires `from`")
-        result = addValue(result, path, structuredClone(valueAt(result, from)))
-        break
-      }
-      case "test":
-        if (!("value" in operation)) throw new InvalidError("JSON Patch test requires `value`")
-        if (!equalJson(valueAt(result, path), operation["value"])) {
-          throw new InvalidError(`JSON Patch test failed at \`${path}\``)
-        }
-        break
-      default:
-        throw new InvalidError(`unknown JSON Patch operation \`${op}\``)
-    }
-  }
-  return result
-}
 
 function chunkKind(envelope: AgentEnvelope): ChunkKind {
   if (envelope.operation === OPERATION_REASONING) return "reasoning"
@@ -281,6 +77,13 @@ export function envelopeToAgUi(envelope: AgentEnvelope): readonly AgUiEvent[] {
     if (envelope.taskState?.kind === "known" && envelope.taskState.name === "Submitted") {
       return [{ type: "RUN_STARTED", threadId, runId }]
     }
+    if (
+      envelope.taskState?.kind === "known" &&
+      (envelope.taskState.name === "Failed" || envelope.taskState.name === "Rejected")
+    ) {
+      const detail = envelope.metadata?.get("detail")
+      return [{ type: "RUN_ERROR", message: detail?.kind === "str" ? detail.value : "task failed" }]
+    }
     if (envelope.taskState !== undefined && taskStateIsTerminal(envelope.taskState)) {
       return [{ type: "RUN_FINISHED", threadId, runId }]
     }
@@ -303,14 +106,21 @@ export function envelopeToAgUi(envelope: AgentEnvelope): readonly AgUiEvent[] {
   }
   if (envelope.kind === AgentKind.Event && envelope.operation === OPERATION_STATE_SNAPSHOT) {
     try {
-      return [{ type: "STATE_SNAPSHOT", snapshot: parseJson(envelope.body, "state snapshot") }]
+      const context = "state snapshot"
+      const snapshot = decodeStateSnapshot(
+        expectMap(decodeOne(envelope.body, context), context),
+        context
+      )
+      return [{ type: "STATE_SNAPSHOT", snapshot: snapshot.document }]
     } catch {
       return []
     }
   }
   if (envelope.kind === AgentKind.Event && envelope.operation === OPERATION_STATE_DELTA) {
     try {
-      return [{ type: "STATE_DELTA", delta: parseJson(envelope.body, "state delta") }]
+      const context = "state delta"
+      const delta = decodeStateDelta(expectMap(decodeOne(envelope.body, context), context), context)
+      return [{ type: "STATE_DELTA", delta: delta.patch }]
     } catch {
       return []
     }
@@ -334,55 +144,43 @@ export function envelopesToAgUi(envelopes: readonly AgentEnvelope[]): readonly A
   return events
 }
 
+/** Replace the session state document of `conversation` with `state`, a JSON
+ * object, then snapshot it. The state rides the session lane as one
+ * revision-guarded patch, the same records `Session.state` writes, so every
+ * reader folds one state model. */
 export async function publishStateSnapshot(
   laser: Laser,
-  topic: string,
   source: AgentId,
   conversation: ConversationId,
-  state: unknown
+  state: Readonly<Record<string, unknown>>
 ): Promise<void> {
-  await laser
-    .agdx(topic, source, conversation)
-    .emit(jsonBytes(state, "state snapshot"))
-    .withOperation(OPERATION_STATE_SNAPSHOT)
-    .contentType(ContentType.Json)
-    .send()
+  const document = laser.sessions().open(conversation).asAgent(source).state()
+  await document.replace(state)
+  await document.snapshot()
 }
 
+/** Apply `patch`, an RFC 6902 JSON Patch array, to the session state document
+ * of `conversation`. */
 export async function publishStateDelta(
   laser: Laser,
-  topic: string,
   source: AgentId,
   conversation: ConversationId,
-  patch: unknown
+  patch: readonly PatchOp[]
 ): Promise<void> {
   if (!Array.isArray(patch))
     throw new InvalidError("an AG-UI state delta must be a JSON Patch array")
-  await laser
-    .agdx(topic, source, conversation)
-    .emit(jsonBytes(patch, "state delta"))
-    .withOperation(OPERATION_STATE_DELTA)
-    .contentType(ContentType.Json)
-    .send()
+  await laser.sessions().open(conversation).asAgent(source).state().patch(patch)
 }
 
+/** The session state document of `conversation`: the fold of the retained
+ * session lane, or the managed state view when the fold is incomplete and the
+ * view is not behind it. `undefined` until a state record exists. */
 export async function reconstructState(
   laser: Laser,
-  conversation: ConversationId,
-  topic: string
+  conversation: ConversationId
 ): Promise<unknown> {
-  const messages = await laser.context(conversation).fetch([topic], Number.MAX_SAFE_INTEGER)
-  let state: unknown = undefined
-  for (const message of messages) {
-    const envelope = message.envelope
-    if (envelope?.kind !== AgentKind.Event) continue
-    if (envelope.operation === OPERATION_STATE_SNAPSHOT) {
-      state = parseJson(envelope.body, "state snapshot")
-    } else if (envelope.operation === OPERATION_STATE_DELTA && state !== undefined) {
-      state = applyJsonPatch(state, parseJson(envelope.body, "state delta"))
-    }
-  }
-  return state
+  const view = await laser.sessions().open(conversation).state().currentView()
+  return view.revision > 0n || view.complete ? view.document : undefined
 }
 
 export async function aguiEvents(

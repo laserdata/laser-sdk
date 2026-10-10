@@ -28,7 +28,7 @@ import {
 } from "../../src/wire/checkpoint.js"
 import { CheckpointRequestId, DestinationId } from "../../src/wire/ids.js"
 import {
-  AGDX_AGENT_SUBMIT_CODE,
+  AGDX_AGENT_BASE,
   AGDX_BATCH_CODE,
   AGDX_CHECKPOINT_CODE,
   AGDX_CONTROL_PUBLISH_CODE,
@@ -39,7 +39,14 @@ import {
   AGDX_KV_GET_CODE,
   AGDX_KV_LEASE_CODE,
   AGDX_KV_LEASE_RENEW_CODE,
-  AGDX_KV_RELEASE_CODE
+  AGDX_KV_RELEASE_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_STATE_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_CHANGES_CODE
 } from "../../src/wire/codes.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
@@ -175,7 +182,21 @@ void test("given_a_command_code_when_classified_then_should_map_to_feature_and_a
   assert.deepEqual(featureAction(AGDX_KV_CAS_FENCED_CODE), ["kv", "write"])
   assert.equal(featureAction(AGDX_HELLO_CODE), undefined)
   assert.equal(featureAction(AGDX_BATCH_CODE), undefined)
-  assert.deepEqual(featureAction(AGDX_AGENT_SUBMIT_CODE), ["agent", "write"])
+  // The retired run codes map to no feature.
+  for (let code = AGDX_AGENT_BASE; code <= AGDX_AGENT_BASE + 3; code += 1) {
+    assert.equal(featureAction(code), undefined)
+  }
+  for (const code of [
+    AGDX_SESSION_GET_CODE,
+    AGDX_SESSION_LIST_CODE,
+    AGDX_SESSION_EVENTS_CODE,
+    AGDX_SESSION_STATE_CODE,
+    AGDX_SESSION_LINKS_CODE,
+    AGDX_SESSION_SOURCES_CODE,
+    AGDX_SESSION_CHANGES_CODE
+  ]) {
+    assert.deepEqual(featureAction(code), ["session", "read"])
+  }
   assert.deepEqual(featureAction(AGDX_DESTINATION_GET_CODE), ["destination", "read"])
   assert.equal(featureAction(AGDX_CHECKPOINT_CODE), undefined)
   assert.equal(featureAction(AGDX_DESTINATION_HTTP_CODE), undefined)
@@ -199,6 +220,8 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
     "authz",
     "kv_lease",
     "kv_fence",
+    "filter",
+    "session",
     "unrecognized"
   ] as const
   const actions = ["read", "write", "delete", "admin", "unrecognized"] as const
@@ -215,6 +238,7 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
   assert.equal(actionIndex("authz", "admin"), 53)
   assert.equal(actionIndex("kv_lease", "admin"), 58)
   assert.equal(actionIndex("kv_fence", "read"), 60)
+  assert.equal(actionIndex("session", "read"), 70)
 })
 
 void test("given_a_supervisor_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {

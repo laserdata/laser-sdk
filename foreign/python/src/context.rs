@@ -10,7 +10,7 @@ use crate::memory::{
 };
 use crate::session::PyCheckpoint;
 use crate::snapshot::SnapshotHandle;
-use laser_sdk::agent::{ReplayBound, resume_offsets};
+use laser_sdk::agent::ReplayBound;
 use laser_sdk::context::{Chain, ContextMessage, ContextPolicy, LastN, RoleFilter, TokenBudget};
 use laser_sdk::laser::Laser;
 use laser_sdk::memory::{Feedback, MemoryId, MemoryScope};
@@ -61,10 +61,10 @@ impl PyContextScope {
 
 // The topics a read covers: the named ones, or the assembler's default pair
 // (commands and responses) when none were named.
-fn read_topics(topics: Option<Vec<String>>) -> PyResult<Vec<AgentTopic<'static>>> {
+pub(crate) fn read_topics(topics: Option<Vec<String>>) -> PyResult<Vec<AgentTopic<'static>>> {
     match topics {
         Some(names) => names.into_iter().map(static_topic).collect(),
-        None => Ok(vec![AgentTopic::Commands, AgentTopic::Responses]),
+        None => Ok(vec![AgentTopic::Sessions]),
     }
 }
 
@@ -93,8 +93,8 @@ impl PyContextScope {
         })
     }
 
-    /// Read this conversation's history from `topics` (default `agent.commands`
-    /// and `agent.responses`), bounded to the last `n` messages (default 50).
+    /// Read this conversation's history from `topics` (default
+    /// `agent.sessions`), bounded to the last `n` messages (default 50).
     /// `token_budget` trims the selected messages to an estimated token count,
     /// applied after `n`, so the read is bounded by turns and by prompt size at
     /// once. Use `fetch_with` for an explicit policy.
@@ -124,8 +124,7 @@ impl PyContextScope {
     }
 
     /// The last `n` messages rendered as one newline-joined text block, the
-    /// prompt-ready form. `topics` defaults to `agent.commands` and
-    /// `agent.responses`. `token_budget` trims the block to an estimated token
+    /// prompt-ready form. `topics` defaults to `agent.sessions`. `token_budget` trims the block to an estimated token
     /// count, applied after `n`.
     #[pyo3(signature = (*, topics=None, n=DEFAULT_LAST_N, token_budget=None))]
     fn block<'py>(
@@ -155,8 +154,8 @@ impl PyContextScope {
 
     /// Rebuild state by folding this conversation's messages on `topics` with
     /// `fold(state, message) -> state`, starting from `init`. Name exactly
-    /// one bound: `last_n` messages, `from_offsets` (one per-partition map
-    /// shared by every topic), `from_checkpoint` (resume after a checkpoint),
+    /// one bound: `last_n` messages, `from_offsets` (a map from topic name to
+    /// that topic's `{partition: offset}` map), `from_checkpoint` (resume after a checkpoint),
     /// `at` (stop at a checkpoint), or `full=True` (the whole partition).
     /// `last_n` looks at the newest `CONTEXT_READ_WINDOW` records of each
     /// partition, every other bound folds its whole range.
@@ -169,7 +168,7 @@ impl PyContextScope {
         init: Py<PyAny>,
         fold: Py<PyAny>,
         last_n: Option<usize>,
-        from_offsets: Option<BTreeMap<u32, u64>>,
+        from_offsets: Option<BTreeMap<String, BTreeMap<u32, u64>>>,
         from_checkpoint: Option<PyRef<'_, PyCheckpoint>>,
         at: Option<PyRef<'_, PyCheckpoint>>,
         full: bool,
@@ -215,7 +214,11 @@ impl PyContextScope {
                             ))
                         })?;
                     let seed = Python::attach(|py| json_to_py(py, &state))?;
-                    (seed, ReplayBound::FromOffsets(resume_offsets(&snapshot)))
+                    let checkpoint =
+                        laser_sdk::agent::checkpoint_from_snapshot(&laser, &snapshot, &topics)
+                            .await
+                            .map_err(to_pyerr)?;
+                    (seed, ReplayBound::FromCheckpoint(checkpoint))
                 }
                 None => (init, ReplayBound::Full),
             };
@@ -224,8 +227,8 @@ impl PyContextScope {
         })
     }
 
-    /// The current tail of `topics` (default `agent.commands` and
-    /// `agent.responses`) as a `Checkpoint`: fold up to it with `state(at=..)`
+    /// The current tail of `topics` (default `agent.sessions`) as a
+    /// `Checkpoint`: fold up to it with `state(at=..)`
     /// or resume after it with `state(from_checkpoint=..)`. Offsets are per
     /// topic partition, not per conversation.
     #[pyo3(signature = (topics=None))]
@@ -378,6 +381,24 @@ impl PyContextMessage {
         self.inner.topic.clone()
     }
 
+    /// The broker's append time in microseconds.
+    #[getter]
+    fn timestamp_micros(&self) -> u64 {
+        self.inner.timestamp_micros
+    }
+
+    /// The numeric id of the stream the message was read from.
+    #[getter]
+    fn stream_id(&self) -> u32 {
+        self.inner.stream_id
+    }
+
+    /// The numeric id of the topic the message was read from.
+    #[getter]
+    fn topic_id(&self) -> u32 {
+        self.inner.topic_id
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ContextMessage(id={}, topic={:?}, conversation_id={})",
@@ -415,7 +436,7 @@ impl PyContextScope {
 
 fn replay_bound(
     last_n: Option<usize>,
-    from_offsets: Option<BTreeMap<u32, u64>>,
+    from_offsets: Option<BTreeMap<String, BTreeMap<u32, u64>>>,
     from_checkpoint: Option<laser_sdk::context::Checkpoint>,
     at: Option<laser_sdk::context::Checkpoint>,
     full: bool,
@@ -590,6 +611,15 @@ struct CustomPolicy {
 }
 
 impl ContextPolicy for CustomPolicy {
+    fn name(&self) -> String {
+        self.attribute("name")
+            .unwrap_or_else(|| "custom".to_owned())
+    }
+
+    fn version(&self) -> String {
+        self.attribute("version").unwrap_or_else(|| "1".to_owned())
+    }
+
     fn select(&self, messages: &[ContextMessage]) -> Vec<ContextMessage> {
         let result = Python::attach(|py| {
             let messages = messages
@@ -631,6 +661,80 @@ impl ContextPolicy for CustomPolicy {
     }
 }
 
+impl CustomPolicy {
+    // A string attribute of the Python policy, such as its `name`.
+    fn attribute(&self, name: &str) -> Option<String> {
+        Python::attach(|py| {
+            self.callback
+                .bind(py)
+                .getattr(name)
+                .ok()
+                .and_then(|value| value.extract::<String>().ok())
+        })
+    }
+}
+
+// What `spec` keeps and drops of `history`, with the policy name as the reason.
+fn selection_of(
+    spec: &PolicySpec,
+    history: Vec<PyRef<'_, PyContextMessage>>,
+) -> PyResult<PySelection> {
+    let (policy, failure) = spec.clone().build();
+    let history: Vec<ContextMessage> = history
+        .iter()
+        .map(|message| message.inner.clone())
+        .collect();
+    let selection = policy.selection(&history);
+    if let Some(error) = take_failure(&failure) {
+        return Err(error);
+    }
+    Ok(PySelection {
+        kept: selection.kept,
+        dropped: selection.dropped,
+        reason: selection.reason,
+    })
+}
+
+/// What a context policy kept and dropped of a history, and the policy that
+/// decided.
+#[gen_stub_pyclass]
+#[pyclass(name = "Selection", frozen)]
+pub struct PySelection {
+    kept: Vec<ContextMessage>,
+    dropped: Vec<ContextMessage>,
+    reason: String,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PySelection {
+    /// The messages the policy kept, in log order.
+    #[getter]
+    fn kept(&self) -> Vec<PyContextMessage> {
+        self.kept
+            .iter()
+            .cloned()
+            .map(PyContextMessage::new)
+            .collect()
+    }
+
+    /// The messages the policy dropped, in log order.
+    #[getter]
+    fn dropped(&self) -> Vec<PyContextMessage> {
+        self.dropped
+            .iter()
+            .cloned()
+            .map(PyContextMessage::new)
+            .collect()
+    }
+
+    /// The policy that decided, by name.
+    #[getter]
+    fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 // Call a Python estimator. A failure is parked for the read to raise, and the
 // message is costed as unbounded so the budget keeps nothing past it.
 fn estimate(estimator: &Py<PyAny>, failure: &EstimatorFailure, message: &ContextMessage) -> usize {
@@ -661,6 +765,24 @@ pub struct PyLastN {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyLastN {
+    /// The policy name a context manifest records.
+    #[getter]
+    fn name(&self) -> String {
+        self.spec.clone().build().0.name()
+    }
+
+    /// The policy version a context manifest records.
+    #[getter]
+    fn version(&self) -> String {
+        self.spec.clone().build().0.version()
+    }
+
+    /// What this policy keeps and drops of `history`, a list of
+    /// `ContextMessage`.
+    fn selection(&self, history: Vec<PyRef<'_, PyContextMessage>>) -> PyResult<PySelection> {
+        selection_of(&self.spec, history)
+    }
+
     #[new]
     fn new(n: usize) -> Self {
         Self {
@@ -682,6 +804,24 @@ pub struct PyTokenBudget {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyTokenBudget {
+    /// The policy name a context manifest records.
+    #[getter]
+    fn name(&self) -> String {
+        self.spec.clone().build().0.name()
+    }
+
+    /// The policy version a context manifest records.
+    #[getter]
+    fn version(&self) -> String {
+        self.spec.clone().build().0.version()
+    }
+
+    /// What this policy keeps and drops of `history`, a list of
+    /// `ContextMessage`.
+    fn selection(&self, history: Vec<PyRef<'_, PyContextMessage>>) -> PyResult<PySelection> {
+        selection_of(&self.spec, history)
+    }
+
     #[new]
     #[pyo3(signature = (max_tokens, estimator=None))]
     fn new(max_tokens: usize, estimator: Option<Py<PyAny>>) -> Self {
@@ -704,6 +844,24 @@ pub struct PyRoleFilter {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyRoleFilter {
+    /// The policy name a context manifest records.
+    #[getter]
+    fn name(&self) -> String {
+        self.spec.clone().build().0.name()
+    }
+
+    /// The policy version a context manifest records.
+    #[getter]
+    fn version(&self) -> String {
+        self.spec.clone().build().0.version()
+    }
+
+    /// What this policy keeps and drops of `history`, a list of
+    /// `ContextMessage`.
+    fn selection(&self, history: Vec<PyRef<'_, PyContextMessage>>) -> PyResult<PySelection> {
+        selection_of(&self.spec, history)
+    }
+
     #[new]
     fn new(agents: Vec<String>) -> PyResult<Self> {
         let roles = agents
@@ -727,6 +885,24 @@ pub struct PyChain {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyChain {
+    /// The policy name a context manifest records.
+    #[getter]
+    fn name(&self) -> String {
+        self.spec.clone().build().0.name()
+    }
+
+    /// The policy version a context manifest records.
+    #[getter]
+    fn version(&self) -> String {
+        self.spec.clone().build().0.version()
+    }
+
+    /// What this policy keeps and drops of `history`, a list of
+    /// `ContextMessage`.
+    fn selection(&self, history: Vec<PyRef<'_, PyContextMessage>>) -> PyResult<PySelection> {
+        selection_of(&self.spec, history)
+    }
+
     #[new]
     fn new(policies: Vec<Bound<'_, PyAny>>) -> PyResult<Self> {
         let specs = policies
@@ -746,6 +922,8 @@ impl PyChain {
 pub struct PyScopedMemory {
     backend: Backend,
     conversation: ConversationId,
+    origin: Option<laser_sdk::wire::graph::SourceRef>,
+    producer: Option<laser_sdk::wire::graph::ProducerInfo>,
 }
 
 impl PyScopedMemory {
@@ -753,7 +931,19 @@ impl PyScopedMemory {
         Self {
             backend,
             conversation,
+            origin: None,
+            producer: None,
         }
+    }
+
+    pub(crate) fn lineage(
+        mut self,
+        origin: Option<laser_sdk::wire::graph::SourceRef>,
+        producer: Option<laser_sdk::wire::graph::ProducerInfo>,
+    ) -> Self {
+        self.origin = origin;
+        self.producer = producer;
+        self
     }
 
     fn scope(
@@ -820,7 +1010,7 @@ impl PyScopedMemory {
     /// Remember `payload` (str, bytes, or bytearray) in this conversation.
     /// Returns the new item's id. `kind`, `durable`, and `dedup` behave as on
     /// `Memory.remember`.
-    #[pyo3(signature = (payload, *, agent=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false))]
+    #[pyo3(signature = (payload, *, agent=None, stream=None, user=None, application=None, kind="fact", durable=false, dedup=false, origin=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
     fn remember<'py>(
         &self,
@@ -833,9 +1023,14 @@ impl PyScopedMemory {
         kind: &str,
         durable: bool,
         dedup: bool,
+        origin: Option<&Bound<'_, PyAny>>,
+        producer: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let backend = self.backend.clone();
+        let (origin, producer) = crate::memory::lineage(origin, producer)?;
         let options = RememberOptions {
+            origin: origin.or_else(|| self.origin.clone()),
+            producer: producer.or_else(|| self.producer.clone()),
             agent: parse_agent(agent)?,
             conversation: Some(self.conversation),
             stream,
@@ -926,9 +1121,9 @@ impl PyScopedMemory {
 
     /// Record feedback on the item `target`. `weight` is positive to
     /// promote, negative to demote, and `note` is an optional human note. The
-    /// id alone selects the item, so it may sit in another conversation of the
-    /// namespace. This conversation only stamps the feedback record's
-    /// provenance. Returns the feedback record's id.
+    /// feedback is limited to this conversation: it counts only when the item
+    /// was remembered here, and feedback on an item of another conversation
+    /// changes nothing. Returns the feedback record's id.
     #[pyo3(signature = (target, weight, *, note=None))]
     fn improve<'py>(
         &self,
@@ -948,9 +1143,9 @@ impl PyScopedMemory {
         })
     }
 
-    /// Forget the item `id`. The id alone selects the item, so it may sit in
-    /// another conversation of the namespace. This conversation only stamps the
-    /// tombstone's provenance.
+    /// Forget the item `id` if it was remembered in this conversation. The
+    /// tombstone is limited to this conversation, so it changes nothing for an
+    /// item of another conversation.
     fn forget<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
         let backend = self.backend.clone();
         let scope = self.scope(None, None, None, None, false)?;
@@ -971,5 +1166,35 @@ impl PyScopedMemory {
     #[getter]
     fn conversation(&self) -> String {
         self.conversation.to_string()
+    }
+
+    /// The origin stamped on every remembered item, as a dict, or None.
+    #[getter]
+    fn origin(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.origin
+            .as_ref()
+            .map(|origin| ser_to_py(py, origin))
+            .transpose()
+    }
+
+    /// The producer stamped on every remembered item, as a dict, or None.
+    #[getter]
+    fn producer(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.producer
+            .as_ref()
+            .map(|producer| ser_to_py(py, producer))
+            .transpose()
+    }
+
+    /// This scope with `origin` (a source reference dict) and `producer` (a
+    /// `{"name", "version"}` dict) stamped on every remembered item.
+    #[pyo3(signature = (origin=None, producer=None))]
+    fn with_lineage(
+        &self,
+        origin: Option<&Bound<'_, PyAny>>,
+        producer: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyScopedMemory> {
+        let (origin, producer) = crate::memory::lineage(origin, producer)?;
+        Ok(PyScopedMemory::new(self.backend.clone(), self.conversation).lineage(origin, producer))
     }
 }

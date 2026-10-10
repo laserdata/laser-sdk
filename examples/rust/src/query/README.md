@@ -1,4 +1,4 @@
-# query - the Views primitive
+# query: the Views primitive
 
 A projector turns topic records into a queryable view. This example waits for projection, then reads host readings that match a filter.
 

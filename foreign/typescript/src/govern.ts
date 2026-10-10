@@ -1,13 +1,16 @@
+import { millis, millisToMicros } from "./client/duration.js"
 import { blake3 } from "@noble/hashes/blake3.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
 import {
   CodecError,
+  InvalidError,
   PolicyBlockedError,
   PolicyDeferredError,
   StepUpRequiredError,
   type LaserError
 } from "./client/errors.js"
 import { Mutex } from "./runtime/mutex.js"
+import { warn } from "./runtime/warn.js"
 import { IntentId, type ConversationId } from "./types/ids.js"
 import { decodeOne, encodeNamed, expectMap, field, type CborMap } from "./wire/cbor.js"
 
@@ -186,13 +189,12 @@ export class GovernorState {
   ) {
     const capacity = retention.capacity ?? DEFAULT_GOVERNOR_RETENTION.capacity
     const idleTtlMs = retention.idleTtlMs ?? DEFAULT_GOVERNOR_RETENTION.idleTtlMs
-    if (!Number.isSafeInteger(capacity) || capacity < 1) {
-      throw new RangeError("governor retention capacity must be a positive safe integer")
+    if (!Number.isSafeInteger(capacity) || capacity < 0) {
+      throw new InvalidError("governor retention capacity must be a non-negative safe integer")
     }
-    if (!Number.isSafeInteger(idleTtlMs) || idleTtlMs < 0) {
-      throw new RangeError("governor retention idleTtlMs must be a non-negative safe integer")
-    }
-    this.retention = { capacity, idleTtlMs }
+    millis(idleTtlMs, "governor retention idleTtlMs")
+    // A zero capacity keeps one chain, as Rust and Python clamp it.
+    this.retention = { capacity: Math.max(1, capacity), idleTtlMs }
   }
 
   async govern(
@@ -207,9 +209,16 @@ export class GovernorState {
     if (applied.recorded) {
       const key = action.conversation?.toString() ?? ""
       const emission = this.emitChained(key, action, decision, applied.outcome, emit)
-      if (this.mode === GovernorMode.Observe) await emission.catch(() => undefined)
-      else if (applied.denial === undefined) await emission
-      else await emission.catch(() => undefined)
+      if (this.mode === GovernorMode.Observe) {
+        await emission.catch((error: unknown) => {
+          warn(`policy evidence write failed (observe mode): ${errorText(error)}`)
+        })
+      } else if (applied.denial === undefined) await emission
+      else {
+        await emission.catch((error: unknown) => {
+          warn(`policy evidence write failed (denial stands): ${errorText(error)}`)
+        })
+      }
     }
     if (applied.denial !== undefined) throw applied.denial
     const payload = applied.body ?? action.payload
@@ -287,7 +296,7 @@ export class GovernorState {
   }
 
   private pruneChains(nowMicros: bigint): void {
-    const ttlMicros = BigInt(this.retention.idleTtlMs) * 1000n
+    const ttlMicros = millisToMicros(this.retention.idleTtlMs)
     for (const [key, entry] of this.chains) {
       if (entry.users === 0 && nowMicros - entry.touchedMicros >= ttlMicros) {
         this.chains.delete(key)
@@ -358,7 +367,7 @@ export class QuorumGovernor implements ActionGovernor {
    * invalid configuration blocks when evaluated. */
   constructor(private readonly policy: QuorumPolicy) {}
 
-  voter(name: string, governor: ActionGovernor, mandatory = false): this {
+  voter(name: string, governor: ActionGovernor, mandatory: boolean): this {
     this.voters.push({ name, governor, mandatory })
     return this
   }
@@ -675,4 +684,8 @@ function parseEvidenceOutcome(value: string, context: string): PolicyEvidence["o
     throw new CodecError(`\`${value}\` is not a recognized evidence outcome`, context, "outcome")
   }
   return value as PolicyEvidence["outcome"]
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

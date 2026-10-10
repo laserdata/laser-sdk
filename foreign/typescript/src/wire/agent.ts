@@ -1,18 +1,43 @@
 import { CodecError, InvalidError } from "../client/errors.js"
-import { type CborMap, expectMap, field } from "./cbor.js"
+import {
+  type CborMap,
+  decodeOne,
+  expectMap,
+  expectString,
+  expectU32,
+  expectU64,
+  field,
+  singleVariantTag
+} from "./cbor.js"
 import { ContentType } from "./content.js"
 import { ChannelId, ConversationId, CorrelationId, RecordId } from "./ids.js"
 import type { LogPosition } from "./ids.js"
 import { logPositionFromBytes, logPositionToBytes } from "./ids.js"
 import {
+  decodeProducer,
+  decodeSourceRef,
+  encodeProducer,
+  encodeSourceRef,
+  type ProducerInfo,
+  type SourceRef
+} from "./graph.js"
+import { validateNamespace } from "./kv.js"
+import { validatePortableJson } from "./json-patch.js"
+import {
   MAX_AGENT_STRING_BYTES,
   MAX_BODY_REFERENCE_BYTES,
   MAX_CARD_CAPABILITIES,
   MAX_IDEMPOTENCY_KEY_BYTES,
+  MAX_MANIFEST_FRAGMENTS,
+  MAX_MEMORY_TAGS,
+  MAX_MEMORY_TAG_BYTES,
   MAX_METADATA_ENTRIES,
   MAX_METADATA_KEY_BYTES,
   MAX_METADATA_TOTAL_BYTES,
-  MAX_METADATA_VALUE_BYTES
+  MAX_METADATA_VALUE_BYTES,
+  MAX_SESSION_LABEL_BYTES,
+  MAX_STATE_DOCUMENT_BYTES,
+  MAX_STATE_PATCH_OPS
 } from "./limits.js"
 import { type Value, decodeValue, encodeValue } from "./value.js"
 
@@ -81,6 +106,692 @@ export type TaskState =
   | { readonly kind: "known"; readonly name: keyof typeof TaskStateName }
   | { readonly kind: "unrecognized"; readonly code: number }
 
+export type SessionStatus =
+  "submitted" | "active" | "paused" | "completed" | "failed" | "canceled" | "unrecognized"
+
+export function sessionStatusFromWire(value: string): SessionStatus {
+  switch (value) {
+    case "submitted":
+    case "active":
+    case "paused":
+    case "completed":
+    case "failed":
+    case "canceled":
+      return value
+    default:
+      return "unrecognized"
+  }
+}
+
+export interface SdkInfo {
+  readonly language: string
+  readonly version: string
+}
+
+export interface Budget {
+  readonly tokens?: bigint
+  readonly costMicros?: bigint
+}
+
+export interface SessionStart {
+  readonly label?: string
+  readonly namespace?: string
+  readonly agent: AgentId
+  readonly sdk: SdkInfo
+  readonly parent?: ConversationId
+  readonly root?: ConversationId
+  readonly idleTimeoutMicros?: bigint
+  readonly budget?: Budget
+  readonly tags: readonly string[]
+}
+
+export interface SessionTransition {
+  readonly actor?: AgentId
+  readonly acknowledges?: LogPosition
+}
+
+export interface SessionEnd {
+  readonly reason?: string
+  readonly error?: AgentErrorBody
+}
+
+/** The JSON body of a `session_pause` request on `agent.control`: the agents
+ * whose acknowledgments complete the pause, frozen when the request is
+ * written. An empty set names no agent, and every agent that receives work
+ * for the session while it is paused acknowledges when it holds that work. */
+export interface SessionPauseRequest {
+  readonly participants: readonly AgentId[]
+}
+
+/** One work record an agent held while its session was paused. A
+ * `session_parked` event on the session lane carries it, and a
+ * `session_unparked` event with the same body records that the agent handled
+ * the record after the resume. */
+export interface SessionParking {
+  readonly source: SourceRef
+  readonly role: AgentId
+  readonly request: LogPosition
+}
+
+export type Fragment =
+  | {
+      readonly kind: "message"
+      readonly at: SourceRef
+      readonly tokens: number
+      readonly bytes: number
+    }
+  | {
+      readonly kind: "memory"
+      readonly id: string
+      readonly version?: bigint
+      readonly digest?: Uint8Array
+      readonly tokens: number
+      readonly bytes: number
+    }
+  | {
+      readonly kind: "kv"
+      readonly namespace: string
+      readonly key: string
+      readonly version?: bigint
+      readonly digest?: Uint8Array
+      readonly tokens: number
+      readonly bytes: number
+    }
+  | {
+      readonly kind: "state"
+      readonly key: string
+      readonly revision: bigint
+      readonly tokens: number
+      readonly bytes: number
+    }
+  | {
+      readonly kind: "summary"
+      readonly at: SourceRef
+      readonly tokens: number
+      readonly bytes: number
+    }
+
+export interface ContextManifest {
+  readonly policy: string
+  readonly policyVersion: string
+  readonly fragments: readonly Fragment[]
+  readonly tokens: bigint
+  readonly bytes: bigint
+  readonly frontier: readonly (readonly [number, number, bigint])[]
+  readonly correlation?: CorrelationId
+}
+
+export interface ContextCompaction {
+  readonly summaryAt: SourceRef
+  readonly covered: readonly (readonly [number, number, bigint, bigint])[]
+  readonly summarizer: ProducerInfo
+}
+
+export interface ContextRetrieval {
+  readonly query?: string
+  readonly items: readonly (readonly [string, number])[]
+}
+
+function encodeFragment(fragment: Fragment): Map<string, unknown> {
+  const fields = new Map<string, unknown>()
+  switch (fragment.kind) {
+    case "message":
+    case "summary":
+      fields.set("at", encodeSourceRef(fragment.at))
+      break
+    case "memory":
+      fields.set("id", fragment.id)
+      if (fragment.version !== undefined) fields.set("version", fragment.version)
+      if (fragment.digest !== undefined) {
+        if (fragment.digest.length !== 32)
+          throw new InvalidError("context fragment digest must be 32 bytes")
+        fields.set("digest", fragment.digest)
+      }
+      break
+    case "kv":
+      fields.set("namespace", fragment.namespace)
+      fields.set("key", fragment.key)
+      if (fragment.version !== undefined) fields.set("version", fragment.version)
+      if (fragment.digest !== undefined) {
+        if (fragment.digest.length !== 32)
+          throw new InvalidError("context fragment digest must be 32 bytes")
+        fields.set("digest", fragment.digest)
+      }
+      break
+    case "state":
+      fields.set("key", fragment.key)
+      fields.set("revision", fragment.revision)
+      break
+  }
+  fields.set("tokens", BigInt(fragment.tokens))
+  fields.set("bytes", BigInt(fragment.bytes))
+  const tag =
+    fragment.kind === "kv" ? "Kv" : fragment.kind.slice(0, 1).toUpperCase() + fragment.kind.slice(1)
+  return new Map([[tag, fields]])
+}
+
+function decodeFragment(raw: unknown, context: string): Fragment {
+  const [tag, inner] = singleVariantTag(raw, context)
+  const fields = expectMap(inner, context)
+  const tokens = field.requiredU32(fields, "tokens", context)
+  const bytes = field.requiredU32(fields, "bytes", context)
+  switch (tag) {
+    case "Message":
+    case "Summary":
+      return {
+        kind: tag === "Message" ? "message" : "summary",
+        at: decodeSourceRef(fields.get("at"), context),
+        tokens,
+        bytes
+      }
+    case "Memory":
+    case "Kv": {
+      const version = field.optionalU64(fields, "version", context)
+      const digest = field.optionalBytes(fields, "digest", context)
+      if (digest !== undefined && digest.length !== 32)
+        throw new CodecError("context fragment digest must be 32 bytes", context, "digest")
+      const optional = {
+        ...(version !== undefined ? { version } : {}),
+        ...(digest !== undefined ? { digest } : {})
+      }
+      return tag === "Memory"
+        ? {
+            kind: "memory",
+            id: field.requiredString(fields, "id", context),
+            tokens,
+            bytes,
+            ...optional
+          }
+        : {
+            kind: "kv",
+            namespace: field.requiredString(fields, "namespace", context),
+            key: field.requiredString(fields, "key", context),
+            tokens,
+            bytes,
+            ...optional
+          }
+    }
+    case "State":
+      return {
+        kind: "state",
+        key: field.requiredString(fields, "key", context),
+        revision: field.requiredU64(fields, "revision", context),
+        tokens,
+        bytes
+      }
+    default:
+      throw new CodecError(`unknown context fragment ${tag}`, context, "fragment")
+  }
+}
+
+export function encodeContextManifest(manifest: ContextManifest): Map<string, unknown> {
+  if (manifest.fragments.length > MAX_MANIFEST_FRAGMENTS)
+    throw new InvalidError("context manifest has too many fragments")
+  const map = new Map<string, unknown>([
+    ["policy", manifest.policy],
+    ["policy_version", manifest.policyVersion],
+    ["fragments", manifest.fragments.map(encodeFragment)],
+    ["tokens", manifest.tokens],
+    ["bytes", manifest.bytes],
+    [
+      "frontier",
+      manifest.frontier.map(([topic, partition, offset]) => [
+        BigInt(topic),
+        BigInt(partition),
+        offset
+      ])
+    ]
+  ])
+  if (manifest.correlation !== undefined) map.set("correlation", manifest.correlation.toBytes())
+  return map
+}
+
+export function decodeContextManifest(map: CborMap, context: string): ContextManifest {
+  const fragments = field.requiredArray(map, "fragments", context, (raw, index) =>
+    decodeFragment(raw, `${context}.fragments[${String(index)}]`)
+  )
+  if (fragments.length > MAX_MANIFEST_FRAGMENTS)
+    throw new CodecError("context manifest has too many fragments", context, "fragments")
+  const correlation = field.optionalBytes(map, "correlation", context)
+  return {
+    policy: field.requiredString(map, "policy", context),
+    policyVersion: field.requiredString(map, "policy_version", context),
+    fragments,
+    tokens: field.requiredU64(map, "tokens", context),
+    bytes: field.requiredU64(map, "bytes", context),
+    frontier: field.requiredArray(map, "frontier", context, (raw, index) => {
+      if (!Array.isArray(raw) || raw.length !== 3)
+        throw new CodecError("context frontier entry must have three integers", context, "frontier")
+      return [
+        expectU32(raw[0], `${context}.frontier[${String(index)}].topic`),
+        expectU32(raw[1], `${context}.frontier[${String(index)}].partition`),
+        expectU64(raw[2], `${context}.frontier[${String(index)}].offset`)
+      ] as const
+    }),
+    ...(correlation !== undefined ? { correlation: CorrelationId.fromBytes(correlation) } : {})
+  }
+}
+
+export function encodeContextCompaction(compaction: ContextCompaction): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["summary_at", encodeSourceRef(compaction.summaryAt)],
+    [
+      "covered",
+      compaction.covered.map(([topic, partition, from, to]) => [
+        BigInt(topic),
+        BigInt(partition),
+        from,
+        to
+      ])
+    ],
+    ["summarizer", encodeProducer(compaction.summarizer)]
+  ])
+}
+
+export function decodeContextCompaction(map: CborMap, context: string): ContextCompaction {
+  return {
+    summaryAt: decodeSourceRef(map.get("summary_at"), `${context}.summary_at`),
+    covered: field.requiredArray(map, "covered", context, (raw, index) => {
+      if (!Array.isArray(raw) || raw.length !== 4)
+        throw new CodecError("covered range must have four integers", context, "covered")
+      return [
+        expectU32(raw[0], `${context}.covered[${String(index)}].topic`),
+        expectU32(raw[1], `${context}.covered[${String(index)}].partition`),
+        expectU64(raw[2], `${context}.covered[${String(index)}].from`),
+        expectU64(raw[3], `${context}.covered[${String(index)}].to`)
+      ] as const
+    }),
+    summarizer: decodeProducer(
+      field.requiredMap(map, "summarizer", context),
+      `${context}.summarizer`
+    )
+  }
+}
+
+export function encodeContextRetrieval(retrieval: ContextRetrieval): Map<string, unknown> {
+  const map = new Map<string, unknown>()
+  if (retrieval.query !== undefined) map.set("query", retrieval.query)
+  map.set(
+    "items",
+    retrieval.items.map(([id, score]) => [id, score])
+  )
+  return map
+}
+
+export function decodeContextRetrieval(map: CborMap, context: string): ContextRetrieval {
+  const query = field.optionalString(map, "query", context)
+  return {
+    ...(query !== undefined ? { query } : {}),
+    items: field.requiredArray(map, "items", context, (raw, index) => {
+      if (!Array.isArray(raw) || raw.length !== 2 || typeof raw[1] !== "number")
+        throw new CodecError("retrieval item must contain an id and score", context, "items")
+      return [expectString(raw[0], `${context}.items[${String(index)}].id`), raw[1]] as const
+    })
+  }
+}
+
+export type PatchOp =
+  | { readonly op: "add" | "replace" | "test"; readonly path: string; readonly value: unknown }
+  | { readonly op: "remove"; readonly path: string }
+  | { readonly op: "move" | "copy"; readonly from: string; readonly path: string }
+
+export interface StateDelta {
+  readonly baseRevision: bigint
+  readonly patch: readonly PatchOp[]
+  readonly opId: string
+}
+
+export interface StateSnapshot {
+  readonly baseRevision: bigint
+  readonly document: unknown
+}
+
+function jsonBytes(value: unknown): number {
+  try {
+    validatePortableJson(value)
+    const json: unknown = JSON.stringify(value)
+    if (typeof json !== "string") throw new Error("value is not JSON")
+    return new TextEncoder().encode(json).length
+  } catch (error) {
+    if (error instanceof InvalidError) throw error
+    throw new InvalidError("state value must be JSON")
+  }
+}
+
+export function validateStateDelta(delta: StateDelta): void {
+  if (delta.patch.length > MAX_STATE_PATCH_OPS)
+    throw new InvalidError("state patch has too many operations")
+  if (delta.opId.length === 0) throw new InvalidError("state patch operation id must not be empty")
+  if (jsonBytes(delta.patch) > MAX_STATE_DOCUMENT_BYTES)
+    throw new InvalidError("state patch exceeds the document byte cap")
+}
+
+export function validateStateSnapshot(snapshot: StateSnapshot): void {
+  if (jsonBytes(snapshot.document) > MAX_STATE_DOCUMENT_BYTES)
+    throw new InvalidError("state document exceeds its byte cap")
+}
+
+export function jsonToCbor(value: unknown): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (Array.isArray(value)) return value.map(jsonToCbor)
+  if (typeof value === "object" && !(value instanceof Uint8Array)) {
+    return new Map(
+      Object.entries(value)
+        .sort(([left], [right]) => compareUtf8(left, right))
+        .map(([key, item]) => [key, jsonToCbor(item)])
+    )
+  }
+  throw new InvalidError("state value must be JSON")
+}
+
+function compareUtf8(left: string, right: string): number {
+  const first = textEncoder.encode(left)
+  const second = textEncoder.encode(right)
+  for (let index = 0; index < Math.min(first.length, second.length); index += 1) {
+    const difference = (first[index] ?? 0) - (second[index] ?? 0)
+    if (difference !== 0) return difference
+  }
+  return first.length - second.length
+}
+
+export function cborToJson(value: unknown, context: string): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && !Number.isSafeInteger(value))
+      throw new CodecError(
+        "state JSON integer is outside the exact number range",
+        context,
+        "document"
+      )
+    return value
+  }
+  if (typeof value === "bigint") {
+    if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER))
+      throw new CodecError(
+        "state JSON integer is outside the exact number range",
+        context,
+        "document"
+      )
+    return Number(value)
+  }
+  if (Array.isArray(value)) return value.map((item) => cborToJson(item, context))
+  if (value instanceof Map) {
+    const out = Object.create(null) as Record<string, unknown>
+    for (const [key, item] of value) {
+      if (typeof key !== "string")
+        throw new CodecError("state object key must be text", context, "document")
+      out[key] = cborToJson(item, context)
+    }
+    return out
+  }
+  throw new CodecError("state document must be JSON", context, "document")
+}
+
+function encodePatchOp(operation: PatchOp): Map<string, unknown> {
+  if (typeof operation.path !== "string")
+    throw new InvalidError("state patch path must be a string")
+  const op: unknown = operation.op
+  if (typeof op !== "string" || !["add", "remove", "replace", "move", "copy", "test"].includes(op))
+    throw new InvalidError("unknown state patch operation")
+  const map = new Map<string, unknown>([["op", operation.op]])
+  if (operation.op === "move" || operation.op === "copy") {
+    if (typeof operation.from !== "string")
+      throw new InvalidError("state patch source must be a string")
+    map.set("from", operation.from)
+  }
+  map.set("path", operation.path)
+  if (operation.op === "add" || operation.op === "replace" || operation.op === "test") {
+    if (!("value" in operation)) throw new InvalidError("state patch value is missing")
+    map.set("value", jsonToCbor(operation.value))
+  }
+  return map
+}
+
+function decodePatchOp(value: unknown, context: string): PatchOp {
+  const map = expectMap(value, context)
+  const op = field.requiredString(map, "op", context)
+  const path = field.requiredString(map, "path", context)
+  switch (op) {
+    case "add":
+    case "replace":
+    case "test":
+      if (!map.has("value")) throw new CodecError("state patch value is missing", context, "value")
+      return { op, path, value: cborToJson(map.get("value"), context) }
+    case "remove":
+      return { op, path }
+    case "move":
+    case "copy":
+      return { op, path, from: field.requiredString(map, "from", context) }
+    default:
+      throw new CodecError(`unknown state patch operation ${op}`, context, "op")
+  }
+}
+
+export function encodeStateDelta(delta: StateDelta): Map<string, unknown> {
+  validateStateDelta(delta)
+  return new Map<string, unknown>([
+    ["base_revision", delta.baseRevision],
+    ["patch", delta.patch.map(encodePatchOp)],
+    ["op_id", delta.opId]
+  ])
+}
+
+export function decodeStateDelta(map: CborMap, context: string): StateDelta {
+  const delta = {
+    baseRevision: field.requiredU64(map, "base_revision", context),
+    patch: field.requiredArray(map, "patch", context, (item, index) =>
+      decodePatchOp(item, `${context}.patch[${String(index)}]`)
+    ),
+    opId: field.requiredString(map, "op_id", context)
+  }
+  validateStateDelta(delta)
+  return delta
+}
+
+export function encodeStateSnapshot(snapshot: StateSnapshot): Map<string, unknown> {
+  validateStateSnapshot(snapshot)
+  return new Map<string, unknown>([
+    ["base_revision", snapshot.baseRevision],
+    ["document", jsonToCbor(snapshot.document)]
+  ])
+}
+
+export function decodeStateSnapshot(map: CborMap, context: string): StateSnapshot {
+  const snapshot = {
+    baseRevision: field.requiredU64(map, "base_revision", context),
+    document: cborToJson(map.get("document"), context)
+  }
+  validateStateSnapshot(snapshot)
+  return snapshot
+}
+
+export function validateSessionStart(start: SessionStart): void {
+  if (
+    start.label !== undefined &&
+    (utf8Length(start.label) > MAX_SESSION_LABEL_BYTES || /\p{Cc}/u.test(start.label))
+  )
+    throw new InvalidError("session label exceeds its cap or contains a control character")
+  if (start.namespace !== undefined) validateNamespace(start.namespace)
+  if (start.root !== undefined && start.parent === undefined)
+    throw new InvalidError("session root requires a parent")
+  if (start.tags.length > MAX_MEMORY_TAGS) throw new InvalidError("session has too many tags")
+  if (start.tags.some((tag) => utf8Length(tag) > MAX_MEMORY_TAG_BYTES))
+    throw new InvalidError("session tag exceeds its byte cap")
+}
+
+function validateStartAncestry(start: SessionStart, envelope: AgentEnvelope): void {
+  const sameParent =
+    start.parent === undefined
+      ? envelope.parent === undefined
+      : envelope.parent?.equals(start.parent) === true
+  const sameRoot =
+    start.root === undefined
+      ? envelope.root === undefined
+      : envelope.root?.equals(start.root) === true
+  if (!sameParent || !sameRoot)
+    throw new InvalidError("session ancestry must match envelope parent and root")
+}
+
+export function encodeSdkInfo(sdk: SdkInfo): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["language", sdk.language],
+    ["version", sdk.version]
+  ])
+}
+
+export function decodeSdkInfo(map: CborMap, context: string): SdkInfo {
+  return {
+    language: field.requiredString(map, "language", context),
+    version: field.requiredString(map, "version", context)
+  }
+}
+
+export function encodeBudget(budget: Budget): Map<string, unknown> {
+  const map = new Map<string, unknown>()
+  if (budget.tokens !== undefined) map.set("tokens", budget.tokens)
+  if (budget.costMicros !== undefined) map.set("cost_micros", budget.costMicros)
+  return map
+}
+
+export function decodeBudget(map: CborMap, context: string): Budget {
+  const tokens = field.optionalU64(map, "tokens", context)
+  const costMicros = field.optionalU64(map, "cost_micros", context)
+  return {
+    ...(tokens !== undefined ? { tokens } : {}),
+    ...(costMicros !== undefined ? { costMicros } : {})
+  }
+}
+
+export function encodeSessionStart(start: SessionStart): Map<string, unknown> {
+  validateSessionStart(start)
+  const map = new Map<string, unknown>()
+  if (start.label !== undefined) map.set("label", start.label)
+  if (start.namespace !== undefined) map.set("namespace", start.namespace)
+  map.set("agent", start.agent)
+  map.set("sdk", encodeSdkInfo(start.sdk))
+  if (start.parent !== undefined) map.set("parent", start.parent.toBytes())
+  if (start.root !== undefined) map.set("root", start.root.toBytes())
+  if (start.idleTimeoutMicros !== undefined) map.set("idle_timeout_micros", start.idleTimeoutMicros)
+  if (start.budget !== undefined) map.set("budget", encodeBudget(start.budget))
+  if (start.tags.length > 0) map.set("tags", [...start.tags])
+  return map
+}
+
+export function decodeSessionStart(map: CborMap, context: string): SessionStart {
+  const label = field.optionalString(map, "label", context)
+  const namespace = field.optionalString(map, "namespace", context)
+  const sdk = field.requiredMap(map, "sdk", context)
+  const parent = field.optionalBytes(map, "parent", context)
+  const root = field.optionalBytes(map, "root", context)
+  const idleTimeoutMicros = field.optionalU64(map, "idle_timeout_micros", context)
+  const budgetMap = field.optionalMap(map, "budget", context)
+  const tags = field.optionalArray(map, "tags", context, (tag, index) => {
+    if (typeof tag !== "string")
+      throw new CodecError(`session tag ${String(index)} must be a string`, context, "tags")
+    return tag
+  })
+  const start: SessionStart = {
+    ...(label !== undefined ? { label } : {}),
+    ...(namespace !== undefined ? { namespace } : {}),
+    agent: parseAgentId(field.requiredString(map, "agent", context)),
+    sdk: decodeSdkInfo(sdk, `${context}.sdk`),
+    ...(parent !== undefined ? { parent: ConversationId.fromBytes(parent) } : {}),
+    ...(root !== undefined ? { root: ConversationId.fromBytes(root) } : {}),
+    ...(idleTimeoutMicros !== undefined ? { idleTimeoutMicros } : {}),
+    ...(budgetMap !== undefined ? { budget: decodeBudget(budgetMap, `${context}.budget`) } : {}),
+    tags
+  }
+  validateSessionStart(start)
+  return start
+}
+
+export function encodeSessionTransition(transition: SessionTransition): Map<string, unknown> {
+  const map = new Map<string, unknown>()
+  if (transition.actor !== undefined) map.set("actor", transition.actor)
+  if (transition.acknowledges !== undefined)
+    map.set("acknowledges", logPositionToBytes(transition.acknowledges))
+  return map
+}
+
+export function decodeSessionTransition(map: CborMap, context: string): SessionTransition {
+  const actor = field.optionalString(map, "actor", context)
+  const acknowledges = field.optionalBytes(map, "acknowledges", context)
+  return {
+    ...(actor !== undefined ? { actor: parseAgentId(actor) } : {}),
+    ...(acknowledges !== undefined ? { acknowledges: logPositionFromBytes(acknowledges) } : {})
+  }
+}
+
+/** The JSON text of a pause request. An empty participant set is omitted. */
+export function encodeSessionPauseRequestJson(request: SessionPauseRequest): string {
+  return request.participants.length === 0
+    ? "{}"
+    : JSON.stringify({ participants: request.participants })
+}
+
+/** Read a pause request body. An empty or absent body names no participant. */
+export function decodeSessionPauseRequestJson(body: Uint8Array): SessionPauseRequest {
+  if (body.byteLength === 0) return { participants: [] }
+  let value: unknown
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body))
+  } catch (cause) {
+    throw new CodecError("invalid session pause request", "agent", "pause", { cause })
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new CodecError("a session pause request is a JSON object", "agent", "pause")
+  }
+  const participants = (value as { readonly participants?: unknown }).participants
+  if (participants === undefined) return { participants: [] }
+  if (!Array.isArray(participants) || participants.some((agent) => typeof agent !== "string")) {
+    throw new CodecError("pause participants are agent ids", "agent", "participants")
+  }
+  return { participants: (participants as string[]).map((agent) => parseAgentId(agent)) }
+}
+
+export function encodeSessionParking(parking: SessionParking): Map<string, unknown> {
+  return new Map<string, unknown>([
+    ["source", encodeSourceRef(parking.source)],
+    ["role", parking.role],
+    ["request", logPositionToBytes(parking.request)]
+  ])
+}
+
+export function decodeSessionParking(map: CborMap, context: string): SessionParking {
+  return {
+    source: decodeSourceRef(map.get("source"), `${context}.source`),
+    role: parseAgentId(field.requiredString(map, "role", context)),
+    request: logPositionFromBytes(field.requiredBytes(map, "request", context))
+  }
+}
+
+/** A parking must point at a log record with its topic generation. */
+export function validateSessionParking(parking: SessionParking): void {
+  if (parking.source.kind !== "message") {
+    throw new InvalidError("a parked record must point at a log record")
+  }
+  if (parking.source.generation === undefined) {
+    throw new InvalidError("a parked record must name its source topic generation")
+  }
+}
+
+export function encodeSessionEnd(end: SessionEnd): Map<string, unknown> {
+  const map = new Map<string, unknown>()
+  if (end.reason !== undefined) map.set("reason", end.reason)
+  if (end.error !== undefined) map.set("error", encodeAgentErrorBody(end.error))
+  return map
+}
+
+export function decodeSessionEnd(map: CborMap, context: string): SessionEnd {
+  const reason = field.optionalString(map, "reason", context)
+  const error = field.optionalMap(map, "error", context)
+  return {
+    ...(reason !== undefined ? { reason } : {}),
+    ...(error !== undefined ? { error: decodeAgentErrorBody(error, `${context}.error`) } : {})
+  }
+}
+
 export const TaskStateName = {
   Submitted: 1,
   Working: 2,
@@ -90,7 +801,8 @@ export const TaskStateName = {
   Failed: 6,
   Rejected: 7,
   AuthRequired: 8,
-  Unknown: 9
+  Unknown: 9,
+  Paused: 10
 } as const
 
 const TASK_STATE_DISPLAY: Readonly<Record<keyof typeof TaskStateName, string>> = {
@@ -102,7 +814,8 @@ const TASK_STATE_DISPLAY: Readonly<Record<keyof typeof TaskStateName, string>> =
   Failed: "failed",
   Rejected: "rejected",
   AuthRequired: "auth-required",
-  Unknown: "unknown"
+  Unknown: "unknown",
+  Paused: "paused"
 }
 
 const TASK_STATE_NAME_BY_CODE: ReadonlyMap<number, keyof typeof TaskStateName> = new Map(
@@ -221,6 +934,7 @@ export interface TokenUsage {
   readonly reasoningOutputTokens?: bigint
   readonly cacheReadInputTokens?: bigint
   readonly cacheCreationInputTokens?: bigint
+  readonly costMicros?: bigint
 }
 
 export function encodeTokenUsage(usage: TokenUsage): Map<string, unknown> {
@@ -236,6 +950,7 @@ export function encodeTokenUsage(usage: TokenUsage): Map<string, unknown> {
   if (usage.cacheCreationInputTokens !== undefined) {
     map.set("cache_creation_input_tokens", usage.cacheCreationInputTokens)
   }
+  if (usage.costMicros !== undefined) map.set("cost_micros", usage.costMicros)
   return map
 }
 
@@ -243,12 +958,14 @@ export function decodeTokenUsage(map: CborMap, context: string): TokenUsage {
   const reasoningOutputTokens = field.optionalU64(map, "reasoning_output_tokens", context)
   const cacheReadInputTokens = field.optionalU64(map, "cache_read_input_tokens", context)
   const cacheCreationInputTokens = field.optionalU64(map, "cache_creation_input_tokens", context)
+  const costMicros = field.optionalU64(map, "cost_micros", context)
   return {
     inputTokens: field.requiredU64(map, "input_tokens", context),
     outputTokens: field.requiredU64(map, "output_tokens", context),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
     ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
-    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {})
+    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+    ...(costMicros !== undefined ? { costMicros } : {})
   }
 }
 
@@ -667,6 +1384,13 @@ export const features = {
 } as const
 
 export const OPERATION_TASK = "task"
+export const OPERATION_SESSION = "session"
+/** The event that records one work record an agent held while its session
+ * was paused. The body is a `SessionParking`. */
+export const OPERATION_SESSION_PARKED = "session_parked"
+/** The event that records that an agent handled a held record after the
+ * resume. The body is the `SessionParking` of the held record. */
+export const OPERATION_SESSION_UNPARKED = "session_unparked"
 export const OPERATION_CARD = "card"
 export const OPERATION_PROGRESS = "progress"
 export const OPERATION_QUARANTINE = "quarantine"
@@ -679,17 +1403,39 @@ export const OPERATION_STATE_DELTA = "state_delta"
 
 export const METADATA_ROLE = "role"
 export const METADATA_BRIDGE_HOPS = "bridge_hops"
-export const METADATA_RUN = "run"
 export const METADATA_DELEGATED_BY = "on_behalf_of"
 export const METADATA_PURPOSE = "purpose"
 export const METADATA_DATA_CLASSIFICATION = "data_classification"
 export const METADATA_TASK_CONTEXT = "task_context"
 export const METADATA_SESSION_INTENT = "session_intent"
+/** The metadata key for a model call's requested model. */
+export const METADATA_REQUEST_MODEL = "gen_ai.request.model"
+/** The metadata key for the model that answered a call. */
+export const METADATA_RESPONSE_MODEL = "gen_ai.response.model"
+/** The metadata key for the provider that served a model call. */
+export const METADATA_PROVIDER_NAME = "gen_ai.provider.name"
+/** The metadata key that marks a command as the first command of a submitted
+ * session. The receiving agent marks the session working when it picks the
+ * command up. */
+export const METADATA_SUBMITTED = "submitted"
+/** The metadata key for a call's duration in microseconds, measured by the
+ * application around the provider or tool call. */
+export const METADATA_DURATION_MICROS = "duration_micros"
+
+/** The estimated token count of `bytes` bytes of context: one token per four
+ * bytes, rounded up. Every SDK and the session fold use this one estimate. */
+export function estimateTokens(bytes: number): bigint {
+  if (!Number.isSafeInteger(bytes) || bytes < 0)
+    throw new InvalidError("a byte count must be a non-negative safe integer")
+  return BigInt(Math.ceil(bytes / 4))
+}
 
 export interface AgentEnvelope {
   readonly kind: AgentKind
   readonly record?: RecordId
   readonly conversation: ConversationId
+  readonly parent?: ConversationId
+  readonly root?: ConversationId
   readonly source: AgentId
   readonly target?: AgentId
   readonly cause?: RecordId
@@ -854,6 +1600,8 @@ export function encodeAgentEnvelope(envelope: AgentEnvelope): Map<string, unknow
   map.set("kind", envelope.kind)
   if (envelope.record !== undefined) map.set("record", envelope.record.toBytes())
   map.set("conversation", envelope.conversation.toBytes())
+  if (envelope.parent !== undefined) map.set("parent", envelope.parent.toBytes())
+  if (envelope.root !== undefined) map.set("root", envelope.root.toBytes())
   map.set("source", envelope.source)
   if (envelope.target !== undefined) map.set("target", envelope.target)
   if (envelope.cause !== undefined) map.set("cause", envelope.cause.toBytes())
@@ -878,6 +1626,8 @@ export function encodeAgentEnvelope(envelope: AgentEnvelope): Map<string, unknow
 
 export function decodeAgentEnvelope(map: CborMap, context: string): AgentEnvelope {
   const record = field.optionalBytes(map, "record", context)
+  const parent = field.optionalBytes(map, "parent", context)
+  const root = field.optionalBytes(map, "root", context)
   const target = field.optionalString(map, "target", context)
   const cause = field.optionalBytes(map, "cause", context)
   const causeAt = field.optionalBytes(map, "cause_at", context)
@@ -900,6 +1650,8 @@ export function decodeAgentEnvelope(map: CborMap, context: string): AgentEnvelop
     kind: parseAgentKind(field.requiredString(map, "kind", context), context),
     ...(record !== undefined ? { record: RecordId.fromBytes(record) } : {}),
     conversation: ConversationId.fromBytes(field.requiredBytes(map, "conversation", context)),
+    ...(parent !== undefined ? { parent: ConversationId.fromBytes(parent) } : {}),
+    ...(root !== undefined ? { root: ConversationId.fromBytes(root) } : {}),
     source: parseAgentId(field.requiredString(map, "source", context)),
     ...(target !== undefined ? { target: parseAgentId(target) } : {}),
     ...(cause !== undefined ? { cause: RecordId.fromBytes(cause) } : {}),
@@ -932,6 +1684,7 @@ const CHUNK_STREAM_OPERATIONS: ReadonlySet<string> = new Set([
 
 const STATUS_OPERATIONS: ReadonlySet<string> = new Set([
   OPERATION_TASK,
+  OPERATION_SESSION,
   OPERATION_CARD,
   OPERATION_PROGRESS,
   OPERATION_QUARANTINE,
@@ -953,6 +1706,14 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
   if (kind !== AgentKind.Chunk) {
     require(envelope.record !== undefined, "record")
   }
+
+  if (envelope.root !== undefined && envelope.parent === undefined)
+    invalid("root", "root requires parent")
+  if (
+    envelope.parent?.equals(envelope.conversation) === true ||
+    envelope.root?.equals(envelope.conversation) === true
+  )
+    invalid("parent", "parent and root must differ from conversation")
 
   switch (kind) {
     case AgentKind.Command:
@@ -1015,7 +1776,7 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
   }
 
   if (kind === AgentKind.Status) {
-    if (envelope.operation === OPERATION_TASK) {
+    if (envelope.operation === OPERATION_TASK || envelope.operation === OPERATION_SESSION) {
       require(envelope.taskState !== undefined, "task_state")
     }
   } else if (kind !== AgentKind.Response && kind !== AgentKind.Error) {
@@ -1027,7 +1788,7 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
     if (envelope.operation !== undefined && !STATUS_OPERATIONS.has(envelope.operation)) {
       invalid(
         "operation",
-        `status operation must be \`${OPERATION_TASK}\`, \`${OPERATION_CARD}\`, \`${OPERATION_PROGRESS}\`, \`${OPERATION_QUARANTINE}\`, or \`${OPERATION_UNQUARANTINE}\`, got \`${envelope.operation}\``
+        `status operation must be \`${OPERATION_TASK}\`, \`${OPERATION_SESSION}\`, \`${OPERATION_CARD}\`, \`${OPERATION_PROGRESS}\`, \`${OPERATION_QUARANTINE}\`, or \`${OPERATION_UNQUARANTINE}\`, got \`${envelope.operation}\``
       )
     }
   } else if (kind === AgentKind.Chunk) {
@@ -1057,7 +1818,29 @@ export function validateAgentEnvelope(envelope: AgentEnvelope): void {
     invalid("usage", "whole-stream accounting rides the terminal chunk")
   }
 
-  if (kind === AgentKind.Chunk) {
+  if (kind === AgentKind.Status && envelope.operation === OPERATION_SESSION) {
+    require(envelope.body.length > 0, "body")
+    const state = envelope.taskState
+    if (state === undefined) return invalid("task_state", "session state is required")
+    if (envelope.last !== taskStateIsTerminal(state))
+      invalid("last", "session last must match terminal task state")
+    try {
+      const body = expectMap(decodeOne(envelope.body, "session body"), "session body")
+      if (state.kind === "known" && state.name === "Submitted") {
+        validateStartAncestry(decodeSessionStart(body, "session start"), envelope)
+      } else if (state.kind === "known" && state.name === "Working") {
+        if (body.has("agent") || body.has("sdk"))
+          validateStartAncestry(decodeSessionStart(body, "session start"), envelope)
+        else decodeSessionTransition(body, "session transition")
+      } else if (taskStateIsTerminal(state)) {
+        decodeSessionEnd(body, "session end")
+      } else {
+        decodeSessionTransition(body, "session transition")
+      }
+    } catch (error) {
+      invalid("body", error instanceof Error ? error.message : String(error))
+    }
+  } else if (kind === AgentKind.Chunk) {
     if (envelope.body.length === 0 && !envelope.last) {
       rejectValidation({ kind: "missing", agentKind: kind, field: "body" })
     }

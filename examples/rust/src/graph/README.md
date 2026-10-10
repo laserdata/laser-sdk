@@ -1,4 +1,4 @@
-# graph - the Graph primitive
+# graph: the Graph primitive
 
 A graph connects entities through named relationships. This example writes a relationship and reads the neighboring entities.
 

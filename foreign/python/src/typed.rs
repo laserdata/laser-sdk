@@ -1,6 +1,7 @@
 use crate::async_bridge::future_into_py;
 use crate::convert::{BodyValue, py_to_json};
 use crate::errors::{TypedDecodeError, to_pyerr};
+use crate::ids::PyMessageId;
 use crate::publish::{PyBatchPublish, PyPublish};
 use crate::stream::PyTopic;
 use laser_sdk::laser::Laser;
@@ -168,7 +169,7 @@ struct Reader {
 
 struct Entry {
     value: Py<PyAny>,
-    position: String,
+    position: PyMessageId,
     headers: BTreeMap<String, String>,
 }
 
@@ -232,7 +233,7 @@ impl Reader {
                     Ok(record) => decode_entry(py, self.cls.as_ref(), record),
                     Err(error) => {
                         let message = error.to_string();
-                        let position = error.position.as_ref().map(ToString::to_string);
+                        let position = error.position.map(PyMessageId::from);
                         Err(typed_decode_error(
                             py,
                             message,
@@ -341,9 +342,10 @@ pub struct PyTypedRecord {
     /// when the topic has none.
     #[pyo3(get)]
     pub value: Py<PyAny>,
-    /// The record's log position, from its own message header.
+    /// The record's log position (partition and offset), from its own message
+    /// header.
     #[pyo3(get)]
-    pub position: String,
+    pub position: PyMessageId,
     /// The record's user headers decoded to strings.
     #[pyo3(get)]
     pub headers: BTreeMap<String, String>,
@@ -353,7 +355,7 @@ pub struct PyTypedRecord {
 #[pymethods]
 impl PyTypedRecord {
     fn __repr__(&self) -> String {
-        format!("TypedRecord(position={})", self.position)
+        format!("TypedRecord(position={})", self.position.inner)
     }
 }
 
@@ -427,7 +429,7 @@ fn decode_entry(
     cls: Option<&Py<PyAny>>,
     record: laser_sdk::typed::TypedRecord<BodyValue>,
 ) -> Result<Entry, PyErr> {
-    let position = record.position.to_string();
+    let position = PyMessageId::from(record.position);
     let value = record.value.to_py(py).and_then(|obj| {
         let Some(cls) = cls else {
             return Ok(obj);
@@ -450,7 +452,10 @@ fn decode_entry(
         }),
         Err(error) => Err(typed_decode_error(
             py,
-            format!("record at {position} does not decode as the topic's cls: {error}"),
+            format!(
+                "record at {} does not decode as the topic's cls: {error}",
+                position.inner
+            ),
             Some(position),
             error,
         )),
@@ -463,11 +468,12 @@ fn decode_entry(
 fn typed_decode_error(
     py: Python<'_>,
     message: String,
-    position: Option<String>,
+    position: Option<PyMessageId>,
     source: PyErr,
 ) -> PyErr {
     let error = TypedDecodeError::new_err(message);
     let value = error.value(py);
+    let position = position.and_then(|position| Py::new(py, position).ok());
     let _ = value.setattr("position", position);
     let _ = value.setattr("source", source.value(py));
     error.set_cause(py, Some(source));

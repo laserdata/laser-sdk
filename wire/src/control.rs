@@ -534,8 +534,8 @@ impl ProjectionBuilder {
 #[non_exhaustive]
 pub enum RetentionPolicy {
     /// Follow the log: rows are pruned once Iggy drops the messages that
-    /// produced them. The default, and the only policy that also deletes the
-    /// projection when the source topic is deleted.
+    /// produced them. The default. Like `KeepUntilSourceDeleted`, it also
+    /// deletes the projection when the source topic is deleted.
     #[default]
     MirrorLog,
     /// Keep rows forever, regardless of the source log *or its deletion*.
@@ -820,14 +820,25 @@ pub enum ControlCommand {
     RegisterGraph(Projection),
     /// Drop the graph projection registered under this id.
     DropGraph(String),
-    /// Register a run-status source: LaserData Cloud folds run-tagged agent
-    /// records from this topic into the run registry. Idempotent by source.
-    RegisterRunSource(SourceSelector),
-    /// Stop folding run-status records from this topic. Idempotent.
-    RemoveRunSource(SourceSelector),
+    /// Register the named session topics in one stream, or all session topics.
+    RegisterSessionSource {
+        stream: String,
+        topics: SessionTopics,
+    },
+    /// Stop folding session records from one stream.
+    RemoveSessionSource {
+        stream: String,
+    },
     /// One consumer-filter catalog mutation, stamped by the streaming server.
     /// Its outcome (applied or rejected) is recorded under the operation id.
     FilterCatalog(crate::filter::FilterCatalogCommand),
+}
+
+/// The topics a session-source registration covers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionTopics {
+    All,
+    Named(Vec<String>),
 }
 
 /// Versioned wrapper around a [`ControlCommand`], CBOR-named on the wire.
@@ -836,6 +847,13 @@ pub struct ControlEnvelope {
     pub v: u32,
     pub timestamp_micros: u64,
     pub command: ControlCommand,
+    /// The stream the command's resource names belong to, set by a client that
+    /// scopes its resources to a stream on the projection, binding, graph, and
+    /// schema commands. The writer-schema registry keys `RegisterSchema` and
+    /// `DropSchema` by `(stream, id)` when it is set. Absent on the wire when
+    /// unset, which addresses the deployment-wide registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 #[cfg(test)]
@@ -982,6 +1000,7 @@ mod wire_tests {
             v: CONTROL_OP_VERSION,
             timestamp_micros: 42,
             command: ControlCommand::ApplyBinding(binding),
+            stream: None,
         };
         let bytes = encode_named(&envelope).expect("envelope serializes");
         let back: ControlEnvelope = decode_named(&bytes).expect("envelope deserializes");
@@ -1009,14 +1028,40 @@ mod wire_tests {
                 name: None,
                 version: None,
             }),
+            stream: None,
         };
         let bytes = encode_named(&envelope).expect("envelope serializes");
         let back: ControlEnvelope = decode_named(&bytes).expect("envelope deserializes");
+        assert_eq!(back.stream, None);
         let ControlCommand::RegisterSchema(decoded) = back.command else {
             panic!("expected RegisterSchema");
         };
         assert_eq!(decoded.id, 11);
         assert_eq!(decoded.content_type(), ContentType::Avro);
+    }
+
+    #[test]
+    fn given_a_stream_scoped_drop_schema_when_round_tripped_then_should_preserve_the_stream() {
+        let envelope = ControlEnvelope {
+            v: CONTROL_OP_VERSION,
+            timestamp_micros: 7,
+            command: ControlCommand::DropSchema(11),
+            stream: Some("acme".to_owned()),
+        };
+        let back: ControlEnvelope =
+            decode_named(&encode_named(&envelope).expect("envelope serializes"))
+                .expect("envelope deserializes");
+        assert_eq!(back.stream.as_deref(), Some("acme"));
+        assert!(matches!(back.command, ControlCommand::DropSchema(11)));
+        let unscoped = ControlEnvelope {
+            stream: None,
+            ..envelope
+        };
+        let json = serde_json::to_string(&unscoped).expect("envelope serializes");
+        assert!(
+            !json.contains("stream"),
+            "an unset stream is omitted: {json}"
+        );
     }
 
     #[test]

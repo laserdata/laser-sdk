@@ -49,8 +49,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LaserError::Query` | `QueryError` | `QueryExecutionError` | error-class |
 | `LaserError::Kv` | `KvError` | `KvExecutionError` | error-class |
 | `LaserError::Fork` | `ForkError` | `ForkExecutionError` | error-class |
+| `LaserError::Session` | `SessionError` | `SessionError` | error-class |
 | `LaserError::Graph` | `GraphError` | `GraphExecutionError` | error-class |
-| `LaserError::Agent` | `AgentError` | `AgentWorkflowExecutionError` | error-class |
 | `LaserError::Authz` | `AuthzError` | `AuthzExecutionError` | error-class |
 | `LaserError::Filter` | `FilterError` | `FilterExecutionError` | error-class |
 | `LaserError::FilterFault` | `FilterFaultError` | `FilterFaultError` | error-class |
@@ -142,6 +142,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `A2aBridge::router` | omitted | omitted | rust-crate |
 | `A2aBridge::signed_card` | `A2aBridge.signed_card` | `A2aBridge.signedCard` |  |
 | `A2aBridge::submit` | `A2aBridge.submit` | `A2aBridge.submit` |  |
+| `A2aBridge::submit_in` | `A2aBridge.submit_in` | `A2aBridge.submitIn` |  |
+| `A2aBridge::submit_in_to` | `A2aBridge.submit_in(target=)` | `A2aBridge.submitIn(target=)` | overload |
+| `A2aBridge::submit_to` | `A2aBridge.submit(target=)` | `A2aBridge.submit(target=)` | overload |
 | `A2aBridge::task` | `A2aBridge.task` | `A2aBridge.task` |  |
 | `A2aBridge::with_bridge_hops` | `A2aBridge.with_bridge_hops` | `A2aBridge.withBridgeHops` |  |
 | `A2aBridge::with_capabilities` | `new A2aBridge(capabilities=)` | `A2aBridge.withCapabilities` | keywords |
@@ -208,6 +211,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `TaskState::Rejected` | `TaskState.Rejected` | `TaskState` | plain-value |
 | `TaskState::AuthRequired` | `TaskState.AuthRequired` | `TaskState` | plain-value |
 | `TaskState::Unknown` | `TaskState.Unknown` | `TaskState` | plain-value |
+| `TaskState::Paused` | `TaskState.Paused` | `TaskState` | plain-value |
 | `TaskState::Unrecognized` | `TaskState.Unrecognized` | `TaskState` | plain-value |
 | `TaskState::code` | `TaskState.code` | `fn:code` | free-function |
 | `TaskState::from_code` | `TaskState.from_code` | `fn:taskStateFromCode` | free-function |
@@ -227,19 +231,27 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Agdx::emit` | `Agdx.emit` | `Agdx.emit` | keywords |
 | `Agdx::fail` | `Agdx.fail` | `Agdx.fail` | keywords |
 | `Agdx::request_input` | `Agdx.request_input` | `Agdx.requestInput` | keywords |
+| `Agdx::request_input_from` | `Agdx.request_input(target=)` | `Agdx.requestInput(target=)` | overload |
 | `Agdx::respond` | `Agdx.respond` | `Agdx.respond` | keywords |
 | `Agdx::status` | `Agdx.status` | `Agdx.status` | keywords |
 | `Agdx::stream` | `Agdx.stream` | `Agdx.stream` | keywords |
+| `AgdxReceipt` | `AgdxReceipt` | `AgdxReceipt` |  |
+| `AgdxReceipt.record` | `AgdxReceipt.record` | `AgdxReceipt.record` | keywords |
+| `AgdxReceipt.partition_id` | `AgdxReceipt.partition_id` | `AgdxReceipt.partitionId` | keywords |
+| `AgdxReceipt.offset` | `AgdxReceipt.offset` | `AgdxReceipt.offset` | keywords |
 | `AgdxSend` | `Agdx.command` | `AgdxSend` | keywords |
 | `AgdxSend::body` | `Agdx.status(body=)` | `AgdxSend.body` | keywords |
 | `AgdxSend::claim_check` | `Agdx.command(claim_check=)` | `AgdxSend.claimCheck` | keywords |
 | `AgdxSend::content_type` | `Agdx.command(content_type=)` | `AgdxSend.contentType` | keywords |
 | `AgdxSend::last` | `Agdx.status(last=)` | `AgdxSend.last` | keywords |
 | `AgdxSend::send` | `Agdx.command` | `AgdxSend.send` | one-call, keywords |
+| `AgdxSend::send_receipt` | `Agdx.command(receipt=)` | `AgdxSend.sendReceipt` | keywords |
 | `AgdxSend::signed_by` | `Laser.agdx(signing_key=)` | `AgdxSend.signedBy` | keywords |
+| `AgdxSend::with_ancestry` | `Agdx.command(parent=, root=)` | `AgdxSend.withAncestry` | keywords |
 | `AgdxSend::with_cause` | `Agdx.command(cause=)` | `AgdxSend.withCause` | keywords |
 | `AgdxSend::with_correlation` | `Agdx.status(correlation=)` | `AgdxSend.withCorrelation` | keywords |
 | `AgdxSend::with_deadline_micros` | `Agdx.command(deadline_micros=)` | `AgdxSend.withDeadlineMicros` | keywords |
+| `AgdxSend::with_finish_reason` | `Agdx.command(finish_reason=)` | `AgdxSend.withFinishReason` | keywords |
 | `AgdxSend::with_idempotency_key` | `Agdx.command(idempotency_key=)` | `AgdxSend.withIdempotencyKey` | keywords |
 | `AgdxSend::with_metadata` | `Agdx.command(metadata=)` | `AgdxSend.withMetadata` | keywords |
 | `AgdxSend::with_operation` | `Agdx.command(operation=)` | `AgdxSend.withOperation` | keywords |
@@ -272,6 +284,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Agent.warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `AgentBuilder.warmDedup` | keywords |
 | `Agent.middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `Agent.on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
+| `Agent.operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
+| `Agent.sessions` | `Laser.spawn_agent(sessions=)` | `AgentBuilder.sessions` | keywords |
 | `Agent.dedup_window` | `Laser.spawn_agent(dedup_window=)` | `AgentBuilder.dedupWindow` | keywords |
 | `Agent.retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `AgentBuilder.retry` | keywords |
 | `Agent.understood_features` | `Laser.spawn_agent(understood_features=)` | `AgentBuilder.understoodFeatures` | keywords |
@@ -319,9 +333,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::maybe_max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `AgentBuilder.maxQueuedRecords` | keywords |
 | `AgentBuilder::maybe_middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `AgentBuilder::maybe_on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
+| `AgentBuilder::maybe_operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
 | `AgentBuilder::maybe_poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `AgentBuilder.pollInterval` | keywords |
 | `AgentBuilder::maybe_respond_on` | `Laser.spawn_agent(respond_on=)` | `AgentBuilder.respondOn` | keywords |
 | `AgentBuilder::maybe_retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `AgentBuilder.retry` | keywords |
+| `AgentBuilder::maybe_sessions` | `Laser.spawn_agent(sessions=)` | `AgentBuilder.sessions` | keywords |
 | `AgentBuilder::maybe_shutdown_grace` | `Laser.spawn_agent(shutdown_grace_ms=)` | `AgentBuilder.shutdownGrace` | keywords |
 | `AgentBuilder::maybe_signing_key` | `Laser.spawn_agent(signing_key=)` | `AgentBuilder.signingKey` | keywords |
 | `AgentBuilder::maybe_understood_features` | `Laser.spawn_agent(understood_features=)` | `AgentBuilder.understoodFeatures` | keywords |
@@ -329,9 +345,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentBuilder::maybe_warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `AgentBuilder.warmDedup` | keywords |
 | `AgentBuilder::middleware` | `Laser.spawn_agent(middleware=)` | `AgentBuilder.middleware` | keywords |
 | `AgentBuilder::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `AgentBuilder.onDeadLetter` | keywords |
+| `AgentBuilder::operations` | `Laser.spawn_agent(operations=)` | `AgentBuilder.operations` | keywords |
 | `AgentBuilder::poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `AgentBuilder.pollInterval` | keywords |
 | `AgentBuilder::respond_on` | `Laser.spawn_agent(respond_on=)` | `AgentBuilder.respondOn` | keywords |
 | `AgentBuilder::retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `AgentBuilder.retry` | keywords |
+| `AgentBuilder::sessions` | `Laser.spawn_agent(sessions=)` | `AgentBuilder.sessions` | keywords |
 | `AgentBuilder::shutdown_grace` | `Laser.spawn_agent(shutdown_grace_ms=)` | `AgentBuilder.shutdownGrace` | keywords |
 | `AgentBuilder::signing_key` | `Laser.spawn_agent(signing_key=)` | `AgentBuilder.signingKey` | keywords |
 | `AgentBuilder::understood_features` | `Laser.spawn_agent(understood_features=)` | `AgentBuilder.understoodFeatures` | keywords |
@@ -344,26 +362,12 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentCtx::message` | `AgentCtx.message` | `AgentCtx.message` | property |
 | `AgentCtx::reply_on` | `AgentCtx.reply_on` | `AgentCtx.replyOn` |  |
 | `AgentCtx::request` | `AgentCtx.request` | `AgentCtx.request` |  |
+| `AgentCtx::request_at` | `AgentCtx.request_at` | `AgentCtx.requestAt` | property |
 | `AgentCtx::respond` | `AgentCtx.respond` | `AgentCtx.respond` |  |
 | `AgentCtx::respond_input` | `AgentCtx.respond_input` | `AgentCtx.respondInput` |  |
 | `AgentCtx::send` | `AgentCtx.send` | `AgentCtx.send` |  |
+| `AgentCtx::session` | `AgentCtx.session` | `AgentCtx.session` |  |
 | `AgentCtx::spawn_subconversation` | `AgentCtx.spawn_subconversation` | `AgentCtx.spawnSubconversation` |  |
-| `AgentErrorBody` | dict via `Agdx.fail` | `AgentErrorBody` | serde-dict |
-| `AgentErrorBody.code` | dict key | `AgentErrorBody.code` | serde-dict, keywords |
-| `AgentErrorBody.message` | dict key | `AgentErrorBody.message` | serde-dict, keywords |
-| `AgentErrorBody.retryable` | dict key | `AgentErrorBody.retryable` | serde-dict, keywords |
-| `AgentErrorBody.detail` | dict key | `AgentErrorBody.detail` | serde-dict, keywords |
-| `AgentErrorCode` | dict via `Agdx.fail` | `AgentErrorCode` | serde-dict |
-| `AgentErrorCode::InvalidRequest` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::Unauthorized` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::Unsupported` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::DeadlineExceeded` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::Cancelled` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::ToolFailure` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::Internal` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::Unrecognized` | dict key | `AgentErrorCode` | serde-dict, plain-value |
-| `AgentErrorCode::code` | omitted | `fn:agentErrorCode` | plain-value, free-function |
-| `AgentErrorCode::from_code` | omitted | `fn:agentErrorCodeFromCode` | plain-value, free-function |
 | `AgentHandle` | `AgentHandle` | `AgentHandle` |  |
 | `AgentHandle::abort` | `AgentHandle.abort` | `AgentHandle.abort` |  |
 | `AgentHandle::join` | `AgentHandle.join` | `AgentHandle.join` |  |
@@ -379,7 +383,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentMessage.content_type` | `AgentMessage.content_type` | `AgentMessage.contentType` | keywords |
 | `AgentMessage.verified_principal` | `AgentMessage.verified_principal` | `AgentMessage.verifiedPrincipal` | keywords |
 | `AgentMessage::body` | `AgentMessage.body` | `fn:agentMessageBody` | free-function |
-| `AgentMessage::resolve_body` | `AgentMessage.resolve_body` | `fn:resolveBody` | free-function |
+| `AgentMessage::resolve_body` | `AgentMessage.resolve_body` | `fn:agentMessageResolveBody` | free-function |
 | `AgentMiddleware` | `Laser.spawn_agent(middleware=)` | `AgentMiddleware` | callback |
 | `AgentMiddleware::before_handle` | `Laser.spawn_agent(middleware=)` | `AgentMiddleware.beforeHandle` | callback, keywords |
 | `AgentMiddleware::after_handle` | `Laser.spawn_agent(middleware=)` | `AgentMiddleware.afterHandle` | callback, keywords |
@@ -407,14 +411,13 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentScope::id` | `AgentScope.id` | `AgentScope.id` | property |
 | `AgentScope::publish_card` | `AgentScope.publish_card` | `AgentScope.publishCard` |  |
 | `AgentScope::send` | `AgentScope.send` | `AgentScope.send` |  |
+| `AssembledContext` | `AssembledContext` | `AssembledContext` |  |
+| `AssembledContext.fragments` | `AssembledContext.fragments` | `AssembledContext.fragments` |  |
+| `AssembledContext.manifest` | `AssembledContext.manifest` | `AssembledContext.manifest` |  |
+| `AssembledContext::text` | `AssembledContext.text` | `AssembledContext.text` |  |
 | `BatchItem` | dict via `Laser.execute_batch` | `wire.BatchItem` | serde-dict |
 | `BatchItem.code` | dict key | `wire.BatchItem.code` | serde-dict, keywords |
 | `BatchItem.payload` | dict key | `wire.BatchItem.payload` | serde-dict, keywords |
-| `Budget` | `Workflow.budget` | `Budget` | keywords |
-| `Budget::invocations` | `Workflow.budget(invocations=)` | `Budget.invocations` | keywords |
-| `Budget::tokens` | `Workflow.budget(tokens=)` | `Budget.tokens` | keywords |
-| `Budget::unlimited` | `Workflow.budget` | `Budget.unlimited` | keywords |
-| `Budget::wall_clock` | `Workflow.budget(wall_clock_ms=)` | `Budget.wallClock` | keywords |
 | `CapabilityDescriptor` | dict via `RouteCandidate.capability` | `CapabilityDescriptor` | serde-dict |
 | `CapabilityDescriptor.skill_id` | dict key | `CapabilityDescriptor.skillId` | serde-dict, keywords |
 | `CapabilityDescriptor.input` | dict key | `CapabilityDescriptor.input` | serde-dict, keywords |
@@ -465,9 +468,22 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsumptionStatus` | `ConsumptionStatus` | `ConsumptionStatus` |  |
 | `ConsumptionStatus::NotYetConsumed` | `ConsumptionStatus.NotYetConsumed` | `ConsumptionStatus` | plain-value |
 | `ConsumptionStatus::Consumed` | `ConsumptionStatus.Consumed` | `ConsumptionStatus` | plain-value |
+| `ConsumptionStatus::Skipped` | `ConsumptionStatus.Skipped` | `ConsumptionStatus` | plain-value |
 | `ContentRef` | dict via `RouteCandidate.capability` | `ContentRef` | serde-dict |
 | `ContentRef::ContentType` | dict key | `ContentRef` | serde-dict, plain-value |
 | `ContentRef::SchemaId` | dict key | `ContentRef` | serde-dict, plain-value |
+| `ContextCompaction` | dict via `Session.record_compaction` | `wire.ContextCompaction` | serde-dict |
+| `ContextCompaction.summary_at` | dict key | `wire.ContextCompaction.summaryAt` | serde-dict, keywords |
+| `ContextCompaction.covered` | dict key | `wire.ContextCompaction.covered` | serde-dict, keywords |
+| `ContextCompaction.summarizer` | dict key | `wire.ContextCompaction.summarizer` | serde-dict, keywords |
+| `ContextManifest` | dict via `AssembledContext.manifest` | `wire.ContextManifest` | serde-dict |
+| `ContextManifest.policy` | dict key | `wire.ContextManifest.policy` | serde-dict, keywords |
+| `ContextManifest.policy_version` | dict key | `wire.ContextManifest.policyVersion` | serde-dict, keywords |
+| `ContextManifest.fragments` | dict key | `wire.ContextManifest.fragments` | serde-dict, keywords |
+| `ContextManifest.tokens` | dict key | `wire.ContextManifest.tokens` | serde-dict, keywords |
+| `ContextManifest.bytes` | dict key | `wire.ContextManifest.bytes` | serde-dict, keywords |
+| `ContextManifest.frontier` | dict key | `wire.ContextManifest.frontier` | serde-dict, keywords |
+| `ContextManifest.correlation` | dict key | `wire.ContextManifest.correlation` | serde-dict, keywords |
 | `Contract` | `Contract` | `Contract` |  |
 | `Contract::Completed` | `Contract.Completed` | `Contract` | plain-value |
 | `Contract::Failed` | `Contract.Failed` | `Contract` | plain-value |
@@ -480,8 +496,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ContractBuilder::fence` | `Laser.contract(fence=)` | `ContractBuilder.fence` | keywords |
 | `ContractBuilder::from` | `Laser.contract(source=)` | `ContractBuilder.from` | keywords |
 | `ContractBuilder::inbox_route` | `Laser.contract(fixed_inbox=)` | `ContractBuilder.inboxRoute` | keywords |
+| `ContractBuilder::parent` | `Laser.contract(parent=, root=)` | `ContractBuilder.parent` | keywords |
 | `ContractBuilder::payload` | `Laser.contract(payload=)` | `ContractBuilder.payload` | keywords |
-| `ContractBuilder::registered` | `Laser.contract(registered=)` | `ContractBuilder.registered` | keywords |
 | `ContractBuilder::reply_on` | `Laser.contract(reply_on=)` | `ContractBuilder.replyOn` | keywords |
 | `ContractBuilder::send` | `Laser.contract` | `ContractBuilder.send` | one-call |
 | `ConversationState` | `ConversationState` | `ConversationState` |  |
@@ -491,14 +507,27 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `agent::DEFAULT_CHUNK_LINGER_MS` | `const:DEFAULT_CHUNK_LINGER_MS` | `const:DEFAULT_CHUNK_LINGER_MS` |  |
 | `agent::DEFAULT_SESSION_CONTEXT_TOKENS` | `const:DEFAULT_SESSION_CONTEXT_TOKENS` | `const:DEFAULT_SESSION_CONTEXT_TOKENS` |  |
 | `agent::DEFAULT_SESSION_CONTEXT_TURNS` | `const:DEFAULT_SESSION_CONTEXT_TURNS` | `const:DEFAULT_SESSION_CONTEXT_TURNS` |  |
+| `agent::DEFAULT_SESSION_HEARTBEAT` | `const:DEFAULT_SESSION_HEARTBEAT_MS` | `const:DEFAULT_SESSION_HEARTBEAT_MS` |  |
+| `agent::DEFAULT_SESSION_IDLE_TIMEOUT` | `const:DEFAULT_SESSION_IDLE_TIMEOUT_MS` | `const:DEFAULT_SESSION_IDLE_TIMEOUT_MS` |  |
 | `agent::DEFAULT_SESSION_MEMORY_NAMESPACE` | `const:DEFAULT_SESSION_MEMORY_NAMESPACE` | `const:DEFAULT_SESSION_MEMORY_NAMESPACE` |  |
-| `agent::DEFAULT_SESSION_TOPICS` | `const:DEFAULT_SESSION_TOPICS` | `const:DEFAULT_SESSION_TOPICS` |  |
 | `DeadLetterSink` | `Laser.spawn_agent(dead_letter=)` | `DeadLetterSink` | callback |
 | `DeadLetterSink::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `DeadLetterSink.onDeadLetter` | callback, keywords |
 | `Deduplicator` | `Laser.spawn_agent(dedup=)` | `Deduplicator` | callback |
 | `Deduplicator::observe` | `Laser.spawn_agent(dedup=)` | `Deduplicator.observe` | callback, keywords |
 | `agent::FINISH_REASON_ABANDONED` | `const:FINISH_REASON_ABANDONED` | `const:FINISH_REASON_ABANDONED` |  |
 | `agent::FINISH_REASON_GAP` | `const:FINISH_REASON_GAP` | `const:FINISH_REASON_GAP` |  |
+| `Fragment` | dict via `AssembledContext.manifest` | `wire.Fragment` | serde-dict |
+| `Fragment::Message` | dict key | `wire.Fragment` | serde-dict, plain-value |
+| `Fragment::Memory` | dict key | `wire.Fragment` | serde-dict, plain-value |
+| `Fragment::Kv` | dict key | `wire.Fragment` | serde-dict, plain-value |
+| `Fragment::State` | dict key | `wire.Fragment` | serde-dict, plain-value |
+| `Fragment::Summary` | dict key | `wire.Fragment` | serde-dict, plain-value |
+| `GapReason` | omitted | `wire.GapReason` | plain-value |
+| `GapReason::ExpiredBeforeFold` | omitted | `wire.GapReason` | plain-value |
+| `GapReason::Pruned` | omitted | `wire.GapReason` | plain-value |
+| `GapReason::Truncated` | omitted | `wire.GapReason` | plain-value |
+| `GapReason::Rebuilding` | omitted | `wire.GapReason` | plain-value |
+| `GapReason::Unrecognized` | omitted | `wire.GapReason` | plain-value |
 | `Gather` | `Gather` | `Gather` |  |
 | `Gather.ok` | `Gather.ok` | `Gather.ok` | keywords |
 | `Gather.failures` | `Gather.failures` | `Gather.failures` | keywords |
@@ -579,12 +608,14 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::query_page` | `Laser.query_page` | `Laser.queryPage` |  |
 | `Laser::query_status` | `Laser.query_status` | `Laser.queryStatus` |  |
 | `Laser::query_target` | `Laser.query_target` | `Laser.queryTarget` |  |
+| `Laser::read_at` | `Laser.read_at` | `Laser.readAt` |  |
 | `Laser::reassemble_channel` | `Laser.reassemble_channel` | `Laser.reassembleChannel` |  |
 | `Laser::reconstruct_state` | `Laser.reconstruct_state` | `Laser.reconstructState` |  |
 | `Laser::redrive_dead_letter` | `Laser.redrive_dead_letter` | `Laser.redriveDeadLetter` |  |
 | `Laser::refresh_capabilities` | `Laser.refresh_capabilities` | `Laser.refreshCapabilities` |  |
 | `Laser::request` | `Laser.request` | `Laser.request` |  |
-| `Laser::runs` | `Laser.runs` | `Laser.runs` |  |
+| `Laser::resource_name` | `Laser.resource_name` | `Laser.resourceName` |  |
+| `Laser::resource_naming` | `Laser.resource_naming` | `Laser.resourceNaming` | property |
 | `Laser::scatter` | `Laser.scatter` | `Laser.scatter` | keywords |
 | `Laser::scatter_report` | `Laser.scatter_report` | `Laser.scatterReport` | keywords |
 | `Laser::schemas` | `Laser.schemas` | `Laser.schemas` |  |
@@ -607,16 +638,58 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::with_governor` | `Laser.with_governor` | `Laser.withGovernor` |  |
 | `Laser::with_governor_retention` | `Laser.with_governor_retention` | `Laser.withGovernor(retention=)` | overload |
 | `Laser::with_ops_stream` | `Laser.with_ops_stream` | `Laser.withOpsStream` |  |
+| `Laser::with_resource_naming` | `Laser.with_resource_naming` | `Laser.withResourceNaming` |  |
 | `Laser::workflow` | `Laser.workflow` | `Laser.workflow` |  |
+| `LinkRelation` | omitted | `wire.LinkRelation` | plain-value |
+| `LinkRelation::Wrote` | omitted | `wire.LinkRelation` | plain-value |
+| `LinkRelation::Recalled` | omitted | `wire.LinkRelation` | plain-value |
+| `LinkRelation::Touched` | omitted | `wire.LinkRelation` | plain-value |
+| `LinkSurface` | omitted | `LinkSurface` | plain-value |
+| `LinkSurface::Memory` | omitted | `LinkSurface` | plain-value |
+| `LinkSurface::Kv` | omitted | `LinkSurface` | plain-value |
+| `LinkSurface::GraphNode` | omitted | `LinkSurface` | plain-value |
+| `LinkSurface::GraphEdge` | omitted | `LinkSurface` | plain-value |
+| `LinkSurface::Projection` | omitted | `LinkSurface` | plain-value |
+| `LinkSurface::Child` | omitted | `LinkSurface` | plain-value |
 | `LocalAgentHandler` | `Laser.spawn_agent(handler=)` | `AgentHandler` | callback, trait-variant |
 | `LocalAgentHandler::handle` | `Laser.spawn_agent(handler=)` | `AgentHandler.handle` | callback, keywords |
 | `agent::MAX_CHUNK_BODY_BYTES` | `const:MAX_CHUNK_BODY_BYTES` | `const:MAX_CHUNK_BODY_BYTES` |  |
 | `MemoryHandler` | `MemoryHandler` | `MemoryHandler` |  |
 | `MemoryHandler::auto_remember` | `MemoryHandler.auto_remember` | `MemoryHandler.autoRemember` |  |
 | `MemoryHandler::new` | `new MemoryHandler()` | `new MemoryHandler()` | constructor |
+| `ModelCall` | `ModelCall` | `ModelCall` |  |
+| `ModelCall::complete` | `ModelCall.complete` | `ModelCall.complete` |  |
+| `ModelCall::correlation` | `ModelCall.correlation` | `ModelCall.correlation` | property |
+| `ModelCall::fail` | `ModelCall.fail` | `ModelCall.fail` |  |
+| `ModelRequest` | `ModelRequest` | `ModelRequest` |  |
+| `ModelRequest.model` | `ModelRequest.model` | `ModelRequest.model` |  |
+| `ModelRequest.provider` | `ModelRequest.provider` | `ModelRequest.provider` |  |
+| `ModelRequest.operation` | `ModelRequest.operation` | `ModelRequest.operation` |  |
+| `ModelRequest.body` | `ModelRequest.body` | `ModelRequest.body` |  |
+| `ModelRequest::new` | `new ModelRequest()` | `new ModelRequest()` | constructor |
+| `ModelRequest::operation` | `ModelRequest.operation` | `ModelRequest.operation` |  |
+| `ModelRequest::provider` | `ModelRequest.provider` | `ModelRequest.provider` |  |
+| `ModelResponse` | `ModelResponse` | `ModelResponse` |  |
+| `ModelResponse.body` | `ModelResponse.body` | `ModelResponse.body` | keywords |
+| `ModelResponse.model` | `ModelResponse.model` | `ModelResponse.model` | keywords |
+| `ModelResponse.finish_reason` | `ModelResponse.finish_reason` | `ModelResponse.finishReason` | keywords |
+| `ModelResponse.usage` | `ModelResponse.usage` | `ModelResponse.usage` | keywords |
+| `ModelResponse.duration` | `ModelResponse.duration_ms` | `ModelResponse.durationMs` | keywords |
 | `OnTimeout` | omitted | `OnTimeout` | plain-value |
 | `OnTimeout::Fail` | omitted | `OnTimeout` | plain-value |
 | `OnTimeout::Reassign` | omitted | `OnTimeout` | plain-value |
+| `ParkedRecords` | `ParkedRecords` | `ParkedRecords` |  |
+| `ParkedRecords.records` | `ParkedRecords.records` | `ParkedRecords.records` | keywords |
+| `ParkedRecords.complete` | `ParkedRecords.complete` | `ParkedRecords.complete` | keywords |
+| `PayloadRange` | dict via `Sessions.events` | `wire.PayloadRange` | serde-dict |
+| `PayloadRange.topic_id` | dict key | `wire.PayloadRange.topicId` | serde-dict, keywords |
+| `PayloadRange.topic_generation` | dict key | `wire.PayloadRange.topicGeneration` | serde-dict, keywords |
+| `PayloadRange.partition_id` | dict key | `wire.PayloadRange.partitionId` | serde-dict, keywords |
+| `PayloadRange.first` | dict key | `wire.PayloadRange.first` | serde-dict, keywords |
+| `PayloadRange.last` | dict key | `wire.PayloadRange.last` | serde-dict, keywords |
+| `PendingControl` | `PendingControl` | `PendingControl` |  |
+| `PendingControl.pause_requested` | `PendingControl.pause_requested` | `PendingControl.pauseRequested` | keywords |
+| `PendingControl.cancel_requested` | `PendingControl.cancel_requested` | `PendingControl.cancelRequested` | keywords |
 | `RegisteredCard` | `RegisteredCard` | `RegisteredCard` |  |
 | `RegisteredCard.agent` | `RegisteredCard.agent` | `RegisteredCard.agent` | keywords |
 | `RegisteredCard.card` | `RegisteredCard.card` | `RegisteredCard.card` | keywords |
@@ -643,6 +716,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumer.warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `ReliableConsumerOptions.warmDedup` | keywords |
 | `ReliableConsumer.middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumer.on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
+| `ReliableConsumer.operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
+| `ReliableConsumer.sessions` | `Laser.spawn_agent(sessions=)` | `ReliableConsumerOptions.sessions` | keywords |
 | `ReliableConsumer.verifier` | `Laser.spawn_agent(verifier=)` | `ReliableConsumerOptions.verifier` | keywords |
 | `ReliableConsumer.signing_key` | `Laser.spawn_agent(signing_key=)` | `ReliableConsumerOptions.signingKey` | keywords |
 | `ReliableConsumer::builder` | `Laser.spawn_agent` | `new ReliableConsumer()` | keywords, constructor |
@@ -668,9 +743,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::maybe_max_queued_records` | `Laser.spawn_agent(max_queued_records=)` | `ReliableConsumerOptions.maxQueuedRecords` | keywords |
 | `ReliableConsumerBuilder::maybe_middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumerBuilder::maybe_on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
+| `ReliableConsumerBuilder::maybe_operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
 | `ReliableConsumerBuilder::maybe_poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `ReliableConsumerOptions.pollIntervalMs` | keywords |
 | `ReliableConsumerBuilder::maybe_respond_on` | `Laser.spawn_agent(respond_on=)` | `ReliableConsumerOptions.respondOn` | keywords |
 | `ReliableConsumerBuilder::maybe_retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `ReliableConsumerOptions.retry` | keywords |
+| `ReliableConsumerBuilder::maybe_sessions` | `Laser.spawn_agent(sessions=)` | `ReliableConsumerOptions.sessions` | keywords |
 | `ReliableConsumerBuilder::maybe_shutdown_grace` | `Laser.spawn_agent(shutdown_grace_ms=)` | `ReliableConsumerOptions.shutdownGraceMs` | keywords |
 | `ReliableConsumerBuilder::maybe_signing_key` | `Laser.spawn_agent(signing_key=)` | `ReliableConsumerOptions.signingKey` | keywords |
 | `ReliableConsumerBuilder::maybe_understood_features` | `Laser.spawn_agent(understood_features=)` | `ReliableConsumerOptions.understoodFeatures` | keywords |
@@ -678,9 +755,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ReliableConsumerBuilder::maybe_warm_dedup` | `Laser.spawn_agent(warm_dedup=)` | `ReliableConsumerOptions.warmDedup` | keywords |
 | `ReliableConsumerBuilder::middleware` | `Laser.spawn_agent(middleware=)` | `ReliableConsumerOptions.middleware` | keywords |
 | `ReliableConsumerBuilder::on_dead_letter` | `Laser.spawn_agent(dead_letter=)` | `ReliableConsumerOptions.onDeadLetter` | keywords |
+| `ReliableConsumerBuilder::operations` | `Laser.spawn_agent(operations=)` | `ReliableConsumerOptions.operations` | keywords |
 | `ReliableConsumerBuilder::poll_interval` | `Laser.spawn_agent(poll_interval_ms=)` | `ReliableConsumerOptions.pollIntervalMs` | keywords |
 | `ReliableConsumerBuilder::respond_on` | `Laser.spawn_agent(respond_on=)` | `ReliableConsumerOptions.respondOn` | keywords |
 | `ReliableConsumerBuilder::retry` | `Laser.spawn_agent(retry_max_attempts=, retry_base_delay_ms=)` | `ReliableConsumerOptions.retry` | keywords |
+| `ReliableConsumerBuilder::sessions` | `Laser.spawn_agent(sessions=)` | `ReliableConsumerOptions.sessions` | keywords |
 | `ReliableConsumerBuilder::shutdown_grace` | `Laser.spawn_agent(shutdown_grace_ms=)` | `ReliableConsumerOptions.shutdownGraceMs` | keywords |
 | `ReliableConsumerBuilder::signing_key` | `Laser.spawn_agent(signing_key=)` | `ReliableConsumerOptions.signingKey` | keywords |
 | `ReliableConsumerBuilder::topic` | `Laser.spawn_agent(listen_on=)` | `ReliableConsumerOptions.topic` | keywords |
@@ -730,59 +809,274 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ScatterReport.outcomes` | `ScatterReport.outcomes` | `ScatterReport.outcomes` |  |
 | `ScatterReport::completed` | `ScatterReport.completed` | `ScatterReport.completed` |  |
 | `ScatterReport::failures` | `ScatterReport.failures` | `ScatterReport.failures` |  |
+| `SdkInfo` | `SdkInfo` | `wire.SdkInfo` |  |
+| `SdkInfo.language` | `SdkInfo.language` | `wire.SdkInfo.language` | keywords |
+| `SdkInfo.version` | `SdkInfo.version` | `wire.SdkInfo.version` | keywords |
 | `Session` | `Session` | `Session` |  |
+| `Session::acting_on` | `Session.acting_on` | `Session.actingOn` |  |
+| `Session::agent` | `Session.agent` | `Session.agent` | property |
 | `Session::append` | `Session.append` | `Session.append` |  |
+| `Session::as_agent` | `Session.as_agent` | `Session.asAgent` |  |
+| `Session::assemble` | `Session.assemble` | `Session.assemble` |  |
+| `Session::cancel` | `Session.cancel` | `Session.cancel` |  |
+| `Session::cancel_requested` | `Session.cancel_requested` | `Session.cancelRequested` |  |
 | `Session::checkpoint` | `Session.checkpoint` | `Session.checkpoint` |  |
 | `Session::config` | `Session.config` | `Session.config` | property |
 | `Session::context` | `Session.context` | `Session.context` |  |
 | `Session::context_with` | `Session.context_with` | `Session.contextWith` |  |
 | `Session::conversation` | `Session.conversation` | `Session.conversation` | property |
+| `Session::end` | `Session.end` | `Session.end` |  |
+| `Session::fail` | `Session.fail` | `Session.fail` |  |
 | `Session::graph` | `Session.graph` | `Session.graph` |  |
+| `Session::kv` | `Session.kv` | `Session.kv` |  |
+| `Session::linked_graph` | `Session.linked_graph` | `Session.linkedGraph` |  |
+| `Session::linked_memory` | `Session.linked_memory` | `Session.linkedMemory` |  |
 | `Session::memory` | `Session.memory` | `Session.memory` |  |
 | `Session::memory_in` | `Session.memory_in` | `Session.memory(namespace=)` | overload |
+| `Session::model` | `Session.model` | `Session.model` |  |
+| `Session::over_budget` | `Session.over_budget` | `Session.overBudget` |  |
+| `Session::parent` | `Session.parent` | `Session.parent` | property |
+| `Session::parked` | `Session.parked` | `Session.parked` |  |
+| `Session::pending_control` | `Session.pending_control` | `Session.pendingControl` |  |
+| `Session::record_compaction` | `Session.record_compaction` | `Session.recordCompaction` |  |
+| `Session::record_model_call` | `Session.record_model_call` | `Session.recordModelCall` |  |
+| `Session::record_retrieval` | `Session.record_retrieval` | `Session.recordRetrieval` |  |
+| `Session::redact` | `Session.redact` | `Session.redact` |  |
+| `Session::reference` | `Session.reference` | `Session.reference` |  |
 | `Session::replay` | `Session.replay` | `Session.replay` |  |
+| `Session::root` | `Session.root` | `Session.root` | property |
+| `Session::run` | `Session.run` | `Session.run` |  |
 | `Session::scope` | `Session.scope` | `Session.scope` | property |
+| `Session::signed_by` | `Session.signed_by` | `Session.signedBy` |  |
+| `Session::state` | `Session.state` | `Session.state` |  |
 | `Session::state_at` | `Session.state_at` | `Session.stateAt` |  |
+| `Session::status` | `Session.status` | `Session.status` |  |
+| `Session::stream` | `Session.stream` | `Session.stream` | property |
+| `Session::tool` | `Session.tool` | `Session.tool` |  |
 | `Session::turns_at` | `Session.turns_at` | `Session.turnsAt` |  |
 | `Session::turns_since` | `Session.turns_since` | `Session.turnsSince` |  |
+| `SessionBootstrap` | `SessionBootstrap` | `SessionBootstrap` |  |
+| `SessionBootstrap.registered` | `SessionBootstrap.registered` | `SessionBootstrap.registered` | keywords |
+| `SessionBuilder` | `SessionBuilder` | `SessionBuilder` |  |
+| `SessionBuilder::agent` | `SessionBuilder.agent` | `SessionBuilder.agent` |  |
+| `SessionBuilder::begin` | `SessionBuilder.begin` | `SessionBuilder.begin` |  |
+| `SessionBuilder::budget` | `SessionBuilder.budget` | `SessionBuilder.budget` |  |
+| `SessionBuilder::id` | `SessionBuilder.id` | `SessionBuilder.id` |  |
+| `SessionBuilder::idle_timeout` | `SessionBuilder.idle_timeout` | `SessionBuilder.idleTimeout` |  |
+| `SessionBuilder::namespace` | `SessionBuilder.namespace` | `SessionBuilder.namespace` |  |
+| `SessionBuilder::parent` | `SessionBuilder.parent` | `SessionBuilder.parent` |  |
+| `SessionBuilder::tag` | `SessionBuilder.tag` | `SessionBuilder.tag` |  |
+| `SessionBuilder::with_id` | `SessionBuilder.with_id` | `SessionBuilder.withId` |  |
+| `SessionChange` | `SessionChange` | `SessionChange` |  |
+| `SessionChange::Changed` | `SessionChange.Changed` | `SessionChange` | plain-value |
+| `SessionChange::Resync` | `SessionChange.Resync` | `SessionChange` | plain-value |
 | `SessionConfig` | `SessionConfig` | `SessionConfig` |  |
 | `SessionConfig::context_token_bound` | `SessionConfig.context_token_bound` | `SessionConfig.contextTokenBound` | property |
 | `SessionConfig::context_tokens` | `Laser.sessions(context_tokens=)` | `SessionConfig.contextTokens` | keywords |
 | `SessionConfig::context_turn_bound` | `SessionConfig.context_turn_bound` | `SessionConfig.contextTurnBound` | property |
 | `SessionConfig::context_turns` | `Laser.sessions(context_turns=)` | `SessionConfig.contextTurns` | keywords |
-| `SessionConfig::kind_for` | `SessionConfig.kind_for` | `SessionConfig.kindFor` |  |
+| `SessionConfig::fail_on_dead_letter` | `Laser.sessions(fail_on_dead_letter=)` | `SessionConfig.failOnDeadLetter` | keywords |
+| `SessionConfig::fails_on_dead_letter` | `SessionConfig.fails_on_dead_letter` | `SessionConfig.failsOnDeadLetter` | property |
+| `SessionConfig::heartbeat` | `Laser.sessions(heartbeat_ms=)` | `SessionConfig.heartbeat` | keywords |
+| `SessionConfig::heartbeat_value` | `SessionConfig.heartbeat_ms` | `SessionConfig.heartbeatValue` | property |
+| `SessionConfig::idle_timeout` | `Laser.sessions(idle_timeout_ms=)` | `SessionConfig.idleTimeout` | keywords |
+| `SessionConfig::idle_timeout_value` | `SessionConfig.idle_timeout_ms` | `SessionConfig.idleTimeoutValue` | property |
+| `SessionConfig::layout` | `Laser.sessions(layout=)` | `SessionConfig.layout` | keywords |
+| `SessionConfig::layout_kind` | `SessionConfig.layout` | `SessionConfig.layoutKind` | property |
 | `SessionConfig::memory_namespace` | `Laser.sessions(memory_namespace=)` | `SessionConfig.memoryNamespace` | keywords |
 | `SessionConfig::memory_namespace_name` | `SessionConfig.memory_namespace_name` | `SessionConfig.memoryNamespaceName` | property |
 | `SessionConfig::new` | `Laser.sessions` | `new SessionConfig()` | keywords, constructor |
+| `SessionConfig::register_source` | `Laser.sessions(register_source=)` | `SessionConfig.registerSource` | keywords |
+| `SessionConfig::registers_source` | `SessionConfig.registers_source` | `SessionConfig.registersSource` | property |
+| `SessionConfig::sdk` | `Laser.sessions(sdk=)` | `SessionConfig.sdk` | keywords |
+| `SessionConfig::sdk_info` | `SessionConfig.sdk` | `SessionConfig.sdkInfo` | property |
 | `SessionConfig::stream` | `Laser.sessions(stream=)` | `SessionConfig.stream` | keywords |
 | `SessionConfig::stream_name` | `SessionConfig.stream_name` | `SessionConfig.streamName` | property |
-| `SessionConfig::topic` | `Laser.sessions(topics=)` | `SessionConfig.topic` | keywords |
-| `SessionConfig::topic_for` | `SessionConfig.topic_for` | `SessionConfig.topicFor` |  |
-| `SessionConfig::topics` | `SessionConfig.topics` | `SessionConfig.topics` | property |
+| `SessionControl` | `SessionControl` | `SessionControl` |  |
+| `SessionControl::as_operator` | `SessionControl.as_operator` | `SessionControl.asOperator` |  |
+| `SessionControl::cancel` | `SessionControl.cancel` | `SessionControl.cancel` |  |
+| `SessionControl::force_cancel` | `SessionControl.force_cancel` | `SessionControl.forceCancel` |  |
+| `SessionControl::participants` | `SessionControl.participants` | `SessionControl.participants` |  |
+| `SessionControl::pause` | `SessionControl.pause` | `SessionControl.pause` |  |
+| `SessionControl::resume` | `SessionControl.resume` | `SessionControl.resume` |  |
+| `SessionControl::signed_by` | `SessionControl.signed_by` | `SessionControl.signedBy` |  |
+| `SessionEvent` | dict via `Sessions.events` | `wire.SessionEvent` | serde-dict |
+| `SessionEvent.at` | dict key | `wire.SessionEvent.at` | serde-dict, keywords |
+| `SessionEvent.session` | dict key | `wire.SessionEvent.session` | serde-dict, keywords |
+| `SessionEvent.broker_ts` | dict key | `wire.SessionEvent.brokerTs` | serde-dict, keywords |
+| `SessionEvent.kind` | dict key | `wire.SessionEvent.kind` | serde-dict, keywords |
+| `SessionEvent.operation` | dict key | `wire.SessionEvent.operation` | serde-dict, keywords |
+| `SessionEvent.display` | dict key | `wire.SessionEvent.display` | serde-dict, keywords |
+| `SessionEvent.agent` | dict key | `wire.SessionEvent.agent` | serde-dict, keywords |
+| `SessionEvent.addressee` | dict key | `wire.SessionEvent.addressee` | serde-dict, keywords |
+| `SessionEvent.correlation` | dict key | `wire.SessionEvent.correlation` | serde-dict, keywords |
+| `SessionEvent.cause` | dict key | `wire.SessionEvent.cause` | serde-dict, keywords |
+| `SessionEvent.tool` | dict key | `wire.SessionEvent.tool` | serde-dict, keywords |
+| `SessionEvent.usage` | dict key | `wire.SessionEvent.usage` | serde-dict, keywords |
+| `SessionEvent.after_end` | dict key | `wire.SessionEvent.afterEnd` | serde-dict, keywords |
+| `SessionEvent.verified_actor` | dict key | `wire.SessionEvent.verifiedActor` | serde-dict, keywords |
+| `SessionEvent.summary` | dict key | `wire.SessionEvent.summary` | serde-dict, keywords |
+| `SessionEventsPage` | dict via `Sessions.events` | `SessionEventsPage` | serde-dict |
+| `SessionEventsPage.items` | dict key | `SessionEventsPage.items` | serde-dict, keywords |
+| `SessionEventsPage.cursor` | dict key | `SessionEventsPage.cursor` | serde-dict, keywords |
+| `SessionEventsPage.ranges` | dict key | `SessionEventsPage.ranges` | serde-dict, keywords |
+| `SessionEventsPage.frontier` | dict key | `SessionEventsPage.frontier` | serde-dict, keywords |
+| `SessionEventsPage.fixed_frontier` | dict key | `SessionEventsPage.fixedFrontier` | serde-dict, keywords |
+| `SessionEventsPage.gaps` | dict key | `SessionEventsPage.gaps` | serde-dict, keywords |
+| `SessionEventsRequest` | `Sessions.events` | `SessionEventsRequest` | keywords |
+| `SessionEventsRequest::cursor` | `Sessions.events(cursor=)` | `SessionEventsRequest.cursor` | keywords |
+| `SessionEventsRequest::fetch` | `Sessions.events` | `SessionEventsRequest.fetch` | one-call |
+| `SessionEventsRequest::fixed_frontier` | `Sessions.events(fixed_frontier=)` | `SessionEventsRequest.fixedFrontier` | keywords |
+| `SessionEventsRequest::limit` | `Sessions.events(limit=)` | `SessionEventsRequest.limit` | keywords |
+| `SessionFlags` | dict via `Sessions.get` | `wire.SessionFlags` | serde-dict |
+| `SessionFlags.label_truncated` | dict key | `wire.SessionFlags.labelTruncated` | serde-dict, keywords |
+| `SessionFlags.overflow` | dict key | `wire.SessionFlags.overflow` | serde-dict, keywords |
+| `SessionFlags.events_truncated` | dict key | `wire.SessionFlags.eventsTruncated` | serde-dict, keywords |
+| `SessionFlags.lane_conflict` | dict key | `wire.SessionFlags.laneConflict` | serde-dict, keywords |
+| `SessionFlags.rebuilding` | dict key | `wire.SessionFlags.rebuilding` | serde-dict, keywords |
+| `SessionFlags.liveness_unknown` | dict key | `wire.SessionFlags.livenessUnknown` | serde-dict, keywords |
+| `SessionInfo` | dict via `Sessions.get` | `SessionInfo` | serde-dict |
+| `SessionInfo.stream` | dict key | `SessionInfo.stream` | serde-dict, keywords |
+| `SessionInfo.id` | dict key | `SessionInfo.id` | serde-dict, keywords |
+| `SessionInfo.label` | dict key | `SessionInfo.label` | serde-dict, keywords |
+| `SessionInfo.namespace` | dict key | `SessionInfo.namespace` | serde-dict, keywords |
+| `SessionInfo.agent` | dict key | `SessionInfo.agent` | serde-dict, keywords |
+| `SessionInfo.parent` | dict key | `SessionInfo.parent` | serde-dict, keywords |
+| `SessionInfo.root` | dict key | `SessionInfo.root` | serde-dict, keywords |
+| `SessionInfo.status` | dict key | `SessionInfo.status` | serde-dict, keywords |
+| `SessionInfo.idle` | dict key | `SessionInfo.idle` | serde-dict, keywords |
+| `SessionInfo.over_budget` | dict key | `SessionInfo.overBudget` | serde-dict, keywords |
+| `SessionInfo.pause_requested` | dict key | `SessionInfo.pauseRequested` | serde-dict, keywords |
+| `SessionInfo.cancel_requested` | dict key | `SessionInfo.cancelRequested` | serde-dict, keywords |
+| `SessionInfo.started_at` | dict key | `SessionInfo.startedAt` | serde-dict, keywords |
+| `SessionInfo.ended_at` | dict key | `SessionInfo.endedAt` | serde-dict, keywords |
+| `SessionInfo.first_event_at` | dict key | `SessionInfo.firstEventAt` | serde-dict, keywords |
+| `SessionInfo.last_event_at` | dict key | `SessionInfo.lastEventAt` | serde-dict, keywords |
+| `SessionInfo.last_heartbeat_at` | dict key | `SessionInfo.lastHeartbeatAt` | serde-dict, keywords |
+| `SessionInfo.events` | dict key | `SessionInfo.events` | serde-dict, keywords |
+| `SessionInfo.model_calls` | dict key | `SessionInfo.modelCalls` | serde-dict, keywords |
+| `SessionInfo.tool_calls` | dict key | `SessionInfo.toolCalls` | serde-dict, keywords |
+| `SessionInfo.tokens_in` | dict key | `SessionInfo.tokensIn` | serde-dict, keywords |
+| `SessionInfo.tokens_out` | dict key | `SessionInfo.tokensOut` | serde-dict, keywords |
+| `SessionInfo.cost_micros` | dict key | `SessionInfo.costMicros` | serde-dict, keywords |
+| `SessionInfo.errors` | dict key | `SessionInfo.errors` | serde-dict, keywords |
+| `SessionInfo.budget` | dict key | `SessionInfo.budget` | serde-dict, keywords |
+| `SessionInfo.sdk` | dict key | `SessionInfo.sdk` | serde-dict, keywords |
+| `SessionInfo.flags` | dict key | `SessionInfo.flags` | serde-dict, keywords |
+| `SessionInfo.held` | dict key | `SessionInfo.held` | serde-dict, keywords |
+| `SessionInfo.frontier` | dict key | `SessionInfo.frontier` | serde-dict, keywords |
+| `SessionLayout` | `SessionLayout` | `SessionLayout` |  |
+| `SessionLayout::Shared` | `SessionLayout.Shared` | `SessionLayout` | plain-value |
+| `SessionLayout::PerAgentTopic` | `SessionLayout.PerAgentTopic` | `SessionLayout` | plain-value |
+| `SessionLayout::PerAgentPartition` | `SessionLayout.PerAgentPartition` | `SessionLayout` | plain-value |
+| `SessionLayout::SinglePartition` | `SessionLayout.SinglePartition` | `SessionLayout` | plain-value |
+| `SessionLayout::per_agent_partition` | `SessionLayout.PerAgentPartition` | omitted | constructor, plain-value |
+| `SessionLayout::per_agent_topic` | `SessionLayout.PerAgentTopic` | omitted | constructor, plain-value |
+| `SessionLease` | `SessionLease` | `SessionLease` |  |
+| `SessionLease::release` | `SessionLease.release` | `SessionLease.release` |  |
+| `SessionLease::session` | `SessionLease.session` | `SessionLease.session` | property |
+| `SessionLease::stream` | `SessionLease.stream` | `SessionLease.stream` | property |
+| `SessionLink` | dict via `Sessions.links` | `wire.SessionLink` | serde-dict |
+| `SessionLink.surface` | dict key | `wire.SessionLink.surface` | serde-dict, keywords |
+| `SessionLink.resource` | dict key | `wire.SessionLink.resource` | serde-dict, keywords |
+| `SessionLink.item` | dict key | `wire.SessionLink.item` | serde-dict, keywords |
+| `SessionLink.relation` | dict key | `wire.SessionLink.relation` | serde-dict, keywords |
+| `SessionLink.first` | dict key | `wire.SessionLink.first` | serde-dict, keywords |
+| `SessionLink.last` | dict key | `wire.SessionLink.last` | serde-dict, keywords |
+| `SessionLinksView` | dict via `Sessions.links` | `SessionLinksView` | serde-dict |
+| `SessionLinksView.links` | dict key | `SessionLinksView.links` | serde-dict, keywords |
+| `SessionLinksView.frontier` | dict key | `SessionLinksView.frontier` | serde-dict, keywords |
+| `SessionLinksView.truncated` | dict key | `SessionLinksView.truncated` | serde-dict, keywords |
+| `SessionListRequest` | `Sessions.list` | `SessionListRequest` | keywords |
+| `SessionListRequest::agent` | `Sessions.list(agent=)` | `SessionListRequest.agent` | keywords |
+| `SessionListRequest::cursor` | `Sessions.list(cursor=)` | `SessionListRequest.cursor` | keywords |
+| `SessionListRequest::fetch` | `Sessions.list` | `SessionListRequest.fetch` | one-call |
+| `SessionListRequest::label_prefix` | `Sessions.list(label_prefix=)` | `SessionListRequest.labelPrefix` | keywords |
+| `SessionListRequest::limit` | `Sessions.list(limit=)` | `SessionListRequest.limit` | keywords |
+| `SessionListRequest::root` | `Sessions.list(root=)` | `SessionListRequest.root` | keywords |
+| `SessionListRequest::status` | `Sessions.list(status=)` | `SessionListRequest.status` | keywords |
+| `SessionListRequest::text` | `Sessions.list(text=)` | `SessionListRequest.text` | keywords |
+| `SessionListRequest::total` | `Sessions.list(total=)` | `SessionListRequest.total` | keywords |
+| `SessionPage` | dict via `Sessions.list` | `SessionPage` | serde-dict |
+| `SessionPage.items` | dict key | `SessionPage.items` | serde-dict, keywords |
+| `SessionPage.cursor` | dict key | `SessionPage.cursor` | serde-dict, keywords |
+| `SessionPage.total` | dict key | `SessionPage.total` | serde-dict, keywords |
+| `SessionPage.searched` | dict key | `SessionPage.searched` | serde-dict, keywords |
+| `SessionPage.truncated` | dict key | `SessionPage.truncated` | serde-dict, keywords |
+| `SessionParking` | dict via `ParkedRecords.records` | `wire.SessionParking` | serde-dict |
+| `SessionParking.source` | dict key | `wire.SessionParking.source` | serde-dict, keywords |
+| `SessionParking.role` | dict key | `wire.SessionParking.role` | serde-dict, keywords |
+| `SessionParking.request` | dict key | `wire.SessionParking.request` | serde-dict, keywords |
 | `SessionPolicy` | omitted | `SessionPolicy` | plain-value |
 | `SessionPolicy::PerCall` | omitted | `SessionPolicy` | plain-value |
 | `SessionPolicy::PerUser` | omitted | `SessionPolicy` | plain-value |
 | `SessionPolicy::conversation_for` | `fn:session_policy_conversation_for` | `fn:conversationFor` | free-function |
+| `SessionState` | `SessionState` | `SessionState` |  |
+| `SessionState::get` | `SessionState.get` | `SessionState.get` |  |
+| `SessionState::patch` | `SessionState.patch` | `SessionState.patch` |  |
+| `SessionState::replace` | `SessionState.replace` | `SessionState.replace` |  |
+| `SessionState::set` | `SessionState.set` | `SessionState.set` |  |
+| `SessionState::snapshot` | `SessionState.snapshot` | `SessionState.snapshot` |  |
+| `SessionStateView` | dict via `SessionState.get` | `SessionStateView` | serde-dict |
+| `SessionStateView.revision` | dict key | `SessionStateView.revision` | serde-dict, keywords |
+| `SessionStateView.document` | dict key | `SessionStateView.document` | serde-dict, keywords |
+| `SessionStateView.history` | dict key | `SessionStateView.history` | serde-dict, keywords |
+| `SessionStateView.frontier` | dict key | `SessionStateView.frontier` | serde-dict, keywords |
+| `SessionStateView.complete` | dict key | `SessionStateView.complete` | serde-dict, keywords |
 | `SessionTurn` | `SessionTurn` | `SessionTurn` |  |
-| `SessionTurn.kind` | `SessionTurn.kind` | `SessionTurn.kind` | keywords |
+| `SessionTurn.display` | `SessionTurn.display` | `SessionTurn.display` | keywords |
 | `SessionTurn.message` | `SessionTurn.message` | `SessionTurn.message` | keywords |
 | `SessionTurn::text` | `SessionTurn.text` | `fn:sessionTurnText` | free-function |
-| `SessionTurnKind` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::Instruction` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::Response` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::ModelResponse` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::ToolCall` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::ToolResult` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::HumanInput` | omitted | `SessionTurnKind` | plain-value |
-| `SessionTurnKind::for_topic` | `Sessions.turn_kind` | `fn:sessionTurnKind` | free-function |
-| `SessionTurnKind::topic` | `Sessions.turn_topic` | `fn:sessionTurnTopic` | free-function |
+| `SessionWatch` | `SessionWatch` | `SessionWatch` |  |
+| `SessionWatch::next` | `SessionWatch.next` | `SessionWatch.next` |  |
 | `Sessions` | `Sessions` | `Sessions` |  |
+| `Sessions::bootstrap` | `Sessions.bootstrap` | `Sessions.bootstrap` |  |
+| `Sessions::changes` | `Sessions.changes` | `Sessions.changes` |  |
 | `Sessions::config` | `Sessions.config` | `Sessions.config` | property |
+| `Sessions::control` | `Sessions.control` | `Sessions.control` |  |
 | `Sessions::create` | `Sessions.create` | `Sessions.create` |  |
+| `Sessions::events` | `Sessions.events` | `Sessions.events` |  |
+| `Sessions::get` | `Sessions.get` | `Sessions.get` |  |
+| `Sessions::links` | `Sessions.links` | `Sessions.links` |  |
+| `Sessions::list` | `Sessions.list` | `Sessions.list` |  |
 | `Sessions::open` | `Sessions.open` | `Sessions.open` |  |
+| `Sessions::sources` | `Sessions.sources` | `Sessions.sources` |  |
 | `Sessions::start` | `Sessions.start` | `Sessions.start` |  |
+| `Sessions::state` | `Sessions.state` | `Sessions.state` |  |
+| `Sessions::stream` | `Sessions.stream` | `Sessions.stream` | property |
+| `Sessions::submit` | `Sessions.submit` | `Sessions.submit` |  |
+| `Sessions::watch` | `Sessions.watch` | `Sessions.watch` |  |
 | `SlidingWindow` | `Laser.spawn_agent(dedup_window=)` | `SlidingWindow` | keywords |
 | `SlidingWindow::new` | `Laser.spawn_agent` | `new SlidingWindow()` | keywords, constructor |
+| `SourceFrontier` | dict via `SessionState.get` | `wire.SourceFrontier` | serde-dict |
+| `SourceFrontier.topic_id` | dict key | `wire.SourceFrontier.topicId` | serde-dict, keywords |
+| `SourceFrontier.topic_generation` | dict key | `wire.SourceFrontier.topicGeneration` | serde-dict, keywords |
+| `SourceFrontier.partition_id` | dict key | `wire.SourceFrontier.partitionId` | serde-dict, keywords |
+| `SourceFrontier.folded` | dict key | `wire.SourceFrontier.folded` | serde-dict, keywords |
+| `SourceFrontier.head` | dict key | `wire.SourceFrontier.head` | serde-dict, keywords |
+| `SourceFrontier.retained_from` | dict key | `wire.SourceFrontier.retainedFrom` | serde-dict, keywords |
+| `SourceGap` | dict via `Sessions.events` | `wire.SourceGap` | serde-dict |
+| `SourceGap.topic_id` | dict key | `wire.SourceGap.topicId` | serde-dict, keywords |
+| `SourceGap.topic_generation` | dict key | `wire.SourceGap.topicGeneration` | serde-dict, keywords |
+| `SourceGap.partition_id` | dict key | `wire.SourceGap.partitionId` | serde-dict, keywords |
+| `SourceGap.from` | dict key | `wire.SourceGap.from` | serde-dict, keywords |
+| `SourceGap.to` | dict key | `wire.SourceGap.to` | serde-dict, keywords |
+| `SourceGap.reason` | dict key | `wire.SourceGap.reason` | serde-dict, keywords |
+| `StateChange` | dict via `SessionState.get` | `wire.StateChange` | serde-dict |
+| `StateChange.revision` | dict key | `wire.StateChange.revision` | serde-dict, keywords |
+| `StateChange.op_id` | dict key | `wire.StateChange.opId` | serde-dict, keywords |
+| `StateChange.outcome` | dict key | `wire.StateChange.outcome` | serde-dict, keywords |
+| `StateChange.at` | dict key | `wire.StateChange.at` | serde-dict, keywords |
+| `StateChange.broker_ts` | dict key | `wire.StateChange.brokerTs` | serde-dict, keywords |
+| `StateChange.old_digest` | dict key | `wire.StateChange.oldDigest` | serde-dict, keywords |
+| `StateChange.new_digest` | dict key | `wire.StateChange.newDigest` | serde-dict, keywords |
+| `StateChange.reason` | dict key | `wire.StateChange.reason` | serde-dict, keywords |
+| `StateOutcome` | omitted | `wire.StateOutcome` | plain-value |
+| `StateOutcome::Applied` | omitted | `wire.StateOutcome` | plain-value |
+| `StateOutcome::Rejected` | omitted | `wire.StateOutcome` | plain-value |
+| `StateOutcome::Stale` | omitted | `wire.StateOutcome` | plain-value |
+| `StateOutcome::Duplicate` | omitted | `wire.StateOutcome` | plain-value |
+| `StateOutcome::Unrecognized` | omitted | `wire.StateOutcome` | plain-value |
 | `StepContext` | `Workflow.step(build=)` | `StepContext` | callback |
 | `StepContext.outputs` | `Workflow.step(build=)` | `StepContext.outputs` | callback, keywords |
 | `StepFn` | `Workflow.step(build=)` | `StepFn` | callback |
@@ -795,7 +1089,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `StepHandle::exclusive_in` | `Workflow.step(fence_namespace=)` | `StepHandle.exclusiveIn` | keywords |
 | `StepHandle::inbox_route` | `Laser.workflow(fixed_inbox=)` | `StepHandle.inboxRoute` | keywords |
 | `StepHandle::on_timeout` | `Workflow.step(on_timeout=)` | `StepHandle.onTimeout` | keywords |
-| `StepHandle::registered` | `Workflow.registered` | `StepHandle.registered` | native-binding |
 | `StepHandle::run` | `Workflow.step` | `StepHandle.run` | one-call |
 | `StepHandle::run_id` | `Workflow.run_id` | `StepHandle.runId` | native-binding |
 | `StepHandle::step` | `Workflow.step` | `StepHandle.step` | keywords |
@@ -804,25 +1097,53 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `StreamEvent::Body` | dict key | `StreamEvent` | serde-dict, plain-value |
 | `StreamEvent::Finished` | dict key | `StreamEvent` | serde-dict, plain-value |
 | `StreamEvent::Failed` | dict key | `StreamEvent` | serde-dict, plain-value |
+| `SubmitBuilder` | `SubmitBuilder` | `SubmitBuilder` |  |
+| `SubmitBuilder::budget` | `SubmitBuilder.budget` | `SubmitBuilder.budget` |  |
+| `SubmitBuilder::from` | `SubmitBuilder.from_` | `SubmitBuilder.from` |  |
+| `SubmitBuilder::label` | `SubmitBuilder.label` | `SubmitBuilder.label` |  |
+| `SubmitBuilder::namespace` | `SubmitBuilder.namespace` | `SubmitBuilder.namespace` |  |
+| `SubmitBuilder::operation` | `SubmitBuilder.operation` | `SubmitBuilder.operation` |  |
+| `SubmitBuilder::send` | `SubmitBuilder.send` | `SubmitBuilder.send` |  |
+| `SubmitBuilder::tag` | `SubmitBuilder.tag` | `SubmitBuilder.tag` |  |
+| `Submitted` | `Submitted` | `Submitted` |  |
+| `Submitted.session` | `Submitted.session` | `Submitted.session` | keywords |
+| `Submitted.correlation` | `Submitted.correlation` | `Submitted.correlation` | keywords |
 | `SystemClock` | `SystemClock` | `SystemClock` |  |
 | `TestClock` | `TestClock` | `TestClock` |  |
 | `TestClock::advance` | `TestClock.advance` | `TestClock.advance` |  |
 | `TestClock::new` | `new TestClock()` | `new TestClock()` | constructor |
 | `TestClock::set` | `TestClock.set` | `TestClock.set` |  |
+| `ToolCall` | `ToolCall` | `ToolCall` |  |
+| `ToolCall::complete` | `ToolCall.complete` | `ToolCall.complete` |  |
+| `ToolCall::correlation` | `ToolCall.correlation` | `ToolCall.correlation` | property |
+| `ToolCall::fail` | `ToolCall.fail` | `ToolCall.fail` |  |
+| `TopicRetention` | `TopicRetention` | `TopicRetention` |  |
+| `TopicRetention::expire_after` | `TopicRetention.expire_after` | `TopicRetention.expireAfter` |  |
+| `TopicRetention::expiry` | `TopicRetention.expiry_ms` | `TopicRetention.expiry` | property |
+| `TopicRetention::max_size` | `TopicRetention.max_size` | `TopicRetention.maxSize` | property |
+| `TopicRetention::new` | `new TopicRetention(expiry_ms=, max_size=)` | `TopicRetention.new` | keywords |
 | `Verifier` | `Workflow.step(verify=)` | `Verifier` | callback |
 | `Verifier::verify` | `Workflow.step(verify=)` | `Verifier` | callback |
 | `agent::WORKFLOW_FENCE_NAMESPACE` | `const:WORKFLOW_FENCE_NAMESPACE` | `const:WORKFLOW_FENCE_NAMESPACE` |  |
 | `Workflow` | `Workflow` | `Workflow` |  |
 | `Workflow::budget` | `Workflow.budget` | `Workflow.budget` |  |
 | `Workflow::inbox_route` | `Laser.workflow(fixed_inbox=)` | `Workflow.inboxRoute` | keywords |
-| `Workflow::registered` | `Workflow.registered` | `Workflow.registered` |  |
 | `Workflow::run` | `Workflow.run` | `Workflow.run` |  |
 | `Workflow::run_id` | `Workflow.run_id` | `Workflow.runId` |  |
 | `Workflow::step` | `Workflow.step` | `Workflow.step` | keywords |
+| `WorkflowBudget` | `WorkflowBudget` | `WorkflowBudget` |  |
+| `WorkflowBudget::invocations` | `WorkflowBudget.invocations` | `WorkflowBudget.invocations` |  |
+| `WorkflowBudget::tokens` | `WorkflowBudget.tokens` | `WorkflowBudget.tokens` | constructor |
+| `WorkflowBudget::unlimited` | `WorkflowBudget.unlimited` | `WorkflowBudget.unlimited` |  |
+| `WorkflowBudget::wall_clock` | `WorkflowBudget.wall_clock` | `WorkflowBudget.wallClock` |  |
 | `WorkflowOutcome` | `WorkflowOutcome` | `WorkflowOutcome` |  |
 | `WorkflowOutcome.outputs` | `WorkflowOutcome.outputs` | `WorkflowOutcome.outputs` | keywords |
 | `WorkflowOutcome.run_id` | `WorkflowOutcome.run_id` | `WorkflowOutcome.runId` | keywords |
+| `agent::checkpoint_from_snapshot` | `fn:checkpoint_from_snapshot` | `fn:checkpointFromSnapshot` |  |
+| `agent::default_redact` | `fn:default_redact` | `fn:defaultRedact` |  |
+| `agent::derive_session_id` | `fn:derive_session_id` | `fn:deriveSessionId` |  |
 | `agent::resume_offsets` | `fn:resume_offsets` | `fn:resumeOffsets` |  |
+| `agent::snapshot_from_checkpoint` | `fn:snapshot_from_checkpoint` | `fn:snapshotFromCheckpoint` |  |
 
 ## agui
 
@@ -956,7 +1277,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Capabilities.graph` | `Capabilities.graph` | `Capabilities.graph` | keywords |
 | `Capabilities.forks` | `Capabilities.forks` | `Capabilities.forks` | keywords |
 | `Capabilities.a2a_gateway` | `Capabilities.a2a_gateway` | `Capabilities.a2aGateway` | keywords |
-| `Capabilities.agent_workflow` | `Capabilities.agent_workflow` | `Capabilities.agentWorkflow` | keywords |
+| `Capabilities.sessions` | `Capabilities.sessions` | `Capabilities.sessions` | keywords |
+| `Capabilities.stream_tenancy` | `Capabilities.stream_tenancy` | `Capabilities.streamTenancy` | keywords |
 | `Capabilities.watch` | `Capabilities.watch` | `Capabilities.watch` | keywords |
 | `Capabilities.authz` | `Capabilities.authz` | `Capabilities.authz` | keywords |
 | `Capabilities.filters` | `Capabilities.filters` | `Capabilities.filters` | keywords |
@@ -972,7 +1294,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Capabilities::serves_consistency` | `Capabilities.serves_consistency` | `fn:servesConsistency` | free-function |
 | `Capabilities::unready_backends` | `Capabilities.unready_backends` | `fn:unreadyBackends` | free-function |
 | `Capabilities::with_a2a_gateway` | `Laser.with_capabilities(a2a_gateway=)` | `Capabilities.a2aGateway` | keywords |
-| `Capabilities::with_agent_workflow` | `Laser.with_capabilities(agent_workflow=)` | `Capabilities.agentWorkflow` | keywords |
 | `Capabilities::with_backends` | `Laser.with_capabilities(backends=)` | `Capabilities.backends` | keywords |
 | `Capabilities::with_destination_consistency` | `Laser.with_capabilities(destinations_consistency=)` | `DestinationCaps.consistency` | keywords |
 | `Capabilities::with_destinations` | `Laser.with_capabilities(destinations=)` | `DestinationCaps.available` | keywords |
@@ -988,6 +1309,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Capabilities::with_query_consistency` | `Laser.with_capabilities(query_consistency=)` | `QueryCaps.consistency` | keywords |
 | `Capabilities::with_query_execution` | `Laser.with_capabilities(query_execution=)` | `QueryCaps.cursorPaging` | keywords |
 | `Capabilities::with_query_keyword` | `Laser.with_capabilities(query_keyword=)` | `QueryCaps.keyword` | keywords |
+| `Capabilities::with_sessions` | `Laser.with_capabilities(sessions=)` | `Capabilities.sessions` | keywords |
+| `Capabilities::with_stream_tenancy` | `Laser.with_capabilities(stream_tenancy=)` | `Capabilities.streamTenancy` | keywords |
 | `Capabilities::with_versions` | `Laser.with_capabilities(versions=)` | `Capabilities.versions` | keywords |
 | `DestinationCaps` | `DestinationCaps` | `DestinationCaps` |  |
 | `DestinationCaps.available` | `DestinationCaps.available` | `DestinationCaps.available` | keywords |
@@ -1075,6 +1398,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Checkpoint` | `Checkpoint` | `Checkpoint` |  |
 | `Checkpoint::is_empty` | `Checkpoint.is_empty` | `Checkpoint.isEmpty` |  |
 | `Checkpoint::topic_offsets` | `Checkpoint.topic_offsets` | `Checkpoint.topicOffsets` |  |
+| `Checkpoint::topics` | `Checkpoint.topics` | `Checkpoint.topics` |  |
 | `ContextAssembler` | `Laser.assemble_context` | `ContextAssembler` | keywords |
 | `ContextAssembler::assemble` | `Laser.assemble_context` | `ContextAssembler.assemble` | one-call |
 | `ContextAssembler::builder` | `Laser.assemble_context` | `ContextAssembler.builder` | keywords |
@@ -1099,10 +1423,20 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ContextMessage.payload` | `ContextMessage.payload` | `ContextMessage.payload` | keywords |
 | `ContextMessage.envelope` | `ContextMessage.envelope` | `ContextMessage.envelope` | keywords |
 | `ContextMessage.topic` | `ContextMessage.topic` | `ContextMessage.topic` | keywords |
+| `ContextMessage.timestamp_micros` | `ContextMessage.timestamp_micros` | `ContextMessage.timestampMicros` | keywords |
+| `ContextMessage.stream_id` | `ContextMessage.stream_id` | `ContextMessage.streamId` | keywords |
+| `ContextMessage.topic_id` | `ContextMessage.topic_id` | `ContextMessage.topicId` | keywords |
 | `ContextPolicy` | `Laser.assemble_context(policy=)` | `ContextPolicy` | callback |
 | `ContextPolicy::select` | `Laser.assemble_context(policy=)` | `ContextPolicy.select` | callback, keywords |
+| `ContextPolicy::name` | `Laser.assemble_context(policy=)` | `ContextPolicy.name` | callback, keywords |
+| `ContextPolicy::version` | `Laser.assemble_context(policy=)` | `ContextPolicy.version` | callback, keywords |
+| `ContextPolicy::selection` | `Laser.assemble_context(policy=)` | `ContextPolicy.selection` | callback, keywords |
 | `LastN` | `LastN` | `LastN` |  |
 | `RoleFilter` | `RoleFilter` | `RoleFilter` |  |
+| `Selection` | `Selection` | `Selection` |  |
+| `Selection.kept` | `Selection.kept` | `Selection.kept` | keywords |
+| `Selection.dropped` | `Selection.dropped` | `Selection.dropped` | keywords |
+| `Selection.reason` | `Selection.reason` | `Selection.reason` | keywords |
 | `TokenBudget` | `TokenBudget` | `TokenBudget` |  |
 | `TokenBudget::new` | `new TokenBudget()` | `new TokenBudget()` | constructor |
 | `TokenBudget::with_estimator` | `new TokenBudget(estimator=)` | `new TokenBudget(estimate=)` | overload |
@@ -1122,19 +1456,23 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ContextScope::graph` | `ContextScope.graph` | `ContextScope.graph` |  |
 | `ContextScope::laser` | `ContextScope.laser` | `ContextScope.laser` | property |
 | `ContextScope::memory` | `ContextScope.memory` | `ContextScope.memory` |  |
-| `ContextScope::memory_with` | `ContextScope.memory_with` | `ContextScope.memory` | overload |
+| `ContextScope::memory_with` | `ContextScope.memory_with` | `ContextScope.memoryWith` |  |
 | `ContextScope::state` | `ContextScope.state` | `ContextScope.state` |  |
 | `ContextScope::state_with` | `ContextScope.state_with` | `ContextScope.stateWith` |  |
 | `ScopedMemory` | `ScopedMemory` | `ScopedMemory` |  |
 | `ScopedMemory::block` | `ScopedMemory.block` | `ScopedMemory.block` |  |
 | `ScopedMemory::consolidate` | `ScopedMemory.consolidate` | `ScopedMemory.consolidate` |  |
+| `ScopedMemory::consolidate_with` | `ScopedMemory.consolidate(summarizer=, prune_summarized=)` | `ScopedMemory.consolidate` | overload |
 | `ScopedMemory::conversation` | `ScopedMemory.conversation` | `ScopedMemory.conversation` | property |
 | `ScopedMemory::forget` | `ScopedMemory.forget` | `ScopedMemory.forget` |  |
 | `ScopedMemory::handle` | `ScopedMemory.handle` | `ScopedMemory.handle` | property |
 | `ScopedMemory::improve` | `ScopedMemory.improve` | `ScopedMemory.improve` |  |
+| `ScopedMemory::origin` | `ScopedMemory.origin` | `ScopedMemory.origin` | property |
+| `ScopedMemory::producer` | `ScopedMemory.producer` | `ScopedMemory.producer` | property |
 | `ScopedMemory::recall` | `ScopedMemory.recall` | `ScopedMemory.recall` |  |
 | `ScopedMemory::remember` | `ScopedMemory.remember` | `ScopedMemory.remember` |  |
 | `ScopedMemory::search` | `ScopedMemory.search` | `ScopedMemory.search` |  |
+| `ScopedMemory::with_lineage` | `ScopedMemory.with_lineage` | `ScopedMemory.withLineage` |  |
 
 ## crash_context
 
@@ -1280,6 +1618,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsumerFilter.foreign_policy` | `ConsumerFilter.foreign_policy` | `ConsumerFilter.foreignPolicy` |  |
 | `ConsumerFilter.mismatch_policy` | `ConsumerFilter.mismatch_policy` | `ConsumerFilter.mismatchPolicy` |  |
 | `ConsumerFilter.schema_refs` | `ConsumerFilter.schema_refs` | `ConsumerFilter.schemaRefs` |  |
+| `ConsumerFilter.schema_stream` | `ConsumerFilter.schema_stream` | `ConsumerFilter.schemaStream` |  |
 | `ConsumerFilter::avro` | `ConsumerFilter.avro` | `ConsumerFilter.avro` |  |
 | `ConsumerFilter::cbor` | `ConsumerFilter.cbor` | `ConsumerFilter.cbor` |  |
 | `ConsumerFilter::digest` | `ConsumerFilter.digest` | `ConsumerFilter.digest` | property |
@@ -1289,6 +1628,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsumerFilter::with_fault_policy` | `ConsumerFilter.with_fault_policy` | `ConsumerFilter.withFaultPolicy` |  |
 | `ConsumerFilter::with_foreign_policy` | `ConsumerFilter.with_foreign_policy` | `ConsumerFilter.withForeignPolicy` |  |
 | `ConsumerFilter::with_mismatch_policy` | `ConsumerFilter.with_mismatch_policy` | `ConsumerFilter.withMismatchPolicy` |  |
+| `ConsumerFilter::with_schema_stream` | `ConsumerFilter.with_schema_stream` | `ConsumerFilter.withSchemaStream` |  |
 | `Continuation` | dict via `ConsumerGroup.reader` | `Continuation` | serde-dict |
 | `Continuation.group_id` | dict key | `Continuation.groupId` | serde-dict, keywords |
 | `Continuation.next_scan_offset` | dict key | `Continuation.nextScanOffset` | serde-dict, keywords |
@@ -1297,7 +1637,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Continuation.read_mode` | dict key | `Continuation.readMode` | serde-dict, keywords |
 | `Continuation.mode` | dict key | `Continuation.mode` | serde-dict, keywords |
 | `Continuation.policy_generation` | dict key | `Continuation.policyGeneration` | serde-dict, keywords |
-| `filters::DEFAULT_OUTCOME_WAIT` | `const:DEFAULT_OUTCOME_WAIT_SECS` | `const:DEFAULT_OUTCOME_WAIT_MS` |  |
+| `filters::DEFAULT_OUTCOME_WAIT` | `const:DEFAULT_OUTCOME_WAIT_MS` | `const:DEFAULT_OUTCOME_WAIT_MS` |  |
 | `DecodeLimits` | `CompiledFilter.evaluate` | `DecodeLimits` | keywords |
 | `DecodeLimits.max_payload_bytes` | `CompiledFilter.evaluate(max_payload_bytes=)` | `DecodeLimits.maxPayloadBytes` | keywords |
 | `DecodeLimits.max_depth` | `CompiledFilter.evaluate(max_depth=)` | `DecodeLimits.maxDepth` | keywords |
@@ -1464,7 +1804,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilteredReader::close` | `FilteredReader.close` | `FilteredReader.close` |  |
 | `FilteredReader::data_connections_opened` | `FilteredReader.data_connections_opened` | `FilteredReader.dataConnectionsOpened` |  |
 | `FilteredReader::examined_in_round` | `FilteredReader.examined_in_round` | `FilteredReader.examinedInRound` |  |
-| `FilteredReader::idle_interval` | `FilteredReader.idle_interval` | `FilteredReader.idleIntervalMs` |  |
+| `FilteredReader::idle_interval` | `FilteredReader.idle_interval_ms` | `FilteredReader.idleIntervalMs` |  |
 | `FilteredReader::next_page` | `FilteredReader.next_page` | `FilteredReader.nextPage` |  |
 | `FilteredReader::next_record` | `FilteredReader.next_record` | `FilteredReader.nextRecord` |  |
 | `FilteredReader::owns` | `FilteredReader.owns` | `FilteredReader.owns` |  |
@@ -1474,7 +1814,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilteredReaderBuilder` | `ConsumerGroup.reader` | `FilteredReaderBuilder` | keywords |
 | `FilteredReaderBuilder::build` | `ConsumerGroup.reader` | `FilteredReaderBuilder.build` | one-call |
 | `FilteredReaderBuilder::count` | `ConsumerGroup.reader(count=)` | `FilteredReaderBuilder.count` | keywords |
-| `FilteredReaderBuilder::idle_interval` | `ConsumerGroup.reader(idle_interval=)` | `FilteredReaderBuilder.idleInterval` | keywords |
+| `FilteredReaderBuilder::idle_interval` | `ConsumerGroup.reader(idle_interval_ms=)` | `FilteredReaderBuilder.idleInterval` | keywords |
 | `FilteredReaderBuilder::local_guard` | `ConsumerGroup.reader(local_guard=)` | `FilteredReaderBuilder.localGuard` | keywords |
 | `FilteredReaderBuilder::max_examined` | `ConsumerGroup.reader(max_examined=)` | `FilteredReaderBuilder.maxExamined` | keywords |
 | `FilteredReaderBuilder::max_reply_bytes` | `ConsumerGroup.reader(max_reply_bytes=)` | `FilteredReaderBuilder.maxReplyBytes` | keywords |
@@ -1628,6 +1968,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ForkHandle::id` | `ForkHandle.id` | `ForkHandle.id` | property |
 | `ForkHandle::promote` | `ForkHandle.promote` | `ForkHandle.promote` |  |
 | `ForkHandle::put_row` | `ForkHandle.put_row` | `ForkHandle.putRow` |  |
+| `ForkHandle::resource_id` | `ForkHandle.resource_id` | `ForkHandle.resourceId` | property |
 | `ForkHandle::squash` | `ForkHandle.squash` | `ForkHandle.squash` |  |
 | `ForkInfo` | dict via `ForkHandle.create` | `ForkInfo` | serde-dict |
 | `ForkInfo.fork_id` | dict key | `ForkInfo.forkId` | serde-dict, keywords |
@@ -1710,7 +2051,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `GovernorMode::as_str` | omitted | omitted | plain-value |
 | `GovernorRetention` | `GovernorRetention` | `GovernorRetention` |  |
 | `GovernorRetention.capacity` | `GovernorRetention.capacity` | `GovernorRetention.capacity` | keywords |
-| `GovernorRetention.idle_ttl` | `GovernorRetention.idle_ttl_secs` | `GovernorRetention.idleTtlMs` | keywords |
+| `GovernorRetention.idle_ttl` | `GovernorRetention.idle_ttl_ms` | `GovernorRetention.idleTtlMs` | keywords |
 | `govern::POLICY_DECISION_OPERATION` | `const:POLICY_DECISION_OPERATION` | `const:POLICY_DECISION_OPERATION` |  |
 | `PolicyEvidence` | `PolicyEvidence` | `PolicyEvidence` |  |
 | `PolicyEvidence.decision_id` | `PolicyEvidence.decision_id` | `PolicyEvidence.decisionId` | keywords |
@@ -1770,15 +2111,18 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `GraphHandle::both` | `GraphHandle.both` | `GraphHandle.both` |  |
 | `GraphHandle::conversation` | `GraphHandle.conversation` | `GraphHandle.conversation` |  |
 | `GraphHandle::fetch` | `GraphHandle.fetch` | `GraphHandle.fetch` |  |
+| `GraphHandle::in_session` | `GraphHandle.in_session` | `GraphHandle.inSession` |  |
 | `GraphHandle::incoming` | `GraphHandle.incoming` | `GraphHandle.incoming` |  |
 | `GraphHandle::limit` | `GraphHandle.limit` | `GraphHandle.limit` |  |
 | `GraphHandle::link` | `GraphHandle.link` | `GraphHandle.link` |  |
 | `GraphHandle::neighbors` | `GraphHandle.neighbors` | `GraphHandle.neighbors` |  |
 | `GraphHandle::out` | `GraphHandle.out` | `GraphHandle.out` |  |
+| `GraphHandle::produced_by` | `GraphHandle.produced_by` | `GraphHandle.producedBy` |  |
 | `GraphHandle::relink` | `GraphHandle.relink` | `GraphHandle.relink` |  |
 | `GraphHandle::return_edges` | `GraphHandle.return_edges` | `GraphHandle.returnEdges` |  |
 | `GraphHandle::return_paths` | `GraphHandle.return_paths` | `GraphHandle.returnPaths` |  |
 | `GraphHandle::return_triplets` | `GraphHandle.return_triplets` | `GraphHandle.returnTriplets` |  |
+| `GraphHandle::sourced_from` | `GraphHandle.sourced_from` | `GraphHandle.sourcedFrom` |  |
 | `GraphHandle::start_ids` | `GraphHandle.start_ids` | `GraphHandle.startIds` |  |
 | `GraphHandle::start_match` | `GraphHandle.start_match` | `GraphHandle.startMatch` |  |
 | `GraphHandle::start_nearest` | `GraphHandle.start_nearest` | `GraphHandle.startNearest` |  |
@@ -1882,7 +2226,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `CasExpect` | dict via `FencedLeaseClient.prepare_cas_fenced` | `CasExpect` | serde-dict |
 | `CasExpect::Match` | dict key | `CasExpect` | serde-dict, plain-value |
 | `CasExpect::Absent` | dict key | `CasExpect` | serde-dict, plain-value |
-| `kv::DEFAULT_ATTEMPT_TIMEOUT` | `const:DEFAULT_ATTEMPT_TIMEOUT_SECS` | `const:DEFAULT_ATTEMPT_TIMEOUT_MS` |  |
+| `kv::DEFAULT_ATTEMPT_TIMEOUT` | `const:DEFAULT_ATTEMPT_TIMEOUT_MS` | `const:DEFAULT_ATTEMPT_TIMEOUT_MS` |  |
 | `kv::DEFAULT_NAMESPACE` | `const:DEFAULT_NAMESPACE` | `const:DEFAULT_NAMESPACE` |  |
 | `kv::DEFAULT_SCAN_LIMIT` | `const:DEFAULT_SCAN_LIMIT` | `const:DEFAULT_SCAN_LIMIT` |  |
 | `DedicatedKvTransport` | `DedicatedKvTransport` | `DedicatedKvTransport` |  |
@@ -1923,13 +2267,16 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Kv::get_entry_at_least` | `Kv.get_entry_at_least` | `Kv.getEntryAtLeast` |  |
 | `Kv::get_many` | `Kv.get_many` | `Kv.getMany` |  |
 | `Kv::get_typed` | `Kv.get_typed` | `Kv.getTyped` |  |
+| `Kv::in_session` | `Kv.in_session` | `Kv.inSession` |  |
 | `Kv::lease` | `Kv.lease` | `Kv.lease` |  |
 | `Kv::move_to` | `Kv.move_to` | `Kv.moveTo` |  |
 | `Kv::namespace` | `Kv.namespace` | `Kv.namespace` | property |
 | `Kv::patch` | `Kv.patch` | `Kv.patch` |  |
 | `Kv::release` | `Kv.release` | `Kv.release` |  |
 | `Kv::renew_lease` | `Kv.renew_lease` | `Kv.renewLease` |  |
+| `Kv::resource_namespace` | `Kv.resource_namespace` | `Kv.resourceNamespace` | property |
 | `Kv::scan` | `Kv.scan` | `Kv.scan` |  |
+| `Kv::session` | `Kv.session` | `Kv.session` | property |
 | `Kv::set` | `Kv.set` | `Kv.set` |  |
 | `KvCasFenced` | dict via `FencedLeaseClient.prepare_cas_fenced` | `KvCasFenced` | serde-dict |
 | `KvCasFenced.v` | dict key | `KvCasFenced.v` | serde-dict, keywords |
@@ -2042,7 +2389,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `KvSetRequest::ttl` | `KvSetRequest.ttl` | `KvSetRequest.ttl` |  |
 | `Lease` | `Lease` | `Lease` |  |
 | `Lease.token` | `Lease.token` | `Lease.token` | keywords |
-| `Lease.granted_ttl` | `Lease.granted_ttl_secs` | `Lease.grantedTtlMicros` | keywords |
+| `Lease.granted_ttl` | `Lease.granted_ttl_ms` | `Lease.grantedTtlMs` | keywords |
 | `Lease.position` | `Lease.position` | `Lease.position` | keywords |
 | `LocalManagedKvTransport` | `new FencedLeaseClient(transport=)` | `ManagedKvTransport` | callback, trait-variant |
 | `LocalManagedKvTransport::ready` | `new FencedLeaseClient(transport=)` | `ManagedKvTransport.ready` | callback, keywords |
@@ -2067,6 +2414,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `MemoryRowScope.app` | dict key | `wire.MemoryRowScope.app` | serde-dict, keywords |
 | `MemoryRowScope.conversation` | dict key | `wire.MemoryRowScope.conversation` | serde-dict, keywords |
 | `MemoryRowScope.source` | dict key | `wire.MemoryRowScope.source` | serde-dict, keywords |
+| `MemoryRowScope.timestamp_micros` | dict key | `wire.MemoryRowScope.timestampMicros` | serde-dict, keywords |
 | `MutationPosition` | `MutationPosition` | `MutationPosition` |  |
 | `MutationPosition.topic_generation` | `MutationPosition.topic_generation` | `MutationPosition.topicGeneration` | keywords |
 | `MutationPosition.partition` | `MutationPosition.partition` | `MutationPosition.partition` | keywords |
@@ -2074,6 +2422,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `PreparedMutation` | `PreparedMutation` | `PreparedMutation` |  |
 | `PreparedMutation::ambiguous_recovery` | `PreparedMutation.ambiguous_recovery` | `PreparedMutation.ambiguousRecovery` | property, keywords |
 | `PreparedMutation::operation_id` | `PreparedMutation.operation_id` | `PreparedMutation.operationId` | property, keywords |
+| `SessionRef` | dict via `Session.reference` | `SessionRef` | serde-dict |
+| `SessionRef.stream` | dict key | `SessionRef.stream` | serde-dict, keywords |
+| `SessionRef.session` | dict key | `SessionRef.session` | serde-dict, keywords |
 | `SharedKvTransport` | omitted | omitted | shared-ownership |
 
 ## laser
@@ -2101,6 +2452,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LaserBuilder::publish_max_retries` | `Laser.connect(publish_max_retries=)` | `LaserBuilder.publishMaxRetries` | keywords |
 | `LaserBuilder::publish_retry_backoff` | `Laser.connect(publish_retry_backoff_ms=)` | `LaserBuilder.publishRetryBackoff` | keywords |
 | `LaserBuilder::publish_timeout` | `Laser.connect(publish_timeout_ms=)` | `LaserBuilder.publishTimeout` | keywords |
+| `LaserBuilder::resource_naming` | `Laser.connect(resource_naming=)` | `LaserBuilder.resourceNaming` | keywords |
 | `LaserBuilder::stream` | `Laser.connect(stream=)` | `LaserBuilder.stream` | keywords |
 | `LaserBuilder::verifier` | `Laser.connect(verifier=)` | `LaserBuilder.verifier` | keywords |
 | `laser::OPS_STREAM_DEFAULT` | `const:OPS_STREAM_DEFAULT` | `const:OPS_STREAM_DEFAULT` |  |
@@ -2108,6 +2460,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `PublishOptions.timeout` | `Laser.connect(publish_timeout_ms=)` | `PublishOptions.timeoutMs` | keywords |
 | `PublishOptions.max_retries` | `Laser.connect(publish_max_retries=)` | `PublishOptions.maxRetries` | keywords |
 | `PublishOptions.retry_backoff` | `Laser.connect(publish_retry_backoff_ms=)` | `PublishOptions.retryBackoffMs` | keywords |
+| `ResourceNaming` | omitted | `ResourceNaming` | plain-value |
+| `ResourceNaming::Stream` | omitted | `ResourceNaming` | plain-value |
+| `ResourceNaming::Bare` | omitted | `ResourceNaming` | plain-value |
 
 ## mcp
 
@@ -2115,6 +2470,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | --- | --- | --- | --- |
 | `McpBridge` | `McpBridge` | `McpBridge` |  |
 | `McpBridge::call_tool` | `McpBridge.call_tool` | `McpBridge.callTool` |  |
+| `McpBridge::call_tool_in` | `McpBridge.call_tool_in` | `McpBridge.callToolIn` |  |
+| `McpBridge::call_tool_in_to` | `McpBridge.call_tool_in(target=)` | `McpBridge.callToolIn(target=)` | overload |
+| `McpBridge::call_tool_to` | `McpBridge.call_tool(target=)` | `McpBridge.callTool(target=)` | overload |
 | `McpBridge::get_prompt` | `McpBridge.get_prompt` | `McpBridge.getPrompt` |  |
 | `McpBridge::handle_rpc` | `McpBridge.handle_rpc` | `McpBridge.handleRpc` |  |
 | `McpBridge::initialize` | `McpBridge.initialize` | `McpBridge.initialize` |  |
@@ -2128,7 +2486,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `McpBridge::with_memory_tools` | `new McpBridge(memory_tools=)` | `McpBridge.withMemoryTools` | keywords |
 | `McpBridge::with_prompt` | `new McpBridge(prompts=)` | `McpBridge.withPrompt` | keywords |
 | `McpBridge::with_resource` | `new McpBridge(resources=)` | `McpBridge.withResource` | keywords |
-| `McpBridge::with_timeout` | `new McpBridge(timeout_secs=)` | `McpBridge.withTimeout` | keywords |
+| `McpBridge::with_timeout` | `new McpBridge(timeout_ms=)` | `McpBridge.withTimeout` | keywords |
 | `McpBridge::with_tool` | `new McpBridge(tools=)` | `McpBridge.withTool` | keywords |
 | `McpContent` | dict via `McpBridge.call_tool` | `McpContent` | serde-dict |
 | `McpContent.kind` | dict key | `McpContent.kind` | serde-dict, keywords |
@@ -2190,7 +2548,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ConsolidationReport.derived` | `ConsolidationReport.derived` | `ConsolidationReport.derived` | keywords |
 | `Consolidator` | `Laser.spawn_agent(consolidator=)` | `Consolidator` | callback |
 | `Consolidator::consolidate` | `Laser.spawn_agent(consolidator=)` | `Consolidator.consolidate` | callback, keywords |
-| `memory::DEFAULT_MEMORY_TOPIC_TTL` | `const:DEFAULT_MEMORY_TOPIC_TTL_SECS` | `const:DEFAULT_MEMORY_TOPIC_TTL_MS` |  |
+| `memory::DEFAULT_MEMORY_TOPIC_TTL` | `const:DEFAULT_MEMORY_TOPIC_TTL_MS` | `const:DEFAULT_MEMORY_TOPIC_TTL_MS` |  |
 | `DefaultConsolidator` | `MemoryHandle.consolidate` | `ConsolidateOptions` | keywords |
 | `DefaultConsolidator::new` | `MemoryHandle.consolidate` | `ConsolidateOptions` | keywords |
 | `DefaultConsolidator::prune_summarized` | `MemoryHandle.consolidate(prune_summarized=)` | `ConsolidateOptions.pruneSummarized` | keywords |
@@ -2260,6 +2618,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `MemoryHandle::Custom` | `MemoryHandle.custom` | `MemoryBackendKind` | plain-value |
 | `MemoryHandle::backend` | `MemoryHandle.backend` | `MemoryHandle.backend` | property |
 | `MemoryHandle::consolidate` | `MemoryHandle.consolidate` | `MemoryHandle.consolidate` |  |
+| `MemoryHandle::consolidate_with` | `MemoryHandle.consolidate(summarizer=, prune_summarized=)` | `MemoryHandle.consolidate` | overload |
 | `MemoryHandle::context` | `MemoryHandle.context` | `MemoryHandle.context` |  |
 | `MemoryHandle::embedder` | `MemoryHandle.embedder` | `MemoryHandle.embedder` |  |
 | `MemoryHandle::fetch` | `MemoryHandle.fetch` | `MemoryHandle.fetch` |  |
@@ -2287,6 +2646,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `MemoryItem.score` | `MemoryItem.score` | `MemoryItem.score` | keywords |
 | `MemoryItem.signals` | `MemoryItem.signals` | `MemoryItem.signals` | keywords |
 | `MemoryItem.source` | `MemoryItem.source` | `MemoryItem.source` | keywords |
+| `MemoryItem.origin` | `MemoryItem.origin` | `MemoryItem.origin` | keywords |
+| `MemoryItem.producer` | `MemoryItem.producer` | `MemoryItem.producer` | keywords |
 | `MemoryItem::json` | `MemoryItem.json` | `fn:memoryItemJson` | free-function |
 | `MemoryItem::text` | `MemoryItem.text` | `fn:memoryItemText` | free-function |
 | `MemoryKind` | omitted | `MemoryKind` | plain-value |
@@ -2325,6 +2686,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `MemoryScope.conversation` | `MemoryHandle.remember(conversation=)` | `MemoryScope.conversation` | keywords |
 | `MemoryScope.app` | `MemoryHandle.remember(application=)` | `MemoryScope.app` | keywords |
 | `MemoryScope.lifetime` | `MemoryHandle.remember(durable=)` | `MemoryScope.lifetime` | keywords |
+| `MemoryScope.origin` | `MemoryHandle.remember(origin=)` | `MemoryScope.origin` | keywords |
+| `MemoryScope.producer` | `MemoryHandle.remember(producer=)` | `MemoryScope.producer` | keywords |
 | `MemoryScope::builder` | `MemoryHandle.remember` | `MemoryScope` | keywords |
 | `MemoryScopeBuilder` | `MemoryHandle.remember` | `MemoryScope` | keywords |
 | `MemoryScopeBuilder::agent` | `MemoryHandle.remember(agent=)` | `MemoryScope.agent` | keywords |
@@ -2336,16 +2699,20 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `MemoryScopeBuilder::maybe_app` | `MemoryHandle.remember(application=)` | `MemoryScope.app` | keywords |
 | `MemoryScopeBuilder::maybe_conversation` | `MemoryHandle.remember(conversation=)` | `MemoryScope.conversation` | keywords |
 | `MemoryScopeBuilder::maybe_lifetime` | `MemoryHandle.remember(durable=)` | `MemoryScope.lifetime` | keywords |
+| `MemoryScopeBuilder::maybe_origin` | `MemoryHandle.remember(origin=)` | `MemoryScope.origin` | keywords |
+| `MemoryScopeBuilder::maybe_producer` | `MemoryHandle.remember(producer=)` | `MemoryScope.producer` | keywords |
 | `MemoryScopeBuilder::maybe_stream` | `MemoryHandle.remember(stream=)` | `MemoryScope.stream` | keywords |
 | `MemoryScopeBuilder::maybe_user` | `MemoryHandle.remember(user=)` | `MemoryScope.user` | keywords |
+| `MemoryScopeBuilder::origin` | `MemoryHandle.remember(origin=)` | `MemoryScope.origin` | keywords |
+| `MemoryScopeBuilder::producer` | `MemoryHandle.remember(producer=)` | `MemoryScope.producer` | keywords |
 | `MemoryScopeBuilder::stream` | `MemoryHandle.remember(stream=)` | `MemoryScope.stream` | keywords |
 | `MemoryScopeBuilder::user` | `MemoryHandle.remember(user=)` | `MemoryScope.user` | keywords |
 | `MemoryTopicBuilder` | `Laser.memory_topic` | `MemoryTopicBuilder` | keywords |
 | `MemoryTopicBuilder::build` | `Laser.memory_topic` | `MemoryTopicBuilder.build` | one-call |
-| `MemoryTopicBuilder::no_expiry` | `Laser.memory_topic(ttl_secs=)` | `MemoryTopicBuilder.noExpiry` | overload |
+| `MemoryTopicBuilder::no_expiry` | `Laser.memory_topic(ttl_ms=)` | `MemoryTopicBuilder.noExpiry` | overload |
 | `MemoryTopicBuilder::partitions` | `Laser.memory_topic(partitions=)` | `MemoryTopicBuilder.partitions` | keywords |
 | `MemoryTopicBuilder::stream` | `Laser.memory_topic(stream=)` | `MemoryTopicBuilder.stream` | keywords |
-| `MemoryTopicBuilder::ttl` | `Laser.memory_topic(ttl_secs=)` | `MemoryTopicBuilder.ttl` | keywords |
+| `MemoryTopicBuilder::ttl` | `Laser.memory_topic(ttl_ms=)` | `MemoryTopicBuilder.ttl` | keywords |
 | `NoSummarizer` | `MemoryHandle.consolidate(summarizer=)` | `ConsolidateOptions.summarizer` | overload |
 | `RecallBuilder` | `MemoryHandle.recall` | `RecallBuilder` | keywords |
 | `RecallBuilder::agent` | `MemoryHandle.recall(agent=)` | `RecallBuilder.agent` | keywords |
@@ -2379,6 +2746,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `RememberBuilder::dedup` | `MemoryHandle.remember(dedup=)` | `RememberBuilder.dedup` | keywords |
 | `RememberBuilder::durable` | `MemoryHandle.remember(durable=)` | `RememberBuilder.durable` | keywords |
 | `RememberBuilder::kind` | `MemoryHandle.remember(kind=)` | `RememberBuilder.kind` | keywords |
+| `RememberBuilder::origin` | `MemoryHandle.remember(origin=)` | `RememberBuilder.origin` | keywords |
+| `RememberBuilder::producer` | `MemoryHandle.remember(producer=)` | `RememberBuilder.producer` | keywords |
 | `RememberBuilder::scope` | `MemoryHandle.remember(conversation=)` | `RememberBuilder.scope` | keywords |
 | `RememberBuilder::send` | `MemoryHandle.remember` | `RememberBuilder.send` | one-call |
 | `RememberBuilder::stream` | `MemoryHandle.remember(stream=)` | `RememberBuilder.stream` | keywords |
@@ -2413,14 +2782,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 
 | Rust | Python | TypeScript | Notes |
 | --- | --- | --- | --- |
-| `AgentRunState` | omitted | `AgentRunState` | plain-value |
-| `AgentRunState::Submitted` | omitted | `AgentRunState` | plain-value |
-| `AgentRunState::Running` | omitted | `AgentRunState` | plain-value |
-| `AgentRunState::Completed` | omitted | `AgentRunState` | plain-value |
-| `AgentRunState::Cancelled` | omitted | `AgentRunState` | plain-value |
-| `AgentRunState::Failed` | omitted | `AgentRunState` | plain-value |
-| `AgentRunState::as_str` | omitted | omitted | plain-value |
-| `AgentRunState::is_terminal` | `fn:agent_run_state_is_terminal` | `fn:agentRunStateIsTerminal` | free-function |
 | `EdgeDir` | omitted | `EdgeDir` | plain-value |
 | `EdgeDir::Out` | omitted | `EdgeDir` | plain-value |
 | `EdgeDir::In` | omitted | `EdgeDir` | plain-value |
@@ -2431,15 +2792,22 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 
 | Rust | Python | TypeScript | Notes |
 | --- | --- | --- | --- |
-| `AgentRunInfo` | `AgentRunInfo` | `AgentRunInfo` |  |
-| `AgentRunInfo.run_id` | `AgentRunInfo.run_id` | `AgentRunInfo.runId` | keywords |
-| `AgentRunInfo.agent_id` | `AgentRunInfo.agent_id` | `AgentRunInfo.agentId` | keywords |
-| `AgentRunInfo.user_id` | `AgentRunInfo.user_id` | `AgentRunInfo.userId` | keywords |
-| `AgentRunInfo.state` | `AgentRunInfo.state` | `AgentRunInfo.state` | keywords |
-| `AgentRunInfo.created_at_micros` | `AgentRunInfo.created_at_micros` | `AgentRunInfo.createdAtMicros` | keywords |
-| `AgentRunInfo.updated_at_micros` | `AgentRunInfo.updated_at_micros` | `AgentRunInfo.updatedAtMicros` | keywords |
-| `AgentRunInfo.detail` | `AgentRunInfo.detail` | `AgentRunInfo.detail` | keywords |
-| `AgentRunInfo.cancel_requested` | `AgentRunInfo.cancel_requested` | `AgentRunInfo.cancelRequested` | keywords |
+| `AgentErrorBody` | dict via `Agdx.fail` | `AgentErrorBody` | serde-dict |
+| `AgentErrorBody.code` | dict key | `AgentErrorBody.code` | serde-dict, keywords |
+| `AgentErrorBody.message` | dict key | `AgentErrorBody.message` | serde-dict, keywords |
+| `AgentErrorBody.retryable` | dict key | `AgentErrorBody.retryable` | serde-dict, keywords |
+| `AgentErrorBody.detail` | dict key | `AgentErrorBody.detail` | serde-dict, keywords |
+| `AgentErrorCode` | dict via `Agdx.fail` | `AgentErrorCode` | serde-dict |
+| `AgentErrorCode::InvalidRequest` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::Unauthorized` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::Unsupported` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::DeadlineExceeded` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::Cancelled` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::ToolFailure` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::Internal` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::Unrecognized` | dict key | `AgentErrorCode` | serde-dict, plain-value |
+| `AgentErrorCode::code` | omitted | `fn:agentErrorCode` | plain-value, free-function |
+| `AgentErrorCode::from_code` | omitted | `fn:agentErrorCodeFromCode` | plain-value, free-function |
 | `AttemptColumnMetrics` | dict via `Destinations.prepare` | `wire.AttemptColumnMetrics` | serde-dict |
 | `AttemptColumnMetrics.field_id` | dict key | `wire.AttemptColumnMetrics.fieldId` | serde-dict, keywords |
 | `AttemptColumnMetrics.value_count` | dict key | `wire.AttemptColumnMetrics.valueCount` | serde-dict, keywords |
@@ -2457,6 +2825,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `BackendBinding.resource_id` | dict key | `wire.BackendBinding.resourceId` | serde-dict, keywords |
 | `BackendBinding.generation` | dict key | `wire.BackendBinding.generation` | serde-dict, keywords |
 | `BinaryValue` | omitted | `BinaryValue` | plain-value |
+| `Budget` | `Budget` | `Budget` |  |
+| `Budget.tokens` | `Budget.tokens` | `Budget.tokens` | keywords |
+| `Budget.cost_micros` | `Budget.cost_micros` | `Budget.costMicros` | keywords |
 | `CheckpointError` | dict via `CheckpointError.detail` | `CheckpointError` | serde-dict |
 | `CheckpointError::Invalid` | dict key | `CheckpointError` | serde-dict, plain-value |
 | `CheckpointError::NotFound` | dict key | `CheckpointError` | serde-dict, plain-value |
@@ -2587,6 +2958,44 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Digest32::BYTES` | `const:DIGEST32_BYTES` | `Digest32.BYTES` | free-function |
 | `Digest32::as_bytes` | omitted | omitted | plain-value |
 | `Digest32::new` | omitted | omitted | plain-value |
+| `DisplayType` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionSubmitted` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionStarted` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionPaused` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionResumed` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionCompleted` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionFailed` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionCanceled` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionHeartbeat` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionParked` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionUnparked` | omitted | `DisplayType` | plain-value |
+| `DisplayType::SessionControl` | omitted | `DisplayType` | plain-value |
+| `DisplayType::UserMessage` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ModelRequest` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ModelResponse` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ModelStream` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ToolCall` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ToolResult` | omitted | `DisplayType` | plain-value |
+| `DisplayType::AgentHandoff` | omitted | `DisplayType` | plain-value |
+| `DisplayType::AgentMessage` | omitted | `DisplayType` | plain-value |
+| `DisplayType::StateUpdated` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ContextAssembled` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ContextCompacted` | omitted | `DisplayType` | plain-value |
+| `DisplayType::ContextRetrieved` | omitted | `DisplayType` | plain-value |
+| `DisplayType::MemoryCreated` | omitted | `DisplayType` | plain-value |
+| `DisplayType::MemoryForgotten` | omitted | `DisplayType` | plain-value |
+| `DisplayType::MemoryFeedback` | omitted | `DisplayType` | plain-value |
+| `DisplayType::TaskStatus` | omitted | `DisplayType` | plain-value |
+| `DisplayType::WorkflowStep` | omitted | `DisplayType` | plain-value |
+| `DisplayType::PolicyDecision` | omitted | `DisplayType` | plain-value |
+| `DisplayType::Error` | omitted | `DisplayType` | plain-value |
+| `DisplayType::DeadLetter` | omitted | `DisplayType` | plain-value |
+| `DisplayType::Undecodable` | omitted | `DisplayType` | plain-value |
+| `DisplayType::Invalid` | omitted | `DisplayType` | plain-value |
+| `DisplayType::KvSet` | omitted | `DisplayType` | plain-value |
+| `DisplayType::GraphUpsert` | omitted | `DisplayType` | plain-value |
+| `DisplayType::UnauthorizedControl` | omitted | `DisplayType` | plain-value |
+| `DisplayType::as_str` | omitted | omitted | plain-value |
 | `EdgeId` | omitted | `EdgeId` | plain-value |
 | `EdgeId::as_u128` | omitted | `EdgeId.asU128` | plain-value |
 | `EdgeId::content` | `fn:edge_id_content` | `EdgeId.content` | free-function |
@@ -2608,16 +3017,18 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `GraphEdge.valid_from` | dict key | `GraphEdge.validFrom` | serde-dict, keywords |
 | `GraphEdge.valid_to` | dict key | `GraphEdge.validTo` | serde-dict, keywords |
 | `GraphEdge.source` | dict key | `GraphEdge.source` | serde-dict, keywords |
+| `GraphEdge.producer` | dict key | `GraphEdge.producer` | serde-dict, keywords |
 | `GraphEdge::relate` | `fn:graph_edge_relate` | `fn:graphEdgeRelate` | free-function |
 | `GraphEdge::valid` | `fn:graph_edge_valid` | `fn:graphEdgeValid` | free-function |
 | `GraphEdge::valid_at` | `fn:graph_edge_valid_at` | `fn:graphEdgeValidAt` | free-function |
-| `GraphEdge::with_source` | `fn:graph_edge_with_source` | `GraphEdge.source` | free-function, keywords |
+| `GraphEdge::with_source` | `fn:graph_edge_with_source` | `fn:graphEdgeWithSource` | free-function |
 | `GraphNode` | dict via `GraphHandle.upsert` | `GraphNode` | serde-dict |
 | `GraphNode.id` | dict key | `GraphNode.id` | serde-dict, keywords |
 | `GraphNode.labels` | dict key | `GraphNode.labels` | serde-dict, keywords |
 | `GraphNode.attrs` | dict key | `GraphNode.attrs` | serde-dict, keywords |
 | `GraphNode.embedding` | dict key | `GraphNode.embedding` | serde-dict, keywords |
 | `GraphNode.source` | dict key | `GraphNode.source` | serde-dict, keywords |
+| `GraphNode.producer` | dict key | `GraphNode.producer` | serde-dict, keywords |
 | `GraphNode::entity` | `fn:graph_node_entity` | `fn:graphNodeEntity` | free-function |
 | `GraphResult` | dict via `GraphHandle.fetch` | `GraphResult` | serde-dict |
 | `GraphResult.nodes` | dict key | `GraphResult.nodes` | serde-dict, keywords |
@@ -2718,12 +3129,12 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `NewPartitionPolicy::Beginning` | omitted | `wire.NewPartitionPolicy` | plain-value |
 | `NewPartitionPolicy::CapturedLatest` | omitted | `wire.NewPartitionPolicy` | plain-value |
 | `NewPartitionPolicy::Reject` | omitted | `wire.NewPartitionPolicy` | plain-value |
-| `NodeId` | omitted | `wire.NodeId` | plain-value |
-| `NodeId::as_u128` | omitted | `wire.NodeId.asU128` | plain-value |
-| `NodeId::content` | `fn:node_id_content` | `wire.NodeId.content` | free-function |
-| `NodeId::from_bytes` | omitted | `wire.NodeId.fromBytes` | plain-value |
-| `NodeId::from_u128` | omitted | `wire.NodeId.fromU128` | plain-value |
-| `NodeId::to_bytes` | omitted | `wire.NodeId.toBytes` | plain-value |
+| `NodeId` | omitted | `NodeId` | plain-value |
+| `NodeId::as_u128` | omitted | `NodeId.asU128` | plain-value |
+| `NodeId::content` | `fn:node_id_content` | `NodeId.content` | free-function |
+| `NodeId::from_bytes` | omitted | `NodeId.fromBytes` | plain-value |
+| `NodeId::from_u128` | omitted | `NodeId.fromU128` | plain-value |
+| `NodeId::to_bytes` | omitted | `NodeId.toBytes` | plain-value |
 | `PartitionCheckpoint` | dict via `Destinations.get` | `wire.PartitionCheckpoint` | serde-dict |
 | `PartitionCheckpoint.incarnation` | dict key | `wire.PartitionCheckpoint.incarnation` | serde-dict, keywords |
 | `PartitionCheckpoint.started_at_offset` | dict key | `wire.PartitionCheckpoint.startedAtOffset` | serde-dict, keywords |
@@ -2794,6 +3205,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `PreparedTableRequirements.schema_id` | dict key | `wire.PreparedTableRequirements.schemaId` | serde-dict, keywords |
 | `PreparedTableRequirements.partition_spec_id` | dict key | `wire.PreparedTableRequirements.partitionSpecId` | serde-dict, keywords |
 | `PreparedTableRequirements.commit_requirements` | dict key | `wire.PreparedTableRequirements.commitRequirements` | serde-dict, keywords |
+| `ProducerInfo` | dict via `GraphHandle.upsert` | `ProducerInfo` | serde-dict |
+| `ProducerInfo.name` | dict key | `ProducerInfo.name` | serde-dict, keywords |
+| `ProducerInfo.version` | dict key | `ProducerInfo.version` | serde-dict, keywords |
 | `ProjectionRef` | dict via `Destinations.register` | `wire.ProjectionRef` | serde-dict |
 | `ProjectionRef.id` | dict key | `wire.ProjectionRef.id` | serde-dict, keywords |
 | `ProjectionRef.version` | dict key | `wire.ProjectionRef.version` | serde-dict, keywords |
@@ -2851,21 +3265,18 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `RetentionGap.incarnation` | dict key | `wire.RetentionGap.incarnation` | serde-dict, keywords |
 | `RetentionGap.required_next_offset` | dict key | `wire.RetentionGap.requiredNextOffset` | serde-dict, keywords |
 | `RetentionGap.retained_start` | dict key | `wire.RetentionGap.retainedStart` | serde-dict, keywords |
-| `RunBudget` | `RunBudget` | `wire.RunBudget` |  |
-| `RunBudget.max_events` | `RunBudget.max_events` | `wire.RunBudget.maxEvents` | keywords |
-| `RunBudget.max_model_calls` | `RunBudget.max_model_calls` | `wire.RunBudget.maxModelCalls` | keywords |
-| `RunBudget.max_tool_calls` | `RunBudget.max_tool_calls` | `wire.RunBudget.maxToolCalls` | keywords |
-| `RunBudget.max_patches` | `RunBudget.max_patches` | `wire.RunBudget.maxPatches` | keywords |
-| `RunBudget.max_depth` | `RunBudget.max_depth` | `wire.RunBudget.maxDepth` | keywords |
-| `RunBudget.max_wall_clock_micros` | `RunBudget.max_wall_clock_micros` | `wire.RunBudget.maxWallClockMicros` | keywords |
-| `RunBudget.max_cost_usd` | `RunBudget.max_cost_usd` | `wire.RunBudget.maxCostUsd` | keywords |
-| `RunPage` | `RunPage` | `RunPage` |  |
-| `RunPage.runs` | `RunPage.runs` | `RunPage.runs` | keywords |
-| `RunPage.cursor` | `RunPage.cursor` | `RunPage.cursor` | keywords |
 | `SchemaFingerprint` | omitted | `SchemaFingerprint` | plain-value |
 | `SchemaFingerprint::BYTES` | `const:SCHEMA_FINGERPRINT_BYTES` | `SchemaFingerprint.BYTES` | free-function |
 | `SchemaFingerprint::as_bytes` | omitted | omitted | plain-value |
 | `SchemaFingerprint::new` | omitted | omitted | plain-value |
+| `SessionStatus` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Submitted` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Active` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Paused` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Completed` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Failed` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Canceled` | omitted | `SessionStatus` | plain-value |
+| `SessionStatus::Unrecognized` | omitted | `SessionStatus` | plain-value |
 | `SourceIncarnation` | dict via `Destinations.get` | `wire.SourceIncarnation` | serde-dict |
 | `SourceIncarnation.cluster` | dict key | `wire.SourceIncarnation.cluster` | serde-dict, keywords |
 | `SourceIncarnation.stream_id` | dict key | `wire.SourceIncarnation.streamId` | serde-dict, keywords |
@@ -2951,12 +3362,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | Rust | Python | TypeScript | Notes |
 | --- | --- | --- | --- |
 | `AgentTopic` | `AgentTopic` | `AgentTopic` |  |
-| `AgentTopic::Commands` | `AgentTopic.Commands` | `AgentTopic.Commands` |  |
-| `AgentTopic::Responses` | `AgentTopic.Responses` | `AgentTopic.Responses` |  |
-| `AgentTopic::ToolCalls` | `AgentTopic.ToolCalls` | `AgentTopic.ToolCalls` |  |
-| `AgentTopic::ToolResults` | `AgentTopic.ToolResults` | `AgentTopic.ToolResults` |  |
-| `AgentTopic::LlmIo` | `AgentTopic.LlmIo` | `AgentTopic.LlmIo` |  |
-| `AgentTopic::HumanInput` | `AgentTopic.HumanInput` | `AgentTopic.HumanInput` |  |
+| `AgentTopic::Sessions` | `AgentTopic.Sessions` | `AgentTopic.Sessions` |  |
+| `AgentTopic::Streams` | `AgentTopic.Streams` | `AgentTopic.Streams` |  |
+| `AgentTopic::Heartbeats` | `AgentTopic.Heartbeats` | `AgentTopic.Heartbeats` |  |
+| `AgentTopic::Control` | `AgentTopic.Control` | `AgentTopic.Control` |  |
+| `AgentTopic::Memory` | `AgentTopic.Memory` | `AgentTopic.Memory` |  |
 | `AgentTopic::Audit` | `AgentTopic.Audit` | `AgentTopic.Audit` |  |
 | `AgentTopic::Registry` | `AgentTopic.Registry` | `AgentTopic.Registry` |  |
 | `AgentTopic::WorkflowJournal` | `AgentTopic.WorkflowJournal` | `AgentTopic.WorkflowJournal` |  |
@@ -3080,10 +3490,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AggFunc::Max` | omitted | `AggFunc` | plain-value |
 | `AggFunc::Percentile` | omitted | `AggFunc` | plain-value |
 | `AggFunc::StdDev` | omitted | `AggFunc` | plain-value |
-| `Aggregate` | dict via `Laser.execute_query` | `wire.Aggregate` | serde-dict |
-| `Aggregate.group_by` | dict key | `wire.Aggregate.groupBy` | serde-dict, keywords |
-| `Aggregate.funcs` | dict key | `wire.Aggregate.funcs` | serde-dict, keywords |
-| `Aggregate.window` | dict key | `wire.Aggregate.window` | serde-dict, keywords |
+| `Aggregate` | dict via `Laser.execute_query` | `Aggregate` | serde-dict |
+| `Aggregate.group_by` | dict key | `Aggregate.groupBy` | serde-dict, keywords |
+| `Aggregate.funcs` | dict key | `Aggregate.funcs` | serde-dict, keywords |
+| `Aggregate.window` | dict key | `Aggregate.window` | serde-dict, keywords |
 | `BoundaryRelation` | omitted | `wire.BoundaryRelation` | plain-value |
 | `BoundaryRelation::Current` | omitted | `wire.BoundaryRelation` | plain-value |
 | `BoundaryRelation::Historical` | omitted | `wire.BoundaryRelation` | plain-value |
@@ -3092,16 +3502,16 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `query::CONTENT_TYPE` | `const:CONTENT_TYPE` | `const:CONTENT_TYPE` |  |
 | `query::CONTROL_OP_VERSION` | `const:CONTROL_OP_VERSION` | `const:CONTROL_OP_VERSION` |  |
 | `query::CONTROL_TOPIC` | `const:CONTROL_TOPIC` | `const:CONTROL_TOPIC` |  |
-| `CmpOp` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Eq` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Ne` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Lt` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Lte` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Gt` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Gte` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::In` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Contains` | omitted | `wire.CmpOp` | plain-value |
-| `CmpOp::Prefix` | omitted | `wire.CmpOp` | plain-value |
+| `CmpOp` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Eq` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Ne` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Lt` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Lte` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Gt` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Gte` | omitted | `CmpOp` | plain-value |
+| `CmpOp::In` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Contains` | omitted | `CmpOp` | plain-value |
+| `CmpOp::Prefix` | omitted | `CmpOp` | plain-value |
 | `Consistency` | omitted | `Consistency` | plain-value |
 | `Consistency::Eventual` | omitted | `Consistency` | plain-value |
 | `Consistency::ReadYourWrites` | omitted | `Consistency` | plain-value |
@@ -3109,9 +3519,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Consistency::is_eventual` | `fn:consistency_is_eventual` | `fn:consistencyIsEventual` | free-function |
 | `query::DEFAULT_STREAM_PAGE_SIZE` | `const:DEFAULT_STREAM_PAGE_SIZE` | `const:DEFAULT_STREAM_PAGE_SIZE` |  |
 | `query::DLQ_TOPIC` | `const:DLQ_TOPIC` | `const:DLQ_TOPIC` |  |
-| `Dir` | omitted | `wire.Dir` | plain-value |
-| `Dir::Asc` | omitted | `wire.Dir` | plain-value |
-| `Dir::Desc` | omitted | `wire.Dir` | plain-value |
+| `Dir` | omitted | `Dir` | plain-value |
+| `Dir::Asc` | omitted | `Dir` | plain-value |
+| `Dir::Desc` | omitted | `Dir` | plain-value |
 | `EdgeExtract` | dict via `Projections.register_graph` | `EdgeExtract` | serde-dict |
 | `EdgeExtract.edge_type` | dict key | `EdgeExtract.edgeType` | serde-dict, keywords |
 | `EdgeExtract.from_pointer` | dict key | `EdgeExtract.fromPointer` | serde-dict, keywords |
@@ -3157,10 +3567,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `IndexSchemaBuilder::field_at` | `IndexSchemaBuilder.field_at` | `IndexSchemaBuilder.fieldAt` |  |
 | `IndexSchemaBuilder::inline_payload` | `IndexSchemaBuilder.inline_payload` | `IndexSchemaBuilder.inlinePayload` |  |
 | `IndexSchemaBuilder::vector_field` | `IndexSchemaBuilder.vector_field` | `IndexSchemaBuilder.vectorField` |  |
-| `KeyMatch` | dict via `Laser.execute_query` | `wire.KeyMatch` | serde-dict |
-| `KeyMatch.field` | dict key | `wire.KeyMatch.field` | serde-dict, keywords |
-| `KeyMatch.value` | dict key | `wire.KeyMatch.value` | serde-dict, keywords |
-| `KeyMatch::new` | `fn:key_match_new` | `wire.KeyMatch` | free-function, keywords |
+| `KeyMatch` | dict via `Laser.execute_query` | `KeyMatch` | serde-dict |
+| `KeyMatch.field` | dict key | `KeyMatch.field` | serde-dict, keywords |
+| `KeyMatch.value` | dict key | `KeyMatch.value` | serde-dict, keywords |
+| `KeyMatch::new` | `fn:key_match_new` | `KeyMatch` | free-function, keywords |
 | `query::MAX_INDEX_ENTRIES_PER_RECORD` | `const:MAX_INDEX_ENTRIES_PER_RECORD` | `const:MAX_INDEX_ENTRIES_PER_RECORD` |  |
 | `query::MAX_PAGE_SIZE` | `const:MAX_PAGE_SIZE` | `const:MAX_PAGE_SIZE` |  |
 | `MaterializationBoundary` | dict via `QueryResult.context` | `wire.MaterializationBoundary` | serde-dict |
@@ -3262,38 +3672,38 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Query.fork` | dict key | `Query.fork` | serde-dict, keywords |
 | `Query.raw_sql` | dict key | `Query.rawSql` | serde-dict, keywords |
 | `Query.consistency` | dict key | `Query.consistency` | serde-dict, keywords |
-| `Query::builder` | `new QueryBuilder()` | `Query` | constructor, keywords |
+| `Query::builder` | `new QueryBuilder()` | `new QueryBuilder()` | constructor |
 | `Query::new` | `fn:query_new` | `Query` | free-function, keywords |
 | `Query::operational` | `fn:query_operational` | `fn:operationalQuery` | free-function |
-| `QueryBuilder` | `QueryBuilder` | `Query` | keywords |
-| `QueryBuilder::aggregate` | `QueryBuilder.aggregate` | `Query.aggregate` | keywords |
-| `QueryBuilder::build` | `QueryBuilder.build` | `Query` | keywords |
-| `QueryBuilder::by_key` | `QueryBuilder.by_key` | `Query.byKey` | keywords |
-| `QueryBuilder::consistency` | `QueryBuilder.consistency` | `Query.consistency` | keywords |
-| `QueryBuilder::deadline_micros` | `QueryBuilder.deadline_micros` | `Query.deadlineMicros` | keywords |
-| `QueryBuilder::distinct` | `QueryBuilder.distinct` | `Query.distinct` | keywords |
-| `QueryBuilder::execution_id` | `QueryBuilder.execution_id` | `Query.executionId` | keywords |
-| `QueryBuilder::filter` | `QueryBuilder.filter` | `Query.filter` | keywords |
-| `QueryBuilder::fork` | `QueryBuilder.fork` | `Query.fork` | keywords |
-| `QueryBuilder::having` | `QueryBuilder.having` | `Query.having` | keywords |
-| `QueryBuilder::maybe_aggregate` | `QueryBuilder.aggregate` | `Query.aggregate` | keywords |
-| `QueryBuilder::maybe_filter` | `QueryBuilder.filter` | `Query.filter` | keywords |
-| `QueryBuilder::maybe_fork` | `QueryBuilder.fork` | `Query.fork` | keywords |
-| `QueryBuilder::maybe_having` | `QueryBuilder.having` | `Query.having` | keywords |
-| `QueryBuilder::maybe_message_type` | `QueryBuilder.message_type` | `Query.messageType` | keywords |
-| `QueryBuilder::maybe_raw_sql` | `QueryBuilder.raw_sql` | `Query.rawSql` | keywords |
-| `QueryBuilder::maybe_text` | `QueryBuilder.text` | `Query.text` | keywords |
-| `QueryBuilder::maybe_time_range` | `QueryBuilder.time_range` | `Query.timeRange` | keywords |
-| `QueryBuilder::maybe_vector` | `QueryBuilder.vector` | `Query.vector` | keywords |
-| `QueryBuilder::message_type` | `QueryBuilder.message_type` | `Query.messageType` | keywords |
-| `QueryBuilder::order` | `QueryBuilder.order` | `Query.order` | keywords |
-| `QueryBuilder::page` | `QueryBuilder.page` | `Query.page` | keywords |
-| `QueryBuilder::raw_sql` | `QueryBuilder.raw_sql` | `Query.rawSql` | keywords |
-| `QueryBuilder::select` | `QueryBuilder.select` | `Query.select` | keywords |
-| `QueryBuilder::target` | `QueryBuilder.target` | `Query.target` | keywords |
-| `QueryBuilder::text` | `QueryBuilder.text` | `Query.text` | keywords |
-| `QueryBuilder::time_range` | `QueryBuilder.time_range` | `Query.timeRange` | keywords |
-| `QueryBuilder::vector` | `QueryBuilder.vector` | `Query.vector` | keywords |
+| `QueryBuilder` | `QueryBuilder` | `QueryBuilder` |  |
+| `QueryBuilder::aggregate` | `QueryBuilder.aggregate` | `QueryBuilder.aggregate` |  |
+| `QueryBuilder::build` | `QueryBuilder.build` | `QueryBuilder.build` |  |
+| `QueryBuilder::by_key` | `QueryBuilder.by_key` | `QueryBuilder.byKey` |  |
+| `QueryBuilder::consistency` | `QueryBuilder.consistency` | `QueryBuilder.consistency` |  |
+| `QueryBuilder::deadline_micros` | `QueryBuilder.deadline_micros` | `QueryBuilder.deadlineMicros` |  |
+| `QueryBuilder::distinct` | `QueryBuilder.distinct` | `QueryBuilder.distinct` |  |
+| `QueryBuilder::execution_id` | `QueryBuilder.execution_id` | `QueryBuilder.executionId` |  |
+| `QueryBuilder::filter` | `QueryBuilder.filter` | `QueryBuilder.filter` |  |
+| `QueryBuilder::fork` | `QueryBuilder.fork` | `QueryBuilder.fork` |  |
+| `QueryBuilder::having` | `QueryBuilder.having` | `QueryBuilder.having` |  |
+| `QueryBuilder::maybe_aggregate` | `QueryBuilder.aggregate` | `QueryBuilder.aggregate` |  |
+| `QueryBuilder::maybe_filter` | `QueryBuilder.filter` | `QueryBuilder.filter` |  |
+| `QueryBuilder::maybe_fork` | `QueryBuilder.fork` | `QueryBuilder.fork` |  |
+| `QueryBuilder::maybe_having` | `QueryBuilder.having` | `QueryBuilder.having` |  |
+| `QueryBuilder::maybe_message_type` | `QueryBuilder.message_type` | `QueryBuilder.messageType` |  |
+| `QueryBuilder::maybe_raw_sql` | `QueryBuilder.raw_sql` | `QueryBuilder.rawSql` |  |
+| `QueryBuilder::maybe_text` | `QueryBuilder.text` | `QueryBuilder.text` |  |
+| `QueryBuilder::maybe_time_range` | `QueryBuilder.time_range` | `QueryBuilder.timeRange` |  |
+| `QueryBuilder::maybe_vector` | `QueryBuilder.vector` | `QueryBuilder.vector` |  |
+| `QueryBuilder::message_type` | `QueryBuilder.message_type` | `QueryBuilder.messageType` |  |
+| `QueryBuilder::order` | `QueryBuilder.order` | `QueryBuilder.order` |  |
+| `QueryBuilder::page` | `QueryBuilder.page` | `QueryBuilder.page` |  |
+| `QueryBuilder::raw_sql` | `QueryBuilder.raw_sql` | `QueryBuilder.rawSql` |  |
+| `QueryBuilder::select` | `QueryBuilder.select` | `QueryBuilder.select` |  |
+| `QueryBuilder::target` | `QueryBuilder.target` | `QueryBuilder.target` |  |
+| `QueryBuilder::text` | `QueryBuilder.text` | `QueryBuilder.text` |  |
+| `QueryBuilder::time_range` | `QueryBuilder.time_range` | `QueryBuilder.timeRange` |  |
+| `QueryBuilder::vector` | `QueryBuilder.vector` | `QueryBuilder.vector` |  |
 | `QueryContext` | dict via `QueryResult.context` | `QueryContext` | serde-dict |
 | `QueryContext.execution_id` | dict key | `QueryContext.executionId` | serde-dict, keywords |
 | `QueryContext.engine` | dict key | `QueryContext.engine` | serde-dict, keywords |
@@ -3345,11 +3755,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `QueryErrorCode::StaleGeneration` | omitted | `wire.QueryErrorCode` | plain-value |
 | `QueryErrorCode::TargetUnavailable` | omitted | `wire.QueryErrorCode` | plain-value |
 | `QueryErrorCode::ResourceLimit` | omitted | `wire.QueryErrorCode` | plain-value |
-| `QueryExecutionId` | omitted | `wire.QueryExecutionId` | plain-value |
-| `QueryExecutionId::as_u128` | omitted | `wire.QueryExecutionId.asU128` | plain-value |
-| `QueryExecutionId::from_bytes` | omitted | `wire.QueryExecutionId.fromBytes` | plain-value |
-| `QueryExecutionId::from_u128` | omitted | `wire.QueryExecutionId.fromU128` | plain-value |
-| `QueryExecutionId::to_bytes` | omitted | `wire.QueryExecutionId.toBytes` | plain-value |
+| `QueryExecutionId` | omitted | `QueryExecutionId` | plain-value |
+| `QueryExecutionId::as_u128` | omitted | `QueryExecutionId.asU128` | plain-value |
+| `QueryExecutionId::from_bytes` | omitted | `QueryExecutionId.fromBytes` | plain-value |
+| `QueryExecutionId::from_u128` | omitted | `QueryExecutionId.fromU128` | plain-value |
+| `QueryExecutionId::to_bytes` | omitted | `QueryExecutionId.toBytes` | plain-value |
 | `QueryExecutionState` | omitted | `wire.QueryExecutionState` | plain-value |
 | `QueryExecutionState::Queued` | omitted | `wire.QueryExecutionState` | plain-value |
 | `QueryExecutionState::Planning` | omitted | `wire.QueryExecutionState` | plain-value |
@@ -3367,11 +3777,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `QueryExecutionStatus.produced_bytes` | dict key | `QueryExecutionStatus.producedBytes` | serde-dict, keywords |
 | `QueryExecutionStatus.row_count` | dict key | `QueryExecutionStatus.rowCount` | serde-dict, keywords |
 | `QueryExecutionStatus.error` | dict key | `QueryExecutionStatus.error` | serde-dict, keywords |
-| `QueryPageRequest` | dict via `Laser.execute_query` | `wire.QueryPageRequest` | serde-dict |
-| `QueryPageRequest.limit` | dict key | `wire.QueryPageRequest.limit` | serde-dict, keywords |
-| `QueryPageRequest.offset` | dict key | `wire.QueryPageRequest.offset` | serde-dict, keywords |
-| `QueryPageRequest.cursor` | dict key | `wire.QueryPageRequest.cursor` | serde-dict, keywords |
-| `QueryPageRequest.want_total` | dict key | `wire.QueryPageRequest.wantTotal` | serde-dict, keywords |
+| `QueryPageRequest` | dict via `Laser.execute_query` | `QueryPageRequest` | serde-dict |
+| `QueryPageRequest.limit` | dict key | `QueryPageRequest.limit` | serde-dict, keywords |
+| `QueryPageRequest.offset` | dict key | `QueryPageRequest.offset` | serde-dict, keywords |
+| `QueryPageRequest.cursor` | dict key | `QueryPageRequest.cursor` | serde-dict, keywords |
+| `QueryPageRequest.want_total` | dict key | `QueryPageRequest.wantTotal` | serde-dict, keywords |
 | `QueryRequest` | `QueryRequest` | `QueryRequest` |  |
 | `QueryRequest::agg_as` | `QueryRequest.agg_as` | `QueryRequest.aggAs` |  |
 | `QueryRequest::at_snapshot` | `QueryRequest.at_snapshot` | `QueryRequest.atSnapshot` |  |
@@ -3451,10 +3861,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `QueryTarget::Operational` | dict key | `QueryTarget` | serde-dict, plain-value |
 | `QueryTarget::Lakehouse` | dict key | `QueryTarget` | serde-dict, plain-value |
 | `QueryTarget::operational` | `fn:query_target_operational` | `fn:operationalTarget` | free-function |
-| `RawSql` | dict via `Laser.execute_query` | `wire.RawSql` | serde-dict |
-| `RawSql.dialect` | dict key | `wire.RawSql.dialect` | serde-dict, keywords |
-| `RawSql.sql` | dict key | `wire.RawSql.sql` | serde-dict, keywords |
-| `RawSql.params` | dict key | `wire.RawSql.params` | serde-dict, keywords |
+| `RawSql` | dict via `Laser.execute_query` | `RawSql` | serde-dict |
+| `RawSql.dialect` | dict key | `RawSql.dialect` | serde-dict, keywords |
+| `RawSql.sql` | dict key | `RawSql.sql` | serde-dict, keywords |
+| `RawSql.params` | dict key | `RawSql.params` | serde-dict, keywords |
 | `ResolvedQueryTarget` | dict via `QueryResult.context` | `wire.ResolvedQueryTarget` | serde-dict |
 | `ResolvedQueryTarget::Operational` | dict key | `wire.ResolvedQueryTarget` | serde-dict, plain-value |
 | `ResolvedQueryTarget::Lakehouse` | dict key | `wire.ResolvedQueryTarget` | serde-dict, plain-value |
@@ -3508,15 +3918,15 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SchemaSource::Protobuf` | dict key | `SchemaSource` | serde-dict, plain-value |
 | `SchemaSource::JsonSchema` | dict key | `SchemaSource` | serde-dict, plain-value |
 | `SchemaSource::Unknown` | dict key | `SchemaSource` | serde-dict, plain-value |
-| `Select` | dict via `Laser.execute_query` | `wire.Select` | serde-dict |
-| `Select.fields` | dict key | `wire.Select.fields` | serde-dict, keywords |
-| `Select.payload` | dict key | `wire.Select.payload` | serde-dict, keywords |
+| `Select` | dict via `Laser.execute_query` | `Select` | serde-dict |
+| `Select.fields` | dict key | `Select.fields` | serde-dict, keywords |
+| `Select.payload` | dict key | `Select.payload` | serde-dict, keywords |
 | `SnapshotSelector` | dict via `Laser.execute_query` | `SnapshotSelector` | serde-dict |
 | `SnapshotSelector::SnapshotId` | dict key | `SnapshotSelector` | serde-dict, plain-value |
 | `SnapshotSelector::TimestampMicros` | dict key | `SnapshotSelector` | serde-dict, plain-value |
-| `Sort` | dict via `Laser.execute_query` | `wire.Sort` | serde-dict |
-| `Sort.field` | dict key | `wire.Sort.field` | serde-dict, keywords |
-| `Sort.dir` | dict key | `wire.Sort.dir` | serde-dict, keywords |
+| `Sort` | dict via `Laser.execute_query` | `Sort` | serde-dict |
+| `Sort.field` | dict key | `Sort.field` | serde-dict, keywords |
+| `Sort.dir` | dict key | `Sort.dir` | serde-dict, keywords |
 | `SourceSelector` | dict via `Bindings.remove` | `SourceSelector` | serde-dict |
 | `SourceSelector.stream` | dict key | `SourceSelector.stream` | serde-dict, keywords |
 | `SourceSelector.topic` | dict key | `SourceSelector.topic` | serde-dict, keywords |
@@ -3526,9 +3936,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SqlDialect::Postgres` | omitted | `SqlDialect` | plain-value |
 | `SqlDialect::MySql` | omitted | `SqlDialect` | plain-value |
 | `SqlDialect::Sqlite` | omitted | `SqlDialect` | plain-value |
-| `TextQuery` | dict via `Laser.execute_query` | `wire.TextQuery` | serde-dict |
-| `TextQuery.field` | dict key | `wire.TextQuery.field` | serde-dict, keywords |
-| `TextQuery.query` | dict key | `wire.TextQuery.query` | serde-dict, keywords |
+| `TextQuery` | dict via `Laser.execute_query` | `TextQuery` | serde-dict |
+| `TextQuery.field` | dict key | `TextQuery.field` | serde-dict, keywords |
+| `TextQuery.query` | dict key | `TextQuery.query` | serde-dict, keywords |
 | `TypedQueryRows` | `TypedQueryRows` | `QueryRequest.rowsTyped` | protocol |
 | `TypedQueryRows::next` | `TypedQueryRows.next` | `QueryRequest.rowsTyped` | protocol |
 | `TypedValue` | dict via `Row.values` | `TypedValue` | serde-dict |
@@ -3566,10 +3976,10 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Value::Null` | omitted | `Value` | native-value, plain-value |
 | `Value::List` | omitted | `Value` | native-value, plain-value |
 | `Value::from_input` | omitted | `fn:valueFromInput` | native-value, free-function |
-| `VectorQuery` | dict via `Laser.execute_query` | `wire.VectorQuery` | serde-dict |
-| `VectorQuery.field` | dict key | `wire.VectorQuery.field` | serde-dict, keywords |
-| `VectorQuery.embedding` | dict key | `wire.VectorQuery.embedding` | serde-dict, keywords |
-| `VectorQuery.top_k` | dict key | `wire.VectorQuery.topK` | serde-dict, keywords |
+| `VectorQuery` | dict via `Laser.execute_query` | `VectorQuery` | serde-dict |
+| `VectorQuery.field` | dict key | `VectorQuery.field` | serde-dict, keywords |
+| `VectorQuery.embedding` | dict key | `VectorQuery.embedding` | serde-dict, keywords |
+| `VectorQuery.top_k` | dict key | `VectorQuery.topK` | serde-dict, keywords |
 | `query::WINDOW_START` | `const:WINDOW_START` | `const:WINDOW_START` |  |
 | `Window` | dict via `Laser.execute_query` | `wire.Window` | serde-dict |
 | `Window.field` | dict key | `wire.Window.field` | serde-dict, keywords |
@@ -3601,6 +4011,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AuthzError::InvalidName` | dict key | `AuthzError` | serde-dict, plain-value |
 | `AuthzError::Conflict` | dict key | `AuthzError` | serde-dict, plain-value |
 | `AuthzError::Version` | dict key | `AuthzError` | serde-dict, plain-value |
+| `AuthzError::TenancyViolation` | dict key | `AuthzError` | serde-dict, plain-value |
 | `AuthzEvent` | `AuthzEvent` | `AuthzEvent` |  |
 | `AuthzEvent.revision` | `AuthzEvent.revision` | `AuthzEvent.revision` | keywords |
 | `AuthzEvent.actor` | `AuthzEvent.actor` | `AuthzEvent.actor` | keywords |
@@ -3621,22 +4032,23 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Effect` | omitted | `Effect` | plain-value |
 | `Effect::Allow` | omitted | `Effect` | plain-value |
 | `Effect::Deny` | omitted | `Effect` | plain-value |
-| `Feature` | omitted | `wire.Feature` | plain-value |
-| `Feature::Kv` | omitted | `wire.Feature` | plain-value |
-| `Feature::Memory` | omitted | `wire.Feature` | plain-value |
-| `Feature::Projection` | omitted | `wire.Feature` | plain-value |
-| `Feature::Fork` | omitted | `wire.Feature` | plain-value |
-| `Feature::Graph` | omitted | `wire.Feature` | plain-value |
-| `Feature::Query` | omitted | `wire.Feature` | plain-value |
-| `Feature::Agent` | omitted | `wire.Feature` | plain-value |
-| `Feature::Workflow` | omitted | `wire.Feature` | plain-value |
-| `Feature::Destination` | omitted | `wire.Feature` | plain-value |
-| `Feature::Checkpoint` | omitted | `wire.Feature` | plain-value |
-| `Feature::Authz` | omitted | `wire.Feature` | plain-value |
-| `Feature::KvLease` | omitted | `wire.Feature` | plain-value |
-| `Feature::KvFence` | omitted | `wire.Feature` | plain-value |
-| `Feature::Filter` | omitted | `wire.Feature` | plain-value |
-| `Feature::Unrecognized` | omitted | `wire.Feature` | plain-value |
+| `Feature` | omitted | `Feature` | plain-value |
+| `Feature::Kv` | omitted | `Feature` | plain-value |
+| `Feature::Memory` | omitted | `Feature` | plain-value |
+| `Feature::Projection` | omitted | `Feature` | plain-value |
+| `Feature::Fork` | omitted | `Feature` | plain-value |
+| `Feature::Graph` | omitted | `Feature` | plain-value |
+| `Feature::Query` | omitted | `Feature` | plain-value |
+| `Feature::Agent` | omitted | `Feature` | plain-value |
+| `Feature::Workflow` | omitted | `Feature` | plain-value |
+| `Feature::Destination` | omitted | `Feature` | plain-value |
+| `Feature::Checkpoint` | omitted | `Feature` | plain-value |
+| `Feature::Authz` | omitted | `Feature` | plain-value |
+| `Feature::KvLease` | omitted | `Feature` | plain-value |
+| `Feature::KvFence` | omitted | `Feature` | plain-value |
+| `Feature::Filter` | omitted | `Feature` | plain-value |
+| `Feature::Session` | omitted | `Feature` | plain-value |
+| `Feature::Unrecognized` | omitted | `Feature` | plain-value |
 | `Grant` | `Grant` | `Grant` |  |
 | `Grant.effect` | `Grant.effect` | `Grant.effect` | keywords |
 | `Grant.feature` | `Grant.feature` | `Grant.feature` | keywords |
@@ -3667,26 +4079,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `rbac::grants_allow` | `fn:grants_allow` | `fn:grantsAllow` |  |
 | `rbac::validate_role_name` | `fn:validate_role_name` | `fn:validateRoleName` |  |
 
-## runs
-
-| Rust | Python | TypeScript | Notes |
-| --- | --- | --- | --- |
-| `RunListRequest` | `Runs.list` | `RunListRequest` | keywords |
-| `RunListRequest::agent` | `Runs.list(agent=)` | `RunListRequest.agent` | keywords |
-| `RunListRequest::cursor` | `Runs.list(cursor=)` | `RunListRequest.cursor` | keywords |
-| `RunListRequest::fetch` | `Runs.list` | `RunListRequest.fetch` | one-call |
-| `RunListRequest::limit` | `Runs.list(limit=)` | `RunListRequest.limit` | keywords |
-| `RunListRequest::state` | `Runs.list(state=)` | `RunListRequest.state` | keywords |
-| `Runs` | `Runs` | `Runs` |  |
-| `Runs::cancel` | `Runs.cancel` | `Runs.cancel` |  |
-| `Runs::list` | `Runs.list` | `Runs.list` |  |
-| `Runs::register_source` | `Runs.register_source` | `Runs.registerSource` |  |
-| `Runs::remove_source` | `Runs.remove_source` | `Runs.removeSource` |  |
-| `Runs::status` | `Runs.status` | `Runs.status` |  |
-| `Runs::submit` | `Runs.submit` | `Runs.submit` |  |
-| `Runs::submit_budgeted` | `Runs.submit_budgeted` | `Runs.submitBudgeted` |  |
-| `Runs::submit_with` | `Runs.submit_with` | `Runs.submitWith` |  |
-
 ## schema_codecs
 
 | Rust | Python | TypeScript | Notes |
@@ -3709,6 +4101,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentEnvelope.kind` | dict key | `AgentEnvelope.kind` | serde-dict, keywords |
 | `AgentEnvelope.record` | dict key | `AgentEnvelope.record` | serde-dict, keywords |
 | `AgentEnvelope.conversation` | dict key | `AgentEnvelope.conversation` | serde-dict, keywords |
+| `AgentEnvelope.parent` | dict key | `AgentEnvelope.parent` | serde-dict, keywords |
+| `AgentEnvelope.root` | dict key | `AgentEnvelope.root` | serde-dict, keywords |
 | `AgentEnvelope.source` | dict key | `AgentEnvelope.source` | serde-dict, keywords |
 | `AgentEnvelope.target` | dict key | `AgentEnvelope.target` | serde-dict, keywords |
 | `AgentEnvelope.cause` | dict key | `AgentEnvelope.cause` | serde-dict, keywords |
@@ -3807,7 +4201,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LogPosition.partition_id` | `LogPosition.partition_id` | `LogPosition.partitionId` | keywords |
 | `LogPosition.offset` | `LogPosition.offset` | `LogPosition.offset` | keywords |
 | `LogPosition::from_bytes` | `LogPosition.from_bytes` | `fn:logPositionFromBytes` | free-function |
-| `LogPosition::new` | `new LogPosition()` | `LogPosition` | constructor, keywords |
+| `LogPosition::new` | `new LogPosition()` | `fn:newLogPosition` | constructor, free-function |
 | `LogPosition::to_bytes` | `LogPosition.to_bytes` | `fn:logPositionToBytes` | free-function |
 | `RecordId` | omitted | `RecordId` | plain-value |
 | `RecordId::as_u128` | omitted | `RecordId.asU128` | plain-value |
@@ -3835,6 +4229,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `TokenUsage.reasoning_output_tokens` | dict key | `wire.TokenUsage.reasoningOutputTokens` | serde-dict, keywords |
 | `TokenUsage.cache_read_input_tokens` | dict key | `wire.TokenUsage.cacheReadInputTokens` | serde-dict, keywords |
 | `TokenUsage.cache_creation_input_tokens` | dict key | `wire.TokenUsage.cacheCreationInputTokens` | serde-dict, keywords |
+| `TokenUsage.cost_micros` | dict key | `wire.TokenUsage.costMicros` | serde-dict, keywords |
 | `ValidateError` | `ValidateError` | `wire.ValidateError` |  |
 | `ValidateError::Missing` | `ValidateError.MISSING` | `wire.ValidateError` | plain-value |
 | `ValidateError::Forbidden` | `ValidateError.FORBIDDEN` | `wire.ValidateError` | plain-value |
@@ -3859,7 +4254,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `snapshot::DEFAULT_SNAPSHOT_NAMESPACE` | `const:DEFAULT_SNAPSHOT_NAMESPACE` | `const:DEFAULT_SNAPSHOT_NAMESPACE` |  |
 | `snapshot::DEFAULT_SNAPSHOT_TOPIC` | `const:DEFAULT_SNAPSHOT_TOPIC` | `const:DEFAULT_SNAPSHOT_TOPIC` |  |
 | `FoldSnapshot` | dict via `SnapshotStore.latest` | `FoldSnapshot` | serde-dict |
+| `FoldSnapshot.stream` | dict key | `FoldSnapshot.stream` | serde-dict, keywords |
+| `FoldSnapshot.stream_id` | dict key | `FoldSnapshot.streamId` | serde-dict, keywords |
+| `FoldSnapshot.stream_created_at_micros` | dict key | `FoldSnapshot.streamCreatedAtMicros` | serde-dict, keywords |
 | `FoldSnapshot.conversation` | dict key | `FoldSnapshot.conversation` | serde-dict, keywords |
+| `FoldSnapshot.fold` | dict key | `FoldSnapshot.fold` | serde-dict, keywords |
 | `FoldSnapshot.as_of` | dict key | `FoldSnapshot.asOf` | serde-dict, keywords |
 | `FoldSnapshot.state` | dict key | `FoldSnapshot.state` | serde-dict, keywords |
 | `FoldSnapshot::resume_offset` | `fn:fold_snapshot_resume_offset` | `fn:foldSnapshotResumeOffset` | free-function |
@@ -3869,6 +4268,12 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LocalSnapshotStore` | `SnapshotStore` | `SnapshotStore` | trait-variant |
 | `LocalSnapshotStore::latest` | `SnapshotStore.latest` | `SnapshotStore.latest` | keywords |
 | `LocalSnapshotStore::save` | `SnapshotStore.save` | `SnapshotStore.save` | keywords |
+| `SnapshotOffset` | omitted | `wire.SnapshotOffset` | native-value |
+| `SnapshotOffset.topic_id` | omitted | `wire.SnapshotOffset.topicId` | native-value, keywords |
+| `SnapshotOffset.topic_created_at_micros` | omitted | `wire.SnapshotOffset.topicCreatedAtMicros` | native-value, keywords |
+| `SnapshotOffset.partition_id` | omitted | `wire.SnapshotOffset.partitionId` | native-value, keywords |
+| `SnapshotOffset.offset` | omitted | `wire.SnapshotOffset.offset` | native-value, keywords |
+| `SnapshotOffset::new` | omitted | `wire.SnapshotOffset` | native-value, keywords |
 | `SnapshotStore` | `SnapshotStore` | `SnapshotStore` |  |
 | `SnapshotStore::latest` | `SnapshotStore.latest` | `SnapshotStore.latest` | keywords |
 | `SnapshotStore::save` | `SnapshotStore.save` | `SnapshotStore.save` | keywords |
@@ -4035,8 +4440,8 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `DirectConfig` | omitted | omitted | rust-crate |
 | `GroupFilter` | `GroupFilter` | `GroupFilter` |  |
 | `GroupFilter::configure` | `GroupFilter.configure` | `GroupFilter.configure` |  |
-| `GroupFilter::configure_as` | `GroupFilter.configure(operation_id=)` | `GroupFilter.configureAs` | overload |
-| `GroupFilter::configure_with` | `GroupFilter.configure(filter_id=, revision=)` | `GroupFilter.configureWith` | overload |
+| `GroupFilter::configure_as` | `GroupFilter.configure_as` | `GroupFilter.configureAs` |  |
+| `GroupFilter::configure_with` | `GroupFilter.configure_with` | `GroupFilter.configureWith` |  |
 | `GroupFilter::delete` | `GroupFilter.delete` | `GroupFilter.delete` |  |
 | `GroupFilter::get` | `GroupFilter.get` | `GroupFilter.get` |  |
 | `GroupFilter::preview` | `GroupFilter.preview` | `GroupFilter.preview` |  |
@@ -4072,15 +4477,15 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ProducerBuilder::build` | `Topic.producer` | `Topic.producer` | one-call |
 | `ProducerBuilder::create_stream` | `Topic.producer(create_stream=)` | `ProducerOptions.createStream` | keywords |
 | `ProducerBuilder::create_topic` | `Topic.producer(create_topic=)` | `ProducerOptions.createTopic` | keywords |
-| `ProducerBuilder::expire_after` | `Topic.producer(message_expiry=)` | `ProducerOptions.expireAfterMicros` | keywords |
+| `ProducerBuilder::expire_after` | `Topic.producer(expire_after_ms=)` | `ProducerOptions.expireAfterMs` | keywords |
 | `ProducerBuilder::linger` | `Topic.producer(linger_ms=)` | `ProducerOptions.lingerMs` | keywords |
-| `ProducerBuilder::max_topic_bytes` | `Topic.producer(max_topic_size=)` | `ProducerOptions.maxTopicBytes` | keywords |
-| `ProducerBuilder::never_expire` | `Topic.producer(message_expiry=)` | `ProducerOptions.neverExpire` | keywords |
+| `ProducerBuilder::max_topic_bytes` | `Topic.producer(max_topic_bytes=)` | `ProducerOptions.maxTopicBytes` | keywords |
+| `ProducerBuilder::never_expire` | `Topic.producer(never_expire=)` | `ProducerOptions.neverExpire` | keywords |
 | `ProducerBuilder::partitions` | `Topic.producer(partitions=)` | `ProducerOptions.partitions` | keywords |
 | `ProducerBuilder::retries` | `Topic.producer(retries=)` | `ProducerOptions.retries` | keywords |
 | `ProducerBuilder::retry_backoff` | `Topic.producer(retry_interval_ms=)` | `ProducerOptions.retryBackoffMs` | keywords |
 | `ProducerBuilder::routing` | `Topic.producer(key=, partition=)` | `ProducerOptions.routing` | keywords |
-| `ProducerBuilder::unlimited_topic_size` | `Topic.producer(max_topic_size=)` | `ProducerOptions.unlimitedTopicSize` | keywords |
+| `ProducerBuilder::unlimited_topic_size` | `Topic.producer(unlimited_topic_size=)` | `ProducerOptions.unlimitedTopicSize` | keywords |
 | `ProducerMessage` | `Producer.send` | `ProducerMessage` | keywords |
 | `ProducerMessage::builder` | `Producer.send` | `new ProducerMessage()` | keywords, constructor |
 | `ProducerMessage::header` | `Producer.send(headers=)` | `ProducerMessage.header` | keywords |
@@ -4203,7 +4608,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `TypedRecords` | `TypedRecords` | `TypedRecords` |  |
 | `TypedRecords::batch` | `TypedTopic.records(batch=)` | `TypedRecords.batch` | keywords |
 | `TypedRecords::from_offsets` | `TypedTopic.records(from_offsets=)` | `TypedRecords.fromOffsets` | keywords |
-| `TypedRecords::next` | `TypedRecords.next` | `TypedRecords.stream` | protocol |
+| `TypedRecords::next` | `TypedRecords.next` | `TypedRecords.next` |  |
 | `TypedRecords::offsets` | `TypedRecords.offsets` | `TypedRecords.offsets` | property |
 | `TypedRecords::poll` | `TypedRecords.poll` | `TypedRecords.poll` |  |
 | `TypedRecords::stream` | `TypedRecords.__aiter__` | `TypedRecords.stream` | protocol |
@@ -4258,6 +4663,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ChangeRecord.from_offset` | `ChangeRecord.from_offset` | `ChangeRecord.fromOffset` | keywords |
 | `ChangeRecord.to_offset` | `ChangeRecord.to_offset` | `ChangeRecord.toOffset` | keywords |
 | `ChangeRecord.rows` | `ChangeRecord.rows` | `ChangeRecord.rows` | keywords |
+| `ChangeRecord.stream` | `ChangeRecord.stream` | `ChangeRecord.stream` | keywords |
 | `Watch` | `Laser.watch` | `Watch` | keywords |
 | `Watch::index` | `Laser.watch(index=)` | `Watch.index` | keywords |
 | `Watch::records` | `Laser.watch(from_offsets=)` | `Watch.records` | keywords |
@@ -4273,9 +4679,45 @@ These Python and TypeScript APIs have no Rust row for a language reason.
 
 | Client | API | Note |
 | --- | --- | --- |
+| Python | `AmbiguousMutationRecovery.ttl_ms` | property |
 | Python | `Consumer.init` | lazy-init |
 | Python | `ConsumerMessage.header_kinds` | rust-crate |
+| Python | `KvStore` | native-binding |
 | Python | `Producer.init` | lazy-init |
+| Python | `apply_json_patch()` | native-binding |
+| Python | `decode_context_compaction()` | native-binding |
+| Python | `decode_context_manifest()` | native-binding |
+| Python | `decode_context_retrieval()` | native-binding |
+| Python | `decode_session_changes()` | native-binding |
+| Python | `decode_session_end()` | native-binding |
+| Python | `decode_session_events()` | native-binding |
+| Python | `decode_session_get()` | native-binding |
+| Python | `decode_session_links()` | native-binding |
+| Python | `decode_session_list()` | native-binding |
+| Python | `decode_session_reply()` | native-binding |
+| Python | `decode_session_sources()` | native-binding |
+| Python | `decode_session_start()` | native-binding |
+| Python | `decode_session_state()` | native-binding |
+| Python | `decode_session_transition()` | native-binding |
+| Python | `decode_state_delta()` | native-binding |
+| Python | `decode_state_snapshot()` | native-binding |
+| Python | `encode_context_compaction()` | native-binding |
+| Python | `encode_context_manifest()` | native-binding |
+| Python | `encode_context_retrieval()` | native-binding |
+| Python | `encode_session_changes()` | native-binding |
+| Python | `encode_session_end()` | native-binding |
+| Python | `encode_session_events()` | native-binding |
+| Python | `encode_session_get()` | native-binding |
+| Python | `encode_session_links()` | native-binding |
+| Python | `encode_session_list()` | native-binding |
+| Python | `encode_session_reply()` | native-binding |
+| Python | `encode_session_sources()` | native-binding |
+| Python | `encode_session_start()` | native-binding |
+| Python | `encode_session_state()` | native-binding |
+| Python | `encode_session_transition()` | native-binding |
+| Python | `encode_state_delta()` | native-binding |
+| Python | `encode_state_snapshot()` | native-binding |
+| TypeScript | `KvStore` | callback |
 | TypeScript | `Laser.withObserver` | telemetry |
 | TypeScript | `LaserBuilder.observer` | telemetry |
 | TypeScript | `LaserObserver` | telemetry |

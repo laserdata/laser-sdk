@@ -1,17 +1,23 @@
 import type { CapabilitySurface } from "../client/capabilities.js"
 import type { OpVersions } from "./hello.js"
 import {
-  type AgentCancel,
-  type AgentList,
-  type AgentReply,
-  type AgentStatusReq,
-  type AgentSubmit,
-  decodeAgentReply,
-  encodeAgentCancel,
-  encodeAgentList,
-  encodeAgentStatusReq,
-  encodeAgentSubmit
-} from "./agent-workflow.js"
+  type SessionChanges,
+  type SessionEvents,
+  type SessionGet,
+  type SessionLinks,
+  type SessionList,
+  type SessionReply,
+  type SessionSources,
+  type SessionState,
+  decodeSessionReply,
+  encodeSessionChanges,
+  encodeSessionEvents,
+  encodeSessionGet,
+  encodeSessionLinks,
+  encodeSessionList,
+  encodeSessionSources,
+  encodeSessionState
+} from "./session.js"
 import {
   type AuthzHistoryReq,
   type AuthzReply,
@@ -99,10 +105,13 @@ import {
   validateQueryRouteListRequest
 } from "./checkpoint.js"
 import {
-  AGDX_AGENT_CANCEL_CODE,
-  AGDX_AGENT_LIST_CODE,
-  AGDX_AGENT_STATUS_CODE,
-  AGDX_AGENT_SUBMIT_CODE,
+  AGDX_SESSION_CHANGES_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_STATE_CODE,
   AGDX_AUTHZ_BIND_ROLES_CODE,
   AGDX_AUTHZ_DEFINE_ROLE_CODE,
   AGDX_AUTHZ_DELETE_ROLE_CODE,
@@ -684,29 +693,47 @@ export const ForkPutCommand = framed<ForkPut, ForkReply>(
   forkVersion
 )
 
-export const AgentSubmitCommand = framed<AgentSubmit, AgentReply>(
-  AGDX_AGENT_SUBMIT_CODE,
-  "agentWorkflow",
-  encodeAgentSubmit,
-  decodeAgentReply
+export const SessionGetCommand = framed<SessionGet, SessionReply>(
+  AGDX_SESSION_GET_CODE,
+  "sessions",
+  encodeSessionGet,
+  decodeSessionReply
 )
-export const AgentCancelCommand = framed<AgentCancel, AgentReply>(
-  AGDX_AGENT_CANCEL_CODE,
-  "agentWorkflow",
-  encodeAgentCancel,
-  decodeAgentReply
+export const SessionListCommand = framed<SessionList, SessionReply>(
+  AGDX_SESSION_LIST_CODE,
+  "sessions",
+  encodeSessionList,
+  decodeSessionReply
 )
-export const AgentStatusCommand = framed<AgentStatusReq, AgentReply>(
-  AGDX_AGENT_STATUS_CODE,
-  "agentWorkflow",
-  encodeAgentStatusReq,
-  decodeAgentReply
+export const SessionEventsCommand = framed<SessionEvents, SessionReply>(
+  AGDX_SESSION_EVENTS_CODE,
+  "sessions",
+  encodeSessionEvents,
+  decodeSessionReply
 )
-export const AgentListCommand = framed<AgentList, AgentReply>(
-  AGDX_AGENT_LIST_CODE,
-  "agentWorkflow",
-  encodeAgentList,
-  decodeAgentReply
+export const SessionStateCommand = framed<SessionState, SessionReply>(
+  AGDX_SESSION_STATE_CODE,
+  "sessions",
+  encodeSessionState,
+  decodeSessionReply
+)
+export const SessionLinksCommand = framed<SessionLinks, SessionReply>(
+  AGDX_SESSION_LINKS_CODE,
+  "sessions",
+  encodeSessionLinks,
+  decodeSessionReply
+)
+export const SessionSourcesCommand = framed<SessionSources, SessionReply>(
+  AGDX_SESSION_SOURCES_CODE,
+  "sessions",
+  encodeSessionSources,
+  decodeSessionReply
+)
+export const SessionChangesCommand = framed<SessionChanges, SessionReply>(
+  AGDX_SESSION_CHANGES_CODE,
+  "sessions",
+  encodeSessionChanges,
+  decodeSessionReply
 )
 
 export const BatchCommand: ManagedCommand<BatchRequest, BatchReply> = {
@@ -775,10 +802,13 @@ export const MANAGED_COMMANDS = [
   ForkPromoteCommand,
   ForkListCommand,
   ForkPutCommand,
-  AgentSubmitCommand,
-  AgentCancelCommand,
-  AgentStatusCommand,
-  AgentListCommand
+  SessionGetCommand,
+  SessionListCommand,
+  SessionEventsCommand,
+  SessionStateCommand,
+  SessionLinksCommand,
+  SessionSourcesCommand,
+  SessionChangesCommand
 ] as const
 
 export const EXTRA_MANAGED_COMMANDS = [

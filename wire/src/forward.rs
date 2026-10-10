@@ -4,6 +4,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Trusted stream identity stamped by the server before forwarding a session request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedScope {
+    pub stream_id: u32,
+    pub stream: String,
+    pub stream_created_at_micros: u64,
+}
+
 /// A forwarded managed query. Carries the authenticated identity the SDK cannot
 /// set itself, plus the opaque request the SDK sent. CBOR-encoded, named fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +55,9 @@ pub struct ForwardedCommand {
     /// regardless.
     #[serde(default)]
     pub read_all: bool,
+    /// Server-stamped stream identity. A session command without it fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ForwardedScope>,
     /// The managed command code (browse, key-value, or fork block). The backend
     /// dispatches on it.
     pub command_code: u32,
@@ -99,6 +110,7 @@ mod tests {
             correlation: None,
             operation_id: Some(17),
             read_all: true,
+            scope: None,
             command_code: 1_000_000,
             payload: vec![0x90; 5],
             grants: Vec::new(),
@@ -129,6 +141,7 @@ mod tests {
             correlation: None,
             operation_id: Some(9),
             read_all: false,
+            scope: None,
             command_code: 42,
             payload: vec![0xde, 0xad, 0xbe, 0xef],
             grants: Vec::new(),
