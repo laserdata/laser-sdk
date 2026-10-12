@@ -611,6 +611,7 @@ impl NativePlane {
                 "LD_PLANE_IGGY_PAT_FILE",
                 "/nonexistent/laser-bench-plane.pat",
             )
+            .env("LD_PLANE_CLUSTER_KIND", "standalone")
             .env("LD_PLANE_DB_PATH", &db_path)
             .env("LD_PLANE_QUERY_SOCKET", &socket_path)
             .env("LD_PLANE_HEALTH_ADDR", health_address.to_string())
