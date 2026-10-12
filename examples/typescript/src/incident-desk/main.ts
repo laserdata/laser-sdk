@@ -150,7 +150,8 @@ async function registerTickets(laser: Laser): Promise<void> {
     allowedProjections: [id],
     defaultProjection: id,
     index: TICKETS_INDEX,
-    notify: true
+    notify: true,
+    skipRejected: false
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)

@@ -147,7 +147,8 @@ async function registerTape(
     allowedProjections: [id],
     defaultProjection: id,
     index,
-    notify: true
+    notify: true,
+    skipRejected: false
   }
   await laser.projections().register(projection)
   await laser.bindings().apply(binding)
