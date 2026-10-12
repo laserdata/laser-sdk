@@ -361,6 +361,17 @@ impl PySessions {
         })
     }
 
+    /// Stop the deployment from indexing this stream's sessions, through the
+    /// authenticated managed control path. A later `bootstrap` registers the
+    /// stream again.
+    fn unregister<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let sessions = self.inner.clone();
+        future_into_py(py, async move {
+            sessions.unregister().await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
     /// The stream the sessions ride.
     #[getter]
     fn stream(&self) -> PyResult<String> {

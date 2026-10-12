@@ -13,6 +13,115 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::time::{Duration, sleep};
 
+/// How long a managed mutation keeps repeating its frame while its outcome is
+/// unknown, the shared client contract deadline.
+pub(crate) use crate::retry::MANAGED_MUTATION_DEADLINE;
+
+const KV_READ_BARRIER: u8 = 1;
+const FORK_READ_BARRIER: u8 = 2;
+const GRAPH_READ_BARRIER: u8 = 4;
+const SESSION_READ_BARRIER: u8 = 8;
+const ALL_READ_BARRIERS: u8 =
+    KV_READ_BARRIER | FORK_READ_BARRIER | GRAPH_READ_BARRIER | SESSION_READ_BARRIER;
+
+/// The read barrier bit of a managed read's surface, or `0` for a command
+/// that takes none.
+fn barrier_bit(code: u32) -> u8 {
+    use laser_wire::codes::{
+        AGDX_FORK_LIST_CODE, AGDX_GRAPH_NEIGHBORS_CODE, AGDX_GRAPH_QUERY_CODE, AGDX_KV_EXISTS_CODE,
+        AGDX_KV_GET_CODE, AGDX_KV_NAMESPACES_CODE, AGDX_KV_SCAN_CODE,
+    };
+    match code {
+        AGDX_KV_GET_CODE | AGDX_KV_SCAN_CODE | AGDX_KV_NAMESPACES_CODE | AGDX_KV_EXISTS_CODE => {
+            KV_READ_BARRIER
+        }
+        AGDX_FORK_LIST_CODE => FORK_READ_BARRIER,
+        AGDX_GRAPH_QUERY_CODE | AGDX_GRAPH_NEIGHBORS_CODE => GRAPH_READ_BARRIER,
+        laser_wire::codes::AGDX_SESSION_GET_CODE
+        | laser_wire::codes::AGDX_SESSION_LIST_CODE
+        | laser_wire::codes::AGDX_SESSION_EVENTS_CODE
+        | laser_wire::codes::AGDX_SESSION_STATE_CODE
+        | laser_wire::codes::AGDX_SESSION_LINKS_CODE
+        | laser_wire::codes::AGDX_SESSION_SOURCES_CODE
+        | laser_wire::codes::AGDX_SESSION_CHANGES_CODE => SESSION_READ_BARRIER,
+        _ => 0,
+    }
+}
+
+/// The message of a managed reply that leaves a mutation's outcome unknown, or
+/// `None` for a final reply. `Pending` means the plane accepted the mutation
+/// and has not folded it yet. `PlaneUnavailable` means the node's own plane did
+/// not answer, so the request may still apply. `Unavailable` means the node was
+/// too busy to forward it. Each is repeated under the same operation identity.
+fn unknown_outcome(reply: &[u8]) -> Option<laser_wire::result::CommandError> {
+    let error = decode_named::<laser_wire::result::CommandError>(reply).ok()?;
+    (error.code.is_pending()
+        || error.code.is_plane_unavailable()
+        || error.code == laser_wire::result::ResultCode::Unavailable)
+        .then_some(error)
+}
+
+/// Whether `position` is past `other` on the same surface. A later topic
+/// generation is past every position of an earlier one, because the earlier
+/// topic is gone and its offsets are never read again.
+fn is_past(
+    position: &laser_wire::mutation::MutationPosition,
+    other: &laser_wire::mutation::MutationPosition,
+) -> bool {
+    (position.topic_generation, position.offset) > (other.topic_generation, other.offset)
+}
+
+/// Raise each surface of `seen` to the later of its own position and the one
+/// in `answered`.
+fn merge_frontier(
+    seen: &mut laser_wire::mutation::AppliedFrontier,
+    answered: &laser_wire::mutation::AppliedFrontier,
+) {
+    for (slot, position) in [
+        (&mut seen.kv, answered.kv),
+        (&mut seen.fork, answered.fork),
+        (&mut seen.graph, answered.graph),
+    ] {
+        if let Some(position) = position
+            && slot.is_none_or(|current| is_past(&position, &current))
+        {
+            *slot = Some(position);
+        }
+    }
+    for position in &answered.sessions {
+        // A newer incarnation of the stream replaces every position of the
+        // one before it.
+        seen.sessions.retain(|kept| {
+            kept.stream_id != position.stream_id
+                || kept.stream_generation >= position.stream_generation
+        });
+        let same_unit = |kept: &laser_wire::mutation::SessionPosition| {
+            kept.stream_id == position.stream_id
+                && kept.topic == position.topic
+                && kept.partition_id == position.partition_id
+        };
+        let order = |unit: &laser_wire::mutation::SessionPosition| {
+            (unit.stream_generation, unit.topic_generation, unit.offset)
+        };
+        match seen.sessions.iter_mut().find(|kept| same_unit(kept)) {
+            Some(kept) if order(position) > order(kept) => *kept = position.clone(),
+            Some(_) => {}
+            None => seen.sessions.push(position.clone()),
+        }
+    }
+}
+
+/// The surface reply inside a positioned reply, and the frontier it carries.
+/// A reply the streaming server itself refused with comes unwrapped.
+fn open_positioned(reply: Vec<u8>) -> (Vec<u8>, Option<laser_wire::mutation::AppliedFrontier>) {
+    match decode_named::<laser_wire::mutation::ManagedReplyEnvelope>(&reply) {
+        Ok(envelope) => (envelope.reply, Some(envelope.frontier)),
+        Err(_) => (reply, None),
+    }
+}
+
+pub(crate) use crate::retry::jittered;
+
 // The generic correlation header and the header caps moved to laser-wire (they
 // are wire contract). Re-exported here so the historical paths keep resolving.
 pub use laser_wire::headers::{
@@ -32,7 +141,6 @@ pub const OPS_STREAM_DEFAULT: &str = "_agdx";
 // the stream too or the two would collide on a shared topic name.
 type ProducerKey = (String, String);
 type ProducerCell = Arc<OnceCell<Arc<IggyProducer>>>;
-const TRANSIENT_SEND_ATTEMPTS: usize = 10;
 const PUBLISH_BATCH_LENGTH: usize = 1000;
 
 /// How a [`Laser`] names the managed resources it sends: KV, memory, lease,
@@ -104,6 +212,15 @@ struct LaserInner {
     #[cfg(feature = "kv")]
     coordination_acquire_gate: tokio::sync::Mutex<()>,
     producers: DashMap<ProducerKey, ProducerCell>,
+    // The node managed requests use after the shared connection's plane failed.
+    managed_route: crate::managed_route::ManagedRoute,
+    // Surfaces whose next read must wait for the new node's fold to reach the
+    // mutation log head, one bit per surface, set by a node move.
+    read_barriers: std::sync::atomic::AtomicU8,
+    // The highest mutation position seen per surface, from mutation and read
+    // replies. Every KV, fork and graph read sends it back, so whichever node
+    // answers has applied at least what this client wrote or read before.
+    seen_frontier: std::sync::Mutex<laser_wire::mutation::AppliedFrontier>,
     pub(crate) producer_statistics: Arc<crate::stream::producer_statistics::ProducerRegistry>,
     negotiated: std::sync::RwLock<NegotiatedState>,
     // Lets one caller at a time re-probe an unmanaged capability set.
@@ -271,6 +388,9 @@ impl Laser {
                 client: std::sync::RwLock::new(Arc::new(client)),
                 publish_options: PublishOptions::default(),
                 reconnect_gate: tokio::sync::Mutex::new(()),
+                managed_route: Default::default(),
+                read_barriers: std::sync::atomic::AtomicU8::new(0),
+                seen_frontier: std::sync::Mutex::default(),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
                 connection_string: None,
                 #[cfg(feature = "kv")]
@@ -490,6 +610,7 @@ impl Laser {
         }
         #[cfg(feature = "agent")]
         self.inner.reply_hubs.clear();
+        self.inner.managed_route.close().await;
         self.client().shutdown().await.map_err(LaserError::from)
     }
 
@@ -1032,28 +1153,254 @@ impl Laser {
     /// `AGDX_QUERY` on the server, and the connect-time probe uses it for
     /// `AGDX_HELLO`. Every managed command is non-replicated from Iggy's
     /// perspective. Idempotent writes carry a stable operation identity so
-    /// Plane can append them to its standard Iggy mutation topics.
+    /// Plane can append them to its standard Iggy mutation topics, see
+    /// [`send_managed_mutation`](Self::send_managed_mutation).
     #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed"))]
     pub(crate) async fn send_raw_with_response(
         &self,
         code: u32,
         payload: Vec<u8>,
-    ) -> Result<Vec<u8>, IggyError> {
-        let payload = if laser_wire::codes::is_idempotent_managed_request(code) {
+    ) -> Result<Vec<u8>, LaserError> {
+        if !laser_wire::codes::is_idempotent_managed_request(code) {
+            // After a node move, the first read of each surface waits for the
+            // new node's fold to reach the log head, so it cannot miss this
+            // client's own earlier writes, even one whose reply was lost.
+            let barrier = barrier_bit(code);
+            let barriered = barrier != 0
+                && self
+                    .inner
+                    .read_barriers
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    & barrier
+                    != 0;
+            let frame = bytes::Bytes::from(self.read_frame(code, &payload, barriered)?);
+            let (node, client) = self.managed_client().await;
+            let reply = match client.send_binary_request(code, frame).await {
+                Ok(reply) => self.take_positioned(reply.to_vec()),
+                Err(error) => {
+                    // A pinned node does not reconnect. The caller decides
+                    // whether to send again, and the next request uses the
+                    // shared connection.
+                    if let Some(node) = node.as_deref() {
+                        self.inner.managed_route.unpin(node).await;
+                    }
+                    return Err(error.into());
+                }
+            };
+            // A read is safe to send again, so it moves once to another node
+            // when this node's plane did not answer.
+            if decode_named::<laser_wire::result::CommandError>(&reply)
+                .is_ok_and(|error| error.code.is_plane_unavailable())
+                && self.move_managed(node.as_deref()).await
+            {
+                let (moved_node, client) = self.managed_client().await;
+                // The move armed the barrier, so the one retry carries it.
+                let frame = bytes::Bytes::from(self.read_frame(code, &payload, barrier != 0)?);
+                let reply = match client.send_binary_request(code, frame).await {
+                    Ok(reply) => self.take_positioned(reply.to_vec()),
+                    Err(error) => {
+                        // The fresh pin fails like the first one: it goes,
+                        // so later requests do not fail on it first.
+                        if let Some(node) = moved_node.as_deref() {
+                            self.inner.managed_route.unpin(node).await;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                if barrier != 0 {
+                    self.settle_barrier(barrier, &reply);
+                }
+                return Ok(reply);
+            }
+            if barriered {
+                self.settle_barrier(barrier, &reply);
+            }
+            return Ok(reply);
+        }
+        let operation_id = u128::from(ulid::Ulid::generate());
+        let frame =
             laser_wire::framing::encode_named(&laser_wire::mutation::ManagedRequestEnvelope {
                 v: laser_wire::mutation::MANAGED_REQUEST_VERSION,
-                operation_id: u128::from(ulid::Ulid::generate()),
+                operation_id,
                 payload,
             })
-            .map_err(|_| IggyError::InvalidFormat)?
-        } else {
-            payload
+            .map_err(|error| LaserError::Codec(format!("encode managed request: {error}")))?;
+        self.send_managed_mutation(code, operation_id, frame).await
+    }
+
+    /// Send one managed mutation until its outcome is known. The frame, and
+    /// with it the operation identity, never changes between attempts, so the
+    /// server applies the mutation at most once and returns the recorded
+    /// outcome to a repeat. A `Pending` reply or a transport failure after the
+    /// request may have left leaves the outcome unknown, so the same frame is
+    /// sent again with jittered backoff. When [`MANAGED_MUTATION_DEADLINE`]
+    /// passes first, the caller gets [`LaserError::AmbiguousMutation`] naming
+    /// the identity: the mutation may still apply.
+    async fn send_managed_mutation(
+        &self,
+        code: u32,
+        operation_id: u128,
+        frame: Vec<u8>,
+    ) -> Result<Vec<u8>, LaserError> {
+        let deadline = tokio::time::Instant::now() + MANAGED_MUTATION_DEADLINE;
+        let mut delay = crate::retry::MANAGED_MUTATION.base;
+        loop {
+            let (node, client) = self.managed_client().await;
+            let (unknown, node_failed) = match client
+                .send_binary_request(code, bytes::Bytes::from(frame.clone()))
+                .await
+            {
+                Ok(reply) => {
+                    let reply = self.take_positioned(reply.to_vec());
+                    match unknown_outcome(&reply) {
+                        Some(error) => (error.message, error.code.is_plane_unavailable()),
+                        None => return Ok(reply),
+                    }
+                }
+                Err(error) if crate::error::is_transient_iggy_io_error(&error) => {
+                    (error.to_string(), true)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            // The same frame goes to another node, so the move keeps the
+            // operation identity and the deadline.
+            if node_failed {
+                self.move_managed(node.as_deref()).await;
+            }
+            let wait = jittered(delay);
+            if tokio::time::Instant::now() + wait >= deadline {
+                return Err(LaserError::AmbiguousMutation(format!(
+                    "operation {operation_id:032x} outcome is still unknown after {}s: {unknown}",
+                    MANAGED_MUTATION_DEADLINE.as_secs()
+                )));
+            }
+            tracing::debug!(
+                target: "laser",
+                code,
+                operation = %format!("{operation_id:032x}"),
+                %unknown,
+                "managed mutation outcome unknown, repeating it under the same identity"
+            );
+            sleep(wait).await;
+            delay = delay
+                .saturating_mul(2)
+                .min(crate::retry::MANAGED_MUTATION.max);
+        }
+    }
+
+    /// The connection managed requests use: the node they moved to after a
+    /// plane failure, or the shared connection. The node name is `None` for
+    /// the shared connection.
+    async fn managed_client(&self) -> (Option<String>, Arc<IggyClient>) {
+        match self.inner.managed_route.pinned().await {
+            Some(pinned) => (Some(pinned.node), pinned.client),
+            None => (None, self.client()),
+        }
+    }
+
+    /// The frame for managed read `code`. A KV, fork, graph or session read
+    /// always goes in a
+    /// [`ManagedReadEnvelope`](laser_wire::mutation::ManagedReadEnvelope)
+    /// carrying the highest positions this client has seen for the surface, so
+    /// the reply brings the answering node's frontier back.
+    fn read_frame(&self, code: u32, read: &[u8], log_head: bool) -> Result<Vec<u8>, LaserError> {
+        if !laser_wire::codes::is_barrier_read(code) {
+            return Ok(read.to_vec());
+        }
+        let (min_position, min_sessions) = {
+            let seen = self
+                .inner
+                .seen_frontier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match laser_wire::mutation::PositionSurface::of_code(code) {
+                Some(laser_wire::mutation::PositionSurface::Kv) => (seen.kv, Vec::new()),
+                Some(laser_wire::mutation::PositionSurface::Fork) => (seen.fork, Vec::new()),
+                Some(laser_wire::mutation::PositionSurface::Graph) => (seen.graph, Vec::new()),
+                // A session read: the plane keeps only the positions of the
+                // read's own stream.
+                None => (None, seen.sessions.clone()),
+            }
         };
-        let reply = self
-            .client()
-            .send_binary_request(code, bytes::Bytes::from(payload))
-            .await?;
-        Ok(reply.to_vec())
+        laser_wire::framing::encode_named(&laser_wire::mutation::ManagedReadEnvelope {
+            v: laser_wire::mutation::MANAGED_REQUEST_VERSION,
+            read: read.to_vec(),
+            min_position,
+            log_head,
+            min_sessions,
+        })
+        .map_err(|error| LaserError::Codec(format!("encode managed read: {error}")))
+    }
+
+    /// Open a positioned reply and raise the seen frontier to the one it
+    /// carries.
+    fn take_positioned(&self, reply: Vec<u8>) -> Vec<u8> {
+        let (reply, frontier) = open_positioned(reply);
+        if let Some(frontier) = frontier {
+            merge_frontier(
+                &mut self
+                    .inner
+                    .seen_frontier
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                &frontier,
+            );
+        }
+        reply
+    }
+
+    /// The highest mutation position this client has seen per managed
+    /// surface. Every KV, fork and graph reply raises it, and every later read
+    /// of that surface sends it, so whichever node answers has applied at
+    /// least what this client wrote or read before. Clones of this handle
+    /// share it.
+    pub fn seen_positions(&self) -> laser_wire::mutation::AppliedFrontier {
+        self.inner
+            .seen_frontier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Clear a surface's pending read barrier once a barriered read was served.
+    /// A `Stale` answer keeps it, so the next read waits again.
+    fn settle_barrier(&self, barrier: u8, reply: &[u8]) {
+        let stale = decode_named::<laser_wire::result::CommandError>(reply)
+            .is_ok_and(|error| error.code == laser_wire::result::ResultCode::Stale);
+        if !stale {
+            self.inner
+                .read_barriers
+                .fetch_and(!barrier, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Move managed requests off `failed` to another node whose plane is
+    /// ready. Needs the connection string to dial that node, so a
+    /// bring-your-own client stays where it is. Returns whether a node other
+    /// than `failed` now serves managed requests.
+    async fn move_managed(&self, failed: Option<&str>) -> bool {
+        let Some(connection_string) = self.inner.connection_string.as_deref() else {
+            return false;
+        };
+        let versions = self
+            .inner
+            .negotiated
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capabilities
+            .versions;
+        let moved = self
+            .inner
+            .managed_route
+            .repin(connection_string, &self.client(), failed, versions)
+            .await
+            .is_some_and(|node| Some(node.as_str()) != failed);
+        if moved {
+            self.inner
+                .read_barriers
+                .store(ALL_READ_BARRIERS, std::sync::atomic::Ordering::Release);
+        }
+        moved
     }
 
     /// Send an already-framed managed command: the caller built (and holds)
@@ -1073,7 +1420,7 @@ impl Laser {
             .client()
             .send_binary_request(code, bytes::Bytes::from(payload))
             .await?;
-        Ok(reply.to_vec())
+        Ok(self.take_positioned(reply.to_vec()))
     }
 
     /// A Iggy `IggyProducerBuilder` for `(stream, topic)`. laser-sdk builds on
@@ -1290,10 +1637,11 @@ pub(crate) fn clone_iggy_message(message: &IggyMessage) -> IggyMessage {
 /// on a new topic see `AlreadyExists` on the loser. The retry reads the stream
 /// and topic the winner created.
 pub(crate) async fn init_producer(producer: &IggyProducer) -> Result<(), IggyError> {
-    for attempt in 0..TRANSIENT_SEND_ATTEMPTS {
+    for attempt in 0..crate::retry::CREATE_RACE_ATTEMPTS {
         match producer.init().await {
             Err(error)
-                if is_idempotent_create_race(&error) && attempt + 1 < TRANSIENT_SEND_ATTEMPTS =>
+                if is_idempotent_create_race(&error)
+                    && attempt + 1 < crate::retry::CREATE_RACE_ATTEMPTS =>
             {
                 sleep(Duration::from_millis(50 * (attempt + 1) as u64)).await;
             }
@@ -1648,6 +1996,9 @@ impl LaserBuilder {
                 client: std::sync::RwLock::new(Arc::new(client)),
                 publish_options,
                 reconnect_gate: tokio::sync::Mutex::new(()),
+                managed_route: Default::default(),
+                read_barriers: std::sync::atomic::AtomicU8::new(0),
+                seen_frontier: std::sync::Mutex::default(),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
                 connection_string,
                 #[cfg(feature = "kv")]
@@ -3208,5 +3559,192 @@ mod resource_naming_tests {
             "stream:fleet/memory"
         );
         assert_eq!(laser.resource_name_in(None, "memory"), "memory");
+    }
+}
+
+#[cfg(test)]
+mod managed_mutation_tests {
+    use super::unknown_outcome;
+    use laser_wire::framing::encode_named;
+    use laser_wire::result::{CommandError, ResultCode};
+
+    fn reply(code: ResultCode, message: &str) -> Vec<u8> {
+        encode_named(&CommandError::new(code, message)).expect("encodes")
+    }
+
+    #[test]
+    fn given_pending_or_unavailable_replies_when_classified_then_should_repeat_the_same_identity() {
+        for (code, message) in [
+            (ResultCode::Pending, "not folded yet"),
+            (ResultCode::PlaneUnavailable, "plane down"),
+            (ResultCode::Unavailable, "busy"),
+        ] {
+            let unknown = unknown_outcome(&reply(code, message)).expect("outcome unknown");
+            assert_eq!(unknown.code, code);
+            assert_eq!(unknown.message, message);
+        }
+    }
+
+    #[test]
+    fn given_barrier_reads_when_classified_then_every_wire_barrier_code_should_have_a_surface() {
+        for code in
+            laser_wire::codes::AGDX_COMMAND_BASE..laser_wire::codes::AGDX_COMMAND_BASE + 1000
+        {
+            assert_eq!(
+                super::barrier_bit(code) != 0,
+                laser_wire::codes::is_barrier_read(code),
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_final_replies_when_classified_then_should_return_them() {
+        assert_eq!(unknown_outcome(&reply(ResultCode::Conflict, "taken")), None);
+        assert_eq!(unknown_outcome(&reply(ResultCode::Forbidden, "no")), None);
+        assert_eq!(unknown_outcome(&[0xa1, 0x62, 0x6f, 0x6b, 0xf6]), None);
+    }
+}
+
+#[cfg(test)]
+mod positioned_reply_tests {
+    use super::Laser;
+    use laser_wire::codes::{AGDX_KV_GET_CODE, AGDX_SESSION_GET_CODE};
+    use laser_wire::framing::{decode_named, encode_named};
+    use laser_wire::mutation::{
+        AppliedFrontier, MANAGED_REQUEST_VERSION, ManagedReadEnvelope, ManagedReplyEnvelope,
+        MutationPosition, SessionPosition,
+    };
+    use laser_wire::result::{CommandError, ResultCode};
+
+    fn at(offset: u64) -> MutationPosition {
+        MutationPosition {
+            topic_generation: 1,
+            partition: 0,
+            offset,
+        }
+    }
+
+    fn positioned(kv: u64, reply: &[u8]) -> Vec<u8> {
+        encode_named(&ManagedReplyEnvelope {
+            v: MANAGED_REQUEST_VERSION,
+            frontier: AppliedFrontier {
+                kv: Some(at(kv)),
+                ..AppliedFrontier::default()
+            },
+            reply: reply.to_vec(),
+        })
+        .expect("encodes")
+    }
+
+    #[test]
+    fn given_positioned_replies_when_taken_then_reads_should_carry_the_highest_position_seen() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let first: ManagedReadEnvelope =
+            decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get", false).unwrap()).unwrap();
+        assert_eq!(first.read, b"get");
+        assert_eq!(first.min_position, None, "nothing seen yet");
+        assert!(!first.log_head);
+
+        assert_eq!(laser.take_positioned(positioned(9, b"written")), b"written");
+        assert_eq!(laser.take_positioned(positioned(4, b"older")), b"older");
+        assert_eq!(laser.seen_positions().kv, Some(at(9)));
+        let next: ManagedReadEnvelope =
+            decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get", true).unwrap()).unwrap();
+        assert_eq!(next.min_position, Some(at(9)));
+        assert!(next.log_head);
+    }
+
+    #[test]
+    fn given_frontiers_when_merged_then_should_keep_the_later_position_per_surface() {
+        let at = |topic_generation, offset| MutationPosition {
+            topic_generation,
+            partition: 0,
+            offset,
+        };
+        let mut seen = AppliedFrontier {
+            kv: Some(at(1, 9)),
+            fork: Some(at(1, 4)),
+            graph: None,
+            sessions: Vec::new(),
+        };
+        super::merge_frontier(
+            &mut seen,
+            &AppliedFrontier {
+                kv: Some(at(1, 3)),
+                fork: Some(at(2, 0)),
+                graph: Some(at(1, 1)),
+                sessions: Vec::new(),
+            },
+        );
+        assert_eq!(seen.kv, Some(at(1, 9)), "an older answer never lowers it");
+        assert_eq!(seen.fork, Some(at(2, 0)), "a recreated topic is later");
+        assert_eq!(seen.graph, Some(at(1, 1)));
+    }
+
+    #[test]
+    fn given_session_positions_when_merged_then_session_reads_should_carry_them() {
+        let session = |stream_generation, topic: &str, offset| SessionPosition {
+            stream_id: 4,
+            stream_generation,
+            topic: topic.to_owned(),
+            topic_generation: 1,
+            partition_id: 0,
+            offset,
+        };
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        let answered = |sessions| {
+            encode_named(&ManagedReplyEnvelope {
+                v: MANAGED_REQUEST_VERSION,
+                frontier: AppliedFrontier {
+                    sessions,
+                    ..AppliedFrontier::default()
+                },
+                reply: b"page".to_vec(),
+            })
+            .expect("encodes")
+        };
+        laser.take_positioned(answered(vec![
+            session(1, "lane", 5),
+            session(1, "inbox", 2),
+        ]));
+        laser.take_positioned(answered(vec![session(1, "lane", 3)]));
+        assert_eq!(
+            laser.seen_positions().sessions,
+            vec![session(1, "lane", 5), session(1, "inbox", 2)],
+            "an older answer never lowers a unit"
+        );
+        let read: ManagedReadEnvelope = decode_named(
+            &laser
+                .read_frame(AGDX_SESSION_GET_CODE, b"session", false)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read.read, b"session");
+        assert_eq!(read.min_position, None);
+        assert_eq!(read.min_sessions.len(), 2);
+
+        laser.take_positioned(answered(vec![session(2, "lane", 0)]));
+        assert_eq!(
+            laser.seen_positions().sessions,
+            vec![session(2, "lane", 0)],
+            "a recreated stream drops the positions of the one before it"
+        );
+    }
+
+    #[test]
+    fn given_unpositioned_traffic_when_framed_then_should_pass_it_unwrapped() {
+        let laser = Laser::from_client(iggy::prelude::IggyClient::default());
+        assert_eq!(
+            laser
+                .read_frame(laser_wire::codes::AGDX_QUERY_CODE, b"query", false)
+                .unwrap(),
+            b"query",
+            "a read outside the folded surfaces is sent as it is"
+        );
+        let refusal = encode_named(&CommandError::new(ResultCode::PlaneUnavailable, "down"))
+            .expect("encodes");
+        assert_eq!(laser.take_positioned(refusal.clone()), refusal);
+        assert_eq!(laser.seen_positions(), AppliedFrontier::default());
     }
 }

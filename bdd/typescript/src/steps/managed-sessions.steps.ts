@@ -274,6 +274,17 @@ Then(
 );
 
 Then(
+  "the client has seen session positions for the stream",
+  function (this: LaserWorld) {
+    const positions = laserOf(this).seenPositions().sessions ?? [];
+    assert.ok(
+      positions.length > 0,
+      "a session read reply carried the session fold's positions",
+    );
+  },
+);
+
+Then(
   /^the stream counts (\d+) completed sessions?$/,
   async function (this: LaserWorld, count: string) {
     const sessions = sessionsOf(this);
@@ -1367,17 +1378,9 @@ When(
   async function (this: LaserWorld) {
     const laser = laserOf(this);
     const session = this.requireSession();
-    const payload = wire.encodeNamed(
-      wire.encodeControlEnvelope({
-        v: wire.CONTROL_OP_VERSION,
-        timestampMicros: BigInt(Date.now()) * 1000n,
-        command: { kind: "removeSessionSource", stream: session.stream() },
-      }),
-    );
-    await laser
-      .stream(laser.opsStream)
-      .topic(laser.controlTopic)
-      .send(payload, { key: new TextEncoder().encode("control") });
+    // Control goes through the authenticated managed path. A native append
+    // to the control topic is refused by the deployment.
+    await laser.sessions(sessionsOf(this).config).unregister();
     await eventually("source registration removal", async () => {
       try {
         await laser.sessions().sources(session.conversation);

@@ -20,6 +20,12 @@ Feature: Managed sessions on a deployment that indexes them
       | declared partitions |
       | single partition    |
 
+  Scenario: Session reads bring back the positions the session fold applied
+    Given a managed session stream in the shared layout
+    When agent "planner" runs the session "positions" with one command answered by "worker"
+    Then the indexed session "positions" is completed by "planner" with 4 events
+    And the client has seen session positions for the stream
+
   Scenario: A2A and MCP children roll up under their root
     Given a managed session stream in the shared layout
     And agent "worker" answers every command it receives

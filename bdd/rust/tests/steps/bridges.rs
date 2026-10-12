@@ -56,6 +56,63 @@ async fn submit_and_cancel_a2a(world: &mut LaserWorld) {
     panic!("canceled task did not replay");
 }
 
+fn bound_bridge(world: &LaserWorld) -> A2aBridge {
+    A2aBridge::new(
+        world.laser().clone(),
+        "a2a-gateway"
+            .parse::<laser_sdk::types::AgentId>()
+            .expect("a2a-gateway is valid"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+    )
+    .with_task_binding([3; 32], Duration::from_secs(60))
+}
+
+#[when(regex = r#"^caller "([^"]+)" submits a bound A2A task$"#)]
+async fn submit_bound_a2a(world: &mut LaserWorld, caller: String) {
+    let task = bound_bridge(world)
+        .caller(caller)
+        .submit(br#"{"message":{"role":"user","text":"bound"}}"#.to_vec())
+        .await
+        .expect("the bound submit succeeds");
+    world.bound_task = Some(task.id);
+}
+
+async fn record_bound_cancel(world: &mut LaserWorld, caller: Option<String>) {
+    let bridge = bound_bridge(world);
+    let id = world
+        .bound_task
+        .clone()
+        .expect("a bound task was submitted");
+    let outcome = match &caller {
+        Some(caller) => bridge.caller(caller.clone()).cancel(&id).await,
+        None => bridge.cancel(&id).await,
+    };
+    let state = match outcome {
+        Ok(task) if task.status.state == TaskState::Canceled => "Canceled".to_owned(),
+        Ok(task) => format!("{:?}", task.status.state),
+        Err(LaserError::HandlerConfig(_)) => "refused".to_owned(),
+        Err(error) => panic!("unexpected cancel error: {error}"),
+    };
+    let name = caller.unwrap_or_else(|| "anonymous".to_owned());
+    world.bound_outcomes.push(format!("{name}:{state}"));
+}
+
+#[when(regex = r#"^caller "([^"]+)" tries to cancel the bound A2A task$"#)]
+async fn caller_cancels_bound_a2a(world: &mut LaserWorld, caller: String) {
+    record_bound_cancel(world, Some(caller)).await;
+}
+
+#[when("an anonymous caller tries to cancel the bound A2A task")]
+async fn anonymous_cancels_bound_a2a(world: &mut LaserWorld) {
+    record_bound_cancel(world, None).await;
+}
+
+#[then(regex = r#"^the bound A2A cancel outcomes are "([^"]+)"$"#)]
+async fn bound_cancel_outcomes(world: &mut LaserWorld, outcomes: String) {
+    assert_eq!(world.bound_outcomes.join(","), outcomes);
+}
+
 #[then(regex = r#"^the replayed A2A task state is "([^"]+)"$"#)]
 async fn replayed_state(world: &mut LaserWorld, state: String) {
     assert_eq!(world.bridge_task_state.as_deref(), Some(state.as_str()));

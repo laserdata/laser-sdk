@@ -19,14 +19,80 @@ export interface PendingControl {
   readonly pauseRequested: boolean
   /** A cancel was requested, or an operator forced the session canceled. */
   readonly cancelRequested: boolean
+  /** A control request for the session arrived on another partition of
+   * `agent.control` than the one its conversation id routes to. Such a request
+   * is never applied, here or by the plane. */
+  readonly controlConflict: boolean
 }
 
 /** No pending request.
  * @internal */
 export const NO_PENDING_CONTROL: PendingControl = Object.freeze({
   pauseRequested: false,
-  cancelRequested: false
+  cancelRequested: false,
+  controlConflict: false
 })
+
+const PRIME_1 = 0x9e3779b1
+const PRIME_2 = 0x85ebca77
+const PRIME_3 = 0xc2b2ae3d
+const PRIME_4 = 0x27d4eb2f
+const PRIME_5 = 0x165667b1
+
+function rotl(value: number, bits: number): number {
+  return ((value << bits) | (value >>> (32 - bits))) >>> 0
+}
+
+/** XXH32 with seed zero.
+ * @internal */
+export function xxh32(input: Uint8Array): number {
+  const view = new DataView(input.buffer, input.byteOffset, input.byteLength)
+  const lane = (at: number): number => view.getUint32(at, true)
+  const round = (acc: number, value: number): number =>
+    Math.imul(rotl((acc + Math.imul(value, PRIME_2)) >>> 0, 13), PRIME_1) >>> 0
+  let at = 0
+  let hash: number
+  if (input.byteLength >= 16) {
+    const acc = [(PRIME_1 + PRIME_2) >>> 0, PRIME_2, 0, (0 - PRIME_1) >>> 0]
+    while (at + 16 <= input.byteLength) {
+      for (let index = 0; index < 4; index += 1) {
+        acc[index] = round(acc[index] ?? 0, lane(at + index * 4))
+      }
+      at += 16
+    }
+    hash =
+      (rotl(acc[0] ?? 0, 1) +
+        rotl(acc[1] ?? 0, 7) +
+        rotl(acc[2] ?? 0, 12) +
+        rotl(acc[3] ?? 0, 18)) >>>
+      0
+  } else {
+    hash = PRIME_5
+  }
+  hash = (hash + input.byteLength) >>> 0
+  while (at + 4 <= input.byteLength) {
+    hash = Math.imul(rotl((hash + Math.imul(lane(at), PRIME_3)) >>> 0, 17), PRIME_4) >>> 0
+    at += 4
+  }
+  while (at < input.byteLength) {
+    hash = Math.imul(rotl((hash + Math.imul(input[at] ?? 0, PRIME_5)) >>> 0, 11), PRIME_1) >>> 0
+    at += 1
+  }
+  hash ^= hash >>> 15
+  hash = Math.imul(hash, PRIME_2) >>> 0
+  hash ^= hash >>> 13
+  hash = Math.imul(hash, PRIME_3) >>> 0
+  return (hash ^ (hash >>> 16)) >>> 0
+}
+
+/** The `agent.control` partition a session's control records belong on: the
+ * partition Iggy routes the conversation id key to, XXH32 with seed zero over
+ * the conversation string modulo the partition count. The plane applies the
+ * same rule, so both refuse a record on any other partition.
+ * @internal */
+export function controlPartition(conversation: string, partitions: number): number | undefined {
+  return partitions > 0 ? xxh32(new TextEncoder().encode(conversation)) % partitions : undefined
+}
 
 /** One control request a session record carries.
  * @internal */
@@ -147,6 +213,14 @@ class Entry {
   last: ControlPosition | undefined
   folded = false
   pending: (readonly [ControlPosition, ControlRequest])[] = []
+  // A request arrived off the session's control route.
+  conflict = false
+
+  withConflict(): ControlState {
+    return this.conflict
+      ? { ...this.state, flags: { ...this.state.flags, controlConflict: true } }
+      : this.state
+  }
 
   apply(at: ControlPosition, request: ControlRequest): void {
     if (this.last !== undefined && !newer(at, this.last)) return
@@ -156,14 +230,19 @@ class Entry {
 }
 
 /** Fold control records in log order into a state and the position of the
- * last one.
+ * last one. A record off `route`, the session's control partition, is not
+ * applied and flags the state.
  * @internal */
 export function foldControl(
-  records: Iterable<readonly [ControlPosition, ControlRequest]>
+  records: Iterable<readonly [ControlPosition, ControlRequest]>,
+  route: number | undefined
 ): readonly [ControlState, ControlPosition | undefined] {
   const entry = new Entry()
-  for (const [at, request] of records) entry.apply(at, request)
-  return [entry.state, entry.last]
+  for (const [at, request] of records) {
+    if (route === undefined || route === at[0]) entry.apply(at, request)
+    else entry.conflict = true
+  }
+  return [entry.withConflict(), entry.last]
 }
 
 /** The control state of the sessions one runtime has seen. The runtime loads
@@ -181,6 +260,28 @@ export class ControlBook {
   // Whether the startup read loaded every session, so a session without an
   // entry has no requests.
   private loaded = false
+  // The partition count of agent.control, zero while unknown.
+  private partitions = 0
+
+  /** The partition count of `agent.control`, which fixes each session's
+   * control route. */
+  setPartitions(partitions: number): void {
+    this.partitions = partitions
+  }
+
+  // Whether `partition` is the control route of `conversation`. Every
+  // partition is while the count is unknown.
+  private onRoute(conversation: string, partition: number): boolean {
+    const route = controlPartition(conversation, this.partitions)
+    return route === undefined || route === partition
+  }
+
+  /** Forget every session, for a recreated `agent.control` whose history
+   * starts again. */
+  reset(): void {
+    this.entries.clear()
+    this.loaded = false
+  }
 
   /** Mark whether a follower is keeping the book current. */
   setLive(live: boolean): void {
@@ -199,7 +300,8 @@ export class ControlBook {
     for (const [conversation, at, request] of records) {
       const entry = this.entry(conversation)
       entry.folded = true
-      entry.apply(at, request)
+      if (this.onRoute(conversation, at[0])) entry.apply(at, request)
+      else entry.conflict = true
     }
     this.loaded = true
   }
@@ -207,7 +309,9 @@ export class ControlBook {
   /** Record one live control request. */
   observe(conversation: string, at: ControlPosition, request: ControlRequest): void {
     const entry = this.entry(conversation)
-    if (entry.folded || this.loaded) {
+    if (!this.onRoute(conversation, at[0])) {
+      entry.conflict = true
+    } else if (entry.folded || this.loaded) {
       entry.folded = true
       entry.apply(at, request)
     } else {
@@ -221,7 +325,7 @@ export class ControlBook {
     if (!this.live) return undefined
     const entry = this.entries.get(conversation)
     if (entry === undefined) return this.loaded ? NO_CONTROL : undefined
-    return entry.folded ? entry.state : undefined
+    return entry.folded ? entry.withConflict() : undefined
   }
 
   /** Whether any session has a pause or resume request, so the runtime has
@@ -248,14 +352,14 @@ export class ControlBook {
     last: ControlPosition | undefined
   ): ControlState {
     const entry = this.entry(conversation)
-    if (entry.folded && this.live) return entry.state
+    if (entry.folded && this.live) return entry.withConflict()
     const pending = entry.pending
     entry.pending = []
     entry.state = state
     entry.last = last
     entry.folded = true
     for (const [at, request] of pending) entry.apply(at, request)
-    return entry.state
+    return entry.withConflict()
   }
 
   private entry(conversation: string): Entry {

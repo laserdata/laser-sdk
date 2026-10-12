@@ -8,9 +8,11 @@ import {
   ProjectionBindingBuilder,
   ProjectionBuilder,
   decodeControlEnvelope,
+  decodeProjectionBinding,
   decodeRetentionPolicy,
   decodeSchemaSource,
   encodeControlEnvelope,
+  encodeProjectionBinding,
   parseProjectionId,
   projectionKindFromCode,
   projectionKindIsRow,
@@ -49,6 +51,32 @@ void test("given_the_binding_control_fixtures_when_decoded_then_should_preserve_
 
   const removed = await assertControlRoundTrips("control_remove_binding.bin")
   assert.equal(removed.command.kind, "removeBinding")
+})
+
+void test("given_the_operator_control_fixtures_when_decoded_then_should_preserve_the_decision", async () => {
+  const accepted = await assertControlRoundTrips("control_accept_gap.bin")
+  if (accepted.command.kind !== "acceptGap") throw new Error("wrong command")
+  assert.equal(accepted.command.acceptance.partitionId, 2)
+  assert.equal(accepted.command.acceptance.fromOffset, 41n)
+  assert.equal(accepted.command.acceptance.toOffset, 97n)
+
+  const skipped = await assertControlRoundTrips("control_skip_record.bin")
+  if (skipped.command.kind !== "skipRecord") throw new Error("wrong command")
+  assert.equal(skipped.command.skip.offset, 58n)
+  assert.equal(skipped.command.skip.target, "readings_rows")
+})
+
+void test("given_a_stamped_control_fixture_when_decoded_then_should_preserve_the_stamp", async () => {
+  const stamped = await assertControlRoundTrips("control_stamped_remove_binding.bin")
+  assert.equal(stamped.stream, "fleet")
+  if (stamped.stamp === undefined) throw new Error("stamp missing")
+  assert.equal(stamped.stamp.deploymentId, 7n)
+  assert.equal(stamped.stamp.actorUserId, 42)
+  assert.equal(stamped.stamp.operationId, 0x0123456789abcdef0123456789abcdefn)
+  assert.equal(stamped.stamp.streamGeneration?.streamId, 3)
+  assert.equal(stamped.stamp.keyId, 11n)
+  const plain = await assertControlRoundTrips("control_remove_binding.bin")
+  assert.equal(plain.stamp, undefined)
 })
 
 void test("given_each_schema_control_fixture_when_decoded_then_should_preserve_the_source", async () => {
@@ -174,6 +202,20 @@ void test("given_a_binding_without_a_source_when_built_then_should_refuse", () =
     .build()
   assert.equal(binding.index, "t")
   assert.equal(binding.notify, true)
+})
+
+void test("given_a_binding_that_skips_rejected_records_when_encoded_then_should_round_trip_the_opt_in", () => {
+  const plain = new ProjectionBindingBuilder().source("s", "t").build()
+  assert.equal(plain.skipRejected, false)
+  assert.equal(encodeProjectionBinding(plain).has("skip_rejected"), false)
+  const opted = new ProjectionBindingBuilder().source("s", "t").skipRejected().build()
+  const encoded = encodeProjectionBinding(opted)
+  assert.equal(encoded.get("skip_rejected"), true)
+  const decoded = decodeProjectionBinding(
+    expectMap(decodeOne(encodeNamed(encoded), "binding"), "binding"),
+    "binding"
+  )
+  assert.equal(decoded.skipRejected, true)
 })
 
 void test("given_an_index_schema_builder_when_built_then_should_expand_root_fields", () => {

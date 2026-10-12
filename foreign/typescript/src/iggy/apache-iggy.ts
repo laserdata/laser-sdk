@@ -1,7 +1,9 @@
+import { MANAGED_MUTATION, MANAGED_MUTATION_DEADLINE_MS, jittered } from "../retry.js"
 import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.command.js"
 import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
 import { GET_STREAM } from "apache-iggy/dist/wire/stream/get-stream.command.js"
 import { GET_TOPIC } from "apache-iggy/dist/wire/topic/get-topic.command.js"
+import type { ClusterNode } from "apache-iggy/dist/wire/cluster/cluster.utils.js"
 import { connectOptions } from "../client/connect-options.js"
 import {
   publishOptions,
@@ -45,9 +47,36 @@ import type { HeaderValue } from "../stream/header-value.js"
 import type { Routing } from "../stream/routing.js"
 import { Mutex } from "../runtime/mutex.js"
 import { mintUlidValue } from "../runtime/ulid.js"
-import { encodeNamed } from "../wire/cbor.js"
-import { isIdempotentManagedRequest } from "../wire/codes.js"
-import { MANAGED_REQUEST_VERSION, encodeManagedRequestEnvelope } from "../wire/mutation.js"
+import { decodeOne, encodeNamed, expectMap } from "../wire/cbor.js"
+import {
+  AGDX_FORK_LIST_CODE,
+  AGDX_GRAPH_NEIGHBORS_CODE,
+  AGDX_GRAPH_QUERY_CODE,
+  AGDX_HELLO_CODE,
+  AGDX_KV_EXISTS_CODE,
+  AGDX_KV_GET_CODE,
+  AGDX_KV_NAMESPACES_CODE,
+  AGDX_KV_SCAN_CODE,
+  AGDX_SESSION_CHANGES_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_STATE_CODE,
+  isBarrierRead,
+  isIdempotentManagedRequest
+} from "../wire/codes.js"
+import { type OpVersions, decodeBackendAnnounce } from "../wire/hello.js"
+import {
+  type AppliedFrontier,
+  MANAGED_REQUEST_VERSION,
+  decodeManagedReplyEnvelope,
+  encodeManagedReadEnvelope,
+  encodeManagedRequestEnvelope,
+  mergeFrontier,
+  positionSurfaceOf
+} from "../wire/mutation.js"
 
 export interface PolledMessage {
   readonly payload: Uint8Array
@@ -178,6 +207,8 @@ export interface LaserTransport {
     payload: Uint8Array,
     options?: { readonly retryAfterReconnect?: boolean }
   ): Promise<Uint8Array>
+  /** The highest mutation position seen per managed surface. */
+  seenPositions?(): AppliedFrontier
   ensureStream(name: string): Promise<void>
   deleteStream(name: string): Promise<boolean>
   ensureTopic(streamId: string, topicId: string, partitions: number): Promise<void>
@@ -327,6 +358,11 @@ export interface LaserTransport {
 export interface NodeConnection {
   send(code: number, payload: Uint8Array): Promise<Uint8Array>
   close(): Promise<void>
+}
+
+interface ManagedNode {
+  readonly name: string
+  readonly connection: NodeConnection
 }
 
 /** A dedicated coordinator connection, owned by its opener. */
@@ -1171,12 +1207,156 @@ async function connectWithRetry(
   throw new TransportError(message, responseError === undefined, { cause: lastError })
 }
 
+/** How long a managed mutation repeats its frame while its outcome is unknown,
+ * as Rust `MANAGED_MUTATION_DEADLINE`. */
+export { MANAGED_MUTATION_DEADLINE_MS }
+
+/** The message of a surface-neutral `Pending` reply, `undefined` for any other
+ * reply. A typed surface reply never decodes as this shape. */
+/**
+ * The roster nodes managed requests may move to, in roster order, as Rust
+ * `managed_route::candidates`. The failed node is skipped. Without a pinned
+ * node the shared connection was on the leader, so the leader is skipped.
+ * Nodes that report themselves stopping or unreachable are skipped too.
+ * @internal
+ */
+export function managedCandidates(
+  nodes: readonly ClusterNode[],
+  failed: string | undefined
+): ClusterNode[] {
+  return nodes.filter(
+    (node) =>
+      (failed === undefined ? node.role !== "Leader" : node.name !== failed) &&
+      node.status !== "Stopping" &&
+      node.status !== "Unreachable"
+  )
+}
+
+function sameVersions(left: OpVersions, right: OpVersions): boolean {
+  return (
+    left.query === right.query &&
+    left.control === right.control &&
+    left.kv === right.kv &&
+    left.fork === right.fork &&
+    left.agent === right.agent &&
+    left.graph === right.graph &&
+    (left.checkpoint ?? 0) === (right.checkpoint ?? 0) &&
+    (left.filter ?? 0) === (right.filter ?? 0) &&
+    left.features === right.features
+  )
+}
+
+const KV_READ_BARRIER = 1
+const FORK_READ_BARRIER = 2
+const GRAPH_READ_BARRIER = 4
+const SESSION_READ_BARRIER = 8
+const ALL_READ_BARRIERS =
+  KV_READ_BARRIER | FORK_READ_BARRIER | GRAPH_READ_BARRIER | SESSION_READ_BARRIER
+
+/**
+ * The read barrier bit of a managed read's surface, `0` for a command that
+ * takes none, as Rust `barrier_bit`.
+ * @internal
+ */
+export function barrierBit(code: number): number {
+  switch (code) {
+    case AGDX_KV_GET_CODE:
+    case AGDX_KV_SCAN_CODE:
+    case AGDX_KV_NAMESPACES_CODE:
+    case AGDX_KV_EXISTS_CODE:
+      return KV_READ_BARRIER
+    case AGDX_FORK_LIST_CODE:
+      return FORK_READ_BARRIER
+    case AGDX_GRAPH_QUERY_CODE:
+    case AGDX_GRAPH_NEIGHBORS_CODE:
+      return GRAPH_READ_BARRIER
+    case AGDX_SESSION_GET_CODE:
+    case AGDX_SESSION_LIST_CODE:
+    case AGDX_SESSION_EVENTS_CODE:
+    case AGDX_SESSION_STATE_CODE:
+    case AGDX_SESSION_LINKS_CODE:
+    case AGDX_SESSION_SOURCES_CODE:
+    case AGDX_SESSION_CHANGES_CODE:
+      return SESSION_READ_BARRIER
+    default:
+      return 0
+  }
+}
+
+/**
+ * The surface reply inside a positioned reply, and the frontier it carries, as
+ * Rust `open_positioned`. A reply the streaming server itself refused with
+ * comes unwrapped.
+ * @internal
+ */
+export function openPositioned(reply: Uint8Array): {
+  readonly reply: Uint8Array
+  readonly frontier?: AppliedFrontier
+} {
+  try {
+    const envelope = decodeManagedReplyEnvelope(
+      expectMap(decodeOne(reply, "ManagedReplyEnvelope"), "ManagedReplyEnvelope"),
+      "ManagedReplyEnvelope"
+    )
+    return { reply: envelope.reply, frontier: envelope.frontier }
+  } catch {
+    return { reply }
+  }
+}
+
+function isStaleReply(reply: Uint8Array): boolean {
+  try {
+    const value = decodeOne(reply, "CommandError")
+    return value instanceof Map && value.get("code") === "stale"
+  } catch {
+    return false
+  }
+}
+
+function isPlaneUnavailableReply(reply: Uint8Array): boolean {
+  try {
+    const value = decodeOne(reply, "CommandError")
+    return value instanceof Map && value.get("code") === "plane_unavailable"
+  } catch {
+    return false
+  }
+}
+
+export function pendingReplyMessage(reply: Uint8Array): string | undefined {
+  let value: unknown
+  try {
+    value = decodeOne(reply, "CommandError")
+  } catch {
+    return undefined
+  }
+  // Pending: accepted, outcome unknown. PlaneUnavailable: the node's own plane
+  // did not answer, and the request may still apply. Unavailable: the node was
+  // too busy to forward it. Each repeats the same identity.
+  if (!(value instanceof Map)) return undefined
+  const code: unknown = value.get("code")
+  if (code !== "pending" && code !== "plane_unavailable" && code !== "unavailable") return undefined
+  const message: unknown = value.get("message")
+  return typeof message === "string" ? message : code
+}
+
 export class ApacheIggyTransport implements LaserTransport {
   readonly kind = "apache-iggy" as const
   readonly publishRetriesManaged = true
   private readonly reconnectLock = new Mutex()
   private readonly publishLane = new Mutex()
   private readonly disconnected = new WeakSet<SimpleClient>()
+  // The node managed requests use after the shared connection's plane failed.
+  private managedNode: ManagedNode | undefined
+  private managedMove: Promise<void> | undefined
+  // The operation versions the first hello on the shared connection announced.
+  private helloVersions: OpVersions | undefined
+  // Surfaces whose next read must wait for the new node's fold to reach the
+  // mutation log head, one bit per surface, set by a node move.
+  private readBarriers = 0
+  // The highest mutation position seen per surface, from mutation and read
+  // replies. Every KV, fork and graph read sends it back, so whichever node
+  // answers has applied at least what this client wrote or read before.
+  private seenFrontier: AppliedFrontier = {}
   // Groups this transport rejoins after a reconnect. Setup helpers allow
   // recreation, while joining an existing group keeps `create: false`.
   private readonly consumerGroups = new Map<
@@ -1379,18 +1559,239 @@ export class ApacheIggyTransport implements LaserTransport {
   async sendManaged(
     code: number,
     payload: Uint8Array,
+    options?: {
+      readonly retryAfterReconnect?: boolean
+      /** Overrides the mutation deadline, for tests.
+       * @internal */
+      readonly mutationDeadlineMs?: number
+    }
+  ): Promise<Uint8Array> {
+    if (!isIdempotentManagedRequest(code)) {
+      // After a node move, the first read of each surface waits for the new
+      // node's fold to reach the log head, so it cannot miss this client's own
+      // earlier writes, even one whose reply was lost.
+      const barrier = barrierBit(code)
+      const barriered = (this.readBarriers & barrier) !== 0
+      const request = this.readFrame(code, payload, barriered)
+      const node = this.managedNode
+      let reply: Uint8Array
+      try {
+        reply = await this.sendManagedOn(node, code, request, options)
+      } catch (cause) {
+        // A pinned node does not reconnect. The caller decides whether to
+        // send again, and the next request uses the shared connection.
+        if (node !== undefined && this.managedNode === node) {
+          this.managedNode = undefined
+          await node.connection.close()
+        }
+        throw cause
+      }
+      if (code === AGDX_HELLO_CODE && node === undefined) this.rememberHello(reply)
+      // A read is safe to send again, so it moves once to another node when
+      // this node's plane did not answer. The move armed the barrier.
+      if (isPlaneUnavailableReply(reply) && (await this.moveManaged(node?.name))) {
+        const retry = this.readFrame(code, payload, barrier !== 0)
+        const movedNode = this.managedNode
+        let moved: Uint8Array
+        try {
+          moved = await this.sendManagedOn(movedNode, code, retry, options)
+        } catch (cause) {
+          // The fresh pin fails like the first one: it goes, so later
+          // requests do not fail on it first.
+          if (movedNode !== undefined && this.managedNode === movedNode) {
+            this.managedNode = undefined
+            await movedNode.connection.close()
+          }
+          throw cause
+        }
+        if (barrier !== 0) this.settleBarrier(barrier, moved)
+        return moved
+      }
+      if (barriered) this.settleBarrier(barrier, reply)
+      return reply
+    }
+    const operationId = mintUlidValue()
+    const frame = encodeNamed(
+      encodeManagedRequestEnvelope({
+        v: MANAGED_REQUEST_VERSION,
+        operationId,
+        payload
+      })
+    )
+    return this.sendManagedMutation(code, operationId, frame, options)
+  }
+
+  /**
+   * Sends one managed mutation until its outcome is known, as Rust
+   * `send_managed_mutation`. The frame and its operation identity never change
+   * between attempts, so the server applies the mutation at most once. A
+   * `Pending` reply or a retryable transport failure repeats the same frame with
+   * jittered backoff. Past the deadline the caller gets
+   * `AmbiguousMutationError` naming the identity, because the mutation may
+   * still apply.
+   */
+  private async sendManagedMutation(
+    code: number,
+    operationId: bigint,
+    frame: Uint8Array,
+    options?: { readonly retryAfterReconnect?: boolean; readonly mutationDeadlineMs?: number }
+  ): Promise<Uint8Array> {
+    const deadlineMs = options?.mutationDeadlineMs ?? MANAGED_MUTATION_DEADLINE_MS
+    const deadline = Date.now() + deadlineMs
+    let delay = MANAGED_MUTATION.baseMs
+    for (;;) {
+      let unknown: string
+      const node = this.managedNode
+      let nodeFailed: boolean
+      try {
+        const reply = await this.sendManagedOn(node, code, frame, options)
+        const pending = pendingReplyMessage(reply)
+        if (pending === undefined) return reply
+        unknown = pending
+        nodeFailed = isPlaneUnavailableReply(reply)
+      } catch (cause) {
+        // A pinned node's connection has no reconnect, so any failure there
+        // leaves the outcome unknown and moves the request.
+        const ambiguous =
+          node !== undefined ||
+          cause instanceof AmbiguousMutationError ||
+          (cause instanceof TransportError && cause.retryable)
+        if (!ambiguous) throw cause
+        unknown = cause instanceof Error ? cause.message : String(cause)
+        nodeFailed = true
+      }
+      // The same frame goes to another node, so the move keeps the operation
+      // identity and the deadline.
+      if (nodeFailed) await this.moveManaged(node?.name)
+      const wait = jittered(delay)
+      if (Date.now() + wait >= deadline) {
+        throw new AmbiguousMutationError(
+          `operation ${operationId.toString(16).padStart(32, "0")} outcome is still unknown after ${String(deadlineMs / 1000)}s: ${unknown}`
+        )
+      }
+      await new Promise((resolve) => setTimeout(resolve, wait))
+      delay = Math.min(delay * 2, MANAGED_MUTATION.maxMs)
+    }
+  }
+
+  private async sendManagedOn(
+    node: ManagedNode | undefined,
+    code: number,
+    payload: Uint8Array,
     options?: { readonly retryAfterReconnect?: boolean }
   ): Promise<Uint8Array> {
-    const request = isIdempotentManagedRequest(code)
-      ? encodeNamed(
-          encodeManagedRequestEnvelope({
-            v: MANAGED_REQUEST_VERSION,
-            operationId: mintUlidValue(),
-            payload
-          })
+    if (node === undefined) return this.sendManagedPreframed(code, payload, options)
+    return this.takePositioned(await node.connection.send(code, payload))
+  }
+
+  /**
+   * The frame for managed read `code`, as Rust `read_frame`. A KV, fork,
+   * graph or session read always goes in a read envelope carrying the highest
+   * positions this client has seen for the surface, so the reply brings the
+   * answering node's frontier back.
+   */
+  private readFrame(code: number, read: Uint8Array, logHead: boolean): Uint8Array {
+    if (!isBarrierRead(code)) return read
+    const surface = positionSurfaceOf(code)
+    const minPosition = surface === undefined ? undefined : this.seenFrontier[surface]
+    // A session read: the plane keeps only the positions of the read's own
+    // stream.
+    const minSessions = surface === undefined ? (this.seenFrontier.sessions ?? []) : []
+    return encodeNamed(
+      encodeManagedReadEnvelope({
+        v: MANAGED_REQUEST_VERSION,
+        read,
+        ...(minPosition !== undefined ? { minPosition } : {}),
+        ...(logHead ? { logHead } : {}),
+        ...(minSessions.length > 0 ? { minSessions } : {})
+      })
+    )
+  }
+
+  /** Opens a positioned reply and raises the seen frontier to its own. */
+  private takePositioned(reply: Uint8Array): Uint8Array {
+    const opened = openPositioned(reply)
+    if (opened.frontier !== undefined) {
+      this.seenFrontier = mergeFrontier(this.seenFrontier, opened.frontier)
+    }
+    return opened.reply
+  }
+
+  /** The highest mutation position this client has seen per surface. */
+  seenPositions(): AppliedFrontier {
+    return this.seenFrontier
+  }
+
+  /** Clears a surface's pending barrier once a barriered read was served. */
+  private settleBarrier(barrier: number, reply: Uint8Array): void {
+    if (!isStaleReply(reply)) this.readBarriers &= ~barrier
+  }
+
+  private rememberHello(reply: Uint8Array): void {
+    try {
+      this.helloVersions ??= decodeBackendAnnounce(reply).versions
+    } catch {
+      // Not an announcement, so nothing was negotiated to compare against.
+    }
+  }
+
+  /**
+   * Moves managed requests off `failed` to another roster node whose plane is
+   * ready and speaks the versions this transport negotiated, as Rust
+   * `ManagedRoute::repin`. Concurrent callers share one move. Returns whether
+   * a node other than `failed` now serves managed requests.
+   */
+  private async moveManaged(failed: string | undefined): Promise<boolean> {
+    if (this.connection === undefined || this.closed) return false
+    this.managedMove ??= this.repinManaged(failed).finally(() => {
+      this.managedMove = undefined
+    })
+    await this.managedMove
+    const current = this.managedNode?.name
+    return current !== undefined && current !== failed
+  }
+
+  private async repinManaged(failed: string | undefined): Promise<void> {
+    if (this.managedNode?.name !== failed) return
+    let nodes: readonly ClusterNode[]
+    try {
+      nodes = (
+        await this.execute(
+          (client) => client.cluster.getClusterMetadata(),
+          "failed to read the cluster metadata"
         )
-      : payload
-    return this.sendManagedPreframed(code, request, options)
+      ).nodes
+    } catch {
+      return
+    }
+    for (const node of managedCandidates(nodes, failed)) {
+      let connection: NodeConnection
+      try {
+        connection = await this.openNodeConnection(node.ip, node.endpoints.tcp)
+      } catch {
+        continue
+      }
+      let serves: boolean
+      try {
+        const announce = decodeBackendAnnounce(
+          await connection.send(AGDX_HELLO_CODE, new Uint8Array())
+        )
+        serves =
+          announce.ready !== false &&
+          (this.helloVersions === undefined || sameVersions(this.helloVersions, announce.versions))
+      } catch {
+        serves = false
+      }
+      if (!serves) {
+        await connection.close()
+        continue
+      }
+      const old = this.managedNode
+      this.managedNode = { name: node.name, connection }
+      this.readBarriers = ALL_READ_BARRIERS
+      if (old !== undefined) await old.connection.close()
+      return
+    }
   }
 
   async sendManagedPreframed(
@@ -1404,7 +1805,7 @@ export class ApacheIggyTransport implements LaserTransport {
       `managed command ${String(code)} failed`,
       options?.retryAfterReconnect ?? true
     )
-    return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
+    return this.takePositioned(new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength))
   }
 
   async ensureStream(name: string): Promise<void> {
@@ -2116,6 +2517,9 @@ export class ApacheIggyTransport implements LaserTransport {
   async close(): Promise<void> {
     this.closed = true
     this.consumerGroups.clear()
+    const managed = this.managedNode
+    this.managedNode = undefined
+    if (managed !== undefined) await managed.connection.close()
     if (this.ownership === "owned") await this.client.destroy()
   }
 

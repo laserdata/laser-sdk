@@ -12,6 +12,7 @@ export {
   CodecError,
   TypedDecodeError,
   ProtocolError,
+  CommandExecutionError,
   TransportError,
   SignatureError,
   QueryExecutionError,
@@ -186,7 +187,7 @@ export type {
   AmbiguousMutationRecovery
 } from "./managed/coordination.js"
 export type { KvGet, KvLease, KvLeaseRenew, KvRelease, KvCasFenced } from "./wire/kv.js"
-export type { MutationPosition } from "./wire/mutation.js"
+export type { AppliedFrontier, MutationPosition, SessionPosition } from "./wire/mutation.js"
 export type { KvEntry, KvPage, KvMetadata, KvNamespaceInfo, KvError, CasExpect } from "./wire/kv.js"
 export { kvEntryKeyStr } from "./wire/kv.js"
 export {
@@ -453,6 +454,7 @@ export {
   A2A_JSONRPC_BINDING,
   A2A_PROTOCOL_VERSION,
   A2aBridge,
+  A2aCaller,
   A2aMethod,
   commandFromMessageSend,
   taskFromEnvelope
@@ -660,6 +662,7 @@ export type {
   Query,
   QueryContext,
   QueryExecutionStatus,
+  QueryFrontier,
   SnapshotSelector,
   AggFunc,
   SqlDialect,
@@ -713,7 +716,12 @@ export {
   validateSupervisorAssertion
 } from "./wire/checkpoint.js"
 export type { PartitionLifecycleChange } from "./wire/checkpoint.js"
-export { resultCodeFromCode, resultCodeHttpStatus } from "./wire/result.js"
+export {
+  resultCodeFromCode,
+  resultCodeHttpStatus,
+  resultCodeIsPending,
+  resultCodeIsPlaneUnavailable
+} from "./wire/result.js"
 export { contentTypeCode, isRawContentType } from "./wire/content.js"
 export type { PublishOptions } from "./client/publish-options.js"
 export type { ObserveEffect } from "./stream/topic.js"

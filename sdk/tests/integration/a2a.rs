@@ -285,3 +285,59 @@ async fn given_two_workers_when_submitting_to_one_then_only_that_worker_should_h
     assert_eq!(handled(&to_beta), ["beta"]);
     assert_eq!(handled(&to_alpha), ["alpha"]);
 }
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_task_binding_when_another_caller_uses_the_task_id_then_should_refuse_it() {
+    let laser = harness::laser().await;
+    let bridge = A2aBridge::new(
+        laser.clone(),
+        "a2a-bound"
+            .parse::<laser_sdk::types::AgentId>()
+            .expect("a2a-bound is a valid agent id"),
+        AgentTopic::Sessions,
+        AgentTopic::Sessions,
+    )
+    .with_task_binding([3; 32], std::time::Duration::from_secs(60));
+    let params = br#"{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}]}}"#.to_vec();
+
+    // A bound bridge refuses an anonymous submit before publishing anything.
+    assert!(matches!(
+        bridge.submit(params.clone()).await,
+        Err(LaserError::HandlerConfig(_))
+    ));
+    let task = bridge
+        .caller("alice")
+        .submit(params)
+        .await
+        .expect("the caller submit should succeed");
+    assert_eq!(task.id.split('.').count(), 3);
+
+    for refused in [
+        bridge.caller("bob").cancel(&task.id).await,
+        bridge.caller("bob").task(&task.id).await,
+        bridge.cancel(&task.id).await,
+    ] {
+        assert!(matches!(refused, Err(LaserError::HandlerConfig(_))));
+    }
+    let anonymous = bridge
+        .handle_rpc(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": task.id}
+        }))
+        .await;
+    assert!(anonymous.error.is_some());
+
+    let canceled = bridge
+        .caller("alice")
+        .cancel(&task.id)
+        .await
+        .expect("the owner cancel should succeed");
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    let owned = bridge
+        .caller("alice")
+        .handle_rpc(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task.id}
+        }))
+        .await;
+    assert!(owned.error.is_none());
+}

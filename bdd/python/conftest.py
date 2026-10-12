@@ -65,6 +65,7 @@ class World:
         self.caps = None
         self.error = None
         self.filtered = []
+        self.noted_position = None
 
     def run(self, factory):
         # `factory` is a zero-arg callable returning a coroutine. The binding's
@@ -141,6 +142,8 @@ class Bench:
         self.data_stack = None
         self.filter = None
         self.verdict = None
+        self.binding_builder = None
+        self.binding = None
 
 
 @pytest.fixture

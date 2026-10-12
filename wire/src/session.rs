@@ -101,6 +101,11 @@ pub mod request {
         pub after: u64,
         /// The page size. Zero leaves it to the server.
         pub limit: u32,
+        /// The change series `after` was read from. A node whose series
+        /// differs answers a resync, so a cursor never crosses to another
+        /// node's or a restored index's sequence numbers. Absent on a first read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub series: Option<u64>,
     }
 }
 
@@ -207,6 +212,10 @@ pub struct SessionFlags {
     pub events_truncated: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lane_conflict: bool,
+    /// A control record arrived on a partition other than the session's
+    /// control route and was not applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub control_conflict: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rebuilding: bool,
     /// Liveness is not known yet because the heartbeat tail has not caught
@@ -375,9 +384,37 @@ pub struct SessionSources {
 pub struct SessionChangeRow {
     pub seq: u64,
     pub sessions: Vec<ConversationId>,
+    /// The records behind the change: the folded records for `records`, the
+    /// link source records for `links`, and for `expiry` the folded record
+    /// whose time expired the sessions. Empty for `maintenance` and for an
+    /// expiry the clock decided.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub positions: Vec<LogPosition>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "SessionChangeOrigin::is_records")]
+    pub origin: SessionChangeOrigin,
+}
+
+/// What made the sessions of one change row change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionChangeOrigin {
+    /// Records folded from the session sources.
+    #[default]
+    Records,
+    /// Links written by managed mutations or projections.
+    Links,
+    /// A source partition was reset or left the registration, and its
+    /// sessions were rebuilt.
+    Maintenance,
+    /// Sessions idle past their retention were removed.
+    Expiry,
+}
+
+impl SessionChangeOrigin {
+    pub fn is_records(&self) -> bool {
+        *self == Self::Records
+    }
 }
 
 /// Change rows after a sequence. `resync` is set when the requested sequence
@@ -387,6 +424,10 @@ pub struct SessionChanges {
     pub rows: Vec<SessionChangeRow>,
     pub floor: u64,
     pub resync: bool,
+    /// The change series these sequence numbers belong to. Zero from an index
+    /// that does not name one.
+    #[serde(default, skip_serializing_if = "is_zero_series")]
+    pub series: u64,
 }
 
 /// The reply to every session read: `Ok` with the outcome, or `Err` with a
@@ -454,4 +495,9 @@ impl crate::validate::Validate for SessionHeartbeat {
         }
         Ok(())
     }
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate")]
+fn is_zero_series(series: &u64) -> bool {
+    *series == 0
 }

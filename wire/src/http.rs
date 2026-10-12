@@ -1522,6 +1522,8 @@ pub struct SessionChangesQuery {
     pub after: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<u64>,
 }
 
 /// `PUT /agdx/kv/{namespace}/{key}/cas` query: the compare-and-swap precondition

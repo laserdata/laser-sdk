@@ -43,6 +43,25 @@ def test_given_result_code_names_when_mapped_then_should_follow_the_rust_codes()
         ls.result_code_code("nope")
 
 
+def test_given_a_pending_result_code_when_classified_then_should_only_allow_the_same_identity():
+    assert ls.result_code_code("Pending") == 19
+    assert ls.result_code_from_code(19) == "Pending"
+    assert ls.result_code_from_code(21) == "Unrecognized(21)"
+    assert ls.result_code_http_status("Pending") == 503
+    assert ls.result_code_is_pending("Pending") is True
+    assert ls.result_code_is_pending("Unavailable") is False
+    assert ls.result_code_is_retryable("Pending") is False
+
+
+def test_given_a_plane_unavailable_result_code_when_classified_then_should_name_the_node():
+    assert ls.result_code_code("PlaneUnavailable") == 20
+    assert ls.result_code_from_code(20) == "PlaneUnavailable"
+    assert ls.result_code_http_status("PlaneUnavailable") == 503
+    assert ls.result_code_is_plane_unavailable("PlaneUnavailable") is True
+    assert ls.result_code_is_plane_unavailable("Unavailable") is False
+    assert ls.result_code_is_retryable("PlaneUnavailable") is True
+
+
 def test_given_tagged_values_when_read_then_should_delegate_to_the_typed_value():
     value = ls.key_match_new("n", 7)["value"]
     assert ls.typed_value_as_i64(value) == 7

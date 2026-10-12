@@ -98,6 +98,7 @@ async def test_given_a_stalled_connection_when_a_producer_sends_then_should_hono
         publish_retry_backoff_ms=10,
     )
     try:
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(**options)
         if initialized:
             await producer.init()
@@ -128,6 +129,7 @@ async def test_given_a_confirmed_chunk_when_the_next_times_out_then_should_prese
         publish_max_retries=0,
     )
     try:
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(batch_length=1, partition=0)
         await producer.init()
         pause_after_reply[0] = 1
@@ -156,6 +158,7 @@ async def test_given_a_temporary_outage_when_retries_are_overridden_then_should_
     )
     resume = None
     try:
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(retries=2, retry_interval_ms=10, partition=0)
         await producer.init()
         forwarding.clear()
@@ -181,6 +184,7 @@ async def test_given_a_stopped_server_when_a_producer_sends_then_should_time_out
             publish_max_retries=1,
             publish_retry_backoff_ms=100,
         )
+        await laser.stream(laser.default_stream).ensure()
         producer = laser.topic("pulse").producer(retries=1, retry_interval_ms=100)
         await producer.send(b"warm")
         await asyncio.to_thread(server.stop)
@@ -199,6 +203,7 @@ async def test_given_a_deleted_stream_when_a_producer_sends_then_should_name_cau
     laser,
 ):
     stream = laser.default_stream
+    await laser.stream(laser.default_stream).ensure()
     producer = laser.topic("pulse").producer(retries=1, retry_interval_ms=100)
     await producer.send(b"first")
     await laser.stream(stream).delete()
@@ -225,6 +230,7 @@ async def test_given_unconfirmed_records_when_resent_through_batch_then_should_k
     resender = None
     try:
         topic = laser.topic("pulse")
+        await laser.stream(laser.default_stream).ensure()
         producer = topic.producer(batch_length=1, partition=0)
         await producer.init()
         pause_after_reply[0] = 1

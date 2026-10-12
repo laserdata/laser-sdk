@@ -112,6 +112,11 @@ fn request(arm: UdsArm) -> Result<Vec<u8>, BenchError> {
             })
             .map_err(|error| BenchError::Invalid(format!("encode UDS KV request: {error}")))?;
             let forwarded = encode_named(&ForwardedCommand {
+                read_barrier: false,
+                min_position: None,
+                positioned_reply: false,
+                min_sessions: Vec::new(),
+                tenancy: laser_sdk::wire::authz::Tenancy::default(),
                 user_id: 1,
                 client_id: 0,
                 correlation: None,

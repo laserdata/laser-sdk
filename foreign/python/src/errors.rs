@@ -311,6 +311,12 @@ create_exception!(
 );
 create_exception!(
     laser_sdk,
+    CommandError,
+    LaserError,
+    "A managed endpoint returned its result code and message. `detail` holds both fields."
+);
+create_exception!(
+    laser_sdk,
     TransportError,
     LaserError,
     "The underlying Apache Iggy transport failed."
@@ -923,6 +929,7 @@ fn exception_classes(py: Python<'_>) -> Vec<ExceptionClass<'_>> {
         ),
         class(py.get_type::<StateStoreError>(), None, None, &[], &[]),
         class(py.get_type::<QueryError>(), None, None, &[], &[DETAIL]),
+        class(py.get_type::<CommandError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<KvError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<ForkError>(), None, None, &[], &[DETAIL]),
         class(py.get_type::<GraphError>(), None, None, &[], &[DETAIL]),
@@ -1156,6 +1163,7 @@ fn class_of<'py>(py: Python<'py>, err: &SdkError) -> Bound<'py, PyType> {
         SdkError::Codec(_) => py.get_type::<CodecError>(),
         SdkError::Invalid(_) => py.get_type::<InvalidError>(),
         SdkError::Protocol(_) => py.get_type::<ProtocolError>(),
+        SdkError::Command(_) => py.get_type::<CommandError>(),
         SdkError::Unsupported { .. } => py.get_type::<UnsupportedError>(),
         SdkError::Integrity { .. } => py.get_type::<IntegrityError>(),
         SdkError::Signature(_) => py.get_type::<SignatureError>(),
@@ -1217,6 +1225,7 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
             pyerr.set_cause(py, Some(to_pyerr_ref(&SdkError::Iggy((**cause).clone()))));
         }
         SdkError::Query(error) => value.setattr("detail", ser_to_py(py, error)?)?,
+        SdkError::Command(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Kv(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Fork(error) => value.setattr("detail", ser_to_py(py, error)?)?,
         SdkError::Graph(error) => value.setattr("detail", ser_to_py(py, error)?)?,
@@ -1374,7 +1383,9 @@ fn typed_detail(
         .ok()
         .filter(|detail| !detail.is_none())?;
     let is = |class: Bound<'_, PyType>| value.is_instance(&class).unwrap_or(false);
-    if is(py.get_type::<QueryError>()) {
+    if is(py.get_type::<CommandError>()) {
+        py_to_de(&detail).ok().map(SdkError::Command)
+    } else if is(py.get_type::<QueryError>()) {
         py_to_de(&detail).ok().map(SdkError::Query)
     } else if is(py.get_type::<KvError>()) {
         py_to_de(&detail).ok().map(SdkError::Kv)

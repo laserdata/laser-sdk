@@ -7,7 +7,7 @@ use laser_wire::dispatch::{
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// The operator requests a session has on `agent.control`, as this process
 /// observed them. A handler reads them through
@@ -19,6 +19,10 @@ pub struct PendingControl {
     pub pause_requested: bool,
     /// A cancel was requested, or an operator forced the session canceled.
     pub cancel_requested: bool,
+    /// A control request for the session arrived on another partition of
+    /// `agent.control` than the one its conversation id routes to. Such a
+    /// request is never applied, here or by the plane.
+    pub control_conflict: bool,
 }
 
 impl PendingControl {
@@ -91,6 +95,73 @@ pub(crate) fn control_request(
 /// Where a control record sits: its partition and offset on `agent.control`.
 pub(crate) type ControlPosition = (u32, u64);
 
+/// The `agent.control` partition a session's control records belong on: the
+/// partition Iggy routes the conversation id key to, XXH32 with seed zero
+/// over the conversation string modulo the partition count. The plane applies
+/// the same rule, so both refuse a record on any other partition.
+pub(crate) fn control_partition(conversation: ConversationId, partitions: u32) -> Option<u32> {
+    (partitions > 0).then(|| xxh32(conversation.to_string().as_bytes()) % partitions)
+}
+
+const PRIME_1: u32 = 0x9E37_79B1;
+const PRIME_2: u32 = 0x85EB_CA77;
+const PRIME_3: u32 = 0xC2B2_AE3D;
+const PRIME_4: u32 = 0x27D4_EB2F;
+const PRIME_5: u32 = 0x1656_67B1;
+
+/// XXH32 with seed zero.
+fn xxh32(input: &[u8]) -> u32 {
+    let lane =
+        |at: usize| u32::from_le_bytes([input[at], input[at + 1], input[at + 2], input[at + 3]]);
+    let round = |acc: u32, value: u32| {
+        acc.wrapping_add(value.wrapping_mul(PRIME_2))
+            .rotate_left(13)
+            .wrapping_mul(PRIME_1)
+    };
+    let mut at = 0;
+    let mut hash = if input.len() >= 16 {
+        let mut acc = [
+            PRIME_1.wrapping_add(PRIME_2),
+            PRIME_2,
+            0,
+            0u32.wrapping_sub(PRIME_1),
+        ];
+        while at + 16 <= input.len() {
+            for (index, slot) in acc.iter_mut().enumerate() {
+                *slot = round(*slot, lane(at + index * 4));
+            }
+            at += 16;
+        }
+        acc[0]
+            .rotate_left(1)
+            .wrapping_add(acc[1].rotate_left(7))
+            .wrapping_add(acc[2].rotate_left(12))
+            .wrapping_add(acc[3].rotate_left(18))
+    } else {
+        PRIME_5
+    };
+    hash = hash.wrapping_add(input.len() as u32);
+    while at + 4 <= input.len() {
+        hash = hash
+            .wrapping_add(lane(at).wrapping_mul(PRIME_3))
+            .rotate_left(17)
+            .wrapping_mul(PRIME_4);
+        at += 4;
+    }
+    while at < input.len() {
+        hash = hash
+            .wrapping_add(u32::from(input[at]).wrapping_mul(PRIME_5))
+            .rotate_left(11)
+            .wrapping_mul(PRIME_1);
+        at += 1;
+    }
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(PRIME_2);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(PRIME_3);
+    hash ^ (hash >> 16)
+}
+
 /// A control request at its position on `agent.control`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedRequest {
@@ -149,6 +220,8 @@ pub(crate) struct ControlBook {
     // Whether the startup read loaded every session, so a session without an
     // entry has no requests.
     loaded: AtomicBool,
+    // The partition count of agent.control, zero while unknown.
+    partitions: AtomicU32,
 }
 
 #[derive(Default)]
@@ -157,9 +230,17 @@ struct Entry {
     last: Option<ControlPosition>,
     folded: bool,
     pending: Vec<(ControlPosition, ControlRequest)>,
+    // A request arrived off the session's control route.
+    conflict: bool,
 }
 
 impl Entry {
+    fn with_conflict(&self) -> ControlState {
+        let mut state = self.state;
+        state.flags.control_conflict |= self.conflict;
+        state
+    }
+
     fn apply(&mut self, at: ControlPosition, request: ControlRequest) {
         if self.last.is_some_and(|last| !newer(at, last)) {
             return;
@@ -176,6 +257,26 @@ fn newer(at: ControlPosition, last: ControlPosition) -> bool {
 }
 
 impl ControlBook {
+    /// The partition count of `agent.control`, which fixes each session's
+    /// control route.
+    pub(crate) fn set_partitions(&self, partitions: u32) {
+        self.partitions.store(partitions, Ordering::Release);
+    }
+
+    // Whether `partition` is the control route of `conversation`. Every
+    // partition is while the count is unknown.
+    fn on_route(&self, conversation: ConversationId, partition: u32) -> bool {
+        control_partition(conversation, self.partitions.load(Ordering::Acquire))
+            .is_none_or(|route| route == partition)
+    }
+
+    /// Forget every session, for a recreated `agent.control` whose history
+    /// starts again.
+    pub(crate) fn reset(&self) {
+        self.lock().clear();
+        self.loaded.store(false, Ordering::Release);
+    }
+
     /// Mark whether a follower is keeping the book current.
     pub(crate) fn set_live(&self, live: bool) {
         self.live.store(live, Ordering::Release);
@@ -195,9 +296,14 @@ impl ControlBook {
     ) {
         let mut entries = self.lock();
         for (conversation, at, request) in records {
+            let on_route = self.on_route(conversation, at.0);
             let entry = entries.entry(conversation).or_default();
             entry.folded = true;
-            entry.apply(at, request);
+            if on_route {
+                entry.apply(at, request);
+            } else {
+                entry.conflict = true;
+            }
         }
         self.loaded.store(true, Ordering::Release);
     }
@@ -210,9 +316,12 @@ impl ControlBook {
         request: ControlRequest,
     ) {
         let loaded = self.loaded.load(Ordering::Acquire);
+        let on_route = self.on_route(conversation, at.0);
         let mut entries = self.lock();
         let entry = entries.entry(conversation).or_default();
-        if entry.folded || loaded {
+        if !on_route {
+            entry.conflict = true;
+        } else if entry.folded || loaded {
             entry.folded = true;
             entry.apply(at, request);
         } else {
@@ -228,7 +337,7 @@ impl ControlBook {
         }
         let loaded = self.loaded.load(Ordering::Acquire);
         match self.lock().get(&conversation) {
-            Some(entry) if entry.folded => Some(entry.state),
+            Some(entry) if entry.folded => Some(entry.with_conflict()),
             Some(_) => None,
             None => loaded.then(ControlState::default),
         }
@@ -264,7 +373,7 @@ impl ControlBook {
         let mut entries = self.lock();
         let entry = entries.entry(conversation).or_default();
         if entry.folded && live {
-            return entry.state;
+            return entry.with_conflict();
         }
         let pending = std::mem::take(&mut entry.pending);
         entry.state = state;
@@ -273,7 +382,7 @@ impl ControlBook {
         for (at, request) in pending {
             entry.apply(at, request);
         }
-        entry.state
+        entry.with_conflict()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ConversationId, Entry>> {
@@ -284,20 +393,76 @@ impl ControlBook {
 }
 
 /// Fold control records in log order into a state and the position of the
-/// last one.
+/// last one. A record off `route`, the session's control partition, is not
+/// applied and flags the state.
 pub(crate) fn fold(
     records: impl IntoIterator<Item = (ControlPosition, ControlRequest)>,
+    route: Option<u32>,
 ) -> (ControlState, Option<ControlPosition>) {
     let mut entry = Entry::default();
     for (at, request) in records {
-        entry.apply(at, request);
+        if route.is_none_or(|route| route == at.0) {
+            entry.apply(at, request);
+        } else {
+            entry.conflict = true;
+        }
     }
-    (entry.state, entry.last)
+    (entry.with_conflict(), entry.last)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_known_inputs_when_hashed_then_should_match_the_xxh32_reference() {
+        assert_eq!(xxh32(b""), 0x02CC_5D05);
+        assert_eq!(xxh32(b"abc"), 0x32D1_53FF);
+        assert_eq!(
+            xxh32(b"Nobody inspects the spammish repetition"),
+            0xE229_3B2F
+        );
+    }
+
+    #[test]
+    fn given_a_request_off_the_control_route_when_recorded_then_should_flag_and_never_apply() {
+        let session: ConversationId = "01KWM3K3XEP3NP5TN850J17YBP".parse().unwrap();
+        let route = control_partition(session, 2).expect("a partition count");
+        let book = ControlBook::default();
+        book.set_partitions(2);
+        book.load([
+            (session, (route, 1), request(ControlAction::Pause)),
+            (session, (1 - route, 2), request(ControlAction::Cancel)),
+        ]);
+        book.set_live(true);
+        book.observe(session, (1 - route, 3), request(ControlAction::Resume));
+        let state = book.state(session).expect("folded");
+        assert!(state.flags.pause_requested, "the routed pause applies");
+        assert!(
+            !state.flags.cancel_requested,
+            "the misrouted cancel never applies"
+        );
+        assert!(state.flags.control_conflict);
+
+        let (folded, _) = fold(
+            [
+                ((1 - route, 5), request(ControlAction::Cancel)),
+                ((route, 6), request(ControlAction::Pause)),
+            ],
+            Some(route),
+        );
+        assert_eq!(
+            folded.flags, state.flags,
+            "the log fold agrees with the book"
+        );
+
+        book.reset();
+        assert_eq!(
+            book.state(session),
+            None,
+            "a reset book folds again from the log"
+        );
+    }
     use laser_wire::agent::CorrelationId;
 
     fn command(operation: &str, target: Option<&str>) -> AgentEnvelope {
@@ -377,16 +542,20 @@ mod tests {
 
     #[test]
     fn given_pause_resume_and_cancel_when_folded_then_should_keep_only_the_latest_pause_state() {
-        let (state, last) = fold([
-            ((0, 1), request(ControlAction::Pause)),
-            ((0, 2), request(ControlAction::Resume)),
-            ((0, 3), request(ControlAction::Cancel)),
-        ]);
+        let (state, last) = fold(
+            [
+                ((0, 1), request(ControlAction::Pause)),
+                ((0, 2), request(ControlAction::Resume)),
+                ((0, 3), request(ControlAction::Cancel)),
+            ],
+            None,
+        );
         assert_eq!(
             state.flags,
             PendingControl {
                 pause_requested: false,
-                cancel_requested: true
+                cancel_requested: true,
+                control_conflict: false,
             }
         );
         assert_eq!(state.paused(), None);
@@ -402,16 +571,20 @@ mod tests {
         book.observe(session, (0, 4), request(ControlAction::Pause));
         book.observe(session, (0, 6), request(ControlAction::Cancel));
         assert_eq!(flags(&book, session), None, "unfolded until the first read");
-        let (state, last) = fold([
-            ((0, 4), request(ControlAction::Pause)),
-            ((0, 5), request(ControlAction::Resume)),
-        ]);
+        let (state, last) = fold(
+            [
+                ((0, 4), request(ControlAction::Pause)),
+                ((0, 5), request(ControlAction::Resume)),
+            ],
+            None,
+        );
         let installed = book.install(session, state, last);
         assert_eq!(
             installed.flags,
             PendingControl {
                 pause_requested: false,
-                cancel_requested: true
+                cancel_requested: true,
+                control_conflict: false,
             }
         );
         book.observe(session, (0, 7), request(ControlAction::Pause));
@@ -419,7 +592,8 @@ mod tests {
             flags(&book, session),
             Some(PendingControl {
                 pause_requested: true,
-                cancel_requested: true
+                cancel_requested: true,
+                control_conflict: false,
             })
         );
         assert_eq!(
@@ -460,7 +634,8 @@ mod tests {
             flags(&book, later),
             Some(PendingControl {
                 pause_requested: false,
-                cancel_requested: true
+                cancel_requested: true,
+                control_conflict: false,
             })
         );
     }

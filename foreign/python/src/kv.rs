@@ -84,6 +84,14 @@ impl PyLaser {
         }
     }
 
+    /// The highest mutation position this client has seen per managed
+    /// surface. Every KV, fork and graph reply raises it, and every later read
+    /// of that surface sends it, so whichever node answers has applied at
+    /// least what this client wrote or read before.
+    fn seen_positions(&self) -> PyAppliedFrontier {
+        self.inner.seen_positions().into()
+    }
+
     /// Every KV namespace holding at least one entry for this caller.
     fn kv_namespaces<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let laser = self.inner.clone();
@@ -114,6 +122,83 @@ pub struct PyMutationPosition {
     pub partition: u32,
     #[pyo3(get)]
     pub offset: u64,
+}
+
+/// The mutation positions seen per managed surface, `None` for a surface
+/// with no position yet.
+#[gen_stub_pyclass]
+#[pyclass(name = "AppliedFrontier", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyAppliedFrontier {
+    #[pyo3(get)]
+    pub kv: Option<PyMutationPosition>,
+    #[pyo3(get)]
+    pub fork: Option<PyMutationPosition>,
+    #[pyo3(get)]
+    pub graph: Option<PyMutationPosition>,
+    /// The session positions seen per stream and source partition.
+    #[pyo3(get)]
+    pub sessions: Vec<PySessionPosition>,
+}
+
+impl From<laser_sdk::wire::mutation::AppliedFrontier> for PyAppliedFrontier {
+    fn from(value: laser_sdk::wire::mutation::AppliedFrontier) -> Self {
+        Self {
+            kv: value.kv.map(Into::into),
+            fork: value.fork.map(Into::into),
+            graph: value.graph.map(Into::into),
+            sessions: value.sessions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// How far a node's session fold has applied one partition of a session
+/// source.
+#[gen_stub_pyclass]
+#[pyclass(name = "SessionPosition", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PySessionPosition {
+    #[pyo3(get)]
+    pub stream_id: u32,
+    #[pyo3(get)]
+    pub stream_generation: u64,
+    #[pyo3(get)]
+    pub topic: String,
+    #[pyo3(get)]
+    pub topic_generation: u64,
+    #[pyo3(get)]
+    pub partition_id: u32,
+    #[pyo3(get)]
+    pub offset: u64,
+}
+
+impl From<laser_sdk::wire::mutation::SessionPosition> for PySessionPosition {
+    fn from(value: laser_sdk::wire::mutation::SessionPosition) -> Self {
+        Self {
+            stream_id: value.stream_id,
+            stream_generation: value.stream_generation,
+            topic: value.topic,
+            topic_generation: value.topic_generation,
+            partition_id: value.partition_id,
+            offset: value.offset,
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PySessionPosition {
+    fn __repr__(&self) -> String {
+        format!(
+            "SessionPosition(stream_id={}, stream_generation={}, topic={:?}, topic_generation={}, partition_id={}, offset={})",
+            self.stream_id,
+            self.stream_generation,
+            self.topic,
+            self.topic_generation,
+            self.partition_id,
+            self.offset
+        )
+    }
 }
 
 impl From<MutationPosition> for PyMutationPosition {
@@ -152,6 +237,25 @@ impl PyMutationPosition {
         format!(
             "MutationPosition(topic_generation={}, partition={}, offset={})",
             self.topic_generation, self.partition, self.offset
+        )
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAppliedFrontier {
+    fn __repr__(&self) -> String {
+        let show = |position: &Option<PyMutationPosition>| {
+            position
+                .as_ref()
+                .map_or_else(|| "None".to_owned(), PyMutationPosition::__repr__)
+        };
+        format!(
+            "AppliedFrontier(kv={}, fork={}, graph={}, sessions={})",
+            show(&self.kv),
+            show(&self.fork),
+            show(&self.graph),
+            self.sessions.len()
         )
     }
 }

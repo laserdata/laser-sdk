@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { ConfigError, InvalidError, ProtocolError } from "../../src/client/errors.js"
 import { Json } from "../../src/stream/codecs.js"
-import { QueryRequest } from "../../src/managed/query.js"
+import { QueryRequest, queryReplyWaitMs } from "../../src/managed/query.js"
+import { QUERY_DEADLINE_MS, QUERY_REPLY_GRACE_MS } from "../../src/retry.js"
 import { BackendResourceId, QueryExecutionId } from "../../src/wire/ids.js"
 import {
   QueryBuilder,
@@ -42,7 +43,8 @@ function result(query: Query, cursor?: string): QueryResult {
       elapsedMicros: 1n,
       scannedBytes: 1n,
       producedBytes: 1n,
-      rowCount: 1n
+      rowCount: 1n,
+      frontier: []
     }
   }
 }
@@ -108,7 +110,8 @@ void test("query replies and status remain bound to the requested execution iden
         startedAtMicros: 1n,
         scannedBytes: 0n,
         producedBytes: 0n,
-        rowCount: 0n
+        rowCount: 0n,
+        frontier: []
       })
   )
 
@@ -267,4 +270,15 @@ void test("given_a_query_builder_missing_a_required_field_when_built_then_should
         .build(),
     InvalidError
   )
+})
+
+void test("given_query_deadlines_when_turned_into_reply_waits_then_should_add_the_grace_up_to_the_cap", () => {
+  const now = 1_000_000_000n
+  assert.equal(queryReplyWaitMs(now + 5_000_000n, now), 5_000 + QUERY_REPLY_GRACE_MS)
+  assert.equal(queryReplyWaitMs(now - 1n, now), QUERY_REPLY_GRACE_MS)
+  assert.equal(
+    queryReplyWaitMs(now + BigInt(QUERY_DEADLINE_MS) * 1000n, now),
+    QUERY_DEADLINE_MS + QUERY_REPLY_GRACE_MS
+  )
+  assert.throws(() => queryReplyWaitMs(now + 60_000_000n, now), InvalidError)
 })

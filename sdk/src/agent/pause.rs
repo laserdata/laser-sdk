@@ -216,6 +216,8 @@ pub(crate) struct SourceTopic {
 pub(crate) struct ControlFeed {
     pub(crate) stream_id: u32,
     pub(crate) topic_id: u32,
+    // The creation time of the control topic the feed reads.
+    topic_gen: u64,
     next: BTreeMap<u32, u64>,
     /// Some partition holds more than the bounded read covered, or already
     /// expired records, so requests older than the read may be missing.
@@ -265,10 +267,12 @@ pub(crate) async fn load_control(
             }
         }
     }
+    book.set_partitions(details.partitions_count);
     book.load(records);
     Ok(Some(ControlFeed {
         stream_id,
         topic_id: details.id,
+        topic_gen: details.created_at.as_micros(),
         next,
         truncated,
     }))
@@ -280,6 +284,55 @@ pub(crate) async fn load_control(
 /// consumer group assigns it. Each request is handed to the pause runtime
 /// through `notify`. When the follower stops, the book stops claiming to be
 /// current and every read folds the log.
+/// The longest wait between looks for an `agent.control` topic that did not
+/// exist when the consumer started.
+use crate::retry::CONTROL_DISCOVERY_MAX;
+
+/// Wait for `agent.control` to appear, then follow it. A stream that gets its
+/// control topic after the consumer started still receives operator
+/// requests. Until then the book reports control as unavailable.
+/// Starts the pause runtime once a control topic that was missing at start
+/// appears, and returns where the follower reports each request.
+pub(crate) type StartPause = Box<
+    dyn FnOnce(
+            &ControlFeed,
+        )
+            -> futures::future::BoxFuture<'static, Option<mpsc::UnboundedSender<ConversationId>>>
+        + Send,
+>;
+
+pub(crate) async fn discover_then_follow_control(
+    laser: Laser,
+    me: Option<AgentId>,
+    book: Arc<ControlBook>,
+    start_pause: Option<StartPause>,
+    poll_interval: Duration,
+    mut stop: oneshot::Receiver<()>,
+) {
+    let mut delay = poll_interval.max(Duration::from_millis(100));
+    let feed = loop {
+        tokio::select! {
+            _ = &mut stop => return,
+            () = tokio::time::sleep(crate::retry::jittered(delay)) => {}
+        }
+        match load_control(&laser, me.as_ref(), &book).await {
+            Ok(Some(feed)) => break feed,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(%error, "looking for the agent control topic failed, trying again");
+            }
+        }
+        delay = delay.saturating_mul(2).min(CONTROL_DISCOVERY_MAX);
+    };
+    book.set_live(true);
+    tracing::info!("the agent control topic appeared, following operator requests");
+    let notify = match start_pause {
+        Some(start) => start(&feed).await,
+        None => None,
+    };
+    follow_control(laser, feed, me, book, notify, poll_interval, stop).await;
+}
+
 pub(crate) async fn follow_control(
     laser: Laser,
     mut feed: ControlFeed,
@@ -305,6 +358,7 @@ pub(crate) async fn follow_control(
         }
     };
     let mut failures = 0u32;
+    let mut checked = tokio::time::Instant::now();
     loop {
         let pass = async {
             let client = laser.client();
@@ -351,6 +405,27 @@ pub(crate) async fn follow_control(
             }
         };
         if idle {
+            // A recreated agent.control starts every session's control
+            // history again, so the book starts again from the new topic.
+            if checked.elapsed() >= CONTROL_TOPIC_CHECK {
+                checked = tokio::time::Instant::now();
+                if let Ok(Some(details)) =
+                    iggy::prelude::TopicClient::get_topic(laser.client().as_ref(), &stream, &topic)
+                        .await
+                    && (details.id != feed.topic_id
+                        || details.created_at.as_micros() != feed.topic_gen)
+                {
+                    book.reset();
+                    match load_control(&laser, me.as_ref(), &book).await {
+                        Ok(Some(reloaded)) => {
+                            debug!("agent.control was recreated, its sessions are read again");
+                            feed = reloaded;
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
+            }
             tokio::select! {
                 _ = &mut stop => break,
                 () = tokio::time::sleep(poll_interval) => {}
@@ -359,6 +434,10 @@ pub(crate) async fn follow_control(
     }
     book.set_live(false);
 }
+
+/// How often an idle control follower checks that agent.control is still the
+/// topic it reads.
+const CONTROL_TOPIC_CHECK: Duration = Duration::from_secs(5);
 
 fn observe_control(
     message: &IggyMessage,

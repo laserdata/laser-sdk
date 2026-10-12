@@ -25,7 +25,7 @@ function start(budget: SessionStart["budget"]): AgentEnvelope {
     body: encodeNamed(
       encodeSessionStart({
         agent: AGENT,
-        sdk: { language: "typescript", version: "0.7.0" },
+        sdk: { language: "typescript", version: "0.8.0" },
         tags: [],
         ...(budget !== undefined ? { budget } : {})
       })

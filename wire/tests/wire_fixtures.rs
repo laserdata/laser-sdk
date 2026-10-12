@@ -36,9 +36,10 @@ use laser_wire::codes::{
 };
 use laser_wire::content::ContentType;
 use laser_wire::control::{
-    ControlCommand, ControlEnvelope, FieldType, IndexField, IndexSchema, Projection,
-    ProjectionBinding, ProjectionId, ProjectionKind, RetentionPolicy, SchemaDef, SchemaSource,
-    SessionTopics, SourceSelector,
+    ControlCommand, ControlEnvelope, ControlStamp, ControlStreamGeneration, FieldType,
+    GapAcceptance, IndexField, IndexSchema, Projection, ProjectionBinding, ProjectionId,
+    ProjectionKind, RecordSkip, RetentionPolicy, SchemaDef, SchemaSource, SessionTopics,
+    SourceSelector,
 };
 use laser_wire::destination::{
     BackendBinding, BackendResourceId, DestinationDesiredState, DestinationErrorPolicy,
@@ -84,7 +85,8 @@ use laser_wire::kv::{
 };
 use laser_wire::memory::MemoryRecord;
 use laser_wire::mutation::{
-    MANAGED_REQUEST_VERSION, ManagedRequestEnvelope, MutationCommandEnvelope, MutationPosition,
+    AppliedFrontier, MANAGED_REQUEST_VERSION, ManagedReadEnvelope, ManagedReplyEnvelope,
+    ManagedRequestEnvelope, MutationCommandEnvelope, MutationPosition, SessionPosition,
 };
 use laser_wire::query::{
     AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch, Page, Query,
@@ -177,6 +179,7 @@ fn given_session_read_requests_when_encoded_then_should_match_golden_fixtures() 
             stream: "agents".to_owned(),
             after: 42,
             limit: 100,
+            series: None,
         },
     );
     assert_frame("session_link_surface.bin", &LinkSurface::GraphNode);
@@ -533,6 +536,7 @@ fn canonical_binding() -> ProjectionBinding {
         retention: Some(RetentionPolicy::TimeToLive {
             ttl_micros: 3_600_000_000,
         }),
+        skip_rejected: false,
     }
 }
 
@@ -963,6 +967,7 @@ fn canonical_query_result() -> QueryResult {
             scanned_bytes: 4_096,
             produced_bytes: 128,
             row_count: 1,
+            frontier: Vec::new(),
         },
     }
 }
@@ -1496,6 +1501,7 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
         timestamp_micros: TIMESTAMP_MICROS,
         command,
         stream: None,
+        stamp: None,
     };
     assert_frame(
         "control_register_projection.bin",
@@ -1512,6 +1518,45 @@ fn given_control_frames_when_encoded_then_should_match_golden_fixtures() {
             projection_ref: Some("reading.v1".to_owned()),
         }),
     );
+    assert_frame(
+        "control_accept_gap.bin",
+        &envelope(ControlCommand::AcceptGap(GapAcceptance {
+            source: SourceSelector::new("fleet", "readings"),
+            partition_id: 2,
+            topic_created_at_micros: 1_700_000_000_000_000,
+            from_offset: 41,
+            to_offset: 97,
+        })),
+    );
+    assert_frame(
+        "control_skip_record.bin",
+        &envelope(ControlCommand::SkipRecord(RecordSkip {
+            source: SourceSelector::new("fleet", "readings"),
+            partition_id: 2,
+            topic_created_at_micros: 1_700_000_000_000_000,
+            offset: 58,
+            target: "readings_rows".to_owned(),
+            reason: "value out of range".to_owned(),
+        })),
+    );
+    assert_frame("control_stamped_remove_binding.bin", &{
+        let mut stamped = envelope(ControlCommand::RemoveBinding {
+            source: SourceSelector::new("fleet", "readings"),
+            projection_ref: None,
+        });
+        stamped.stream = Some("fleet".to_owned());
+        stamped.stamp = Some(ControlStamp {
+            deployment_id: 7,
+            actor_user_id: 42,
+            operation_id: 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+            stream_generation: Some(ControlStreamGeneration {
+                stream_id: 3,
+                created_at_micros: 1_700_000_000_000_000,
+            }),
+            key_id: 11,
+        });
+        stamped
+    });
     assert_frame(
         "control_register_session_source_all.bin",
         &envelope(ControlCommand::RegisterSessionSource {
@@ -1683,6 +1728,7 @@ fn given_authz_frames_when_encoded_then_should_match_golden_fixtures() {
                     user_id: 7,
                     roles: vec!["kv-reader".to_owned()],
                 },
+                stream: None,
             }],
             next_after_revision: None,
         }),
@@ -2235,11 +2281,18 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             correlation: Some("conv-1".to_owned()),
             query_envelope: vec![1, 2, 3, 4],
             grants: Vec::new(),
+            tenancy: Default::default(),
+            scope: None,
         },
     );
     assert_frame(
         "forwarded_command.bin",
         &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
             user_id: 7,
             client_id: 42,
             correlation: None,
@@ -2259,6 +2312,11 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "forwarded_command_scoped.bin",
         &ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
             user_id: 7,
             client_id: 42,
             correlation: None,
@@ -2268,6 +2326,48 @@ fn given_forwarded_frames_when_encoded_then_should_match_golden_fixtures() {
             command_code: AGDX_KV_SET_CODE,
             payload: vec![9, 9, 9],
             grants: Vec::new(),
+        },
+    );
+    assert_frame(
+        "forwarded_command_positioned.bin",
+        &ForwardedCommand {
+            read_barrier: true,
+            min_position: Some(laser_wire::mutation::MutationPosition {
+                topic_generation: 9,
+                partition: 0,
+                offset: 42,
+            }),
+            positioned_reply: true,
+            min_sessions: vec![laser_wire::mutation::SessionPosition {
+                stream_id: 0,
+                stream_generation: 1_700_000_000_000_000,
+                topic: "agent.sessions".to_owned(),
+                topic_generation: 10,
+                partition_id: 0,
+                offset: 43,
+            }],
+            tenancy: laser_wire::authz::Tenancy::Stream,
+            user_id: 7,
+            client_id: 42,
+            correlation: None,
+            operation_id: None,
+            read_all: false,
+            scope: Some(scope.clone()),
+            command_code: laser_wire::codes::AGDX_KV_GET_CODE,
+            payload: vec![9, 9, 9],
+            grants: Vec::new(),
+        },
+    );
+    assert_frame(
+        "forwarded_query_scoped.bin",
+        &ForwardedQuery {
+            user_id: 7,
+            client_id: 42,
+            correlation: None,
+            query_envelope: vec![1, 2, 3, 4],
+            grants: Vec::new(),
+            tenancy: laser_wire::authz::Tenancy::Stream,
+            scope: Some(scope.clone()),
         },
     );
     assert_frame(
@@ -2291,7 +2391,7 @@ fn given_origin_and_producer_frames_when_encoded_then_should_match_golden_fixtur
     };
     let producer = ProducerInfo {
         name: "extractor".to_owned(),
-        version: "0.7.0".to_owned(),
+        version: "0.8.0".to_owned(),
     };
     assert_frame("source_ref_generation.bin", &origin);
     let mut node = GraphNode::entity("Component", "cache");
@@ -2442,6 +2542,8 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         &MutationCommandEnvelope {
             v: KV_OP_VERSION,
             operation_id: 42,
+            actor_user_id: 0,
+            deployment_id: 0,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
             scope: None,
@@ -2461,6 +2563,8 @@ fn given_hello_reply_frame_when_encoded_then_should_match_golden_fixture() {
         &MutationCommandEnvelope {
             v: KV_OP_VERSION,
             operation_id: 43,
+            actor_user_id: 0,
+            deployment_id: 0,
             timestamp_micros: 1_700_000_000_000_000,
             command_code: AGDX_KV_SET_CODE,
             scope: Some(ForwardedScope {
@@ -2494,6 +2598,49 @@ fn given_managed_identity_frames_when_encoded_then_should_match_golden_fixtures(
             valid_from_micros: 100,
             valid_to_micros: Some(200),
             revoked: false,
+        },
+    );
+}
+
+fn session_position() -> SessionPosition {
+    SessionPosition {
+        stream_id: 2,
+        stream_generation: 1_700_000_000_000_001,
+        topic: "agent.sessions".to_owned(),
+        topic_generation: 1_700_000_000_000_002,
+        partition_id: 1,
+        offset: 9,
+    }
+}
+
+#[test]
+fn given_positioned_managed_frames_when_encoded_then_should_match_golden_fixtures() {
+    let position = |offset| MutationPosition {
+        topic_generation: 1_700_000_000_000_000,
+        partition: 0,
+        offset,
+    };
+    assert_frame(
+        "managed_read.bin",
+        &ManagedReadEnvelope {
+            v: MANAGED_REQUEST_VERSION,
+            read: vec![9, 8, 7],
+            min_position: Some(position(41)),
+            log_head: true,
+            min_sessions: vec![session_position()],
+        },
+    );
+    assert_frame(
+        "managed_reply.bin",
+        &ManagedReplyEnvelope {
+            v: MANAGED_REQUEST_VERSION,
+            frontier: AppliedFrontier {
+                kv: Some(position(41)),
+                fork: None,
+                graph: Some(position(3)),
+                sessions: vec![session_position()],
+            },
+            reply: vec![1, 2, 3],
         },
     );
 }
@@ -2800,7 +2947,7 @@ mod agent_fixtures {
                 covered: vec![(2, 0, 1, 9)],
                 summarizer: ProducerInfo {
                     name: "summarizer".to_owned(),
-                    version: "0.7.0".to_owned(),
+                    version: "0.8.0".to_owned(),
                 },
             },
         );
@@ -2843,7 +2990,7 @@ mod agent_fixtures {
             agent: source(),
             sdk: SdkInfo {
                 language: "rust".to_owned(),
-                version: "0.7.0".to_owned(),
+                version: "0.8.0".to_owned(),
             },
             parent: Some(parent),
             root: Some(root),
@@ -3653,6 +3800,7 @@ fn given_filter_catalog_frames_when_encoded_then_should_match_golden_fixtures() 
                 grants: Vec::new(),
             }),
             stream: None,
+            stamp: None,
         },
     );
 }
@@ -3708,7 +3856,7 @@ fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
         }),
         sdk: Some(SdkInfo {
             language: "rust".to_owned(),
-            version: "0.7.0".to_owned(),
+            version: "0.8.0".to_owned(),
         }),
         flags: SessionFlags {
             events_truncated: true,
@@ -3831,14 +3979,25 @@ fn given_session_read_replies_when_encoded_then_should_match_golden_fixtures() {
     assert_frame(
         "session_reply_changes.bin",
         &SessionReply::Ok(SessionOutcome::Changes(SessionChanges {
-            rows: vec![SessionChangeRow {
-                seq: 43,
-                sessions: vec![id],
-                positions: vec![position],
-                truncated: false,
-            }],
+            rows: vec![
+                SessionChangeRow {
+                    seq: 43,
+                    sessions: vec![id],
+                    positions: vec![position],
+                    truncated: false,
+                    origin: laser_wire::session::SessionChangeOrigin::Records,
+                },
+                SessionChangeRow {
+                    seq: 44,
+                    sessions: vec![id],
+                    positions: vec![position],
+                    truncated: false,
+                    origin: laser_wire::session::SessionChangeOrigin::Links,
+                },
+            ],
             floor: 10,
             resync: false,
+            series: 0,
         })),
     );
     assert_frame(

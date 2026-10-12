@@ -33,13 +33,10 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tracing::{debug, error, warn};
 
-// Capped exponential backoff between consecutive poll failures: 50ms, 100ms,
-// 200ms, up to one second.
+// Capped exponential backoff between consecutive poll failures, jittered so
+// consumers that failed together do not reopen together. See `crate::retry`.
 pub(crate) fn backoff_for(attempt: u32) -> Duration {
-    const BASE_MILLIS: u64 = 50;
-    const CEILING_MILLIS: u64 = 1000;
-    let scaled = BASE_MILLIS.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1).min(16)));
-    Duration::from_millis(scaled.min(CEILING_MILLIS))
+    crate::retry::CONSUMER.delay(attempt)
 }
 
 /// The composed-dedup and fence-map tuning constants, grouped near the top so
@@ -594,7 +591,8 @@ impl ReliableConsumer {
         let control = Arc::new(ControlBook::default());
         let (reconcile, reconcile_requests) = tokio::sync::mpsc::unbounded_channel();
         let mut pause = None;
-        let control_follower = if self.topic == AGENT_CONTROL {
+        let mut late_control = false;
+        let mut control_follower = if self.topic == AGENT_CONTROL {
             None
         } else {
             match crate::agent::pause::load_control(laser, me.as_ref(), &control).await? {
@@ -628,7 +626,13 @@ impl ReliableConsumer {
                     ));
                     Some((stop, task))
                 }
-                None => None,
+                // No control topic yet. The follower starts once the worker
+                // exists, keeps looking for the topic, and then starts the
+                // pause runtime too, so a late topic holds delivery as well.
+                None => {
+                    late_control = true;
+                    None
+                }
             }
         };
         drop(reconcile);
@@ -652,7 +656,11 @@ impl ReliableConsumer {
             operations: self.operations,
             sessions,
             control,
-            pause: pause.clone(),
+            pause: Arc::new(
+                pause
+                    .clone()
+                    .map_or_else(std::sync::OnceLock::new, std::sync::OnceLock::from),
+            ),
             budget: BudgetGate::default(),
             high_water_fence: dashmap::DashMap::new(),
             fence_last_sweep: std::sync::atomic::AtomicU64::new(0),
@@ -686,7 +694,51 @@ impl ReliableConsumer {
             None => None,
         };
 
+        // A control topic missing at start: follow it once it appears and
+        // start the pause runtime then, recovered from the log first.
+        let late_driver: LateDriver = Arc::default();
+        if late_control {
+            let start_pause = match (&me, source) {
+                (Some(me), Some(source)) => {
+                    let slot = Arc::clone(&reliable.pause);
+                    let sessions = reliable.sessions.clone();
+                    let me = me.clone();
+                    let book = Arc::clone(&reliable.control);
+                    let worker: Arc<dyn Replay> = reliable.clone();
+                    let driver = Arc::clone(&late_driver);
+                    let start: crate::agent::pause::StartPause = Box::new(move |feed| {
+                        let (reconcile, requests) = tokio::sync::mpsc::unbounded_channel();
+                        let runtime = Arc::new(PauseRuntime::new(
+                            sessions,
+                            me,
+                            book,
+                            feed,
+                            source,
+                            reconcile.clone(),
+                        ));
+                        Box::pin(async move {
+                            start_late_pause(runtime, worker, requests, reconcile, slot, driver)
+                                .await
+                        })
+                    });
+                    Some(start)
+                }
+                _ => None,
+            };
+            let (stop, stopped) = oneshot::channel();
+            let task = tokio::spawn(crate::agent::pause::discover_then_follow_control(
+                laser.clone(),
+                me.clone(),
+                Arc::clone(&reliable.control),
+                start_pause,
+                self.poll_interval,
+                stopped,
+            ));
+            control_follower = Some((stop, task));
+        }
+
         // An aborted or dropped runtime stops its background tasks with it.
+        let _late = AbortLateOnDrop(Arc::clone(&late_driver));
         let _background = AbortOnDrop(
             control_follower
                 .iter()
@@ -738,9 +790,79 @@ impl ReliableConsumer {
                 task.abort();
             }
         }
+        let late = late_driver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((stop, mut task)) = late {
+            let _ = stop.send(());
+            if tokio::time::timeout(self.shutdown_grace, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
         stop_follower(control_follower).await;
         result
     }
+}
+
+/// The pause driver started after a late control topic appeared.
+type LateDriver = Arc<Mutex<Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>>>;
+
+// Aborts a late pause driver when the runtime future is dropped.
+struct AbortLateOnDrop(LateDriver);
+
+impl Drop for AbortLateOnDrop {
+    fn drop(&mut self) {
+        if let Some((_, task)) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+// Recover a pause runtime that started after a late control topic appeared,
+// install it, and start its driver. Recovery retries on the consumer backoff.
+// A runtime that never recovers is not installed, so delivery is not held.
+async fn start_late_pause(
+    runtime: Arc<PauseRuntime>,
+    worker: Arc<dyn Replay>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<ConversationId>,
+    reconcile: tokio::sync::mpsc::UnboundedSender<ConversationId>,
+    slot: Arc<std::sync::OnceLock<Arc<PauseRuntime>>>,
+    driver: LateDriver,
+) -> Option<tokio::sync::mpsc::UnboundedSender<ConversationId>> {
+    let mut attempt = 0;
+    loop {
+        match runtime.recover().await {
+            Ok(()) => break,
+            Err(error) => {
+                attempt += 1;
+                if attempt >= crate::retry::CONSUMER_FAILURE_BUDGET {
+                    warn!(%error, "the pause runtime for the late control topic did not recover, sessions of this agent cannot be paused");
+                    return None;
+                }
+                tokio::time::sleep(crate::retry::CONSUMER.delay(attempt)).await;
+            }
+        }
+    }
+    if slot.set(Arc::clone(&runtime)).is_err() {
+        return None;
+    }
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(crate::agent::pause::drive(
+        runtime, worker, requests, stopped,
+    ));
+    *driver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stop, task));
+    Some(reconcile)
 }
 
 // Aborts the runtime's background tasks when the runtime future is dropped,
@@ -867,20 +989,33 @@ impl Opener {
     }
 
     // Leave the failed consumer and open another, after the backoff the
-    // failure count asks for.
-    async fn reopen(&self, consumer: &mut Consumer, failures: u32) -> Result<(), LaserError> {
+    // failure count asks for. A failed open counts as another consumer
+    // failure, so a brief outage during the reopen is retried within the same
+    // budget instead of ending the consumer.
+    async fn reopen(&self, consumer: &mut Consumer, failures: &mut u32) -> Result<(), LaserError> {
         if let Err(error) = consumer.shutdown().await {
             debug!(%error, topic = %self.topic, "the failed consumer did not leave its group cleanly");
         }
-        sleep(backoff_for(failures)).await;
-        *consumer = self.open().await?;
-        Ok(())
+        loop {
+            sleep(backoff_for(*failures)).await;
+            match self.open().await {
+                Ok(reopened) => {
+                    *consumer = reopened;
+                    return Ok(());
+                }
+                Err(error) if recoverable(&error, *failures + 1) => {
+                    *failures += 1;
+                    warn!(%error, attempt = *failures, topic = %self.topic, "reopening the agent consumer failed, retrying");
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
 // The consecutive consumer failures after which a retryable failure is no
 // longer treated as transient.
-pub(crate) const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 10;
+pub(crate) const MAX_CONSECUTIVE_POLL_ERRORS: u32 = crate::retry::CONSUMER_FAILURE_BUDGET;
 
 // Whether a consumer failure is worth reopening the consumer for. The
 // verdict is `LaserError::is_retryable`, the one TypeScript shares: a stale
@@ -929,7 +1064,7 @@ where
                     break Err(error);
                 }
                 warn!(%error, attempt = failures, topic = %opener.topic, "agent consumer failed, reopening it");
-                if let Err(error) = opener.reopen(&mut consumer, failures).await {
+                if let Err(error) = opener.reopen(&mut consumer, &mut failures).await {
                     break Err(error);
                 }
                 worker.invalidate_pause();
@@ -962,7 +1097,7 @@ where
                 break Err(error);
             }
             warn!(%error, source = %message.position, "committing a handled record failed, reopening the consumer");
-            if let Err(error) = opener.reopen(&mut consumer, failures).await {
+            if let Err(error) = opener.reopen(&mut consumer, &mut failures).await {
                 break Err(error);
             }
             worker.invalidate_pause();
@@ -1055,7 +1190,7 @@ where
                     return Err(error);
                 }
                 warn!(%error, attempt = failures, topic = %opener.topic, "agent consumer failed, reopening it");
-                opener.reopen(&mut consumer, failures).await?;
+                opener.reopen(&mut consumer, &mut failures).await?;
                 worker.invalidate_pause();
             }
         }
@@ -1428,8 +1563,8 @@ struct ReliableWorker<H> {
     /// The control requests the control subscription observed.
     control: Arc<ControlBook>,
     /// The pause runtime, for an agent with an id on a stream with
-    /// `agent.control`.
-    pause: Option<Arc<PauseRuntime>>,
+    /// `agent.control`. Set at start, or once a missing control topic appears.
+    pause: Arc<std::sync::OnceLock<Arc<PauseRuntime>>>,
     /// The budget check before a session's work reaches the handler.
     budget: BudgetGate,
     #[cfg(feature = "sign")]
@@ -1458,7 +1593,7 @@ impl<H> ReliableWorker<H> {
     // Tell the pause runtime which partitions the consumer reads, when it
     // knows.
     fn observe_assignment(&self, consumer: &Consumer) {
-        if let Some(pause) = &self.pause {
+        if let Some(pause) = self.pause.get() {
             pause.observe_assignment(consumer.assigned_partitions());
         }
     }
@@ -1466,7 +1601,7 @@ impl<H> ReliableWorker<H> {
     // The consumer was reopened: the pause runtime reads the lane again
     // before the next dispatch.
     fn invalidate_pause(&self) {
-        if let Some(pause) = &self.pause {
+        if let Some(pause) = self.pause.get() {
             pause.invalidate();
         }
     }
@@ -1823,7 +1958,7 @@ where
         // parked on the session lane and committed. A resumed session handles
         // its held records first. The session gate stays held through the
         // handler, so a pause acknowledgment follows the record in flight.
-        let _gate = match (&self.pause, live) {
+        let _gate = match (self.pause.get(), live) {
             (Some(pause), true) => {
                 let gate = pause.gate(message.provenance.conversation_id).await;
                 if pause.hold(self, &message).await? == Hold::Commit {
@@ -2184,6 +2319,22 @@ impl DedupWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_consumer_failures_when_backing_off_then_should_jitter_within_the_upper_half() {
+        for attempt in [1, 3, 10] {
+            let ceiling = crate::retry::CONSUMER.ceiling(attempt);
+            for _ in 0..64 {
+                let delay = backoff_for(attempt);
+                assert!(
+                    delay <= ceiling && delay >= ceiling / 2,
+                    "attempt {attempt}: {delay:?}"
+                );
+            }
+        }
+        assert_eq!(crate::retry::CONSUMER.ceiling(1), Duration::from_millis(50));
+        assert_eq!(crate::retry::CONSUMER.ceiling(40), Duration::from_secs(1));
+    }
 
     #[test]
     fn given_an_agdx_command_when_warming_dedup_then_should_restore_the_scoped_key() {

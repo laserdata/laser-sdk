@@ -1015,6 +1015,22 @@ export interface QueryContext {
   readonly scannedBytes: bigint
   readonly producedBytes: bigint
   readonly rowCount: bigint
+  /** How far the store that served the query had applied each source
+   * partition of the index. A reply from another node can sit at another
+   * point of the same log, so compare positions, not wall time. Empty when the
+   * store reports no positions. */
+  readonly frontier: readonly QueryFrontier[]
+}
+/** One source partition's applied position in the store that served a query. */
+export interface QueryFrontier {
+  readonly stream: string
+  readonly topic: string
+  readonly partitionId: number
+  /** Creation time of the topic incarnation the rows come from, when the
+   * serving node knows it. Offsets of different incarnations do not compare. */
+  readonly topicCreatedAtMicros?: bigint
+  /** The last offset the store applied. */
+  readonly appliedOffset: bigint
 }
 export interface QueryResult {
   readonly fields: readonly LogicalField[]
@@ -1146,6 +1162,20 @@ function encodeContext(value: QueryContext): Map<string, unknown> {
   map.set("scanned_bytes", value.scannedBytes)
   map.set("produced_bytes", value.producedBytes)
   map.set("row_count", value.rowCount)
+  if (value.frontier.length > 0)
+    map.set(
+      "frontier",
+      value.frontier.map((entry) => {
+        const item = mapOf([
+          ["stream", entry.stream],
+          ["topic", entry.topic],
+          ["partition_id", entry.partitionId]
+        ])
+        optional(item, "topic_created_at_micros", entry.topicCreatedAtMicros)
+        item.set("applied_offset", entry.appliedOffset)
+        return item
+      })
+    )
   return map
 }
 function decodeContext(map: CborMap, context: string): QueryContext {
@@ -1187,7 +1217,19 @@ function decodeContext(map: CborMap, context: string): QueryContext {
     elapsedMicros: field.requiredU64(map, "elapsed_micros", context),
     scannedBytes: field.requiredU64(map, "scanned_bytes", context),
     producedBytes: field.requiredU64(map, "produced_bytes", context),
-    rowCount: field.requiredU64(map, "row_count", context)
+    rowCount: field.requiredU64(map, "row_count", context),
+    frontier: field.optionalArray(map, "frontier", context, (item, index) => {
+      const entryContext = `${context}.frontier[${String(index)}]`
+      const entry = expectMap(item, entryContext)
+      const topicCreatedAtMicros = field.optionalU64(entry, "topic_created_at_micros", entryContext)
+      return {
+        stream: field.requiredString(entry, "stream", entryContext),
+        topic: field.requiredString(entry, "topic", entryContext),
+        partitionId: field.requiredU32(entry, "partition_id", entryContext),
+        ...(topicCreatedAtMicros === undefined ? {} : { topicCreatedAtMicros }),
+        appliedOffset: field.requiredU64(entry, "applied_offset", entryContext)
+      }
+    })
   }
 }
 export function encodeQueryResult(value: QueryResult): Map<string, unknown> {

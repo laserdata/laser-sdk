@@ -17,7 +17,7 @@ export const A2A_PROTOCOL_VERSION = "1.0";
 // @public (undocumented)
 export class A2aBridge {
     constructor(laser: Laser, source: AgentId, requestTopic: string, replyTopic: string);
-    // (undocumented)
+    caller(principal: string): A2aCaller;
     cancel(id: string): Promise<Task>;
     // (undocumented)
     card(): AgentCard;
@@ -31,7 +31,6 @@ export class A2aBridge {
     submitIn(parent: ConversationId, root: ConversationId, paramsJson: unknown, options?: {
         readonly target?: AgentId;
     }): Promise<Task>;
-    // (undocumented)
     task(id: string): Promise<Task>;
     // (undocumented)
     withBridgeHops(previous: readonly string[]): this;
@@ -39,6 +38,20 @@ export class A2aBridge {
     withCapabilities(capabilities: readonly CapabilityDescriptor[]): this;
     // (undocumented)
     withSigningKey(key: SigningKey): this;
+    withTaskBinding(key: Uint8Array, ttlMs: number): this;
+}
+
+// @public
+export class A2aCaller {
+    cancel(id: string): Promise<Task>;
+    handleRpc(input: unknown): Promise<JsonRpcResponse>;
+    submit(paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    submitIn(parent: ConversationId, root: ConversationId, paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    task(id: string): Promise<Task>;
 }
 
 // @public (undocumented)
@@ -1078,6 +1091,18 @@ export type AmbiguousMutationRecovery = {
     readonly kind: "reconcileTargetPrecondition";
 };
 
+// @public
+export interface AppliedFrontier {
+    // (undocumented)
+    readonly fork?: MutationPosition;
+    // (undocumented)
+    readonly graph?: MutationPosition;
+    // (undocumented)
+    readonly kv?: MutationPosition;
+    // (undocumented)
+    readonly sessions?: readonly SessionPosition[];
+}
+
 // @public (undocumented)
 export interface AppliedPolicy {
     readonly digest?: Uint8Array;
@@ -1255,6 +1280,7 @@ export interface AuthzEvent {
     readonly op: AuthzEventKind;
     // (undocumented)
     readonly revision: bigint;
+    readonly stream?: string;
 }
 
 // @public (undocumented)
@@ -1268,6 +1294,9 @@ export type AuthzEventKind = {
     readonly kind: "rolesBound";
     readonly userId: number;
     readonly roles: readonly string[];
+} | {
+    readonly kind: "tenancySet";
+    readonly tenancy: Tenancy;
 };
 
 // @public (undocumented)
@@ -1341,6 +1370,11 @@ export type AuthzSubject = {
     readonly userId: number;
 } | {
     readonly kind: "all";
+}
+/** Every change attributed to one stream, as Rust `AuthzSubject::Stream`. */
+| {
+    readonly kind: "stream";
+    readonly stream: string;
 };
 
 // @public (undocumented)
@@ -2224,6 +2258,23 @@ export interface CoercedPredicate {
 // @public (undocumented)
 export function commandEnvelope(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, body: Uint8Array): AgentEnvelope;
 
+// @public (undocumented)
+interface CommandError {
+    // (undocumented)
+    readonly code: ResultCode;
+    // (undocumented)
+    readonly message: string;
+}
+
+// @public (undocumented)
+export class CommandExecutionError extends LaserError {
+    constructor(message: string, detail: CommandError, options?: {
+        cause?: unknown;
+    });
+    // (undocumented)
+    readonly detail: CommandError;
+}
+
 // @public
 export function commandFromMessageSend(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, paramsJson: Uint8Array): AgentEnvelope;
 
@@ -2791,17 +2842,46 @@ type ControlCommand = {
 } | {
     readonly kind: "filterCatalog";
     readonly command: FilterCatalogCommand;
+} | {
+    readonly kind: "acceptGap";
+    readonly acceptance: GapAcceptance;
+} | {
+    readonly kind: "skipRecord";
+    readonly skip: RecordSkip;
 };
 
 // @public (undocumented)
 interface ControlEnvelope {
     // (undocumented)
     readonly command: ControlCommand;
+    readonly stamp?: ControlStamp;
     readonly stream?: string;
     // (undocumented)
     readonly timestampMicros: bigint;
     // (undocumented)
     readonly v: number;
+}
+
+// @public
+interface ControlStamp {
+    // (undocumented)
+    readonly actorUserId: number;
+    // (undocumented)
+    readonly deploymentId: bigint;
+    // (undocumented)
+    readonly keyId: bigint;
+    // (undocumented)
+    readonly operationId: bigint;
+    // (undocumented)
+    readonly streamGeneration?: ControlStreamGeneration;
+}
+
+// @public (undocumented)
+interface ControlStreamGeneration {
+    // (undocumented)
+    readonly createdAtMicros: bigint;
+    // (undocumented)
+    readonly streamId: number;
 }
 
 // @public (undocumented)
@@ -3004,6 +3084,9 @@ function decodeAgentErrorBody(map: CborMap, context: string): AgentErrorBody;
 function decodeAgentPresence(map: CborMap, context: string): AgentPresence;
 
 // @public (undocumented)
+function decodeAppliedFrontier(map: CborMap, context: string): AppliedFrontier;
+
+// @public (undocumented)
 function decodeArrowIpcMessageMetadata(map: CborMap, context: string): ArrowIpcMessageMetadata;
 
 // @public (undocumented)
@@ -3131,6 +3214,9 @@ function decodeControlCommand(value: unknown, context: string): ControlCommand;
 
 // @public (undocumented)
 function decodeControlEnvelope(map: CborMap, context: string): ControlEnvelope;
+
+// @public (undocumented)
+function decodeControlStamp(map: CborMap, context: string): ControlStamp;
 
 // @public (undocumented)
 function decodeDecodeRecord(map: CborMap, context: string): DecodeRecord;
@@ -3429,6 +3515,12 @@ function decodeLogicalSchemaRef(map: CborMap, context: string): LogicalSchemaRef
 function decodeLogicalType(map: CborMap, context: string): LogicalType;
 
 // @public (undocumented)
+function decodeManagedReadEnvelope(map: CborMap, context: string): ManagedReadEnvelope;
+
+// @public
+function decodeManagedReplyEnvelope(map: CborMap, context: string): ManagedReplyEnvelope;
+
+// @public (undocumented)
 function decodeManagedRequestEnvelope(map: CborMap, context: string): ManagedRequestEnvelope;
 
 // @public (undocumented)
@@ -3651,6 +3743,9 @@ function decodeSessionParking(map: CborMap, context: string): SessionParking;
 
 // @public
 function decodeSessionPauseRequestJson(body: Uint8Array): SessionPauseRequest;
+
+// @public (undocumented)
+function decodeSessionPosition(map: CborMap, context: string): SessionPosition;
 
 // @public (undocumented)
 function decodeSessionRef(map: CborMap, context: string): SessionRef;
@@ -4351,6 +4446,9 @@ function encodeAgentErrorBody(body: AgentErrorBody): Map<string, unknown>;
 function encodeAgentPresence(presence: AgentPresence): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeAppliedFrontier(frontier: AppliedFrontier): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeArrowIpcMessageMetadata(metadata: ArrowIpcMessageMetadata): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4469,6 +4567,9 @@ function encodeControlCommand(command: ControlCommand): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeControlEnvelope(envelope: ControlEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeControlStamp(stamp: ControlStamp): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeDecodeRecord(request: DecodeRecord): Map<string, unknown>;
@@ -4795,6 +4896,12 @@ function encodeLogicalSchemaRef(value: LogicalSchemaRef): Map<string, unknown>;
 function encodeLogicalType(value: LogicalType): Map<string, unknown>;
 
 // @public (undocumented)
+function encodeManagedReadEnvelope(envelope: ManagedReadEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
+function encodeManagedReplyEnvelope(envelope: ManagedReplyEnvelope): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeManagedRequestEnvelope(envelope: ManagedRequestEnvelope): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4998,6 +5105,9 @@ function encodeSessionParking(parking: SessionParking): Map<string, unknown>;
 
 // @public
 function encodeSessionPauseRequestJson(request: SessionPauseRequest): string;
+
+// @public (undocumented)
+function encodeSessionPosition(position: SessionPosition): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeSessionRef(ref: SessionRef): Map<string, unknown>;
@@ -6499,13 +6609,22 @@ interface ForwardedCommand {
     // (undocumented)
     readonly grants: readonly Grant[];
     // (undocumented)
+    readonly minPosition?: MutationPosition;
+    // (undocumented)
+    readonly minSessions: readonly SessionPosition[];
+    // (undocumented)
     readonly operationId?: bigint;
     // (undocumented)
     readonly payload: Uint8Array;
     // (undocumented)
+    readonly positionedReply: boolean;
+    // (undocumented)
     readonly readAll: boolean;
     // (undocumented)
+    readonly readBarrier: boolean;
+    // (undocumented)
     readonly scope?: ForwardedScope;
+    readonly tenancy?: Tenancy;
     // (undocumented)
     readonly userId: number;
 }
@@ -6520,6 +6639,8 @@ interface ForwardedQuery {
     readonly grants: readonly Grant[];
     // (undocumented)
     readonly queryEnvelope: Uint8Array;
+    readonly scope?: ForwardedScope;
+    readonly tenancy?: Tenancy;
     // (undocumented)
     readonly userId: number;
 }
@@ -6570,6 +6691,20 @@ type Fragment = {
 
 // @public
 export function fuseReciprocalRank(signals: readonly (readonly MemoryItem[])[], limit: number): readonly MemoryItem[];
+
+// @public
+interface GapAcceptance {
+    // (undocumented)
+    readonly fromOffset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly source: SourceSelector;
+    // (undocumented)
+    readonly toOffset: bigint;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+}
 
 // @public (undocumented)
 type GapReason = "expired_before_fold" | "pruned" | "truncated" | "rebuilding" | "unrecognized";
@@ -7506,7 +7641,13 @@ export class InvalidError extends LaserError {
 }
 
 // @public
+function isAfter(position: MutationPosition, other: MutationPosition): boolean;
+
+// @public
 export function isAmbiguousMutation(error: unknown): boolean;
+
+// @public
+function isBarrierRead(code: number): boolean;
 
 // @public
 export function isBudgetExceeded(error: unknown): boolean;
@@ -8452,6 +8593,7 @@ export class Laser implements AsyncDisposable {
     scatterReport(source: AgentId, selector: CapabilitySelector, payload: BytesLike, inboxRoute: InboxRoute, deadlineMs: number): Promise<ScatterReport>;
     // (undocumented)
     schemas(): Schemas;
+    seenPositions(): AppliedFrontier;
     // (undocumented)
     sendAgent(topic: string, payload: BytesLike, provenance: Provenance, options?: {
         readonly contentType?: ContentType;
@@ -8871,6 +9013,29 @@ export interface ManagedKvTransport {
     reset(): Promise<void>;
     // (undocumented)
     send(code: number, frame: Uint8Array): Promise<Uint8Array>;
+}
+
+// @public
+interface ManagedReadEnvelope {
+    // (undocumented)
+    readonly logHead?: boolean;
+    // (undocumented)
+    readonly minPosition?: MutationPosition;
+    readonly minSessions?: readonly SessionPosition[];
+    // (undocumented)
+    readonly read: Uint8Array;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public
+interface ManagedReplyEnvelope {
+    // (undocumented)
+    readonly frontier: AppliedFrontier;
+    // (undocumented)
+    readonly reply: Uint8Array;
+    // (undocumented)
+    readonly v: number;
 }
 
 // @public (undocumented)
@@ -9641,6 +9806,9 @@ export class MemoryTopicBuilder {
 }
 
 // @public
+function mergeFrontier(seen: AppliedFrontier, other: AppliedFrontier): AppliedFrontier;
+
+// @public
 export interface Message {
     // (undocumented)
     readonly headers: Headers_2;
@@ -9763,7 +9931,11 @@ export class Msgpack<T = unknown> implements Codec<T> {
 // @public (undocumented)
 interface MutationCommandEnvelope {
     // (undocumented)
+    readonly actorUserId: number;
+    // (undocumented)
     readonly commandCode: number;
+    // (undocumented)
+    readonly deploymentId: bigint;
     // (undocumented)
     readonly operationId: bigint;
     // (undocumented)
@@ -10176,6 +10348,7 @@ interface PayloadRange {
 // @public
 export interface PendingControl {
     readonly cancelRequested: boolean;
+    readonly controlConflict: boolean;
     readonly pauseRequested: boolean;
 }
 
@@ -10267,6 +10440,12 @@ export interface PolicyRef {
     // (undocumented)
     readonly ruleIds: readonly string[];
 }
+
+// @public
+type PositionSurface = "kv" | "fork" | "graph";
+
+// @public
+function positionSurfaceOf(code: number): PositionSurface | undefined;
 
 // @public (undocumented)
 export interface Predicate {
@@ -10534,6 +10713,7 @@ export interface ProjectionBinding {
     readonly notify: boolean;
     // (undocumented)
     readonly retention?: RetentionPolicy;
+    readonly skipRejected: boolean;
     // (undocumented)
     readonly source: SourceSelector;
 }
@@ -10549,6 +10729,7 @@ export class ProjectionBindingBuilder {
     retention(retention: RetentionPolicy): this;
     // (undocumented)
     selector(source: SourceSelector): this;
+    skipRejected(): this;
     source(stream: string, topic: string): this;
     tryBuild(): ProjectionBinding | undefined;
 }
@@ -11074,6 +11255,7 @@ export interface QueryContext {
     readonly engine: QueryEngine;
     // (undocumented)
     readonly executionId: QueryExecutionId;
+    readonly frontier: readonly QueryFrontier[];
     // (undocumented)
     readonly globalStateRevision?: bigint;
     // (undocumented)
@@ -11201,6 +11383,18 @@ interface QueryExecutionView {
     readonly result?: QueryResult;
     // (undocumented)
     readonly status: QueryExecutionStatus;
+}
+
+// @public
+export interface QueryFrontier {
+    readonly appliedOffset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+    readonly topicCreatedAtMicros?: bigint;
 }
 
 // @public (undocumented)
@@ -11672,6 +11866,22 @@ export type RecordPolicy = "reject" | "pass";
 // @public (undocumented)
 export function recordPolicyIsReject(policy: RecordPolicy): boolean;
 
+// @public
+interface RecordSkip {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly reason: string;
+    // (undocumented)
+    readonly source: SourceSelector;
+    // (undocumented)
+    readonly target: string;
+    // (undocumented)
+    readonly topicCreatedAtMicros: bigint;
+}
+
 // @public (undocumented)
 type RecreatedPartitionPolicy = "reject";
 
@@ -11963,6 +12173,12 @@ function resultCodeFromWord(word: string): ResultCode | undefined;
 export function resultCodeHttpStatus(value: ResultCode): number;
 
 // @public
+export function resultCodeIsPending(value: ResultCode): boolean;
+
+// @public
+export function resultCodeIsPlaneUnavailable(value: ResultCode): boolean;
+
+// @public
 function resultCodeIsRetryable(value: ResultCode): boolean;
 
 // @public (undocumented)
@@ -11986,6 +12202,8 @@ const ResultCodeName: {
     readonly ExpiredSnapshot: 16;
     readonly StaleGeneration: 17;
     readonly TargetUnavailable: 18;
+    readonly Pending: 19;
+    readonly PlaneUnavailable: 20;
 };
 
 // @public (undocumented)
@@ -12438,9 +12656,12 @@ export type SessionChange = {
     readonly kind: "resync";
 };
 
+// @public
+type SessionChangeOrigin = "records" | "links" | "maintenance" | "expiry";
+
 // @public (undocumented)
 interface SessionChangeRow {
-    // (undocumented)
+    readonly origin?: SessionChangeOrigin;
     readonly positions: readonly LogPosition[];
     // (undocumented)
     readonly seq: bigint;
@@ -12455,6 +12676,7 @@ interface SessionChanges {
     // (undocumented)
     readonly after: bigint;
     readonly limit: number;
+    readonly series?: bigint;
     // (undocumented)
     readonly stream: string;
 }
@@ -12471,6 +12693,8 @@ interface SessionChangesQuery {
     readonly after?: bigint;
     // (undocumented)
     readonly limit?: number;
+    // (undocumented)
+    readonly series?: bigint;
 }
 
 // @public (undocumented)
@@ -12484,6 +12708,7 @@ interface SessionChangesView {
     readonly resync: boolean;
     // (undocumented)
     readonly rows: readonly SessionChangeRow[];
+    readonly series: bigint;
 }
 
 // @public
@@ -12651,6 +12876,7 @@ export class SessionEventsRequest {
 
 // @public (undocumented)
 interface SessionFlags {
+    readonly controlConflict: boolean;
     // (undocumented)
     readonly eventsTruncated: boolean;
     // (undocumented)
@@ -12929,6 +13155,22 @@ interface SessionPauseRequest {
 export type SessionPolicy = "perCall" | "perUser";
 
 // @public
+export interface SessionPosition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly streamGeneration: bigint;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topic: string;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+}
+
+// @public
 type SessionRecord = {
     readonly kind: "envelope";
     readonly envelope: AgentEnvelope;
@@ -12987,6 +13229,7 @@ export class Sessions {
     state(id: ConversationId, historyLimit: number): Promise<SessionStateView>;
     stream(): string;
     submit(agent: AgentId, input: BytesLike): SubmitBuilder;
+    unregister(): Promise<void>;
     watch(pollEveryMs: number): Promise<SessionWatch>;
 }
 
@@ -13828,6 +14071,9 @@ export interface TaskStatus {
     // (undocumented)
     readonly state: TaskState;
 }
+
+// @public
+type Tenancy = "deployment" | "stream";
 
 // @public (undocumented)
 export function terminal(envelope: AgentEnvelope, finishReason: string): AgentEnvelope;
@@ -14777,6 +15023,7 @@ declare namespace wire {
         BindRolesReq,
         AuthzSubject,
         AuthzHistoryReq,
+        Tenancy,
         AuthzEventKind,
         AuthzEvent,
         AuthzHistoryReply,
@@ -14927,6 +15174,7 @@ declare namespace wire {
         ClientMetadata,
         ClientMetadataList,
         isIdempotentManagedRequest,
+        isBarrierRead,
         AGDX_COMMAND_BASE,
         AGDX_HELLO_CODE,
         AGDX_BACKEND_HELLO_CODE,
@@ -15155,6 +15403,8 @@ declare namespace wire {
         parseProjectionId,
         projectionKindIsRow,
         schemaDefContentType,
+        encodeControlStamp,
+        decodeControlStamp,
         encodeSessionTopics,
         decodeSessionTopics,
         encodeIndexField,
@@ -15199,6 +15449,10 @@ declare namespace wire {
         SchemaSource,
         SchemaDef,
         ControlCommand,
+        GapAcceptance,
+        RecordSkip,
+        ControlStamp,
+        ControlStreamGeneration,
         SessionTopics,
         ControlEnvelope,
         recordPolicyIsReject,
@@ -15408,13 +15662,13 @@ declare namespace wire {
         ForkOutcome,
         ForkError,
         ForkReply,
-        encodeForwardedScope,
-        decodeForwardedScope,
         encodeForwardedQuery,
         decodeForwardedQuery,
         encodeForwardedCommand,
         decodeForwardedCommand,
         ForwardedScope,
+        decodeForwardedScope,
+        encodeForwardedScope,
         ForwardedQuery,
         ForwardedCommand,
         edgeDirIsOut,
@@ -15906,12 +16160,28 @@ declare namespace wire {
         MemoryRecord,
         encodeManagedRequestEnvelope,
         decodeManagedRequestEnvelope,
+        encodeSessionPosition,
+        decodeSessionPosition,
+        encodeManagedReadEnvelope,
+        decodeManagedReadEnvelope,
+        positionSurfaceOf,
+        isAfter,
+        mergeFrontier,
+        encodeAppliedFrontier,
+        decodeAppliedFrontier,
+        encodeManagedReplyEnvelope,
+        decodeManagedReplyEnvelope,
         encodeMutationPosition,
         decodeMutationPosition,
         encodeMutationCommandEnvelope,
         decodeMutationCommandEnvelope,
         MANAGED_REQUEST_VERSION,
         ManagedRequestEnvelope,
+        ManagedReadEnvelope,
+        SessionPosition,
+        PositionSurface,
+        AppliedFrontier,
+        ManagedReplyEnvelope,
         MutationPosition,
         MutationCommandEnvelope,
         consistencyIsEventual,
@@ -16006,6 +16276,7 @@ declare namespace wire {
         BoundaryRelation,
         MaterializationBoundary,
         QueryContext,
+        QueryFrontier,
         QueryResult,
         QueryError,
         QueryErrorCode,
@@ -16018,10 +16289,13 @@ declare namespace wire {
         resultCodeToCode,
         resultCodeHttpStatus,
         resultCodeIsRetryable,
+        resultCodeIsPending,
+        resultCodeIsPlaneUnavailable,
         resultCodeFromWord,
         resultCodeWord,
         ResultCodeName,
         ResultCode,
+        CommandError,
         logicalTypeKind,
         logicalTypeAcceptsMapKey,
         encodeLogicalSchema,
@@ -16124,6 +16398,7 @@ declare namespace wire {
         SessionLink,
         SessionLinksView,
         SessionSourcesView,
+        SessionChangeOrigin,
         SessionChangeRow,
         SessionChangesView,
         SessionOutcome,
@@ -16295,7 +16570,7 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:762:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
+// src/client/laser.ts:764:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point full.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point full.d.ts
 

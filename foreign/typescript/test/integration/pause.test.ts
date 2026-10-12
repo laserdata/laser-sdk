@@ -693,3 +693,34 @@ void test("given_a_held_record_of_a_recreated_topic_when_resumed_then_should_rep
     await laser.close()
   }
 })
+
+void test("given_a_control_topic_created_after_start_when_paused_then_should_hold_work_until_resumed", async () => {
+  const stream = `laser-ts-pause-${randomUUID()}`
+  const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  try {
+    // The worker starts before agent.control exists.
+    await laser.bootstrap(4, TopicRetention.expireAfter(86_400_000))
+    const native = (await Laser.fromClient(laser.client)).withDefaultStream(stream)
+    const recorder = new Recorder()
+    const worker = await spawn(native, recorder)
+    await laser.topic(AgentTopic.Control).ensure(4)
+    const session = ConversationId.new()
+    await sendWork(laser, session, "before")
+    await waitSeen(recorder, "before", 1)
+    // The follower finds the topic with a short backoff, so repeat the pause
+    // until the late pause runtime acknowledges one.
+    await eventually(async () => {
+      const request = position(await control(laser, session).pause())
+      await delay(1_000)
+      return (await acknowledged(laser, session, "Paused", request)) ? true : undefined
+    })
+    await sendWork(laser, session, "held")
+    await waitParked(laser, session, 1)
+    assert.equal(recorder.count("held"), 0, "work for a paused session is held")
+    await control(laser, session).resume()
+    await waitSeen(recorder, "held", 1)
+    await worker.shutdown()
+  } finally {
+    await laser.close()
+  }
+})

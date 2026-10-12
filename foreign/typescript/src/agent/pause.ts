@@ -1,3 +1,4 @@
+import { CONSUMER, CONTROL_DISCOVERY_MAX_MS, backoffDelay, jittered } from "../retry.js"
 import { INTERNAL_TRANSPORT } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import type { LaserTransport, PolledMessage } from "../iggy/apache-iggy.js"
@@ -77,6 +78,8 @@ export interface SourceTopic {
 export interface ControlFeed {
   readonly streamId: number
   readonly topicId: number
+  /** The creation time of the control topic the feed reads, when known. */
+  readonly topicGen?: bigint
   readonly next: Map<number, bigint>
   /** Some partition holds more than the bounded read covered, or already
    * expired records, so requests older than the read may be missing. */
@@ -94,7 +97,15 @@ export async function loadControl(
 ): Promise<ControlFeed | undefined> {
   const stream = laser.defaultStream
   if (stream === undefined) return undefined
-  const transport = laser[INTERNAL_TRANSPORT]()
+  return loadControlFrom(laser[INTERNAL_TRANSPORT](), stream, me, book)
+}
+
+async function loadControlFrom(
+  transport: LaserTransport,
+  stream: string,
+  me: WireAgentId | undefined,
+  book: ControlBook
+): Promise<ControlFeed | undefined> {
   const partitions = await transport.findTopicPartitionCount(stream, AGENT_CONTROL)
   if (partitions === undefined) return undefined
   const ids = (await transport.resolveStreamTopicIds?.(stream, AGENT_CONTROL)) ?? {
@@ -113,8 +124,16 @@ export async function loadControl(
       if (read !== undefined) records.push(read)
     }
   }
+  const snapshot = await transport.findSnapshotTopic?.(stream, AGENT_CONTROL)
+  book.setPartitions(partitions)
   book.load(records)
-  return { streamId: ids.streamId, topicId: ids.topicId, next, truncated }
+  return {
+    streamId: ids.streamId,
+    topicId: ids.topicId,
+    ...(snapshot !== undefined ? { topicGen: snapshot.createdAtMicros } : {}),
+    next,
+    truncated
+  }
 }
 
 function readControl(
@@ -132,6 +151,86 @@ function readControl(
     : [envelope.conversation.toString(), [partition, message.offset], request]
 }
 
+/** The longest wait between looks for an `agent.control` topic that did not
+ * exist when the consumer started. */
+
+/** Waits for `agent.control` to appear, then follows it, as Rust
+ * `discover_then_follow_control`. A stream that gets its control topic after
+ * the consumer started still receives operator requests. Until then the book
+ * reports control as unavailable.
+ * @internal */
+export class LateControlFollower {
+  private readonly stopper = new AbortController()
+  private follower: ControlFollower | undefined
+  private readonly done: Promise<void>
+
+  constructor(
+    private readonly laser: Laser,
+    private readonly transport: LaserTransport,
+    private readonly stream: string,
+    private readonly me: WireAgentId | undefined,
+    private readonly book: ControlBook,
+    private readonly pollIntervalMs: number,
+    private readonly onFeed?: (
+      feed: ControlFeed
+    ) => Promise<((session: string) => void) | undefined>
+  ) {
+    this.done = this.discover()
+  }
+
+  /** Stop looking or following, and wait for both to finish. */
+  async stop(): Promise<void> {
+    this.stopper.abort()
+    await this.done
+    await this.follower?.stop()
+  }
+
+  /** Stop without waiting. */
+  abort(): void {
+    this.stopper.abort()
+    this.follower?.abort()
+  }
+
+  private async discover(): Promise<void> {
+    const signal = this.stopper.signal
+    const stopped = (): boolean => signal.aborted
+    let delay = Math.max(this.pollIntervalMs, 100)
+    while (!stopped()) {
+      await pause(jittered(delay), signal)
+      if (stopped()) return
+      let feed: ControlFeed | undefined
+      try {
+        feed = await loadControl(this.laser, this.me, this.book)
+      } catch {
+        feed = undefined
+      }
+      if (stopped()) return
+      if (feed !== undefined) {
+        // The pause runtime starts now too, so a late topic holds delivery
+        // as Rust `discover_then_follow_control` does.
+        let notify: ((session: string) => void) | undefined
+        try {
+          notify = await this.onFeed?.(feed)
+        } catch {
+          notify = undefined
+        }
+        if (stopped()) return
+        this.follower = new ControlFollower(
+          this.transport,
+          this.stream,
+          feed,
+          this.me,
+          this.book,
+          notify,
+          this.pollIntervalMs
+        )
+        return
+      }
+      delay = Math.min(delay * 2, CONTROL_DISCOVERY_MAX_MS)
+    }
+  }
+}
+
 /** The control follower: polls every `agent.control` partition from where the
  * startup read ended and records each request for `me` in the book, so every
  * instance of a role sees every request whatever partitions its consumer group
@@ -145,7 +244,7 @@ export class ControlFollower {
   constructor(
     private readonly transport: LaserTransport,
     private readonly stream: string,
-    private readonly feed: ControlFeed,
+    private feed: ControlFeed,
     private readonly me: WireAgentId | undefined,
     private readonly book: ControlBook,
     private readonly notify: ((session: string) => void) | undefined,
@@ -169,6 +268,7 @@ export class ControlFollower {
   private async follow(): Promise<void> {
     const signal = this.stopper.signal
     let failures = 0
+    let checked = Date.now()
     try {
       while (!signal.aborted) {
         let read = false
@@ -193,10 +293,42 @@ export class ControlFollower {
           await pause(backoffFor(failures), signal)
           continue
         }
-        if (!read) await pause(this.pollIntervalMs, signal)
+        if (!read) {
+          // A recreated agent.control starts every session's control history
+          // again, so the book starts again from the new topic.
+          if (Date.now() - checked >= CONTROL_TOPIC_CHECK_MS) {
+            checked = Date.now()
+            if (await this.recreated()) {
+              this.book.reset()
+              const reloaded = await loadControlFrom(
+                this.transport,
+                this.stream,
+                this.me,
+                this.book
+              )
+              if (reloaded === undefined) return
+              this.feed = reloaded
+              continue
+            }
+          }
+          await pause(this.pollIntervalMs, signal)
+        }
       }
     } finally {
       this.book.setLive(false)
+    }
+  }
+
+  private async recreated(): Promise<boolean> {
+    if (this.feed.topicGen === undefined) return false
+    try {
+      const current = await this.transport.findSnapshotTopic?.(this.stream, AGENT_CONTROL)
+      return (
+        current !== undefined &&
+        (current.id !== this.feed.topicId || current.createdAtMicros !== this.feed.topicGen)
+      )
+    } catch {
+      return false
     }
   }
 
@@ -209,10 +341,14 @@ export class ControlFollower {
   }
 }
 
+/** How often an idle control follower checks that agent.control is still the
+ * topic it reads. */
+const CONTROL_TOPIC_CHECK_MS = 5_000
+
 // Capped exponential backoff between consecutive read failures: 50ms, 100ms,
-// 200ms, up to one second.
+// 200ms, up to one second, spread over its upper half as Rust `backoff_for`.
 function backoffFor(attempt: number): number {
-  return Math.min(50 * 2 ** Math.min(Math.max(attempt - 1, 0), 16), 1_000)
+  return backoffDelay(CONSUMER, attempt)
 }
 
 function pause(ms: number, signal: AbortSignal): Promise<void> {

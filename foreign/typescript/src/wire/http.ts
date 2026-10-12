@@ -187,6 +187,7 @@ export interface SessionLinksQuery {
 export interface SessionChangesQuery {
   readonly after?: bigint
   readonly limit?: number
+  readonly series?: bigint
 }
 
 export function sessionsQueryParams(query: SessionsQuery): URLSearchParams {
@@ -258,6 +259,7 @@ export function sessionChangesQueryParams(query: SessionChangesQuery): URLSearch
   const params = new URLSearchParams()
   params.set(PARAM_AFTER, String(query.after ?? 0n))
   setParam(params, PARAM_LIMIT, query.limit)
+  setParam(params, "series", query.series?.toString())
   return params
 }
 
@@ -275,7 +277,19 @@ export function decodeSessionChangesQuery(params: URLSearchParams): SessionChang
     throw new CodecError(`query parameter ${PARAM_AFTER} must fit u64`, "query", PARAM_AFTER)
   }
   const limit = u32Param(params, PARAM_LIMIT)
-  return { after, ...(limit !== undefined ? { limit } : {}) }
+  const rawSeries = params.get("series")
+  if (rawSeries !== null && !/^\d+$/.test(rawSeries)) {
+    throw new CodecError("query parameter series must be an unsigned integer", "query", "series")
+  }
+  const series = rawSeries === null ? undefined : BigInt(rawSeries)
+  if (series !== undefined && series > 0xffff_ffff_ffff_ffffn) {
+    throw new CodecError("query parameter series must fit u64", "query", "series")
+  }
+  return {
+    after,
+    ...(limit !== undefined ? { limit } : {}),
+    ...(series !== undefined ? { series } : {})
+  }
 }
 
 /** The HTTP error body of a session read failure. */

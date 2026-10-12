@@ -4,6 +4,8 @@ This guide describes how the Rust, Python, and TypeScript clients behave. Operat
 
 Rust, Python, and TypeScript share the features and defaults listed in [the parity matrix](parity.md). The matrix covers inherent and trait methods, generated builder controls, and standalone SDK functions. Names and construction follow each language.
 
+Managed command errors keep their original result code and message. Rust exposes `LaserError::Command`, Python exposes `CommandError`, and TypeScript exposes `CommandExecutionError`. The shared classifiers preserve unavailable, permission, missing-resource and version-skew results, including unrecognized codes.
+
 ## Agents and sessions
 
 All three clients implement agent sessions. The [AGDX specification](agdx.md#a15-agent-sessions) defines the session records, topics, and reads.
@@ -26,6 +28,7 @@ A session is one conversation with a recorded lifecycle. Its id is the conversat
 - `state()` returns the session state document. `set`, `patch`, and `replace` append JSON Patch deltas, `snapshot` writes the whole document, and `get` folds the retained lane. A handle starts from the folded lane before its first write, so a lens such as `ctx.session()` writes against the current revision. The SDK writes a snapshot after every 64 deltas and before `end`. A successful append does not prove a patch applied.
 - `context()`, `checkpoint()`, `turns_at`, `turns_since`, `state_at`, and `replay` read the session lane. Each turn carries its display type, such as `session.started` or `tool.call`.
 - `Sessions::bootstrap(partitions, retention)` bootstraps the agent topics. When the server announces `sessions` and source registration is on, it also registers the stream as a session source. It waits until the session reads see that registration, retrying temporary read failures until the publish timeout. A refused registration is logged and reported as `registered: false`, never an error, because provisioning can register a stream for an account without session administration rights.
+- `Sessions::unregister()` removes the stream's session source registration through the same authenticated managed control path. It needs the same session administration right. The session index for the stream is dropped once the record applies, and a later bootstrap registers the stream again. Control records are never written to the control topic directly. The deployment refuses such a record.
 
 The `sessions` capability is set by the server only when it serves the managed session reads. A client starts with it off and must not infer support from the SDK version. Without it, every write and lane read above works on open Apache Iggy.
 
@@ -35,7 +38,7 @@ The `sessions` capability is set by the server only when it serves the managed s
 - A failed session read is `LaserError::Session` in Rust and `SessionError` in Python and TypeScript, classified by its result code.
 - `list()` also filters by `root(id)`, the tree rooted at one session, and `label_prefix(prefix)` (TypeScript `labelPrefix`, Python `root=` and `label_prefix=`).
 - `SessionInfo.held` counts the records held while the session was paused and not yet handled. `SessionFlags.liveness_unknown` is set while the server's heartbeat tail has not caught up, so `idle` is not meaningful yet. `SessionEvent.verified_actor` names the principal whose key verified a signed record.
-- `watch` starts from now and reports the changed session ids of each poll, or a resync when it fell below the retained change floor.
+- `watch` starts from now and reports the changed session ids of each poll. If retained history or an incomplete change row prevents full reporting, it returns a resync. List the sessions again after a resync.
 - `Laser::read_at(source)` (TypeScript `readAt`) reads the one record a message source reference names with a standard poll. It returns nothing when the record is gone or the topic was recreated, and works on open Apache Iggy.
 - [Session sizing](session-sizing.md) reports what a local managed stack measured for role scans, filtered page admission, fold rate, state history growth, and the change feed.
 
@@ -47,6 +50,8 @@ The `sessions` capability is set by the server only when it serves the managed s
 - A cancel while paused ends the session as canceled. Held records are not handled. `Session::parked()` lists them with a `complete` flag that is false when the bounded read could not prove the list complete, and the managed index counts them as `SessionInfo.held`.
 - The handler is never interrupted. Recovery after a restart, rebalance, or reconnect rebuilds the held set from the lane and reports incomplete recovery instead of dropping work.
 - Timelines show the holds as `session.parked` and `session.unparked`. No capability advertises the pause runtime yet.
+- A session's control route is the `agent.control` partition its conversation id hashes to (XXH32 with seed zero, modulo the partition count), the partition every SDK writes its control requests to. The SDK control book, the log fold and the plane apply only requests on that partition, whatever order partitions are read in. A request on any other partition is never applied, and `PendingControl.control_conflict` (TypeScript `controlConflict`) and `SessionInfo.flags.control_conflict` report it. A recreated `agent.control` (a new topic generation) starts every session's control history again: the follower notices the new topic within 5 seconds and reloads, and the plane drops the old requests when the first record of the new generation folds. Changing the partition count of an existing `agent.control` is not supported, recreate it instead.
+- An agent that starts before `agent.control` exists keeps looking for it with a backoff that grows to 30 seconds. Once the topic appears, the agent follows it, rebuilds its pause state from the log, and starts the pause runtime, so pause holds work from then on in Rust, Python and TypeScript alike.
 
 ### Session budgets
 
@@ -151,6 +156,8 @@ Live waits end with a typed timeout. TypeScript keeps an unfinished poll so the 
 
 A query with a zero row ceiling sends nothing. Results, pages, status, and cancellation stay bound to the execution ID that was requested.
 
+A query deadline is at most 25 seconds away. A later one fails with an invalid-argument error before any round trip. The server stops waiting for the backend at the deadline and replies `DeadlineExceeded`. The client waits 2 seconds past the deadline for that reply and then fails with a timeout. A timeout does not prove the query stopped. The backend's own statement timeout ends a statement that is still running.
+
 TypeScript MessagePack writes named maps and the shortest integer encoding. It rejects integers outside the signed and unsigned 64-bit ranges. Bodies the caller has already encoded stay opaque bytes.
 
 ## Coordination and ownership
@@ -208,3 +215,24 @@ The pure A2A and MCP converters keep the original request bytes and open no conn
 Python workflow builders, verifiers, and compensation callbacks can return a value directly or through an awaitable. Objects with `build` or `verify` methods work too. A custom snapshot store implements `latest(conversation)` and `save(snapshot)`, and `state_with` accepts it directly or wrapped in `SnapshotStore`. Callback errors keep their SDK class, and cancellation retires the asynchronous work in flight.
 
 A custom Python route policy is `None`, a built-in policy name, or a synchronous callable or object with a `select` method. The scorer receives `skill_id` and `RouteCandidate` objects with `agent`, `card`, and `capability`. It returns a candidate index, or `None` to refuse them all. An async scorer is rejected.
+
+## Retry and deadline table
+
+Every client reads its retries and deadlines from one table: `sdk/src/retry.rs` in Rust, which Python uses, and `src/retry.ts` in TypeScript. Both are tested against `sdk/tests/fixtures/retry-table.json`. A backoff doubles per consecutive failure from its base up to its maximum, and each wait is drawn at random from the upper half of that delay.
+
+| Surface | Values |
+| --- | --- |
+| Managed mutation and control append | backoff from 100 ms to 2 s, 30 s deadline |
+| Reliable consumer and pause runtime reopen | backoff from 50 ms to 1 s, gives up after 10 consecutive failures |
+| Control topic discovery | waits up to 30 s between looks |
+| Consumer-group filter change | 3 attempts 200 ms apart, outcome awaited 30 s |
+| Query deadline | 25 s by default and at most, reply awaited 2 s past it |
+| Producers racing to create a stream or topic | 10 attempts |
+
+## Managed mutation outcomes
+
+A managed mutation keeps one operation identity for every attempt. When the server reports `Pending`, reports `PlaneUnavailable` because the plane behind the node did not answer, reports `Unavailable` because the node shed the request, or the connection fails after the request was sent, the client sends the same request again with jittered backoff. The server applies a mutation at most once for one identity and returns the recorded outcome to a repeat. If the outcome is still unknown after 30 seconds, the call fails with `AmbiguousMutation` (`AmbiguousMutationError` in Python and TypeScript). The message names the operation identity. The mutation may still apply, so check the target state before you issue new work. Rust, Python and TypeScript behave the same way. Python uses the Rust client.
+
+When the node a client is connected to answers `PlaneUnavailable`, or its managed connection fails, a client built from a connection string moves its managed requests to another node of the cluster. It reads the roster, skips the failed node and nodes that report themselves stopping or unreachable, and dials the next node directly instead of following the leader redirect. Before it uses that node, it checks that the node's plane is ready and announces the same operation versions the client negotiated. A mutation keeps its operation identity and its deadline across the move. A read moves once when its node answers `PlaneUnavailable`. Later requests stay on the new node. When the new node's connection fails during a read, the error goes to the caller and the next request uses the original connection again. After a move, the first key-value, fork, graph and session read each carries a read barrier. The new node answers it only after its fold has applied every mutation its log held when the read arrived, or for a session read every record its session source partitions held, so the read sees the client's own earlier writes. A node that does not get there within its wait bound answers `Stale`, and the next read carries the barrier again. A client built from an existing Iggy client cannot dial another node, so it keeps repeating on its own connection. Rust and TypeScript behave the same way. Python uses the Rust client.
+
+Every managed key-value, fork and graph reply carries the position each of the answering node's folds had applied. The client keeps the highest position it has seen per surface and sends it with every later read of that surface. The node that answers serves the read only once its fold has applied that position, and answers `Stale` when it does not get there within its wait bound. So a read never misses the client's own earlier writes and never goes back behind an earlier read, whichever node answers. After a mutation topic is recreated, the first read that still names the old topic answers `Stale` and brings the new topic's position back, so the next read goes through. A session watch waits through `Stale` as it waits for a new change, so a watch that moved to a node that has not folded its stream yet keeps going instead of failing. Session reads work the same way per stream and source partition. A session read reply carries the session fold's position on every source partition of its stream, and the next session read sends the positions the client has seen. A position on a stream or topic that was deleted or recreated since, or on a topic the stream no longer registers, is ignored by the node, so it never holds a read back. Clones of one client share its positions. `seen_positions()` in Rust and Python and `seenPositions()` in TypeScript return them.

@@ -1,3 +1,8 @@
+import {
+  FILTER_MUTATION_ATTEMPTS,
+  FILTER_MUTATION_BACKOFF_MS,
+  FILTER_OUTCOME_WAIT_MS
+} from "../retry.js"
 import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import { publishOptions, retryTransientRead } from "../client/publish-options.js"
 import { resultCodeIsRetryable } from "../wire/result.js"
@@ -113,11 +118,11 @@ const DEFAULT_PREVIEW_RECORDS = 20
 const DEFAULT_MAX_UNACKED_PAGES = 1024
 const MAX_NODE_CONNECTIONS = 16
 const ASSIGNMENT_REFRESH_MS = 2_000
-const MUTATION_ATTEMPTS = 3
-const MUTATION_RETRY_BACKOFF_MS = 200
+const MUTATION_ATTEMPTS = FILTER_MUTATION_ATTEMPTS
+const MUTATION_RETRY_BACKOFF_MS = FILTER_MUTATION_BACKOFF_MS
 const OUTCOME_POLL_INTERVAL_MS = 100
 /** How long the typed catalog verbs wait for a mutation's authoritative outcome. */
-export const DEFAULT_OUTCOME_WAIT_MS = 30_000
+export const DEFAULT_OUTCOME_WAIT_MS = FILTER_OUTCOME_WAIT_MS
 
 const GET_STREAM_CODE = 200
 const GET_TOPIC_CODE = 300

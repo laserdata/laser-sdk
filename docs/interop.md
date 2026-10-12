@@ -49,7 +49,7 @@ A2A v1.0 uses PascalCase operation names. The stateless bridge does not serve `L
 | --- | --- |
 | `SendMessage` | Publish a typed AGDX `command` on a fresh task conversation, tunneling the whole params JSON in the body. The task id is the conversation. The A2A task identity rides `correlation` (derived from the conversation, so lookup stays stateless). Returns `Submitted`. |
 | `SendStreamingMessage` | Same publish as `SendMessage`. The stream is consumed log-natively (`Laser::reassemble_channel`), not re-emitted as SSE. |
-| `GetTask` | Read the reply topic, map the answering `response`/`error` envelope (matched by `correlation`) to the A2A task. `Working` until one lands. |
+| `GetTask` | Read the reply topic, map the answering `response`/`error` envelope (matched by `correlation`) to the A2A task. `Working` until one lands, and `Unknown` when the bounded scan could not reach the end of the reply topic, so the caller should look again. |
 | `CancelTask` | Publish an AGDX `error` terminal (`Cancelled`, `task_state = Canceled`). Returns `Canceled`. With `sign` and `with_signing_key`, the terminal is signed. |
 
 ```rust
@@ -71,6 +71,23 @@ A worker behind the bridge consumes the decoded command envelope (`message.envel
 `A2aBridge::submit_in(parent, root, params)` sends a task as a child session of `parent` in the tree rooted at `root`. It writes the child's submitted start on `agent.sessions` with that ancestry before the command, and the handling agent ends the child. Python takes `submit_in(parent, params, root=)`, and TypeScript names it `submitIn`.
 
 A task the bridge submits is addressed to every agent (`agdx.to = *`), so on a shared `agent.sessions` topic every listening agent receives it. To send it to one agent, use `A2aBridge::submit_to(target, params)` or `submit_in_to(target, parent, root, params)`. The command then carries `agdx.to = <target>`, and only that agent handles it. Python takes `submit(params, target=)` and `submit_in(parent, params, root=, target=)`. TypeScript takes `submit(params, { target })` and `submitIn(parent, root, params, { target })`. The JSON-RPC `router()` and `handle_rpc` paths submit unaddressed, so run one worker per request topic behind them.
+
+### Binding tasks to callers
+
+By default anyone who knows a task id can read or cancel the task. `A2aBridge::with_task_binding(key, ttl)` ties each task id to the caller that submitted it. The id then has three dot-separated parts: the conversation, an expiry in Unix microseconds, and a keyed BLAKE3 digest. The digest covers the caller, the stream creation time, the conversation and the expiry, under the 32-byte `key`. So an id works only for its own caller, only on the stream it was made on, and only until it expires. A recreated stream with the same name does not accept old ids.
+
+Once binding is on, every task operation needs a caller. Use `bridge.caller(principal)` and call `submit`, `submit_to`, `submit_in`, `submit_in_to`, `task`, `cancel` or `handle_rpc` on it. The bridge methods without a caller refuse with `HandlerConfig` before they publish anything. Another caller's id, an expired id and a changed id are refused the same way as a malformed id. So a caller cannot tell whether a task exists. The `router()` reads the caller from an `A2aCallerPrincipal` request extension. Your authentication layer must insert it, and a request without it is refused. Keep the key secret and the same on every bridge replica that serves the same stream. Rotating the key ends every open task id.
+
+Python passes `task_binding_key=` (32 bytes) and `task_binding_ttl_ms=` to the `A2aBridge` constructor, and `caller=` to `submit`, `submit_in`, `task`, `cancel` and `handle_rpc`. TypeScript uses `withTaskBinding(key, ttlMs)` and `caller(principal)`, which returns an `A2aCaller` with the same methods. All three SDKs make the same digest, so a task id made by one works in the others.
+
+```rust
+let bridge = Arc::new(
+    A2aBridge::new(laser.clone(), "a2a-gateway".parse::<AgentId>()?, AgentTopic::Sessions, AgentTopic::Sessions)
+        .with_task_binding(task_key, std::time::Duration::from_secs(3600)),
+);
+let task = bridge.caller("user-42").submit(params).await?;
+let current = bridge.caller("user-42").task(&task.id).await?;
+```
 
 ## MCP (`mcp-bridge`)
 

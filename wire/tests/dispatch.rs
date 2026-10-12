@@ -143,7 +143,7 @@ fn envelope(kind: &str, record: &Json) -> AgentEnvelope {
             agent: source.clone(),
             sdk: SdkInfo {
                 language: "rust".to_owned(),
-                version: "0.7.0".to_owned(),
+                version: "0.8.0".to_owned(),
             },
             parent: None,
             root: None,

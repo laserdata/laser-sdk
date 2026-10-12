@@ -7,7 +7,7 @@ This page reports what a local managed stack measured for the session index: how
 | Item | Value |
 | --- | --- |
 | Host | AMD Ryzen 9 7950X (16 cores, 32 threads), 61 GiB RAM, Kingston KC3000 2 TB NVMe under disk encryption, Linux 7.1.5 |
-| Streaming server | The LaserData Iggy fork, `0.9.3-ld`, release build, default configuration (filtered reads admit `max_concurrent = 16` pages per shard) |
+| Streaming server | The LaserData Iggy fork, `0.9.4-ld`, release build, default configuration (filtered reads admit `max_concurrent = 16` pages per shard) |
 | Plane | Plane `0.22.0`, release build, session store on the embedded engine or on the external SQL store |
 | External SQL store | Server version 16.14 in Docker on the same host, default settings, as `scripts/run-managed-bdd.sh --postgres` starts it |
 | Client | Rust Laser SDK `0.7.0`, release build of `bench/examples/session_sizing.rs` |

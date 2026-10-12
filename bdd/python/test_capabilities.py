@@ -9,6 +9,59 @@ scenarios(str(SCENARIOS / "capabilities.feature"))
 scenarios(str(SCENARIOS / "capabilities_injected.feature"))
 
 
+@when(parsers.parse("a prepared release receives managed result code {code:d}"))
+def prepared_release_error(world, code):
+    words = {
+        5: "conflict",
+        18: "target_unavailable",
+        10: "forbidden",
+        2: "not_found",
+        7: "version_skew",
+        19: "pending",
+        20: "plane_unavailable",
+    }
+    if code in words:
+        word = words[code].encode()
+        encoded_code = bytes([0x60 + len(word)]) + word
+    else:
+        encoded_code = b"\xa1\x6cunrecognized\x18" + bytes([code])
+    reply = b"\xa2\x64code" + encoded_code + b"\x67message\x67refused"
+
+    class CommandReply:
+        async def send(self, command, frame):
+            return reply
+
+        async def reset(self):
+            pass
+
+    client = ls.FencedLeaseClient(CommandReply())
+    operation = client.prepare_release(
+        {"v": 1, "namespace": "coord", "key": b"lease", "lease_token": 1, "holder_id": "worker"}
+    )
+    try:
+        world.run(lambda: client.release(operation))
+    except ls.CommandError as error:
+        assert not error.ambiguous_mutation
+        world.error = error
+    else:
+        raise AssertionError("the command must be refused")
+
+
+@then(parsers.parse("the command error keeps code {code:d} and retryability {retryable}"))
+def command_error_classifiers(world, code, retryable):
+    names = {
+        5: "Conflict",
+        18: "TargetUnavailable",
+        10: "Forbidden",
+        2: "NotFound",
+        7: "VersionSkew",
+        19: "Pending",
+        20: "PlaneUnavailable",
+    }
+    assert world.error.code == names.get(code, f"Unrecognized({code})")
+    assert world.error.retryable is (retryable == "true")
+
+
 @given("a managed-query connection that does not advertise read-your-writes")
 def inject_eventual_query(world):
     world.laser = world.run(

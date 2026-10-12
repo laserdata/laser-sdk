@@ -70,10 +70,19 @@ pub enum ResultCode {
     StaleGeneration,
     /// The resolved target is not ready to serve queries.
     TargetUnavailable,
+    /// The mutation was accepted into the log, but its outcome is not known
+    /// yet. Only a retry with the same operation identity may follow: it
+    /// returns the recorded outcome once the mutation has applied. A new
+    /// identity could apply the change a second time.
+    Pending,
+    /// The streaming server could not reach its own plane, or the plane did
+    /// not answer in time. The request may still apply, so a mutation repeats
+    /// only under the same operation identity, on this node or another one.
+    PlaneUnavailable,
     /// A code from a newer peer this build does not name. Decodes and re-encodes
     /// byte-for-byte so an old build relays it rather than failing. Only a value
-    /// outside the named range (19 and up) should ever appear here: `from_code`
-    /// never produces `Unrecognized` for `0..=18`, which map to the named
+    /// outside the named range (21 and up) should ever appear here: `from_code`
+    /// never produces `Unrecognized` for `0..=20`, which map to the named
     /// variants.
     Unrecognized(u16),
 }
@@ -101,6 +110,8 @@ impl ResultCode {
             ResultCode::ExpiredSnapshot => 16,
             ResultCode::StaleGeneration => 17,
             ResultCode::TargetUnavailable => 18,
+            ResultCode::Pending => 19,
+            ResultCode::PlaneUnavailable => 20,
             ResultCode::Unrecognized(code) => code,
         }
     }
@@ -128,6 +139,8 @@ impl ResultCode {
             16 => ResultCode::ExpiredSnapshot,
             17 => ResultCode::StaleGeneration,
             18 => ResultCode::TargetUnavailable,
+            19 => ResultCode::Pending,
+            20 => ResultCode::PlaneUnavailable,
             other => ResultCode::Unrecognized(other),
         }
     }
@@ -159,6 +172,10 @@ impl ResultCode {
             ResultCode::ExpiredSnapshot => 410,
             ResultCode::StaleGeneration => 409,
             ResultCode::TargetUnavailable => 503,
+            // The outcome is still being decided, so the same request comes
+            // back later. It is not generically retryable, see `is_retryable`.
+            ResultCode::Pending => 503,
+            ResultCode::PlaneUnavailable => 503,
             ResultCode::Unrecognized(_) => 500,
         }
     }
@@ -167,12 +184,33 @@ impl ResultCode {
     /// different outcome. True only for the two transient classes: the store was
     /// momentarily unreachable, or the read model had not caught up yet. Every
     /// other code needs the request, the credential, or the data to change first,
-    /// so retrying it unchanged only wastes the attempt.
+    /// so retrying it unchanged only wastes the attempt. [`Pending`](Self::Pending)
+    /// is not in this set: only the original operation identity may be
+    /// retried, see [`is_pending`](Self::is_pending).
     pub const fn is_retryable(self) -> bool {
         matches!(
             self,
-            ResultCode::Unavailable | ResultCode::Stale | ResultCode::TargetUnavailable
+            ResultCode::Unavailable
+                | ResultCode::Stale
+                | ResultCode::TargetUnavailable
+                | ResultCode::PlaneUnavailable
         )
+    }
+
+    /// Whether the mutation was accepted and its outcome is still unknown. The
+    /// caller repeats the exact request with the same operation identity.
+    pub const fn is_pending(self) -> bool {
+        matches!(self, ResultCode::Pending)
+    }
+
+    /// Whether the streaming server could not reach its own plane, or the
+    /// plane did not answer in time. The request may still apply. A client
+    /// repeats a mutation under the same operation identity, and may send it
+    /// to another node. Unlike [`Unavailable`](Self::Unavailable), which a
+    /// busy node or an unreachable destination answers, this one names the
+    /// node itself as the problem.
+    pub const fn is_plane_unavailable(self) -> bool {
+        matches!(self, ResultCode::PlaneUnavailable)
     }
 }
 
@@ -341,9 +379,18 @@ mod tests {
             ResultCode::Forbidden,
             ResultCode::StepUpRequired,
             ResultCode::Unavailable,
+            ResultCode::TargetUnavailable,
+            ResultCode::Pending,
+            ResultCode::PlaneUnavailable,
         ] {
             assert_eq!(ResultCode::from_code(code.code()), code);
         }
+        assert_eq!(ResultCode::Pending.code(), 19);
+        assert_eq!(ResultCode::PlaneUnavailable.code(), 20);
+        assert!(ResultCode::PlaneUnavailable.is_retryable());
+        assert!(ResultCode::PlaneUnavailable.is_plane_unavailable());
+        assert!(!ResultCode::Unavailable.is_plane_unavailable());
+        assert_eq!(ResultCode::from_code(21), ResultCode::Unrecognized(21));
         // An unknown numeric code rides through as Unrecognized.
         assert_eq!(ResultCode::from_code(900), ResultCode::Unrecognized(900));
         assert_eq!(ResultCode::Unrecognized(900).code(), 900);
@@ -415,6 +462,7 @@ mod tests {
             ResultCode::Backend,
             ResultCode::Forbidden,
             ResultCode::StepUpRequired,
+            ResultCode::Pending,
             ResultCode::Unrecognized(900),
         ] {
             assert!(

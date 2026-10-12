@@ -585,7 +585,7 @@ void test("given_operator_control_when_a_handler_reads_its_session_then_should_s
     await send(canceled)
     assert.deepEqual(await next(1), [
       canceled.toString(),
-      { pauseRequested: false, cancelRequested: true }
+      { pauseRequested: false, cancelRequested: true, controlConflict: false }
     ])
 
     // A request sent while the handler runs reaches it through the control
@@ -594,12 +594,12 @@ void test("given_operator_control_when_a_handler_reads_its_session_then_should_s
     await send(paused)
     assert.deepEqual(await next(2), [
       paused.toString(),
-      { pauseRequested: false, cancelRequested: false }
+      { pauseRequested: false, cancelRequested: false, controlConflict: false }
     ])
     await laser.sessions().control(stream, paused).asOperator(operator).pause()
     assert.deepEqual(await next(3), [
       paused.toString(),
-      { pauseRequested: true, cancelRequested: false }
+      { pauseRequested: true, cancelRequested: false, controlConflict: false }
     ])
   } finally {
     await laser.close()

@@ -162,6 +162,7 @@ env "${plane_env[@]}" \
   LD_PLANE_IGGY_TLS_DISABLED=true \
   LD_PLANE_IGGY_PAT_FILE=/nonexistent/plane.pat \
   LD_PLANE_INTERNAL_API_TOKEN=managed-bdd \
+  LD_PLANE_CLUSTER_KIND=standalone \
   LD_PLANE_DB_PATH="$state/plane/index.db" \
   LD_PLANE_SNAPSHOT_DIR="$state/plane/snapshots" \
   LD_PLANE_REGISTRY_PATH="$state/plane/projections.json" \

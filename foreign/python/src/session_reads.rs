@@ -240,8 +240,8 @@ impl PyLaser {
 pub enum PySessionChange {
     /// These sessions changed, each named once.
     Changed { sessions: Vec<String> },
-    /// The watch fell below the retained change floor. List the sessions
-    /// again to catch up.
+    /// The retained feed cannot identify every changed session. List the
+    /// sessions again to catch up.
     Resync(),
 }
 

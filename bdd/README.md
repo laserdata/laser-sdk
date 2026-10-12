@@ -18,6 +18,7 @@ bdd/
 │   ├── bridges.feature                A2A, MCP, and AG-UI keep the AGDX lifecycle, streaming, and state
 │   ├── capabilities.feature           negotiation + the Unsupported boundary
 │   ├── capabilities_injected.feature  the read-consistency pre-gate under injected caps
+│   ├── consistency.feature            managed reads carry the client's highest seen position
 │   ├── context_window.feature         the bounded context read window per partition
 │   ├── data_stack.feature              schemas, typed query, destinations, checkpoints, and Arrow
 │   ├── filters.feature                consumer-filter evaluation rules (shared evaluator)

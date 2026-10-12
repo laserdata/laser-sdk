@@ -28,7 +28,7 @@ void test("given_a_temporary_session_read_failure_when_bootstrapping_then_should
           message: "the read route is restarting"
         })
       )
-    return Promise.resolve({ rows: [], floor: 0n, resync: false })
+    return Promise.resolve({ rows: [], floor: 0n, resync: false, series: 0n })
   }
 
   const result = await sessions.bootstrap(1, TopicRetention.expireAfter(60_000))

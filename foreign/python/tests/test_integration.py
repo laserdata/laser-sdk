@@ -11,6 +11,20 @@ import pytest
 pytestmark = pytest.mark.integration
 
 
+async def test_given_an_absent_stream_when_a_producer_starts_then_should_require_creation_opt_in(
+    iggy_endpoint,
+):
+    stream = f"creation-{uuid.uuid4().hex[:12]}"
+    laser = await ls.Laser.connect(iggy_endpoint, stream=stream)
+    try:
+        with pytest.raises(ls.TransportError, match="was not found"):
+            await laser.topic("events").producer().init()
+        response = await laser.topic("events").producer(create_stream=True).send(b"created")
+        assert len(response.confirmations) == 1
+    finally:
+        await laser.close()
+
+
 def test_given_signing_keys_when_enrolled_then_should_expose_their_identity():
     key = ls.SigningKey(bytes(range(32)))
     operator_key = ls.SigningKey(bytes(reversed(range(32))))

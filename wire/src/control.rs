@@ -595,6 +595,16 @@ pub struct ProjectionBinding {
     /// [`retention`](ProjectionBindingBuilder::retention).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionPolicy>,
+    /// Let the plane skip a record the destination or the extraction
+    /// deterministically rejects, instead of holding the partition until the
+    /// binding enables skipping. Operator skips also require this opt-in. The
+    /// plane skips only after it proved the rejection: the destination
+    /// accepted other records of the same batch and refused this
+    /// one twice. Every skip is an ordered control record, so every replica
+    /// skips the same record, and the record goes to the dead-letter topic.
+    /// Default off and skipped on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_rejected: bool,
 }
 
 impl ProjectionBinding {
@@ -614,6 +624,7 @@ pub struct ProjectionBindingBuilder {
     index: Option<String>,
     notify: bool,
     retention: Option<RetentionPolicy>,
+    skip_rejected: bool,
 }
 
 impl ProjectionBindingBuilder {
@@ -682,6 +693,15 @@ impl ProjectionBindingBuilder {
         self
     }
 
+    /// Let the plane skip a record it proved the destination or the
+    /// extraction rejects, instead of holding the partition. The skipped record
+    /// goes to the dead-letter topic. See [`ProjectionBinding::skip_rejected`].
+    #[must_use]
+    pub fn skip_rejected(mut self) -> Self {
+        self.skip_rejected = true;
+        self
+    }
+
     /// Build the binding. Panics if `.source(..)` / `.selector(..)` was not set
     /// (programmer error, not user input). Prefer [`try_build`](Self::try_build)
     /// for code paths that handle config-load failures gracefully.
@@ -705,6 +725,7 @@ impl ProjectionBindingBuilder {
             index,
             notify: self.notify,
             retention: self.retention,
+            skip_rejected: self.skip_rejected,
         })
     }
 }
@@ -832,6 +853,79 @@ pub enum ControlCommand {
     /// One consumer-filter catalog mutation, stamped by the streaming server.
     /// Its outcome (applied or rejected) is recorded under the operation id.
     FilterCatalog(crate::filter::FilterCatalogCommand),
+    /// An operator accepts that one source partition lost history to
+    /// retention. A projection that resumes past the gap continues, and keeps
+    /// the gap as a record that its history is incomplete. Only the managed
+    /// backend's operator path appends it. The streaming server never forwards
+    /// it from a client.
+    AcceptGap(GapAcceptance),
+    /// The plane skips one record that a binding's destination or extraction
+    /// deterministically rejected. Ordered on the control topic, so every
+    /// replica skips the same record. Appended by the plane itself, for a
+    /// binding that opted in or after an operator asked. The streaming server
+    /// never forwards it from a client.
+    SkipRecord(RecordSkip),
+}
+
+/// One record a binding skips, on one topic incarnation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordSkip {
+    pub source: SourceSelector,
+    pub partition_id: u32,
+    /// Creation time of the source topic incarnation. A recreated topic never
+    /// inherits a skip.
+    pub topic_created_at_micros: u64,
+    pub offset: u64,
+    /// The operational index or graph the record failed to reach. The
+    /// record's other effects still apply.
+    pub target: String,
+    /// What the destination or the extraction said about the record.
+    pub reason: String,
+}
+
+impl RecordSkip {
+    /// Whether this skip covers `offset` of `partition_id` for `target` on
+    /// the topic incarnation `generation`.
+    pub fn covers(
+        &self,
+        stream: &str,
+        topic: &str,
+        partition_id: u32,
+        generation: u64,
+        offset: u64,
+        target: &str,
+    ) -> bool {
+        self.source.stream == stream
+            && self.source.topic == topic
+            && self.partition_id == partition_id
+            && self.topic_created_at_micros == generation
+            && self.offset == offset
+            && self.target == target
+    }
+}
+
+/// The exact missing range an operator accepted for one source partition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GapAcceptance {
+    pub source: SourceSelector,
+    pub partition_id: u32,
+    /// Creation time of the source topic incarnation the gap belongs to. A
+    /// recreated topic needs its own acceptance.
+    pub topic_created_at_micros: u64,
+    /// First missing offset, the resume point the projection expected.
+    pub from_offset: u64,
+    /// First offset the log could still serve when the gap was accepted.
+    pub to_offset: u64,
+}
+
+impl GapAcceptance {
+    /// Whether this acceptance covers a resume at `cursor` whose first readable
+    /// record is `first_available`, on the topic incarnation `generation`.
+    pub fn covers(&self, generation: u64, cursor: u64, first_available: u64) -> bool {
+        self.topic_created_at_micros == generation
+            && self.from_offset <= cursor
+            && self.to_offset >= first_available
+    }
 }
 
 /// The topics a session-source registration covers.
@@ -854,11 +948,83 @@ pub struct ControlEnvelope {
     /// unset, which addresses the deployment-wide registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<String>,
+    /// Identity the managed backend binds to the record before it appends it
+    /// to the control log. A client never sets it. The backend seals the whole
+    /// encoded envelope, stamp included, so a record cannot be moved to
+    /// another deployment, actor, operation or stream generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<ControlStamp>,
+}
+
+/// Who appended a control record and for which resource generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlStamp {
+    /// The deployment whose backend appended the record. Zero for a
+    /// standalone backend without a deployment identity.
+    pub deployment_id: u64,
+    /// The authenticated user the request came from. Zero for a command the
+    /// streaming server issues itself.
+    pub actor_user_id: u32,
+    /// Stable identity of the logical control operation. A retry keeps it, so
+    /// a second append of the same operation applies once.
+    pub operation_id: u128,
+    /// The authenticated stream generation, present when the request was
+    /// scoped to a stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_generation: Option<ControlStreamGeneration>,
+    /// Identifies the sealing key without revealing it.
+    pub key_id: u64,
+}
+
+/// One incarnation of a stream: a deleted and recreated stream has a new
+/// creation time even when it reuses its name and id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ControlStreamGeneration {
+    pub stream_id: u32,
+    pub created_at_micros: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_binding_that_skips_rejected_records_when_encoded_then_should_carry_the_opt_in_only_when_set()
+     {
+        let plain = ProjectionBinding::builder().source("s", "t").build();
+        assert!(!plain.skip_rejected);
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert!(plain_json.get("skip_rejected").is_none());
+        let opted = ProjectionBinding::builder()
+            .source("s", "t")
+            .skip_rejected()
+            .build();
+        let json = serde_json::to_value(&opted).unwrap();
+        assert_eq!(json["skip_rejected"], true);
+        let decoded: ProjectionBinding = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, opted);
+    }
+
+    #[test]
+    fn given_a_record_skip_when_matched_then_should_cover_only_its_exact_record() {
+        let skip = RecordSkip {
+            source: SourceSelector::new("s", "t"),
+            partition_id: 2,
+            topic_created_at_micros: 7,
+            offset: 40,
+            target: "rows".to_owned(),
+            reason: "rejected".to_owned(),
+        };
+        assert!(skip.covers("s", "t", 2, 7, 40, "rows"));
+        assert!(
+            !skip.covers("s", "t", 2, 8, 40, "rows"),
+            "another incarnation"
+        );
+        assert!(!skip.covers("s", "t", 2, 7, 41, "rows"));
+        assert!(!skip.covers("s", "t", 3, 7, 40, "rows"));
+        assert!(!skip.covers("s", "t", 2, 7, 40, "other"));
+        assert!(!skip.covers("s", "u", 2, 7, 40, "rows"));
+    }
 
     #[test]
     fn given_an_unknown_schema_source_kind_when_decoded_then_should_degrade_not_fail() {
@@ -1001,6 +1167,7 @@ mod wire_tests {
             timestamp_micros: 42,
             command: ControlCommand::ApplyBinding(binding),
             stream: None,
+            stamp: None,
         };
         let bytes = encode_named(&envelope).expect("envelope serializes");
         let back: ControlEnvelope = decode_named(&bytes).expect("envelope deserializes");
@@ -1029,6 +1196,7 @@ mod wire_tests {
                 version: None,
             }),
             stream: None,
+            stamp: None,
         };
         let bytes = encode_named(&envelope).expect("envelope serializes");
         let back: ControlEnvelope = decode_named(&bytes).expect("envelope deserializes");
@@ -1047,6 +1215,7 @@ mod wire_tests {
             timestamp_micros: 7,
             command: ControlCommand::DropSchema(11),
             stream: Some("acme".to_owned()),
+            stamp: None,
         };
         let back: ControlEnvelope =
             decode_named(&encode_named(&envelope).expect("envelope serializes"))
@@ -1061,6 +1230,40 @@ mod wire_tests {
         assert!(
             !json.contains("stream"),
             "an unset stream is omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn given_a_stamped_envelope_when_round_tripped_then_should_keep_the_identity_and_omit_an_unset_stamp()
+     {
+        let envelope = ControlEnvelope {
+            v: CONTROL_OP_VERSION,
+            timestamp_micros: 7,
+            command: ControlCommand::DropSchema(11),
+            stream: Some("acme".to_owned()),
+            stamp: Some(ControlStamp {
+                deployment_id: 42,
+                actor_user_id: 3,
+                operation_id: u128::MAX - 1,
+                stream_generation: Some(ControlStreamGeneration {
+                    stream_id: 9,
+                    created_at_micros: 1_700_000_000_000_000,
+                }),
+                key_id: u64::MAX,
+            }),
+        };
+        let back: ControlEnvelope =
+            decode_named(&encode_named(&envelope).expect("envelope serializes"))
+                .expect("envelope deserializes");
+        assert_eq!(back.stamp, envelope.stamp);
+        let unstamped = ControlEnvelope {
+            stamp: None,
+            ..envelope
+        };
+        let json = serde_json::to_string(&unstamped).expect("envelope serializes");
+        assert!(
+            !json.contains("\"stamp\""),
+            "an unset stamp is omitted: {json}"
         );
     }
 

@@ -118,6 +118,14 @@ function sameAddress(left: MessageId, right: MessageId): boolean {
   return left.partitionId === right.partitionId && left.offset === right.offset
 }
 
+/** What a bounded reply lookup established, as Rust `ReplyLookup`.
+ * `incomplete` means the scan bound ended before the reply topic did, which is
+ * not proof that the task is still working. */
+export type ReplyLookup =
+  | { readonly kind: "found"; readonly envelope: AgentEnvelope }
+  | { readonly kind: "notFound" }
+  | { readonly kind: "incomplete" }
+
 /** The first AGDX response or error carrying `correlation` on a reply topic,
  * read forward from the start of each partition. With a verifier only a reply
  * that verifies counts, so a forged answer cannot settle the lookup. */
@@ -127,9 +135,9 @@ export async function findAgdxReply(
   topic: string,
   correlation: CorrelationId,
   verifier?: KeyRegistry
-): Promise<AgentEnvelope | undefined> {
+): Promise<ReplyLookup> {
   const partitions = await transport.findTopicPartitionCount(stream, topic)
-  if (partitions === undefined) return undefined
+  if (partitions === undefined) return { kind: "notFound" }
   // Each pass drains every partition up to 10,000 records, like Rust's
   // reply reader.
   const cursor = Cursor.create(
@@ -140,19 +148,22 @@ export async function findAgdxReply(
   ).batch(LOOKUP_BATCH)
   for (let pass = 0; pass < MAX_LOOKUP_PASSES; pass += 1) {
     const messages = await cursor.pollRecords()
-    if (messages.length === 0) return undefined
+    if (messages.length === 0) return { kind: "notFound" }
     for (const message of messages) {
       const envelope = matchingReply(decodeAgentMessage(message), correlation, verifier)
-      if (envelope !== undefined) return envelope
+      if (envelope !== undefined) return { kind: "found", envelope }
     }
   }
-  return undefined
+  return { kind: "incomplete" }
 }
 
 export class ReplyHub {
   private readonly waiters = new Map<string, ReplyWaiter>()
   private readonly streamWaiters = new Map<string, StreamWaiter>()
   private stopped = false
+  // Resolves the parked dispatcher. Set only while nobody waits, so an idle
+  // hub does not poll the reply topic.
+  private wake: (() => void) | undefined
 
   private constructor(
     private readonly transport: LaserTransport,
@@ -213,6 +224,7 @@ export class ReplyHub {
       armed: !deferUntilArmed
     }
     this.waiters.set(correlation, waiter)
+    this.wake?.()
     return {
       wait: (timeoutMs: number, signal?: AbortSignal) =>
         raceWithTimeout(reply, timeoutMs, () => this.waiters.delete(correlation), signal),
@@ -240,6 +252,7 @@ export class ReplyHub {
       ...(expectedSigner !== undefined ? { expectedSigner } : {})
     }
     this.streamWaiters.set(correlation, waiter)
+    this.wake?.()
     return {
       next: (timeoutMs: number, signal?: AbortSignal) => {
         const queued = waiter.queued.shift()
@@ -266,6 +279,7 @@ export class ReplyHub {
 
   stop(): void {
     this.stopped = true
+    this.wake?.()
   }
 
   private async seedTailOffsets(): Promise<bigint[]> {
@@ -291,6 +305,17 @@ export class ReplyHub {
   private async runDispatchLoop(initialOffsets: readonly bigint[]): Promise<void> {
     let offsets = [...initialOffsets]
     while (!this.stopped) {
+      // Nobody waits: park until a subscribe or stop. The check and the
+      // parking run without an await between them, so no wake is missed.
+      if (this.waiters.size === 0 && this.streamWaiters.size === 0) {
+        await new Promise<void>((resolve) => {
+          this.wake = () => {
+            this.wake = undefined
+            resolve()
+          }
+        })
+        continue
+      }
       let partitionCount: number | undefined
       try {
         partitionCount = await this.transport.findTopicPartitionCount(this.stream, this.topic)

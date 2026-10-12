@@ -69,6 +69,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `LaserError::Codec` | `CodecError` | `CodecError` | error-class |
 | `LaserError::Invalid` | `InvalidError` | `InvalidError` | error-class |
 | `LaserError::Protocol` | `ProtocolError` | `ProtocolError` | error-class |
+| `LaserError::Command` | `CommandError` | `CommandExecutionError` | error-class |
 | `LaserError::Unsupported` | `UnsupportedError` | `UnsupportedError` | error-class |
 | `LaserError.Unsupported.surface` | `UnsupportedError.surface` | `UnsupportedError.surface` | error-class |
 | `LaserError.Unsupported.feature` | `UnsupportedError.feature` | `UnsupportedError.feature` | error-class |
@@ -135,6 +136,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `a2a::A2A_JSONRPC_BINDING` | `const:A2A_JSONRPC_BINDING` | `const:A2A_JSONRPC_BINDING` |  |
 | `a2a::A2A_PROTOCOL_VERSION` | `const:A2A_PROTOCOL_VERSION` | `const:A2A_PROTOCOL_VERSION` |  |
 | `A2aBridge` | `A2aBridge` | `A2aBridge` |  |
+| `A2aBridge::caller` | `A2aBridge.submit(caller=)` | `A2aBridge.caller` | keywords |
 | `A2aBridge::cancel` | `A2aBridge.cancel` | `A2aBridge.cancel` |  |
 | `A2aBridge::card` | `A2aBridge.card` | `A2aBridge.card` |  |
 | `A2aBridge::handle_rpc` | `A2aBridge.handle_rpc` | `A2aBridge.handleRpc` |  |
@@ -149,6 +151,16 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `A2aBridge::with_bridge_hops` | `A2aBridge.with_bridge_hops` | `A2aBridge.withBridgeHops` |  |
 | `A2aBridge::with_capabilities` | `new A2aBridge(capabilities=)` | `A2aBridge.withCapabilities` | keywords |
 | `A2aBridge::with_signing_key` | `new A2aBridge(signing_key=)` | `A2aBridge.withSigningKey` | keywords |
+| `A2aBridge::with_task_binding` | `new A2aBridge(task_binding_key=, task_binding_ttl_ms=)` | `A2aBridge.withTaskBinding` | keywords |
+| `A2aCaller` | `A2aBridge.submit(caller=)` | `A2aCaller` | keywords |
+| `A2aCaller::cancel` | `A2aBridge.cancel(caller=)` | `A2aCaller.cancel` | keywords |
+| `A2aCaller::handle_rpc` | `A2aBridge.handle_rpc(caller=)` | `A2aCaller.handleRpc` | keywords |
+| `A2aCaller::submit` | `A2aBridge.submit(caller=)` | `A2aCaller.submit` | keywords |
+| `A2aCaller::submit_in` | `A2aBridge.submit_in(caller=)` | `A2aCaller.submitIn` | keywords |
+| `A2aCaller::submit_in_to` | `A2aBridge.submit_in(target=, caller=)` | `A2aCaller.submitIn(target=)` | keywords, overload |
+| `A2aCaller::submit_to` | `A2aBridge.submit(target=, caller=)` | `A2aCaller.submit(target=)` | keywords, overload |
+| `A2aCaller::task` | `A2aBridge.task(caller=)` | `A2aCaller.task` | keywords |
+| `A2aCallerPrincipal` | omitted | omitted | plain-value, rust-crate |
 | `A2aMethod` | omitted | `A2aMethod` | plain-value |
 | `A2aMethod::MessageSend` | omitted | `A2aMethod.MessageSend` | plain-value |
 | `A2aMethod::MessageStream` | omitted | `A2aMethod.MessageStream` | plain-value |
@@ -411,6 +423,11 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AgentScope::id` | `AgentScope.id` | `AgentScope.id` | property |
 | `AgentScope::publish_card` | `AgentScope.publish_card` | `AgentScope.publishCard` |  |
 | `AgentScope::send` | `AgentScope.send` | `AgentScope.send` |  |
+| `AppliedFrontier` | `AppliedFrontier` | `AppliedFrontier` |  |
+| `AppliedFrontier.kv` | `AppliedFrontier.kv` | `AppliedFrontier.kv` | keywords |
+| `AppliedFrontier.fork` | `AppliedFrontier.fork` | `AppliedFrontier.fork` | keywords |
+| `AppliedFrontier.graph` | `AppliedFrontier.graph` | `AppliedFrontier.graph` | keywords |
+| `AppliedFrontier.sessions` | `AppliedFrontier.sessions` | `AppliedFrontier.sessions` | keywords |
 | `AssembledContext` | `AssembledContext` | `AssembledContext` |  |
 | `AssembledContext.fragments` | `AssembledContext.fragments` | `AssembledContext.fragments` |  |
 | `AssembledContext.manifest` | `AssembledContext.manifest` | `AssembledContext.manifest` |  |
@@ -619,6 +636,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Laser::scatter` | `Laser.scatter` | `Laser.scatter` | keywords |
 | `Laser::scatter_report` | `Laser.scatter_report` | `Laser.scatterReport` | keywords |
 | `Laser::schemas` | `Laser.schemas` | `Laser.schemas` |  |
+| `Laser::seen_positions` | `Laser.seen_positions` | `Laser.seenPositions` |  |
 | `Laser::send_agent` | `Laser.send_agent` | `Laser.sendAgent` |  |
 | `Laser::sessions` | `Laser.sessions` | `Laser.sessions` |  |
 | `Laser::sessions_with` | `Laser.sessions(stream=)` | `Laser.sessions(config=)` | overload |
@@ -690,6 +708,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `PendingControl` | `PendingControl` | `PendingControl` |  |
 | `PendingControl.pause_requested` | `PendingControl.pause_requested` | `PendingControl.pauseRequested` | keywords |
 | `PendingControl.cancel_requested` | `PendingControl.cancel_requested` | `PendingControl.cancelRequested` | keywords |
+| `PendingControl.control_conflict` | `PendingControl.control_conflict` | `PendingControl.controlConflict` | keywords |
 | `RegisteredCard` | `RegisteredCard` | `RegisteredCard` |  |
 | `RegisteredCard.agent` | `RegisteredCard.agent` | `RegisteredCard.agent` | keywords |
 | `RegisteredCard.card` | `RegisteredCard.card` | `RegisteredCard.card` | keywords |
@@ -933,6 +952,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SessionFlags.overflow` | dict key | `wire.SessionFlags.overflow` | serde-dict, keywords |
 | `SessionFlags.events_truncated` | dict key | `wire.SessionFlags.eventsTruncated` | serde-dict, keywords |
 | `SessionFlags.lane_conflict` | dict key | `wire.SessionFlags.laneConflict` | serde-dict, keywords |
+| `SessionFlags.control_conflict` | dict key | `wire.SessionFlags.controlConflict` | serde-dict, keywords |
 | `SessionFlags.rebuilding` | dict key | `wire.SessionFlags.rebuilding` | serde-dict, keywords |
 | `SessionFlags.liveness_unknown` | dict key | `wire.SessionFlags.livenessUnknown` | serde-dict, keywords |
 | `SessionInfo` | dict via `Sessions.get` | `SessionInfo` | serde-dict |
@@ -1011,6 +1031,13 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SessionPolicy::PerCall` | omitted | `SessionPolicy` | plain-value |
 | `SessionPolicy::PerUser` | omitted | `SessionPolicy` | plain-value |
 | `SessionPolicy::conversation_for` | `fn:session_policy_conversation_for` | `fn:conversationFor` | free-function |
+| `SessionPosition` | `SessionPosition` | `SessionPosition` |  |
+| `SessionPosition.stream_id` | `SessionPosition.stream_id` | `SessionPosition.streamId` | keywords |
+| `SessionPosition.stream_generation` | `SessionPosition.stream_generation` | `SessionPosition.streamGeneration` | keywords |
+| `SessionPosition.topic` | `SessionPosition.topic` | `SessionPosition.topic` | keywords |
+| `SessionPosition.topic_generation` | `SessionPosition.topic_generation` | `SessionPosition.topicGeneration` | keywords |
+| `SessionPosition.partition_id` | `SessionPosition.partition_id` | `SessionPosition.partitionId` | keywords |
+| `SessionPosition.offset` | `SessionPosition.offset` | `SessionPosition.offset` | keywords |
 | `SessionState` | `SessionState` | `SessionState` |  |
 | `SessionState::get` | `SessionState.get` | `SessionState.get` |  |
 | `SessionState::patch` | `SessionState.patch` | `SessionState.patch` |  |
@@ -1045,6 +1072,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Sessions::state` | `Sessions.state` | `Sessions.state` |  |
 | `Sessions::stream` | `Sessions.stream` | `Sessions.stream` | property |
 | `Sessions::submit` | `Sessions.submit` | `Sessions.submit` |  |
+| `Sessions::unregister` | `Sessions.unregister` | `Sessions.unregister` |  |
 | `Sessions::watch` | `Sessions.watch` | `Sessions.watch` |  |
 | `SlidingWindow` | `Laser.spawn_agent(dedup_window=)` | `SlidingWindow` | keywords |
 | `SlidingWindow::new` | `Laser.spawn_agent` | `new SlidingWindow()` | keywords, constructor |
@@ -3612,6 +3640,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ProjectionBinding.index` | dict key | `ProjectionBinding.index` | serde-dict, keywords |
 | `ProjectionBinding.notify` | dict key | `ProjectionBinding.notify` | serde-dict, keywords |
 | `ProjectionBinding.retention` | dict key | `ProjectionBinding.retention` | serde-dict, keywords |
+| `ProjectionBinding.skip_rejected` | dict key | `ProjectionBinding.skipRejected` | serde-dict, keywords |
 | `ProjectionBinding::builder` | `new ProjectionBindingBuilder()` | `new ProjectionBindingBuilder()` | constructor |
 | `ProjectionBindingBuilder` | `ProjectionBindingBuilder` | `ProjectionBindingBuilder` |  |
 | `ProjectionBindingBuilder::allow` | `ProjectionBindingBuilder.allow` | `ProjectionBindingBuilder.allow` |  |
@@ -3622,6 +3651,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ProjectionBindingBuilder::notify` | `ProjectionBindingBuilder.notify` | `ProjectionBindingBuilder.notify` |  |
 | `ProjectionBindingBuilder::retention` | `ProjectionBindingBuilder.retention` | `ProjectionBindingBuilder.retention` |  |
 | `ProjectionBindingBuilder::selector` | `ProjectionBindingBuilder.selector` | `ProjectionBindingBuilder.selector` |  |
+| `ProjectionBindingBuilder::skip_rejected` | `ProjectionBindingBuilder.skip_rejected` | `ProjectionBindingBuilder.skipRejected` |  |
 | `ProjectionBindingBuilder::source` | `ProjectionBindingBuilder.source` | `ProjectionBindingBuilder.source` |  |
 | `ProjectionBindingBuilder::try_build` | `ProjectionBindingBuilder.try_build` | `ProjectionBindingBuilder.tryBuild` |  |
 | `ProjectionBuilder` | `ProjectionBuilder` | `ProjectionBuilder` |  |
@@ -3718,6 +3748,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `QueryContext.scanned_bytes` | dict key | `QueryContext.scannedBytes` | serde-dict, keywords |
 | `QueryContext.produced_bytes` | dict key | `QueryContext.producedBytes` | serde-dict, keywords |
 | `QueryContext.row_count` | dict key | `QueryContext.rowCount` | serde-dict, keywords |
+| `QueryContext.frontier` | dict key | `QueryContext.frontier` | serde-dict, keywords |
 | `QueryEngine` | dict via `QueryResult.context` | `wire.QueryEngine` | serde-dict |
 | `QueryEngine.name` | dict key | `wire.QueryEngine.name` | serde-dict, keywords |
 | `QueryEngine.version` | dict key | `wire.QueryEngine.version` | serde-dict, keywords |
@@ -3777,6 +3808,12 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `QueryExecutionStatus.produced_bytes` | dict key | `QueryExecutionStatus.producedBytes` | serde-dict, keywords |
 | `QueryExecutionStatus.row_count` | dict key | `QueryExecutionStatus.rowCount` | serde-dict, keywords |
 | `QueryExecutionStatus.error` | dict key | `QueryExecutionStatus.error` | serde-dict, keywords |
+| `QueryFrontier` | dict via `QueryResult.context` | `QueryFrontier` | serde-dict |
+| `QueryFrontier.stream` | dict key | `QueryFrontier.stream` | serde-dict, keywords |
+| `QueryFrontier.topic` | dict key | `QueryFrontier.topic` | serde-dict, keywords |
+| `QueryFrontier.partition_id` | dict key | `QueryFrontier.partitionId` | serde-dict, keywords |
+| `QueryFrontier.topic_created_at_micros` | dict key | `QueryFrontier.topicCreatedAtMicros` | serde-dict, keywords |
+| `QueryFrontier.applied_offset` | dict key | `QueryFrontier.appliedOffset` | serde-dict, keywords |
 | `QueryPageRequest` | dict via `Laser.execute_query` | `QueryPageRequest` | serde-dict |
 | `QueryPageRequest.limit` | dict key | `QueryPageRequest.limit` | serde-dict, keywords |
 | `QueryPageRequest.offset` | dict key | `QueryPageRequest.offset` | serde-dict, keywords |
@@ -3888,10 +3925,14 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ResultCode::ExpiredSnapshot` | omitted | `ResultCode` | plain-value |
 | `ResultCode::StaleGeneration` | omitted | `ResultCode` | plain-value |
 | `ResultCode::TargetUnavailable` | omitted | `ResultCode` | plain-value |
+| `ResultCode::Pending` | omitted | `ResultCode` | plain-value |
+| `ResultCode::PlaneUnavailable` | omitted | `ResultCode` | plain-value |
 | `ResultCode::Unrecognized` | omitted | `ResultCode` | plain-value |
 | `ResultCode::code` | `fn:result_code_code` | `fn:code` | free-function |
 | `ResultCode::from_code` | `fn:result_code_from_code` | `fn:resultCodeFromCode` | free-function |
 | `ResultCode::http_status` | `fn:result_code_http_status` | `fn:resultCodeHttpStatus` | free-function |
+| `ResultCode::is_pending` | `fn:result_code_is_pending` | `fn:resultCodeIsPending` | free-function |
+| `ResultCode::is_plane_unavailable` | `fn:result_code_is_plane_unavailable` | `fn:resultCodeIsPlaneUnavailable` | free-function |
 | `ResultCode::is_retryable` | `fn:result_code_is_retryable` | `fn:isRetryable` | free-function |
 | `RetentionPolicy` | dict via `Bindings.apply` | `RetentionPolicy` | serde-dict |
 | `RetentionPolicy::MirrorLog` | dict key | `RetentionPolicy` | serde-dict, plain-value |
@@ -4017,10 +4058,12 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AuthzEvent.actor` | `AuthzEvent.actor` | `AuthzEvent.actor` | keywords |
 | `AuthzEvent.at_micros` | `AuthzEvent.at_micros` | `AuthzEvent.atMicros` | keywords |
 | `AuthzEvent.op` | `AuthzEvent.op` | `AuthzEvent.op` | keywords |
+| `AuthzEvent.stream` | `AuthzEvent.stream` | `AuthzEvent.stream` | keywords |
 | `AuthzEventKind` | dict via `AuthzEvent.op` | `AuthzEventKind` | serde-dict |
 | `AuthzEventKind::RoleDefined` | dict key | `AuthzEventKind` | serde-dict, plain-value |
 | `AuthzEventKind::RoleDeleted` | dict key | `AuthzEventKind` | serde-dict, plain-value |
 | `AuthzEventKind::RolesBound` | dict key | `AuthzEventKind` | serde-dict, plain-value |
+| `AuthzEventKind::TenancySet` | dict key | `AuthzEventKind` | serde-dict, plain-value |
 | `AuthzHistoryReply` | `AuthzHistoryReply` | `AuthzHistoryReply` |  |
 | `AuthzHistoryReply.v` | `AuthzHistoryReply.v` | `AuthzHistoryReply.v` | keywords |
 | `AuthzHistoryReply.events` | `AuthzHistoryReply.events` | `AuthzHistoryReply.events` | keywords |
@@ -4029,6 +4072,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `AuthzSubject::Role` | dict key | `AuthzSubject` | serde-dict, plain-value |
 | `AuthzSubject::Binding` | dict key | `AuthzSubject` | serde-dict, plain-value |
 | `AuthzSubject::All` | dict key | `AuthzSubject` | serde-dict, plain-value |
+| `AuthzSubject::Stream` | dict key | `AuthzSubject` | serde-dict, plain-value |
 | `Effect` | omitted | `Effect` | plain-value |
 | `Effect::Allow` | omitted | `Effect` | plain-value |
 | `Effect::Deny` | omitted | `Effect` | plain-value |

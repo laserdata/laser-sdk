@@ -28,6 +28,7 @@ import {
   type ControlState,
   type PendingControl,
   controlRequest,
+  controlPartition,
   foldControl
 } from "./agent/control.js"
 import {
@@ -509,6 +510,19 @@ export class Sessions {
       return { registered: false }
     }
     return { registered: await this.registrationVisible() }
+  }
+
+  /** Stop the deployment from indexing this stream's sessions, through the
+   * authenticated managed control path, as Rust `Sessions::unregister`. A later
+   * `bootstrap` registers the stream again. */
+  async unregister(): Promise<void> {
+    if (!(await this.laser.capabilities()).sessions) {
+      throw new UnsupportedError("this deployment does not index sessions", { surface: "sessions" })
+    }
+    await this.laser[INTERNAL_PUBLISH_CONTROL]({
+      kind: "removeSessionSource",
+      stream: this.stream()
+    })
   }
 
   // Wait until the deployment serves reads for the registered stream, up to
@@ -1327,6 +1341,11 @@ export class Session {
         left.id.partitionId - right.id.partitionId ||
         compareBigint(left.id.offset, right.id.offset)
     )
+    const stream = this.laser.defaultStream
+    const partitions =
+      stream === undefined
+        ? undefined
+        : await this.laser[INTERNAL_TRANSPORT]().findTopicPartitionCount(stream, AGENT_CONTROL)
     const [state, last] = foldControl(
       records.flatMap((record) => {
         const request =
@@ -1334,7 +1353,8 @@ export class Session {
         return request === undefined
           ? []
           : [[[record.id.partitionId, record.id.offset] as const, request] as const]
-      })
+      }),
+      partitions === undefined ? undefined : controlPartition(conversation, partitions)
     )
     return this.parts.control?.install(conversation, state, last) ?? state
   }

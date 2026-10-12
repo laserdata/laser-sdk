@@ -113,7 +113,7 @@ void test("given_a_scoped_memory_with_lineage_when_remembering_then_should_stamp
   } as unknown as MemoryHandle
   const conversation = ConversationId.new()
   const origin = { kind: "memory" as const, id: "m-1" }
-  const producer = { name: "sdk:planner", version: "0.7.0" }
+  const producer = { name: "sdk:planner", version: "0.8.0" }
   const plain = ScopedMemory.create(handle, conversation)
   assert.equal(plain.origin(), undefined)
   const linked = plain.withLineage(origin, producer)

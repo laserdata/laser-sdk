@@ -325,6 +325,30 @@ pub const PRESENCE_OP_VERSION: u32 = 1;
 /// log record must select its decoder before any body byte is read.
 pub const AGENT_OP_VERSION: u32 = 1;
 
+/// Whether a managed read may carry a [`crate::mutation::ManagedReadEnvelope`]
+/// barrier: the reads of the key-value, fork and graph surfaces, whose state
+/// the mutation logs fold, and the session reads, whose state the session
+/// fold builds from the session source topics.
+pub const fn is_barrier_read(code: u32) -> bool {
+    matches!(
+        code,
+        AGDX_KV_GET_CODE
+            | AGDX_KV_SCAN_CODE
+            | AGDX_KV_NAMESPACES_CODE
+            | AGDX_KV_EXISTS_CODE
+            | AGDX_FORK_LIST_CODE
+            | AGDX_GRAPH_QUERY_CODE
+            | AGDX_GRAPH_NEIGHBORS_CODE
+            | AGDX_SESSION_GET_CODE
+            | AGDX_SESSION_LIST_CODE
+            | AGDX_SESSION_EVENTS_CODE
+            | AGDX_SESSION_STATE_CODE
+            | AGDX_SESSION_LINKS_CODE
+            | AGDX_SESSION_SOURCES_CODE
+            | AGDX_SESSION_CHANGES_CODE
+    )
+}
+
 /// Whether a Plane-served managed command changes state and therefore must
 /// carry a stable operation identity across transport retries. Iggy's custom
 /// authorization mutations use their established request `mutation_id`
@@ -351,5 +375,6 @@ pub const fn is_idempotent_managed_request(code: u32) -> bool {
             | AGDX_FORK_PUT_CODE
             | AGDX_GRAPH_UPSERT_CODE
             | AGDX_CHECKPOINT_CODE
+            | AGDX_CONTROL_PUBLISH_CODE
     )
 }

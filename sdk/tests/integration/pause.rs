@@ -777,3 +777,46 @@ async fn write_parking(laser: &Laser, session: ConversationId, parking: &Session
         .await
         .expect("the parking is written");
 }
+
+#[tokio::test]
+#[serial_test::serial(integration)]
+async fn given_a_control_topic_created_after_start_when_paused_then_should_hold_work_until_resumed()
+{
+    let laser = harness::laser().await;
+    let seen = Seen::default();
+    // The worker starts before agent.control exists.
+    let worker = spawn(&laser, &seen, None, ConcurrencyPolicy::Serial).await;
+    laser
+        .topic(AgentTopic::Control.topic_string())
+        .ensure(4)
+        .await
+        .expect("provisioning creates the control topic late");
+    let session = ConversationId::new();
+    send_work(&laser, session, "before").await;
+    wait_seen(&seen, "before", 1).await;
+    // The follower finds the topic with a short backoff, so repeat the pause
+    // until the late pause runtime acknowledges one.
+    harness::eventually(|| {
+        let laser = laser.clone();
+        async move {
+            let request = position(control(&laser, session).pause().await.ok()?);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            acknowledgments(&laser, session)
+                .await
+                .contains(&(TaskState::Paused, request))
+                .then_some(())
+        }
+    })
+    .await;
+
+    send_work(&laser, session, "held").await;
+    wait_parked(&laser, session, 1).await;
+    assert_eq!(seen.count("held"), 0, "work for a paused session is held");
+
+    control(&laser, session)
+        .resume()
+        .await
+        .expect("resume is sent");
+    wait_seen(&seen, "held", 1).await;
+    worker.shutdown().await.expect("the worker stops");
+}

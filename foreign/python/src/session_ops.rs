@@ -406,6 +406,7 @@ impl PySession {
             Ok(PyPendingControl {
                 pause_requested: pending.pause_requested,
                 cancel_requested: pending.cancel_requested,
+                control_conflict: pending.control_conflict,
             })
         })
     }
@@ -624,6 +625,10 @@ pub struct PyPendingControl {
     /// A cancel was requested, or an operator forced the session canceled.
     #[pyo3(get)]
     cancel_requested: bool,
+    /// A control request arrived on another partition of `agent.control` than
+    /// the session's control route. It was never applied.
+    #[pyo3(get)]
+    control_conflict: bool,
 }
 
 /// A session handed to an agent: written as submitted on the lane, with a

@@ -170,6 +170,11 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(query::result_code_from_code, module)?)?;
     module.add_function(wrap_pyfunction!(query::result_code_http_status, module)?)?;
     module.add_function(wrap_pyfunction!(query::result_code_is_retryable, module)?)?;
+    module.add_function(wrap_pyfunction!(query::result_code_is_pending, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        query::result_code_is_plane_unavailable,
+        module
+    )?)?;
     module.add_class::<query::PyQueryFilter>()?;
     module.add_class::<query::PyQueryRows>()?;
     module.add_class::<query::PyTypedQueryRows>()?;
@@ -190,6 +195,8 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<coordination::PyPreparedMutation>()?;
     module.add_class::<coordination::PyAmbiguousMutationRecovery>()?;
     module.add_class::<kv::PyMutationPosition>()?;
+    module.add_class::<kv::PyAppliedFrontier>()?;
+    module.add_class::<kv::PySessionPosition>()?;
     module.add_class::<kv::PyKvEntry>()?;
     module.add_class::<kv::PyKvMetadata>()?;
     module.add_class::<kv::PyKvPage>()?;

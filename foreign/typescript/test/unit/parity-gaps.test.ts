@@ -468,6 +468,7 @@ void test("given_a_send_waiting_for_provisioning_when_shutdown_finishes_then_sho
     })
   const producer = Producer.create(transport, "fleet", "readings", {
     background: { lingerMs: 10_000 },
+    createStream: true,
     createTopic: false
   })
   const sending = producer.send(new Uint8Array([1]))

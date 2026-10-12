@@ -470,6 +470,24 @@ impl Sessions {
         Ok(SessionBootstrap { registered })
     }
 
+    /// Stop the deployment from indexing this stream's sessions. The request
+    /// goes through the authenticated managed control path and needs session
+    /// administration rights on the stream. The index for the stream is
+    /// dropped once the control record folds. A later
+    /// [`bootstrap`](Self::bootstrap) registers the stream again.
+    pub async fn unregister(&self) -> Result<(), LaserError> {
+        if !self.laser.capabilities().await.sessions {
+            return Err(LaserError::unsupported(
+                "sessions",
+                "this deployment does not index sessions",
+            ));
+        }
+        let stream = self.stream()?.to_owned();
+        self.laser
+            .publish_control(ControlCommand::RemoveSessionSource { stream })
+            .await
+    }
+
     /// The stream the sessions ride.
     pub fn stream(&self) -> Result<&str, LaserError> {
         self.laser.stream_required()

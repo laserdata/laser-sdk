@@ -49,6 +49,53 @@ def submit_and_cancel_a2a(world):
     raise AssertionError(f"canceled task did not replay: {replayed!r}")
 
 
+def bound_bridge(world):
+    return ls.A2aBridge(
+        world.laser,
+        "a2a-gateway",
+        ls.AgentTopic.Sessions,
+        ls.AgentTopic.Sessions,
+        task_binding_key=bytes([3] * 32),
+        task_binding_ttl_ms=60_000,
+    )
+
+
+@when(parsers.parse('caller "{caller}" submits a bound A2A task'))
+def submit_bound_a2a(world, caller):
+    bridge = bound_bridge(world)
+    task = world.run(
+        lambda: bridge.submit({"message": {"role": "user", "text": "bound"}}, caller=caller)
+    )
+    world.bound_task = task["id"]
+    world.bound_outcomes = []
+
+
+def record_bound_cancel(world, caller):
+    bridge = bound_bridge(world)
+    try:
+        task = world.run(lambda: bridge.cancel(world.bound_task, caller=caller))
+        state = task["status"]["state"]
+        state = "Canceled" if state.casefold() == "canceled" else state
+    except ls.HandlerConfigError:
+        state = "refused"
+    world.bound_outcomes.append(f"{caller or 'anonymous'}:{state}")
+
+
+@when(parsers.parse('caller "{caller}" tries to cancel the bound A2A task'))
+def caller_cancels_bound_a2a(world, caller):
+    record_bound_cancel(world, caller)
+
+
+@when("an anonymous caller tries to cancel the bound A2A task")
+def anonymous_cancels_bound_a2a(world):
+    record_bound_cancel(world, None)
+
+
+@then(parsers.parse('the bound A2A cancel outcomes are "{outcomes}"'))
+def bound_cancel_outcomes(world, outcomes):
+    assert ",".join(world.bound_outcomes) == outcomes
+
+
 @then(parsers.parse('the replayed A2A task state is "{state}"'))
 def replayed_a2a_state(world, state):
     assert world.bridge_task_state == state

@@ -5,6 +5,7 @@ import {
   AuthzExecutionError,
   BudgetExceededError,
   CheckpointExecutionError,
+  CommandExecutionError,
   ConsumerGroupSetupError,
   FenceViolationError,
   FilterExecutionError,
@@ -92,6 +93,12 @@ export function isStreamOrTopicNotFound(error: unknown): boolean {
  * is a grant, not a retry. */
 export function isPermissionDenied(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    ["Forbidden", "Unauthenticated"].includes(cause.detail.code.name)
+  )
+    return true
   if (cause instanceof RoutePrincipalMismatchError) return true
   const code = iggyErrorCode(error)
   if (code === IGGY_UNAUTHORIZED || code === IGGY_UNAUTHENTICATED) return true
@@ -104,6 +111,12 @@ export function isPermissionDenied(error: unknown): boolean {
  * Permanent: gate the code path instead of retrying. */
 export function isUnsupported(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "Unsupported"
+  )
+    return true
   if (cause instanceof UnsupportedError) return true
   if (
     (cause instanceof QueryExecutionError ||
@@ -120,6 +133,12 @@ export function isUnsupported(error: unknown): boolean {
 /** Whether the failure names a missing resource. */
 export function isNotFound(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "NotFound"
+  )
+    return true
   const kind = detailKind(cause)
   if (
     cause instanceof QueryExecutionError &&
@@ -140,6 +159,12 @@ export function isNotFound(error: unknown): boolean {
  * connected deployment. Permanent for this client build. */
 export function isVersionSkew(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "VersionSkew"
+  )
+    return true
   if (
     (cause instanceof QueryExecutionError ||
       cause instanceof KvExecutionError ||
@@ -168,6 +193,12 @@ export function isAmbiguousMutation(error: unknown): boolean {
 /** Whether a read-consistency barrier was not met yet. Retryable. */
 export function isStale(error: unknown): boolean {
   const cause = publishCause(error)
+  if (
+    cause instanceof CommandExecutionError &&
+    cause.detail.code.kind === "known" &&
+    cause.detail.code.name === "Stale"
+  )
+    return true
   return (
     (cause instanceof QueryExecutionError || cause instanceof KvExecutionError) &&
     detailKind(cause) === "stale"
@@ -215,7 +246,9 @@ export function isQuarantined(error: unknown): boolean {
  * later attempt. */
 export function isUnavailable(error: unknown): boolean {
   const value = code(error)
-  return value.kind === "known" && value.name === "Unavailable"
+  return (
+    value.kind === "known" && (value.name === "Unavailable" || value.name === "TargetUnavailable")
+  )
 }
 
 const QUERY_CODES: Readonly<Record<string, keyof typeof ResultCodeName>> = {
@@ -298,6 +331,7 @@ function surfaceCode(
  */
 export function code(error: unknown): ResultCode {
   const cause = publishCause(error)
+  if (cause instanceof CommandExecutionError) return cause.detail.code
   const iggy = iggyErrorCode(error)
   if (iggy === IGGY_RESOURCE_NOT_FOUND || isStreamOrTopicNotFound(error)) return known("NotFound")
   if (iggy === IGGY_UNAUTHORIZED) return known("Forbidden")
@@ -323,6 +357,8 @@ export function code(error: unknown): ResultCode {
     return known("NotFound")
   if (!(cause instanceof LaserError)) return known("Backend")
   switch (cause.kind) {
+    case "command":
+      return known("Backend")
     case "unsupported":
     case "no-stream":
     case "no-respond-topic":

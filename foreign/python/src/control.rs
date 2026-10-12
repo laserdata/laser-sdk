@@ -297,6 +297,14 @@ impl PyProjectionBindingBuilder {
         Ok(slf)
     }
 
+    /// Let the plane skip a record it proved the destination or the extraction
+    /// rejects, instead of holding the partition. Every skip is an ordered
+    /// control record, and the skipped record goes to the dead-letter topic.
+    fn skip_rejected(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        slf.apply(ProjectionBindingBuilder::skip_rejected)?;
+        Ok(slf)
+    }
+
     /// The binding dict. Raises `InvalidError` without a source.
     fn build(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.try_build(py)
