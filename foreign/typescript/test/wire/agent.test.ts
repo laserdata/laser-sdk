@@ -116,7 +116,7 @@ void test("given_session_bodies_when_encoded_then_should_round_trip_and_validate
     label: "Research",
     namespace: "agents",
     agent: parseAgentId("planner"),
-    sdk: { language: "typescript", version: "0.7.0" },
+    sdk: { language: "typescript", version: "0.8.0" },
     idleTimeoutMicros: 300_000_000n,
     budget: { tokens: 1000n },
     tags: ["demo"]
@@ -172,7 +172,7 @@ void test("given_session_bodies_when_encoded_then_should_round_trip_and_validate
 
 void test("given_session_fixtures_when_decoded_then_should_re_encode_byte_identically", async () => {
   const start = await roundTrip("agent_session_start.bin", decodeSessionStart, encodeSessionStart)
-  assert.equal(start.sdk.version, "0.7.0")
+  assert.equal(start.sdk.version, "0.8.0")
   const transition = await roundTrip(
     "agent_session_transition.bin",
     decodeSessionTransition,

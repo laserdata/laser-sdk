@@ -114,6 +114,8 @@ def fresh_feed(world):
     world.connect()
 
     async def publish():
+        # Producers no longer create streams, so the feed makes its own.
+        await world.laser.topic(TOPIC).ensure(1)
         producer = world.laser.topic(TOPIC).producer(partition=0, partitions=1)
         await producer.send_batch([RECORDS[name] for name in FEED])
 

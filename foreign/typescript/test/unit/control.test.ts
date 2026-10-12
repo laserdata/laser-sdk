@@ -5,9 +5,11 @@ import {
   ControlBook,
   type ControlRequest,
   NO_CONTROL,
+  controlPartition,
   controlRequest,
   foldControl,
-  pausedBy
+  pausedBy,
+  xxh32
 } from "../../src/agent/control.js"
 import { SessionFacts, isWork, parkedOf } from "../../src/agent/lane-scan.js"
 import { RoleState } from "../../src/agent/pause.js"
@@ -72,12 +74,19 @@ void test("given_a_pause_with_participants_when_classified_then_should_name_only
 })
 
 void test("given_pause_resume_and_cancel_when_folded_then_should_keep_only_the_latest_pause_state", () => {
-  const [state, last] = foldControl([
-    [[0, 1n], request("pause")],
-    [[0, 2n], request("resume")],
-    [[0, 3n], request("cancel")]
-  ])
-  assert.deepEqual(state.flags, { pauseRequested: false, cancelRequested: true })
+  const [state, last] = foldControl(
+    [
+      [[0, 1n], request("pause")],
+      [[0, 2n], request("resume")],
+      [[0, 3n], request("cancel")]
+    ],
+    undefined
+  )
+  assert.deepEqual(state.flags, {
+    pauseRequested: false,
+    cancelRequested: true,
+    controlConflict: false
+  })
   assert.equal(pausedBy(state), undefined)
   assert.deepEqual(state.resume?.at, [0, 2n])
   assert.deepEqual(last, [0, 3n])
@@ -90,18 +99,26 @@ void test("given_live_requests_before_the_fold_when_installed_then_should_replay
   book.observe(session, [0, 4n], request("pause"))
   book.observe(session, [0, 6n], request("cancel"))
   assert.equal(book.state(session), undefined, "unfolded until the first read")
-  const [state, last] = foldControl([
-    [[0, 4n], request("pause")],
-    [[0, 5n], request("resume")]
-  ])
+  const [state, last] = foldControl(
+    [
+      [[0, 4n], request("pause")],
+      [[0, 5n], request("resume")]
+    ],
+    undefined
+  )
   assert.deepEqual(book.install(session, state, last).flags, {
     pauseRequested: false,
-    cancelRequested: true
+    cancelRequested: true,
+    controlConflict: false
   })
   book.observe(session, [0, 7n], request("pause"))
   const current = book.state(session)
   assert.ok(current !== undefined)
-  assert.deepEqual(current.flags, { pauseRequested: true, cancelRequested: true })
+  assert.deepEqual(current.flags, {
+    pauseRequested: true,
+    cancelRequested: true,
+    controlConflict: false
+  })
   assert.deepEqual(pausedBy(current)?.at, [0, 7n])
   book.setLive(false)
   assert.equal(book.state(session), undefined, "a stopped follower forces a fold")
@@ -122,7 +139,11 @@ void test("given_a_loaded_book_when_reading_an_unseen_session_then_should_report
   assert.deepEqual(book.state(ConversationId.new().toString()), NO_CONTROL)
   const later = ConversationId.new().toString()
   book.observe(later, [2, 9n], request("cancel"))
-  assert.deepEqual(book.state(later)?.flags, { pauseRequested: false, cancelRequested: true })
+  assert.deepEqual(book.state(later)?.flags, {
+    pauseRequested: false,
+    cancelRequested: true,
+    controlConflict: false
+  })
 })
 
 function parking(offset: bigint, request: bigint): SessionParking {
@@ -177,4 +198,43 @@ void test("given_acknowledgments_when_recorded_then_should_keep_the_latest_on_th
   assert.equal(latest(), "Working")
   role.recordAck(ack("Paused", 12n))
   assert.equal(latest(), "Paused")
+})
+
+void test("given_known_inputs_when_hashed_then_should_match_the_xxh32_reference", () => {
+  const encode = (text: string): Uint8Array => new TextEncoder().encode(text)
+  assert.equal(xxh32(encode("")), 0x02cc5d05)
+  assert.equal(xxh32(encode("abc")), 0x32d153ff)
+  assert.equal(xxh32(encode("Nobody inspects the spammish repetition")), 0xe2293b2f)
+})
+
+void test("given_a_request_off_the_control_route_when_recorded_then_should_flag_and_never_apply", () => {
+  const session = "01KWM3K3XEP3NP5TN850J17YBP"
+  const route = controlPartition(session, 2)
+  assert.ok(route !== undefined)
+  const other = 1 - route
+  const book = new ControlBook()
+  book.setPartitions(2)
+  book.load([
+    [session, [route, 1n], request("pause")],
+    [session, [other, 2n], request("cancel")]
+  ])
+  book.setLive(true)
+  book.observe(session, [other, 3n], request("resume"))
+  const state = book.state(session)
+  assert.ok(state !== undefined)
+  assert.deepEqual(state.flags, {
+    pauseRequested: true,
+    cancelRequested: false,
+    controlConflict: true
+  })
+  const [folded] = foldControl(
+    [
+      [[other, 5n], request("cancel")],
+      [[route, 6n], request("pause")]
+    ],
+    route
+  )
+  assert.deepEqual(folded.flags, state.flags, "the log fold agrees with the book")
+  book.reset()
+  assert.equal(book.state(session), undefined, "a reset book folds again from the log")
 })

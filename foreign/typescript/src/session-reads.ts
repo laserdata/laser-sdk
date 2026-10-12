@@ -1,6 +1,7 @@
 import { millis } from "./client/duration.js"
 import { ProtocolError, SessionError } from "./client/errors.js"
 import { INTERNAL_TRANSPORT } from "./client/internals.js"
+import { code } from "./client/error-classify.js"
 import { executeManaged } from "./client/managed.js"
 import type { Laser } from "./client/laser.js"
 import type { AgentId, SessionStatus } from "./wire/agent.js"
@@ -187,8 +188,8 @@ export class SessionEventsRequest {
 }
 
 /** What a `SessionWatch` reports: the sessions that changed, each named once,
- * or a resync when the watch fell below the retained change floor and the
- * sessions should be listed again. */
+ * or a resync when the retained feed cannot identify every changed session.
+ * List the sessions again after a resync. */
 export type SessionChange =
   | { readonly kind: "changed"; readonly sessions: readonly WireConversationId[] }
   | { readonly kind: "resync" }
@@ -196,6 +197,9 @@ export type SessionChange =
 /** A follower of one stream's session changes. Build it with `Sessions.watch`. */
 export class SessionWatch {
   private readonly ready: SessionChange[] = []
+  // The change series `after` belongs to. Sequence numbers from another node
+  // or a restored index never continue this cursor.
+  private series: bigint | undefined
 
   private constructor(
     private readonly laser: Laser,
@@ -212,6 +216,10 @@ export class SessionWatch {
     const watch = new SessionWatch(laser, stream, pollEveryMs, 0n)
     for (;;) {
       const page = await watch.changes(watch.after)
+      if (page.resync) {
+        watch.after = page.floor
+        continue
+      }
       const seq = page.rows.reduce<bigint | undefined>(
         (max, row) => (max === undefined || row.seq > max ? row.seq : max),
         undefined
@@ -228,7 +236,17 @@ export class SessionWatch {
       options.signal?.throwIfAborted()
       const ready = this.ready.shift()
       if (ready !== undefined) return ready
-      const page = await this.changes(this.after)
+      let page: SessionChangesView
+      try {
+        page = await this.changes(this.after)
+      } catch (error) {
+        // A node that has not folded this stream far enough yet, typically
+        // the one a move just reached, answers Stale. The watch waits for it
+        // as it waits for a new change.
+        if (!isStale(error)) throw error
+        await pause(this.pollEveryMs, options.signal)
+        continue
+      }
       if (page.resync) {
         this.after = page.floor
         return { kind: "resync" }
@@ -236,6 +254,13 @@ export class SessionWatch {
       if (page.rows.length === 0) {
         await pause(this.pollEveryMs, options.signal)
         continue
+      }
+      // A truncated row does not name every changed session. The caller lists
+      // again after the resync, which covers this page, so the cursor moves
+      // past it instead of resyncing forever.
+      if (page.rows.some((row) => row.truncated)) {
+        for (const row of page.rows) if (row.seq > this.after) this.after = row.seq
+        return { kind: "resync" }
       }
       const seen = new Set<string>()
       const changed: WireConversationId[] = []
@@ -256,9 +281,11 @@ export class SessionWatch {
     const outcome = await readSession(this.laser, SessionChangesCommand, {
       stream: this.stream,
       after,
-      limit: 0
+      limit: 0,
+      ...(this.series === undefined ? {} : { series: this.series })
     })
     if (outcome.kind !== "changes") throw unexpected("changes")
+    if (outcome.changes.series !== 0n) this.series = outcome.changes.series
     return outcome.changes
   }
 }
@@ -275,4 +302,9 @@ function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
     }
     signal?.addEventListener("abort", abort, { once: true })
   })
+}
+
+function isStale(error: unknown): boolean {
+  const result = code(error)
+  return result.kind === "known" && result.name === "Stale"
 }

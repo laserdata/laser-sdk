@@ -1,3 +1,4 @@
+import { CREATE_RACE_ATTEMPTS } from "../retry.js"
 import { millisToMicros } from "../client/duration.js"
 import { type BytesLike, ownedBytes } from "../client/bytes.js"
 import { iggyErrorCode } from "../client/error-classify.js"
@@ -27,7 +28,8 @@ export interface ProducerOptions {
    * be positive. Defaults to the connection's publish retry backoff. */
   readonly retryBackoffMs?: number
   /** Create the stream before the first send when it does not exist.
-   * Defaults to `true`, like Rust and Python. */
+   * Defaults to `false`, like Rust and Python: a stream is provisioned with
+   * its tenant, and a governed identity has no right to create one. */
   readonly createStream?: boolean
   /** Create the topic before the first send when it does not exist.
    * Defaults to `true`, like Rust and Python. */
@@ -142,7 +144,6 @@ const MAX_KEY_BYTES = 255
 const MIB = 1024 * 1024
 // A producer init that loses a stream or topic creation race retries this many
 // times, 50 ms times the attempt apart, as Rust `init_producer` does.
-const CREATE_RACE_ATTEMPTS = 10
 const STREAM_NAME_ALREADY_EXISTS = 1012
 const TOPIC_NAME_ALREADY_EXISTS = 2013
 // Apache Iggy answers that imply the batch committed and only the confirmation
@@ -395,7 +396,8 @@ export class Producer implements AsyncDisposable {
   }
 
   private async provisionOnce(): Promise<void> {
-    const createStream = this.options.createStream ?? true
+    // A producer never creates a stream unless asked, as in Rust and Python.
+    const createStream = this.options.createStream ?? false
     const createTopic = this.options.createTopic ?? true
     if (createStream) await this.transport.ensureStream(this.streamName)
     if (!createTopic) return

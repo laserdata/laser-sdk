@@ -169,6 +169,12 @@ def indexed_completed(world, label, owner, events):
     assert not info.get("flags", {}).get("lane_conflict", False), info
 
 
+@then("the client has seen session positions for the stream")
+def seen_session_positions(world):
+    positions = _managed(world).laser.seen_positions().sessions
+    assert positions, "a session read reply carried the session fold's positions"
+
+
 @then(parsers.re(r"the stream counts (?P<count>\d+) completed sessions?$"))
 def counts_completed(world, count):
     managed = _managed(world)
@@ -1050,20 +1056,9 @@ def refuse_stale_registration(world):
 def recover_lane_registration(world):
     managed = _managed(world)
     laser = managed.laser
-    command = ls.Cbor.encode(
-        {
-            "v": 1,
-            "timestamp_micros": time.time_ns() // 1000,
-            "command": {"RemoveSessionSource": {"stream": world.session.stream}},
-        }
-    )
-    world.run(
-        lambda: (
-            laser.stream(laser.ops_stream)
-            .topic(laser.control_topic)
-            .send(command, partition_key="control")
-        )
-    )
+    # Control goes through the authenticated managed path. A native append to
+    # the control topic is refused by the deployment.
+    world.run(lambda: laser.sessions(layout=LAYOUTS[managed.layout]()).unregister())
 
     def removed():
         try:

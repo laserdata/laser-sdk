@@ -238,6 +238,56 @@ async def test_given_a_path_holding_the_bridge_when_continued_then_should_refuse
     assert mcp.with_bridge_hops(["upstream"]) is mcp
 
 
+@pytest.mark.integration
+async def test_given_a_task_binding_when_another_caller_uses_the_task_id_then_should_refuse_it(
+    laser,
+):
+    await laser.bootstrap(partitions=1, retention=ls.TopicRetention.expire_after(86_400_000))
+    bridge = ls.A2aBridge(
+        laser,
+        "a2a-bound",
+        "agent.sessions",
+        "agent.sessions",
+        task_binding_key=bytes([3] * 32),
+        task_binding_ttl_ms=60_000,
+    )
+    params = {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}}
+    with pytest.raises(ls.HandlerConfigError):
+        await bridge.submit(params)
+    task = await bridge.submit(params, caller="alice")
+    assert len(task["id"].split(".")) == 3
+    with pytest.raises(ls.HandlerConfigError):
+        await bridge.cancel(task["id"], caller="bob")
+    with pytest.raises(ls.HandlerConfigError):
+        await bridge.task(task["id"], caller="bob")
+    with pytest.raises(ls.HandlerConfigError):
+        await bridge.cancel(task["id"])
+    refused = await bridge.handle_rpc(
+        {"jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": task["id"]}}
+    )
+    assert refused.get("error") is not None
+    canceled = await bridge.cancel(task["id"], caller="alice")
+    assert canceled["status"]["state"].lower() == "canceled"
+    owned = await bridge.handle_rpc(
+        {"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task["id"]}},
+        caller="alice",
+    )
+    assert owned.get("error") is None
+    with pytest.raises(ls.InvalidError):
+        ls.A2aBridge(
+            laser,
+            "a2a-bound",
+            "agent.sessions",
+            "agent.sessions",
+            task_binding_key=bytes(16),
+            task_binding_ttl_ms=60_000,
+        )
+    with pytest.raises(ls.InvalidError):
+        ls.A2aBridge(
+            laser, "a2a-bound", "agent.sessions", "agent.sessions", task_binding_key=bytes(32)
+        )
+
+
 def test_given_a_path_holding_a_bridge_when_entered_then_should_refuse_the_loop():
     assert ls.enter_bridge("mcp-edge", ["a2a-edge"]) == ["a2a-edge", "mcp-edge"]
     with pytest.raises(ls.InvalidError):

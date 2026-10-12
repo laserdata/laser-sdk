@@ -292,7 +292,7 @@ impl PyTopic {
     /// takes `expire_after_ms` (milliseconds) or `never_expire=True`, else the
     /// server default, and `max_topic_bytes` or `unlimited_topic_size=True`,
     /// else the server default. Setting both of a pair raises `InvalidError`.
-    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=true, create_topic=true, partitions=1, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
+    #[pyo3(signature = (*, batch_length=1000, linger_ms=0.0, retries=None, retry_interval_ms=None, key=None, partition=None, create_stream=false, create_topic=true, partitions=1, expire_after_ms=None, never_expire=false, max_topic_bytes=None, unlimited_topic_size=false, background=None))]
     #[allow(clippy::too_many_arguments)]
     fn producer(
         &self,

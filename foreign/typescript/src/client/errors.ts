@@ -2,6 +2,7 @@ import type { MessageWithHeaders, SendMessagesConfirmation } from "../iggy/apach
 import type { CheckpointError } from "../wire/checkpoint.js"
 import type { FaultReason, FilterError, FilterGroupIdentity } from "../wire/filter.js"
 import type { SessionError as WireSessionError } from "../wire/session.js"
+import type { CommandError as WireCommandError } from "../wire/result.js"
 
 export type LaserErrorKind =
   | "config"
@@ -16,6 +17,7 @@ export type LaserErrorKind =
   | "codec"
   | "typed-decode"
   | "protocol"
+  | "command"
   | "transport"
   | "query"
   | "kv"
@@ -239,6 +241,15 @@ export class ProtocolError extends LaserError {
     super(message, "protocol", options)
     this.resultCode = details?.resultCode
     this.commandCode = details?.commandCode
+  }
+}
+
+export class CommandExecutionError extends LaserError {
+  readonly detail: WireCommandError
+
+  constructor(message: string, detail: WireCommandError, options?: { cause?: unknown }) {
+    super(message, "command", options)
+    this.detail = detail
   }
 }
 

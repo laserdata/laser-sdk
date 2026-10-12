@@ -106,7 +106,7 @@ void test("given_transport_managed_retries_when_producer_overrides_them_then_sho
   assert.equal(sends, 1)
 })
 
-void test("given_a_producer_with_defaults_when_sending_first_then_should_create_the_stream_and_topic_once", async () => {
+void test("given_a_producer_with_defaults_when_sending_first_then_should_create_only_the_topic_once", async () => {
   const ensured: string[] = []
   const transport = {
     ensureStream: (stream: string) => {
@@ -122,6 +122,14 @@ void test("given_a_producer_with_defaults_when_sending_first_then_should_create_
   const producer = Producer.create(transport, "fleet", "readings", { partitions: 3 })
   await producer.send(new Uint8Array([1]))
   await producer.send(new Uint8Array([2]))
+  // A stream is provisioned ahead of time, so the default creates only the topic.
+  assert.deepEqual(ensured, ["topic:fleet/readings/3"])
+  ensured.length = 0
+  const creating = Producer.create(transport, "fleet", "readings", {
+    partitions: 3,
+    createStream: true
+  })
+  await creating.send(new Uint8Array([3]))
   assert.deepEqual(ensured, ["stream:fleet", "topic:fleet/readings/3"])
 })
 
@@ -266,17 +274,21 @@ void test("given_a_transient_setup_failure_when_sending_then_should_retry_setup_
       return Promise.resolve({ confirmations: [] })
     }
   } as unknown as LaserTransport
-  await Producer.create(transport, "stream", "topic", { retries: 1, retryBackoffMs: 1 }).send(
-    new Uint8Array([1])
-  )
+  await Producer.create(transport, "stream", "topic", {
+    retries: 1,
+    retryBackoffMs: 1,
+    createStream: true
+  }).send(new Uint8Array([1]))
   assert.equal(ensures, 2)
   assert.equal(sends, 1)
 
   ensures = 0
   await assert.rejects(
-    Producer.create(transport, "stream", "topic", { retries: 0, retryBackoffMs: 1 }).send(
-      new Uint8Array([1])
-    ),
+    Producer.create(transport, "stream", "topic", {
+      retries: 0,
+      retryBackoffMs: 1,
+      createStream: true
+    }).send(new Uint8Array([1])),
     (error: unknown) => error instanceof PublishFailedError
   )
   assert.equal(ensures, 1)

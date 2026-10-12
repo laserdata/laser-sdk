@@ -338,6 +338,7 @@ fn context(query: &Query, index: &str, row_count: usize) -> QueryContext {
         scanned_bytes: 0,
         produced_bytes: 0,
         row_count: row_count as u64,
+        frontier: Vec::new(),
     }
 }
 

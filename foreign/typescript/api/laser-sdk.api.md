@@ -17,7 +17,7 @@ export const A2A_PROTOCOL_VERSION = "1.0";
 // @public (undocumented)
 export class A2aBridge {
     constructor(laser: Laser, source: AgentId, requestTopic: string, replyTopic: string);
-    // (undocumented)
+    caller(principal: string): A2aCaller;
     cancel(id: string): Promise<Task>;
     // (undocumented)
     card(): AgentCard;
@@ -31,7 +31,6 @@ export class A2aBridge {
     submitIn(parent: ConversationId, root: ConversationId, paramsJson: unknown, options?: {
         readonly target?: AgentId;
     }): Promise<Task>;
-    // (undocumented)
     task(id: string): Promise<Task>;
     // (undocumented)
     withBridgeHops(previous: readonly string[]): this;
@@ -39,6 +38,20 @@ export class A2aBridge {
     withCapabilities(capabilities: readonly CapabilityDescriptor[]): this;
     // (undocumented)
     withSigningKey(key: SigningKey): this;
+    withTaskBinding(key: Uint8Array, ttlMs: number): this;
+}
+
+// @public
+export class A2aCaller {
+    cancel(id: string): Promise<Task>;
+    handleRpc(input: unknown): Promise<JsonRpcResponse>;
+    submit(paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    submitIn(parent: ConversationId, root: ConversationId, paramsJson: unknown, options?: {
+        readonly target?: AgentId;
+    }): Promise<Task>;
+    task(id: string): Promise<Task>;
 }
 
 // @public (undocumented)
@@ -708,6 +721,18 @@ export type AmbiguousMutationRecovery = {
     readonly kind: "reconcileTargetPrecondition";
 };
 
+// @public
+export interface AppliedFrontier {
+    // (undocumented)
+    readonly fork?: MutationPosition;
+    // (undocumented)
+    readonly graph?: MutationPosition;
+    // (undocumented)
+    readonly kv?: MutationPosition;
+    // (undocumented)
+    readonly sessions?: readonly SessionPosition[];
+}
+
 // @public (undocumented)
 export interface AppliedPolicy {
     readonly digest?: Uint8Array;
@@ -811,6 +836,7 @@ export interface AuthzEvent {
     readonly op: AuthzEventKind;
     // (undocumented)
     readonly revision: bigint;
+    readonly stream?: string;
 }
 
 // @public (undocumented)
@@ -824,6 +850,9 @@ export type AuthzEventKind = {
     readonly kind: "rolesBound";
     readonly userId: number;
     readonly roles: readonly string[];
+} | {
+    readonly kind: "tenancySet";
+    readonly tenancy: Tenancy;
 };
 
 // @public (undocumented)
@@ -853,6 +882,11 @@ export type AuthzSubject = {
     readonly userId: number;
 } | {
     readonly kind: "all";
+}
+/** Every change attributed to one stream, as Rust `AuthzSubject::Stream`. */
+| {
+    readonly kind: "stream";
+    readonly stream: string;
 };
 
 // Warning: (ae-forgotten-export) The symbol "BackendResourceId" needs to be exported by the entry point index.d.ts
@@ -1409,6 +1443,17 @@ export interface CoercedPredicate {
 
 // @public (undocumented)
 export function commandEnvelope(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, body: Uint8Array): AgentEnvelope;
+
+// @public (undocumented)
+export class CommandExecutionError extends LaserError {
+    constructor(message: string, detail: CommandError, options?: {
+        cause?: unknown;
+    });
+    // Warning: (ae-forgotten-export) The symbol "CommandError" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    readonly detail: CommandError;
+}
 
 // @public
 export function commandFromMessageSend(record: RecordId, conversation: ConversationId_2, source: AgentId_2, correlation: CorrelationId, paramsJson: Uint8Array): AgentEnvelope;
@@ -4169,6 +4214,7 @@ export class Laser implements AsyncDisposable {
     scatterReport(source: AgentId, selector: CapabilitySelector, payload: BytesLike, inboxRoute: InboxRoute, deadlineMs: number): Promise<ScatterReport>;
     // (undocumented)
     schemas(): Schemas;
+    seenPositions(): AppliedFrontier;
     // (undocumented)
     sendAgent(topic: string, payload: BytesLike, provenance: Provenance, options?: {
         readonly contentType?: ContentType;
@@ -5107,6 +5153,7 @@ export type PathSegment = {
 // @public
 export interface PendingControl {
     readonly cancelRequested: boolean;
+    readonly controlConflict: boolean;
     readonly pauseRequested: boolean;
 }
 
@@ -5347,6 +5394,7 @@ export interface ProjectionBinding {
     readonly notify: boolean;
     // (undocumented)
     readonly retention?: RetentionPolicy;
+    readonly skipRejected: boolean;
     // (undocumented)
     readonly source: SourceSelector;
 }
@@ -5362,6 +5410,7 @@ export class ProjectionBindingBuilder {
     retention(retention: RetentionPolicy): this;
     // (undocumented)
     selector(source: SourceSelector): this;
+    skipRejected(): this;
     source(stream: string, topic: string): this;
     tryBuild(): ProjectionBinding | undefined;
 }
@@ -5791,6 +5840,7 @@ export interface QueryContext {
     readonly engine: QueryEngine;
     // (undocumented)
     readonly executionId: QueryExecutionId;
+    readonly frontier: readonly QueryFrontier[];
     // (undocumented)
     readonly globalStateRevision?: bigint;
     // (undocumented)
@@ -5850,6 +5900,18 @@ export interface QueryExecutionStatus {
     //
     // (undocumented)
     readonly state: QueryExecutionState;
+}
+
+// @public
+export interface QueryFrontier {
+    readonly appliedOffset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly stream: string;
+    // (undocumented)
+    readonly topic: string;
+    readonly topicCreatedAtMicros?: bigint;
 }
 
 // @public (undocumented)
@@ -6374,6 +6436,12 @@ export function resultCodeFromCode(code: number): ResultCode;
 
 // @public (undocumented)
 export function resultCodeHttpStatus(value: ResultCode): number;
+
+// @public
+export function resultCodeIsPending(value: ResultCode): boolean;
+
+// @public
+export function resultCodeIsPlaneUnavailable(value: ResultCode): boolean;
 
 // @public (undocumented)
 export function resumeOffsets(snapshot: FoldSnapshot): readonly SnapshotOffset[];
@@ -6959,6 +7027,22 @@ export interface SessionPage {
 // @public (undocumented)
 export type SessionPolicy = "perCall" | "perUser";
 
+// @public
+export interface SessionPosition {
+    // (undocumented)
+    readonly offset: bigint;
+    // (undocumented)
+    readonly partitionId: number;
+    // (undocumented)
+    readonly streamGeneration: bigint;
+    // (undocumented)
+    readonly streamId: number;
+    // (undocumented)
+    readonly topic: string;
+    // (undocumented)
+    readonly topicGeneration: bigint;
+}
+
 // @public (undocumented)
 export interface SessionRef {
     // (undocumented)
@@ -6987,6 +7071,7 @@ export class Sessions {
     state(id: ConversationId, historyLimit: number): Promise<SessionStateView>;
     stream(): string;
     submit(agent: AgentId, input: BytesLike): SubmitBuilder;
+    unregister(): Promise<void>;
     watch(pollEveryMs: number): Promise<SessionWatch>;
 }
 
@@ -7833,20 +7918,21 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:479:7 - (ae-forgotten-export) The symbol "Dispatch" needs to be exported by the entry point index.d.ts
-// src/client/laser.ts:762:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
+// src/client/laser.ts:481:7 - (ae-forgotten-export) The symbol "Dispatch" needs to be exported by the entry point index.d.ts
+// src/client/laser.ts:764:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
 // src/wire/agent.ts:106:31 - (ae-forgotten-export) The symbol "TaskStateName" needs to be exported by the entry point index.d.ts
 // src/wire/agent.ts:852:31 - (ae-forgotten-export) The symbol "AgentErrorCodeName" needs to be exported by the entry point index.d.ts
 // src/wire/agent.ts:882:31 - (ae-forgotten-export) The symbol "DeadLetterReasonName" needs to be exported by the entry point index.d.ts
 // src/wire/agent.ts:909:31 - (ae-forgotten-export) The symbol "HealthName" needs to be exported by the entry point index.d.ts
+// src/wire/authz.ts:734:36 - (ae-forgotten-export) The symbol "Tenancy" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:398:7 - (ae-forgotten-export) The symbol "CheckpointRequestId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:399:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:404:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:409:7 - (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
 // src/wire/filter.ts:300:40 - (ae-forgotten-export) The symbol "FilterLiteral" needs to be exported by the entry point index.d.ts
-// src/wire/result.ts:24:31 - (ae-forgotten-export) The symbol "ResultCodeName" needs to be exported by the entry point index.d.ts
+// src/wire/result.ts:26:31 - (ae-forgotten-export) The symbol "ResultCodeName" needs to be exported by the entry point index.d.ts
 
 // (No @packageDocumentation comment for this package)
 

@@ -9,6 +9,7 @@ import {
   A2A_PROTOCOL_VERSION,
   A2aBridge,
   contentRefMode,
+  taskBindingMac,
   taskFromEnvelope,
   taskToJson,
   type AgentCard,
@@ -499,7 +500,7 @@ void test("given_a_parent_session_when_an_a2a_task_is_submitted_in_it_then_shoul
   }
 })
 
-function capturingLaser(sent: AgentEnvelope[], reply?: AgentEnvelope): Laser {
+function capturingLaser(sent: AgentEnvelope[], reply?: AgentEnvelope, generation = 1n): Laser {
   const transport = {
     sendMessagesWithHeaders(
       _stream: string,
@@ -524,7 +525,7 @@ function capturingLaser(sent: AgentEnvelope[], reply?: AgentEnvelope): Laser {
     defaultStream: "agents",
     capabilities: () => Promise.resolve({ sessions: false }),
     [INTERNAL_TRANSPORT]: () => ({
-      findSnapshotStream: () => Promise.resolve({ id: 0, createdAtMicros: 1n }),
+      findSnapshotStream: () => Promise.resolve({ id: 0, createdAtMicros: generation }),
       findSnapshotTopic: () => Promise.resolve({ id: 0, createdAtMicros: 2n, partitions: 4 })
     }),
     agdx: (topic: string, source: AgentId, conversation: TaskConversationId) =>
@@ -559,6 +560,82 @@ void test("given_a_target_when_an_a2a_task_is_submitted_then_should_address_the_
   )
   await bridge.submit({ message: { text: "hi" } })
   assert.deepEqual(commandTargets(sent), ["beta", "alpha", undefined])
+})
+
+void test("given_the_shared_vector_when_a_task_binding_digest_is_made_then_should_match_the_rust_sdk", () => {
+  const mac = taskBindingMac(
+    new Uint8Array(32).fill(7),
+    "alice",
+    10n,
+    TaskConversationId.derive("task-42"),
+    1_000n
+  )
+  assert.equal(
+    Buffer.from(mac).toString("hex"),
+    "d1ea2040a6c1451ff74ad5eb597715ce67fa2d144aa0a2b369d9e56ebf0fee1b"
+  )
+})
+
+function boundBridge(sent: AgentEnvelope[], generation = 1n): A2aBridge {
+  return new A2aBridge(
+    capturingLaser(sent, undefined, generation),
+    AgentId.new("bridge"),
+    AgentTopic.Sessions,
+    AgentTopic.Sessions
+  ).withTaskBinding(new Uint8Array(32).fill(3), 60_000)
+}
+
+void test("given_a_task_binding_when_another_caller_uses_the_task_id_then_should_refuse_it_before_publishing", async () => {
+  const sent: AgentEnvelope[] = []
+  const bridge = boundBridge(sent)
+  const task = await bridge.caller("alice").submit({ message: { text: "hi" } })
+  assert.equal(task.id.split(".").length, 3)
+  assert.equal(sent.length, 1)
+  await assert.rejects(bridge.caller("bob").cancel(task.id), HandlerConfigError)
+  await assert.rejects(bridge.caller("bob").task(task.id), HandlerConfigError)
+  assert.equal(sent.length, 1, "a refused cancel publishes nothing")
+  const canceled = await bridge.caller("alice").cancel(task.id)
+  assert.deepEqual(canceled.status.state, { kind: "known", name: "Canceled" })
+  assert.equal(sent.length, 2)
+})
+
+void test("given_a_task_binding_when_no_caller_is_given_then_should_refuse_every_task_operation", async () => {
+  const sent: AgentEnvelope[] = []
+  const bridge = boundBridge(sent)
+  await assert.rejects(bridge.submit({ message: { text: "hi" } }), HandlerConfigError)
+  assert.equal(sent.length, 0, "an anonymous submit publishes nothing")
+  const task = await bridge.caller("alice").submit({ message: { text: "hi" } })
+  await assert.rejects(bridge.cancel(task.id), HandlerConfigError)
+  const response = await bridge.handleRpc({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "CancelTask",
+    params: { id: task.id }
+  })
+  assert.notEqual(response.error, undefined)
+  assert.equal(sent.length, 1)
+  const owned = await bridge.caller("alice").handleRpc({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "CancelTask",
+    params: { id: task.id }
+  })
+  assert.equal(owned.error, undefined)
+})
+
+void test("given_a_task_binding_when_the_stream_was_recreated_or_the_id_was_altered_then_should_refuse_the_id", async () => {
+  const sent: AgentEnvelope[] = []
+  const task = await boundBridge(sent)
+    .caller("alice")
+    .submit({ message: { text: "hi" } })
+  await assert.rejects(boundBridge(sent, 2n).caller("alice").cancel(task.id), HandlerConfigError)
+  const [conversation, expires, mac] = task.id.split(".") as [string, string, string]
+  const later = `${conversation}.${(BigInt(expires) + 1n).toString()}.${mac}`
+  await assert.rejects(boundBridge(sent).caller("alice").cancel(later), HandlerConfigError)
+  const expired = `${conversation}.1.${mac}`
+  await assert.rejects(boundBridge(sent).caller("alice").cancel(expired), HandlerConfigError)
+  assert.throws(() => boundBridge(sent).withTaskBinding(new Uint8Array(16), 1_000), InvalidError)
+  assert.equal(sent.length, 1)
 })
 
 void test("given_a_target_when_an_mcp_tool_is_called_then_should_address_the_command_to_that_agent", async () => {

@@ -121,7 +121,7 @@ void test("unavailable announcement fails closed", () => {
       resourceId,
       "operational",
       "Embedded",
-      { kind: "turso", version: "1" },
+      { kind: "embedded", version: "1" },
       1n,
       1n
     ),

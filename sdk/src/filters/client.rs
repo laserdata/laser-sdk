@@ -25,12 +25,14 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
 const DEFAULT_PREVIEW_RECORDS: u32 = 20;
-const MUTATION_ATTEMPTS: u32 = 3;
-const MUTATION_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+use crate::retry::{
+    FILTER_MUTATION_ATTEMPTS as MUTATION_ATTEMPTS,
+    FILTER_MUTATION_BACKOFF as MUTATION_RETRY_BACKOFF,
+};
 const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the typed catalog verbs wait for a mutation's authoritative
 /// outcome before they report it as ambiguous.
-pub const DEFAULT_OUTCOME_WAIT: Duration = Duration::from_secs(30);
+pub const DEFAULT_OUTCOME_WAIT: Duration = crate::retry::FILTER_OUTCOME_WAIT;
 
 impl Laser {
     /// The catalog and native filter commands behind a consumer group's

@@ -16,6 +16,7 @@ import { createAgdx, type Agdx } from "../agent/agdx.js"
 import { replyTopicFor, resolveAgentTopic } from "../agent/partitioning.js"
 import { decodeAgentMessage, type AgentMessage } from "../agent/reliable-consumer.js"
 import { type Dispatch, classify } from "../wire/dispatch.js"
+import type { AppliedFrontier } from "../wire/mutation.js"
 import { ReplyHub } from "../agent/replies.js"
 import { ContractBuilder, scatter, scatterReport, type ScatterReport } from "../agent/contract.js"
 import { Workflow } from "../agent/workflow.js"
@@ -67,7 +68,7 @@ import { ForkHandle } from "../managed/forks.js"
 import { Kv } from "../managed/kv.js"
 import { LeaseCoordinator } from "../managed/coordination.js"
 import { Bindings, Projections, Schemas } from "../managed/projections.js"
-import { QueryRequest } from "../managed/query.js"
+import { QueryRequest, queryReplyWaitMs } from "../managed/query.js"
 import { Destinations } from "../managed/destinations.js"
 import {
   authzHistory,
@@ -92,6 +93,7 @@ import {
 import type { BatchItem } from "../wire/batch.js"
 import {
   AGDX_HELLO_CODE,
+  AGDX_CONTROL_PUBLISH_CODE,
   AGDX_SET_CLIENT_METADATA_CODE,
   CONTROL_OP_VERSION,
   QUERY_OP_VERSION
@@ -146,7 +148,7 @@ import {
   OPS_STREAM,
   streamOpsTopic
 } from "../wire/topics.js"
-import { encodeNamed } from "../wire/cbor.js"
+import { decodeOne, encodeNamed } from "../wire/cbor.js"
 import type { ChannelId } from "../wire/ids.js"
 import type { SourceRef } from "../wire/graph.js"
 import type { ContextMessage } from "../context.js"
@@ -163,7 +165,7 @@ import {
   TimeoutError,
   UnsupportedError
 } from "./errors.js"
-import { executeManaged, type ManagedTransport } from "./managed.js"
+import { decodeManagedReply, executeManaged, type ManagedTransport } from "./managed.js"
 import { BARE_SCOPE, type ResourceScope } from "./resource-scope.js"
 import {
   INTERNAL_DIALED,
@@ -956,6 +958,16 @@ export class Laser implements AsyncDisposable {
           this.transport.sendManaged(commandCode, payload, options)
         )
     }
+  }
+
+  /**
+   * The highest mutation position this client has seen per managed surface,
+   * as Rust `Laser::seen_positions`. Every KV, fork and graph reply raises it,
+   * and every later read of that surface sends it, so whichever node answers
+   * has applied at least what this client wrote or read before.
+   */
+  seenPositions(): AppliedFrontier {
+    return this.transport.seenPositions?.() ?? {}
   }
 
   async capabilities(): Promise<Capabilities> {
@@ -2024,16 +2036,38 @@ export class Laser implements AsyncDisposable {
   }
 
   private async publishControl(command: ControlCommand, stream?: string): Promise<void> {
+    const capabilities = await this.capabilities()
+    if (!capabilities.managed) {
+      throw new UnsupportedError("control commands require a managed backend", {
+        surface: "control"
+      })
+    }
+    if (
+      capabilities.versions !== undefined &&
+      capabilities.versions.control !== CONTROL_OP_VERSION
+    ) {
+      throw new InvalidError(
+        `control wire version must be ${String(CONTROL_OP_VERSION)}, got ${String(capabilities.versions.control)}`
+      )
+    }
     const envelope = {
       v: CONTROL_OP_VERSION,
-      timestampMicros: BigInt(Date.now()) * 1000n,
+      timestampMicros: 0n,
       command,
       ...(stream !== undefined ? { stream } : {})
     }
     const payload = encodeNamed(encodeControlEnvelope(envelope))
-    await this.stream(this.opsStream)
-      .topic(this.controlTopic)
-      .send(payload, { key: new TextEncoder().encode("control") })
+    const reply = await this.managedTransport().sendManaged(AGDX_CONTROL_PUBLISH_CODE, payload)
+    decodeManagedReply((bytes) => {
+      const value = decodeOne(bytes, "control reply")
+      if (
+        value instanceof Map &&
+        value.get("code") === "ok" &&
+        typeof value.get("message") === "string"
+      )
+        return
+      throw new ProtocolError("control reply did not report an accepted command")
+    }, reply)
   }
 
   /** Executes a pre-built `Query` and returns the raw paged result. Most
@@ -2053,10 +2087,12 @@ export class Laser implements AsyncDisposable {
         { surface: "query", feature: "consistency" }
       )
     }
-    const reply = await executeManaged(this.managedTransport(), capabilities, QueryCommand, {
-      v: QUERY_OP_VERSION,
-      query
-    })
+    const reply = await sendQueryUntil(query.deadlineMicros, () =>
+      executeManaged(this.managedTransport(), capabilities, QueryCommand, {
+        v: QUERY_OP_VERSION,
+        query
+      })
+    )
     if (reply.kind === "ok") {
       if (reply.result.context.executionId.asU128() !== query.executionId.asU128()) {
         throw new ProtocolError("query reply execution id does not match the request")
@@ -2080,12 +2116,14 @@ export class Laser implements AsyncDisposable {
         feature: "cursor_paging"
       })
     }
-    const reply = await executeManaged(this.managedTransport(), capabilities, QueryPageCommand, {
-      v: QUERY_OP_VERSION,
-      executionId,
-      cursor,
-      deadlineMicros
-    })
+    const reply = await sendQueryUntil(deadlineMicros, () =>
+      executeManaged(this.managedTransport(), capabilities, QueryPageCommand, {
+        v: QUERY_OP_VERSION,
+        executionId,
+        cursor,
+        deadlineMicros
+      })
+    )
     if (reply.kind === "ok") {
       if (reply.result.context.executionId.asU128() !== executionId.asU128()) {
         throw new ProtocolError("query reply execution id does not match the request")
@@ -2179,4 +2217,24 @@ export class Laser implements AsyncDisposable {
 function stampBroadcastAddressee(headers: Map<string, HeaderValue>, topic: string): void {
   if (topic !== AGENT_SESSIONS && topic !== AGENT_CONTROL) return
   if (!headers.has(TARGET_AGENT_ID)) headers.set(TARGET_AGENT_ID, { kind: "string", value: "*" })
+}
+
+/** Send one query request and wait for its reply no longer than the query's
+ * deadline allows. A deadline further out than `QUERY_DEADLINE_MS` is refused,
+ * because the reply could not come back before the transport stops waiting for
+ * it. A timed out wait does not mean the query stopped. The server ends it at
+ * its deadline. */
+async function sendQueryUntil<T>(deadlineMicros: bigint, send: () => Promise<T>): Promise<T> {
+  const waitMs = queryReplyWaitMs(deadlineMicros, BigInt(Date.now()) * 1000n)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new TimeoutError("no query reply by the query deadline"))
+    }, waitMs)
+  })
+  try {
+    return await Promise.race([send(), expired])
+  } finally {
+    clearTimeout(timer)
+  }
 }

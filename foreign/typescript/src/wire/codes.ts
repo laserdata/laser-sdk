@@ -112,6 +112,7 @@ export const AGENT_OP_VERSION = 1
 const IDEMPOTENT_MANAGED_REQUESTS = new Set([
   AGDX_BATCH_CODE,
   AGDX_CHECKPOINT_CODE,
+  AGDX_CONTROL_PUBLISH_CODE,
   AGDX_KV_SET_CODE,
   AGDX_KV_DELETE_CODE,
   AGDX_KV_DELETE_MANY_CODE,
@@ -133,4 +134,30 @@ const IDEMPOTENT_MANAGED_REQUESTS = new Set([
 
 export function isIdempotentManagedRequest(code: number): boolean {
   return IDEMPOTENT_MANAGED_REQUESTS.has(code)
+}
+
+const BARRIER_READS: ReadonlySet<number> = new Set([
+  AGDX_KV_GET_CODE,
+  AGDX_KV_SCAN_CODE,
+  AGDX_KV_NAMESPACES_CODE,
+  AGDX_KV_EXISTS_CODE,
+  AGDX_FORK_LIST_CODE,
+  AGDX_GRAPH_QUERY_CODE,
+  AGDX_GRAPH_NEIGHBORS_CODE,
+  AGDX_SESSION_GET_CODE,
+  AGDX_SESSION_LIST_CODE,
+  AGDX_SESSION_EVENTS_CODE,
+  AGDX_SESSION_STATE_CODE,
+  AGDX_SESSION_LINKS_CODE,
+  AGDX_SESSION_SOURCES_CODE,
+  AGDX_SESSION_CHANGES_CODE
+])
+
+/**
+ * Whether a managed read may carry a `ManagedReadEnvelope` barrier: the reads
+ * of the key-value, fork, graph and session surfaces, as Rust
+ * `is_barrier_read`.
+ */
+export function isBarrierRead(code: number): boolean {
+  return BARRIER_READS.has(code)
 }

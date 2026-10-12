@@ -1,7 +1,10 @@
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
+use laser_sdk::LaserError;
+use laser_sdk::kv::{FencedLeaseClient, KvRelease, ManagedKvTransport};
 use laser_sdk::prelude::Capabilities;
 use laser_sdk::query::{Consistency, ResultCode};
+use laser_sdk::wire::result::CommandError;
 
 #[given("a managed-query connection that does not advertise read-your-writes")]
 async fn managed_query_without_read_your_writes(world: &mut LaserWorld) {
@@ -14,6 +17,47 @@ async fn managed_query_without_read_your_writes(world: &mut LaserWorld) {
         .expect("a Laser is connected")
         .with_capabilities(Capabilities::OPEN.with_query(true));
     world.laser = Some(laser);
+}
+
+struct CommandReply(ResultCode);
+
+impl ManagedKvTransport for CommandReply {
+    async fn send(&self, _code: u32, _frame: Vec<u8>) -> Result<Vec<u8>, LaserError> {
+        Ok(laser_sdk::wire::framing::encode_named(&CommandError::new(
+            self.0, "refused",
+        ))?)
+    }
+
+    async fn reset(&self) {}
+}
+
+#[when(regex = r"^a prepared release receives managed result code (\d+)$")]
+async fn prepared_release_error(world: &mut LaserWorld, code: u16) {
+    let client = FencedLeaseClient::new(CommandReply(ResultCode::from_code(code)));
+    let operation = client
+        .prepare_release(&KvRelease {
+            v: 1,
+            namespace: "coord".to_owned(),
+            key: b"lease".to_vec(),
+            lease_token: 1,
+            holder_id: "worker".to_owned(),
+        })
+        .expect("release prepares");
+    let error = client
+        .release(&operation)
+        .await
+        .expect_err("the command is refused");
+    assert!(matches!(&error, LaserError::Command(_)));
+    assert!(!error.is_ambiguous_mutation());
+    world.last_code = Some(error.code());
+    world.last_retryable = Some(error.is_retryable());
+    world.last_result = Some(Err(error.to_string()));
+}
+
+#[then(regex = r"^the command error keeps code (\d+) and retryability (true|false)$")]
+fn command_error_classifiers(world: &mut LaserWorld, code: u16, retryable: String) {
+    assert_eq!(world.last_code, Some(ResultCode::from_code(code)));
+    assert_eq!(world.last_retryable, Some(retryable == "true"));
 }
 
 #[when("I read the negotiated capabilities")]

@@ -116,6 +116,72 @@ pub fn split_scoped_resource(name: &str) -> Option<(&str, &str)> {
     (!stream.is_empty() && !local.is_empty()).then_some((stream, local))
 }
 
+/// How a deployment scopes its managed resources, as its replicated
+/// authorization state records it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tenancy {
+    /// One deployment-wide namespace. Every grant pattern is accepted.
+    #[default]
+    Deployment,
+    /// Each stream is an account. A role may allow access inside one stream
+    /// only, and the root role is bound to root alone.
+    Stream,
+}
+
+impl Tenancy {
+    pub fn is_deployment(&self) -> bool {
+        *self == Self::Deployment
+    }
+}
+
+/// Whether an allow grant reaches resources in more than one stream: a
+/// whole-feature grant, or a prefix that is not inside one `stream:<name>/`.
+/// A deny grant only narrows access, so it never spans.
+pub fn grant_spans_streams(grant: &Grant) -> bool {
+    if grant.effect == Effect::Deny {
+        return false;
+    }
+    match grant.resource.kind {
+        ResourceKind::Literal => false,
+        ResourceKind::Prefix => prefix_stream(&grant.resource.value).is_none(),
+        // A whole-feature grant, and any pattern kind this build does not know.
+        _ => true,
+    }
+}
+
+/// The one stream every allow grant of a role stays inside, which its audit
+/// events are attributed to. `None` when a grant reaches more than one stream
+/// or none, or when the role allows nothing.
+pub fn grants_stream(grants: &[Grant]) -> Option<String> {
+    let mut streams = grants
+        .iter()
+        .filter(|grant| grant.effect == Effect::Allow)
+        .map(|grant| match grant.resource.kind {
+            ResourceKind::Literal => split_scoped_resource(&grant.resource.value)
+                .map(|(stream, _)| stream)
+                .or_else(|| grant.resource.value.strip_prefix(STREAM_RESOURCE_PREFIX))
+                .filter(|stream| !stream.is_empty() && !stream.contains('/')),
+            ResourceKind::Prefix => prefix_stream(&grant.resource.value),
+            _ => None,
+        });
+    let first = streams.next()??;
+    streams
+        .all(|stream| stream == Some(first))
+        .then(|| first.to_owned())
+}
+
+/// The one stream a prefix stays inside, if any.
+fn prefix_stream(prefix: &str) -> Option<&str> {
+    if let Some((stream, _local)) = split_scoped_resource(prefix) {
+        return Some(stream);
+    }
+    prefix
+        .strip_prefix(STREAM_RESOURCE_PREFIX)?
+        .strip_suffix('/')
+        .filter(|stream| !stream.is_empty() && !stream.contains('/'))
+}
+
 pub const SUPERVISOR_ASSERTION_VERSION: u32 = 1;
 pub const SUPERVISOR_ASSERTION_DOMAIN: &[u8] = b"agdx.supervisor-actor.v1";
 pub const MAX_SUPERVISOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
@@ -562,6 +628,9 @@ pub enum AuthzSubject {
     Binding { user_id: u32 },
     /// Every authorization change.
     All,
+    /// Every change attributed to one stream: roles whose grants stay inside
+    /// it and bindings of such roles. What a stream's owner may audit.
+    Stream(String),
 }
 
 /// Read the authorization change history for a subject, paged by revision. The
@@ -585,6 +654,8 @@ pub enum AuthzEventKind {
     RoleDeleted(String),
     /// A user's role set was rebound.
     RolesBound { user_id: u32, roles: Vec<String> },
+    /// The deployment's tenancy was set.
+    TenancySet(Tenancy),
 }
 
 /// One recorded authorization change: its revision, who made it, when, and what.
@@ -594,6 +665,10 @@ pub struct AuthzEvent {
     pub actor: String,
     pub at_micros: u64,
     pub op: AuthzEventKind,
+    /// The stream the change is attributed to, see [`grants_stream`]. Absent
+    /// for a change that concerns no single stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// A page of authorization change history.
@@ -654,6 +729,65 @@ pub enum AuthzError {
 #[cfg(all(test, feature = "cbor"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_role_grants_when_attributed_then_should_name_one_stream_or_none() {
+        let allow = |kind: ResourceKind, value: &str| Grant {
+            effect: Effect::Allow,
+            feature: Feature::Kv,
+            action: Action::Read,
+            resource: ResourcePattern {
+                kind,
+                value: value.to_owned(),
+            },
+        };
+        assert_eq!(
+            grants_stream(&[
+                allow(ResourceKind::Prefix, "stream:acme/"),
+                allow(ResourceKind::Literal, "stream:acme/cart"),
+            ]),
+            Some("acme".to_owned())
+        );
+        assert_eq!(
+            grants_stream(&[
+                allow(ResourceKind::Prefix, "stream:acme/"),
+                allow(ResourceKind::Literal, "stream:other/cart"),
+            ]),
+            None
+        );
+        assert_eq!(grants_stream(&[allow(ResourceKind::All, "")]), None);
+        assert_eq!(
+            grants_stream(&[allow(ResourceKind::Prefix, "stream:acme")]),
+            None
+        );
+        assert_eq!(grants_stream(&[]), None);
+    }
+
+    #[test]
+    fn given_a_tenancy_event_when_round_tripped_then_should_keep_it_and_spanning_should_follow_the_pattern()
+     {
+        let event = AuthzEventKind::TenancySet(Tenancy::Stream);
+        let bytes = crate::framing::encode_named(&event).expect("encodes");
+        assert_eq!(
+            crate::framing::decode_named::<AuthzEventKind>(&bytes).expect("decodes"),
+            event
+        );
+        let allow = |resource| Grant {
+            effect: Effect::Allow,
+            feature: Feature::Kv,
+            action: Action::Read,
+            resource,
+        };
+        assert!(grant_spans_streams(&allow(ResourcePattern::all())));
+        assert!(grant_spans_streams(&allow(ResourcePattern::prefix(
+            "orders"
+        ))));
+        assert!(!grant_spans_streams(&allow(ResourcePattern::prefix(
+            "stream:a/"
+        ))));
+        assert!(!grant_spans_streams(&allow(ResourcePattern::literal("x"))));
+        assert!(Tenancy::default().is_deployment());
+    }
     use crate::framing::{decode_named, encode_named};
 
     #[test]

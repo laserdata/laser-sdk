@@ -8,6 +8,8 @@ pub(crate) mod contract;
 pub(crate) mod control;
 mod ctx;
 mod laser;
+#[cfg(feature = "a2a-bridge")]
+pub(crate) use laser::ReplyLookup;
 pub(crate) mod lease;
 mod memory_handler;
 pub(crate) mod partitioning;

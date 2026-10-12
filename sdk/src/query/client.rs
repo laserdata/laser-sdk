@@ -18,7 +18,7 @@ use laser_wire::validate::Validate;
 use serde::de::DeserializeOwned;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
+use crate::retry::{QUERY_DEADLINE as DEFAULT_QUERY_DEADLINE, QUERY_REPLY_GRACE};
 
 impl Laser {
     /// Start a query over `index`. Returns a fluent builder, finished with
@@ -125,6 +125,7 @@ impl Laser {
             }
             .into());
         }
+        let deadline_micros = query.deadline_micros;
         let request = QueryEnvelope::new(query);
         let payload = encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
@@ -132,7 +133,7 @@ impl Laser {
         // server forwards it to LaserData Cloud over its local socket and returns
         // the `QueryReply` bytes, off the log, no reply topic, no correlation poll.
         let payload = self
-            .send_raw_with_response(AGDX_QUERY_CODE, payload)
+            .send_query_until(AGDX_QUERY_CODE, payload, deadline_micros)
             .await?;
         match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
             QueryReply::Ok(result) => validate_query_result(*result, execution_id),
@@ -141,6 +142,25 @@ impl Laser {
                 "query: unknown reply variant".to_owned(),
             )),
         }
+    }
+
+    /// Send one query request and wait for its reply no longer than the
+    /// query's deadline allows. A deadline further out than
+    /// [`DEFAULT_QUERY_DEADLINE`] is refused, because the reply could not
+    /// come back before the transport stops waiting for it. A timed out wait
+    /// does not mean the query stopped. The server ends it at its deadline.
+    async fn send_query_until(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        deadline_micros: u64,
+    ) -> Result<Vec<u8>, LaserError> {
+        tokio::time::timeout(
+            query_reply_wait(deadline_micros, now_micros())?,
+            self.send_raw_with_response(code, payload),
+        )
+        .await
+        .map_err(|_| LaserError::Timeout("no query reply by the query deadline"))?
     }
 
     /// Retrieve the next cursor page for an executing query.
@@ -163,7 +183,7 @@ impl Laser {
         let payload = encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
         let payload = self
-            .send_raw_with_response(crate::query::AGDX_QUERY_PAGE_CODE, payload)
+            .send_query_until(crate::query::AGDX_QUERY_PAGE_CODE, payload, deadline_micros)
             .await?;
         match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
             QueryReply::Ok(result) => validate_query_result(*result, execution_id),
@@ -282,6 +302,7 @@ impl<'a> QueryRequest<'a> {
 
     /// Set the absolute execution budget from now. The deadline applies to all
     /// pages under this query identity and is never extended by the server.
+    /// The longest budget is 25 seconds. A longer one fails the fetch.
     pub fn deadline(mut self, timeout: Duration) -> Self {
         self.query.deadline_micros = query_deadline(timeout);
         self
@@ -940,6 +961,23 @@ fn query_deadline(timeout: Duration) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn now_micros() -> u64 {
+    query_deadline(Duration::ZERO)
+}
+
+/// How long to wait for the reply to a query due at `deadline_micros`.
+fn query_reply_wait(deadline_micros: u64, now_micros: u64) -> Result<Duration, LaserError> {
+    let remaining = Duration::from_micros(deadline_micros.saturating_sub(now_micros));
+    if remaining > DEFAULT_QUERY_DEADLINE {
+        return Err(LaserError::Invalid(format!(
+            "the query deadline is {}s away, the longest allowed is {}s",
+            remaining.as_secs(),
+            DEFAULT_QUERY_DEADLINE.as_secs()
+        )));
+    }
+    Ok(remaining + QUERY_REPLY_GRACE)
+}
+
 fn decode_row<C, T>(fields: &[laser_wire::schema::LogicalField], row: &Row) -> Result<T, LaserError>
 where
     C: Decoder<T>,
@@ -1106,6 +1144,21 @@ impl<T: DeserializeOwned> TypedQueryRows<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_query_deadlines_when_waiting_then_should_cap_them_and_add_the_grace() {
+        let now = 1_000_000_000;
+        assert_eq!(
+            query_reply_wait(now + 5_000_000, now).unwrap(),
+            Duration::from_secs(5) + QUERY_REPLY_GRACE
+        );
+        assert_eq!(query_reply_wait(now - 1, now).unwrap(), QUERY_REPLY_GRACE);
+        assert!(query_reply_wait(now + DEFAULT_QUERY_DEADLINE.as_micros() as u64, now).is_ok());
+        assert!(matches!(
+            query_reply_wait(now + 60_000_000, now),
+            Err(LaserError::Invalid(_))
+        ));
+    }
 
     #[tokio::test]
     async fn given_an_over_cap_limit_when_executed_then_should_be_invalid_before_any_round_trip() {

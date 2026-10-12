@@ -913,7 +913,8 @@ async fn given_operator_control_when_a_handler_reads_its_session_then_should_see
             canceled,
             PendingControl {
                 pause_requested: false,
-                cancel_requested: true
+                cancel_requested: true,
+                control_conflict: false,
             }
         )
     );
@@ -939,7 +940,8 @@ async fn given_operator_control_when_a_handler_reads_its_session_then_should_see
             paused,
             PendingControl {
                 pause_requested: true,
-                cancel_requested: false
+                cancel_requested: false,
+                control_conflict: false,
             }
         )
     );

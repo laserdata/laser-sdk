@@ -318,18 +318,23 @@ void test("given_two_verified_replies_when_looked_up_then_should_return_the_firs
     agdxReply(correlation, "second", 1n, toolKey)
   ])
   const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
-  assert.equal(new TextDecoder().decode(found?.body), "first")
+  assert.equal(
+    new TextDecoder().decode(found.kind === "found" ? found.envelope.body : undefined),
+    "first"
+  )
 })
 
 void test("given_a_verifier_when_only_an_unsigned_reply_exists_then_should_find_nothing", async () => {
   const correlation = CorrelationId.fromU128(0x0405n)
   const transport = scannedTopic([agdxReply(correlation, "forged-unsigned", 0n)])
-  assert.equal(
-    await findAgdxReply(transport, "stream", "replies", correlation, enrolled()),
-    undefined
-  )
+  assert.deepEqual(await findAgdxReply(transport, "stream", "replies", correlation, enrolled()), {
+    kind: "notFound"
+  })
   const unverified = await findAgdxReply(transport, "stream", "replies", correlation)
-  assert.equal(new TextDecoder().decode(unverified?.body), "forged-unsigned")
+  assert.equal(
+    new TextDecoder().decode(unverified.kind === "found" ? unverified.envelope.body : undefined),
+    "forged-unsigned"
+  )
 })
 
 void test("given_a_forged_reply_before_a_verified_one_when_looked_up_then_should_skip_the_forgery", async () => {
@@ -339,7 +344,10 @@ void test("given_a_forged_reply_before_a_verified_one_when_looked_up_then_should
     agdxReply(correlation, "honest", 1n, toolKey)
   ])
   const found = await findAgdxReply(transport, "stream", "replies", correlation, enrolled())
-  assert.equal(new TextDecoder().decode(found?.body), "honest")
+  assert.equal(
+    new TextDecoder().decode(found.kind === "found" ? found.envelope.body : undefined),
+    "honest"
+  )
 })
 
 void test("given_an_expected_reply_when_dispatched_then_should_take_only_the_requesters_reply_in_its_session", async () => {
@@ -401,5 +409,58 @@ void test("given_a_reply_deeper_than_a_thousand_records_per_pass_when_looked_up_
     }
   }
   const found = await findAgdxReply(transport as LaserTransport, "stream", "replies", correlation)
-  assert.equal(new TextDecoder().decode(found?.body), "deep")
+  assert.equal(
+    new TextDecoder().decode(found.kind === "found" ? found.envelope.body : undefined),
+    "deep"
+  )
+})
+
+void test("given_a_reply_topic_longer_than_the_scan_bound_when_looked_up_then_should_report_incomplete", async () => {
+  const correlation = CorrelationId.fromU128(0x0499n)
+  const other = CorrelationId.fromU128(0x0500n)
+  // Every poll returns another unrelated reply, so the scan never ends.
+  const endless: Pick<LaserTransport, "findTopicPartitionCount" | "pollMessages"> = {
+    findTopicPartitionCount: () => Promise.resolve(1),
+    pollMessages(
+      _streamId: string,
+      _topicId: string,
+      _target: ConsumerTarget,
+      strategy: ConsumerStart
+    ): Promise<readonly PolledMessage[]> {
+      const from = strategy.kind === "offset" ? strategy.value : 0n
+      return Promise.resolve([agdxReply(other, "unrelated", from)])
+    }
+  }
+  assert.deepEqual(
+    await findAgdxReply(endless as LaserTransport, "stream", "replies", correlation),
+    { kind: "incomplete" }
+  )
+})
+
+void test("given_no_waiter_when_the_hub_is_idle_then_should_not_poll_until_a_subscribe", async () => {
+  const polls = { offset: 0 }
+  const transport = fakeTransport([{ strategy: "last", result: [] }])
+  const scripted = transport.pollMessages.bind(transport)
+  // Assigned onto the fake, so its throwing getters are never read.
+  Object.assign(transport, {
+    pollMessages(
+      streamId: string,
+      topicId: string,
+      target: ConsumerTarget,
+      strategy: ConsumerStart
+    ): Promise<readonly PolledMessage[]> {
+      if (strategy.kind === "offset") polls.offset += 1
+      return scripted(streamId, topicId, target, strategy, 1, false)
+    }
+  })
+  const hub = await ReplyHub.create(transport, "stream", "idle")
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(polls.offset, 0, "an idle hub parks")
+    hub.subscribe("corr-idle")
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.notEqual(polls.offset, 0, "a subscribe wakes the dispatcher")
+  } finally {
+    hub.stop()
+  }
 })

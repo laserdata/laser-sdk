@@ -1,3 +1,26 @@
+import { CONSUMER, CONSUMER_FAILURE_BUDGET, backoffDelay } from "../retry.js"
+
+/** The worker a pause runtime started after a late control topic installs
+ * itself into, and the driver it then runs. */
+class LatePause {
+  driver: PauseDriver | undefined
+  readonly worker: Promise<ReliableWorker | undefined>
+  private settle: (worker: ReliableWorker | undefined) => void = () => undefined
+
+  constructor() {
+    this.worker = new Promise((resolve) => {
+      this.settle = resolve
+    })
+  }
+
+  ready(worker: ReliableWorker): void {
+    this.settle(worker)
+  }
+
+  close(): void {
+    this.settle(undefined)
+  }
+}
 import { code } from "../client/error-classify.js"
 import {
   CancelledError,
@@ -67,6 +90,7 @@ import { BudgetGate } from "./budget.js"
 import { ControlBook } from "./control.js"
 import {
   ControlFollower,
+  LateControlFollower,
   PauseDriver,
   PauseRequests,
   PauseRuntime,
@@ -312,6 +336,7 @@ export function isRetryable(error: LaserError): boolean {
     case "graph":
     case "checkpoint":
     case "session":
+    case "command":
       return resultCodeIsRetryable(code(cause))
     case "filter":
       if (cause instanceof ConsumerGroupSetupError) {
@@ -521,16 +546,29 @@ class ReliableWorker {
     await this.deliver(received, false)
   }
 
+  // The pause runtime, set at start or once a missing control topic appears.
+  private latePause: PauseRuntime | undefined
+
+  /** Start holding work through `pause`, a runtime started after a late
+   * control topic appeared. */
+  installPause(pause: PauseRuntime): void {
+    this.latePause ??= pause
+  }
+
+  private pauseRuntime(): PauseRuntime | undefined {
+    return this.options.pause ?? this.latePause
+  }
+
   // Tell the pause runtime which partitions the consumer reads, when it
   // knows.
   observeAssignment(consumer: Consumer): void {
-    this.options.pause?.observeAssignment(consumer[INTERNAL_ASSIGNED_PARTITIONS]())
+    this.pauseRuntime()?.observeAssignment(consumer[INTERNAL_ASSIGNED_PARTITIONS]())
   }
 
   // The consumer was reopened: the pause runtime reads the lane again before
   // the next dispatch.
   invalidatePause(): void {
-    this.options.pause?.invalidate()
+    this.pauseRuntime()?.invalidate()
   }
 
   // Handle one record. A live record passes the pause check, a held record
@@ -582,7 +620,7 @@ class ReliableWorker {
     // the session lane and committed. A resumed session handles its held
     // records first. The session gate stays held through the handler, so a
     // pause acknowledgment follows the record in flight.
-    const pause = this.options.pause
+    const pause = this.pauseRuntime()
     if (!live || pause === undefined) {
       await this.gated(received, message)
       return
@@ -962,7 +1000,7 @@ export class ReliableConsumer {
     if (me !== undefined) await bindAddressee(laser, engine, this.options.topic, group, me)
     const opener = new Opener(laser, this.options.topic, group, pollIntervalMs, engine.native)
     const consumer = await opener.open()
-    let follower: ControlFollower | undefined
+    let follower: ControlFollower | LateControlFollower | undefined
     let started = false
     try {
       if (this.options.warmDedup === true) {
@@ -979,6 +1017,7 @@ export class ReliableConsumer {
       // operator control.
       const book = new ControlBook()
       const requests = new PauseRequests()
+      const late = new LatePause()
       let pause: PauseRuntime | undefined
       const feed =
         this.options.topic === AGENT_CONTROL ? undefined : await loadControl(laser, me, book)
@@ -1012,12 +1051,62 @@ export class ReliableConsumer {
               },
           pollIntervalMs
         )
+      } else if (this.options.topic !== AGENT_CONTROL) {
+        // No control topic yet. Keep looking for it, so operator requests
+        // reach this consumer once it is provisioned, and start the pause
+        // runtime then, recovered from the log first.
+        const agent = this.options.agent
+        const topic = this.options.topic
+        follower = new LateControlFollower(
+          laser,
+          laserTransport(laser),
+          stream,
+          me,
+          book,
+          pollIntervalMs,
+          agent === undefined
+            ? undefined
+            : async (found) => {
+                const source = await sourceTopic(laser, stream, topic)
+                if (source === undefined) return undefined
+                const runtime = new PauseRuntime(
+                  laser,
+                  sessions,
+                  agent,
+                  book,
+                  [found.streamId, found.topicId],
+                  found.truncated,
+                  source,
+                  (session) => {
+                    requests.request(session)
+                  }
+                )
+                const worker = await late.worker
+                if (worker === undefined) return undefined
+                for (let attempt = 1; ; attempt += 1) {
+                  try {
+                    await runtime.recover()
+                    break
+                  } catch {
+                    if (attempt >= CONSUMER_FAILURE_BUDGET) return undefined
+                    await sleep(backoffDelay(CONSUMER, attempt))
+                  }
+                }
+                worker.installPause(runtime)
+                late.driver = new PauseDriver(runtime, worker)
+                requests.attach(late.driver)
+                return (session) => {
+                  requests.request(session)
+                }
+              }
+        )
       }
       started = true
       await this.consume(laser, handler, control, opener, consumer, deduplicator, ids, {
         sessions,
         book,
         requests,
+        late,
         ...(pause !== undefined ? { pause } : {})
       })
     } catch (error) {
@@ -1050,12 +1139,13 @@ export class ReliableConsumer {
       readonly sessions: Sessions
       readonly book: ControlBook
       readonly requests: PauseRequests
+      readonly late: LatePause
       readonly pause?: PauseRuntime
     }
   ): Promise<void> {
     let consumer = first
     const pollIntervalMs = opener.pollIntervalMs
-    const { sessions, book, requests, pause } = sessionRuntime
+    const { sessions, book, requests, late, pause } = sessionRuntime
     const shutdown = shutdownControl(control, this.options.shutdownGraceMs ?? 30_000)
     const runtime = shutdown.runtime
     const worker = new ReliableWorker(
@@ -1087,6 +1177,7 @@ export class ReliableConsumer {
       ids.topicId
     )
     let driver: PauseDriver | undefined
+    late.ready(worker)
     try {
       // Rebuild the pause state from the log before the first dispatch, then
       // let the pause driver bring each session a request names up to date.
@@ -1096,7 +1187,9 @@ export class ReliableConsumer {
         requests.attach(driver)
       }
       control.ready?.()
+      let failures = 0
       for (;;) {
+        const started = Date.now()
         try {
           const concurrency = this.options.concurrency ?? SERIAL_CONCURRENCY
           const running =
@@ -1121,20 +1214,41 @@ export class ReliableConsumer {
           const failure = handlerError(error)
           if (runtime.signal.aborted || runtime.hardAborted() || !isRetryable(failure))
             throw failure
+          // A consumer that ran healthily before failing starts a new budget,
+          // as Rust resets its count on the next record.
+          if (Date.now() - started >= CONSUMER_HEALTHY_RUN_MS) failures = 0
+          failures += 1
+          if (failures >= MAX_CONSECUTIVE_CONSUMER_FAILURES) throw failure
           try {
             await consumer.shutdown()
           } catch {
             // Reconnection continues when the failed consumer cannot leave cleanly.
           }
-          await sleep(pollIntervalMs, runtime.signal)
-          if (shutdown.stopped()) return
-          consumer = await opener.open()
+          // A failed open counts as another failure, so a brief outage during
+          // the reopen is retried within the same budget.
+          for (;;) {
+            await sleep(consumerBackoff(failures), runtime.signal)
+            if (shutdown.stopped()) return
+            try {
+              consumer = await opener.open()
+              break
+            } catch (openError) {
+              const openFailure = handlerError(openError)
+              if (!isRetryable(openFailure)) throw openFailure
+              failures += 1
+              if (failures >= MAX_CONSECUTIVE_CONSUMER_FAILURES) throw openFailure
+            }
+          }
           worker.invalidatePause()
         }
       }
     } finally {
       shutdown.dispose()
-      if (!runtime.hardAborted()) await driver?.stop()
+      late.close()
+      if (!runtime.hardAborted()) {
+        await driver?.stop()
+        await late.driver?.stop()
+      }
       if (runtime.hardAborted()) {
         // The record in flight stays uncommitted. The consumer leaves in the
         // background, so a group-aware member hands its partitions over
@@ -1429,4 +1543,20 @@ async function laserTransportIds(
       topicId: 0
     }
   )
+}
+
+/** Consecutive consumer failures after which a retryable failure is no longer
+ * treated as transient, as Rust `MAX_CONSECUTIVE_POLL_ERRORS`. */
+const MAX_CONSECUTIVE_CONSUMER_FAILURES = CONSUMER_FAILURE_BUDGET
+/** A consumer that ran this long before failing starts a new failure budget. */
+const CONSUMER_HEALTHY_RUN_MS = 5_000
+
+/**
+ * Capped exponential backoff, 50ms doubling to one second, spread over its
+ * upper half so consumers that failed together do not reopen together, as
+ * Rust `backoff_for`.
+ * @internal
+ */
+export function consumerBackoff(attempt: number): number {
+  return backoffDelay(CONSUMER, attempt)
 }

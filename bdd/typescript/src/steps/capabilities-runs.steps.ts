@@ -1,7 +1,29 @@
 import assert from "node:assert/strict";
 import { Given, Then, When } from "@cucumber/cucumber";
-import { InvalidError, code } from "@laserdata/laser-sdk";
+import { CommandExecutionError, FencedLeaseClient, InvalidError, code, isRetryable } from "@laserdata/laser-sdk";
+import { wire } from "@laserdata/laser-sdk/full";
 import type { LaserWorld } from "../world.js";
+
+When("a prepared release receives managed result code {int}", async function (this: LaserWorld, number: number) {
+  const result = wire.resultCodeFromCode(number);
+  const encoded = result.kind === "known" ? wire.resultCodeWord(result) : new Map<string, unknown>([["unrecognized", number]]);
+  const reply = wire.encodeNamed(new Map<string, unknown>([["code", encoded], ["message", "refused"]]));
+  const client = new FencedLeaseClient({send: () => Promise.resolve(reply), reset: () => Promise.resolve()});
+  const operation = client.prepareRelease({v: 1, namespace: "coord", key: new TextEncoder().encode("lease"), leaseToken: 1n, holderId: "worker"});
+  try {
+    await client.release(operation);
+    throw new Error("the command must be refused");
+  } catch (error) {
+    assert.ok(error instanceof CommandExecutionError);
+    this.error = error;
+  }
+});
+
+Then("the command error keeps code {int} and retryability {word}", function (this: LaserWorld, number: number, retryable: string) {
+  assert.ok(this.error instanceof CommandExecutionError);
+  assert.deepEqual(code(this.error), wire.resultCodeFromCode(number));
+  assert.equal(isRetryable(this.error), retryable === "true");
+});
 
 When("I read the negotiated capabilities", async function (this: LaserWorld) {
   this.capabilities = await this.requireLaser().capabilities();

@@ -239,7 +239,7 @@ void test("given_producer_and_generation_fixtures_when_decoded_then_should_prese
   assert.deepEqual(Buffer.from(encodeGraphNodeFrame(node)), Buffer.from(nodeBytes))
   const edgeBytes = await readFixture("graph_edge_producer.bin")
   const edge = decodeGraphEdge(expectMap(decodeOne(edgeBytes, "edge"), "edge"), "edge")
-  assert.equal(edge.producer?.version, "0.7.0")
+  assert.equal(edge.producer?.version, "0.8.0")
   assert.deepEqual(Buffer.from(encodeGraphEdgeFrame(edge)), Buffer.from(edgeBytes))
 })
 

@@ -148,7 +148,7 @@ void test("given_an_err_reply_when_fetch_fails_then_should_wrap_it_as_a_graph_ex
 void test("given_session_lineage_when_upserting_then_should_stamp_only_elements_without_their_own", async () => {
   const { graph: handle, transport } = graph("kg", [okFrame(EMPTY_RESULT)])
   const session = { stream: "agents", session: ConversationId.fromU128(9n) }
-  const producer = { name: "sdk:planner", version: "0.7.0" }
+  const producer = { name: "sdk:planner", version: "0.8.0" }
   const source = { kind: "memory" as const, id: "m-1" }
   const own = { name: "importer", version: "1" }
   const node = graphNodeEntity("host", "node-7")

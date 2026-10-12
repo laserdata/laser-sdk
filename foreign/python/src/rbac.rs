@@ -206,8 +206,9 @@ impl PyLaser {
     }
 
     /// Read a page of the authorization change history. Requires
-    /// `authz:read`. `subject` is `"all"`, `{"role": name}`, or
-    /// `{"binding": {"user_id": id}}`.
+    /// `authz:read`. `subject` is `"all"`, `{"role": name}`,
+    /// `{"binding": {"user_id": id}}`, or `{"stream": name}` for every change
+    /// attributed to one stream.
     #[pyo3(signature = (subject, *, after_revision=None, limit=100))]
     fn authz_history<'py>(
         &self,
@@ -423,8 +424,9 @@ impl From<WhoamiReply> for PyWhoamiReply {
 }
 
 /// One recorded authorization change: its revision, who made it, when, and
-/// what. `op` is `{"role_defined": name}`, `{"role_deleted": name}`, or
-/// `{"roles_bound": {"user_id": id, "roles": [...]}}`.
+/// what. `op` is `{"role_defined": name}`, `{"role_deleted": name}`,
+/// `{"roles_bound": {"user_id": id, "roles": [...]}}`, or
+/// `{"tenancy_set": "deployment" | "stream"}`.
 #[gen_stub_pyclass]
 #[pyclass(name = "AuthzEvent", frozen, skip_from_py_object)]
 #[derive(Clone)]
@@ -436,6 +438,9 @@ pub struct PyAuthzEvent {
     #[pyo3(get)]
     pub at_micros: u64,
     op: AuthzEventKind,
+    /// The one stream the change is attributed to, `None` when none.
+    #[pyo3(get)]
+    pub stream: Option<String>,
 }
 
 #[gen_stub_pymethods]
@@ -455,6 +460,7 @@ impl From<AuthzEvent> for PyAuthzEvent {
             actor: event.actor,
             at_micros: event.at_micros,
             op: event.op,
+            stream: event.stream,
         }
     }
 }

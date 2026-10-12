@@ -4,13 +4,19 @@ import path from "node:path"
 import { test } from "node:test"
 import {
   actionIndex,
+  decodeAuthzEvent,
+  decodeAuthzEventKind,
   decodeAuthzHistoryReq,
   decodeAuthzReply,
+  decodeAuthzSubject,
   decodeBindRolesReq,
   decodeRole,
   delegatedAllow,
+  encodeAuthzEvent,
+  encodeAuthzEventKind,
   encodeAuthzHistoryReq,
   encodeAuthzReply,
+  encodeAuthzSubject,
   encodeBindRolesReq,
   encodeRole,
   featureAction,
@@ -269,4 +275,40 @@ void test("given_a_supervisor_assertion_when_validated_then_should_check_version
       validateSupervisorAssertion(assertion)
     }, message)
   }
+})
+
+void test("given_a_tenancy_event_when_round_tripped_then_should_keep_it", () => {
+  const event = { kind: "tenancySet", tenancy: "stream" } as const
+  assert.deepEqual(
+    decodeAuthzEventKind(
+      decodeOne(encodeNamed(encodeAuthzEventKind(event) as Map<string, unknown>), "event"),
+      "event"
+    ),
+    event
+  )
+})
+
+void test("given_a_stream_subject_and_an_attributed_event_when_round_tripped_then_should_keep_them", () => {
+  const subject = { kind: "stream", stream: "acme" } as const
+  assert.deepEqual(
+    decodeAuthzSubject(
+      decodeOne(encodeNamed(encodeAuthzSubject(subject) as Map<string, unknown>), "subject"),
+      "subject"
+    ),
+    subject
+  )
+  const event = {
+    revision: 3n,
+    actor: "0",
+    atMicros: 1n,
+    op: { kind: "roleDefined", name: "acme-reader" },
+    stream: "acme"
+  } as const
+  assert.deepEqual(
+    decodeAuthzEvent(
+      expectMap(decodeOne(encodeNamed(encodeAuthzEvent(event)), "event"), "event"),
+      "event"
+    ),
+    event
+  )
 })

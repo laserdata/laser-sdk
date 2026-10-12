@@ -121,6 +121,13 @@ void test("given_session_queries_when_decoded_then_should_take_the_stream_from_t
     after: 42n,
     limit: 10
   })
+  const seriesQuery = { after: 42n, limit: 10, series: 0xffff_ffff_ffff_ffffn }
+  const seriesParams = sessionChangesQueryParams(seriesQuery)
+  assert.equal(seriesParams.toString(), "after=42&limit=10&series=18446744073709551615")
+  assert.deepEqual(decodeSessionChangesQuery(seriesParams), seriesQuery)
+  for (const series of ["-1", "x", "18446744073709551616"]) {
+    assert.throws(() => decodeSessionChangesQuery(new URLSearchParams({ series })), CodecError)
+  }
   assert.deepEqual(decodeSessionStateQuery(new URLSearchParams("history_limit=7")), {
     historyLimit: 7
   })

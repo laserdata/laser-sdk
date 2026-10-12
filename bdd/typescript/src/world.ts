@@ -11,10 +11,12 @@ import {
   type LaserError,
   type AgentHandle,
   type MemoryId,
+  type MutationPosition,
   type Session,
   type SessionLease,
 } from "@laserdata/laser-sdk";
 import { randomUUID } from "node:crypto";
+import type { wire } from "@laserdata/laser-sdk/full";
 
 export class LaserWorld {
   readonly endpoint =
@@ -45,12 +47,17 @@ export class LaserWorld {
   query = new QueryEngine();
   queryResult?: QueryResult;
   dataStack = new DataStackModel();
+  bindingBuilder?: wire.ProjectionBindingBuilder;
+  bindingWire?: Map<string, unknown>;
   kv = new KvEngine();
   cas?: CasResult;
+  notedPosition: MutationPosition | undefined;
   graph = new GraphEngine();
   bridgeHops: readonly string[] = [];
   bridgeLoopRejected = false;
   bridgeTaskState?: string;
+  boundTask?: string;
+  boundOutcomes: string[] = [];
   responders: AgentHandle[] = [];
   answered = new Map<string, string[]>();
   bridgeTask?: string;

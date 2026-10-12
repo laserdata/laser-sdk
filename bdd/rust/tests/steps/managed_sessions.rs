@@ -222,6 +222,15 @@ async fn indexed_completed(world: &mut LaserWorld, label: String, owner: String,
     assert!(!info.flags.lane_conflict, "{info:?}");
 }
 
+#[then("the client has seen session positions for the stream")]
+fn seen_session_positions(world: &mut LaserWorld) {
+    let positions = world.managed.laser().seen_positions().sessions;
+    assert!(
+        !positions.is_empty(),
+        "a session read reply carried the session fold's positions"
+    );
+}
+
 #[then(regex = r"^the stream counts (\d+) completed sessions?$")]
 async fn counts_completed(world: &mut LaserWorld, count: u64) {
     let sessions = world.managed.sessions().clone();
@@ -1474,39 +1483,18 @@ async fn refuse_stale_registration(world: &mut LaserWorld) {
 #[when("the session source is explicitly removed and registered again")]
 async fn recover_lane_registration(world: &mut LaserWorld) {
     let laser = world.managed.laser().clone();
-    let stream = world
-        .managed
-        .sessions()
-        .stream()
-        .expect("a stream")
-        .to_owned();
     let id = world
         .session
         .as_ref()
         .expect("a retained session")
         .conversation();
-    let command = laser_sdk::wire::control::ControlEnvelope {
-        v: laser_sdk::wire::codes::CONTROL_OP_VERSION,
-        timestamp_micros: u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_micros(),
-        )
-        .expect("timestamp fits u64"),
-        command: laser_sdk::wire::control::ControlCommand::RemoveSessionSource { stream },
-        stream: None,
-    };
+    // Control goes through the authenticated managed path. A native append to
+    // the control topic is refused by the deployment.
     laser
-        .stream(laser.ops_stream())
-        .topic(laser.control_topic())
-        .send(
-            laser_sdk::wire::framing::encode_named(&command).expect("encode removal"),
-            BTreeMap::new(),
-            Some("control"),
-        )
+        .sessions_with(SessionConfig::new().layout(world.managed.layout.clone()))
+        .unregister()
         .await
-        .expect("publish source removal");
+        .expect("unregister the session source");
     eventually("source registration removal", async || {
         matches!(
             laser.sessions().sources(id).await,

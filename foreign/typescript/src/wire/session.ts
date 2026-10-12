@@ -227,21 +227,30 @@ export interface SessionChanges {
   readonly after: bigint
   /** The page size. Zero leaves it to the server. */
   readonly limit: number
+  /** The change series `after` was read from, absent on a first read. A node
+   * whose series differs answers a resync. */
+  readonly series?: bigint
 }
 
 export function encodeSessionChanges(request: SessionChanges): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["stream", request.stream],
     ["after", encodeU64(request.after, "session changes after")],
     ["limit", encodeU32(request.limit, "session changes limit")]
   ])
+  if (request.series !== undefined) {
+    map.set("series", encodeU64(request.series, "session changes series"))
+  }
+  return map
 }
 
 export function decodeSessionChanges(map: CborMap, context: string): SessionChanges {
+  const series = field.optionalU64(map, "series", context)
   return {
     stream: field.requiredString(map, "stream", context),
     after: field.requiredU64(map, "after", context),
-    limit: field.requiredU32(map, "limit", context)
+    limit: field.requiredU32(map, "limit", context),
+    ...(series === undefined ? {} : { series })
   }
 }
 
@@ -328,6 +337,9 @@ export interface SessionFlags {
   readonly overflow: boolean
   readonly eventsTruncated: boolean
   readonly laneConflict: boolean
+  /** A control record arrived on a partition other than the session's control
+   * route and was not applied. */
+  readonly controlConflict: boolean
   readonly rebuilding: boolean
   /** Liveness is not known yet because the heartbeat tail has not caught up,
    * so `idle` is not meaningful. */
@@ -431,17 +443,30 @@ export interface SessionSourcesView {
   readonly lane?: readonly [number, bigint, number]
 }
 
+/** What made the sessions of one change row change, as Rust `SessionChangeOrigin`. */
+export type SessionChangeOrigin = "records" | "links" | "maintenance" | "expiry"
+
 export interface SessionChangeRow {
   readonly seq: bigint
   readonly sessions: readonly ConversationId[]
+  /**
+   * The records behind the change: the folded records for `records`, the link
+   * source records for `links`, and for `expiry` the folded record whose time
+   * expired the sessions. Empty for `maintenance` and for an expiry the clock
+   * decided.
+   */
   readonly positions: readonly LogPosition[]
   readonly truncated: boolean
+  /** Absent means `records`. */
+  readonly origin?: SessionChangeOrigin
 }
 
 export interface SessionChangesView {
   readonly rows: readonly SessionChangeRow[]
   readonly floor: bigint
   readonly resync: boolean
+  /** The change series these sequence numbers belong to, zero when unnamed. */
+  readonly series: bigint
 }
 
 export type SessionOutcome =
@@ -686,6 +711,7 @@ function encodeFlags(flags: SessionFlags): Map<string, unknown> {
   setTrue(map, "overflow", flags.overflow)
   setTrue(map, "events_truncated", flags.eventsTruncated)
   setTrue(map, "lane_conflict", flags.laneConflict)
+  setTrue(map, "control_conflict", flags.controlConflict)
   setTrue(map, "rebuilding", flags.rebuilding)
   setTrue(map, "liveness_unknown", flags.livenessUnknown)
   return map
@@ -699,6 +725,7 @@ function decodeFlags(map: CborMap | undefined, context: string): SessionFlags {
     overflow: read("overflow"),
     eventsTruncated: read("events_truncated"),
     laneConflict: read("lane_conflict"),
+    controlConflict: read("control_conflict"),
     rebuilding: read("rebuilding"),
     livenessUnknown: read("liveness_unknown")
   }
@@ -954,7 +981,20 @@ function encodeChangeRow(row: SessionChangeRow): Map<string, unknown> {
   ])
   setList(map, "positions", row.positions, logPositionToBytes)
   map.set("truncated", row.truncated)
+  if (row.origin !== undefined && row.origin !== "records") map.set("origin", row.origin)
   return map
+}
+
+const CHANGE_ORIGINS: readonly SessionChangeOrigin[] = ["records", "links", "maintenance", "expiry"]
+
+function decodeChangeOrigin(map: CborMap, context: string): SessionChangeOrigin | undefined {
+  const origin = field.optionalString(map, "origin", context)
+  if (origin === undefined || origin === "records") return undefined
+  const known = CHANGE_ORIGINS.find((word) => word === origin)
+  if (known === undefined) {
+    throw new CodecError(`unknown change origin \`${origin}\``, context, "origin")
+  }
+  return known
 }
 
 function decodeChangeRow(map: CborMap, context: string): SessionChangeRow {
@@ -964,27 +1004,32 @@ function decodeChangeRow(map: CborMap, context: string): SessionChangeRow {
         throw new CodecError(`${key} ${String(index)} must be bytes`, context, key)
       return item
     })
+  const origin = decodeChangeOrigin(map, context)
   return {
     seq: field.requiredU64(map, "seq", context),
     sessions: bytes("sessions").map((item) => ConversationId.fromBytes(item)),
     positions: bytes("positions").map(logPositionFromBytes),
-    truncated: field.requiredBoolean(map, "truncated", context)
+    truncated: field.requiredBoolean(map, "truncated", context),
+    ...(origin === undefined ? {} : { origin })
   }
 }
 
 function encodeChanges(changes: SessionChangesView): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["rows", changes.rows.map(encodeChangeRow)],
     ["floor", encodeU64(changes.floor, "change floor")],
     ["resync", changes.resync]
   ])
+  if (changes.series !== 0n) map.set("series", encodeU64(changes.series, "change series"))
+  return map
 }
 
 function decodeChanges(map: CborMap, context: string): SessionChangesView {
   return {
     rows: readList(map, "rows", context, decodeChangeRow),
     floor: field.requiredU64(map, "floor", context),
-    resync: field.requiredBoolean(map, "resync", context)
+    resync: field.requiredBoolean(map, "resync", context),
+    series: field.optionalU64(map, "series", context) ?? 0n
   }
 }
 

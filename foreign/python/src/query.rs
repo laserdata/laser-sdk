@@ -268,9 +268,10 @@ impl PyQuery {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros();
+        // The default and longest query deadline in the shared retry table.
         let deadline_micros = u64::try_from(now)
             .unwrap_or(u64::MAX)
-            .saturating_add(30_000_000);
+            .saturating_add(25_000_000);
         let query = Query::builder()
             .execution_id(laser_sdk::query::QueryExecutionId::mint())
             .target(target)
@@ -403,7 +404,7 @@ impl PyQuery {
     }
 
     /// Set the execution deadline `timeout_ms` milliseconds from now
-    /// (default 30,000).
+    /// (default and longest 25,000). A longer one fails the fetch.
     fn deadline(mut slf: PyRefMut<'_, Self>, timeout_ms: f64) -> PyResult<PyRefMut<'_, Self>> {
         let wait = crate::convert::duration_ms(timeout_ms, "timeout_ms")?;
         let now = SystemTime::now()
@@ -1381,6 +1382,22 @@ pub fn result_code_http_status(code: &str) -> PyResult<u16> {
 #[pyfunction]
 pub fn result_code_is_retryable(code: &str) -> PyResult<bool> {
     Ok(parse_result_code(code)?.is_retryable())
+}
+
+/// Whether a mutation with this result code name was accepted with an
+/// outcome that is still unknown. Only the same operation identity may repeat it.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn result_code_is_pending(code: &str) -> PyResult<bool> {
+    Ok(parse_result_code(code)?.is_pending())
+}
+
+/// Whether this result code name means the node's own plane did not answer.
+/// The request may still apply, so only the same operation identity repeats it.
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn result_code_is_plane_unavailable(code: &str) -> PyResult<bool> {
+    Ok(parse_result_code(code)?.is_plane_unavailable())
 }
 
 fn parse_execution_id(value: &str) -> PyResult<QueryExecutionId> {

@@ -523,11 +523,6 @@ async fn given_an_expired_key_when_replaying_a_record_signed_in_its_window_then_
     let laser = harness::laser().await;
     let now = now_micros();
     let key = SigningKey::from_bytes(&[61u8; 32]);
-    let mut registry = KeyRegistry::new();
-    registry.enroll_record(
-        KeyRecord::agent("historic", key.verifying_key())
-            .valid_window(now.saturating_sub(3_600_000_000), Some(now + 2_000_000)),
-    );
 
     // The record lands on the log while the key is valid. By the time the
     // consumer replays it the key has expired, so acceptance proves the
@@ -543,7 +538,13 @@ async fn given_an_expired_key_when_replaying_a_record_signed_in_its_window_then_
         .send()
         .await
         .expect("the signed command should publish");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let expires_at = now_micros();
+    let mut registry = KeyRegistry::new();
+    registry.enroll_record(
+        KeyRecord::agent("historic", key.verifying_key())
+            .valid_window(now.saturating_sub(3_600_000_000), Some(expires_at)),
+    );
+    harness::eventually(|| async { (now_micros() > expires_at).then_some(()) }).await;
 
     let principals = Arc::new(Mutex::new(Vec::new()));
     let mut worker = Agent::builder()

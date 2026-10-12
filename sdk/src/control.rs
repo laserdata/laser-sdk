@@ -1,20 +1,12 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
-use bytes::Bytes;
-use laser_wire::codes::CONTROL_OP_VERSION;
+use laser_wire::codes::{AGDX_CONTROL_PUBLISH_CODE, CONTROL_OP_VERSION};
 use laser_wire::control::{ControlCommand, ControlEnvelope};
 use laser_wire::framing::encode_named;
-use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-// Co-locate every control command on one partition so a `RegisterProjection` is
-// applied before the `ApplyBinding` that references it, and a run-source
-// register lands in order with the rest.
-pub(crate) const CONTROL_PARTITION_KEY: &str = "control";
+use laser_wire::result::{CommandError, ResultCode};
 
 impl Laser {
-    /// Publish one durable control command to `<ops>/control.commands`, scoped
-    /// to no stream. Session source registration uses it.
+    /// Submit one control command through the authenticated managed endpoint.
     #[cfg(feature = "agent")]
     pub(crate) async fn publish_control(&self, command: ControlCommand) -> Result<(), LaserError> {
         self.publish_control_in(command, None).await
@@ -28,32 +20,37 @@ impl Laser {
         command: ControlCommand,
         stream: Option<&str>,
     ) -> Result<(), LaserError> {
-        let elapsed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| {
-                LaserError::Invalid(format!("system clock is before the unix epoch: {error}"))
-            })?;
-        let timestamp_micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let capabilities = self.capabilities().await;
+        if !capabilities.managed {
+            return Err(LaserError::unsupported(
+                "control",
+                "control commands require a managed backend",
+            ));
+        }
+        if let Some(versions) = capabilities.versions
+            && versions.control != CONTROL_OP_VERSION
+        {
+            return Err(LaserError::Invalid(format!(
+                "control wire version must be {CONTROL_OP_VERSION}, got {}",
+                versions.control
+            )));
+        }
         let envelope = ControlEnvelope {
             v: CONTROL_OP_VERSION,
-            timestamp_micros,
+            timestamp_micros: 0,
             command,
             stream: stream.map(str::to_owned),
+            stamp: None,
         };
-        let payload = Bytes::from(
-            encode_named(&envelope)
-                .map_err(|error| LaserError::Codec(format!("encode control command: {error}")))?,
-        );
-        let ops_stream = self.ops_stream();
-        let control_topic = self.control_topic();
-        self.send_with_headers_on(
-            &ops_stream,
-            &control_topic,
-            payload,
-            BTreeMap::new(),
-            Some(CONTROL_PARTITION_KEY),
-        )
-        .await
-        .map(|_| ())
+        let payload = encode_named(&envelope)
+            .map_err(|error| LaserError::Codec(format!("encode control command: {error}")))?;
+        let reply = self
+            .send_raw_with_response(AGDX_CONTROL_PUBLISH_CODE, payload)
+            .await?;
+        let reply: CommandError = crate::error::decode_managed_reply(&reply)?;
+        match reply.code {
+            ResultCode::Ok => Ok(()),
+            _ => Err(reply.into()),
+        }
     }
 }

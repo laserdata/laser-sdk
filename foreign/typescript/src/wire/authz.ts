@@ -662,6 +662,8 @@ export type AuthzSubject =
   | { readonly kind: "role"; readonly name: string }
   | { readonly kind: "binding"; readonly userId: number }
   | { readonly kind: "all" }
+  /** Every change attributed to one stream, as Rust `AuthzSubject::Stream`. */
+  | { readonly kind: "stream"; readonly stream: string }
 
 export function encodeAuthzSubject(subject: AuthzSubject): unknown {
   switch (subject.kind) {
@@ -671,6 +673,8 @@ export function encodeAuthzSubject(subject: AuthzSubject): unknown {
       return new Map([["binding", new Map<string, unknown>([["user_id", subject.userId]])]])
     case "all":
       return "all"
+    case "stream":
+      return new Map([["stream", subject.stream]])
   }
 }
 
@@ -686,6 +690,9 @@ export function decodeAuthzSubject(value: unknown, context: string): AuthzSubjec
   if (map.has("binding")) {
     const bindingMap = expectMap(map.get("binding"), context)
     return { kind: "binding", userId: field.requiredU32(bindingMap, "user_id", context) }
+  }
+  if (map.has("stream")) {
+    return { kind: "stream", stream: expectString(map.get("stream"), context) }
   }
   throw new CodecError("authz subject has no recognized tag", context, "subject")
 }
@@ -717,10 +724,14 @@ export function decodeAuthzHistoryReq(map: CborMap, context: string): AuthzHisto
   }
 }
 
+/** How a deployment scopes its managed resources, as Rust `Tenancy`. */
+export type Tenancy = "deployment" | "stream"
+
 export type AuthzEventKind =
   | { readonly kind: "roleDefined"; readonly name: string }
   | { readonly kind: "roleDeleted"; readonly name: string }
   | { readonly kind: "rolesBound"; readonly userId: number; readonly roles: readonly string[] }
+  | { readonly kind: "tenancySet"; readonly tenancy: Tenancy }
 
 export function encodeAuthzEventKind(op: AuthzEventKind): unknown {
   switch (op.kind) {
@@ -738,6 +749,8 @@ export function encodeAuthzEventKind(op: AuthzEventKind): unknown {
           ])
         ]
       ])
+    case "tenancySet":
+      return new Map([["tenancy_set", op.tenancy]])
   }
 }
 
@@ -757,6 +770,13 @@ export function decodeAuthzEventKind(value: unknown, context: string): AuthzEven
       roles: field.requiredArray(boundMap, "roles", context, (item) => expectString(item, context))
     }
   }
+  if (map.has("tenancy_set")) {
+    const tenancy = expectString(map.get("tenancy_set"), context)
+    if (tenancy !== "deployment" && tenancy !== "stream") {
+      throw new CodecError(`unknown tenancy \`${tenancy}\``, context, "tenancy_set")
+    }
+    return { kind: "tenancySet", tenancy }
+  }
   throw new CodecError("authz event has no recognized tag", context, "op")
 }
 
@@ -765,23 +785,29 @@ export interface AuthzEvent {
   readonly actor: string
   readonly atMicros: bigint
   readonly op: AuthzEventKind
+  /** The one stream the change is attributed to, absent when none. */
+  readonly stream?: string
 }
 
 export function encodeAuthzEvent(event: AuthzEvent): Map<string, unknown> {
-  return new Map<string, unknown>([
+  const map = new Map<string, unknown>([
     ["revision", event.revision],
     ["actor", event.actor],
     ["at_micros", event.atMicros],
     ["op", encodeAuthzEventKind(event.op)]
   ])
+  if (event.stream !== undefined) map.set("stream", event.stream)
+  return map
 }
 
 export function decodeAuthzEvent(map: CborMap, context: string): AuthzEvent {
+  const stream = field.optionalString(map, "stream", context)
   return {
     revision: field.requiredU64(map, "revision", context),
     actor: field.requiredString(map, "actor", context),
     atMicros: field.requiredU64(map, "at_micros", context),
-    op: decodeAuthzEventKind(map.get("op"), context)
+    op: decodeAuthzEventKind(map.get("op"), context),
+    ...(stream !== undefined ? { stream } : {})
   }
 }
 

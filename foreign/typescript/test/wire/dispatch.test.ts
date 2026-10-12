@@ -76,7 +76,7 @@ function envelope(record: Case["record"]): AgentEnvelope {
       ? encodeNamed(
           encodeSessionStart({
             agent: planner,
-            sdk: { language: "rust", version: "0.7.0" },
+            sdk: { language: "rust", version: "0.8.0" },
             tags: []
           })
         )

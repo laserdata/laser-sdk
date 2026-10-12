@@ -299,45 +299,68 @@ async fn resolve(
         .map_err(|error| LaserError::Protocol(format!("decode the partition route: {error}")))
 }
 
-// The primary's address on this connection's transport. A node that reports an
-// unspecified address is reached through the host the caller connected to.
+// The primary's address on this connection's transport.
 fn endpoint(connection_string: &str, route: &PollRoutingResponse) -> Result<String, LaserError> {
     let node = ClusterNode::try_from(route.primary.clone())?;
-    let port = match ConnectionStringUtils::parse_protocol(connection_string)? {
-        TransportProtocol::Tcp => node.endpoints.tcp,
-        TransportProtocol::Quic => node.endpoints.quic,
-        TransportProtocol::WebSocket => node.endpoints.websocket,
-        TransportProtocol::Http => 0,
-    };
-    if port == 0 {
-        return Err(LaserError::unsupported_feature(
+    node_endpoint(connection_string, &node).ok_or_else(|| {
+        LaserError::unsupported_feature(
             "filters",
             "primary_routing",
             format!(
                 "partition primary {} serves no binary endpoint for this transport",
                 node.name
             ),
-        ));
+        )
+    })
+}
+
+/// A node's address on this connection's transport, or `None` when it serves
+/// no binary endpoint for it. A node that reports an unspecified address is
+/// reached through the host the caller connected to.
+pub(crate) fn node_endpoint(connection_string: &str, node: &ClusterNode) -> Option<String> {
+    let port = match ConnectionStringUtils::parse_protocol(connection_string).ok()? {
+        TransportProtocol::Tcp => node.endpoints.tcp,
+        TransportProtocol::Quic => node.endpoints.quic,
+        TransportProtocol::WebSocket => node.endpoints.websocket,
+        TransportProtocol::Http => 0,
+    };
+    if port == 0 {
+        return None;
     }
     let host = match node.ip.as_str() {
         "" | "0.0.0.0" | "::" | "[::]" => host_of(connection_string),
         ip => ip,
     };
-    Ok(if host.contains(':') && !host.starts_with('[') {
+    Some(if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
     })
 }
 
-// Dial the primary itself and stay there. An ordinary connect with
-// credentials signs in and then moves to the metadata leader, so the data
-// connection is built without them and signs in on the transport, which never
-// redirects. It does not reconnect: a lost data connection is routed again.
+// Dial the primary itself and stay there. It does not reconnect: a lost data
+// connection is routed again.
 async fn attach(
     connection_string: &str,
     endpoint: &str,
     session: AttachConsumerSessionRequest,
+) -> Result<IggyClient, LaserError> {
+    let client = dial(connection_string, endpoint, ("filters", "primary_routing")).await?;
+    client
+        .send_binary_request(ATTACH_CONSUMER_SESSION_CODE, session.to_bytes())
+        .await?;
+    Ok(client)
+}
+
+/// Dial one node and stay on it. An ordinary connect with credentials signs in
+/// and then moves to the metadata leader, so this connection is built without
+/// them and signs in on the transport, which never redirects. It does not
+/// reconnect. `feature` names the surface in the refusal for an HTTP
+/// connection string.
+pub(crate) async fn dial(
+    connection_string: &str,
+    endpoint: &str,
+    feature: (&'static str, &'static str),
 ) -> Result<IggyClient, LaserError> {
     let address = with_endpoint(connection_string, endpoint);
     let (transport, credentials) = match ConnectionStringUtils::parse_protocol(&address)? {
@@ -376,16 +399,16 @@ async fn attach(
         }
         TransportProtocol::Http => {
             return Err(LaserError::unsupported_feature(
-                "filters",
-                "primary_routing",
-                "primary filtered reads need a binary transport",
+                feature.0,
+                feature.1,
+                "a dedicated node connection needs a binary transport",
             ));
         }
     };
     let client = IggyClient::new(transport);
     tokio::time::timeout(CONNECT_TIMEOUT, client.connect())
         .await
-        .map_err(|_| LaserError::Timeout("the partition primary to accept a data connection"))??;
+        .map_err(|_| LaserError::Timeout("a cluster node to accept a dedicated connection"))??;
     {
         let transport = client.client();
         let transport = transport.read().await;
@@ -403,9 +426,6 @@ async fn attach(
             AutoLogin::Disabled => {}
         }
     }
-    client
-        .send_binary_request(ATTACH_CONSUMER_SESSION_CODE, session.to_bytes())
-        .await?;
     Ok(client)
 }
 

@@ -63,6 +63,8 @@ pub mod laser;
     feature = "rbac"
 ))]
 mod managed;
+#[cfg(feature = "streaming")]
+mod managed_route;
 #[cfg(feature = "mcp-bridge")]
 pub mod mcp;
 #[cfg(feature = "agent")]
@@ -80,6 +82,7 @@ mod publish_options;
 pub mod query;
 #[cfg(feature = "rbac")]
 pub mod rbac;
+mod retry;
 #[cfg(feature = "schema-codecs")]
 pub mod schema_codecs;
 #[cfg(feature = "sign")]

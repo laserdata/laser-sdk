@@ -29,6 +29,7 @@ def with_fields(error, **fields):
         ("RejectedError", "LaserError"),
         ("AmbiguousMutationError", "LaserError"),
         ("StateStoreError", "LaserError"),
+        ("CommandError", "LaserError"),
         ("CheckpointError", "LaserError"),
         ("FilterFaultError", "FilterError"),
         ("FilterOversizedRecordError", "FilterError"),
@@ -94,6 +95,33 @@ def test_given_a_binding_validation_failure_when_raised_then_should_carry_code_a
         ls.Filter.pred("cpu", "almost", 90)
     assert failure.value.code == "InvalidArgument"
     assert failure.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("wire_code", "code", "retryable", "flag"),
+    [
+        ("conflict", "Conflict", False, None),
+        ("target_unavailable", "TargetUnavailable", True, "unavailable"),
+        ("forbidden", "Forbidden", False, "permission_denied"),
+        ("not_found", "NotFound", False, "not_found"),
+        ("version_skew", "VersionSkew", False, "version_skew"),
+        ("pending", "Pending", False, None),
+        ({"unrecognized": 42}, "Unrecognized(42)", False, None),
+    ],
+)
+async def test_given_a_command_error_when_it_crosses_rust_then_should_preserve_code_and_classifiers(
+    wire_code, code, retryable, flag
+):
+    raised = with_fields(
+        ls.CommandError("refused"), detail={"code": wire_code, "message": "refused"}
+    )
+    memory = ls.MemoryHandle.vector(raised_by(raised))
+    with pytest.raises(ls.CommandError) as failure:
+        await memory.remember("value")
+    assert failure.value.code == code
+    assert failure.value.retryable is retryable
+    if flag is not None:
+        assert getattr(failure.value, flag)
 
 
 @pytest.mark.parametrize(

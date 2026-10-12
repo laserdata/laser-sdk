@@ -529,15 +529,32 @@ impl Session {
                 record.id.offset,
             )
         });
-        let (state, last) = crate::agent::control::fold(records.iter().filter_map(|record| {
-            let request =
-                crate::agent::control::control_request(record.envelope.as_ref()?, me.as_ref())?;
-            Some(((record.id.partition_id, record.id.offset), request))
-        }));
+        let route = self.control_route().await?;
+        let (state, last) = crate::agent::control::fold(
+            records.iter().filter_map(|record| {
+                let request =
+                    crate::agent::control::control_request(record.envelope.as_ref()?, me.as_ref())?;
+                Some(((record.id.partition_id, record.id.offset), request))
+            }),
+            route,
+        );
         Ok(match &self.control {
             Some(book) => book.install(conversation, state, last),
             None => state,
         })
+    }
+
+    // The agent.control partition this session's control records belong on,
+    // `None` while the topic does not exist.
+    async fn control_route(&self) -> Result<Option<u32>, LaserError> {
+        let stream = iggy::prelude::Identifier::named(self.laser.stream_required()?)?;
+        let topic = iggy::prelude::Identifier::named(laser_wire::topics::AGENT_CONTROL)?;
+        let details =
+            iggy::prelude::TopicClient::get_topic(self.laser.client().as_ref(), &stream, &topic)
+                .await?;
+        Ok(details.and_then(|details| {
+            crate::agent::control::control_partition(self.conversation(), details.partitions_count)
+        }))
     }
 
     /// The session's state document.

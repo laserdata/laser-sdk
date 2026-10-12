@@ -247,7 +247,10 @@ impl ProducerBuilder {
             retries: Some(publish.max_retries),
             retry_interval: Some(publish.retry_backoff),
             routing: Routing::Balanced,
-            create_stream: true,
+            // A producer never creates a stream unless asked. A governed
+            // identity has no stream-wide create right, and a stream is
+            // provisioned with its tenant.
+            create_stream: false,
             create_topic: true,
             partitions: 1,
             expire_after: None,
@@ -289,6 +292,9 @@ impl ProducerBuilder {
         self
     }
 
+    /// Create the stream on init when it does not exist. Off by default: a
+    /// stream is provisioned with its tenant, and a scoped identity may not
+    /// create one. A refused create on an existing stream still proceeds.
     #[must_use]
     pub fn create_stream(mut self, create: bool) -> Self {
         self.create_stream = create;

@@ -38,7 +38,7 @@ mod progress;
 #[cfg(feature = "streaming")]
 pub(crate) mod reader;
 #[cfg(feature = "streaming")]
-mod route;
+pub(crate) mod route;
 #[cfg(feature = "streaming")]
 pub use client::{DEFAULT_OUTCOME_WAIT, FilterPreviewBuilder};
 #[cfg(feature = "filters")]

@@ -30,6 +30,15 @@ pub struct ForwardedQuery {
     /// (the default, skipped on the wire) when authorization is not in effect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<crate::authz::Grant>,
+    /// The tenancy of the server's replicated authorization state. The
+    /// backend refuses a frame whose tenancy differs from its own.
+    #[serde(default, skip_serializing_if = "crate::authz::Tenancy::is_deployment")]
+    pub tenancy: crate::authz::Tenancy,
+    /// The stream of the queried index, stamped once the caller's native read
+    /// authority over it was checked. The backend refuses a query of a
+    /// stream-scoped index that arrives without this scope or with another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ForwardedScope>,
 }
 
 /// A forwarded keyed managed command (registry browse, key-value, forks). Unlike
@@ -68,6 +77,35 @@ pub struct ForwardedCommand {
     /// (the default, skipped on the wire) when authorization is not in effect.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<crate::authz::Grant>,
+    /// Set by the server when the client wrapped this read in a
+    /// [`crate::mutation::ManagedReadEnvelope`]. The backend answers only once
+    /// its fold has reached the surface's mutation log head.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_barrier: bool,
+    /// Set by the server from [`crate::mutation::ManagedReadEnvelope`]: the
+    /// backend answers only once its fold for the read's surface has applied
+    /// this position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_position: Option<crate::mutation::MutationPosition>,
+    /// Set by the server for a managed request an SDK client sent over the
+    /// binary protocol. The backend answers with a
+    /// [`crate::mutation::ManagedReplyEnvelope`] carrying its applied
+    /// frontier.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub positioned_reply: bool,
+    /// Set by the server from [`crate::mutation::ManagedReadEnvelope`]: the
+    /// session positions a session read must find applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub min_sessions: Vec<crate::mutation::SessionPosition>,
+    /// The tenancy of the server's replicated authorization state. The
+    /// backend refuses a frame whose tenancy differs from its own.
+    #[serde(default, skip_serializing_if = "crate::authz::Tenancy::is_deployment")]
+    pub tenancy: crate::authz::Tenancy,
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate")]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(all(test, feature = "cbor"))]
@@ -94,6 +132,8 @@ mod tests {
             correlation: Some("conv-1".to_owned()),
             query_envelope: vec![0x90; 5],
             grants: Vec::new(),
+            tenancy: Default::default(),
+            scope: None,
         })
         .expect("encodes");
         assert!(
@@ -105,6 +145,11 @@ mod tests {
     #[test]
     fn given_forwarded_command_when_encoded_then_payload_rides_as_a_byte_string() {
         let frame = encode_named(&ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
             user_id: 7,
             client_id: 42,
             correlation: None,
@@ -130,12 +175,23 @@ mod tests {
             correlation: Some("c".to_owned()),
             query_envelope: vec![0xff, 0x00, 0x18, 0x7f],
             grants: Vec::new(),
+            tenancy: Default::default(),
+            scope: Some(ForwardedScope {
+                stream_id: 3,
+                stream: "acme".to_owned(),
+                stream_created_at_micros: 9,
+            }),
         };
         let back: ForwardedQuery =
             decode_named(&encode_named(&query).expect("encodes")).expect("decodes");
         assert_eq!(back, query);
 
         let command = ForwardedCommand {
+            read_barrier: false,
+            min_position: None,
+            positioned_reply: false,
+            min_sessions: Vec::new(),
+            tenancy: Default::default(),
             user_id: 2,
             client_id: 9,
             correlation: None,

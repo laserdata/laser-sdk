@@ -170,8 +170,13 @@ impl PyA2aBridge {
     /// become the card's skills. `signing_key` signs the published task
     /// envelopes. Every record the bridge publishes carries its `bridge_hops`
     /// loop-guard path, starting at `source`.
+    ///
+    /// `task_binding_key` (32 bytes) with `task_binding_ttl_ms` binds every
+    /// task id to the caller that submitted it, as Rust `with_task_binding`.
+    /// Task methods then need `caller`, the authenticated principal.
     #[new]
-    #[pyo3(signature = (laser, source, request_topic, reply_topic, *, capabilities=None, signing_key=None))]
+    #[pyo3(signature = (laser, source, request_topic, reply_topic, *, capabilities=None, signing_key=None, task_binding_key=None, task_binding_ttl_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         laser: PyRef<'_, PyLaser>,
         source: String,
@@ -179,6 +184,8 @@ impl PyA2aBridge {
         reply_topic: String,
         capabilities: Option<Vec<Bound<'_, PyAny>>>,
         signing_key: Option<PyRef<'_, crate::sign::PySigningKey>>,
+        task_binding_key: Option<Vec<u8>>,
+        task_binding_ttl_ms: Option<f64>,
     ) -> PyResult<Self> {
         let mut bridge = A2aBridge::new(
             laser.inner.clone(),
@@ -197,21 +204,48 @@ impl PyA2aBridge {
         if let Some(key) = signing_key {
             bridge = bridge.with_signing_key(key.inner.as_ref().clone());
         }
+        match (task_binding_key, task_binding_ttl_ms) {
+            (None, None) => {}
+            (Some(key), Some(ttl_ms)) => {
+                let key: [u8; 32] = key.try_into().map_err(|_| {
+                    crate::errors::InvalidError::new_err("task_binding_key must be 32 bytes")
+                })?;
+                if !(ttl_ms.is_finite() && ttl_ms > 0.0) {
+                    return Err(crate::errors::InvalidError::new_err(
+                        "task_binding_ttl_ms must be a positive number",
+                    ));
+                }
+                bridge = bridge
+                    .with_task_binding(key, std::time::Duration::from_secs_f64(ttl_ms / 1000.0));
+            }
+            _ => {
+                return Err(crate::errors::InvalidError::new_err(
+                    "task_binding_key and task_binding_ttl_ms go together",
+                ));
+            }
+        }
         Ok(Self {
             inner: Held::new(bridge),
             source,
         })
     }
 
+    /// Handle one A2A JSON-RPC request. `caller` is the authenticated
+    /// principal, required when the bridge binds tasks to callers.
+    #[pyo3(signature = (request, *, caller=None))]
     fn handle_rpc<'py>(
         &self,
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
+        caller: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         let request = py_to_json(request)?;
         future_into_py(py, async move {
-            let response = bridge.handle_rpc(request).await;
+            let response = match caller {
+                Some(caller) => bridge.caller(caller).handle_rpc(request).await,
+                None => bridge.handle_rpc(request).await,
+            };
             Python::attach(|py| ser_to_py(py, &response))
         })
     }
@@ -220,20 +254,25 @@ impl PyA2aBridge {
     /// task and return the submitted task as a dict. `target` addresses the
     /// task to one agent. Without it every agent on a shared session topic
     /// receives the task.
-    #[pyo3(signature = (params_json, *, target=None))]
+    #[pyo3(signature = (params_json, *, target=None, caller=None))]
     fn submit<'py>(
         &self,
         py: Python<'py>,
         params_json: &Bound<'_, PyAny>,
         target: Option<String>,
+        caller: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         let params = json_arg(params_json)?;
         let target = target_agent(target)?;
         future_into_py(py, async move {
-            let task = match target {
-                Some(target) => bridge.submit_to(target, params).await,
-                None => bridge.submit(params).await,
+            let task = match (target, caller) {
+                (Some(target), Some(caller)) => {
+                    bridge.caller(caller).submit_to(target, params).await
+                }
+                (None, Some(caller)) => bridge.caller(caller).submit(params).await,
+                (Some(target), None) => bridge.submit_to(target, params).await,
+                (None, None) => bridge.submit(params).await,
             }
             .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &task))
@@ -243,7 +282,7 @@ impl PyA2aBridge {
     /// `SendMessage` as a child session of `parent`, in the tree rooted at
     /// `root` (the parent when omitted). The handling agent ends the child.
     /// `target` addresses the task to one agent, as in `submit`.
-    #[pyo3(signature = (parent, params_json, *, root=None, target=None))]
+    #[pyo3(signature = (parent, params_json, *, root=None, target=None, caller=None))]
     fn submit_in<'py>(
         &self,
         py: Python<'py>,
@@ -251,6 +290,7 @@ impl PyA2aBridge {
         params_json: &Bound<'_, PyAny>,
         root: Option<String>,
         target: Option<String>,
+        caller: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         let params = json_arg(params_json)?;
@@ -258,29 +298,59 @@ impl PyA2aBridge {
             crate::agent_runtime::parent_pair(Some(parent), root)?.expect("a parent was given");
         let target = target_agent(target)?;
         future_into_py(py, async move {
-            let task = match target {
-                Some(target) => bridge.submit_in_to(target, parent, root, params).await,
-                None => bridge.submit_in(parent, root, params).await,
+            let task = match (target, caller) {
+                (Some(target), Some(caller)) => {
+                    bridge
+                        .caller(caller)
+                        .submit_in_to(target, parent, root, params)
+                        .await
+                }
+                (None, Some(caller)) => bridge.caller(caller).submit_in(parent, root, params).await,
+                (Some(target), None) => bridge.submit_in_to(target, parent, root, params).await,
+                (None, None) => bridge.submit_in(parent, root, params).await,
             }
             .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &task))
         })
     }
 
-    /// `GetTask`: the task's current state (Working until an answer lands).
-    fn task<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+    /// `GetTask`: the task's current state (Working until an answer lands,
+    /// Unknown when the bounded lookup could not reach the end of the reply
+    /// topic). `caller` is required when the bridge binds tasks to callers.
+    #[pyo3(signature = (id, *, caller=None))]
+    fn task<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+        caller: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         future_into_py(py, async move {
-            let task = bridge.task(&id).await.map_err(to_pyerr)?;
+            let task = match caller {
+                Some(caller) => bridge.caller(caller).task(&id).await,
+                None => bridge.task(&id).await,
+            }
+            .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &task))
         })
     }
 
-    /// `CancelTask`: cancel the task and return it canceled.
-    fn cancel<'py>(&self, py: Python<'py>, id: String) -> PyResult<Bound<'py, PyAny>> {
+    /// `CancelTask`: cancel the task and return it canceled. `caller` is
+    /// required when the bridge binds tasks to callers.
+    #[pyo3(signature = (id, *, caller=None))]
+    fn cancel<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+        caller: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let bridge = self.inner.get();
         future_into_py(py, async move {
-            let task = bridge.cancel(&id).await.map_err(to_pyerr)?;
+            let task = match caller {
+                Some(caller) => bridge.caller(caller).cancel(&id).await,
+                None => bridge.cancel(&id).await,
+            }
+            .map_err(to_pyerr)?;
             Python::attach(|py| ser_to_py(py, &task))
         })
     }

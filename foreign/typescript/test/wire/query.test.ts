@@ -9,8 +9,10 @@ import {
   consistencyGateCheck,
   consistencyIsEventual,
   decodeQueryEnvelope,
+  decodeQueryResult,
   decodeQueryEnvelopeFrame,
   encodeQueryEnvelopeFrame,
+  encodeQueryResult,
   newQuery,
   operationalQuery,
   operationalTarget,
@@ -75,7 +77,8 @@ void test("typed result rows are positional and preserve non-string values", () 
       elapsedMicros: 1n,
       scannedBytes: 2n,
       producedBytes: 3n,
-      rowCount: 1n
+      rowCount: 1n,
+      frontier: []
     }
   }
   const row = result.rows[0]
@@ -92,6 +95,50 @@ void test("typed result rows are positional and preserve non-string values", () 
   assert.equal(queryResultValueI64(result, row, "cpu"), 42n)
   assert.equal(queryResultValueI64(result, row, "payload"), undefined)
   validateQueryResult(result)
+})
+
+void test("given_a_query_reply_with_a_frontier_when_round_tripped_then_should_keep_each_position", () => {
+  const executionId = QueryExecutionId.fromU128(9n)
+  const result: QueryResult = {
+    fields: [{ id: 1, name: "cpu", required: true, fieldType: { kind: "long" } }],
+    rows: [],
+    page: { offset: 0n, limit: 50, hasMore: false },
+    context: {
+      executionId,
+      engine: { name: "embedded", version: "1" },
+      resolvedTarget: {
+        kind: "operational",
+        index: "readings",
+        backendResourceId: BackendResourceId.fromU128(3n),
+        backendGeneration: 1n,
+        runtimeConfigurationRevision: 1n
+      },
+      requestedConsistency: "eventual",
+      deliveredConsistency: "eventual",
+      truncated: false,
+      elapsedMicros: 1n,
+      scannedBytes: 0n,
+      producedBytes: 0n,
+      rowCount: 0n,
+      frontier: [
+        {
+          stream: "telemetry",
+          topic: "readings",
+          partitionId: 2,
+          topicCreatedAtMicros: 77n,
+          appliedOffset: 41n
+        },
+        { stream: "telemetry", topic: "readings", partitionId: 3, appliedOffset: 5n }
+      ]
+    }
+  }
+  const decoded = decodeQueryResult(encodeQueryResult(result), "result")
+  assert.deepEqual(decoded.context.frontier, result.context.frontier)
+  const plain = decodeQueryResult(
+    encodeQueryResult({ ...result, context: { ...result.context, frontier: [] } }),
+    "result"
+  )
+  assert.deepEqual(plain.context.frontier, [])
 })
 
 void test("query validation rejects ambiguous requests and malformed replies", () => {
@@ -125,7 +172,8 @@ void test("query validation rejects ambiguous requests and malformed replies", (
       elapsedMicros: 1n,
       scannedBytes: 1n,
       producedBytes: 1n,
-      rowCount: 0n
+      rowCount: 0n,
+      frontier: []
     }
   }
   assert.throws(() => {

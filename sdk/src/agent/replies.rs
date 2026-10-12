@@ -25,6 +25,9 @@ struct ReplyHubInner {
     // Correlation -> the one-shot completing that request. A reply for an unknown
     // correlation (already completed, or never waited) is dropped.
     waiters: DashMap<String, ReplyWaiter>,
+    // Woken by every subscribe, so an idle dispatcher parks instead of
+    // polling the reply topic with nobody waiting.
+    subscribed: tokio::sync::Notify,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "sign")]
     verifier: Option<Arc<crate::sign::KeyRegistry>>,
@@ -133,6 +136,7 @@ impl ReplyHub {
         }
         let inner = Arc::new(ReplyHubInner {
             waiters: DashMap::new(),
+            subscribed: tokio::sync::Notify::new(),
             task: std::sync::Mutex::new(None),
             #[cfg(feature = "sign")]
             verifier,
@@ -176,6 +180,7 @@ impl ReplyHub {
                 expected_signer,
             },
         );
+        self.inner.subscribed.notify_one();
         ReplyTicket {
             hub: Arc::downgrade(&self.inner),
             correlation,
@@ -242,6 +247,9 @@ impl Drop for ReplyTicket {
 // Poll the reply topic forward and dispatch each record to its waiter. Holds only
 // a `Weak` to the hub, upgrading per pass, so the task exits once the last `Laser`
 // clone (and any outstanding ticket) is gone.
+/// How often a parked dispatcher checks that its hub still exists.
+const IDLE_HUB_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn dispatch_loop(
     client: Arc<IggyClient>,
     stream: Identifier,
@@ -254,6 +262,17 @@ async fn dispatch_loop(
         let Some(inner) = hub.upgrade() else {
             return;
         };
+        // Nobody waits: park until a subscribe. The permit `notify_one`
+        // stores covers a subscribe that lands before this wait starts.
+        if inner.waiters.is_empty() {
+            let parked = async {
+                inner.subscribed.notified().await;
+            };
+            // Wake now and then to notice a hub that was dropped while idle.
+            let _ = tokio::time::timeout(IDLE_HUB_CHECK, parked).await;
+            drop(inner);
+            continue;
+        }
         // The reply topic may not exist at creation (a fan-out reply topic is
         // created by the first reply), so resolve partitions each pass until it is.
         let partitions = match client.get_topic(&stream, &topic).await {

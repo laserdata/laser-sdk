@@ -1,7 +1,9 @@
+import { blake3 } from "@noble/hashes/blake3.js"
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js"
 import { publicErrorMessage } from "../client/error-classify.js"
 import { startChild } from "../agent/contract.js"
 import { findAgdxReply } from "../agent/replies.js"
-import { CodecError, HandlerConfigError, NoStreamError } from "../client/errors.js"
+import { CodecError, HandlerConfigError, InvalidError, NoStreamError } from "../client/errors.js"
 import { INTERNAL_TRANSPORT, INTERNAL_VERIFIER } from "../client/internals.js"
 import type { Laser } from "../client/laser.js"
 import { AgentTopic } from "../provenance/agent-topic.js"
@@ -190,18 +192,133 @@ function paramsBytes(paramsJson: unknown): Uint8Array {
       : jsonBytes(paramsJson, "A2A message params")
 }
 
-function submittedTask(task: ConversationId): Task {
+function submittedTask(id: string): Task {
   return {
-    id: task.toString(),
+    id,
     status: { state: { kind: "known", name: "Submitted" } },
     artifacts: []
   }
 }
 
+const TASK_BINDING_DOMAIN = new TextEncoder().encode("laserdata a2a task v1\0")
+
+function u64Le(value: bigint): Uint8Array {
+  const bytes = new Uint8Array(8)
+  new DataView(bytes.buffer).setBigUint64(0, BigInt.asUintN(64, value), true)
+  return bytes
+}
+
+function u128Le(value: bigint): Uint8Array {
+  const bytes = new Uint8Array(16)
+  bytes.set(u64Le(value), 0)
+  bytes.set(u64Le(value >> 64n), 8)
+  return bytes
+}
+
+/** The keyed digest a bound task id carries: the caller, the stream
+ * generation, the conversation and the expiry, so an id works only for its
+ * caller, on the stream incarnation it was made on, until it expires. The
+ * layout matches the Rust SDK byte for byte. */
+export function taskBindingMac(
+  key: Uint8Array,
+  caller: string,
+  streamGeneration: bigint,
+  task: ConversationId,
+  expiresMicros: bigint
+): Uint8Array {
+  const callerBytes = new TextEncoder().encode(caller)
+  const parts = [
+    TASK_BINDING_DOMAIN,
+    u64Le(BigInt(callerBytes.byteLength)),
+    callerBytes,
+    u64Le(streamGeneration),
+    u128Le(task.asU128()),
+    u64Le(expiresMicros)
+  ]
+  const message = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0))
+  let offset = 0
+  for (const part of parts) {
+    message.set(part, offset)
+    offset += part.byteLength
+  }
+  return blake3(message, { key })
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false
+  let difference = 0
+  for (let index = 0; index < left.byteLength; index += 1)
+    difference |= (left[index] ?? 0) ^ (right[index] ?? 0)
+  return difference === 0
+}
+
+function nowMicros(): bigint {
+  return BigInt(Date.now()) * 1000n
+}
+
+function unboundCaller(): HandlerConfigError {
+  return new HandlerConfigError(
+    "this bridge binds tasks to callers, so the request needs an authenticated caller"
+  )
+}
+
+interface TaskBinding {
+  readonly key: Uint8Array
+  readonly ttlMicros: bigint
+}
+
+/** The bridge acting for one authenticated caller. Build it with
+ * `A2aBridge.caller`. */
+export class A2aCaller {
+  /** @internal */
+  constructor(
+    private readonly bridge: A2aBridge,
+    private readonly principal: string
+  ) {}
+
+  /** `A2aBridge.submit` for this caller. */
+  async submit(paramsJson: unknown, options: { readonly target?: AgentId } = {}): Promise<Task> {
+    return this.bridge[SUBMIT_FOR](paramsJson, undefined, options.target, this.principal)
+  }
+
+  /** `A2aBridge.submitIn` for this caller. */
+  async submitIn(
+    parent: ConversationId,
+    root: ConversationId,
+    paramsJson: unknown,
+    options: { readonly target?: AgentId } = {}
+  ): Promise<Task> {
+    return this.bridge[SUBMIT_FOR](paramsJson, { parent, root }, options.target, this.principal)
+  }
+
+  /** `A2aBridge.task` for this caller. Another caller's task id answers like
+   * an unknown one. */
+  async task(id: string): Promise<Task> {
+    return this.bridge[TASK_FOR](id, this.principal)
+  }
+
+  /** `A2aBridge.cancel` for this caller. Another caller's task id is refused
+   * before anything is published. */
+  async cancel(id: string): Promise<Task> {
+    return this.bridge[CANCEL_FOR](id, this.principal)
+  }
+
+  /** `A2aBridge.handleRpc` for this caller. */
+  async handleRpc(input: unknown): Promise<JsonRpcResponse> {
+    return this.bridge[HANDLE_RPC_FOR](input, this.principal)
+  }
+}
+
+const SUBMIT_FOR = Symbol("a2a submit for caller")
+const TASK_FOR = Symbol("a2a task for caller")
+const CANCEL_FOR = Symbol("a2a cancel for caller")
+const HANDLE_RPC_FOR = Symbol("a2a handle rpc for caller")
+
 export class A2aBridge {
   private capabilities: readonly CapabilityDescriptor[] = []
   private signingKey: SigningKey | undefined
   private hops: readonly string[]
+  private taskBinding: TaskBinding | undefined
 
   constructor(
     private readonly laser: Laser,
@@ -227,12 +344,95 @@ export class A2aBridge {
     return this
   }
 
+  /** Bind every task id to the caller that submitted it, keyed with the
+   * 32-byte `key` and valid for `ttlMs`. A bound id names the caller, the
+   * stream incarnation, the conversation and an expiry under a keyed digest,
+   * so another caller cannot read or cancel the task. Once set, task
+   * operations need a caller: use `caller`. */
+  withTaskBinding(key: Uint8Array, ttlMs: number): this {
+    if (key.byteLength !== 32) throw new InvalidError("the task binding key must be 32 bytes")
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0)
+      throw new InvalidError("the task binding ttl must be a positive number")
+    this.taskBinding = { key: key.slice(), ttlMicros: BigInt(Math.ceil(ttlMs * 1000)) }
+    return this
+  }
+
+  /** The bridge acting for one authenticated caller. */
+  caller(principal: string): A2aCaller {
+    return new A2aCaller(this, principal)
+  }
+
+  // The creation time of the bridge's stream, which tells a recreated stream
+  // apart from the one a task id was made on.
+  private async streamGeneration(): Promise<bigint> {
+    const stream = this.laser.defaultStream
+    if (stream === undefined) {
+      throw new NoStreamError(
+        "an A2A task binding requires a default stream, use connectWithStream() or withDefaultStream()"
+      )
+    }
+    const transport = this.laser[INTERNAL_TRANSPORT]()
+    if (transport.findSnapshotStream === undefined)
+      throw new HandlerConfigError("the A2A task binding needs the stream creation time")
+    const details = await transport.findSnapshotStream(stream)
+    if (details === undefined) throw new HandlerConfigError("the bridge stream does not exist")
+    return details.createdAtMicros
+  }
+
+  // The id a new task is known by.
+  private async taskId(task: ConversationId, caller: string | undefined): Promise<string> {
+    const binding = this.taskBinding
+    if (binding === undefined) return task.toString()
+    if (caller === undefined) throw unboundCaller()
+    const generation = await this.streamGeneration()
+    const expires = BigInt.asUintN(64, nowMicros() + binding.ttlMicros)
+    const mac = taskBindingMac(binding.key, caller, generation, task, expires)
+    return `${task.toString()}.${expires.toString()}.${bytesToHex(mac)}`
+  }
+
+  // The conversation a task id names, refused like a malformed id when it is
+  // not this caller's, expired, or from another stream incarnation.
+  private async openTask(id: string, caller: string | undefined): Promise<ConversationId> {
+    const invalid = (cause?: unknown) =>
+      new HandlerConfigError(`invalid task id \`${id}\``, cause === undefined ? {} : { cause })
+    const binding = this.taskBinding
+    if (binding === undefined) {
+      try {
+        return ConversationId.parse(id)
+      } catch (cause) {
+        throw invalid(cause)
+      }
+    }
+    if (caller === undefined) throw unboundCaller()
+    const parts = id.split(".")
+    if (parts.length !== 3) throw invalid()
+    const [taskText, expiresText, macText] = parts as [string, string, string]
+    let task: ConversationId
+    let expires: bigint
+    let mac: Uint8Array
+    try {
+      task = ConversationId.parse(taskText)
+      if (!/^[0-9]{1,20}$/.test(expiresText)) throw new Error("expiry is not a u64")
+      expires = BigInt(expiresText)
+      if (expires > 0xffff_ffff_ffff_ffffn) throw new Error("expiry is not a u64")
+      if (!/^[0-9a-fA-F]{64}$/.test(macText)) throw new Error("digest is not 32 bytes of hex")
+      mac = hexToBytes(macText)
+    } catch (cause) {
+      throw invalid(cause)
+    }
+    if (expires < nowMicros()) throw invalid()
+    const generation = await this.streamGeneration()
+    if (!sameBytes(taskBindingMac(binding.key, caller, generation, task, expires), mac))
+      throw invalid()
+    return task
+  }
+
   /** Publishes the params as a task. Raw JSON as bytes or a string rides
    * byte-identical, any other value is encoded as JSON first. `target`
    * addresses the task to one agent. Without it every agent on a shared
    * session topic receives the task. */
   async submit(paramsJson: unknown, options: { readonly target?: AgentId } = {}): Promise<Task> {
-    return this.submitAddressed(paramsJson, undefined, options.target)
+    return this[SUBMIT_FOR](paramsJson, undefined, options.target, undefined)
   }
 
   /** `submit` as a child session of `parent`, in the tree rooted at `root`:
@@ -246,15 +446,20 @@ export class A2aBridge {
     paramsJson: unknown,
     options: { readonly target?: AgentId } = {}
   ): Promise<Task> {
-    return this.submitAddressed(paramsJson, { parent, root }, options.target)
+    return this[SUBMIT_FOR](paramsJson, { parent, root }, options.target, undefined)
   }
 
-  private async submitAddressed(
+  /** @internal */
+  async [SUBMIT_FOR](
     paramsJson: unknown,
     ancestry: { readonly parent: ConversationId; readonly root: ConversationId } | undefined,
-    target: AgentId | undefined
+    target: AgentId | undefined,
+    caller: string | undefined
   ): Promise<Task> {
     const task = ConversationId.new()
+    // Made before anything is published, so a bridge that binds tasks refuses
+    // an anonymous submit without side effects.
+    const id = await this.taskId(task, caller)
     if (ancestry !== undefined) {
       await startChild(this.laser, this.source, this.source, task, ancestry.parent, ancestry.root)
     }
@@ -273,16 +478,18 @@ export class A2aBridge {
       .withMetadata(METADATA_BRIDGE_HOPS, bridgeHopMetadata(this.hops))
       .contentType(ContentType.Json)
       .send()
-    return submittedTask(task)
+    return submittedTask(id)
   }
 
+  /** `GetTask`: the task's current state. Working until an answer lands, and
+   * Unknown when the bounded scan could not reach the end of the reply topic. */
   async task(id: string): Promise<Task> {
-    let conversation: ConversationId
-    try {
-      conversation = ConversationId.parse(id)
-    } catch (cause) {
-      throw new HandlerConfigError(`invalid task id \`${id}\``, { cause })
-    }
+    return this[TASK_FOR](id, undefined)
+  }
+
+  /** @internal */
+  async [TASK_FOR](id: string, caller: string | undefined): Promise<Task> {
+    const conversation = await this.openTask(id, caller)
     const stream = this.laser.defaultStream
     if (stream === undefined) {
       throw new NoStreamError(
@@ -296,22 +503,27 @@ export class A2aBridge {
       correlationOf(conversation),
       this.laser[INTERNAL_VERIFIER]()
     )
-    return answer === undefined
-      ? {
-          id,
-          status: { state: { kind: "known", name: "Working" } },
-          artifacts: []
-        }
-      : taskFromEnvelope(id, answer)
+    switch (answer.kind) {
+      case "found":
+        return taskFromEnvelope(id, answer.envelope)
+      case "notFound":
+        return { id, status: { state: { kind: "known", name: "Working" } }, artifacts: [] }
+      // The bounded scan did not reach the end of the reply topic, so the task
+      // may already be answered. Unknown asks the caller to look again.
+      case "incomplete":
+        return { id, status: { state: { kind: "known", name: "Unknown" } }, artifacts: [] }
+    }
   }
 
+  /** `CancelTask`: publish the canceled terminal for the task. */
   async cancel(id: string): Promise<Task> {
-    let conversation: ConversationId
-    try {
-      conversation = ConversationId.parse(id)
-    } catch (cause) {
-      throw new HandlerConfigError(`invalid task id \`${id}\``, { cause })
-    }
+    return this[CANCEL_FOR](id, undefined)
+  }
+
+  /** @internal */
+  async [CANCEL_FOR](id: string, caller: string | undefined): Promise<Task> {
+    // Checked before the cancel is published, so a foreign id has no effect.
+    const conversation = await this.openTask(id, caller)
     let send = this.laser
       .agdx(this.replyTopic, this.source, conversation)
       .fail(correlationOf(conversation), {
@@ -367,6 +579,11 @@ export class A2aBridge {
   }
 
   async handleRpc(input: unknown): Promise<JsonRpcResponse> {
+    return this[HANDLE_RPC_FOR](input, undefined)
+  }
+
+  /** @internal */
+  async [HANDLE_RPC_FOR](input: unknown, caller: string | undefined): Promise<JsonRpcResponse> {
     let id: unknown = null
     try {
       const request = jsonObject(input, "A2A JSON-RPC request")
@@ -378,7 +595,12 @@ export class A2aBridge {
       switch (method) {
         case A2aMethod.MessageSend:
         case A2aMethod.MessageStream:
-          task = await this.submit(jsonBytes(params, "A2A message params"))
+          task = await this[SUBMIT_FOR](
+            jsonBytes(params, "A2A message params"),
+            undefined,
+            undefined,
+            caller
+          )
           break
         case A2aMethod.TasksGet:
         case A2aMethod.TasksCancel: {
@@ -386,7 +608,10 @@ export class A2aBridge {
           const taskId = object["id"]
           if (typeof taskId !== "string")
             throw new HandlerConfigError("A2A task id must be a string")
-          task = method === A2aMethod.TasksGet ? await this.task(taskId) : await this.cancel(taskId)
+          task =
+            method === A2aMethod.TasksGet
+              ? await this[TASK_FOR](taskId, caller)
+              : await this[CANCEL_FOR](taskId, caller)
           break
         }
         default:

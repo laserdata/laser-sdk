@@ -388,7 +388,7 @@ impl Laser {
         &self,
         reply_topic: AgentTopic<'_>,
         correlation: CorrelationId,
-    ) -> Result<Option<AgentEnvelope>, LaserError> {
+    ) -> Result<ReplyLookup, LaserError> {
         const MAX_LOOKUP_PASSES: usize = 32;
         let mut reader =
             AgentReplyReader::new(self.stream_required()?, reply_topic.as_identifier())?;
@@ -398,12 +398,14 @@ impl Laser {
         }
         for _ in 0..MAX_LOOKUP_PASSES {
             match reader.next_agdx_match(&self.client(), correlation).await? {
-                ReplyScan::Found(envelope) => return Ok(Some(*envelope)),
+                ReplyScan::Found(envelope) => return Ok(ReplyLookup::Found(envelope)),
                 ReplyScan::More => continue,
-                ReplyScan::CaughtUp => return Ok(None),
+                ReplyScan::CaughtUp => return Ok(ReplyLookup::NotFound),
             }
         }
-        Ok(None)
+        // The bound ended the scan before the topic did, so the answer may
+        // still be further on. That is not proof the task is still working.
+        Ok(ReplyLookup::Incomplete)
     }
 
     /// A fresh child conversation of `parent`, carrying its parent/root ids for causality.
@@ -993,6 +995,16 @@ pub(crate) fn stamp_broadcast_addressee(
     let broadcast = HeaderValue::from_str(laser_wire::headers::Addressee::Broadcast.as_str())?;
     headers.entry(key).or_insert(broadcast);
     Ok(())
+}
+
+/// What a bounded reply lookup established.
+#[cfg(feature = "a2a-bridge")]
+pub(crate) enum ReplyLookup {
+    Found(Box<AgentEnvelope>),
+    /// The whole reply topic was read and no answer carries the correlation.
+    NotFound,
+    /// The scan bound ended before the topic did.
+    Incomplete,
 }
 
 #[cfg(test)]

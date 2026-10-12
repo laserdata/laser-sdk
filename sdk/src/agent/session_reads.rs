@@ -126,10 +126,22 @@ impl Sessions {
     /// The change rows of this stream after `after`, up to `limit`. Zero
     /// leaves the page size to the server.
     pub async fn changes(&self, after: u64, limit: u32) -> Result<SessionChanges, LaserError> {
+        self.changes_in(after, limit, None).await
+    }
+
+    /// [`changes`](Self::changes) within one change series. A node whose
+    /// series differs answers a resync.
+    async fn changes_in(
+        &self,
+        after: u64,
+        limit: u32,
+        series: Option<u64>,
+    ) -> Result<SessionChanges, LaserError> {
         let request = request::SessionChanges {
             stream: self.stream()?.to_owned(),
             after,
             limit,
+            series,
         };
         match self.read(AGDX_SESSION_CHANGES_CODE, &request).await? {
             SessionOutcome::Changes(changes) => Ok(changes),
@@ -143,8 +155,16 @@ impl Sessions {
     /// change made after it is never missed.
     pub async fn watch(&self, poll_every: Duration) -> Result<SessionWatch, LaserError> {
         let mut after = 0;
+        let mut series = None;
         loop {
-            let page = self.changes(after, 0).await?;
+            let page = self.changes_in(after, 0, series).await?;
+            if page.series != 0 {
+                series = Some(page.series);
+            }
+            if page.resync {
+                after = page.floor;
+                continue;
+            }
             match page.rows.iter().map(|row| row.seq).max() {
                 Some(seq) => after = seq,
                 None => break,
@@ -154,6 +174,7 @@ impl Sessions {
             sessions: self.clone(),
             poll_every,
             after,
+            series,
             ready: VecDeque::new(),
         })
     }
@@ -327,8 +348,8 @@ impl SessionEventsRequest {
 pub enum SessionChange {
     /// These sessions changed, each named once.
     Changed(Vec<laser_wire::agent::ConversationId>),
-    /// The watch fell below the retained change floor. List the sessions
-    /// again to catch up.
+    /// The retained feed cannot identify every changed session. List the
+    /// sessions again to catch up.
     Resync,
 }
 
@@ -338,6 +359,9 @@ pub struct SessionWatch {
     sessions: Sessions,
     poll_every: Duration,
     after: u64,
+    // The change series `after` belongs to. Sequence numbers from another
+    // node or a restored index never continue this cursor.
+    series: Option<u64>,
     ready: VecDeque<SessionChange>,
 }
 
@@ -348,8 +372,20 @@ impl SessionWatch {
             if let Some(change) = self.ready.pop_front() {
                 return Ok(change);
             }
-            let after = self.after;
-            let page = self.sessions.changes(after, 0).await?;
+            let page = match self.sessions.changes_in(self.after, 0, self.series).await {
+                Ok(page) => page,
+                // A node that has not folded this stream far enough yet,
+                // typically the one a move just reached, answers Stale. The
+                // watch waits for it as it waits for a new change.
+                Err(error) if error.code() == crate::query::ResultCode::Stale => {
+                    tokio::time::sleep(self.poll_every).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if page.series != 0 {
+                self.series = Some(page.series);
+            }
             if page.resync {
                 self.after = page.floor;
                 return Ok(SessionChange::Resync);
@@ -357,6 +393,15 @@ impl SessionWatch {
             if page.rows.is_empty() {
                 tokio::time::sleep(self.poll_every).await;
                 continue;
+            }
+            // A truncated row does not name every changed session. The
+            // caller lists again after the resync, which covers this page, so
+            // the cursor moves past it instead of resyncing forever.
+            if page.rows.iter().any(|row| row.truncated) {
+                if let Some(seq) = page.rows.iter().map(|row| row.seq).max() {
+                    self.after = self.after.max(seq);
+                }
+                return Ok(SessionChange::Resync);
             }
             let mut seen = BTreeSet::new();
             let mut changed = Vec::new();

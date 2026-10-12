@@ -170,13 +170,9 @@ pub(crate) async fn call_hook(
         Ok(value) => return Ok(value),
         Err(pending) => pending,
     };
-    let task = receiver
+    let mut cancellation = receiver
         .await
         .map_err(|_| PyRuntimeError::new_err("Python callback was not scheduled"))??;
-    let mut cancellation = CancelHook {
-        event_loop: Python::attach(|py| locals.event_loop(py).unbind()),
-        task: Some(task),
-    };
     let future = Python::attach(|py| {
         pyo3_async_runtimes::into_future_with_locals(
             &locals,
@@ -193,12 +189,11 @@ pub(crate) async fn call_hook(
     result
 }
 
-// Wraps an awaitable in a task on its loop and hands the task back, or
-// cancels it when the Rust caller stopped waiting before it started.
+// The channel owns cancellation until the Rust caller receives the task.
 #[pyclass]
 struct ScheduleHook {
     awaitable: Py<PyAny>,
-    sender: Option<oneshot::Sender<PyResult<Py<PyAny>>>>,
+    sender: Option<oneshot::Sender<PyResult<CancelHook>>>,
 }
 
 #[pymethods]
@@ -207,11 +202,14 @@ impl ScheduleHook {
         let result = py
             .import("asyncio")?
             .call_method1("ensure_future", (self.awaitable.bind(py),))
-            .map(Bound::unbind);
-        if let Some(sender) = self.sender.take()
-            && let Err(Ok(task)) = sender.send(result)
-        {
-            task.bind(py).call_method0("cancel")?;
+            .and_then(|task| {
+                Ok(CancelHook {
+                    event_loop: task.call_method0("get_loop")?.unbind(),
+                    task: Some(task.unbind()),
+                })
+            });
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
         }
         Ok(())
     }
@@ -593,9 +591,62 @@ pub use portable::future_into_py_returning;
 
 #[cfg(test)]
 mod tests {
-    use super::{HookLoop, PyHook, call_hook};
+    use super::{HookLoop, PyHook, ScheduleHook, call_hook};
     use pyo3::prelude::*;
     use pyo3::types::PyModule;
+
+    #[test]
+    fn given_a_scheduled_hook_when_its_unread_handoff_is_dropped_then_should_cancel_the_task() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let module = PyModule::from_code(
+                py,
+                c"import asyncio
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+started = False
+stopped = False
+tasks = []
+async def hook():
+    global started, stopped
+    started = True
+    tasks.append(asyncio.current_task())
+    try:
+        await asyncio.Event().wait()
+    finally:
+        stopped = True
+def tick():
+    loop.run_until_complete(asyncio.sleep(0))
+def cleanup():
+    for task in asyncio.all_tasks(loop):
+        task.cancel()
+    tick()
+    loop.close()
+    asyncio.set_event_loop(None)
+",
+                c"cancel_handoff.py",
+                c"cancel_handoff",
+            )?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let mut schedule = ScheduleHook {
+                awaitable: module.getattr("hook")?.call0()?.unbind(),
+                sender: Some(sender),
+            };
+            schedule.__call__(py)?;
+            module.getattr("tick")?.call0()?;
+            assert!(module.getattr("started")?.extract::<bool>()?);
+            drop(receiver);
+            module.getattr("tick")?.call0()?;
+            let stopped = module.getattr("stopped")?.extract::<bool>()?;
+            module.getattr("cleanup")?.call0()?;
+            assert!(
+                stopped,
+                "an unread handoff still owns callback cancellation"
+            );
+            Ok(())
+        })
+        .expect("callback handoff cancellation");
+    }
 
     fn hooks<'py>(py: Python<'py>, name: &std::ffi::CStr) -> PyResult<Bound<'py, PyModule>> {
         PyModule::from_code(

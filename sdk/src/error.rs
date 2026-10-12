@@ -126,6 +126,9 @@ pub enum LaserError {
     /// (e.g. a scan outcome for a get). Indicates server/client skew.
     #[error("protocol: {0}")]
     Protocol(String),
+    /// A managed endpoint returned its original result code and message.
+    #[error("managed command: {}", .0.message)]
+    Command(CommandError),
     /// The connected infrastructure does not provide the requested feature
     /// (Apache Iggy without LaserData Cloud, or a deployment whose backend
     /// does not advertise the sub-capability). Permanent by definition: gate
@@ -322,10 +325,8 @@ impl From<CommandError> for LaserError {
                 feature: None,
                 message: error.message,
             },
-            ResultCode::InvalidArgument | ResultCode::VersionSkew => {
-                LaserError::Invalid(error.message)
-            }
-            other => LaserError::Protocol(format!("{other:?}: {}", error.message)),
+            ResultCode::InvalidArgument => LaserError::Invalid(error.message),
+            _ => LaserError::Command(error),
         }
     }
 }
@@ -420,6 +421,7 @@ impl LaserError {
             #[cfg(feature = "provenance")]
             Self::Provenance(_) => false,
             Self::Query(error) => ResultCode::from(error).is_retryable(),
+            Self::Command(error) => error.code.is_retryable(),
             Self::Kv(error) => ResultCode::from(error).is_retryable(),
             Self::Fork(error) => ResultCode::from(error).is_retryable(),
             Self::Session(error) => ResultCode::from(error).is_retryable(),
@@ -443,7 +445,10 @@ impl LaserError {
     /// the flag a retry loop keys on when it wants only the recoverable class
     /// rather than everything [`is_retryable`](Self::is_retryable) admits.
     pub fn is_unavailable(&self) -> bool {
-        self.code() == ResultCode::Unavailable
+        matches!(
+            self.code(),
+            ResultCode::Unavailable | ResultCode::TargetUnavailable
+        )
     }
 
     /// Whether the connected plane declined a conditional write because it
@@ -459,6 +464,10 @@ impl LaserError {
     /// does not provide the feature at all. Permanent: do not retry, gate the
     /// code path instead.
     pub fn is_unsupported(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::Unsupported)
+        {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Unsupported { .. }
@@ -472,6 +481,10 @@ impl LaserError {
     /// Whether the failure names a missing resource (index, fork). Distinct
     /// from a backend being down: the call worked, the thing is not there.
     pub fn is_not_found(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::NotFound)
+        {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Query(QueryError::IndexNotFound(_) | QueryError::ForkNotFound(_))
@@ -490,6 +503,10 @@ impl LaserError {
     /// connected LaserData Cloud (the envelope's `v` was not accepted). Permanent for
     /// this client build: upgrade or downshift instead of retrying.
     pub fn is_version_skew(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::VersionSkew)
+        {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Query(QueryError::Version { .. })
@@ -527,6 +544,9 @@ impl LaserError {
     /// or key-value fold has not yet applied the required source position.
     /// Retryable: the read model is catching up.
     pub fn is_stale(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if error.code == ResultCode::Stale) {
+            return true;
+        }
         matches!(
             self.publish_cause(),
             Self::Query(QueryError::Stale { .. }) | Self::Kv(KvError::Stale { .. })
@@ -540,6 +560,10 @@ impl LaserError {
     /// the stream or topic permission the failing verb needs (read, send,
     /// create), or point the client at a stream the principal can use.
     pub fn is_permission_denied(&self) -> bool {
+        if matches!(self.publish_cause(), Self::Command(error) if matches!(error.code, ResultCode::Forbidden | ResultCode::Unauthenticated))
+        {
+            return true;
+        }
         matches!(self.publish_cause(), Self::RoutePrincipalMismatch { .. })
             || matches!(
                 self.iggy_cause(),
@@ -648,6 +672,7 @@ impl LaserError {
             }
             Self::Iggy(error) if is_transient_iggy_io_error(error) => ResultCode::Unavailable,
             Self::Filter(error) => error.code,
+            Self::Command(error) => error.code,
             Self::FilterFault { .. } => ResultCode::InvalidArgument,
             Self::FilterOversizedRecord { .. } => ResultCode::TooLarge,
             Self::ConsumerGroupSetup { source, .. } => source.code(),
@@ -724,6 +749,40 @@ fn unsupported_message(surface: &str, feature: Option<&str>, message: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_managed_command_errors_when_classified_then_should_preserve_the_original_codes() {
+        for (code, retryable, unavailable, denied, missing, skew) in [
+            (ResultCode::Conflict, false, false, false, false, false),
+            (
+                ResultCode::TargetUnavailable,
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            (ResultCode::Forbidden, false, false, true, false, false),
+            (ResultCode::NotFound, false, false, false, true, false),
+            (ResultCode::VersionSkew, false, false, false, false, true),
+            (
+                ResultCode::Unrecognized(42),
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let error = LaserError::from(CommandError::new(code, "refused"));
+            assert_eq!(error.code(), code);
+            assert_eq!(error.is_retryable(), retryable);
+            assert_eq!(error.is_unavailable(), unavailable);
+            assert_eq!(error.is_permission_denied(), denied);
+            assert_eq!(error.is_not_found(), missing);
+            assert_eq!(error.is_version_skew(), skew);
+        }
+    }
 
     #[test]
     fn given_a_failed_producer_send_when_classified_then_should_use_its_cause() {

@@ -79,6 +79,13 @@ async fn fault_policy_digest(world: &mut LaserWorld) {
 #[given("a fresh fleet change feed")]
 async fn fresh_feed(world: &mut LaserWorld) {
     let fresh = fresh_connected_laser().await;
+    // Producers no longer create streams, so the feed makes its own.
+    fresh
+        .laser
+        .topic(TOPIC)
+        .ensure(1)
+        .await
+        .expect("the feed topic is created");
     let producer = fresh
         .laser
         .topic(TOPIC)

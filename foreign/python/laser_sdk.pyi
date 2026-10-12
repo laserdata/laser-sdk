@@ -77,6 +77,7 @@ __all__ = [
     "AgentScope",
     "AgentTopic",
     "AmbiguousMutationRecovery",
+    "AppliedFrontier",
     "AssembledContext",
     "AuthzEvent",
     "AuthzHistoryReply",
@@ -292,6 +293,7 @@ __all__ = [
     "SessionControl",
     "SessionLayout",
     "SessionLease",
+    "SessionPosition",
     "SessionState",
     "SessionTurn",
     "SessionWatch",
@@ -435,6 +437,8 @@ __all__ = [
     "result_code_code",
     "result_code_from_code",
     "result_code_http_status",
+    "result_code_is_pending",
+    "result_code_is_plane_unavailable",
     "result_code_is_retryable",
     "resume_offsets",
     "schema_def_content_type",
@@ -613,7 +617,7 @@ class A2aBridge:
     An A2A bridge: drive an agent as an A2A task source (`SendMessage` ->
     `GetTask` / `CancelTask`).
     """
-    def __new__(cls, laser: Laser, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str, *, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, signing_key: typing.Optional[SigningKey] = None) -> A2aBridge:
+    def __new__(cls, laser: Laser, source: builtins.str, request_topic: builtins.str, reply_topic: builtins.str, *, capabilities: typing.Optional[typing.Sequence[typing.Any]] = None, signing_key: typing.Optional[SigningKey] = None, task_binding_key: typing.Optional[typing.Sequence[builtins.int]] = None, task_binding_ttl_ms: typing.Optional[builtins.float] = None) -> A2aBridge:
         r"""
         An A2A bridge mapping JSON-RPC methods onto agent topics over `laser`,
         publishing as `source`. Use it to drive an agent as an A2A task source
@@ -621,28 +625,39 @@ class A2aBridge:
         become the card's skills. `signing_key` signs the published task
         envelopes. Every record the bridge publishes carries its `bridge_hops`
         loop-guard path, starting at `source`.
+
+        `task_binding_key` (32 bytes) with `task_binding_ttl_ms` binds every
+        task id to the caller that submitted it, as Rust `with_task_binding`.
+        Task methods then need `caller`, the authenticated principal.
         """
-    def handle_rpc(self, request: typing.Any) -> typing.Any: ...
-    def submit(self, params_json: typing.Any, *, target: typing.Optional[builtins.str] = None) -> typing.Any:
+    def handle_rpc(self, request: typing.Any, *, caller: typing.Optional[builtins.str] = None) -> typing.Any:
+        r"""
+        Handle one A2A JSON-RPC request. `caller` is the authenticated
+        principal, required when the bridge binds tasks to callers.
+        """
+    def submit(self, params_json: typing.Any, *, target: typing.Optional[builtins.str] = None, caller: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         `SendMessage`: publish the params (a dict, or raw JSON str / bytes) as a
         task and return the submitted task as a dict. `target` addresses the
         task to one agent. Without it every agent on a shared session topic
         receives the task.
         """
-    def submit_in(self, parent: builtins.str, params_json: typing.Any, *, root: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None) -> typing.Any:
+    def submit_in(self, parent: builtins.str, params_json: typing.Any, *, root: typing.Optional[builtins.str] = None, target: typing.Optional[builtins.str] = None, caller: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
         `SendMessage` as a child session of `parent`, in the tree rooted at
         `root` (the parent when omitted). The handling agent ends the child.
         `target` addresses the task to one agent, as in `submit`.
         """
-    def task(self, id: builtins.str) -> typing.Any:
+    def task(self, id: builtins.str, *, caller: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
-        `GetTask`: the task's current state (Working until an answer lands).
+        `GetTask`: the task's current state (Working until an answer lands,
+        Unknown when the bounded lookup could not reach the end of the reply
+        topic). `caller` is required when the bridge binds tasks to callers.
         """
-    def cancel(self, id: builtins.str) -> typing.Any:
+    def cancel(self, id: builtins.str, *, caller: typing.Optional[builtins.str] = None) -> typing.Any:
         r"""
-        `CancelTask`: cancel the task and return it canceled.
+        `CancelTask`: cancel the task and return it canceled. `caller` is
+        required when the bridge binds tasks to callers.
         """
     def card(self) -> typing.Any:
         r"""
@@ -1226,6 +1241,25 @@ class AmbiguousMutationRecovery:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
+class AppliedFrontier:
+    r"""
+    The mutation positions seen per managed surface, `None` for a surface
+    with no position yet.
+    """
+    @property
+    def kv(self) -> typing.Optional[MutationPosition]: ...
+    @property
+    def fork(self) -> typing.Optional[MutationPosition]: ...
+    @property
+    def graph(self) -> typing.Optional[MutationPosition]: ...
+    @property
+    def sessions(self) -> builtins.list[SessionPosition]:
+        r"""
+        The session positions seen per stream and source partition.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class AssembledContext:
     r"""
     The context a model call received, assembled without writing anything:
@@ -1250,8 +1284,9 @@ class AssembledContext:
 class AuthzEvent:
     r"""
     One recorded authorization change: its revision, who made it, when, and
-    what. `op` is `{"role_defined": name}`, `{"role_deleted": name}`, or
-    `{"roles_bound": {"user_id": id, "roles": [...]}}`.
+    what. `op` is `{"role_defined": name}`, `{"role_deleted": name}`,
+    `{"roles_bound": {"user_id": id, "roles": [...]}}`, or
+    `{"tenancy_set": "deployment" | "stream"}`.
     """
     @property
     def revision(self) -> builtins.int: ...
@@ -1259,6 +1294,11 @@ class AuthzEvent:
     def actor(self) -> builtins.str: ...
     @property
     def at_micros(self) -> builtins.int: ...
+    @property
+    def stream(self) -> typing.Optional[builtins.str]:
+        r"""
+        The one stream the change is attributed to, `None` when none.
+        """
     @property
     def op(self) -> typing.Any:
         r"""
@@ -4692,6 +4732,13 @@ class Laser:
         `str` (UTF-8) or `bytes`. KV is a managed feature: against Apache Iggy
         every operation raises `UnsupportedError`.
         """
+    def seen_positions(self) -> AppliedFrontier:
+        r"""
+        The highest mutation position this client has seen per managed
+        surface. Every KV, fork and graph reply raises it, and every later read
+        of that surface sends it, so whichever node answers has applied at
+        least what this client wrote or read before.
+        """
     def kv_namespaces(self) -> typing.Any:
         r"""
         Every KV namespace holding at least one entry for this caller.
@@ -4810,8 +4857,9 @@ class Laser:
     def authz_history(self, subject: typing.Any, *, after_revision: typing.Optional[builtins.int] = None, limit: builtins.int = 100) -> typing.Any:
         r"""
         Read a page of the authorization change history. Requires
-        `authz:read`. `subject` is `"all"`, `{"role": name}`, or
-        `{"binding": {"user_id": id}}`.
+        `authz:read`. `subject` is `"all"`, `{"role": name}`,
+        `{"binding": {"user_id": id}}`, or `{"stream": name}` for every change
+        attributed to one stream.
         """
     def agent_registry(self) -> AgentRegistry:
         r"""
@@ -5718,6 +5766,12 @@ class PendingControl:
         r"""
         A cancel was requested, or an operator forced the session canceled.
         """
+    @property
+    def control_conflict(self) -> builtins.bool:
+        r"""
+        A control request arrived on another partition of `agent.control` than
+        the session's control route. It was never applied.
+        """
 
 @typing.final
 class PolicyEvidence:
@@ -5954,6 +6008,12 @@ class ProjectionBindingBuilder:
     def notify(self) -> ProjectionBindingBuilder:
         r"""
         Announce every applied row to watchers.
+        """
+    def skip_rejected(self) -> ProjectionBindingBuilder:
+        r"""
+        Let the plane skip a record it proved the destination or the extraction
+        rejects, instead of holding the partition. Every skip is an ordered
+        control record, and the skipped record goes to the dead-letter topic.
         """
     def build(self) -> typing.Any:
         r"""
@@ -6381,7 +6441,7 @@ class QueryRequest:
     def deadline(self, timeout_ms: builtins.float) -> QueryRequest:
         r"""
         Set the execution deadline `timeout_ms` milliseconds from now
-        (default 30,000).
+        (default and longest 25,000). A longer one fails the fetch.
         """
     def deadline_micros(self, deadline_micros: builtins.int) -> QueryRequest:
         r"""
@@ -7359,8 +7419,8 @@ class SessionChange:
     @typing.final
     class Resync(SessionChange):
         r"""
-        The watch fell below the retained change floor. List the sessions
-        again to catch up.
+        The retained feed cannot identify every changed session. List the
+        sessions again to catch up.
         """
         __match_args__ = ()
         def __new__(cls) -> SessionChange.Resync: ...
@@ -7539,6 +7599,26 @@ class SessionLease:
         """
 
 @typing.final
+class SessionPosition:
+    r"""
+    How far a node's session fold has applied one partition of a session
+    source.
+    """
+    @property
+    def stream_id(self) -> builtins.int: ...
+    @property
+    def stream_generation(self) -> builtins.int: ...
+    @property
+    def topic(self) -> builtins.str: ...
+    @property
+    def topic_generation(self) -> builtins.int: ...
+    @property
+    def partition_id(self) -> builtins.int: ...
+    @property
+    def offset(self) -> builtins.int: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class SessionState:
     r"""
     The session's state document: JSON patches on the session lane, applied in
@@ -7638,6 +7718,12 @@ class Sessions:
         r"""
         Create the agent topics, then register the stream as a session source
         when the deployment serves sessions. Returns whether it registered.
+        """
+    def unregister(self) -> typing.Any:
+        r"""
+        Stop the deployment from indexing this stream's sessions, through the
+        authenticated managed control path. A later `bootstrap` registers the
+        stream again.
         """
     def submit(self, agent_id: builtins.str, input: typing.Any) -> SubmitBuilder:
         r"""
@@ -8091,7 +8177,7 @@ class Topic:
         r"""
         Start a batch publish that flushes 1..N records in a single Iggy send.
         """
-    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.float = 0.0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = True, create_topic: builtins.bool = True, partitions: builtins.int = 1, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False, background: typing.Optional[typing.Any] = None) -> Producer:
+    def producer(self, *, batch_length: builtins.int = 1000, linger_ms: builtins.float = 0.0, retries: typing.Optional[builtins.int] = None, retry_interval_ms: typing.Optional[builtins.int] = None, key: typing.Optional[typing.Any] = None, partition: typing.Optional[builtins.int] = None, create_stream: builtins.bool = False, create_topic: builtins.bool = True, partitions: builtins.int = 1, expire_after_ms: typing.Optional[builtins.float] = None, never_expire: builtins.bool = False, max_topic_bytes: typing.Optional[builtins.int] = None, unlimited_topic_size: builtins.bool = False, background: typing.Optional[typing.Any] = None) -> Producer:
         r"""
         Build a Laser direct producer. This is the full streaming hot path
         below the typed publish API: tune batching/linger/retries,
@@ -9146,6 +9232,18 @@ def result_code_http_status(code: builtins.str) -> builtins.int:
     The HTTP status a result code name maps onto.
     """
 
+def result_code_is_pending(code: builtins.str) -> builtins.bool:
+    r"""
+    Whether a mutation with this result code name was accepted with an
+    outcome that is still unknown. Only the same operation identity may repeat it.
+    """
+
+def result_code_is_plane_unavailable(code: builtins.str) -> builtins.bool:
+    r"""
+    Whether this result code name means the node's own plane did not answer.
+    The request may still apply, so only the same operation identity repeats it.
+    """
+
 def result_code_is_retryable(code: builtins.str) -> builtins.bool:
     r"""
     Whether a failure with this result code name may succeed when retried.
@@ -9392,6 +9490,12 @@ class StateStoreError(LaserError):
 class QueryError(LaserError):
     r"""
     The managed query / projection surface returned a typed failure. `detail` is the typed cause.
+    """
+    detail: typing.Any
+
+class CommandError(LaserError):
+    r"""
+    A managed endpoint returned its result code and message. `detail` holds both fields.
     """
     detail: typing.Any
 

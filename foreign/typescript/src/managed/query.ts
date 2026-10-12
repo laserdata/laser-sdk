@@ -1,3 +1,4 @@
+import { QUERY_DEADLINE_MS, QUERY_REPLY_GRACE_MS } from "../retry.js"
 import { millisToMicros } from "../client/duration.js"
 import { BARE_SCOPE, type ResourceScope } from "../client/resource-scope.js"
 import { ConfigError, InvalidError, ProtocolError } from "../client/errors.js"
@@ -33,11 +34,23 @@ const ORIGINAL_PAYLOAD_FIELD = "__laser_original_payload"
 export type QueryExecutor = (query: Query) => Promise<QueryResult>
 export type QueryStatusExecutor = (executionId: QueryExecutionId) => Promise<QueryExecutionStatus>
 
+/** @internal How long to wait for the reply to a query due at
+ * `deadlineMicros`. A deadline further out than `QUERY_DEADLINE_MS` fails. */
+export function queryReplyWaitMs(deadlineMicros: bigint, nowMicros: bigint): number {
+  const remainingMs = deadlineMicros > nowMicros ? Number(deadlineMicros - nowMicros) / 1000 : 0
+  if (remainingMs > QUERY_DEADLINE_MS) {
+    throw new InvalidError(
+      `the query deadline is ${String(Math.floor(remainingMs / 1000))}s away, the longest allowed is ${String(QUERY_DEADLINE_MS / 1000)}s`
+    )
+  }
+  return remainingMs + QUERY_REPLY_GRACE_MS
+}
+
 function emptyQuery(target: QueryTarget): Query {
   return newQuery(
     target,
     QueryExecutionId.fromU128(mintUlidValue()),
-    BigInt(Date.now()) * 1000n + 30_000_000n
+    BigInt(Date.now()) * 1000n + BigInt(QUERY_DEADLINE_MS) * 1000n
   )
 }
 
@@ -79,8 +92,9 @@ export class QueryRequest {
     return this.queryValue.executionId
   }
 
-  /** The absolute deadline, in epoch microseconds. Defaults to 30 seconds
-   * after the request was built, like the Rust and Python SDKs. */
+  /** The absolute deadline, in epoch microseconds. Defaults to 25 seconds
+   * after the request was built, like the Rust and Python SDKs. It can be at
+   * most 25 seconds away, and a later one fails the fetch. */
   deadlineMicros(value: bigint): this {
     this.queryValue = { ...this.queryValue, deadlineMicros: value }
     return this

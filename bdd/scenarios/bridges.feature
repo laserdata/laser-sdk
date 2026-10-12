@@ -18,6 +18,13 @@ Feature: External protocols preserve AGDX lifecycle
     When I submit and cancel an A2A task
     Then the replayed A2A task state is "Canceled"
 
+  Scenario: A bound A2A task answers only the caller that submitted it
+    When caller "alice" submits a bound A2A task
+    And caller "bob" tries to cancel the bound A2A task
+    And an anonymous caller tries to cancel the bound A2A task
+    And caller "alice" tries to cancel the bound A2A task
+    Then the bound A2A cancel outcomes are "bob:refused,anonymous:refused,alice:Canceled"
+
   Scenario: An AG-UI state delta reconstructs the latest state
     When I publish an AG-UI count snapshot of 1 and replace it with 2
     Then the reconstructed AG-UI count is 2

@@ -281,6 +281,129 @@ pub struct A2aBridge {
     /// unauthenticated-cancel hole. Requires the `sign` feature.
     #[cfg(feature = "sign")]
     signing_key: Option<crate::sign::SigningKey>,
+    /// When set, every task id is bound to the caller that submitted it.
+    task_binding: Option<TaskBinding>,
+}
+
+/// The key and lifetime task ids are bound with.
+#[derive(Clone)]
+struct TaskBinding {
+    key: [u8; 32],
+    ttl: std::time::Duration,
+}
+
+impl TaskBinding {
+    /// The keyed digest a bound task id carries: the caller, the stream
+    /// generation, the conversation and the expiry, so an id works only for
+    /// its caller, on the stream incarnation it was made on, until it expires.
+    fn mac(
+        &self,
+        caller: &str,
+        stream_generation: u64,
+        task: ConversationId,
+        expires: u64,
+    ) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new_keyed(&self.key);
+        hasher.update(b"laserdata a2a task v1\0");
+        hasher.update(&(caller.len() as u64).to_le_bytes());
+        hasher.update(caller.as_bytes());
+        hasher.update(&stream_generation.to_le_bytes());
+        hasher.update(&task.as_u128().to_le_bytes());
+        hasher.update(&expires.to_le_bytes());
+        hasher.finalize()
+    }
+}
+
+/// The authenticated caller of an A2A HTTP request. A host that binds tasks
+/// to callers inserts it into the request extensions from its own
+/// authentication, and the router passes it to the bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct A2aCallerPrincipal(pub String);
+
+/// The bridge acting for one authenticated caller. Build it with
+/// [`A2aBridge::caller`].
+pub struct A2aCaller<'a> {
+    bridge: &'a A2aBridge,
+    principal: String,
+}
+
+impl A2aCaller<'_> {
+    /// [`A2aBridge::submit`] for this caller.
+    pub async fn submit(&self, params_json: Vec<u8>) -> Result<Task, LaserError> {
+        self.bridge
+            .submit_addressed(None, None, params_json, Some(&self.principal))
+            .await
+    }
+
+    /// [`A2aBridge::submit_to`] for this caller.
+    pub async fn submit_to(
+        &self,
+        target: impl Into<AgentId>,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
+        self.bridge
+            .submit_addressed(
+                Some(target.into()),
+                None,
+                params_json,
+                Some(&self.principal),
+            )
+            .await
+    }
+
+    /// [`A2aBridge::submit_in`] for this caller.
+    pub async fn submit_in(
+        &self,
+        parent: ConversationId,
+        root: ConversationId,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
+        self.bridge
+            .submit_addressed(
+                None,
+                Some((parent, root)),
+                params_json,
+                Some(&self.principal),
+            )
+            .await
+    }
+
+    /// [`A2aBridge::submit_in_to`] for this caller.
+    pub async fn submit_in_to(
+        &self,
+        target: impl Into<AgentId>,
+        parent: ConversationId,
+        root: ConversationId,
+        params_json: Vec<u8>,
+    ) -> Result<Task, LaserError> {
+        self.bridge
+            .submit_addressed(
+                Some(target.into()),
+                Some((parent, root)),
+                params_json,
+                Some(&self.principal),
+            )
+            .await
+    }
+
+    /// [`A2aBridge::task`] for this caller. Another caller's task id answers
+    /// like an unknown one.
+    pub async fn task(&self, id: &str) -> Result<Task, LaserError> {
+        self.bridge.task_for(id, Some(&self.principal)).await
+    }
+
+    /// [`A2aBridge::cancel`] for this caller. Another caller's task id is
+    /// refused before anything is published.
+    pub async fn cancel(&self, id: &str) -> Result<Task, LaserError> {
+        self.bridge.cancel_for(id, Some(&self.principal)).await
+    }
+
+    /// [`A2aBridge::handle_rpc`] for this caller.
+    pub async fn handle_rpc(&self, request: JsonValue) -> JsonRpcResponse {
+        self.bridge
+            .handle_rpc_for(request, Some(&self.principal))
+            .await
+    }
 }
 
 impl A2aBridge {
@@ -307,7 +430,90 @@ impl A2aBridge {
             hops,
             #[cfg(feature = "sign")]
             signing_key: None,
+            task_binding: None,
         }
+    }
+
+    /// Bind every task id to the caller that submitted it, keyed with `key`
+    /// and valid for `ttl`. A bound id names the caller, the stream
+    /// incarnation, the conversation and an expiry under a keyed digest, so
+    /// another caller cannot read or cancel the task. Once set, task
+    /// operations need a caller: use [`caller`](Self::caller), and the HTTP
+    /// router reads [`A2aCallerPrincipal`] from the request extensions.
+    #[must_use]
+    pub fn with_task_binding(mut self, key: [u8; 32], ttl: std::time::Duration) -> Self {
+        self.task_binding = Some(TaskBinding { key, ttl });
+        self
+    }
+
+    /// The bridge acting for one authenticated caller.
+    pub fn caller(&self, principal: impl Into<String>) -> A2aCaller<'_> {
+        A2aCaller {
+            bridge: self,
+            principal: principal.into(),
+        }
+    }
+
+    /// The creation time of the bridge's stream, which tells a recreated
+    /// stream apart from the one a task id was made on.
+    async fn stream_generation(&self) -> Result<u64, LaserError> {
+        let stream = iggy::prelude::Identifier::named(self.laser.stream_required()?)?;
+        let details =
+            iggy::prelude::StreamClient::get_stream(self.laser.client().as_ref(), &stream)
+                .await?
+                .ok_or_else(|| {
+                    LaserError::HandlerConfig("the bridge stream does not exist".to_owned())
+                })?;
+        Ok(details.created_at.as_micros())
+    }
+
+    /// The id a new task is known by.
+    async fn task_id(
+        &self,
+        task: ConversationId,
+        caller: Option<&str>,
+    ) -> Result<String, LaserError> {
+        let Some(binding) = &self.task_binding else {
+            return Ok(task.to_string());
+        };
+        let caller = caller.ok_or_else(unbound_caller)?;
+        let generation = self.stream_generation().await?;
+        let expires =
+            now_micros().saturating_add(u64::try_from(binding.ttl.as_micros()).unwrap_or(u64::MAX));
+        let mac = binding.mac(caller, generation, task, expires);
+        Ok(format!("{task}.{expires}.{}", mac.to_hex()))
+    }
+
+    /// The conversation a task id names, refused like a malformed id when it
+    /// is not this caller's, expired, or from another stream incarnation.
+    async fn open_task(
+        &self,
+        id: &str,
+        caller: Option<&str>,
+    ) -> Result<ConversationId, LaserError> {
+        let invalid = || LaserError::HandlerConfig(format!("invalid task id `{id}`"));
+        let Some(binding) = &self.task_binding else {
+            return id.parse::<ConversationId>().map_err(|_| invalid());
+        };
+        let caller = caller.ok_or_else(unbound_caller)?;
+        let mut parts = id.split('.');
+        let (Some(task), Some(expires), Some(mac), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(invalid());
+        };
+        let task = task.parse::<ConversationId>().map_err(|_| invalid())?;
+        let expires = expires.parse::<u64>().map_err(|_| invalid())?;
+        let mac = blake3::Hash::from_hex(mac).map_err(|_| invalid())?;
+        if expires < now_micros() {
+            return Err(invalid());
+        }
+        let generation = self.stream_generation().await?;
+        // `blake3::Hash` compares in constant time.
+        if binding.mac(caller, generation, task, expires) != mac {
+            return Err(invalid());
+        }
+        Ok(task)
     }
 
     /// Continue the loop-guard path of work that already crossed other
@@ -349,7 +555,7 @@ impl A2aBridge {
     /// so on a shared session topic every listening agent receives it. Use
     /// [`submit_to`](Self::submit_to) to address one agent.
     pub async fn submit(&self, params_json: Vec<u8>) -> Result<Task, LaserError> {
-        self.submit_addressed(None, None, params_json).await
+        self.submit_addressed(None, None, params_json, None).await
     }
 
     /// [`submit`](Self::submit) addressed to `target`, so only that agent
@@ -360,7 +566,8 @@ impl A2aBridge {
         params_json: Vec<u8>,
     ) -> Result<Task, LaserError> {
         let target = target.into();
-        self.submit_addressed(Some(target), None, params_json).await
+        self.submit_addressed(Some(target), None, params_json, None)
+            .await
     }
 
     /// `message/send` as a child session of `parent`, in the tree rooted at
@@ -374,7 +581,7 @@ impl A2aBridge {
         root: ConversationId,
         params_json: Vec<u8>,
     ) -> Result<Task, LaserError> {
-        self.submit_addressed(None, Some((parent, root)), params_json)
+        self.submit_addressed(None, Some((parent, root)), params_json, None)
             .await
     }
 
@@ -387,7 +594,7 @@ impl A2aBridge {
         params_json: Vec<u8>,
     ) -> Result<Task, LaserError> {
         let target = target.into();
-        self.submit_addressed(Some(target), Some((parent, root)), params_json)
+        self.submit_addressed(Some(target), Some((parent, root)), params_json, None)
             .await
     }
 
@@ -396,8 +603,12 @@ impl A2aBridge {
         target: Option<AgentId>,
         ancestry: Option<(ConversationId, ConversationId)>,
         params_json: Vec<u8>,
+        caller: Option<&str>,
     ) -> Result<Task, LaserError> {
         let task = ConversationId::new();
+        // Minted before anything is published, so an unbound caller on a
+        // binding bridge publishes nothing.
+        let id = self.task_id(task, caller).await?;
         if let Some((parent, root)) = ancestry {
             crate::agent::contract::start_child(
                 &self.laser,
@@ -425,7 +636,7 @@ impl A2aBridge {
         }
         command.send().await?;
         Ok(Task {
-            id: task.to_string(),
+            id,
             status: TaskStatus {
                 state: TaskState::Submitted,
             },
@@ -435,11 +646,14 @@ impl A2aBridge {
 
     /// `tasks/get`: replay the reply topic for the task and map the answering
     /// AGDX envelope (the `response`/`error` carrying this task's `correlation`)
-    /// to the A2A task. Still Working until one lands.
+    /// to the A2A task. Still Working until one lands, and Unknown when the
+    /// bounded scan could not reach the end of the reply topic.
     pub async fn task(&self, id: &str) -> Result<Task, LaserError> {
-        let conversation = id
-            .parse::<ConversationId>()
-            .map_err(|_| LaserError::HandlerConfig(format!("invalid task id `{id}`")))?;
+        self.task_for(id, None).await
+    }
+
+    async fn task_for(&self, id: &str, caller: Option<&str>) -> Result<Task, LaserError> {
+        let conversation = self.open_task(id, caller).await?;
         let correlation = correlation_of(conversation);
         // A point lookup over the reply topic via the forward reply reader (no
         // full re-scan + sort of the conversation each call).
@@ -448,11 +662,21 @@ impl A2aBridge {
             .find_agdx_reply(self.reply_topic.clone(), correlation)
             .await?;
         Ok(match answer {
-            Some(envelope) => task_from_envelope(id, &envelope),
-            None => Task {
+            crate::agent::ReplyLookup::Found(envelope) => task_from_envelope(id, &envelope),
+            crate::agent::ReplyLookup::NotFound => Task {
                 id: id.to_owned(),
                 status: TaskStatus {
                     state: TaskState::Working,
+                },
+                artifacts: Vec::new(),
+            },
+            // The bounded scan did not reach the end of the reply topic, so
+            // the task may already be answered. Unknown asks the caller to
+            // look again rather than claiming the task still works.
+            crate::agent::ReplyLookup::Incomplete => Task {
+                id: id.to_owned(),
+                status: TaskStatus {
+                    state: TaskState::Unknown,
                 },
                 artifacts: Vec::new(),
             },
@@ -463,9 +687,12 @@ impl A2aBridge {
     /// `task_state = Canceled`) correlated to the task, so a later `tasks/get`
     /// also reports Canceled, and returns the canceled task.
     pub async fn cancel(&self, id: &str) -> Result<Task, LaserError> {
-        let conversation = id
-            .parse::<ConversationId>()
-            .map_err(|_| LaserError::HandlerConfig(format!("invalid task id `{id}`")))?;
+        self.cancel_for(id, None).await
+    }
+
+    async fn cancel_for(&self, id: &str, caller: Option<&str>) -> Result<Task, LaserError> {
+        // Checked before the cancel is published, so a foreign id has no effect.
+        let conversation = self.open_task(id, caller).await?;
         let error = agdx::AgentErrorBody {
             code: agdx::AgentErrorCode::Cancelled,
             message: Some("canceled by the A2A client".to_owned()),
@@ -555,8 +782,12 @@ impl A2aBridge {
     }
 
     pub async fn handle_rpc(&self, request: JsonValue) -> JsonRpcResponse {
+        self.handle_rpc_for(request, None).await
+    }
+
+    async fn handle_rpc_for(&self, request: JsonValue, caller: Option<&str>) -> JsonRpcResponse {
         let id = request.get("id").cloned().unwrap_or(JsonValue::Null);
-        match self.dispatch_rpc(&request).await {
+        match self.dispatch_rpc(&request, caller).await {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION,
                 id,
@@ -578,7 +809,11 @@ impl A2aBridge {
         }
     }
 
-    async fn dispatch_rpc(&self, request: &JsonValue) -> Result<JsonValue, LaserError> {
+    async fn dispatch_rpc(
+        &self,
+        request: &JsonValue,
+        caller: Option<&str>,
+    ) -> Result<JsonValue, LaserError> {
         // Serde also reads a struct from an array, so the object check comes first.
         if !request.is_object() {
             return Err(LaserError::HandlerConfig(
@@ -596,7 +831,7 @@ impl A2aBridge {
             Ok(A2aMethod::MessageSend | A2aMethod::MessageStream) => {
                 let body = serde_json::to_vec(&params)
                     .map_err(|error| LaserError::Codec(error.to_string()))?;
-                self.submit(body).await?
+                self.submit_addressed(None, None, body, caller).await?
             }
             Ok(operation @ (A2aMethod::TasksGet | A2aMethod::TasksCancel)) => {
                 let id = params
@@ -607,9 +842,9 @@ impl A2aBridge {
                         LaserError::HandlerConfig("A2A task id must be a string".to_owned())
                     })?;
                 if operation == A2aMethod::TasksGet {
-                    self.task(id).await?
+                    self.task_for(id, caller).await?
                 } else {
-                    self.cancel(id).await?
+                    self.cancel_for(id, caller).await?
                 }
             }
             Err(_) => {
@@ -651,9 +886,26 @@ fn correlation_of(conversation: ConversationId) -> CorrelationId {
 #[cfg(feature = "a2a-http")]
 async fn handle_rpc(
     State(bridge): State<Arc<A2aBridge>>,
+    principal: Option<axum::Extension<A2aCallerPrincipal>>,
     axum::Json(request): axum::Json<JsonValue>,
 ) -> axum::Json<JsonRpcResponse> {
-    axum::Json(bridge.handle_rpc(request).await)
+    let caller = principal.as_ref().map(|principal| principal.0.0.as_str());
+    axum::Json(bridge.handle_rpc_for(request, caller).await)
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+        })
+}
+
+fn unbound_caller() -> LaserError {
+    LaserError::HandlerConfig(
+        "this bridge binds tasks to callers, so the request needs an authenticated caller"
+            .to_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -661,6 +913,48 @@ mod tests {
     use super::*;
     use laser_wire::framing::{decode_named, encode_named};
     use serde_json::{from_str, to_string};
+
+    #[test]
+    fn given_a_task_binding_when_any_bound_field_changes_then_the_digest_should_change() {
+        let binding = TaskBinding {
+            key: [7; 32],
+            ttl: std::time::Duration::from_secs(60),
+        };
+        let task = ConversationId::derive("task-42");
+        let base = binding.mac("alice", 10, task, 1_000);
+        assert_eq!(base, binding.mac("alice", 10, task, 1_000));
+        assert_ne!(base, binding.mac("bob", 10, task, 1_000), "another caller");
+        assert_ne!(
+            base,
+            binding.mac("alice", 11, task, 1_000),
+            "a recreated stream"
+        );
+        assert_ne!(
+            base,
+            binding.mac("alice", 10, ConversationId::derive("task-43"), 1_000),
+            "another task"
+        );
+        assert_ne!(
+            base,
+            binding.mac("alice", 10, task, 2_000),
+            "another expiry"
+        );
+        let other_key = TaskBinding {
+            key: [8; 32],
+            ..binding.clone()
+        };
+        assert_ne!(base, other_key.mac("alice", 10, task, 1_000), "another key");
+        // A caller name cannot be shifted into the following fields.
+        assert_ne!(
+            binding.mac("ab", 10, task, 1),
+            binding.mac("a", 10, task, 1)
+        );
+        // The shared vector the Python and TypeScript SDKs check as well.
+        assert_eq!(
+            base.to_hex().as_str(),
+            "d1ea2040a6c1451ff74ad5eb597715ce67fa2d144aa0a2b369d9e56ebf0fee1b"
+        );
+    }
 
     #[test]
     fn given_task_states_when_serialized_then_should_use_the_kebab_case_wire_names() {

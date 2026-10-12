@@ -297,6 +297,11 @@ fn given_result_codes_when_compared_then_should_match_the_dictionary() {
     assert_eq!(ResultCode::Forbidden.code(), 10);
     assert_eq!(ResultCode::StepUpRequired.code(), 11);
     assert_eq!(ResultCode::Unavailable.code(), 12);
+    assert_eq!(ResultCode::TargetUnavailable.code(), 18);
+    assert_eq!(ResultCode::Pending.code(), 19);
+    assert_eq!(ResultCode::Pending.http_status(), 503);
+    assert_eq!(ResultCode::PlaneUnavailable.code(), 20);
+    assert_eq!(ResultCode::PlaneUnavailable.http_status(), 503);
     assert_eq!(ResultCode::from_code(2), ResultCode::NotFound);
     assert_eq!(ResultCode::from_code(404), ResultCode::Unrecognized(404));
     assert_eq!(ResultCode::NotFound.http_status(), 404);
@@ -370,6 +375,15 @@ fn given_session_queries_when_decoded_then_should_take_the_stream_from_the_path(
     let changes: laser_wire::http::SessionChangesQuery =
         serde_json::from_str("{}").expect("changes query decodes");
     assert_eq!(changes.after, 0);
+    assert_eq!(changes.series, None);
+    let changes: laser_wire::http::SessionChangesQuery =
+        serde_json::from_str(r#"{"after":17,"limit":10,"series":42}"#)
+            .expect("changes query with series decodes");
+    assert_eq!(changes.series, Some(42));
+    assert_eq!(
+        serde_json::to_value(&changes).expect("changes query serializes"),
+        serde_json::json!({"after":17,"limit":10,"series":42})
+    );
     assert_eq!(laser_wire::http::PARAM_FIXED_FRONTIER, "fixed_frontier");
     assert_eq!(laser_wire::http::PARAM_HISTORY_LIMIT, "history_limit");
     assert_eq!(laser_wire::http::PARAM_TEXT, "text");

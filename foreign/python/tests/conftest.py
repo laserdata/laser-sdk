@@ -44,6 +44,7 @@ async def laser(iggy_endpoint):
     """Create a client with a unique default stream for test isolation."""
     stream = f"t-{uuid.uuid4().hex[:12]}"
     client = await _connect_with_retry(iggy_endpoint, stream)
+    await client.stream(stream).ensure()
     return client
 
 

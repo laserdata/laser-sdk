@@ -7,6 +7,7 @@ import {
   AgentTopic,
   CorrelationId,
   ConversationId,
+  HandlerConfigError,
   InvalidError,
   McpBridge,
   enterBridge,
@@ -65,6 +66,70 @@ When("I submit and cancel an A2A task", async function (this: LaserWorld) {
   }
   this.bridgeTaskState = replayed.status.state.name;
 });
+
+function boundBridge(world: LaserWorld): A2aBridge {
+  return new A2aBridge(
+    world.requireLaser(),
+    AgentId.new("a2a-gateway"),
+    AgentTopic.Sessions,
+    AgentTopic.Sessions,
+  ).withTaskBinding(new Uint8Array(32).fill(3), 60_000);
+}
+
+When(
+  /^caller "([^"]+)" submits a bound A2A task$/,
+  async function (this: LaserWorld, caller: string) {
+    const task = await boundBridge(this)
+      .caller(caller)
+      .submit({ message: { role: "user", text: "bound" } });
+    this.boundTask = task.id;
+  },
+);
+
+async function recordBoundCancel(
+  world: LaserWorld,
+  caller: string | undefined,
+): Promise<void> {
+  const bridge = boundBridge(world);
+  const id = world.boundTask;
+  if (id === undefined) throw new Error("no bound A2A task was submitted");
+  let state: string;
+  try {
+    const task =
+      caller === undefined
+        ? await bridge.cancel(id)
+        : await bridge.caller(caller).cancel(id);
+    state =
+      task.status.state.kind === "known"
+        ? task.status.state.name
+        : "unrecognized";
+  } catch (error) {
+    if (!(error instanceof HandlerConfigError)) throw error;
+    state = "refused";
+  }
+  world.boundOutcomes.push(`${caller ?? "anonymous"}:${state}`);
+}
+
+When(
+  /^caller "([^"]+)" tries to cancel the bound A2A task$/,
+  async function (this: LaserWorld, caller: string) {
+    await recordBoundCancel(this, caller);
+  },
+);
+
+When(
+  "an anonymous caller tries to cancel the bound A2A task",
+  async function (this: LaserWorld) {
+    await recordBoundCancel(this, undefined);
+  },
+);
+
+Then(
+  /^the bound A2A cancel outcomes are "([^"]+)"$/,
+  function (this: LaserWorld, outcomes: string) {
+    assert.equal(this.boundOutcomes.join(","), outcomes);
+  },
+);
 
 Then(
   /^the replayed A2A task state is "([^"]+)"$/,
