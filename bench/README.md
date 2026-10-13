@@ -24,7 +24,7 @@ The maintained artifact versions are:
 
 | Binary | Version |
 | --- | --- |
-| Iggy server | `0.9.4-ld` |
+| Iggy server | `0.9.5-ld` |
 | `iggy-bench` | `0.6.0` |
 | plane | `0.23.0` |
 
@@ -121,7 +121,7 @@ Artifact mode downloads binaries and adjacent Minisign signatures from `https://
 [provisioning]
 mode = "artifact"
 cpu_target = "skylake"
-iggy_server_version = "0.9.4-ld"
+iggy_server_version = "0.9.5-ld"
 iggy_bench_version = "0.6.0"
 plane_version = "0.23.0"
 ```

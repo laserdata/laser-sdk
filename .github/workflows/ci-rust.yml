@@ -33,11 +33,12 @@ env:
 jobs:
   # Decide whether the Iggy-server-backed suites run. They always run for a
   # `rust-v*` release tag and on ordinary work. A `wire-v*` tag releases the
-  # wire crate alone, and a pull request or push carrying `[wire-break]` in
-  # its title, body, or commit message is a breaking wire change whose
-  # matching server release does not exist yet: both run every server-free
-  # gate and skip only the suites that need the released server binary. The
-  # unchanged revision runs the full pipeline after the pinned server exists.
+  # wire crate alone. A pull request or push carrying `[wire-break]` in its
+  # title, body, or commit message is a breaking wire change, and one carrying
+  # `[skip-server]` is a compatible change whose pinned server release is
+  # not published yet. All three run every server-free gate and skip only the
+  # suites that need the released server binary. The unchanged revision runs
+  # the full pipeline after the pinned server exists.
   flags:
     runs-on: ubuntu-latest
     outputs:
@@ -63,7 +64,7 @@ jobs:
             mode=skip
           elif [[ "${GITHUB_REF}" != refs/tags/* ]]; then
             for text in "${PR_TITLE}" "${PR_BODY}" "${COMMIT_MESSAGE}"; do
-              if [[ "${text}" == *"[wire-break]"* ]]; then
+              if [[ "${text}" == *"[wire-break]"* || "${text}" == *"[skip-server]"* ]]; then
                 mode=skip
               fi
             done
@@ -272,8 +273,9 @@ jobs:
 
   # All cargo tests: unit plus wire fixtures/robustness with every additive
   # feature, the VSR fork-backed integration suite, then doctests. In the
-  # wire-release and wire-break modes the integration suite skips (its matching
-  # server release does not exist yet) while every server-free test still runs.
+  # wire-release, wire-break, and skip-server modes the integration suite
+  # skips (its pinned server release is not published yet) while every
+  # server-free test still runs.
   test:
     needs: [flags]
     if: needs.flags.outputs.run_ci == 'run'
@@ -292,7 +294,7 @@ jobs:
         run: cargo test --locked --workspace --all-features
       - if: needs.flags.outputs.server_tests == 'run'
         run: cargo test --locked -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
-      - name: Server-free tests only (wire release or wire-break change)
+      - name: Server-free tests only (wire release, wire-break, or skip-server change)
         if: needs.flags.outputs.server_tests == 'skip'
         run: |
           cargo test --locked -p laser-wire --all-features

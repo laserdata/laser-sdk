@@ -25,7 +25,8 @@ defaults:
 jobs:
   # Decide whether the Iggy-server-backed suites run. A change carrying
   # `[wire-break]` in its title, body, or commit message is a breaking wire
-  # change whose matching server release does not exist yet: the server-free
+  # change, and one carrying `[skip-server]` is a compatible change whose
+  # pinned server release is not published yet. In both cases the server-free
   # gates still run and only the live suites skip. Release tags always run
   # everything.
   flags:
@@ -54,7 +55,7 @@ jobs:
           mode=run
           if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
             for text in "${PR_TITLE}" "${PR_BODY}" "${COMMIT_MESSAGE}"; do
-              if [[ "${text}" == *"[wire-break]"* ]]; then
+              if [[ "${text}" == *"[wire-break]"* || "${text}" == *"[skip-server]"* ]]; then
                 mode=skip
               fi
             done

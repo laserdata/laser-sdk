@@ -58,7 +58,7 @@ Modules group related types and operations. Features select optional dependencie
 | `keys` | the versioned managed key record (`KeyRecord`, `KeyKind`, `KEY_RECORD_VERSION`): the one storage representation every port's managed key registry reads and writes |
 | `commands` | the `Command` trait pairing each code with its request/reply types |
 | `http` | `/agdx/*` route constants, path builders, typed query parameters, JSON views for query, destinations, snapshots, schemas, files and metrics, the session routes under `/agdx/sessions/{stream}` with their query types, and the canonical `ErrorBody` reply contract |
-| `http_client` | feature `http-client`, a typed `/agdx/*` client over an injected runtime-agnostic `Transport`, available on native and wasm targets |
+| `http_client` | feature `http-client`, a typed `/agdx/*` client over an injected runtime-agnostic `Transport`, available on native and wasm targets. Each managed write has an `_as` variant that sends the caller's `operation_id`, so a re-sent write applies once |
 | `validate` | the `Validate` trait used both before client I/O and after server decode, including recursive logical schemas and values, query requests and replies, destinations, checkpoints, Arrow metadata, batch, key-value, graph, memory, and client metadata |
 | `framing` | `encode_named`/`decode_named` + `frame_encode`/`frame_decode` |
 | `codecs` | the payload codec traits and marker types |
