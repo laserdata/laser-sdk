@@ -15,6 +15,7 @@ use crate::schema::{Digest32, LogicalSchema, TypedValue, UuidValue};
 use crate::topology::WireTopology;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::num::NonZeroU128;
 
 /// `GET /agdx/capabilities`: the feature-detection probe.
 pub const CAPABILITIES_PATH: &str = "/agdx/capabilities";
@@ -1355,6 +1356,46 @@ pub struct SchemaQuery {
     pub stream: Option<String>,
 }
 
+/// `?operation_id=` on the HTTP managed writes: the projection, binding, graph,
+/// and schema-drop control writes, the key-value writes, and the fork writes.
+/// It names one logical write, so a re-sent request with the same id applies
+/// once. The value is the decimal text of a non-zero `u128`, the same text the
+/// filter routes use. A write without it gets a fresh id per request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+impl OperationQuery {
+    /// The caller's operation id, or `None` when the request carries none.
+    pub fn operation_id(&self) -> Result<Option<NonZeroU128>, InvalidOperationId> {
+        self.operation_id
+            .as_deref()
+            .map(|text| {
+                // `u128::from_str` accepts a leading `+`, which no client sends.
+                if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(InvalidOperationId);
+                }
+                text.parse::<NonZeroU128>().map_err(|_| InvalidOperationId)
+            })
+            .transpose()
+    }
+}
+
+impl From<NonZeroU128> for OperationQuery {
+    fn from(operation_id: NonZeroU128) -> Self {
+        Self {
+            operation_id: Some(operation_id.to_string()),
+        }
+    }
+}
+
+/// An `?operation_id=` that is not the decimal text of a non-zero `u128`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("operation_id must be a non-zero decimal u128")]
+pub struct InvalidOperationId;
+
 /// `GET /agdx/filters` query parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterListQuery {
@@ -1572,6 +1613,37 @@ mod tests {
         assert_eq!(fork_path("f1"), "/agdx/forks/f1");
         assert_eq!(fork_promote_path("f1"), "/agdx/forks/f1/promote");
         assert_eq!(fork_rows_path("f1"), "/agdx/forks/f1/rows");
+    }
+
+    #[test]
+    fn given_an_operation_id_when_rendered_and_parsed_then_should_round_trip() {
+        let operation_id = NonZeroU128::new(u128::MAX).expect("non-zero");
+        let query = OperationQuery::from(operation_id);
+        assert_eq!(
+            query.operation_id.as_deref(),
+            Some("340282366920938463463374607431768211455")
+        );
+        assert_eq!(query.operation_id(), Ok(Some(operation_id)));
+        assert_eq!(OperationQuery::default().operation_id(), Ok(None));
+    }
+
+    #[test]
+    fn given_a_malformed_operation_id_when_parsed_then_should_refuse_it() {
+        for text in [
+            "",
+            "0",
+            "+7",
+            "-7",
+            " 7",
+            "0x7",
+            "7.0",
+            "340282366920938463463374607431768211456",
+        ] {
+            let query = OperationQuery {
+                operation_id: Some(text.to_owned()),
+            };
+            assert_eq!(query.operation_id(), Err(InvalidOperationId), "{text:?}");
+        }
     }
 
     #[test]

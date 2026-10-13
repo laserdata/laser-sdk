@@ -38,7 +38,7 @@ These changes require explicit user authorization unless the current session alr
 
 A `rust-v*` tag publishes both crates after the full gate. A `wire-v*` tag publishes only `laser-wire` after tests that need no server. This lets a changed contract publish before the matching server.
 
-`[wire-break]` in a pull request or push description skips only tests that need the published server artifact. Server-free tests still run. Update the pin in `scripts/resolve-test-iggy-server.sh` afterward and run the full pipeline. Rust, Python, and TypeScript package release tags always run their full pipelines. The wire-only tag remains server-free.
+`[wire-break]` in a pull request or push description marks a breaking wire change. `[skip-server]` marks a compatible change whose pinned server in `scripts/resolve-test-iggy-server.sh` is not published yet. Either one skips only tests that need the published server artifact. Server-free tests still run. Run the full pipeline on the unchanged revision after the pinned server is published. Rust, Python, and TypeScript package release tags always run their full pipelines. The wire-only tag remains server-free.
 
 GitHub Actions use readable upstream version tags. Never replace Action tags with commit hashes or add a workflow that enforces hashed Action references.
 
@@ -439,7 +439,7 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 
 ## What is shipped vs planned
 
-This inventory describes the `0.8.0` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.8.1` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 

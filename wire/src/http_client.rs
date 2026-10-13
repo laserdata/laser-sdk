@@ -29,8 +29,8 @@ use crate::http::{
     DestinationListQuery, DestinationMutationBody, DestinationPageView, DestinationView, ErrorBody,
     FilterBindingListQuery, FilterListQuery, FilterRevisionListQuery, FilterTestBody,
     ForkCreateBody, ForkPutBody, GraphNeighborsQuery, GraphResultView, KvCasQuery, KvPageView,
-    KvPutQuery, KvScanQuery, ProjectionListQuery, PromotedView, QueryExecutionView, QueryPageBody,
-    QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, SchemaListQuery,
+    KvPutQuery, KvScanQuery, OperationQuery, ProjectionListQuery, PromotedView, QueryExecutionView,
+    QueryPageBody, QueryRouteListQuery, QueryRoutePageView, RemoveBindingBody, SchemaListQuery,
     SessionChangesQuery, SessionEventsQuery, SessionLinksQuery, SessionStateQuery, SessionsQuery,
     SnapshotListQuery, SnapshotPageView, TableFileListQuery, TableFilePageView, TableMetricsView,
     TableSchemaView, TableSnapshotView, TableView,
@@ -40,6 +40,7 @@ use crate::query::{Query, QueryResult};
 use crate::result::ResultCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::num::NonZeroU128;
 
 /// The HTTP verb a [`Transport`] must perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
@@ -473,10 +474,38 @@ impl<T: Transport> HttpClient<T> {
         value: &[u8],
         expires_at_micros: Option<u64>,
     ) -> ClientResult<(), T::Error> {
+        self.kv_set_with(namespace, key, value, expires_at_micros, None)
+            .await
+    }
+
+    /// [`kv_set`](Self::kv_set) under the caller's `operation_id`. Re-send a
+    /// write whose outcome is unknown with the same id: the server answers the
+    /// recorded outcome instead of writing again.
+    pub async fn kv_set_as(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expires_at_micros: Option<u64>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        self.kv_set_with(namespace, key, value, expires_at_micros, Some(operation_id))
+            .await
+    }
+
+    async fn kv_set_with(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expires_at_micros: Option<u64>,
+        operation_id: Option<NonZeroU128>,
+    ) -> ClientResult<(), T::Error> {
         let path = with_query(
             &http::kv_entry_path(namespace, &base64url_encode(key)),
             &KvPutQuery { expires_at_micros },
         )?;
+        let path = operation_route(path, operation_id)?;
         // The key is base64url in the path, but the value rides the raw request
         // body, so a large value carries no base64 inflation.
         self.expect_ok(Method::Put, path, Some(value.to_vec()))
@@ -498,6 +527,42 @@ impl<T: Transport> HttpClient<T> {
         expect: CasExpect,
         expires_at_micros: Option<u64>,
     ) -> ClientResult<u64, T::Error> {
+        self.kv_cas_with(namespace, key, value, expect, expires_at_micros, None)
+            .await
+    }
+
+    /// [`kv_cas`](Self::kv_cas) under the caller's `operation_id`. A re-send
+    /// with the same id answers the recorded commit instead of a conflict
+    /// against the version the first attempt wrote.
+    pub async fn kv_cas_as(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expect: CasExpect,
+        expires_at_micros: Option<u64>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<u64, T::Error> {
+        self.kv_cas_with(
+            namespace,
+            key,
+            value,
+            expect,
+            expires_at_micros,
+            Some(operation_id),
+        )
+        .await
+    }
+
+    async fn kv_cas_with(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        expect: CasExpect,
+        expires_at_micros: Option<u64>,
+        operation_id: Option<NonZeroU128>,
+    ) -> ClientResult<u64, T::Error> {
         let (expect_version, expect_absent) = match expect {
             CasExpect::Match(version) => (Some(version), None),
             CasExpect::Absent => (None, Some(true)),
@@ -510,6 +575,7 @@ impl<T: Transport> HttpClient<T> {
                 expires_at_micros,
             },
         )?;
+        let path = operation_route(path, operation_id)?;
         // The value rides the raw body like the plain PUT.
         let response = self
             .dispatch(Method::Put, path, Some(value.to_vec()))
@@ -522,6 +588,18 @@ impl<T: Transport> HttpClient<T> {
     pub async fn kv_delete(&self, namespace: &str, key: &[u8]) -> ClientResult<bool, T::Error> {
         let path = http::kv_entry_path(namespace, &base64url_encode(key));
         self.send_empty(Method::Delete, path).await
+    }
+
+    /// [`kv_delete`](Self::kv_delete) under the caller's `operation_id`.
+    pub async fn kv_delete_as(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        operation_id: NonZeroU128,
+    ) -> ClientResult<bool, T::Error> {
+        let path = http::kv_entry_path(namespace, &base64url_encode(key));
+        self.send_empty(Method::Delete, with_operation(&path, operation_id)?)
+            .await
     }
 
     /// `GET /agdx/kv/{namespace}`: scan a page of entries.
@@ -538,6 +616,20 @@ impl<T: Transport> HttpClient<T> {
     pub async fn create_fork(&self, body: &ForkCreateBody) -> ClientResult<ForkInfo, T::Error> {
         self.send_json(Method::Post, http::FORKS_PATH.to_owned(), body)
             .await
+    }
+
+    /// [`create_fork`](Self::create_fork) under the caller's `operation_id`.
+    pub async fn create_fork_as(
+        &self,
+        body: &ForkCreateBody,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<ForkInfo, T::Error> {
+        self.send_json(
+            Method::Post,
+            with_operation(http::FORKS_PATH, operation_id)?,
+            body,
+        )
+        .await
     }
 
     /// `GET /agdx/forks`: list the caller's forks.
@@ -645,16 +737,50 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`register_projection`](Self::register_projection) under the caller's
+    /// `operation_id`. A control write whose outcome is unknown (`Pending`) is
+    /// safe to re-send with the same id: the plane applies it once.
+    pub async fn register_projection_as(
+        &self,
+        projection: &Projection,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(http::PROJECTIONS_PATH, operation_id)?;
+        self.send_json_ok(Method::Post, path, projection).await
+    }
+
     /// `DELETE /agdx/projections/{id}`: drop a projection.
     pub async fn drop_projection(&self, id: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::projection_path(id), None)
             .await
     }
 
+    /// [`drop_projection`](Self::drop_projection) under the caller's
+    /// `operation_id`.
+    pub async fn drop_projection_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::projection_path(id), operation_id)?;
+        self.expect_ok(Method::Delete, path, None).await
+    }
+
     /// `POST /agdx/bindings`: apply (add or update) a binding.
     pub async fn apply_binding(&self, binding: &ProjectionBinding) -> ClientResult<(), T::Error> {
         self.send_json_ok(Method::Post, http::BINDINGS_PATH.to_owned(), binding)
             .await
+    }
+
+    /// [`apply_binding`](Self::apply_binding) under the caller's
+    /// `operation_id`.
+    pub async fn apply_binding_as(
+        &self,
+        binding: &ProjectionBinding,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(http::BINDINGS_PATH, operation_id)?;
+        self.send_json_ok(Method::Post, path, binding).await
     }
 
     /// `DELETE /agdx/bindings`: remove a binding for a source, or one projection
@@ -671,6 +797,23 @@ impl<T: Transport> HttpClient<T> {
         };
         self.send_json_ok(Method::Delete, http::BINDINGS_PATH.to_owned(), &body)
             .await
+    }
+
+    /// [`remove_binding`](Self::remove_binding) under the caller's
+    /// `operation_id`.
+    pub async fn remove_binding_as(
+        &self,
+        source: &SourceSelector,
+        projection_ref: Option<String>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let body = RemoveBindingBody {
+            stream: source.stream.clone(),
+            topic: source.topic.clone(),
+            projection_ref,
+        };
+        let path = with_operation(http::BINDINGS_PATH, operation_id)?;
+        self.send_json_ok(Method::Delete, path, &body).await
     }
 
     /// `GET /agdx/schemas/{id}`: read one writer schema, or `None` on a 404.
@@ -694,6 +837,18 @@ impl<T: Transport> HttpClient<T> {
             None,
         )
         .await
+    }
+
+    /// [`drop_schema`](Self::drop_schema) under the caller's `operation_id`.
+    pub async fn drop_schema_as(
+        &self,
+        id: u32,
+        stream: Option<&str>,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = schema_route(http::schema_path(id), stream)?;
+        self.expect_ok(Method::Delete, with_operation(&path, operation_id)?, None)
+            .await
     }
 
     /// `POST /agdx/schemas/{id}/decode`: decode a record body under the schema,
@@ -848,6 +1003,21 @@ impl<T: Transport> HttpClient<T> {
         Ok(view.deleted)
     }
 
+    /// [`kv_delete_many`](Self::kv_delete_many) under the caller's
+    /// `operation_id`.
+    pub async fn kv_delete_many_as(
+        &self,
+        namespace: &str,
+        filter: &KvScanQuery,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<usize, T::Error> {
+        let path = with_query(&http::kv_namespace_path(namespace), filter)?;
+        let view: DeletedManyView = self
+            .send_empty(Method::Delete, with_operation(&path, operation_id)?)
+            .await?;
+        Ok(view.deleted)
+    }
+
     /// `POST /agdx/forks/{id}/promote`: promote a fork's rows onto the trunk.
     /// Returns the number of rows applied.
     pub async fn promote_fork(&self, id: &str) -> ClientResult<usize, T::Error> {
@@ -857,16 +1027,48 @@ impl<T: Transport> HttpClient<T> {
         Ok(view.rows)
     }
 
+    /// [`promote_fork`](Self::promote_fork) under the caller's `operation_id`.
+    pub async fn promote_fork_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<usize, T::Error> {
+        let path = with_operation(&http::fork_promote_path(id), operation_id)?;
+        let view: PromotedView = self.send_empty(Method::Post, path).await?;
+        Ok(view.rows)
+    }
+
     /// `DELETE /agdx/forks/{id}`: squash (discard) a fork.
     pub async fn delete_fork(&self, id: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::fork_path(id), None)
             .await
     }
 
+    /// [`delete_fork`](Self::delete_fork) under the caller's `operation_id`.
+    pub async fn delete_fork_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::fork_path(id), operation_id)?;
+        self.expect_ok(Method::Delete, path, None).await
+    }
+
     /// `PUT /agdx/forks/{id}/rows`: write one speculative row into a fork.
     pub async fn put_fork_row(&self, id: &str, body: &ForkPutBody) -> ClientResult<(), T::Error> {
         self.send_json_ok(Method::Put, http::fork_rows_path(id), body)
             .await
+    }
+
+    /// [`put_fork_row`](Self::put_fork_row) under the caller's `operation_id`.
+    pub async fn put_fork_row_as(
+        &self,
+        id: &str,
+        body: &ForkPutBody,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::fork_rows_path(id), operation_id)?;
+        self.send_json_ok(Method::Put, path, body).await
     }
 
     /// `POST /agdx/graph/{name}/query`: run a traversal over a named graph, get
@@ -913,6 +1115,17 @@ impl<T: Transport> HttpClient<T> {
             .await
     }
 
+    /// [`register_graph`](Self::register_graph) under the caller's
+    /// `operation_id`.
+    pub async fn register_graph_as(
+        &self,
+        projection: &Projection,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(http::GRAPHS_PATH, operation_id)?;
+        self.send_json_ok(Method::Post, path, projection).await
+    }
+
     /// `GET /agdx/graphs/{id}`: read one graph projection by id, or `None` when no
     /// graph projection has it.
     pub async fn get_graph(&self, id: &str) -> ClientResult<Option<ProjectionInfo>, T::Error> {
@@ -924,6 +1137,16 @@ impl<T: Transport> HttpClient<T> {
     pub async fn drop_graph(&self, id: &str) -> ClientResult<(), T::Error> {
         self.expect_ok(Method::Delete, http::graph_path(id), None)
             .await
+    }
+
+    /// [`drop_graph`](Self::drop_graph) under the caller's `operation_id`.
+    pub async fn drop_graph_as(
+        &self,
+        id: &str,
+        operation_id: NonZeroU128,
+    ) -> ClientResult<(), T::Error> {
+        let path = with_operation(&http::graph_path(id), operation_id)?;
+        self.expect_ok(Method::Delete, path, None).await
     }
 
     /// `GET /agdx/authz/whoami`: the caller's own bound roles and effective
@@ -1057,13 +1280,30 @@ fn schema_route<E>(path: String, stream: Option<&str>) -> Result<String, ClientE
     )
 }
 
+/// Append `params` to `path`, which may already carry a query string.
 fn with_query<E, P: Serialize>(path: &str, params: &P) -> Result<String, ClientError<E>> {
     let query = serde_urlencoded::to_string(params)
         .map_err(|error| ClientError::Decode(format!("query params: {error}")))?;
     if query.is_empty() {
         Ok(path.to_owned())
+    } else if path.contains('?') {
+        Ok(format!("{path}&{query}"))
     } else {
         Ok(format!("{path}?{query}"))
+    }
+}
+
+fn with_operation<E>(path: &str, operation_id: NonZeroU128) -> Result<String, ClientError<E>> {
+    with_query(path, &OperationQuery::from(operation_id))
+}
+
+fn operation_route<E>(
+    path: String,
+    operation_id: Option<NonZeroU128>,
+) -> Result<String, ClientError<E>> {
+    match operation_id {
+        Some(operation_id) => with_operation(&path, operation_id),
+        None => Ok(path),
     }
 }
 
@@ -1267,6 +1507,21 @@ mod tests {
         }
     }
 
+    // Answers `202` with an empty body and keeps every request it was asked to
+    // send, so a test can read the exact path a method built.
+    #[derive(Default)]
+    struct RecordingTransport {
+        requests: std::cell::RefCell<Vec<HttpRequest>>,
+    }
+
+    impl Transport for RecordingTransport {
+        type Error = std::convert::Infallible;
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse, Self::Error> {
+            self.requests.borrow_mut().push(request);
+            Ok(HttpResponse::new(202, Vec::new()))
+        }
+    }
+
     fn block_on<F: core::future::Future>(future: F) -> F::Output {
         // A minimal executor: these futures never yield (the canned transport
         // is ready immediately), so a busy poll with the no-op waker resolves
@@ -1435,5 +1690,76 @@ mod tests {
         let error = block_on(client.kv_cas("locks", b"job", b"steal", CasExpect::Absent, None))
             .expect_err("a precondition miss is an error");
         assert_eq!(error.code(), Some(ResultCode::Conflict));
+    }
+
+    #[test]
+    fn given_a_caller_operation_id_when_writing_the_registry_then_should_ride_the_query_string() {
+        let operation_id = NonZeroU128::new(42).expect("non-zero");
+        let client = HttpClient::new(RecordingTransport::default());
+        let projection = Projection::builder("reading.v1").build();
+        let source = SourceSelector::new("telemetry", "events");
+
+        block_on(client.register_projection_as(&projection, operation_id)).expect("register");
+        block_on(client.drop_projection_as("reading.v1", operation_id)).expect("drop");
+        block_on(client.remove_binding_as(&source, None, operation_id)).expect("remove");
+        block_on(client.drop_schema_as(7, Some("telemetry"), operation_id)).expect("drop schema");
+        block_on(client.drop_schema_as(7, None, operation_id)).expect("drop shared schema");
+        block_on(client.register_graph_as(&projection, operation_id)).expect("register graph");
+        block_on(client.drop_graph_as("topology.v1", operation_id)).expect("drop graph");
+
+        let paths: Vec<String> = client
+            .transport()
+            .requests
+            .borrow()
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/agdx/projections?operation_id=42",
+                "/agdx/projections/reading.v1?operation_id=42",
+                "/agdx/bindings?operation_id=42",
+                "/agdx/schemas/7?stream=telemetry&operation_id=42",
+                "/agdx/schemas/7?operation_id=42",
+                "/agdx/graphs?operation_id=42",
+                "/agdx/graphs/topology.v1?operation_id=42",
+            ]
+        );
+    }
+
+    #[test]
+    fn given_a_caller_operation_id_when_writing_key_values_then_should_follow_the_other_parameters()
+    {
+        let operation_id = NonZeroU128::new(7).expect("non-zero");
+        let client = HttpClient::new(RecordingTransport::default());
+
+        let _ = block_on(client.kv_set_as("notes", b"k", b"v", Some(10), operation_id));
+        let _ =
+            block_on(client.kv_cas_as("notes", b"k", b"v", CasExpect::Absent, None, operation_id));
+        let _ = block_on(client.kv_delete_as("notes", b"k", operation_id));
+        let _ = block_on(client.delete_fork_as("f1", operation_id));
+
+        let requests = client.transport().requests.borrow();
+        assert_eq!(
+            requests[0].path,
+            "/agdx/kv/notes/aw?expires_at_micros=10&operation_id=7"
+        );
+        assert_eq!(
+            requests[1].path,
+            "/agdx/kv/notes/aw/cas?expect_absent=true&operation_id=7"
+        );
+        assert_eq!(requests[2].path, "/agdx/kv/notes/aw?operation_id=7");
+        assert_eq!(requests[3].path, "/agdx/forks/f1?operation_id=7");
+    }
+
+    #[test]
+    fn given_no_operation_id_when_writing_then_should_send_the_bare_path() {
+        let client = HttpClient::new(RecordingTransport::default());
+        block_on(client.drop_projection("reading.v1")).expect("drop");
+        block_on(client.drop_schema(7, Some("telemetry"))).expect("drop schema");
+        let requests = client.transport().requests.borrow();
+        assert_eq!(requests[0].path, "/agdx/projections/reading.v1");
+        assert_eq!(requests[1].path, "/agdx/schemas/7?stream=telemetry");
     }
 }
