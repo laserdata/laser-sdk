@@ -713,14 +713,14 @@ export {
 } from "./wire/control.js"
 export {
   publicCheckpointMutationRequiredCapability,
-  validateSupervisorAssertion
+  validateOperatorAssertion
 } from "./wire/checkpoint.js"
 export type { PartitionLifecycleChange } from "./wire/checkpoint.js"
 export {
   resultCodeFromCode,
   resultCodeHttpStatus,
   resultCodeIsPending,
-  resultCodeIsPlaneUnavailable
+  resultCodeIsBackendUnavailable
 } from "./wire/result.js"
 export { contentTypeCode, isRawContentType } from "./wire/content.js"
 export type { PublishOptions } from "./client/publish-options.js"

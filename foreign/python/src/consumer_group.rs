@@ -31,7 +31,7 @@ pub struct PyConsumerGroupInfo {
 }
 
 /// A consumer group's filter policy. Build it with `ConsumerGroup.filter`.
-/// Every verb needs a managed plane that serves the filter catalog. Catalog
+/// Every verb needs a managed backend that serves the filter catalog. Catalog
 /// replies are dicts in the wire shape.
 #[gen_stub_pyclass]
 #[pyclass(name = "GroupFilter", frozen)]

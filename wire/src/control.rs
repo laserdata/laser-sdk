@@ -584,7 +584,7 @@ pub struct ProjectionBinding {
     /// Operational index name served by `QueryTarget::Operational`.
     pub index: String,
     /// Opt this binding into the change feed: after each committed projector
-    /// batch the plane publishes one `ChangeRecord` on the changes topic.
+    /// batch the managed backend publishes one `ChangeRecord` on the changes topic.
     /// Default off and skipped on the wire, so a deployment that never opts in
     /// emits nothing and a pre-feed binding encodes byte-identically.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -595,10 +595,10 @@ pub struct ProjectionBinding {
     /// [`retention`](ProjectionBindingBuilder::retention).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionPolicy>,
-    /// Let the plane skip a record the destination or the extraction
+    /// Let the managed backend skip a record the destination or the extraction
     /// deterministically rejects, instead of holding the partition until the
     /// binding enables skipping. Operator skips also require this opt-in. The
-    /// plane skips only after it proved the rejection: the destination
+    /// backend skips only after it proved the rejection: the destination
     /// accepted other records of the same batch and refused this
     /// one twice. Every skip is an ordered control record, so every replica
     /// skips the same record, and the record goes to the dead-letter topic.
@@ -693,7 +693,7 @@ impl ProjectionBindingBuilder {
         self
     }
 
-    /// Let the plane skip a record it proved the destination or the
+    /// Let the managed backend skip a record it proved the destination or the
     /// extraction rejects, instead of holding the partition. The skipped record
     /// goes to the dead-letter topic. See [`ProjectionBinding::skip_rejected`].
     #[must_use]
@@ -859,9 +859,9 @@ pub enum ControlCommand {
     /// backend's operator path appends it. The streaming server never forwards
     /// it from a client.
     AcceptGap(GapAcceptance),
-    /// The plane skips one record that a binding's destination or extraction
+    /// The managed backend skips one record that a binding's destination or extraction
     /// deterministically rejected. Ordered on the control topic, so every
-    /// replica skips the same record. Appended by the plane itself, for a
+    /// replica skips the same record. Appended by the backend itself, for a
     /// binding that opted in or after an operator asked. The streaming server
     /// never forwards it from a client.
     SkipRecord(RecordSkip),

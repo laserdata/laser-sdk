@@ -72,7 +72,7 @@ impl Laser {
     /// Lower-level: execute a pre-built `Query` and return the raw paged result.
     /// Most callers want `query(index).where_eq(...).fetch().await` instead.
     ///
-    /// Query requires `laser-plane` in Laser Stack or LaserData Cloud. Against
+    /// Query requires the managed backend in Laser Stack or LaserData Cloud. Against
     /// Apache Iggy without a managed backend (`query.available` false), this
     /// returns `LaserError::Unsupported`.
     pub async fn execute_query(&self, query: Query) -> Result<QueryResult, LaserError> {

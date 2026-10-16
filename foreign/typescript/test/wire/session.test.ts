@@ -83,7 +83,17 @@ void test("given_session_get_without_stream_when_decoded_then_should_reject", ()
 
 void test("given_session_read_replies_when_decoded_then_should_match_rust_bytes", async () => {
   const replies = new Map<string, ReturnType<typeof decodeSessionReply>>()
-  for (const name of ["info", "page", "events", "state", "links", "sources", "changes", "error"]) {
+  for (const name of [
+    "info",
+    "page",
+    "page_rebuilding",
+    "events",
+    "state",
+    "links",
+    "sources",
+    "changes",
+    "error"
+  ]) {
     const file = `session_reply_${name}.bin`
     const bytes = await readFile(path.join(FIXTURES_DIR, file))
     const reply = decodeSessionReply(decodeOne(bytes, file), file)
@@ -95,6 +105,14 @@ void test("given_session_read_replies_when_decoded_then_should_match_rust_bytes"
   assert.equal(info.outcome.info.status, "active")
   assert.equal(info.outcome.info.flags.eventsTruncated, true)
   assert.equal(info.outcome.info.frontier[0]?.folded, 41n)
+  const page = replies.get("page")
+  assert.ok(page?.kind === "ok" && page.outcome.kind === "page")
+  assert.equal(page.outcome.page.rebuilding, false)
+  assert.equal(page.outcome.page.items.length, 1)
+  const rebuilding = replies.get("page_rebuilding")
+  assert.ok(rebuilding?.kind === "ok" && rebuilding.outcome.kind === "page")
+  assert.equal(rebuilding.outcome.page.rebuilding, true)
+  assert.deepEqual(rebuilding.outcome.page.items, [])
   const events = replies.get("events")
   assert.ok(events?.kind === "ok" && events.outcome.kind === "events")
   assert.equal(events.outcome.page.gaps[0]?.reason, "expired_before_fold")

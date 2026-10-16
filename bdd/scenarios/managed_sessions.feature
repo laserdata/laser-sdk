@@ -1,4 +1,4 @@
-@sessions @plane
+@sessions @managed
 Feature: Managed sessions on a deployment that indexes them
   A deployment that serves sessions folds every registered stream into a
   session index. Reads list and inspect sessions from that index without
@@ -141,6 +141,7 @@ Feature: Managed sessions on a deployment that indexes them
     And the session state sets "step" to 1
     And the session ends
     Then listing the stream finds "reads" as completed
+    And the session list of the stream is not rebuilding
     And the indexed events of the session are "session.started", "tool.call", "tool.result", "state.updated", "state.updated", "session.completed"
     And the indexed state of the session is {"step": 1}
     And the session sources show folded offsets within their heads

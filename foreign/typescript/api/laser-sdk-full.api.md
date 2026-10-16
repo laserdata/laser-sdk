@@ -2104,9 +2104,9 @@ export interface CheckpointRequestEnvelope {
     // (undocumented)
     readonly mutation: PublicCheckpointMutation;
     // (undocumented)
-    readonly requestId: CheckpointRequestId;
+    readonly operatorAssertion?: OperatorActorAssertion;
     // (undocumented)
-    readonly supervisorAssertion?: SupervisorActorAssertion;
+    readonly requestId: CheckpointRequestId;
     // (undocumented)
     readonly v: number;
 }
@@ -4263,7 +4263,7 @@ const destinationRetentionGapPath: (id: DestinationId) => string;
 // @public (undocumented)
 export class Destinations {
     // (undocumented)
-    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     acquireLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -4279,8 +4279,8 @@ export class Destinations {
     // (undocumented)
     list(consistency: CheckpointReadConsistency, filter?: DestinationListFilter, after?: DestinationId, limit?: number): Promise<DestinationCheckpointPage>;
     // (undocumented)
-    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion?: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
-    mutateWithSupervisorAssertion(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, operatorAssertion?: OperatorActorAssertion): Promise<CheckpointMutationResult>;
+    mutateWithOperatorAssertion(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     observePartitionLifecycle(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -4290,7 +4290,7 @@ export class Destinations {
     // (undocumented)
     recordBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, block: DestinationBlock): Promise<CheckpointMutationResult>;
     // (undocumented)
-    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     recordRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, gap: RetentionGap): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -4304,7 +4304,7 @@ export class Destinations {
     // (undocumented)
     setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
     // (undocumented)
-    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     takeOverLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
 }
@@ -9362,6 +9362,9 @@ const MAX_NAMESPACE_BYTES = 128;
 const MAX_NAMESPACE_PARTS = 16;
 
 // @public (undocumented)
+const MAX_OPERATOR_ASSERTION_TTL_MICROS = 300000000n;
+
+// @public (undocumented)
 const MAX_PAGE_SIZE = 1000;
 
 // @public (undocumented)
@@ -9417,9 +9420,6 @@ const MAX_STATE_DOCUMENT_BYTES: number;
 
 // @public (undocumented)
 const MAX_STATE_PATCH_OPS = 256;
-
-// @public (undocumented)
-const MAX_SUPERVISOR_ASSERTION_TTL_MICROS = 300000000n;
 
 // @public (undocumented)
 const MAX_TABLE_NAME_BYTES = 255;
@@ -10136,6 +10136,52 @@ interface OperationErrorView {
 
 // @public (undocumented)
 type OperationState = "accepted" | "running" | "succeeded" | "failed" | "cancelled";
+
+// @public (undocumented)
+const OPERATOR_ASSERTION_KEY_ID_BYTES = 8;
+
+// @public (undocumented)
+const OPERATOR_ASSERTION_SIGNATURE_BYTES = 64;
+
+// @public (undocumented)
+const OPERATOR_ASSERTION_VERSION = 1;
+
+// @public (undocumented)
+interface OperatorActorAssertion {
+    // (undocumented)
+    readonly claims: OperatorActorClaims;
+    // (undocumented)
+    readonly keyId: Uint8Array;
+    // (undocumented)
+    readonly signature: Uint8Array;
+}
+
+// @public (undocumented)
+interface OperatorActorClaims {
+    // (undocumented)
+    readonly action: OperatorAssertionAction;
+    // (undocumented)
+    readonly cloudUserId: number;
+    // (undocumented)
+    readonly deploymentId: number;
+    // (undocumented)
+    readonly destinationGeneration: bigint;
+    // (undocumented)
+    readonly destinationId: DestinationId;
+    // (undocumented)
+    readonly expectedRevision?: bigint;
+    // (undocumented)
+    readonly expiresAtMicros: bigint;
+    // (undocumented)
+    readonly issuedAtMicros: bigint;
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
+    // (undocumented)
+    readonly v: number;
+}
+
+// @public (undocumented)
+type OperatorAssertionAction = "accept_retention_gap" | "supersede_generation" | "record_repair";
 
 // @public (undocumented)
 export const OPS_STREAM_DEFAULT = "_agdx";
@@ -12173,10 +12219,10 @@ function resultCodeFromWord(word: string): ResultCode | undefined;
 export function resultCodeHttpStatus(value: ResultCode): number;
 
 // @public
-export function resultCodeIsPending(value: ResultCode): boolean;
+export function resultCodeIsBackendUnavailable(value: ResultCode): boolean;
 
 // @public
-export function resultCodeIsPlaneUnavailable(value: ResultCode): boolean;
+export function resultCodeIsPending(value: ResultCode): boolean;
 
 // @public
 function resultCodeIsRetryable(value: ResultCode): boolean;
@@ -12203,7 +12249,7 @@ const ResultCodeName: {
     readonly StaleGeneration: 17;
     readonly TargetUnavailable: 18;
     readonly Pending: 19;
-    readonly PlaneUnavailable: 20;
+    readonly BackendUnavailable: 20;
 };
 
 // @public (undocumented)
@@ -12700,7 +12746,7 @@ interface SessionChangesQuery {
 // @public (undocumented)
 function sessionChangesQueryParams(query: SessionChangesQuery): URLSearchParams;
 
-// @public (undocumented)
+// @public
 interface SessionChangesView {
     // (undocumented)
     readonly floor: bigint;
@@ -13124,6 +13170,7 @@ export interface SessionPage {
     readonly cursor?: string;
     // (undocumented)
     readonly items: readonly SessionInfo[];
+    readonly rebuilding: boolean;
     // (undocumented)
     readonly searched?: bigint;
     // (undocumented)
@@ -13844,52 +13891,6 @@ export interface Summarizer {
 }
 
 // @public (undocumented)
-const SUPERVISOR_ASSERTION_KEY_ID_BYTES = 8;
-
-// @public (undocumented)
-const SUPERVISOR_ASSERTION_SIGNATURE_BYTES = 64;
-
-// @public (undocumented)
-const SUPERVISOR_ASSERTION_VERSION = 1;
-
-// @public (undocumented)
-interface SupervisorActorAssertion {
-    // (undocumented)
-    readonly claims: SupervisorActorClaims;
-    // (undocumented)
-    readonly keyId: Uint8Array;
-    // (undocumented)
-    readonly signature: Uint8Array;
-}
-
-// @public (undocumented)
-interface SupervisorActorClaims {
-    // (undocumented)
-    readonly action: SupervisorAssertionAction;
-    // (undocumented)
-    readonly cloudUserId: number;
-    // (undocumented)
-    readonly deploymentId: number;
-    // (undocumented)
-    readonly destinationGeneration: bigint;
-    // (undocumented)
-    readonly destinationId: DestinationId;
-    // (undocumented)
-    readonly expectedRevision?: bigint;
-    // (undocumented)
-    readonly expiresAtMicros: bigint;
-    // (undocumented)
-    readonly issuedAtMicros: bigint;
-    // (undocumented)
-    readonly requestId: CheckpointRequestId;
-    // (undocumented)
-    readonly v: number;
-}
-
-// @public (undocumented)
-type SupervisorAssertionAction = "accept_retention_gap" | "supersede_generation" | "record_repair";
-
-// @public (undocumented)
 export class SwappableGovernor implements ActionGovernor {
     constructor(active: ActionGovernor);
     current(): ActionGovernor;
@@ -14508,6 +14509,9 @@ function validateMaterializationDestination(value: MaterializationDestination): 
 // @public (undocumented)
 function validateNamespace(namespace: string): void;
 
+// @public (undocumented)
+export function validateOperatorAssertion(value: OperatorActorAssertion): void;
+
 // @public
 function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array | undefined): void;
 
@@ -14570,9 +14574,6 @@ function validateStateDelta(delta: StateDelta): void;
 
 // @public (undocumented)
 function validateStateSnapshot(snapshot: StateSnapshot): void;
-
-// @public (undocumented)
-export function validateSupervisorAssertion(value: SupervisorActorAssertion): void;
 
 // @public (undocumented)
 export type Value = {
@@ -15095,7 +15096,7 @@ declare namespace wire {
         encodeCheckpointRequestFrame,
         validateCheckpointRequest,
         validatePublicCheckpointMutation,
-        validateSupervisorAssertion,
+        validateOperatorAssertion,
         decodeCheckpointMutationResult,
         encodeCheckpointMutationResult,
         encodeCheckpointReplyFrame,
@@ -15123,10 +15124,10 @@ declare namespace wire {
         MAX_CHECKPOINT_ERROR_BYTES,
         MAX_REPAIR_DETAIL_BYTES,
         MAX_CHECKPOINT_LEASE_DURATION_MICROS,
-        SUPERVISOR_ASSERTION_VERSION,
-        MAX_SUPERVISOR_ASSERTION_TTL_MICROS,
-        SUPERVISOR_ASSERTION_KEY_ID_BYTES,
-        SUPERVISOR_ASSERTION_SIGNATURE_BYTES,
+        OPERATOR_ASSERTION_VERSION,
+        MAX_OPERATOR_ASSERTION_TTL_MICROS,
+        OPERATOR_ASSERTION_KEY_ID_BYTES,
+        OPERATOR_ASSERTION_SIGNATURE_BYTES,
         CheckpointReadConsistency,
         DestinationEffectiveState,
         PartitionLifecycleState,
@@ -15148,9 +15149,9 @@ declare namespace wire {
         DestinationBlock,
         RepairRecord,
         DestinationCheckpointStatus,
-        SupervisorAssertionAction,
-        SupervisorActorClaims,
-        SupervisorActorAssertion,
+        OperatorAssertionAction,
+        OperatorActorClaims,
+        OperatorActorAssertion,
         PublicCheckpointMutation,
         CheckpointRequestEnvelope,
         CheckpointMutationResult,
@@ -16290,7 +16291,7 @@ declare namespace wire {
         resultCodeHttpStatus,
         resultCodeIsRetryable,
         resultCodeIsPending,
-        resultCodeIsPlaneUnavailable,
+        resultCodeIsBackendUnavailable,
         resultCodeFromWord,
         resultCodeWord,
         ResultCodeName,

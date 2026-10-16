@@ -5,7 +5,7 @@ use laser_wire::change::ChangeRecord;
 use laser_wire::framing::decode_named;
 
 impl Laser {
-    /// The change-feed accessor: [`ChangeRecord`]s the plane publishes after
+    /// The change-feed accessor: [`ChangeRecord`]s the managed backend publishes after
     /// each committed projector batch for a binding that opted into `notify`.
     /// "Query after my data landed" becomes await-then-query instead of
     /// sleep-and-retry, and it composes with read-your-writes rather than

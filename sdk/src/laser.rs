@@ -49,14 +49,14 @@ fn barrier_bit(code: u32) -> u8 {
 }
 
 /// The message of a managed reply that leaves a mutation's outcome unknown, or
-/// `None` for a final reply. `Pending` means the plane accepted the mutation
-/// and has not folded it yet. `PlaneUnavailable` means the node's own plane did
+/// `None` for a final reply. `Pending` means the managed backend accepted the mutation
+/// and has not folded it yet. `BackendUnavailable` means the node's own backend did
 /// not answer, so the request may still apply. `Unavailable` means the node was
 /// too busy to forward it. Each is repeated under the same operation identity.
 fn unknown_outcome(reply: &[u8]) -> Option<laser_wire::result::CommandError> {
     let error = decode_named::<laser_wire::result::CommandError>(reply).ok()?;
     (error.code.is_pending()
-        || error.code.is_plane_unavailable()
+        || error.code.is_backend_unavailable()
         || error.code == laser_wire::result::ResultCode::Unavailable)
         .then_some(error)
 }
@@ -212,7 +212,7 @@ struct LaserInner {
     #[cfg(feature = "kv")]
     coordination_acquire_gate: tokio::sync::Mutex<()>,
     producers: DashMap<ProducerKey, ProducerCell>,
-    // The node managed requests use after the shared connection's plane failed.
+    // The node managed requests use after the shared connection's managed backend failed.
     managed_route: crate::managed_route::ManagedRoute,
     // Surfaces whose next read must wait for the new node's fold to reach the
     // mutation log head, one bit per surface, set by a node move.
@@ -265,8 +265,8 @@ struct NegotiatedState {
     probed_at: Option<tokio::time::Instant>,
 }
 
-// How long a set without a managed plane is trusted before `capabilities()`
-// probes again, so a plane that becomes ready after connect is picked up.
+// How long a set without a managed backend is trusted before `capabilities()`
+// probes again, so a backend that becomes ready after connect is picked up.
 const UNMANAGED_REPROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Laser {
@@ -831,8 +831,8 @@ impl Laser {
     }
 
     /// The negotiated capability set (default [`Capabilities::OPEN`]). A set
-    /// without a managed plane is probed again when it is at least one second
-    /// old, so a plane that was not ready at connect is picked up without an
+    /// without a managed backend is probed again when it is at least one second
+    /// old, so a backend that was not ready at connect is picked up without an
     /// explicit [`refresh_capabilities`](Self::refresh_capabilities). A managed
     /// set and an explicit override are returned as they are. Open features
     /// work regardless of the result.
@@ -1153,7 +1153,7 @@ impl Laser {
     /// `AGDX_QUERY` on the server, and the connect-time probe uses it for
     /// `AGDX_HELLO`. Every managed command is non-replicated from Iggy's
     /// perspective. Idempotent writes carry a stable operation identity so
-    /// Plane can append them to its standard Iggy mutation topics, see
+    /// the managed backend can append them to its mutation topics, see
     /// [`send_managed_mutation`](Self::send_managed_mutation).
     #[tracing::instrument(target = "laser", level = "debug", skip_all, fields(code = code, operation = "managed"))]
     pub(crate) async fn send_raw_with_response(
@@ -1188,9 +1188,9 @@ impl Laser {
                 }
             };
             // A read is safe to send again, so it moves once to another node
-            // when this node's plane did not answer.
+            // when this node's managed backend did not answer.
             if decode_named::<laser_wire::result::CommandError>(&reply)
-                .is_ok_and(|error| error.code.is_plane_unavailable())
+                .is_ok_and(|error| error.code.is_backend_unavailable())
                 && self.move_managed(node.as_deref()).await
             {
                 let (moved_node, client) = self.managed_client().await;
@@ -1253,7 +1253,7 @@ impl Laser {
                 Ok(reply) => {
                     let reply = self.take_positioned(reply.to_vec());
                     match unknown_outcome(&reply) {
-                        Some(error) => (error.message, error.code.is_plane_unavailable()),
+                        Some(error) => (error.message, error.code.is_backend_unavailable()),
                         None => return Ok(reply),
                     }
                 }
@@ -1289,7 +1289,7 @@ impl Laser {
     }
 
     /// The connection managed requests use: the node they moved to after a
-    /// plane failure, or the shared connection. The node name is `None` for
+    /// managed backend failure, or the shared connection. The node name is `None` for
     /// the shared connection.
     async fn managed_client(&self) -> (Option<String>, Arc<IggyClient>) {
         match self.inner.managed_route.pinned().await {
@@ -1317,7 +1317,7 @@ impl Laser {
                 Some(laser_wire::mutation::PositionSurface::Kv) => (seen.kv, Vec::new()),
                 Some(laser_wire::mutation::PositionSurface::Fork) => (seen.fork, Vec::new()),
                 Some(laser_wire::mutation::PositionSurface::Graph) => (seen.graph, Vec::new()),
-                // A session read: the plane keeps only the positions of the
+                // A session read: the managed backend keeps only the positions of the
                 // read's own stream.
                 None => (None, seen.sessions.clone()),
             }
@@ -1374,7 +1374,7 @@ impl Laser {
         }
     }
 
-    /// Move managed requests off `failed` to another node whose plane is
+    /// Move managed requests off `failed` to another node whose managed backend is
     /// ready. Needs the connection string to dial that node, so a
     /// bring-your-own client stays where it is. Returns whether a node other
     /// than `failed` now serves managed requests.
@@ -2044,7 +2044,7 @@ impl LaserBuilder {
 }
 
 // Cheap, non-fatal capability probe: send the server's `AGDX_HELLO` managed command
-// over the binary connection. `Ok` means the connected infrastructure is the fork
+// over the binary connection. `Ok` means the connected infrastructure is Laser Streams
 // and exposes the managed bridge (query/KV/browse/fork off the log). Any error (raw
 // Apache Iggy answers `InvalidCommand`) leaves `managed_host` false. A reply body,
 // when present, is the CBOR `BackendAnnounce` advertising the wire op versions
@@ -2087,7 +2087,7 @@ fn merge_announcement(
     capabilities.filters.native |=
         versions.has_feature(laser_wire::hello::feature::CONSUMER_FILTERS);
     // Served by the streaming server itself, like the native reads: a server
-    // without a managed plane resolves every group as unbound.
+    // without a managed backend resolves every group as unbound.
     capabilities.filters.group_policy_reads |=
         versions.has_feature(laser_wire::hello::feature::GROUP_POLICY_READS);
     if capabilities.filters.native {
@@ -2202,7 +2202,8 @@ mod announcement_tests {
     }
 
     #[test]
-    fn given_consumer_filters_without_a_plane_when_merged_then_should_serve_native_filters_only() {
+    fn given_consumer_filters_without_a_managed_backend_when_merged_then_should_serve_native_filters_only()
+     {
         let announce = BackendAnnounce::new(
             OpVersions::new(0, 0, 0, 0).with_features(feature::CONSUMER_FILTERS | feature::AUTHZ),
         )
@@ -2233,7 +2234,7 @@ mod announcement_tests {
     }
 
     #[test]
-    fn given_an_unavailable_backend_when_merged_then_should_not_enable_plane_surfaces() {
+    fn given_an_unavailable_backend_when_merged_then_should_not_enable_managed_surfaces() {
         let announce = BackendAnnounce::new(
             OpVersions::new(1, 1, 1, 1)
                 .with_agent(1)
@@ -2273,7 +2274,7 @@ mod announcement_tests {
     // surface features enabled the function does not exist, so neither can its
     // tests.
     #[test]
-    fn given_a_ready_backend_when_merged_then_should_enable_advertised_plane_surfaces() {
+    fn given_a_ready_backend_when_merged_then_should_enable_advertised_managed_surfaces() {
         let announce = BackendAnnounce::new(
             OpVersions::new(1, 1, 1, 1)
                 .with_graph(1)
@@ -3576,7 +3577,7 @@ mod managed_mutation_tests {
     fn given_pending_or_unavailable_replies_when_classified_then_should_repeat_the_same_identity() {
         for (code, message) in [
             (ResultCode::Pending, "not folded yet"),
-            (ResultCode::PlaneUnavailable, "plane down"),
+            (ResultCode::BackendUnavailable, "backend down"),
             (ResultCode::Unavailable, "busy"),
         ] {
             let unknown = unknown_outcome(&reply(code, message)).expect("outcome unknown");
@@ -3742,7 +3743,7 @@ mod positioned_reply_tests {
             b"query",
             "a read outside the folded surfaces is sent as it is"
         );
-        let refusal = encode_named(&CommandError::new(ResultCode::PlaneUnavailable, "down"))
+        let refusal = encode_named(&CommandError::new(ResultCode::BackendUnavailable, "down"))
             .expect("encodes");
         assert_eq!(laser.take_positioned(refusal.clone()), refusal);
         assert_eq!(laser.seen_positions(), AppliedFrontier::default());

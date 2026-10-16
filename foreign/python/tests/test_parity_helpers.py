@@ -208,7 +208,8 @@ def test_given_session_read_request_when_reencoded_then_should_match_rust_and_ty
 
 
 @pytest.mark.parametrize(
-    "name", ["info", "page", "events", "state", "links", "sources", "changes", "error"]
+    "name",
+    ["info", "page", "page_rebuilding", "events", "state", "links", "sources", "changes", "error"],
 )
 def test_given_session_read_reply_when_reencoded_then_should_match_rust_and_typescript(name):
     payload = FIXTURES.joinpath(f"session_reply_{name}.bin").read_bytes()
@@ -218,6 +219,19 @@ def test_given_session_read_reply_when_reencoded_then_should_match_rust_and_type
         assert reply == {"Err": {"NotRegistered": "agents"}}
     if name == "state":
         assert reply["Ok"]["State"]["document"] == {"tasks": ["triage"]}
+    if name == "page":
+        assert "rebuilding" not in reply["Ok"]["Page"]
+    if name == "page_rebuilding":
+        assert reply["Ok"]["Page"]["rebuilding"] is True
+        assert reply["Ok"]["Page"]["items"] == []
+
+
+@pytest.mark.parametrize("name", ["info", "page", "page_rebuilding"])
+def test_given_a_session_reply_dict_when_compared_to_the_http_json_then_should_match(name):
+    reply = ls.decode_session_reply(FIXTURES.joinpath(f"session_reply_{name}.bin").read_bytes())
+    outcome = next(iter(reply["Ok"].values()))
+    http = json.loads(FIXTURES.joinpath(f"session_http_{name}.json").read_text())
+    assert outcome == http
 
 
 def test_given_a2a_params_when_converted_then_should_preserve_exact_body_bytes():

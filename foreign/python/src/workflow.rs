@@ -226,7 +226,7 @@ impl PyWorkflow {
     /// `after`
     /// declares the dependencies that order the step. `verify(output) -> bool`
     /// gates completion. `exclusive` claims a fenced lease (needs the managed
-    /// plane). `fence_namespace` also makes the step exclusive and aligns the
+    /// backend). `fence_namespace` also makes the step exclusive and aligns the
     /// lease with a handler's fenced KV effect. `on_timeout` is `"fail"`
     /// (default) or `"reassign"` (re-acquire the
     /// lease, bumping the fence, and hand the task to a fresh holder. Needs an

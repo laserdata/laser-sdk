@@ -7,7 +7,7 @@ consume them:
     live fleet view (last CPU, sample-weighted mean CPU, samples, degraded
     readings per host) straight off the log.
   - the ANALYTICS path: the same readings are indexed to a queryable tape the
-    managed plane materializes, and sample and mean CPU aggregates run once the
+    managed backend materializes, and sample and mean CPU aggregates run once the
     feed drains. The query phase needs Laser Stack or LaserData Cloud and skips
     on Apache Iggy without a managed backend.
 
@@ -34,7 +34,7 @@ AVRO_TAPE_INDEX = _common.index_for(AVRO_TAPE_TOPIC)
 AVRO_PROJECTION = f"{AVRO_TAPE_INDEX}.v1"
 
 # The schema-first tape replays the identical readings as raw Avro datums,
-# decoded by a writer schema the managed plane allocated an id for.
+# decoded by a writer schema the managed backend allocated an id for.
 READING_AVRO_SCHEMA = """{
     "type":"record","name":"HostReading",
     "fields":[
@@ -50,7 +50,7 @@ READING_AVRO_SCHEMA = """{
 # Avro phase volume: bounded so the cloud-gated coda stays quick on a heavy run.
 AVRO_READINGS_CAP = 500
 
-# Indexed columns on the reading tape (the fields the managed plane materializes).
+# Indexed columns on the reading tape (the fields the managed backend materializes).
 # message_type and ts are reserved fields backing message_type(..) / time_range(..).
 HOST = "host"
 CPU = "cpu"
@@ -255,7 +255,7 @@ async def report_samples_and_mean(laser: ls.Laser) -> None:
 
 async def avro_tape(laser: ls.Laser, readings: list[dict]) -> None:
     """The schema-first coda (managed deployment): the identical readings ride a
-    second tape as raw Avro datums. The managed plane resolves the registered
+    second tape as raw Avro datums. The managed backend resolves the registered
     writer schema via `agdx.sid`, decodes the binary bodies, and extracts the
     indexed columns, and the weighted CPU totals must come out the same as the
     JSON tape's. The schema is compiled once client-side so a body that stops
@@ -263,7 +263,7 @@ async def avro_tape(laser: ls.Laser, readings: list[dict]) -> None:
     cannot see."""
     schema_source = {"kind": "avro", "schema": READING_AVRO_SCHEMA}
     schema_id = await laser.schemas().register(schema_source, name="fleet_reading")
-    print(f"the managed plane allocated writer-schema id {schema_id} for the HostReading schema")
+    print(f"the managed backend allocated writer-schema id {schema_id} for the HostReading schema")
 
     await laser.topic(AVRO_TAPE_TOPIC).ensure(partitions=_common.PARTITIONS)
     await _common.start_projector(

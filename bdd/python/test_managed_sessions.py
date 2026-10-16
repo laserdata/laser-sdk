@@ -777,6 +777,17 @@ def listing_finds(world, label):
     assert len(page["items"]) == 1, page
 
 
+@then("the session list of the stream is not rebuilding")
+def list_not_rebuilding(world):
+    managed = _managed(world)
+
+    def read():
+        page = _index(world, lambda: managed.sessions.list())
+        return page if page is not None and "rebuilding" not in page else None
+
+    _eventually(world, read, "a session list that is not rebuilding")
+
+
 @then(parsers.re(r"the indexed events of the session are (?P<listing>\".+\")$"))
 def indexed_events(world, listing):
     managed = _managed(world)

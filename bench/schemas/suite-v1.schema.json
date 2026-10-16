@@ -16,7 +16,7 @@
         "cpu_target": { "type": "string", "minLength": 1 },
         "iggy_server_version": { "type": ["string", "null"], "minLength": 1 },
         "iggy_bench_version": { "type": ["string", "null"], "minLength": 1 },
-        "plane_version": { "type": ["string", "null"], "minLength": 1 }
+        "backend_version": { "type": ["string", "null"], "minLength": 1 }
       },
       "additionalProperties": true
     },
@@ -24,7 +24,7 @@
       "type": "object",
       "required": ["tier", "durability_profile", "cache_state"],
       "properties": {
-        "plane_profile": { "enum": ["embedded", "postgres"] },
+        "backend_profile": { "enum": ["embedded", "postgres"] },
         "postgres_dsn_env": { "type": "string", "minLength": 1 },
         "postgres_ssl_mode": { "type": "string", "minLength": 1 },
         "postgres_pool_connections": { "type": "integer", "minimum": 1 },
@@ -37,7 +37,7 @@
           "properties": {
             "client_cpus": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true },
             "iggy_cpus": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true },
-            "plane_cpus": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true },
+            "backend_cpus": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true },
             "numa_node": { "type": "integer", "minimum": 0 },
             "clocksource": { "type": "string", "minLength": 1 },
             "governor": { "type": "string", "minLength": 1 },

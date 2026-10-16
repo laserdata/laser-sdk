@@ -37,7 +37,7 @@ pub const DEFAULT_OUTCOME_WAIT: Duration = crate::retry::FILTER_OUTCOME_WAIT;
 impl Laser {
     /// The catalog and native filter commands behind a consumer group's
     /// filter handle. Native commands need a server that advertises consumer
-    /// filters. The catalog also needs a managed plane. Either missing answers
+    /// filters. The catalog also needs a managed backend. Either missing answers
     /// `LaserError::Unsupported`.
     pub(crate) fn filters(&self) -> Filters<'_> {
         Filters { laser: self }

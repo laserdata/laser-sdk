@@ -182,20 +182,20 @@ fn prefix_stream(prefix: &str) -> Option<&str> {
         .filter(|stream| !stream.is_empty() && !stream.contains('/'))
 }
 
-pub const SUPERVISOR_ASSERTION_VERSION: u32 = 1;
-pub const SUPERVISOR_ASSERTION_DOMAIN: &[u8] = b"agdx.supervisor-actor.v1";
-pub const MAX_SUPERVISOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
-pub const SUPERVISOR_ASSERTION_KEY_ID_BYTES: usize = 8;
-pub const SUPERVISOR_ASSERTION_SIGNATURE_BYTES: usize = 64;
+pub const OPERATOR_ASSERTION_VERSION: u32 = 1;
+pub const OPERATOR_ASSERTION_DOMAIN: &[u8] = b"agdx.operator-actor.v1";
+pub const MAX_OPERATOR_ASSERTION_TTL_MICROS: u64 = 5 * 60 * 1_000_000;
+pub const OPERATOR_ASSERTION_KEY_ID_BYTES: usize = 8;
+pub const OPERATOR_ASSERTION_SIGNATURE_BYTES: usize = 64;
 
-/// Canonical claims signed by supervisor for one high-risk Iggy mutation.
+/// Canonical claims signed by the service operator for one high-risk Iggy mutation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SupervisorActorClaims {
+pub struct OperatorActorClaims {
     pub v: u32,
     pub request_id: CheckpointRequestId,
     pub deployment_id: u32,
     pub cloud_user_id: u32,
-    pub action: SupervisorAssertionAction,
+    pub action: OperatorAssertionAction,
     pub destination_id: DestinationId,
     pub destination_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,8 +206,8 @@ pub struct SupervisorActorClaims {
 
 /// Signed cloud-user evidence accepted only for the exact action and destination.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SupervisorActorAssertion {
-    pub claims: SupervisorActorClaims,
+pub struct OperatorActorAssertion {
+    pub claims: OperatorActorClaims,
     #[serde(with = "crate::encoding::bin_bytes")]
     pub key_id: Vec<u8>,
     #[serde(with = "crate::encoding::bin_bytes")]
@@ -217,18 +217,18 @@ pub struct SupervisorActorAssertion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum SupervisorAssertionAction {
+pub enum OperatorAssertionAction {
     AcceptRetentionGap,
     SupersedeGeneration,
     RecordRepair,
 }
 
-impl SupervisorActorAssertion {
+impl OperatorActorAssertion {
     pub fn validate(&self) -> Result<(), InvalidError> {
         let claims = &self.claims;
-        if claims.v != SUPERVISOR_ASSERTION_VERSION {
+        if claims.v != OPERATOR_ASSERTION_VERSION {
             return Err(InvalidError::new(format!(
-                "supervisor assertion version must be {SUPERVISOR_ASSERTION_VERSION}"
+                "operator assertion version must be {OPERATOR_ASSERTION_VERSION}"
             )));
         }
         if claims.request_id.as_u128() == 0
@@ -238,23 +238,23 @@ impl SupervisorActorAssertion {
             || claims.destination_generation == 0
         {
             return Err(InvalidError::new(
-                "supervisor assertion identities must be nonzero",
+                "operator assertion identities must be nonzero",
             ));
         }
         if claims.issued_at_micros == 0
             || claims.expires_at_micros <= claims.issued_at_micros
             || claims.expires_at_micros - claims.issued_at_micros
-                > MAX_SUPERVISOR_ASSERTION_TTL_MICROS
+                > MAX_OPERATOR_ASSERTION_TTL_MICROS
         {
             return Err(InvalidError::new(
-                "supervisor assertion validity window is invalid",
+                "operator assertion validity window is invalid",
             ));
         }
-        if self.key_id.len() != SUPERVISOR_ASSERTION_KEY_ID_BYTES
-            || self.signature.len() != SUPERVISOR_ASSERTION_SIGNATURE_BYTES
+        if self.key_id.len() != OPERATOR_ASSERTION_KEY_ID_BYTES
+            || self.signature.len() != OPERATOR_ASSERTION_SIGNATURE_BYTES
         {
             return Err(InvalidError::new(
-                "supervisor assertion key id or signature length is invalid",
+                "operator assertion key id or signature length is invalid",
             ));
         }
         Ok(())
@@ -471,7 +471,7 @@ pub fn feature_action(code: u32) -> Option<(Feature, Action)> {
 pub const ACTION_COUNT: usize = 5;
 
 /// The bit index of a `(feature, action)` in the coarse-capability bitmask, a
-/// pure function shared by every enforcer so the fork and the plane cannot drift.
+/// pure function shared by every enforcer so the streaming server and the managed backend cannot drift.
 /// `Feature`/`Action` are `VariantArray` enums, so the ordinal is stable per wire
 /// revision.
 pub fn action_index(feature: Feature, action: Action) -> usize {

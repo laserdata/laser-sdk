@@ -1003,6 +1003,16 @@ async fn listing_finds(world: &mut LaserWorld, label: String) {
     assert_eq!(page.items.len(), 1, "{page:?}");
 }
 
+#[then("the session list of the stream is not rebuilding")]
+async fn list_not_rebuilding(world: &mut LaserWorld) {
+    let sessions = world.managed.sessions().clone();
+    eventually("a session list that is not rebuilding", async || {
+        let page = sessions.list().fetch().await.ok()?;
+        (!page.rebuilding).then_some(())
+    })
+    .await;
+}
+
 #[then(regex = r#"^the indexed events of the session are (".+")$"#)]
 async fn indexed_events(world: &mut LaserWorld, list: String) {
     let expected: Vec<String> = list

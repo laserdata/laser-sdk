@@ -205,8 +205,8 @@ export function isStale(error: unknown): boolean {
   )
 }
 
-/** Whether the plane declined a conditional write because it does not own
- * the mutation partition. */
+/** Whether the managed backend declined a conditional write because it does
+ * not own the mutation partition. */
 export function isNotLeader(error: unknown): boolean {
   const cause = publishCause(error)
   return (

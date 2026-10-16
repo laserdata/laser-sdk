@@ -39,7 +39,7 @@ impl Laser {
     }
 
     // Read-only registry browse over the server's managed bridge, off the log. Gated
-    // on `managed_host`: browse has no topic transport, so anything but the fork
+    // on `managed_host`: browse has no topic transport, so anything but Laser Streams
     // (including Apache Iggy) returns `Unsupported`.
     async fn execute_browse(
         &self,

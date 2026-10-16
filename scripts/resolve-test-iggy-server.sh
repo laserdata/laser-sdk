@@ -9,7 +9,7 @@ set -euo pipefail
 # resolve this artifact. Local release-candidate validation supplies the
 # same server through LASER_TEST_IGGY_SERVER. LASER_TEST_IGGY_VERSION overrides
 # the pin and LASER_TEST_IGGY_SHA256, when set, pins the downloaded bytes.
-readonly FORK_VERSION="${LASER_TEST_IGGY_VERSION:-0.9.5-ld}"
+readonly FORK_VERSION="${LASER_TEST_IGGY_VERSION:-0.9.6-ld}"
 readonly RELEASES_URL="${LASER_TEST_IGGY_RELEASES_URL:-https://artifacts.laserdata.com}"
 
 if [[ "${1:-}" == "--version" ]]; then

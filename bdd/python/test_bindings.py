@@ -12,7 +12,7 @@ def binding_from(bench, stream, topic):
     bench.binding_builder = ls.ProjectionBindingBuilder().source(stream, topic)
 
 
-@when("the binding lets the plane skip rejected records")
+@when("the binding lets the backend skip rejected records")
 def skip_rejected(bench):
     bench.binding_builder = bench.binding_builder.skip_rejected()
 

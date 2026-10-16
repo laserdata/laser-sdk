@@ -12,7 +12,7 @@ use crate::iggy::IggyBenchmarkKind;
 use crate::local_memory::LocalMemoryDriver;
 use crate::managed::ManagedDriver;
 use crate::mcp::McpDriver;
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 use crate::recovery::RecoveryDriver;
 use crate::rust_client::RustClientDriver;
 use crate::streaming::{
@@ -39,13 +39,13 @@ pub struct Provisioning {
     #[serde(default)]
     pub iggy_root: Option<PathBuf>,
     #[serde(default)]
-    pub plane_root: Option<PathBuf>,
+    pub backend_root: Option<PathBuf>,
     #[serde(default)]
     pub iggy_server: Option<PathBuf>,
     #[serde(default)]
     pub iggy_bench: Option<PathBuf>,
     #[serde(default)]
-    pub plane: Option<PathBuf>,
+    pub backend: Option<PathBuf>,
     #[serde(default)]
     pub cache_root: Option<PathBuf>,
     #[serde(default)]
@@ -53,7 +53,7 @@ pub struct Provisioning {
     #[serde(default)]
     pub iggy_bench_version: Option<String>,
     #[serde(default)]
-    pub plane_version: Option<String>,
+    pub backend_version: Option<String>,
     #[serde(default)]
     pub compose_file: Option<PathBuf>,
 }
@@ -117,7 +117,7 @@ pub struct Environment {
     pub durability_profile: String,
     pub cache_state: String,
     #[serde(default)]
-    pub plane_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub postgres_dsn_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,9 +233,9 @@ impl SuiteManifest {
             .collect()
     }
 
-    /// Whether any declared scenario requires plane.
+    /// Whether any declared scenario requires the backend.
     #[must_use]
-    pub fn requires_plane(&self) -> bool {
+    pub fn requires_backend(&self) -> bool {
         self.scenarios.iter().any(|scenario| {
             (scenario.layer == BenchmarkLayer::L4
                 && scenario.driver.parse::<LocalMemoryDriver>().is_err())
@@ -243,7 +243,7 @@ impl SuiteManifest {
                 || scenario
                     .driver
                     .parse::<RecoveryDriver>()
-                    .is_ok_and(RecoveryDriver::requires_plane)
+                    .is_ok_and(RecoveryDriver::requires_backend)
         })
     }
 
@@ -273,9 +273,9 @@ impl SuiteManifest {
                         "source mode requires iggy_root".to_owned(),
                     ));
                 }
-                if self.requires_plane() && self.provisioning.plane_root.is_none() {
+                if self.requires_backend() && self.provisioning.backend_root.is_none() {
                     return Err(BenchError::Invalid(
-                        "managed source mode requires plane_root".to_owned(),
+                        "managed source mode requires backend_root".to_owned(),
                     ));
                 }
             }
@@ -286,9 +286,9 @@ impl SuiteManifest {
                         "path mode requires iggy_server and iggy_bench".to_owned(),
                     ));
                 }
-                if self.requires_plane() && self.provisioning.plane.is_none() {
+                if self.requires_backend() && self.provisioning.backend.is_none() {
                     return Err(BenchError::Invalid(
-                        "managed path mode requires plane".to_owned(),
+                        "managed path mode requires backend".to_owned(),
                     ));
                 }
             }
@@ -301,9 +301,9 @@ impl SuiteManifest {
                             .to_owned(),
                     ));
                 }
-                if self.requires_plane() && self.provisioning.plane_version.is_none() {
+                if self.requires_backend() && self.provisioning.backend_version.is_none() {
                     return Err(BenchError::Invalid(
-                        "managed artifact mode requires plane_version".to_owned(),
+                        "managed artifact mode requires backend_version".to_owned(),
                     ));
                 }
             }
@@ -324,9 +324,9 @@ impl SuiteManifest {
                 "authoritative suites require explicit host controls".to_owned(),
             ));
         }
-        match self.environment.plane_profile {
-            PlaneProfile::Embedded => Ok(()),
-            PlaneProfile::Postgres => {
+        match self.environment.backend_profile {
+            BackendProfile::Embedded => Ok(()),
+            BackendProfile::Postgres => {
                 let dsn_env = self
                     .environment
                     .postgres_dsn_env
@@ -342,7 +342,7 @@ impl SuiteManifest {
                     || self.environment.postgres_pool_connections == Some(0)
                 {
                     return Err(BenchError::Invalid(
-                        "postgres plane profile requires postgres_dsn_env, postgres_ssl_mode, and a nonzero pool when configured"
+                        "postgres backend profile requires postgres_dsn_env, postgres_ssl_mode, and a nonzero pool when configured"
                             .to_owned(),
                     ));
                 }
@@ -657,7 +657,7 @@ mod tests {
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/suite-minimal.toml"),
         )
         .expect("fixture suite should load");
-        manifest.environment.plane_profile = PlaneProfile::Postgres;
+        manifest.environment.backend_profile = BackendProfile::Postgres;
         assert!(manifest.validate().is_err());
 
         manifest.environment.postgres_dsn_env = Some("BENCH_POSTGRES_DSN".to_owned());
@@ -668,22 +668,22 @@ mod tests {
     }
 
     #[test]
-    fn given_recovery_scenario_when_checked_then_should_require_plane() {
+    fn given_recovery_scenario_when_checked_then_should_require_backend() {
         let mut manifest = SuiteManifest::load(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/suite-minimal.toml"),
         )
         .expect("fixture suite should load");
         manifest.scenarios[0].layer = BenchmarkLayer::L7;
-        manifest.scenarios[0].driver = "plane_restart_memory".to_owned();
-        manifest.scenarios[0].arm = "plane_restart".to_owned();
-        assert!(manifest.requires_plane());
+        manifest.scenarios[0].driver = "backend_restart_memory".to_owned();
+        manifest.scenarios[0].arm = "backend_restart".to_owned();
+        assert!(manifest.requires_backend());
         manifest
             .validate()
             .expect("recovery scenario should validate");
     }
 
     #[test]
-    fn given_local_memory_scenario_when_validated_then_should_not_require_plane() {
+    fn given_local_memory_scenario_when_validated_then_should_not_require_backend() {
         let mut manifest = minimal_manifest();
         manifest.scenarios[0].layer = BenchmarkLayer::L4;
         manifest.scenarios[0].driver = LocalMemoryDriver::VectorMemoryRecall.to_string();
@@ -694,7 +694,7 @@ mod tests {
         manifest
             .validate()
             .expect("complete local memory scenario should validate");
-        assert!(!manifest.requires_plane());
+        assert!(!manifest.requires_backend());
     }
 
     #[test]
@@ -759,23 +759,23 @@ mod tests {
     }
 
     #[test]
-    fn given_signed_plane_when_managed_artifact_suite_is_validated_then_should_accept_it() {
+    fn given_signed_backend_when_managed_artifact_suite_is_validated_then_should_accept_it() {
         let mut manifest = minimal_manifest();
         manifest.provisioning.mode = ProvisionMode::Artifact;
         manifest.provisioning.iggy_server_version = Some("server-version".to_owned());
         manifest.provisioning.iggy_bench_version = Some("bench-version".to_owned());
-        manifest.provisioning.plane_version = Some("plane-version".to_owned());
+        manifest.provisioning.backend_version = Some("backend-version".to_owned());
         manifest.scenarios[0].layer = BenchmarkLayer::L4;
         manifest.scenarios[0].driver = ManagedDriver::Kv.to_string();
         manifest.scenarios[0].arm = KvArm::GetHit.to_string();
 
         manifest
             .validate()
-            .expect("a signed plane release should satisfy artifact provisioning");
+            .expect("a signed backend release should satisfy artifact provisioning");
     }
 
     #[test]
-    fn given_managed_artifact_suite_without_plane_version_when_validated_then_should_reject_it() {
+    fn given_managed_artifact_suite_without_backend_version_when_validated_then_should_reject_it() {
         let mut manifest = minimal_manifest();
         manifest.provisioning.mode = ProvisionMode::Artifact;
         manifest.provisioning.iggy_server_version = Some("server-version".to_owned());
@@ -786,8 +786,8 @@ mod tests {
 
         let error = manifest
             .validate()
-            .expect_err("managed artifact provisioning should require a plane version");
-        assert!(error.to_string().contains("plane_version"));
+            .expect_err("managed artifact provisioning should require a backend version");
+        assert!(error.to_string().contains("backend_version"));
     }
 
     #[test]
@@ -849,7 +849,7 @@ mod tests {
         HostRequirements {
             client_cpus: vec![0],
             iggy_cpus: vec![1],
-            plane_cpus: vec![2],
+            backend_cpus: vec![2],
             numa_node: 0,
             clocksource: "tsc".to_owned(),
             governor: "performance".to_owned(),

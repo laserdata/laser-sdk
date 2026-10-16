@@ -14,7 +14,7 @@ use super::{
 };
 use crate::BenchError;
 use crate::engine::{LoadResult, Operation};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 
 const CORPUS_BATCH_SIZE: usize = 256;
 const ID_FIELD: &str = "id";
@@ -48,7 +48,7 @@ fn invalid_query_arm(value: &str) -> BenchError {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct QuerySummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub stream: String,
     pub topic: String,
     pub index: String,
@@ -88,7 +88,7 @@ pub async fn run_query_evidence(
     laser: &Laser,
     case: &ManagedCase,
     arm: QueryArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     scenario: &str,
     seed: u64,
     monitored_processes: &[(String, u32)],
@@ -124,7 +124,7 @@ pub async fn run_query_evidence(
             index: names.index,
             corpus_entries,
             configuration: serde_json::json!({
-                "path": "laser_query_through_iggy_and_plane",
+                "path": "laser_query_through_iggy_and_backend",
                 "backend_profile": profile,
                 "capabilities": ["projections", "query"],
                 "setup_timed": false,
@@ -171,7 +171,7 @@ async fn wait_for_query(laser: &Laser, timeout: Duration) -> Result<(), BenchErr
         }
         if Instant::now() >= deadline {
             return Err(BenchError::Invalid(format!(
-                "plane did not advertise query and projections within {timeout:?}"
+                "backend did not advertise query and projections within {timeout:?}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -182,7 +182,7 @@ pub(super) async fn prepare_corpus(
     laser: &Laser,
     case: &ManagedCase,
     names: &ProjectionNames,
-    profile: PlaneProfile,
+    profile: BackendProfile,
 ) -> Result<Laser, BenchError> {
     let (scoped, topic) = prepare_projection(laser, case, names, profile).await?;
     publish_corpus(&topic, case, names).await?;
@@ -194,7 +194,7 @@ pub(crate) async fn prepare_projection(
     laser: &Laser,
     case: &ManagedCase,
     names: &ProjectionNames,
-    _profile: PlaneProfile,
+    _profile: BackendProfile,
 ) -> Result<(Laser, laser_sdk::stream::Topic), BenchError> {
     let stream = laser.stream(&names.stream);
     stream
@@ -242,7 +242,7 @@ async fn wait_for_index(laser: &Laser, index: &str, timeout: Duration) -> Result
         }
         if Instant::now() >= deadline {
             return Err(BenchError::Invalid(format!(
-                "plane did not create query index `{index}` within {timeout:?}"
+                "backend did not create query index `{index}` within {timeout:?}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

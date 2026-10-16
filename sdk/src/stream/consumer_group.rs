@@ -367,7 +367,7 @@ impl CreateConsumerGroup {
 }
 
 /// A consumer group's filter policy. Build it with [`ConsumerGroup::filter`].
-/// Every verb needs a managed plane that serves the filter catalog.
+/// Every verb needs a managed backend that serves the filter catalog.
 pub struct GroupFilter {
     group: ConsumerGroup,
 }

@@ -72,7 +72,7 @@ async def publish(laser, payloads):
 async def bound_group(laser, name, definition=None):
     """Create `name` with a filter as its policy. A group filter needs the catalog."""
     if not (await laser.capabilities()).filters.catalog:
-        pytest.skip("a consumer group filter needs a managed plane")
+        pytest.skip("a consumer group filter needs a managed backend")
     await laser.topic(TOPIC).ensure(1)
     group = laser.topic(TOPIC).consumer_group(name)
     await group.create(filter=definition or safe_mode_filter())
@@ -110,7 +110,7 @@ async def test_given_no_catalog_when_reading_then_should_follow_the_group_read_c
 ):
     capabilities = await laser.capabilities()
     if capabilities.filters.catalog:
-        pytest.skip("a plane serves the filter catalog on this stack")
+        pytest.skip("a managed backend serves the filter catalog on this stack")
 
     await laser.topic(TOPIC).ensure(1)
     group = laser.topic(TOPIC).consumer_group("group-read-capability")
@@ -127,7 +127,7 @@ async def test_given_no_catalog_when_reading_then_should_follow_the_group_read_c
 
 async def test_given_no_catalog_when_a_group_is_created_with_a_filter_then_should_refuse(laser):
     if (await laser.capabilities()).filters.catalog:
-        pytest.skip("a plane serves the filter catalog on this stack")
+        pytest.skip("a managed backend serves the filter catalog on this stack")
     await laser.topic(TOPIC).ensure(1)
     group = laser.topic(TOPIC).consumer_group("anomaly-desk")
 
@@ -368,7 +368,7 @@ async def test_given_group_9_and_groups_90_to_97_when_deleted_then_should_find_t
     laser,
 ):
     if not (await laser.capabilities()).filters.catalog:
-        pytest.skip("a consumer group filter needs a managed plane")
+        pytest.skip("a consumer group filter needs a managed backend")
     topic = laser.topic(TOPIC)
     await topic.ensure(1)
     group = None
@@ -754,9 +754,9 @@ async def test_given_a_binary_group_filter_when_configured_then_should_preview_g
     laser, codec
 ):
     if not (await laser.capabilities()).filters.catalog:
-        pytest.skip("requires a managed plane")
+        pytest.skip("requires a managed backend")
     # Schema registration is scoped to the default stream, which must exist
-    # before the managed plane authorizes it.
+    # before the managed backend authorizes it.
     await laser.stream(laser.default_stream).ensure()
     corpus = json.loads(
         (Path(__file__).resolve().parents[3] / "wire/fixtures/filter_codec_cases.json").read_text()

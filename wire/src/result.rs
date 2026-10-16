@@ -75,10 +75,10 @@ pub enum ResultCode {
     /// returns the recorded outcome once the mutation has applied. A new
     /// identity could apply the change a second time.
     Pending,
-    /// The streaming server could not reach its own plane, or the plane did
-    /// not answer in time. The request may still apply, so a mutation repeats
+    /// The node could not reach its managed backend, or the backend did not
+    /// answer in time. The request may still apply, so a mutation repeats
     /// only under the same operation identity, on this node or another one.
-    PlaneUnavailable,
+    BackendUnavailable,
     /// A code from a newer peer this build does not name. Decodes and re-encodes
     /// byte-for-byte so an old build relays it rather than failing. Only a value
     /// outside the named range (21 and up) should ever appear here: `from_code`
@@ -111,7 +111,7 @@ impl ResultCode {
             ResultCode::StaleGeneration => 17,
             ResultCode::TargetUnavailable => 18,
             ResultCode::Pending => 19,
-            ResultCode::PlaneUnavailable => 20,
+            ResultCode::BackendUnavailable => 20,
             ResultCode::Unrecognized(code) => code,
         }
     }
@@ -140,7 +140,7 @@ impl ResultCode {
             17 => ResultCode::StaleGeneration,
             18 => ResultCode::TargetUnavailable,
             19 => ResultCode::Pending,
-            20 => ResultCode::PlaneUnavailable,
+            20 => ResultCode::BackendUnavailable,
             other => ResultCode::Unrecognized(other),
         }
     }
@@ -175,7 +175,7 @@ impl ResultCode {
             // The outcome is still being decided, so the same request comes
             // back later. It is not generically retryable, see `is_retryable`.
             ResultCode::Pending => 503,
-            ResultCode::PlaneUnavailable => 503,
+            ResultCode::BackendUnavailable => 503,
             ResultCode::Unrecognized(_) => 500,
         }
     }
@@ -193,7 +193,7 @@ impl ResultCode {
             ResultCode::Unavailable
                 | ResultCode::Stale
                 | ResultCode::TargetUnavailable
-                | ResultCode::PlaneUnavailable
+                | ResultCode::BackendUnavailable
         )
     }
 
@@ -203,14 +203,14 @@ impl ResultCode {
         matches!(self, ResultCode::Pending)
     }
 
-    /// Whether the streaming server could not reach its own plane, or the
-    /// plane did not answer in time. The request may still apply. A client
+    /// Whether the node could not reach its managed backend, or the backend
+    /// did not answer in time. The request may still apply. A client
     /// repeats a mutation under the same operation identity, and may send it
     /// to another node. Unlike [`Unavailable`](Self::Unavailable), which a
     /// busy node or an unreachable destination answers, this one names the
     /// node itself as the problem.
-    pub const fn is_plane_unavailable(self) -> bool {
-        matches!(self, ResultCode::PlaneUnavailable)
+    pub const fn is_backend_unavailable(self) -> bool {
+        matches!(self, ResultCode::BackendUnavailable)
     }
 }
 
@@ -381,15 +381,15 @@ mod tests {
             ResultCode::Unavailable,
             ResultCode::TargetUnavailable,
             ResultCode::Pending,
-            ResultCode::PlaneUnavailable,
+            ResultCode::BackendUnavailable,
         ] {
             assert_eq!(ResultCode::from_code(code.code()), code);
         }
         assert_eq!(ResultCode::Pending.code(), 19);
-        assert_eq!(ResultCode::PlaneUnavailable.code(), 20);
-        assert!(ResultCode::PlaneUnavailable.is_retryable());
-        assert!(ResultCode::PlaneUnavailable.is_plane_unavailable());
-        assert!(!ResultCode::Unavailable.is_plane_unavailable());
+        assert_eq!(ResultCode::BackendUnavailable.code(), 20);
+        assert!(ResultCode::BackendUnavailable.is_retryable());
+        assert!(ResultCode::BackendUnavailable.is_backend_unavailable());
+        assert!(!ResultCode::Unavailable.is_backend_unavailable());
         assert_eq!(ResultCode::from_code(21), ResultCode::Unrecognized(21));
         // An unknown numeric code rides through as Unrecognized.
         assert_eq!(ResultCode::from_code(900), ResultCode::Unrecognized(900));
@@ -503,6 +503,15 @@ mod tests {
             let back: ResultCode = decode_named(&bytes).expect("deserializes");
             assert_eq!(back, code);
         }
+    }
+
+    #[test]
+    fn given_backend_unavailable_when_serialized_then_should_use_the_backend_unavailable_string() {
+        let json = serde_json::to_string(&ResultCode::BackendUnavailable).expect("serializes");
+        assert_eq!(json, "\"backend_unavailable\"");
+        let back: ResultCode =
+            serde_json::from_str("\"backend_unavailable\"").expect("deserializes");
+        assert_eq!(back, ResultCode::BackendUnavailable);
     }
 
     #[cfg(feature = "cbor")]

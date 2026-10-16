@@ -279,7 +279,7 @@ impl ContractBuilder<'_> {
     ///   effect across different holders or replicas, the handler must commit the
     ///   effect through a fenced compare-and-swap
     ///   ([`Kv::cas_fenced`](crate::kv::Kv::cas_fenced)) carrying this token, so
-    ///   the plane rejects a lower-token writer at the sink. The engine provides
+    ///   the managed backend rejects a lower-token writer at the sink. The engine provides
     ///   the token. The durable guarantee is the handler's to claim.
     pub fn fence(mut self, fence: u64) -> Self {
         self.fence = Some(fence);

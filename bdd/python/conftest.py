@@ -13,18 +13,20 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "foreign" / "python"))
 from iggy_test_server import IggyTestServer  # noqa: E402
 
 
-# `LASER_BDD_PLANE=1` marks a stack with a managed plane, which skips the
-# `@no_plane` scenarios.
+# `LASER_BDD_MANAGED=1` marks a stack with a managed backend, which skips the
+# `@unmanaged` scenarios.
 def pytest_configure(config):
     config.addinivalue_line("markers", "bridges: edge bridge interoperability scenarios")
-    config.addinivalue_line("markers", "plane: requires a managed plane")
-    config.addinivalue_line("markers", "no_plane: requires a server without a managed plane")
+    config.addinivalue_line("markers", "managed: requires a managed backend")
+    config.addinivalue_line("markers", "unmanaged: requires a server without a managed backend")
 
 
 def pytest_collection_modifyitems(config, items):
-    plane = bool(os.environ.get("LASER_BDD_PLANE"))
+    managed = bool(os.environ.get("LASER_BDD_MANAGED"))
     for item in items:
-        if (plane and "no_plane" in item.keywords) or (not plane and "plane" in item.keywords):
+        if (managed and "unmanaged" in item.keywords) or (
+            not managed and "managed" in item.keywords
+        ):
             item.add_marker(
                 pytest.mark.skip(reason="scenario requires another deployment capability")
             )

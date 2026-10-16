@@ -227,8 +227,10 @@ export interface SessionChanges {
   readonly after: bigint
   /** The page size. Zero leaves it to the server. */
   readonly limit: number
-  /** The change series `after` was read from, absent on a first read. A node
-   * whose series differs answers a resync. */
+  /** The change series `after` was read from. A different series answers a
+   * resync with the current series and the newest sequence as `floor`, so `0n`
+   * with `after` zero is the one-call start of a follower. Absent skips the
+   * series check and returns the retained rows after `after`. */
   readonly series?: bigint
 }
 
@@ -385,6 +387,8 @@ export interface SessionPage {
   readonly total?: bigint
   readonly searched?: bigint
   readonly truncated: boolean
+  /** The index is rebuilding on this node, so `items` and `total` can be incomplete. */
+  readonly rebuilding: boolean
 }
 
 export interface SessionEvent {
@@ -461,6 +465,11 @@ export interface SessionChangeRow {
   readonly origin?: SessionChangeOrigin
 }
 
+/** Change rows after a sequence. On a series mismatch `floor` is the newest
+ * sequence and `resync` is set. Otherwise `floor` is the oldest retained
+ * sequence, or the next one when none is retained, and `resync` is set when
+ * `after + 1 < floor`, even with rows present. On `resync` the reader adopts
+ * `series` and `floor` and lists sessions again. */
 export interface SessionChangesView {
   readonly rows: readonly SessionChangeRow[]
   readonly floor: bigint
@@ -815,6 +824,7 @@ function encodeSessionPage(page: SessionPage): Map<string, unknown> {
   encodeU64Option(map, "total", page.total)
   encodeU64Option(map, "searched", page.searched)
   map.set("truncated", page.truncated)
+  setTrue(map, "rebuilding", page.rebuilding)
   return map
 }
 
@@ -827,7 +837,8 @@ function decodeSessionPage(map: CborMap, context: string): SessionPage {
     ...(cursor !== undefined ? { cursor } : {}),
     ...(total !== undefined ? { total } : {}),
     ...(searched !== undefined ? { searched } : {}),
-    truncated: field.requiredBoolean(map, "truncated", context)
+    truncated: field.requiredBoolean(map, "truncated", context),
+    rebuilding: field.optionalBoolean(map, "rebuilding", context) ?? false
   }
 }
 

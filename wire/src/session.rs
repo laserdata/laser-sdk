@@ -101,9 +101,10 @@ pub mod request {
         pub after: u64,
         /// The page size. Zero leaves it to the server.
         pub limit: u32,
-        /// The change series `after` was read from. A node whose series
-        /// differs answers a resync, so a cursor never crosses to another
-        /// node's or a restored index's sequence numbers. Absent on a first read.
+        /// The change series `after` was read from. A different series answers a
+        /// resync with the current series and the newest sequence as `floor`, so
+        /// `Some(0)` with `after` zero is the one-call start of a follower. `None`
+        /// skips the series check and returns the retained rows after `after`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub series: Option<u64>,
     }
@@ -289,6 +290,9 @@ pub struct SessionPage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub searched: Option<u64>,
     pub truncated: bool,
+    /// The index is rebuilding on this node, so `items` and `total` can be incomplete.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebuilding: bool,
 }
 
 /// One indexed record on a session timeline. The summary never holds prompt
@@ -417,8 +421,11 @@ impl SessionChangeOrigin {
     }
 }
 
-/// Change rows after a sequence. `resync` is set when the requested sequence
-/// is below the retained floor, so the reader must list sessions again.
+/// Change rows after a sequence. On a series mismatch `floor` is the newest
+/// sequence and `resync` is set. Otherwise `floor` is the oldest retained
+/// sequence, or the next one when none is retained, and `resync` is set when
+/// `after + 1 < floor`, even with rows present. On `resync` the reader adopts
+/// `series` and `floor` and lists sessions again.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionChanges {
     pub rows: Vec<SessionChangeRow>,

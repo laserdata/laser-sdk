@@ -18,7 +18,7 @@ wire_id!(
 );
 
 wire_id!(
-    /// Stable identity of one supervisor-owned backend resource.
+    /// Stable identity of one operator-owned backend resource.
     BackendResourceId
 );
 

@@ -59,10 +59,10 @@ export const MAX_MANIFEST_IDENTITY_BYTES = 4_096
 export const MAX_CHECKPOINT_ERROR_BYTES = 4_096
 export const MAX_REPAIR_DETAIL_BYTES = 4_096
 export const MAX_CHECKPOINT_LEASE_DURATION_MICROS = 300_000_000n
-export const SUPERVISOR_ASSERTION_VERSION = 1
-export const MAX_SUPERVISOR_ASSERTION_TTL_MICROS = 300_000_000n
-export const SUPERVISOR_ASSERTION_KEY_ID_BYTES = 8
-export const SUPERVISOR_ASSERTION_SIGNATURE_BYTES = 64
+export const OPERATOR_ASSERTION_VERSION = 1
+export const MAX_OPERATOR_ASSERTION_TTL_MICROS = 300_000_000n
+export const OPERATOR_ASSERTION_KEY_ID_BYTES = 8
+export const OPERATOR_ASSERTION_SIGNATURE_BYTES = 64
 export type CheckpointReadConsistency = "linearizable" | "potentially_stale"
 export type DestinationEffectiveState =
   "disabled" | "waiting_for_backend" | "ready" | "running" | "blocked"
@@ -233,15 +233,15 @@ export interface DestinationCheckpointStatus {
   readonly consistency: CheckpointReadConsistency
 }
 
-export type SupervisorAssertionAction =
+export type OperatorAssertionAction =
   "accept_retention_gap" | "supersede_generation" | "record_repair"
 
-export interface SupervisorActorClaims {
+export interface OperatorActorClaims {
   readonly v: number
   readonly requestId: CheckpointRequestId
   readonly deploymentId: number
   readonly cloudUserId: number
-  readonly action: SupervisorAssertionAction
+  readonly action: OperatorAssertionAction
   readonly destinationId: DestinationId
   readonly destinationGeneration: bigint
   readonly expectedRevision?: bigint
@@ -249,8 +249,8 @@ export interface SupervisorActorClaims {
   readonly expiresAtMicros: bigint
 }
 
-export interface SupervisorActorAssertion {
-  readonly claims: SupervisorActorClaims
+export interface OperatorActorAssertion {
+  readonly claims: OperatorActorClaims
   readonly keyId: Uint8Array
   readonly signature: Uint8Array
 }
@@ -390,7 +390,7 @@ export interface CheckpointRequestEnvelope {
   readonly requestId: CheckpointRequestId
   readonly expectedGlobalStateRevision: bigint
   readonly mutation: PublicCheckpointMutation
-  readonly supervisorAssertion?: SupervisorActorAssertion
+  readonly operatorAssertion?: OperatorActorAssertion
 }
 export type CheckpointMutationResult =
   | {
@@ -985,7 +985,7 @@ export function decodePublicCheckpointMutation(
   }
 }
 
-function encodeAssertion(value: SupervisorActorAssertion): Map<string, unknown> {
+function encodeAssertion(value: OperatorActorAssertion): Map<string, unknown> {
   const claims = mapOf([
     ["v", value.claims.v],
     ["request_id", value.claims.requestId.toBytes()],
@@ -1005,7 +1005,7 @@ function encodeAssertion(value: SupervisorActorAssertion): Map<string, unknown> 
   ])
 }
 
-function decodeAssertion(map: CborMap, context: string): SupervisorActorAssertion {
+function decodeAssertion(map: CborMap, context: string): OperatorActorAssertion {
   const claims = field.requiredMap(map, "claims", context)
   const expectedRevision = field.optionalU64(claims, "expected_revision", `${context}.claims`)
   return {
@@ -1044,11 +1044,11 @@ export function encodeCheckpointRequest(value: CheckpointRequestEnvelope): Map<s
     ["expected_global_state_revision", value.expectedGlobalStateRevision],
     ["mutation", encodePublicCheckpointMutation(value.mutation)]
   ])
-  optional(map, "supervisor_assertion", value.supervisorAssertion, encodeAssertion)
+  optional(map, "operator_assertion", value.operatorAssertion, encodeAssertion)
   return map
 }
 export function decodeCheckpointRequest(map: CborMap, context: string): CheckpointRequestEnvelope {
-  const supervisorAssertion = field.optionalMap(map, "supervisor_assertion", context)
+  const operatorAssertion = field.optionalMap(map, "operator_assertion", context)
   return {
     v: field.requiredU32(map, "v", context),
     requestId: CheckpointRequestId.fromBytes(field.requiredBytes(map, "request_id", context)),
@@ -1057,13 +1057,10 @@ export function decodeCheckpointRequest(map: CborMap, context: string): Checkpoi
       field.requiredMap(map, "mutation", context),
       `${context}.mutation`
     ),
-    ...(supervisorAssertion === undefined
+    ...(operatorAssertion === undefined
       ? {}
       : {
-          supervisorAssertion: decodeAssertion(
-            supervisorAssertion,
-            `${context}.supervisor_assertion`
-          )
+          operatorAssertion: decodeAssertion(operatorAssertion, `${context}.operator_assertion`)
         })
   }
 }
@@ -1081,7 +1078,7 @@ export function validateCheckpointRequest(value: CheckpointRequestEnvelope): voi
   if (value.v !== CHECKPOINT_OP_VERSION || value.requestId.asU128() === 0n)
     throw new InvalidError("checkpoint request version or identity is invalid")
   validatePublicCheckpointMutation(value.mutation)
-  validateSupervisorAssertionBinding(value)
+  validateOperatorAssertionBinding(value)
 }
 
 export function validatePublicCheckpointMutation(value: PublicCheckpointMutation): void {
@@ -1186,8 +1183,8 @@ export function validatePublicCheckpointMutation(value: PublicCheckpointMutation
   }
 }
 
-function validateSupervisorAssertionBinding(value: CheckpointRequestEnvelope): void {
-  let required: readonly [SupervisorAssertionAction, DestinationId, bigint, bigint] | undefined
+function validateOperatorAssertionBinding(value: CheckpointRequestEnvelope): void {
+  let required: readonly [OperatorAssertionAction, DestinationId, bigint, bigint] | undefined
   switch (value.mutation.kind) {
     case "accept_retention_gap":
       required = [
@@ -1231,14 +1228,14 @@ function validateSupervisorAssertionBinding(value: CheckpointRequestEnvelope): v
       break
   }
   if (required === undefined) {
-    if (value.supervisorAssertion !== undefined)
-      throw new InvalidError("supervisor assertion is not accepted for this checkpoint mutation")
+    if (value.operatorAssertion !== undefined)
+      throw new InvalidError("operator assertion is not accepted for this checkpoint mutation")
     return
   }
-  const assertion = value.supervisorAssertion
+  const assertion = value.operatorAssertion
   if (assertion === undefined)
-    throw new InvalidError("high-risk checkpoint mutation requires a supervisor assertion")
-  validateSupervisorAssertion(assertion)
+    throw new InvalidError("high-risk checkpoint mutation requires an operator assertion")
+  validateOperatorAssertion(assertion)
   const [action, destinationId, destinationGeneration, expectedRevision] = required
   if (
     assertion.claims.requestId.asU128() !== value.requestId.asU128() ||
@@ -1248,14 +1245,14 @@ function validateSupervisorAssertionBinding(value: CheckpointRequestEnvelope): v
     assertion.claims.expectedRevision !== expectedRevision
   )
     throw new InvalidError(
-      "supervisor assertion is not bound to this request, action, and destination"
+      "operator assertion is not bound to this request, action, and destination"
     )
 }
 
-export function validateSupervisorAssertion(value: SupervisorActorAssertion): void {
+export function validateOperatorAssertion(value: OperatorActorAssertion): void {
   const claims = value.claims
-  if (claims.v !== SUPERVISOR_ASSERTION_VERSION)
-    throw new InvalidError("supervisor assertion version is invalid")
+  if (claims.v !== OPERATOR_ASSERTION_VERSION)
+    throw new InvalidError("operator assertion version is invalid")
   if (
     claims.requestId.asU128() === 0n ||
     claims.deploymentId === 0 ||
@@ -1263,19 +1260,15 @@ export function validateSupervisorAssertion(value: SupervisorActorAssertion): vo
     claims.destinationId.asU128() === 0n ||
     claims.destinationGeneration === 0n
   )
-    throw new InvalidError("supervisor assertion identities must be nonzero")
+    throw new InvalidError("operator assertion identities must be nonzero")
   if (
     claims.issuedAtMicros === 0n ||
     claims.expiresAtMicros <= claims.issuedAtMicros ||
-    claims.expiresAtMicros - claims.issuedAtMicros > MAX_SUPERVISOR_ASSERTION_TTL_MICROS
+    claims.expiresAtMicros - claims.issuedAtMicros > MAX_OPERATOR_ASSERTION_TTL_MICROS
   )
-    throw new InvalidError("supervisor assertion validity window is invalid")
-  fixedBytes(value.keyId, SUPERVISOR_ASSERTION_KEY_ID_BYTES, "supervisor assertion key id")
-  fixedBytes(
-    value.signature,
-    SUPERVISOR_ASSERTION_SIGNATURE_BYTES,
-    "supervisor assertion signature"
-  )
+    throw new InvalidError("operator assertion validity window is invalid")
+  fixedBytes(value.keyId, OPERATOR_ASSERTION_KEY_ID_BYTES, "operator assertion key id")
+  fixedBytes(value.signature, OPERATOR_ASSERTION_SIGNATURE_BYTES, "operator assertion signature")
 }
 
 function validateDestinationRevision(

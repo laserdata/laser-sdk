@@ -15,7 +15,7 @@ use super::{
 };
 use crate::BenchError;
 use crate::engine::{LoadResult, Operation};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 
 const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -43,7 +43,7 @@ fn invalid_projection_arm(value: &str) -> BenchError {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ProjectionSummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub stream: String,
     pub topic: String,
     pub index: String,
@@ -79,7 +79,7 @@ pub async fn run_projection_evidence(
     laser: &Laser,
     case: &ManagedCase,
     arm: ProjectionArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     scenario: &str,
     seed: u64,
     monitored_processes: &[(String, u32)],
@@ -137,7 +137,7 @@ pub async fn run_projection_evidence(
             observation_resolution_ns: visibility_arm(arm)
                 .then_some(duration_ns(VISIBILITY_POLL_INTERVAL)),
             configuration: serde_json::json!({
-                "path": "laser_projection_through_iggy_and_plane",
+                "path": "laser_projection_through_iggy_and_backend",
                 "backend_profile": profile,
                 "setup_timed": false,
                 "warmup_materialization_timed": false,

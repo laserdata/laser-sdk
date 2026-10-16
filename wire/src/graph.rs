@@ -396,7 +396,7 @@ pub enum GraphError {
 }
 
 /// The canonical graph-name rule, shared by the SDK client edge and the
-/// serving plane: non-empty, at most [`MAX_GRAPH_NAME_BYTES`] bytes, no ASCII
+/// managed backend: non-empty, at most [`MAX_GRAPH_NAME_BYTES`] bytes, no ASCII
 /// control characters.
 pub fn validate_graph_name(name: &str) -> Result<(), InvalidError> {
     if name.is_empty() {

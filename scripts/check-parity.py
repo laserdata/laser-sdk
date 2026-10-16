@@ -391,7 +391,7 @@ PY_PEERS = {
     ("CrashContext", "assemble"): ("new:CrashContext", "constructor"),
     ("Cursor", "batch"): ("Topic.replay(batch=)", "keywords"),
     ("Cursor", "from_offsets"): ("Topic.replay(from_offsets=)", "keywords"),
-    ("Destinations", "mutate_with_supervisor_assertion"): ("Destinations.mutate(supervisor_assertion=)", "overload"),
+    ("Destinations", "mutate_with_operator_assertion"): ("Destinations.mutate(operator_assertion=)", "overload"),
     ("KeyRecord", "revoked"): ("KeyRecord.revoke", "name-collision"),
 
     ("PartitionCheckpoint", None): ("dict:Destinations.get", "serde-dict"),
@@ -515,7 +515,7 @@ PY_PEERS = {
     ("KvLease", None): ("dict:FencedLeaseClient.prepare_acquire", "serde-dict"),
     ("KvLeaseRenew", None): ("dict:FencedLeaseClient.prepare_renew", "serde-dict"),
     ("KvRelease", None): ("dict:FencedLeaseClient.prepare_release", "serde-dict"),
-    ("CheckpointRequestEnvelope", "with_supervisor_assertion"): ("fn:new_checkpoint_request_envelope(supervisor_assertion=)", "keywords"),
+    ("CheckpointRequestEnvelope", "with_operator_assertion"): ("fn:new_checkpoint_request_envelope(operator_assertion=)", "keywords"),
     ("ForkInfo", None): ("dict:ForkHandle.create", "serde-dict"),
     ("ForkError", None): ("dict:ForkError.detail", "serde-dict"),
     ("FoldSnapshot", None): ("dict:SnapshotStore.latest", "serde-dict"),
@@ -727,8 +727,8 @@ PY_PEERS = {
     ("BatchItem", None): ("dict:Laser.execute_batch", "serde-dict"),
     ("ArrowIpcMessageMetadata", None): ("dict:PublishRequest.arrow_ipc", "serde-dict"),
     ("MemoryRowScope", None): ("dict:KvEntry.scope", "serde-dict"),
-    ("SupervisorActorAssertion", None): ("dict:Destinations.mutate", "serde-dict"),
-    ("SupervisorActorClaims", None): ("dict:Destinations.mutate", "serde-dict"),
+    ("OperatorActorAssertion", None): ("dict:Destinations.mutate", "serde-dict"),
+    ("OperatorActorClaims", None): ("dict:Destinations.mutate", "serde-dict"),
     ("HeaderValueRef", None): ("-", "plain-value"),
 }
 TS_PEERS = {
@@ -946,7 +946,7 @@ TS_PEERS = {
     ("AgentPresence", "validate"): ("fn:validateAgentPresence", "free-function"),
     ("LogPosition", "from_bytes"): ("fn:logPositionFromBytes", "free-function"),
     ("LogPosition", "to_bytes"): ("fn:logPositionToBytes", "free-function"),
-    ("SupervisorActorAssertion", "validate"): ("fn:validateSupervisorAssertion", "free-function"),
+    ("OperatorActorAssertion", "validate"): ("fn:validateOperatorAssertion", "free-function"),
     ("snapshot::ConversationId", None): ("wire.ConversationId", None),
 }
 

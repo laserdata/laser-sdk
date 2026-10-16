@@ -73,7 +73,7 @@ async def test_given_a_schema_handle_when_publishing_then_should_share_its_cache
     if not (await laser.capabilities()).managed:
         pytest.skip("schema registration requires a managed backend")
     # Schema registration is scoped to the default stream, which must exist
-    # before the managed plane authorizes it.
+    # before the managed backend authorizes it.
     await laser.stream(laser.default_stream).ensure()
     source = {
         "kind": "avro",

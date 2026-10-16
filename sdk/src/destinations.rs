@@ -1,7 +1,7 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
 use crate::types::MintUlid;
-use laser_wire::authz::SupervisorActorAssertion;
+use laser_wire::authz::OperatorActorAssertion;
 use laser_wire::checkpoint::{
     CheckpointMutationResult, CheckpointOwnerId, CheckpointReadConsistency, CheckpointReadReply,
     CheckpointReply, CheckpointRequestEnvelope, CompletedAttempt, DestinationBlock,
@@ -101,16 +101,16 @@ impl Destinations<'_> {
         self.laser.execute_checkpoint(request).await
     }
 
-    pub async fn mutate_with_supervisor_assertion(
+    pub async fn mutate_with_operator_assertion(
         &self,
         expected_global_state_revision: u64,
         mutation: PublicCheckpointMutation,
-        supervisor_assertion: SupervisorActorAssertion,
+        operator_assertion: OperatorActorAssertion,
     ) -> Result<CheckpointMutationResult, LaserError> {
-        let request_id = supervisor_assertion.claims.request_id;
+        let request_id = operator_assertion.claims.request_id;
         let request =
             CheckpointRequestEnvelope::new(request_id, expected_global_state_revision, mutation)
-                .with_supervisor_assertion(supervisor_assertion);
+                .with_operator_assertion(operator_assertion);
         self.laser.execute_checkpoint(request).await
     }
 
@@ -383,9 +383,9 @@ impl Destinations<'_> {
         destination_generation: u64,
         expected_checkpoint_revision: u64,
         next_offset: u64,
-        supervisor_assertion: SupervisorActorAssertion,
+        operator_assertion: OperatorActorAssertion,
     ) -> Result<CheckpointMutationResult, LaserError> {
-        self.mutate_with_supervisor_assertion(
+        self.mutate_with_operator_assertion(
             expected_global_state_revision,
             PublicCheckpointMutation::AcceptRetentionGap {
                 destination_id,
@@ -393,7 +393,7 @@ impl Destinations<'_> {
                 expected_checkpoint_revision,
                 next_offset,
             },
-            supervisor_assertion,
+            operator_assertion,
         )
         .await
     }
@@ -403,15 +403,15 @@ impl Destinations<'_> {
         expected_global_state_revision: u64,
         expected_definition_revision: u64,
         replacement: MaterializationDestination,
-        supervisor_assertion: SupervisorActorAssertion,
+        operator_assertion: OperatorActorAssertion,
     ) -> Result<CheckpointMutationResult, LaserError> {
-        self.mutate_with_supervisor_assertion(
+        self.mutate_with_operator_assertion(
             expected_global_state_revision,
             PublicCheckpointMutation::SupersedeGeneration {
                 expected_definition_revision,
                 replacement,
             },
-            supervisor_assertion,
+            operator_assertion,
         )
         .await
     }
@@ -423,9 +423,9 @@ impl Destinations<'_> {
         destination_generation: u64,
         expected_checkpoint_revision: u64,
         repair: RepairRecord,
-        supervisor_assertion: SupervisorActorAssertion,
+        operator_assertion: OperatorActorAssertion,
     ) -> Result<CheckpointMutationResult, LaserError> {
-        self.mutate_with_supervisor_assertion(
+        self.mutate_with_operator_assertion(
             expected_global_state_revision,
             PublicCheckpointMutation::RecordRepair {
                 destination_id,
@@ -433,7 +433,7 @@ impl Destinations<'_> {
                 expected_checkpoint_revision,
                 repair,
             },
-            supervisor_assertion,
+            operator_assertion,
         )
         .await
     }

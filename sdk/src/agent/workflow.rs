@@ -578,7 +578,7 @@ impl<'a> Workflow<'a> {
             return Err(LaserError::unsupported_feature(
                 "workflow",
                 "kv_fenced_leases",
-                "an exclusive step needs the plane's monotonic fence sequence",
+                "an exclusive step needs the managed backend's monotonic fence sequence",
             ));
         }
         let namespace = step

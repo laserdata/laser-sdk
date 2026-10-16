@@ -45,7 +45,7 @@ Streaming, provenance, agent, bridge, session, and context window scenarios run 
 
 KV and forks use managed commands through `send_raw_with_response`. Apache Iggy without a managed backend rejects these calls. Reference files cover their bytes, and `kv_cas.feature` tests behavior through the reference engine in `bdd/rust/src/kv_engine.rs`. Full managed execution needs Laser Stack or LaserData Cloud. The default BDD suite uses Apache Iggy and local reference engines.
 
-`filters.feature` runs each SDK's own evaluator against named records, with no server. Rust and Python use the shared Rust evaluator, and TypeScript runs its port. The same cases live in `wire/fixtures/filter_eval_cases.json` for the unit suites. `filters_live.feature` needs a server that serves consumer filters, and checks that the saved-filter catalog is refused without a managed plane.
+`filters.feature` runs each SDK's own evaluator against named records, with no server. Rust and Python use the shared Rust evaluator, and TypeScript runs its port. The same cases live in `wire/fixtures/filter_eval_cases.json` for the unit suites. `filters_live.feature` needs a server that serves consumer filters, and checks that the saved-filter catalog is refused without a managed backend.
 
 A new client must pass the shared reference files and applicable behavior scenarios.
 
@@ -75,15 +75,15 @@ Set `LASER_BDD_URL` to a connection string or `LASER_BDD_ADDR` to `host:port` fo
 
 ## Managed scenarios
 
-Scenarios tagged `@plane`, on the scenario or on its feature, need a server with a managed plane and run only when `LASER_BDD_PLANE=1` is set. `managed_sessions.feature` is tagged `@sessions @plane` and reads the session index the plane folds. `scripts/run-managed-bdd.sh` builds the Iggy fork and the plane from the source checkouts named by `LASER_IGGY_REPO` and `LASER_CLOUD_CORE_REPO`, starts them wired together as the plane's own end-to-end tests do, and runs the named runners against them:
+Scenarios tagged `@managed`, on the scenario or on its feature, need a server with a managed backend and run only when `LASER_BDD_MANAGED=1` is set. `managed_sessions.feature` is tagged `@sessions @managed` and reads the session index the backend folds. `scripts/run-managed-bdd.sh` builds Laser Streams and the managed backend from the source checkouts named by `LASER_IGGY_REPO` and `LASER_MANAGED_BACKEND_REPO`, starts them wired together as the backend's own end-to-end tests do, and runs the named runners against them:
 
 ```sh
 scripts/run-managed-bdd.sh all              # rust, python, and typescript
-scripts/run-managed-bdd.sh --postgres rust  # the plane stores sessions in Postgres (needs Docker)
+scripts/run-managed-bdd.sh --postgres rust  # the backend stores sessions in Postgres (needs Docker)
 scripts/run-managed-bdd.sh stack            # start the stack and wait, for runs by hand
 ```
 
-`LASER_MANAGED_IGGY_SERVER` and `LASER_MANAGED_PLANE` point at prebuilt binaries, and `LASER_MANAGED_SKIP_SDK_BUILD=1` reuses the Python extension and the TypeScript package as they are already built.
+`LASER_MANAGED_IGGY_SERVER` and `LASER_MANAGED_BACKEND` point at prebuilt binaries, and `LASER_MANAGED_SKIP_SDK_BUILD=1` reuses the Python extension and the TypeScript package as they are already built.
 
 ## Adding a language
 

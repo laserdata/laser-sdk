@@ -8,7 +8,7 @@ use std::time::Duration;
 
 // The State primitive: fast keyed state next to the log (KV), with
 // git-like copy-on-write forks to try changes before keeping them. Both
-// surfaces are managed by laser-plane in Laser Stack or LaserData Cloud.
+// surfaces are managed by the managed backend in Laser Stack or LaserData Cloud.
 const NAMESPACE: &str = "config";
 const KEY: &str = "service:auth";
 const FORK: &str = "experiment-1";

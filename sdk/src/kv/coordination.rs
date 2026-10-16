@@ -729,7 +729,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: 30_000_000,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
         }
     }
@@ -757,7 +757,7 @@ mod tests {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
             lease_token: 7,
             lease_ttl_micros: 30_000_000,
@@ -786,7 +786,7 @@ mod tests {
         assert_ne!(envelope.operation_id, 0);
         let inner: KvLeaseRenew =
             decode_named(&envelope.payload).expect("the payload is the renewal");
-        assert_eq!(inner.holder_id, "warden-node-1");
+        assert_eq!(inner.holder_id, "node-1");
         assert_eq!(stub.resets.load(Ordering::SeqCst), 1, "reset after failure");
     }
 
@@ -999,7 +999,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_token: 7,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
         };
         let op = client.prepare_release(&release).expect("prepares");
         let outcome = client.release(&op).await;
@@ -1028,7 +1028,7 @@ mod tests {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
             lease_token: 7,
             lease_ttl_micros: 30_000_000,

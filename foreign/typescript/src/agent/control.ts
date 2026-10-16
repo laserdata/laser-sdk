@@ -21,7 +21,7 @@ export interface PendingControl {
   readonly cancelRequested: boolean
   /** A control request for the session arrived on another partition of
    * `agent.control` than the one its conversation id routes to. Such a request
-   * is never applied, here or by the plane. */
+   * is never applied, here or by the managed backend. */
   readonly controlConflict: boolean
 }
 
@@ -87,8 +87,8 @@ export function xxh32(input: Uint8Array): number {
 
 /** The `agent.control` partition a session's control records belong on: the
  * partition Iggy routes the conversation id key to, XXH32 with seed zero over
- * the conversation string modulo the partition count. The plane applies the
- * same rule, so both refuse a record on any other partition.
+ * the conversation string modulo the partition count. The managed backend
+ * applies the same rule, so both refuse a record on any other partition.
  * @internal */
 export function controlPartition(conversation: string, partitions: number): number | undefined {
   return partitions > 0 ? xxh32(new TextEncoder().encode(conversation)) % partitions : undefined

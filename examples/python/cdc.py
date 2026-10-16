@@ -26,8 +26,8 @@ What it shows:
   - draft a stricter revision, run the variant in its own A/B group, pause
     and resume it, see a running policy refuse another one, release and delete both
 
-Consumer group filters need laser-plane, as Laser Stack or LaserData Cloud
-runs it, and skip elsewhere.
+Consumer group filters need the managed backend of Laser Stack or LaserData
+Cloud, and skip elsewhere.
 
 **The sample saves 98.5% of payload transfer: 424 of 27,953 bytes.**
 The desk receives 4 of 240 records, processes each typed change, then

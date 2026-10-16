@@ -398,7 +398,9 @@ export class Workflow {
   ): Promise<CompletedDispatch> {
     const capabilities = await this.laser.capabilities()
     if (!capabilities.kv.fencedLeases) {
-      throw new UnsupportedError("an exclusive step needs the plane's monotonic fence sequence")
+      throw new UnsupportedError(
+        "an exclusive step needs the managed backend's monotonic fence sequence"
+      )
     }
     const taskConversation = ConversationId.derive(`${runId.toString()}/${step.label}`)
     const attempts = step.onTimeout === "reassign" ? MAX_REASSIGNMENTS + 1 : 1

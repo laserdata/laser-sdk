@@ -44,7 +44,7 @@ export interface FilterCaps {
    * validation, served by the streaming server itself. */
   readonly native: boolean
   /** Saved filters, revisions, group bindings, and mutation outcomes, served
-   * with a ready managed plane. */
+   * with a ready managed backend. */
   readonly catalog: boolean
   /** Group-aware reads: the server resolves a consumer group's own policy,
    * delivers an unbound group unfiltered, and fences acknowledgments by policy
@@ -283,7 +283,7 @@ function strongerConsistency(left: Consistency, right: Consistency): Consistency
 
 // Folds one hello announcement into `capabilities`, step for step like Rust
 // `merge_announcement` and `merge_features`. Only a ready announcement lights
-// up plane-served surfaces, and the query surface needs a ready backend that
+// up backend-served surfaces, and the query surface needs a ready backend that
 // announces query capabilities. Additive, so a surface the seed set survives.
 function mergeAnnouncement(capabilities: Capabilities, announce: BackendAnnounce): Capabilities {
   const merged = foldAnnouncement(capabilities, announce)

@@ -1392,12 +1392,12 @@ pub fn result_code_is_pending(code: &str) -> PyResult<bool> {
     Ok(parse_result_code(code)?.is_pending())
 }
 
-/// Whether this result code name means the node's own plane did not answer.
+/// Whether this result code name means the node's own managed backend did not answer.
 /// The request may still apply, so only the same operation identity repeats it.
 #[gen_stub_pyfunction]
 #[pyfunction]
-pub fn result_code_is_plane_unavailable(code: &str) -> PyResult<bool> {
-    Ok(parse_result_code(code)?.is_plane_unavailable())
+pub fn result_code_is_backend_unavailable(code: &str) -> PyResult<bool> {
+    Ok(parse_result_code(code)?.is_backend_unavailable())
 }
 
 fn parse_execution_id(value: &str) -> PyResult<QueryExecutionId> {

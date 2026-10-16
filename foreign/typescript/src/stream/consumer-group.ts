@@ -401,7 +401,7 @@ interface GroupFilterContext {
 
 /**
  * A consumer group's filter policy. Build it with `ConsumerGroup.filter()`.
- * Every verb needs a managed plane that serves the filter catalog.
+ * Every verb needs a managed backend that serves the filter catalog.
  */
 export class GroupFilter {
   private constructor(private readonly group: GroupFilterContext) {}
@@ -452,8 +452,8 @@ export class GroupFilter {
 
   /** The active policy, `undefined` for an unbound group. */
   async get(): Promise<FilterBinding | undefined> {
-    // The catalog gate comes first, like Rust: without a plane the answer is
-    // `unsupported`, whatever the native group looks like.
+    // The catalog gate comes first, like Rust: without a managed backend the
+    // answer is `unsupported`, whatever the native group looks like.
     await this.group.filters().requireCatalog()
     const native = await this.group.native()
     try {

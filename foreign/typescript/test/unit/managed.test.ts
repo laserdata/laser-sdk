@@ -104,7 +104,7 @@ void test("given_an_advertised_version_skew_when_executing_then_should_reject_be
   assert.equal(sent, false)
 })
 
-void test("given_a_supervisor_assertion_when_mutating_then_should_reuse_its_signed_request_id", async () => {
+void test("given_an_operator_assertion_when_mutating_then_should_reuse_its_signed_request_id", async () => {
   const replyBytes = await readFixture("checkpoint_reply_destination.bin")
   const requestId = CheckpointRequestId.fromU128(41n)
   const destinationId = DestinationId.fromU128(42n)

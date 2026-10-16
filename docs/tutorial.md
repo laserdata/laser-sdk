@@ -111,7 +111,7 @@ laser.projections().register(inference_v1).await?;
 laser.bindings().apply(binding).await?;
 ```
 
-The binding is rejected when it names a projection that is not registered. Both calls publish control commands that `laser-plane` applies asynchronously, so poll `laser.projections().get(id)` to observe the result. `laser-plane` then materializes records from `inferences`.
+The binding is rejected when it names a projection that is not registered. Both calls publish control commands that the managed backend applies asynchronously, so poll `laser.projections().get(id)` to observe the result. The backend then materializes records from `inferences`.
 
 ### Three storage tiers
 
@@ -139,7 +139,7 @@ for call in slow {
 }
 ```
 
-`laser.query("inferences")` runs across the same Iggy connection. Query is a managed feature served by Laser Stack or LaserData Cloud. Against Apache Iggy without `laser-plane`, a query terminal such as `.fetch()` returns `LaserError::Unsupported`. KV, forks, and registry browse behave the same way.
+`laser.query("inferences")` runs across the same Iggy connection. Query is a managed feature served by Laser Stack or LaserData Cloud. Against Apache Iggy without a managed backend, a query terminal such as `.fetch()` returns `LaserError::Unsupported`. KV, forks, and registry browse behave the same way.
 
 What runs on Apache Iggy is the open SDK's streaming, agent, provenance, dedup, cursor, and log-backed memory surfaces. The query, KV, fork, and projection surfaces require Laser Stack or LaserData Cloud. The typed result decodes straight back into your struct.
 
@@ -171,7 +171,7 @@ let binding = ProjectionBinding::builder()
 - `TimeToLive { ttl_micros }` - keep rows for a fixed age after they were materialized, independent of the log.
 - `MaxRows { rows }` - keep only the newest N rows for the table.
 
-Leave `.retention(...)` unset to inherit the deployment default. The policy is enforced by `laser-plane`.
+Leave `.retention(...)` unset to inherit the deployment default. The policy is enforced by the managed backend.
 
 ### Why the producer does not stamp `.index(...)` per record
 
@@ -453,9 +453,9 @@ The four built-in codecs (`Json`, `Msgpack`, `Cbor`, `Bson`) are self-describing
 
 Avro and Protobuf need a writer schema to interpret their bodies. Register the schema and attach its `u32` ID through `agdx.sid`. Without a registered schema, projection can use only explicit `agdx.idx.*` headers and leaves the body opaque.
 
-`JsonSchema { schema }` uses draft 2020-12 to check self-describing payloads. A record with that schema ID is decoded and checked by `laser-plane`. A mismatch prevents body-field materialization and appears in health counters. The configured policy determines dead-letter publication.
+`JsonSchema { schema }` uses draft 2020-12 to check self-describing payloads. A record with that schema ID is decoded and checked by the managed backend. A mismatch prevents body-field materialization and appears in health counters. The configured policy determines dead-letter publication.
 
-Registration is synchronous and `laser-plane` allocates the id:
+Registration is synchronous and the managed backend allocates the id:
 
 ```rust
 let schema_id = laser
@@ -465,7 +465,7 @@ let schema_id = laser
     .await?;
 ```
 
-`laser-plane` compiles the schema, allocates a free ID, appends the control record durably, and returns the ID. Apply that ID through `agdx.sid`. The record applies asynchronously, so read the registry before publishing with a new ID. `laser.schemas().drop(id)` records asynchronous removal.
+The managed backend compiles the schema, allocates a free ID, appends the control record durably, and returns the ID. Apply that ID through `agdx.sid`. The record applies asynchronously, so read the registry before publishing with a new ID. `laser.schemas().drop(id)` records asynchronous removal.
 
 `SchemaSource` supports `Avro { schema }`, `Protobuf { descriptor_set, message_type }`, and `JsonSchema { schema }`. Avro uses schema JSON. Protobuf uses a compiled `FileDescriptorSet` and fully qualified message type. The [`fleet-tape`](../examples/rust/src/fleet-tape/README.md) and [`event-analytics`](../examples/rust/src/event-analytics/README.md) examples demonstrate Avro and JSON Schema.
 
@@ -821,7 +821,7 @@ Queries, projections, KV, and forks require Laser Stack or LaserData Cloud. A ma
 | `Projection` + `ProjectionBinding` types | resolved from the cloud's deployment snapshots |
 | query DSL + request/reply envelope | served over the managed command band on the same connection |
 | managed KV client (`kv` feature, `Laser::kv`) + registry browse (projections via `projections().get` / `projections().list`, writer schemas via `schemas().get` / `schemas().list`) | the `AGDX_KV_*` / `AGDX_*_PROJECTION` / `AGDX_*_SCHEMA` managed commands, served by Laser Stack or LaserData Cloud |
-| group-owned consumer policies: normal and advanced readers with fenced acknowledgments, preview/test and revision management, with optional local evaluation under `filters` | the `AGDX_FILTER*` commands evaluated by the LaserData Iggy fork next to the data, and the saved-filter catalog with group bindings kept by `laser-plane` |
+| group-owned consumer policies: normal and advanced readers with fenced acknowledgments, preview/test and revision management, with optional local evaluation under `filters` | the `AGDX_FILTER*` commands evaluated by Laser Streams next to the data, and the saved-filter catalog with group bindings kept by the managed backend |
 | `Codec<T>` trait + `Json` + `Msgpack` + `Cbor` + `Bson` | identical wire. Codecs run on the producer side. Schema-first codecs resolve their writer schema from the managed registry |
 | reliable agent runtime | same agent runtime can run inside cloud services |
 | projection, binding, and schema registry control (`laser.projections()`, `laser.bindings()`, `laser.schemas()`) | the long-running managed projector applies the control commands and materializes the read models |

@@ -2,7 +2,7 @@
 
 A projector turns topic records into a queryable view. This example waits for projection, then reads host readings that match a filter.
 
-Managed by `laser-plane` in Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean.
+Managed by the managed backend in Laser Stack or LaserData Cloud. On Apache Iggy without a managed backend, this prints one pointer and exits clean.
 
 ## What it shows
 

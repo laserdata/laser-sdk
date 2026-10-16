@@ -117,7 +117,7 @@ OPENAI_API_KEY=...    cargo run --example incident-desk --features llm-openai
 
 ## Managed query phases
 
-Projection registration and queries require Laser Stack or LaserData Cloud. Without `laser-plane`, examples report the missing capability and skip those phases. Open streaming still runs.
+Projection registration and queries require Laser Stack or LaserData Cloud. Without a managed backend, examples report the missing capability and skip those phases. Open streaming still runs.
 
 ## Forking the read model (agentic speculation)
 

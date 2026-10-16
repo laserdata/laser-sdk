@@ -19,16 +19,16 @@ pub use laser_wire::hello::{
 ///
 /// Capabilities are grouped by where they live and what they depend on, rather
 /// than a flat list of unrelated flags. [`managed`](Self::managed) is the root
-/// (connected to a managed plane at all). The managed surfaces ([`query`](Self::query),
+/// (connected to a managed backend at all). The managed surfaces ([`query`](Self::query),
 /// [`kv`](Self::kv), [`graph`](Self::graph), [`forks`](Self::forks),
-/// [`a2a_gateway`](Self::a2a_gateway)) are served by that plane. A surface's
+/// [`a2a_gateway`](Self::a2a_gateway)) are served by that backend. A surface's
 /// sub-features nest under it ([`QueryCaps::consistency`], [`KvCaps::cas`]) so a
 /// dependent feature cannot be advertised apart from the surface it refines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Capabilities {
-    /// Connected to a managed plane (LaserData Cloud). The root managed switch:
-    /// with no plane, every managed surface below is unavailable.
+    /// Connected to a managed backend (LaserData Cloud). The root managed switch:
+    /// with no backend, every managed surface below is unavailable.
     pub managed: bool,
     /// The managed query surface (`Laser::query`) and the read-consistency it
     /// serves.
@@ -58,7 +58,7 @@ pub struct Capabilities {
     /// verbs). Fork-native, advertised by the `AUTHZ` feature bit.
     pub authz: bool,
     /// Server-side consumer filters, administered through a consumer group's
-    /// `filter()` handle: native filtered reads and, with a managed plane,
+    /// `filter()` handle: native filtered reads and, with a managed backend,
     /// the group policy catalog.
     pub filters: FilterCaps,
     /// The wire op versions the server advertised in its `AGDX_HELLO` reply, or
@@ -122,10 +122,10 @@ pub struct DestinationCaps {
 pub struct FilterCaps {
     /// Filtered reads, fenced acknowledgments, previews, sample tests, and
     /// validation. Served by the streaming server itself, advertised by the
-    /// `CONSUMER_FILTERS` feature bit, so it needs no managed plane.
+    /// `CONSUMER_FILTERS` feature bit, so it needs no managed backend.
     pub native: bool,
     /// Saved filters, revisions, group bindings, and mutation outcomes. Needs a
-    /// ready managed plane that advertises the `filter` op version.
+    /// ready managed backend that advertises the `filter` op version.
     pub catalog: bool,
     /// Group-aware reads: the server resolves a consumer group's own policy,
     /// delivers an unbound group unfiltered, and fences acknowledgments by
@@ -263,7 +263,7 @@ impl Capabilities {
     // The struct is `#[non_exhaustive]`, so these chainable setters are the
     // supported way to build a custom set: `Capabilities::OPEN.with_query(true)`.
 
-    /// Returns a copy connected to a managed plane (the root switch).
+    /// Returns a copy connected to a managed backend (the root switch).
     #[must_use]
     pub fn with_managed(mut self, value: bool) -> Self {
         self.managed = value;
@@ -502,7 +502,7 @@ mod tests {
         assert!(caps.filters.native);
         assert!(
             !caps.filters.catalog,
-            "the catalog needs a ready plane with the filter op version"
+            "the catalog needs a ready backend with the filter op version"
         );
     }
 

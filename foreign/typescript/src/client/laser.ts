@@ -981,8 +981,8 @@ export class Laser implements AsyncDisposable {
       return probed
     }
     let capabilities = await this.capabilitiesOnce.get(probe)
-    // A set without a managed plane is probed again once its last probe is a
-    // second old, or when it was never probed, as in Rust `reprobe_due`.
+    // A set without a managed backend is probed again once its last probe is
+    // a second old, or when it was never probed, as in Rust `reprobe_due`.
     const probedAt = this.shared.capabilityProbeAtMs
     if (!capabilities.managed && (probedAt === undefined || Date.now() - probedAt >= 1_000)) {
       this.capabilitiesOnce.invalidate(capabilities)
@@ -2071,8 +2071,9 @@ export class Laser implements AsyncDisposable {
   }
 
   /** Executes a pre-built `Query` and returns the raw paged result. Most
-   * callers want `query(index)...fetch()` instead. Needs `laser-plane` in Laser
-   * Stack or LaserData Cloud, otherwise it fails with `UnsupportedError`. */
+   * callers want `query(index)...fetch()` instead. Needs the managed backend
+   * of Laser Stack or LaserData Cloud, otherwise it fails with
+   * `UnsupportedError`. */
   async executeQuery(query: Query): Promise<QueryResult> {
     const capabilities = await this.capabilities()
     if (query.text !== undefined && !capabilities.query.keyword) {

@@ -494,7 +494,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: 30_000_000,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
         };
         assert!(valid.validate().is_ok());
@@ -535,7 +535,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: MIN_LEASE_TTL_MICROS,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
         };
         assert!(acquire.validate().is_ok(), "the floor itself is grantable");
@@ -570,7 +570,7 @@ mod tests {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
             lease_token: 7,
             lease_ttl_micros: MAX_LEASE_TTL_MICROS + 1,
@@ -594,7 +594,7 @@ mod tests {
             v: KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
             lease_token: 7,
             lease_ttl_micros: 30_000_000,
@@ -610,7 +610,7 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_token: 7,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
         };
         assert!(release.validate().is_ok());
         let zero = KvRelease {

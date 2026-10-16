@@ -106,7 +106,7 @@ pub struct KvPage {
 /// reader cannot observe a fold that predates its own lease acquisition. The
 /// server waits a short bound and answers [`KvError::Stale`] when the fold does
 /// not catch up, never an absent value. Only a deployment advertising the
-/// `KV_FENCED_LEASES` capability honors the barrier: a pre-fencing plane
+/// `KV_FENCED_LEASES` capability honors the barrier: a pre-fencing backend
 /// ignores the field, so a client must not send it unless the bit is
 /// advertised. Absent keeps today's immediate local read, byte-identical.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -576,7 +576,7 @@ pub enum KvError {
     /// expired (the formal `NOT_FOUND`).
     #[error("kv key not found")]
     NotFound,
-    /// This plane does not own the mutation partition for the key. The caller
+    /// This managed backend does not own the mutation partition for the key. The caller
     /// may retry after the streaming client refreshes partition leadership.
     #[error("not the partition leader for this key")]
     NotLeader,
@@ -811,12 +811,12 @@ mod tests {
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
             lease_ttl_micros: 30_000_000,
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: Some(42),
         };
         let bytes = encode_named(&request).expect("serializes");
         let back: KvLease = decode_named(&bytes).expect("deserializes");
-        assert_eq!(back.holder_id, "warden-node-1");
+        assert_eq!(back.holder_id, "node-1");
         assert_eq!(back.subject_user_id, Some(42));
         // A self-lease omits the subject on the wire.
         let own = KvLease {
@@ -833,7 +833,7 @@ mod tests {
             v: crate::codes::KV_LEASE_OP_VERSION,
             namespace: "connectors.coordination".to_owned(),
             key: b"source-owner".to_vec(),
-            holder_id: "warden-node-1".to_owned(),
+            holder_id: "node-1".to_owned(),
             subject_user_id: None,
             lease_token: 7,
             lease_ttl_micros: 30_000_000,
@@ -841,7 +841,7 @@ mod tests {
         let bytes = encode_named(&request).expect("serializes");
         let back: KvLeaseRenew = decode_named(&bytes).expect("deserializes");
         assert_eq!(back.lease_token, 7);
-        assert_eq!(back.holder_id, "warden-node-1");
+        assert_eq!(back.holder_id, "node-1");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 A telemetry firehose that publishes many big, richly indexed observability
 events across many indexes, so a deployment can be driven with real data. Built
 for volume rather than narrative: many concurrent producers run against the log
-and the managed plane materializes each topic into its own queryable index.
+and the managed backend materializes each topic into its own queryable index.
 
 Every knob reads from the environment, so the same script scales from a quick
 smoke run to a heavy soak:
@@ -15,7 +15,7 @@ smoke run to a heavy soak:
     LASER_FIREHOSE_MESSAGES=200000 LASER_FIREHOSE_ORGS=16 \\
     LASER_FIREHOSE_CONCURRENCY=8 python3 firehose.py
 
-Indexes only materialize when the connected plane consumes the projections. On
+Indexes only materialize when the managed backend consumes the projections. On
 Apache Iggy the publish path still runs at full speed and the trailing
 analytics are skipped.
 
@@ -38,7 +38,7 @@ EXAMPLE = "firehose"
 # [A-Za-z0-9_] only, so the separator is `_` rather than `.`.
 TOPIC_PREFIX = "org_"
 
-# Indexed columns the plane materializes into each index. message_type and ts are
+# Indexed columns the managed backend materializes into each index. message_type and ts are
 # reserved fields backing message_type(..) and time_range(..).
 FIELDS = [
     "org",
@@ -121,15 +121,20 @@ async def main() -> None:
             _common.phase("provisioning topics and indexes")
             for topic, index in zip(topics, indexes, strict=True):
                 await register_index(laser, topic, index)
-            print(f"registered {len(topics)} projections, waiting for the plane to create indexes")
-            # Best effort. Give the managed plane a moment to create the first index.
-            # With no managed plane attached this short wait simply elapses and we
+            print(
+                f"registered {len(topics)} projections, "
+                "waiting for the managed backend to create indexes"
+            )
+            # Best effort. Give the managed backend a moment to create the first index.
+            # With no managed backend attached this short wait simply elapses and we
             # publish anyway.
             await wait_for_index(laser, indexes[0], 15.0)
         elif not config.register:
             print("LASER_FIREHOSE_REGISTER is off, skipping projection registration (publish only)")
         else:
-            print("projection registration needs the managed plane, publishing to the raw log only")
+            print(
+                "projection registration needs the managed backend, publishing to the raw log only"
+            )
 
         # Spread the total over the orgs, then run `concurrency` shards at a time so a
         # large run does not spawn unbounded work. The first orgs take the remainder
@@ -203,7 +208,7 @@ async def wait_for_index(laser: ls.Laser, index: str, timeout: float) -> None:
             return
         except ls.LaserError:
             await asyncio.sleep(0.25)
-    print(f"index '{index}' is not live yet (no managed plane attached?), publishing anyway")
+    print(f"index '{index}' is not live yet (no managed backend attached?), publishing anyway")
 
 
 async def produce_shard(
@@ -295,7 +300,10 @@ async def run_sample_queries(laser: ls.Laser, indexes: list[str]) -> None:
     try:
         total = (await laser.query(index).with_total().fetch()).page.total
     except ls.LaserError as error:
-        print(f"query unavailable ({error}). Is the plane materializing the indexes? Skipping")
+        print(
+            f"query unavailable ({error}). "
+            "Is the managed backend materializing the indexes? Skipping"
+        )
         return
     print(f"index '{index}' holds {total} rows")
 

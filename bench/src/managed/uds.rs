@@ -19,7 +19,7 @@ use super::{
 };
 use crate::BenchError;
 use crate::engine::{LoadResult, Operation};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Display, EnumString, IntoStaticStr, Serialize, PartialEq, Eq,
@@ -41,7 +41,7 @@ fn invalid_uds_arm(value: &str) -> BenchError {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UdsSummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub configuration: serde_json::Value,
 }
 
@@ -57,16 +57,16 @@ struct UdsContext {
     request: Arc<Vec<u8>>,
 }
 
-/// Run a benchmark-only plane UDS diagnostic without the Iggy forwarding hop.
+/// Run a benchmark-only backend UDS diagnostic without the Iggy forwarding hop.
 ///
 /// # Errors
 ///
-/// Returns an error when the socket cannot be opened, framing fails, or plane returns an unexpected reply.
+/// Returns an error when the socket cannot be opened, framing fails, or the backend returns an unexpected reply.
 pub async fn run_uds_evidence(
     socket_path: &Path,
     case: &ManagedCase,
     arm: UdsArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     monitored_processes: &[(String, u32)],
 ) -> Result<UdsEvidence, BenchError> {
     validate_case(case)?;
@@ -87,7 +87,7 @@ pub async fn run_uds_evidence(
             operation,
             backend_profile: profile,
             configuration: serde_json::json!({
-                "path": "direct_plane_uds_diagnostic",
+                "path": "direct_backend_uds_diagnostic",
                 "latency_boundary": "uds_frame_write_to_reply_frame",
                 "connections": case.concurrency,
                 "identity": "synthetic_trusted_user_1",
@@ -140,7 +140,7 @@ async fn connect(path: &Path, count: usize) -> Result<Vec<Mutex<UnixStream>>, Be
     let mut connections = Vec::with_capacity(count);
     for _ in 0..count {
         let stream = UnixStream::connect(path).await.map_err(|error| {
-            BenchError::Invalid(format!("connect plane UDS `{}`: {error}", path.display()))
+            BenchError::Invalid(format!("connect backend UDS `{}`: {error}", path.display()))
         })?;
         connections.push(Mutex::new(stream));
     }
@@ -183,7 +183,7 @@ async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
         .map_err(|error| error.to_string())?;
     let length = u32::from_le_bytes(prefix) as usize;
     if length > MAX_FRAME_BYTES {
-        return Err(format!("plane UDS reply exceeds {MAX_FRAME_BYTES} bytes"));
+        return Err(format!("backend UDS reply exceeds {MAX_FRAME_BYTES} bytes"));
     }
     let mut payload = vec![0; length];
     stream

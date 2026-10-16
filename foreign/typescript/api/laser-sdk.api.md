@@ -1331,12 +1331,12 @@ export interface CheckpointRequestEnvelope {
     readonly expectedGlobalStateRevision: bigint;
     // (undocumented)
     readonly mutation: PublicCheckpointMutation;
-    // (undocumented)
-    readonly requestId: CheckpointRequestId;
-    // Warning: (ae-forgotten-export) The symbol "SupervisorActorAssertion" needs to be exported by the entry point index.d.ts
+    // Warning: (ae-forgotten-export) The symbol "OperatorActorAssertion" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
-    readonly supervisorAssertion?: SupervisorActorAssertion;
+    readonly operatorAssertion?: OperatorActorAssertion;
+    // (undocumented)
+    readonly requestId: CheckpointRequestId;
     // (undocumented)
     readonly v: number;
 }
@@ -2222,7 +2222,7 @@ export interface DestinationCheckpointView {
 // @public (undocumented)
 export class Destinations {
     // (undocumented)
-    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    acceptRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, nextOffset: bigint, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // Warning: (ae-forgotten-export) The symbol "CheckpointOwnerId" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
@@ -2244,8 +2244,8 @@ export class Destinations {
     // (undocumented)
     list(consistency: CheckpointReadConsistency, filter?: DestinationListFilter, after?: DestinationId, limit?: number): Promise<DestinationCheckpointPage>;
     // (undocumented)
-    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion?: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
-    mutateWithSupervisorAssertion(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    mutate(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, operatorAssertion?: OperatorActorAssertion): Promise<CheckpointMutationResult>;
+    mutateWithOperatorAssertion(expectedGlobalStateRevision: bigint, mutation: PublicCheckpointMutation, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     observePartitionLifecycle(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, partitionId: number): Promise<CheckpointMutationResult>;
     // Warning: (ae-forgotten-export) The symbol "PreparedAttempt" needs to be exported by the entry point index.d.ts
@@ -2259,7 +2259,7 @@ export class Destinations {
     // (undocumented)
     recordBlock(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, block: DestinationBlock): Promise<CheckpointMutationResult>;
     // (undocumented)
-    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    recordRepair(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, repair: RepairRecord, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     recordRetentionGap(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedCheckpointRevision: bigint, gap: RetentionGap): Promise<CheckpointMutationResult>;
     // (undocumented)
@@ -2273,7 +2273,7 @@ export class Destinations {
     // (undocumented)
     setDesiredState(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, expectedDefinitionRevision: bigint, desiredState: DestinationDesiredState): Promise<CheckpointMutationResult>;
     // (undocumented)
-    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, supervisorAssertion: SupervisorActorAssertion): Promise<CheckpointMutationResult>;
+    supersedeGeneration(expectedGlobalStateRevision: bigint, expectedDefinitionRevision: bigint, replacement: MaterializationDestination, operatorAssertion: OperatorActorAssertion): Promise<CheckpointMutationResult>;
     // (undocumented)
     takeOverLease(expectedGlobalStateRevision: bigint, destinationId: DestinationId, destinationGeneration: bigint, owner: CheckpointOwnerId, expectedLeaseSequence: bigint, leaseDurationMicros: bigint): Promise<CheckpointMutationResult>;
 }
@@ -6438,10 +6438,10 @@ export function resultCodeFromCode(code: number): ResultCode;
 export function resultCodeHttpStatus(value: ResultCode): number;
 
 // @public
-export function resultCodeIsPending(value: ResultCode): boolean;
+export function resultCodeIsBackendUnavailable(value: ResultCode): boolean;
 
 // @public
-export function resultCodeIsPlaneUnavailable(value: ResultCode): boolean;
+export function resultCodeIsPending(value: ResultCode): boolean;
 
 // @public (undocumented)
 export function resumeOffsets(snapshot: FoldSnapshot): readonly SnapshotOffset[];
@@ -7016,6 +7016,7 @@ export interface SessionPage {
     readonly cursor?: string;
     // (undocumented)
     readonly items: readonly SessionInfo[];
+    readonly rebuilding: boolean;
     // (undocumented)
     readonly searched?: bigint;
     // (undocumented)
@@ -7717,13 +7718,13 @@ export type UuidValue = Uint8Array;
 export function validateAgentPresence(presence: AgentPresence): void;
 
 // @public (undocumented)
+export function validateOperatorAssertion(value: OperatorActorAssertion): void;
+
+// @public (undocumented)
 export function validateRoleName(name: string): void;
 
 // @public (undocumented)
 export function validateSignature(signature: Signature): void;
-
-// @public (undocumented)
-export function validateSupervisorAssertion(value: SupervisorActorAssertion): void;
 
 // @public (undocumented)
 export type Value = {

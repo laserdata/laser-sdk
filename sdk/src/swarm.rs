@@ -1,7 +1,7 @@
 use crate::govern::PolicyEvidence;
 use std::collections::{HashMap, HashSet};
 
-/// One agent's folded activity, so a supervisor answers "what has this agent
+/// One agent's folded activity, so a coordinator answers "what has this agent
 /// been doing" from evidence already read off the audit topic, without
 /// re-deriving counts by hand every time. `by_verdict` counts every decision
 /// this agent triggered, keyed by [`PolicyEvidence::decision`] (`allow`,
@@ -11,7 +11,7 @@ pub struct AgentActivity {
     /// Every decision folded in for this agent, regardless of verdict.
     pub decisions: u64,
     by_verdict: HashMap<String, u64>,
-    /// The most recent decision folded in (by `at_micros`), for a supervisor
+    /// The most recent decision folded in (by `at_micros`), for a coordinator
     /// that wants the detail behind the counts.
     pub last_decision: Option<PolicyEvidence>,
 }
@@ -44,7 +44,7 @@ impl AgentActivity {
 /// in-process fold, not a topic reader of its own: it composes with whatever
 /// offset-resume convention the caller uses, the same way
 /// [`crate::intent::decide`] composes with whatever publishes the records it
-/// folds. The role this answers is a Supervisor's: "what has the swarm been
+/// folds. The role this answers is a coordinator's: "what has the swarm been
 /// doing," read-only over evidence, never a write path of its own.
 #[derive(Debug, Clone, Default)]
 pub struct SwarmActivity {
@@ -81,7 +81,7 @@ impl SwarmActivity {
     }
 
     /// Every agent this view has folded activity for, busiest first (ties
-    /// broken by name), so a supervisor's summary reads in the order that
+    /// broken by name), so a coordinator's summary reads in the order that
     /// matters most.
     pub fn agents(&self) -> Vec<(&str, &AgentActivity)> {
         let mut agents: Vec<_> = self

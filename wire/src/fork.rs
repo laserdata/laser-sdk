@@ -170,7 +170,7 @@ pub enum ForkError {
     Unavailable(String),
     #[error("unsupported fork op version (expected {expected}, got {got})")]
     Version { expected: u32, got: u32 },
-    /// This plane does not own the mutation partition for the fork.
+    /// This managed backend does not own the mutation partition for the fork.
     #[error("not the partition leader for this fork")]
     NotLeader,
 }

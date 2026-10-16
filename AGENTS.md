@@ -130,7 +130,9 @@ wire/                   the laser-wire crate: the wire CONTRACT, data + pure fun
                         ForwardedScope { stream_id, stream, stream_created_at_micros }
     commands.rs         Command trait pairing each managed command code with request/reply types
     http.rs             /agdx/* route constants + path builders + typed query-param structs + JSON views + the ErrorBody reply contract
-    http_client.rs      (feature http-client) typed /agdx/* client over an injected Transport, the crate's one (runtime-agnostic) async surface
+    http_client.rs      (feature http-client) typed /agdx/* client over an injected Transport, the crate's one (runtime-agnostic) async surface.
+                        A non-2xx reply is ClientError::Api with a decoded ErrorBody, else ClientError::Status
+                        with the HTTP status, a status-derived code, and the reply text
     framing.rs          (feature cbor) encode_named/decode_named + u32-LE frame codec, sans-io
     codecs.rs           (feature codecs, bson adds Bson) Codec/Decoder + Json/Msgpack/Cbor/Bson
     encoding.rs         the one shared bin-bytes serde helper module (internal)
@@ -241,7 +243,7 @@ sdk/src/
   intent.rs           Intent/Vote/Decision: SDK-level typed records for effects that need
                       asynchronous, replayable approval, not an AGDX wire extension (feature =
                       "agent")
-  swarm.rs            SwarmActivity: a replay-safe supervisor read model over governance
+  swarm.rs            SwarmActivity: a replay-safe coordinator read model over governance
                       evidence, deduplicated by decision id (feature = "agent")
   crash_context.rs    CrashContext::assemble: one-call bundle over an already-read journal tail,
                       optional dead-letter capsule, and latest policy evidence, control characters
@@ -434,12 +436,12 @@ docs/                   tutorial.md (progressive guide), building-agents.md (sce
 - `harness::eventually` polls instead of fixed sleeps. Iggy visibility is eventual.
 - The test runner pins `FORK_VERSION`. `LASER_TEST_IGGY_SERVER` overrides the downloaded R2 binary for local validation.
 - Full query, KV, and fork execution requires LaserData Cloud or Laser Stack. SDK tests use reference files for encoded data and managed deployments for execution. `laser_bdd::query_engine` tests query behavior locally through `query.feature`. Original Apache Iggy returns `Unsupported` for these managed commands. Do not add a query worker or request-topic fallback to the SDK.
-- `scripts/run-managed-bdd.sh` runs the BDD runners against a local managed stack, the Iggy fork and the plane built from the sibling `iggy` and `cloud-core` checkouts, with `LASER_BDD_PLANE=1`. `--postgres` keeps the plane's session store in Postgres. The `@plane` scenarios, including `managed_sessions.feature`, run only there.
+- `scripts/run-managed-bdd.sh` runs the BDD runners against a local managed stack, Laser Streams and the managed backend built from the checkouts named by `LASER_IGGY_REPO` and `LASER_MANAGED_BACKEND_REPO`, with `LASER_BDD_MANAGED=1`. `--postgres` keeps the backend's session store in Postgres. The `@managed` scenarios, including `managed_sessions.feature`, run only there.
 - TypeScript verification runs from `foreign/typescript`: `npm run verify`, then `npm run test:integration` against Apache Iggy. Run `scripts/run-bdd-tests.sh typescript` and the TypeScript example tests before release. The package gate installs the exact tarball into clean ESM and CommonJS-interoperating consumers and compiles its declarations. Node 22.14 and Node 24 are supported. Bun, Deno, and browsers are not supported.
 
 ## What is shipped vs planned
 
-This inventory describes the `0.8.1` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
+This inventory describes the `0.8.2` source tree. Skills link here instead of duplicating the inventory. Do not describe planned APIs as implemented.
 
 Capabilities identify managed support such as queries, key-value, forks, graphs, and an A2A gateway, plus native consumer filters served by the streaming server. Every capability flag maps to a hello feature bit or an op version. Memory combines query and graph operations and has no separate managed command group.
 
@@ -469,7 +471,7 @@ Consumer filters belong to consumer groups. `topic.consumer_group(name)` (`sdk/s
 
 The `rbac` API requires `authz` and lives in `sdk/src/rbac/`. It exposes `Laser::whoami`, `list_roles`, `get_role`, `get_bindings`, `define_role`, `delete_role`, `bind_roles`, `bind_roles_expect_revision`, and `authz_history`. Grants use `effect feature:action [on resource-pattern]` for the authenticated server identity. Deny takes precedence, and missing grants deny access.
 
-`validate_role_name` in `wire/src/authz.rs` applies during definition and binding, not replay. Standard Iggy `Permissions` remain independent. The server checks feature, action, and resource before forwarding. The plane checks access to query and graph sources.
+`validate_role_name` in `wire/src/authz.rs` applies during definition and binding, not replay. Standard Iggy `Permissions` remain independent. The server checks feature, action, and resource before forwarding. The managed backend checks access to query and graph sources.
 
 `laser-wire` defines the envelope, IDs, dictionaries, validity matrix, operation names, card body, `BodyRef`, reference data, `agdx.av`, and `OpVersions.agent`. SDK methods expose these through `Laser::agdx` and `Agdx`. `AgdxStream` writes chunks. `Agdx::request_input` and `AgentCtx::respond_input` use existing request and reply records. `ChunkAssembler` handles order, duplicates, gaps, late records, terminal records, and abandonment.
 

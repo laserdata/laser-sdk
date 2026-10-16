@@ -10,7 +10,7 @@ Given(
   },
 );
 
-When("the binding lets the plane skip rejected records", function (this: LaserWorld) {
+When("the binding lets the backend skip rejected records", function (this: LaserWorld) {
   assert.ok(this.bindingBuilder, "a binding builder");
   this.bindingBuilder = this.bindingBuilder.skipRejected();
 });

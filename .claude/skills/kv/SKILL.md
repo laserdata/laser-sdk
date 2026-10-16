@@ -7,7 +7,7 @@ description: The key-value store client - `sdk/src/kv/` (feature `kv`, independe
 
 The TypeScript peer is `foreign/typescript/src/managed/kv.ts` over `src/wire/kv.ts`, including CAS, fenced CAS, scans, expiry, patch, holder-scoped lease renewal, and barriered reads. Python binds the same `Lease` and `MutationPosition` through `foreign/python/src/kv.rs`. All three SDKs refuse a `send()` that carries a precondition and offer `msgpack` on the set and fenced CAS builders. Python spells the bytes setter `bytes()`, returns awaitable `KvCopyRequest` and `KvCasFencedRequest` builders, and keeps the keyword forms. Python `exists` returns a `KvMetadata` (`version`, `expires_at_micros`, `size_bytes`) or `None`.
 
-A small managed key-value store next to the query layer, reachable on the one Iggy connection. Like `query`, the SDK ships only the client. The store lives in `laser-plane`, shipped by Laser Stack and LaserData Cloud, and the Iggy server forwards the operations. All of it is behind the independently selectable `kv` feature: private managed-command plumbing is shared without a semantic feature dependency. Wire: the AGDX spec
+A small managed key-value store next to the query layer, reachable on the one Iggy connection. Like `query`, the SDK ships only the client. The store lives in the managed backend, shipped by Laser Stack and LaserData Cloud, and the streaming server forwards the operations. All of it is behind the independently selectable `kv` feature: private managed-command plumbing is shared without a semantic feature dependency. Wire: the AGDX spec
 
 The server checks KV grants before forwarding commands. Reads use `kv:read`, writes use `kv:write`, and deletes use `kv:delete`, scoped by namespace. Lease lifecycle operations use `kv_lease:admin` on the coordination namespace. Fenced CAS also needs `kv_fence:read` there and `kv:write` on the target. Memory-view reads use `kv:read`, while memory writes require Iggy `send_messages` permission on their topic.
 
@@ -51,7 +51,7 @@ Acquire and renew lifetimes must fall within `MIN_LEASE_TTL_MICROS = 1_000_000` 
 
 ## Rules specific to this area
 
-- SDK KV calls use managed commands rather than publishing mutation-topic records directly. The managed plane records mutations in its own log and maintains the point-state view. Do not add a KV backend or mutation worker to the SDK.
+- SDK KV calls use managed commands rather than publishing mutation-topic records directly. The managed backend records mutations in its own log and maintains the point-state view. Do not add a KV backend or mutation worker to the SDK.
 - The SDK is client-only: never add a KV backend/worker here. Storage, expiry, and dispatch are server-side concerns.
 - Keep the roles distinct: the log stores history, KV exposes point state, and the proposed AgentFS concerns per-agent files.
 - `Laser::kv` provides key-value operations. `Memory` in `sdk/src/memory.rs` provides memory behavior. `MemoryHandle::{set,fetch,update,remove}` records changes on the memory topic, which the deployment materializes into a KV view. Add memory behavior to `Memory` rather than renaming KV operations.

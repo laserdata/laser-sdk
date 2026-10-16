@@ -19,7 +19,7 @@ export const ResultCodeName = {
   StaleGeneration: 17,
   TargetUnavailable: 18,
   Pending: 19,
-  PlaneUnavailable: 20
+  BackendUnavailable: 20
 } as const
 
 export type ResultCode =
@@ -78,8 +78,9 @@ export function resultCodeHttpStatus(value: ResultCode): number {
     // later. It is not generically retryable, see `resultCodeIsPending`.
     case "Pending":
       return 503
-    // The node's own plane did not answer. Another node may serve the request.
-    case "PlaneUnavailable":
+    // The node's own managed backend did not answer. Another node may serve
+    // the request.
+    case "BackendUnavailable":
       return 503
     case "ResourceLimit":
       return 429
@@ -106,7 +107,7 @@ export function resultCodeIsRetryable(value: ResultCode): boolean {
     (value.name === "Unavailable" ||
       value.name === "Stale" ||
       value.name === "TargetUnavailable" ||
-      value.name === "PlaneUnavailable")
+      value.name === "BackendUnavailable")
   )
 }
 
@@ -120,13 +121,13 @@ export function resultCodeIsPending(value: ResultCode): boolean {
 }
 
 /**
- * Whether the streaming server could not reach its own plane, or the plane did
- * not answer in time. The request may still apply, so a mutation is repeated
- * under the same operation identity, possibly on another node, as in Rust
- * `is_plane_unavailable`.
+ * Whether the streaming server could not reach its own managed backend, or
+ * the backend did not answer in time. The request may still apply, so a
+ * mutation is repeated under the same operation identity, possibly on another
+ * node, as in Rust `is_backend_unavailable`.
  */
-export function resultCodeIsPlaneUnavailable(value: ResultCode): boolean {
-  return value.kind === "known" && value.name === "PlaneUnavailable"
+export function resultCodeIsBackendUnavailable(value: ResultCode): boolean {
+  return value.kind === "known" && value.name === "BackendUnavailable"
 }
 
 const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
@@ -150,7 +151,7 @@ const RESULT_NAMES: ReadonlyMap<string, ResultCode> = new Map([
   ["stale_generation", { kind: "known", name: "StaleGeneration" }],
   ["target_unavailable", { kind: "known", name: "TargetUnavailable" }],
   ["pending", { kind: "known", name: "Pending" }],
-  ["plane_unavailable", { kind: "known", name: "PlaneUnavailable" }]
+  ["backend_unavailable", { kind: "known", name: "BackendUnavailable" }]
 ])
 
 const RESULT_WORDS: Readonly<Record<string, string>> = {
@@ -174,7 +175,7 @@ const RESULT_WORDS: Readonly<Record<string, string>> = {
   StaleGeneration: "stale_generation",
   TargetUnavailable: "target_unavailable",
   Pending: "pending",
-  PlaneUnavailable: "plane_unavailable"
+  BackendUnavailable: "backend_unavailable"
 }
 
 /** The code a snake_case wire word names, `undefined` for an unknown word. */

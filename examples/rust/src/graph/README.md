@@ -2,7 +2,7 @@
 
 A graph connects entities through named relationships. This example writes a relationship and reads the neighboring entities.
 
-Managed by `laser-plane` in Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean.
+Managed by the managed backend in Laser Stack or LaserData Cloud. On Apache Iggy without a managed backend, this prints one pointer and exits clean.
 
 ## What it shows
 

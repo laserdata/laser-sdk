@@ -16,7 +16,7 @@ use crate::engine::{
     run_open_loop_for,
 };
 use crate::metrics::{ProcessDelta, ProcessSnapshot};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 use crate::report::OutcomeCounts;
 
 mod batch;
@@ -149,7 +149,7 @@ pub struct ManagedProcessMeasurement {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct KvSummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub namespace: String,
     pub cas_conflicts: u64,
     pub configuration: serde_json::Value,
@@ -181,7 +181,7 @@ pub async fn run_kv_evidence(
     laser: &Laser,
     case: &ManagedCase,
     arm: KvArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     scenario: &str,
     seed: u64,
     monitored_processes: &[(String, u32)],
@@ -232,7 +232,7 @@ pub async fn run_kv_evidence(
             namespace,
             cas_conflicts: cas_conflicts.load(Ordering::Relaxed),
             configuration: serde_json::json!({
-                "path": "laser_kv_through_iggy_and_plane",
+                "path": "laser_kv_through_iggy_and_backend",
                 "backend_profile": profile,
                 "capability": "kv",
                 "setup_timed": false,
@@ -252,7 +252,7 @@ async fn wait_for_kv(laser: &Laser, timeout: Duration) -> Result<(), BenchError>
         }
         if Instant::now() >= deadline {
             return Err(BenchError::Invalid(format!(
-                "plane did not advertise the KV capability within {timeout:?}"
+                "backend did not advertise the KV capability within {timeout:?}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

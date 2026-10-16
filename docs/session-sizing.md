@@ -1,19 +1,19 @@
 # Session sizing
 
-This page reports what a local managed stack measured for the session index: how much a role scans on the shared session lane, how filtered pages behave under concurrent readers, how fast the plane folds session records, how state and its history grow, and how the change feed behaves when several folds of one stream commit at once. Every number below was measured on the setup described here. Treat them as one host's results, not as a supported deployment size.
+This page reports what a local managed stack measured for the session index: how much a role scans on the shared session lane, how filtered pages behave under concurrent readers, how fast the managed backend folds session records, how state and its history grow, and how the change feed behaves when several folds of one stream commit at once. Every number below was measured on the setup described here. Treat them as one host's results, not as a supported deployment size.
 
 ## Setup
 
 | Item | Value |
 | --- | --- |
 | Host | AMD Ryzen 9 7950X (16 cores, 32 threads), 61 GiB RAM, Kingston KC3000 2 TB NVMe under disk encryption, Linux 7.1.5 |
-| Streaming server | The LaserData Iggy fork, `0.9.4-ld`, release build, default configuration (filtered reads admit `max_concurrent = 16` pages per shard) |
-| Plane | Plane `0.22.0`, release build, session store on the embedded engine or on the external SQL store |
+| Streaming server | Laser Streams `0.9.4-ld`, release build, default configuration (filtered reads admit `max_concurrent = 16` pages per shard) |
+| Managed backend | `0.22.0`, release build, session store on the embedded engine or on the external SQL store |
 | External SQL store | Server version 16.14 in Docker on the same host, default settings, as `scripts/run-managed-bdd.sh --postgres` starts it |
 | Client | Rust Laser SDK `0.7.0`, release build of `bench/examples/session_sizing.rs` |
 | Date | 2026-10-09 |
 
-Everything ran on one host, so there is no network between the client, the server, the plane, and the external store. The host was not dedicated to the runs. The stack was started with `scripts/run-managed-bdd.sh stack`, or `scripts/run-managed-bdd.sh --postgres stack` for the external store, which wire the server and the plane exactly as the plane's end-to-end tests do. Each measurement creates its own stream:
+Everything ran on one host, so there is no network between the client, the server, the managed backend, and the external store. The host was not dedicated to the runs. The stack was started with `scripts/run-managed-bdd.sh stack`, or `scripts/run-managed-bdd.sh --postgres stack` for the external store, which wire the server and the backend exactly as the backend's end-to-end tests do. Each measurement creates its own stream:
 
 ```sh
 cd bench
@@ -51,7 +51,7 @@ Wall time includes creating each reader's group. No reader saw an error at any c
 
 ## Fold rate
 
-Each session had 10 records on `agent.sessions`: its start, 8 notes of about 210 bytes, and its end. All records were published before the stream was registered as a session source, so the timed part is the fold alone. The clock starts when the registration is published and stops when the session list counts every session as completed. The first part of that time is the plane noticing the registration, which its supervisor checks every 2 seconds, so the table also gives the rate from the first completed session to the last.
+Each session had 10 records on `agent.sessions`: its start, 8 notes of about 210 bytes, and its end. All records were published before the stream was registered as a session source, so the timed part is the fold alone. The clock starts when the registration is published and stops when the session list counts every session as completed. The first part of that time is the managed backend noticing the registration, which the backend checks every 2 seconds, so the table also gives the rate from the first completed session to the last.
 
 | Store | Partitions | Records | Registration to done | Records per second, end to end | Records per second, first to last completed |
 | --- | --- | --- | --- | --- | --- |
@@ -87,7 +87,7 @@ A history row holds the revision, the operation id, the outcome, the source posi
 
 - A shared lane read by R filtered roles costs the server R scans of the lane. Pick per-agent topics when the roles are many or the lane is busy.
 - Filtered page rounds stayed under 30 ms at the median up to 32 concurrent readers on 4 partitions, and the tail grew about four times. A stream with many concurrent readers per shard pays in latency first.
-- One plane folded about 26,000 to 44,000 session records per second on this host on either store. A deployment whose agents write session records faster than its planes fold them builds a backlog, and adding partitions to one stream does not raise the rate on the embedded engine.
+- One managed backend folded about 26,000 to 44,000 session records per second on this host on either store. A deployment whose agents write session records faster than its backends fold them builds a backlog, and adding partitions to one stream does not raise the rate on the embedded engine.
 - Plan about 0.3 KB on the embedded engine and about 0.5 KB on the external store per state delta for history, plus one current document per session, and the retention policy decides how long the history stays.
 
 [Agents, groups, and layouts](building-agents.md#agents-groups-and-layouts) turns these results into layout and partition guidance.

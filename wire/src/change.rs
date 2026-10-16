@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// One materialized-view advancement on the change feed: after committing a
 /// projector batch for a binding that opted in (`ProjectionBinding.notify`),
-/// the plane publishes one record naming the index, the partition, the offset
+/// the managed backend publishes one record naming the index, the partition, the offset
 /// window the batch covered, and how many rows landed. A consumer awaits the
 /// record then queries, instead of sleeping and retrying: change notification
 /// as records on a topic, consumed by offset, never a server-push watch (the

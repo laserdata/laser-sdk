@@ -309,7 +309,7 @@ async def test_given_a_python_handler_failure_when_consuming_then_should_preserv
 async def test_given_open_iggy_when_connecting_then_should_report_open_capabilities(open_laser):
     laser = open_laser
     caps = await laser.capabilities()
-    # Without a managed plane nothing managed is advertised.
+    # Without a managed backend nothing managed is advertised.
     assert caps.query.available is False
     assert caps.kv.available is False
     assert caps.forks is False
@@ -1030,7 +1030,7 @@ async def test_given_a_blocked_send_when_summarizing_a_crash_then_should_report_
 
 async def test_given_an_avro_record_when_published_then_should_decode_from_the_log(laser):
     # Avro encoding is client-side, so the publish path works on Apache Iggy
-    # (only the managed projection of the body needs laser-plane). Encode a
+    # (only the managed projection of the body needs the managed backend). Encode a
     # record under a compiled schema, publish it, and decode the bytes back.
     schema_source = {
         "kind": "avro",
@@ -2206,7 +2206,7 @@ async def test_given_managed_key_enrollment_when_called_then_should_accept_princ
     if not (await laser.capabilities()).kv.available:
         pytest.skip("managed KV is unavailable")
     # Key-value namespaces are stream scoped, so the default stream must exist
-    # before the managed plane authorizes reads and writes under it.
+    # before the managed backend authorizes reads and writes under it.
     await laser.bootstrap(1, ls.TopicRetention.expire_after(86_400_000))
     registry = ls.KvKeyRegistry(laser, "keys")
     key = ls.SigningKey(bytes(range(32)))

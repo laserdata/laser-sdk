@@ -1,4 +1,4 @@
-// Consumer groups against the fork without a managed plane: no catalog, so no
+// Consumer groups against Laser Streams without a managed backend: no catalog, so no
 // group carries a policy. A group consumer reads every record through the
 // group engine, and every policy verb answers the typed refusal that names
 // what is missing.

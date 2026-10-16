@@ -16,7 +16,7 @@ use crate::binary::BinaryManifest;
 pub enum ArtifactKind {
     IggyServer,
     IggyBench,
-    Plane,
+    Backend,
 }
 
 impl ArtifactKind {
@@ -24,7 +24,8 @@ impl ArtifactKind {
         match self {
             Self::IggyServer => "iggy-server",
             Self::IggyBench => "iggy-bench",
-            Self::Plane => "plane",
+            // the artifact host and the backend repository use this name
+            Self::Backend => "plane",
         }
     }
 
@@ -32,7 +33,7 @@ impl ArtifactKind {
         match self {
             Self::IggyServer => "iggy-server",
             Self::IggyBench => "iggy-bench",
-            Self::Plane => "plane",
+            Self::Backend => "plane",
         }
     }
 
@@ -275,11 +276,11 @@ mod tests {
     }
 
     #[test]
-    fn given_plane_version_and_cpu_when_url_is_built_then_should_match_release_contract() {
+    fn given_backend_version_and_cpu_when_url_is_built_then_should_match_release_contract() {
         let source = ArtifactSource::laserdata();
         let url = source
-            .url(ArtifactKind::Plane, "0.14.0", "skylake")
-            .expect("plane release should form a URL");
+            .url(ArtifactKind::Backend, "0.14.0", "skylake")
+            .expect("backend release should form a URL");
         assert_eq!(
             url,
             "https://artifacts.laserdata.com/plane/0.14.0/plane-linux-amd64-skylake"

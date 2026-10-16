@@ -683,7 +683,7 @@ impl Projection {
     ) {
         // A named-item key is not a ULID, so `MemoryLogEntry` (whose ids are
         // `MemoryId`) fails to decode it, so fall through to the string-id wire
-        // record, which the plane folds too.
+        // record, which the managed backend folds too.
         let Ok(entry) = laser_wire::framing::decode_named::<MemoryLogEntry>(payload) else {
             self.absorb_named(payload);
             return;
@@ -762,7 +762,7 @@ impl Projection {
 
     // Fold a named-item record (a keyed set or forget). The record is the wire
     // `MemoryRecord`, byte-identical to `MemoryLogEntry` but with a string id, so
-    // the named-item write path and the plane's fold agree on the bytes.
+    // the named-item write path and the managed backend's fold agree on the bytes.
     fn absorb_named(&mut self, payload: &[u8]) {
         let Ok(record) =
             laser_wire::framing::decode_named::<laser_wire::memory::MemoryRecord>(payload)
@@ -1088,7 +1088,7 @@ impl LogMemory {
         self.set_named(key, merged).await
     }
 
-    /// Delete named point state: publish a keyed forget (a tombstone the plane
+    /// Delete named point state: publish a keyed forget (a tombstone the managed backend
     /// applies as a delete) and drop it from the projection.
     pub async fn forget_named(&self, key: &str) -> Result<(), LaserError> {
         let id = self.named_key(key);
@@ -3373,7 +3373,7 @@ mod tests {
 
     #[test]
     fn given_a_log_entry_when_encoded_then_the_wire_memory_record_decodes_it() {
-        // The plane folds the memory topic through `laser_wire::memory::MemoryRecord`,
+        // The managed backend folds the memory topic through `laser_wire::memory::MemoryRecord`,
         // so the SDK's on-topic entry must decode into it byte-for-byte or the
         // materialization would miss records.
         let id = MemoryId::new();

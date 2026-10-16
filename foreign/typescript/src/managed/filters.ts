@@ -229,7 +229,7 @@ export interface ConfiguredGroup {
  * The catalog and native filter commands behind a consumer group's filter
  * handle, reached through `ConsumerGroup.filter()`. Native commands need a
  * server that serves consumer filters. The catalog also needs a managed
- * plane. Either missing throws `UnsupportedError`.
+ * backend. Either missing throws `UnsupportedError`.
  */
 export class Filters {
   /** @internal */
