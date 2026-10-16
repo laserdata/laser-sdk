@@ -172,7 +172,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(query::result_code_is_retryable, module)?)?;
     module.add_function(wrap_pyfunction!(query::result_code_is_pending, module)?)?;
     module.add_function(wrap_pyfunction!(
-        query::result_code_is_plane_unavailable,
+        query::result_code_is_backend_unavailable,
         module
     )?)?;
     module.add_class::<query::PyQueryFilter>()?;
@@ -425,7 +425,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(destinations::new_source_scope, module)?)?;
     module.add_function(wrap_pyfunction!(
-        destinations::validate_supervisor_actor_assertion,
+        destinations::validate_operator_actor_assertion,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(intent::decide, module)?)?;

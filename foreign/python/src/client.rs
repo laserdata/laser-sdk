@@ -511,8 +511,8 @@ impl PyLaser {
     }
 
     /// The capability set this client negotiated with the connected infrastructure.
-    /// A set without a managed plane is probed again when it is at least one second
-    /// old, so a plane that was not ready at connect is picked up.
+    /// A set without a managed backend is probed again when it is at least one second
+    /// old, so a backend that was not ready at connect is picked up.
     fn capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -648,11 +648,11 @@ impl PyFilterAnnounce {
 }
 
 /// A read-only snapshot of the connected deployment's capabilities.
-/// Managed features depend on advertised backend support. The server can provide consumer-group reads without a plane.
+/// Managed features depend on advertised backend support. The server can provide consumer-group reads without a managed backend.
 #[gen_stub_pyclass]
 #[pyclass(name = "Capabilities", frozen)]
 pub struct PyCapabilities {
-    /// Connected to a managed plane (the root managed switch).
+    /// Connected to a managed backend (the root managed switch).
     #[pyo3(get)]
     pub managed: bool,
     /// The managed query surface and the read consistency it serves.
@@ -802,7 +802,7 @@ impl From<laser_sdk::capabilities::KvCaps> for PyKvCaps {
 #[derive(Clone)]
 pub struct PyFilterCaps {
     /// Filtered reads, previews, sample tests, and validation, served by the
-    /// streaming server without a managed plane.
+    /// streaming server without a managed backend.
     #[pyo3(get)]
     pub native: bool,
     /// Saved filters, revisions, group bindings, and mutation outcomes.

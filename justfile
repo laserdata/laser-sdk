@@ -48,11 +48,11 @@ parity-check:
   python3 -m unittest scripts/test_check_parity.py
   python3 scripts/check-parity.py
 
-# integration tests against the released VSR-only Iggy fork
+# integration tests against the released Laser Streams server
 test-it:
   cargo test -p laser-sdk --features "integration a2a-bridge agui managed mcp-bridge schema-codecs sign"
 
-# cross-SDK BDD conformance scenarios against the VSR-only Iggy fork.
+# cross-SDK BDD conformance scenarios against the released Laser Streams server.
 # Pass --managed to also run the @managed scenarios against a managed backend.
 bdd *ARGS:
   ./scripts/run-bdd-tests.sh rust {{ARGS}}

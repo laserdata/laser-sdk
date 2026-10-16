@@ -59,9 +59,9 @@ pub mod prelude {
         ArrowIpcMessageMetadata, ArrowIpcPolicy, ArrowIpcRejectionCode, ArrowTimestampUnit,
     };
     pub use crate::authz::{
-        Action, AuthzError, AuthzReply, Effect, Feature, Grant, ResourceKind, ResourcePattern,
-        Role, RoleBinding, SupervisorActorAssertion, SupervisorActorClaims,
-        SupervisorAssertionAction,
+        Action, AuthzError, AuthzReply, Effect, Feature, Grant, OperatorActorAssertion,
+        OperatorActorClaims, OperatorAssertionAction, ResourceKind, ResourcePattern, Role,
+        RoleBinding,
     };
     pub use crate::browse::{BrowseOutcome, BrowseReply, ProjectionInfo, SchemaInfo};
     pub use crate::checkpoint::{

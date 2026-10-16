@@ -160,8 +160,8 @@ pub enum LaserError {
         reference: String,
     },
     /// An envelope signature was absent where required, enrolled to no known key,
-    /// or failed verification. The authorship and control-plane authorization
-    /// gate, never retryable.
+    /// or failed verification. The authorship and authorization gate, never
+    /// retryable.
     #[error("signature: {0}")]
     Signature(String),
     /// The enrolled `ActionGovernor` rejected
@@ -451,7 +451,7 @@ impl LaserError {
         )
     }
 
-    /// Whether the connected plane declined a conditional write because it
+    /// Whether the connected managed backend declined a conditional write because it
     /// does not own that operation's mutation partition.
     pub fn is_not_leader(&self) -> bool {
         matches!(

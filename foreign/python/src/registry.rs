@@ -122,7 +122,7 @@ impl PyLaser {
 
     /// Advertise this connection's live presence (a dict mirroring
     /// `AgentPresence`: `v`, `agent`, `inbox`, ...), so a registry can route
-    /// work to its inbox. Served by the LaserData Iggy fork.
+    /// work to its inbox. Served by Laser Streams.
     fn advertise_presence<'py>(
         &self,
         py: Python<'py>,

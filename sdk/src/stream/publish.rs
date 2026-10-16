@@ -135,10 +135,10 @@ impl<'a> PublishRequest<'a> {
     /// `agdx.idx.` prefix is reserved, so use `.index(...)` for queryable scalars.
     ///
     /// String-valued by design: this and `.index(...)` cross into the managed
-    /// query plane, where every caller-declared key must compare and filter
+    /// query layer, where every caller-declared key must compare and filter
     /// uniformly regardless of what a producer happened to send. For an exact
     /// Apache Iggy typed header (`bool`/`u8`../`u64`/raw bytes) on the wire
-    /// itself, reach for the streaming layer below the query plane:
+    /// itself, reach for the streaming layer below the query layer:
     /// `topic.producer()` (`ProducerMessage::header`), `topic.send(..)`, or
     /// the raw `topic.iggy_producer()` escape hatch.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {

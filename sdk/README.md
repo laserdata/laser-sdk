@@ -21,9 +21,9 @@ The [`laser-wire`](https://crates.io/crates/laser-wire) crate defines encoded me
 
 ```toml
 [dependencies]
-laser-sdk = "0.8.1" # typed streaming plus provenance
+laser-sdk = "0.8.2" # typed streaming plus provenance
 # Add only the layers the application uses:
-laser-sdk = { version = "0.8.1", features = ["agent", "managed"] }
+laser-sdk = { version = "0.8.2", features = ["agent", "managed"] }
 ```
 
 ## Quick example
@@ -116,7 +116,7 @@ let binding = ProjectionBinding::builder()
     .build();
 ```
 
-`laser-plane` runs the projector in Laser Stack and LaserData Cloud. Against Apache Iggy without a managed backend, projection and query calls return `LaserError::Unsupported`. The open streaming path above continues to run unchanged.
+The managed backend runs the projector in Laser Stack and LaserData Cloud. Against Apache Iggy without a managed backend, projection and query calls return `LaserError::Unsupported`. The open streaming path above continues to run unchanged.
 
 ## Typed operational and lakehouse queries
 
@@ -216,7 +216,7 @@ while let Some(next) = records.next().await {
 # Ok(()) }
 ```
 
-`laser.stream("fleet").topic("readings").schema::<Reading>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by `laser-plane`. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication.
+`laser.stream("fleet").topic("readings").schema::<Reading>(id).await?` uses a registered schema. This form requires `schema-codecs` and the registry served by the managed backend. The handle resolves and compiles the schema once, checks each body, and adds `agdx.ct` and `agdx.sid`. A body that does not match fails before publication.
 
 The `records` reader reports `TypedDecodeError { position, source }` for a record that does not decode, then continues. An `Agent` handler can decode through the same API. Its existing dead-letter policy handles invalid records.
 
@@ -384,7 +384,7 @@ For an application checkpoint inside a filtered page, call `reader.ack_through(r
 - `agent`, sessions, reliable consumer, `Agent::builder`, context, memory, state, contracts, workflows, and the `ActionGovernor` effect-boundary policy hook
 - `query`, the managed materialized-view query client, including `read_your_writes` consistency and the unified `ResultCode` via `LaserError::code()`
 - `managed` enables `destinations`, `filters`, `fork`, `graph`, `kv`, `projections`, `query`, `rbac`, and `watch`. Each can also be selected separately. Streaming and agents remain available on Apache Iggy. Managed operations require reported deployment capabilities.
-- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent()`, then `.commit()`. `.send()` is unconditional and refuses a builder that carries a precondition with `LaserError::Invalid`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. `laser-plane` provides storage.
+- `kv` provides managed key-value reads, writes, scans, expiry, and compare-and-swap through `AGDX_KV`. Conditional writes use `.expect_version` or `.expect_absent()`, then `.commit()`. `.send()` is unconditional and refuses a builder that carries a precondition with `LaserError::Invalid`. `copy_to` and `move_to` use one transaction. `get_many` uses a mixed batch. The managed backend provides storage.
 - `streaming` includes consumer-group policies, group-aware consumers, explicit acknowledgment readers and group filter administration. The supporting server selects matching records for a bound group and returns all records for an unbound group. Configuration needs a ready catalog. `filters` adds only the local evaluator and the advanced reader's optional `local_guard` check. A reader joins over its own coordinator connection, and a partition it gains on a rebalance resumes after the group's stored offset.
 - capability RBAC over the managed surfaces (`rbac` feature, `sdk/src/rbac/`): `laser.whoami()` + `list_roles`/`get_role`/`get_bindings`/`define_role`/`delete_role`/`bind_roles`/`bind_roles_expect_revision`/`authz_history`, plus the pure `grants_allow` / `delegated_allow` decision helpers. Grants are `effect feature:action [on resource-pattern]` assembled through roles bound to the server-stamped user (deny-wins, default-deny), gated on the `authz` capability. Role names pass the wire-owned `validate_role_name` (64-byte charset safelist) before any round-trip. The layer is orthogonal to Iggy's own permissions and enforced at the streaming edge.
 - `a2a-bridge`, A2A v1.0 JSON-RPC bridge over the agent topology (SendMessage + streaming, GetTask + CancelTask, the supportedInterfaces Agent Card)

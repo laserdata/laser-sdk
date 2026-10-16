@@ -356,7 +356,7 @@ impl GraphHandle<'_> {
             edges,
         };
         // Spend the cap failure locally rather than amplifying an over-cap
-        // upsert against the managed plane, which rejects it with the same
+        // upsert against the managed backend, which rejects it with the same
         // reason.
         request.validate()?;
         let payload = laser_wire::framing::encode_named(&request)

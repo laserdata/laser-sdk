@@ -18,7 +18,7 @@ def prepared_release_error(world, code):
         2: "not_found",
         7: "version_skew",
         19: "pending",
-        20: "plane_unavailable",
+        20: "backend_unavailable",
     }
     if code in words:
         word = words[code].encode()
@@ -56,7 +56,7 @@ def command_error_classifiers(world, code, retryable):
         2: "NotFound",
         7: "VersionSkew",
         19: "Pending",
-        20: "PlaneUnavailable",
+        20: "BackendUnavailable",
     }
     assert world.error.code == names.get(code, f"Unrecognized({code})")
     assert world.error.retryable is (retryable == "true")

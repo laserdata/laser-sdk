@@ -40,7 +40,7 @@ fn default_checkpoint_mutations_topic() -> String {
     DEFAULT_CHECKPOINT_MUTATIONS_TOPIC.to_owned()
 }
 
-/// The stream/topic names a deployment's plane and streaming server use,
+/// The stream/topic names a deployment's managed backend and streaming server use,
 /// provisioned or discovered rather than hardcoded. `Default` returns today's
 /// constants from [`crate::topics`], so a deployment that never configures
 /// this sees exactly the pre-topology names, the one place those names live.

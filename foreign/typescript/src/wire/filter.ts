@@ -1547,8 +1547,9 @@ export interface FilterMutationRequest {
 
 /**
  * The mutation the catalog appends to its control log, stamped by the
- * streaming server with the actor and group identity, then by the plane with
- * the caller's grants and, for a registration, the allocated filter id.
+ * streaming server with the actor and group identity, then by the managed
+ * backend with the caller's grants and, for a registration, the allocated
+ * filter id.
  */
 export interface FilterCatalogLimits {
   readonly maxDefinitions: number

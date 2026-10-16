@@ -156,6 +156,9 @@ pub enum ClientError<E> {
     Decode(String),
     /// The server returned a non-2xx status with a classified [`ErrorBody`].
     Api(ErrorBody),
+    /// A non-2xx reply without an [`ErrorBody`], such as a gateway's plain-text 502 or 504.
+    /// `body` carries the code derived from the status and the reply text.
+    Status { status: u16, body: ErrorBody },
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ClientError<E> {
@@ -164,6 +167,13 @@ impl<E: core::fmt::Display> core::fmt::Display for ClientError<E> {
             ClientError::Transport(error) => write!(f, "transport error: {error}"),
             ClientError::Decode(detail) => write!(f, "decode error: {detail}"),
             ClientError::Api(body) => write!(f, "api error ({:?}): {}", body.code, body.message),
+            ClientError::Status { status, body } => {
+                write!(
+                    f,
+                    "http status {status} ({:?}): {}",
+                    body.code, body.message
+                )
+            }
         }
     }
 }
@@ -171,12 +181,12 @@ impl<E: core::fmt::Display> core::fmt::Display for ClientError<E> {
 impl<E: core::fmt::Display + core::fmt::Debug> std::error::Error for ClientError<E> {}
 
 impl<E> ClientError<E> {
-    /// The classified [`ResultCode`] for an [`ClientError::Api`], so a caller
-    /// branches on the kind (`NotFound`, `Conflict`, ...) without matching the
+    /// The classified [`ResultCode`] for an [`ClientError::Api`] or [`ClientError::Status`],
+    /// so a caller branches on the kind (`NotFound`, `Conflict`, ...) without matching the
     /// message text. `None` for a transport or decode failure.
     pub fn code(&self) -> Option<ResultCode> {
         match self {
-            ClientError::Api(body) => Some(body.code),
+            ClientError::Api(body) | ClientError::Status { body, .. } => Some(body.code),
             _ => None,
         }
     }
@@ -739,7 +749,7 @@ impl<T: Transport> HttpClient<T> {
 
     /// [`register_projection`](Self::register_projection) under the caller's
     /// `operation_id`. A control write whose outcome is unknown (`Pending`) is
-    /// safe to re-send with the same id: the plane applies it once.
+    /// safe to re-send with the same id: the managed backend applies it once.
     pub async fn register_projection_as(
         &self,
         projection: &Projection,
@@ -1308,8 +1318,8 @@ fn operation_route<E>(
 }
 
 /// On a 2xx, decode the bare `Ok` payload, otherwise turn the body into a typed
-/// [`ClientError::Api`] (falling back to a synthetic body if the error body
-/// itself does not decode, so a malformed 500 still classifies).
+/// [`ClientError::Api`], or a [`ClientError::Status`] classified from the status
+/// when the error body itself does not decode.
 fn decode_ok<E, R: DeserializeOwned>(response: &HttpResponse) -> Result<R, ClientError<E>> {
     if (200..300).contains(&response.status) {
         serde_json::from_slice(&response.body)
@@ -1329,13 +1339,16 @@ fn check_status<E>(response: &HttpResponse) -> Result<(), ClientError<E>> {
 }
 
 fn api_error<E>(response: &HttpResponse) -> ClientError<E> {
-    let body = serde_json::from_slice::<ErrorBody>(&response.body).unwrap_or_else(|_| {
-        ErrorBody::new(
-            code_for_status(response.status),
-            String::from_utf8_lossy(&response.body).into_owned(),
-        )
-    });
-    ClientError::Api(body)
+    match serde_json::from_slice::<ErrorBody>(&response.body) {
+        Ok(body) => ClientError::Api(body),
+        Err(_) => ClientError::Status {
+            status: response.status,
+            body: ErrorBody::new(
+                code_for_status(response.status),
+                String::from_utf8_lossy(&response.body).into_owned(),
+            ),
+        },
+    }
 }
 
 /// A best-effort classification for an `ErrorBody`-less failure response,
@@ -1429,6 +1442,7 @@ pub fn base64url_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ConversationId;
 
     #[test]
     fn given_bytes_when_base64url_round_tripped_then_should_preserve_them() {
@@ -1761,5 +1775,66 @@ mod tests {
         let requests = client.transport().requests.borrow();
         assert_eq!(requests[0].path, "/agdx/projections/reading.v1");
         assert_eq!(requests[1].path, "/agdx/schemas/7?stream=telemetry");
+    }
+
+    #[test]
+    fn given_a_plain_text_gateway_reply_when_read_then_should_keep_its_status() {
+        for (status, text) in [
+            (502, "bad gateway: upstream unreachable"),
+            (504, "gateway timeout: the request may still complete"),
+        ] {
+            let client = HttpClient::new(CannedTransport {
+                response: HttpResponse::new(status, text.as_bytes().to_vec()),
+            });
+            let error = block_on(client.list_sessions("agents", &SessionsQuery::default()))
+                .expect_err("a gateway failure is an error");
+            assert_eq!(error.code(), Some(ResultCode::Backend));
+            assert_eq!(
+                error.to_string(),
+                format!("http status {status} (Backend): {text}")
+            );
+            let ClientError::Status { status: kept, body } = error else {
+                panic!("a body that is not an ErrorBody is a status error: {error:?}");
+            };
+            assert_eq!(
+                (kept, body),
+                (status, ErrorBody::new(ResultCode::Backend, text))
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_typed_backend_error_with_status_502_when_read_then_should_stay_an_api_error() {
+        let typed = ErrorBody::new(ResultCode::Backend, "session backend error: store closed");
+        let client = HttpClient::new(CannedTransport {
+            response: HttpResponse::new(
+                502,
+                serde_json::to_vec(&typed).expect("error body encodes"),
+            ),
+        });
+        let error = block_on(client.list_sessions("agents", &SessionsQuery::default()))
+            .expect_err("a typed backend error is an error");
+        assert_eq!(error.code(), Some(ResultCode::Backend));
+        let ClientError::Api(body) = error else {
+            panic!("a decodable ErrorBody is an api error: {error:?}");
+        };
+        assert_eq!(body, typed);
+    }
+
+    #[test]
+    fn given_a_missing_session_when_read_then_should_be_none_for_any_404_body() {
+        let typed = ErrorBody::new(ResultCode::NotFound, "session not found");
+        for body in [
+            serde_json::to_vec(&typed).expect("error body encodes"),
+            b"not found".to_vec(),
+            Vec::new(),
+        ] {
+            let client = HttpClient::new(CannedTransport {
+                response: HttpResponse::new(404, body),
+            });
+            let session = block_on(client.session("agents", ConversationId::from_u128(2)))
+                .expect("a 404 maps to None");
+            assert_eq!(session, None);
+        }
     }
 }

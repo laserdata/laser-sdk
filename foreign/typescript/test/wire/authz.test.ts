@@ -29,8 +29,8 @@ import {
 } from "../../src/wire/authz.js"
 import { decodeOne, encodeNamed, expectMap } from "../../src/wire/cbor.js"
 import {
-  type SupervisorActorAssertion,
-  validateSupervisorAssertion
+  type OperatorActorAssertion,
+  validateOperatorAssertion
 } from "../../src/wire/checkpoint.js"
 import { CheckpointRequestId, DestinationId } from "../../src/wire/ids.js"
 import {
@@ -247,8 +247,8 @@ void test("given_feature_action_pairs_when_indexed_then_should_match_rust_and_fi
   assert.equal(actionIndex("session", "read"), 70)
 })
 
-void test("given_a_supervisor_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {
-  const valid: SupervisorActorAssertion = {
+void test("given_an_operator_assertion_when_validated_then_should_check_version_ids_window_and_lengths", () => {
+  const valid: OperatorActorAssertion = {
     claims: {
       v: 1,
       requestId: CheckpointRequestId.fromU128(1n),
@@ -263,8 +263,8 @@ void test("given_a_supervisor_assertion_when_validated_then_should_check_version
     keyId: new Uint8Array(8),
     signature: new Uint8Array(64)
   }
-  validateSupervisorAssertion(valid)
-  const broken: readonly [SupervisorActorAssertion, RegExp][] = [
+  validateOperatorAssertion(valid)
+  const broken: readonly [OperatorActorAssertion, RegExp][] = [
     [{ ...valid, claims: { ...valid.claims, v: 2 } }, /version/],
     [{ ...valid, claims: { ...valid.claims, cloudUserId: 0 } }, /nonzero/],
     [{ ...valid, claims: { ...valid.claims, expiresAtMicros: 1_000n + 300_000_001n } }, /window/],
@@ -272,7 +272,7 @@ void test("given_a_supervisor_assertion_when_validated_then_should_check_version
   ]
   for (const [assertion, message] of broken) {
     assert.throws(() => {
-      validateSupervisorAssertion(assertion)
+      validateOperatorAssertion(assertion)
     }, message)
   }
 })

@@ -53,7 +53,7 @@ harness = false
 [lints.clippy]
 pedantic = "deny"
 
-# Match the Iggy fork's release policy so the in-process raw client is built
+# Match the Laser Streams release policy so the in-process raw client is built
 # with the same optimization level as the external iggy-bench and server
 # binaries it is compared against.
 [profile.release]

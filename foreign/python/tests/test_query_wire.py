@@ -53,13 +53,13 @@ def test_given_a_pending_result_code_when_classified_then_should_only_allow_the_
     assert ls.result_code_is_retryable("Pending") is False
 
 
-def test_given_a_plane_unavailable_result_code_when_classified_then_should_name_the_node():
-    assert ls.result_code_code("PlaneUnavailable") == 20
-    assert ls.result_code_from_code(20) == "PlaneUnavailable"
-    assert ls.result_code_http_status("PlaneUnavailable") == 503
-    assert ls.result_code_is_plane_unavailable("PlaneUnavailable") is True
-    assert ls.result_code_is_plane_unavailable("Unavailable") is False
-    assert ls.result_code_is_retryable("PlaneUnavailable") is True
+def test_given_a_backend_unavailable_result_code_when_classified_then_should_name_the_node():
+    assert ls.result_code_code("BackendUnavailable") == 20
+    assert ls.result_code_from_code(20) == "BackendUnavailable"
+    assert ls.result_code_http_status("BackendUnavailable") == 503
+    assert ls.result_code_is_backend_unavailable("BackendUnavailable") is True
+    assert ls.result_code_is_backend_unavailable("Unavailable") is False
+    assert ls.result_code_is_retryable("BackendUnavailable") is True
 
 
 def test_given_tagged_values_when_read_then_should_delegate_to_the_typed_value():

@@ -1,4 +1,4 @@
-// Consumer groups that own their filter policy, against the fork with a
+// Consumer groups that own their filter policy, against Laser Streams with a
 // stand-in catalog. The stand-in answers the backend probe and keeps the
 // group policies the tests configure: a group's own filter and revisions, its
 // binding with a policy generation, and the unbound answer for a group
@@ -562,7 +562,7 @@ async fn catalog_server() -> &'static TestIggy {
 
 async fn start_catalog_server() -> (TestIggy, tempfile::TempDir, Arc<Mutex<CatalogState>>) {
     let socket_dir = tempfile::tempdir().expect("socket directory");
-    let socket = socket_dir.path().join("plane.sock");
+    let socket = socket_dir.path().join("backend.sock");
     let state = Arc::new(Mutex::new(CatalogState::default()));
     spawn_catalog(socket.clone(), Arc::clone(&state));
     let server = TestIggy::start_with(vec![

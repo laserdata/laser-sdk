@@ -68,6 +68,9 @@ import {
 import { ConversationId } from "../../src/wire/ids.js"
 import { STREAM_RESOURCE_PREFIX, streamResource } from "../../src/wire/authz.js"
 import { CodecError } from "../../src/client/errors.js"
+import { decodeOne } from "../../src/wire/cbor.js"
+import { parseCanonicalJson } from "../../src/wire/filter.js"
+import { decodeSessionReply, type SessionPage } from "../../src/wire/session.js"
 
 const FIXTURES_DIR = path.resolve(process.cwd(), "../../wire/fixtures")
 
@@ -168,8 +171,56 @@ void test("given_a_session_error_when_rendered_as_an_error_body_then_should_carr
   })
 })
 
+void test("given_the_session_http_error_fixture_when_decoded_then_should_match_the_session_error_mapping", async () => {
+  assert.deepEqual(
+    decodeErrorBodyJson(await fixture("session_http_error.json")),
+    sessionErrorBody({ kind: "notFound", message: "00000000000000000000000004" })
+  )
+})
+
+void test("given_the_session_http_json_fixtures_when_parsed_exactly_then_should_match_the_binary_replies", async () => {
+  for (const [json, binary] of [
+    ["session_http_page.json", "session_reply_page.bin"],
+    ["session_http_page_rebuilding.json", "session_reply_page_rebuilding.bin"]
+  ] as const) {
+    const parsed = parseCanonicalJson(await fixture(json))
+    assert.ok(parsed instanceof Map, json)
+    const page = await binaryPage(binary)
+    assert.equal(parsed.get("rebuilding") ?? false, page.rebuilding, json)
+    assert.equal(parsed.get("total"), page.total, json)
+    const items: unknown = parsed.get("items")
+    assert.ok(Array.isArray(items), json)
+    assert.deepEqual(
+      items.map((item: unknown) => (item instanceof Map ? (item.get("id") as unknown) : undefined)),
+      page.items.map((item) => item.id.toString()),
+      json
+    )
+  }
+  const series = 7_654_321_098_765_432_101n
+  const text = await fixture("session_http_changes_start_new.json")
+  const start = parseCanonicalJson(text)
+  assert.ok(start instanceof Map)
+  assert.equal(start.get("series"), series)
+  assert.equal(start.get("floor"), 0n)
+  assert.equal(start.get("resync"), true)
+  const { series: rounded } = JSON.parse(text) as { readonly series: number }
+  assert.notEqual(BigInt(rounded), series)
+  const legacy = parseCanonicalJson(await fixture("session_http_changes_legacy.json"))
+  assert.ok(legacy instanceof Map)
+  assert.equal(legacy.has("series"), false)
+})
+
 async function fixture(name: string): Promise<string> {
   return readFile(path.join(FIXTURES_DIR, name), "utf8")
+}
+
+async function binaryPage(name: string): Promise<SessionPage> {
+  const reply = decodeSessionReply(
+    decodeOne(await readFile(path.join(FIXTURES_DIR, name)), name),
+    name
+  )
+  assert.ok(reply.kind === "ok" && reply.outcome.kind === "page", name)
+  return reply.outcome.page
 }
 
 void test("given_the_http_json_fixtures_when_decoded_then_should_re_encode_byte_identically", async () => {
@@ -187,6 +238,7 @@ void test("given_the_http_json_fixtures_when_decoded_then_should_re_encode_byte_
     ["query_route_page.json", decodeQueryRoutePageJson, encodeQueryRoutePageJson],
     ["query_result.json", decodeQueryResultJson, encodeQueryResultJson],
     ["schema_def.json", decodeSchemaDefJson, encodeSchemaDefJson],
+    ["session_http_error.json", decodeErrorBodyJson, encodeErrorBodyJson],
     ["snapshot_page.json", decodeSnapshotPageJson, encodeSnapshotPageJson],
     ["table_file_page.json", decodeTableFilePageJson, encodeTableFilePageJson],
     ["table_metrics.json", decodeTableMetricsJson, encodeTableMetricsJson],

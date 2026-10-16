@@ -15,7 +15,7 @@ pub struct ResolvedStack {
     pub benchmark: Option<BinaryManifest>,
     pub iggy_server: Option<BinaryManifest>,
     pub iggy_bench: Option<BinaryManifest>,
-    pub plane: Option<BinaryManifest>,
+    pub backend: Option<BinaryManifest>,
     pub authoritative: bool,
     pub warning: Option<String>,
 }
@@ -26,7 +26,7 @@ impl ResolvedStack {
     /// # Errors
     ///
     /// Returns an error when a required binary is absent or any binary changed after resolution.
-    pub fn verify(&self, requires_plane: bool) -> Result<(), BenchError> {
+    pub fn verify(&self, requires_backend: bool) -> Result<(), BenchError> {
         if let Some(benchmark) = &self.benchmark {
             benchmark.verify()?;
         }
@@ -41,11 +41,11 @@ impl ResolvedStack {
         })?;
         server.verify()?;
         bench.verify()?;
-        if requires_plane {
-            self.plane
+        if requires_backend {
+            self.backend
                 .as_ref()
                 .ok_or_else(|| {
-                    BenchError::Invalid("resolved stack has no plane binary".to_owned())
+                    BenchError::Invalid("resolved stack has no backend binary".to_owned())
                 })?
                 .verify()?;
         }
@@ -82,18 +82,18 @@ fn resolve_source(manifest: &SuiteManifest) -> Result<ResolvedStack, BenchError>
     };
     let iggy_server = iggy_build.build(LocalBinary::IggyServer)?;
     let iggy_bench = iggy_build.build(LocalBinary::IggyBench)?;
-    let plane = if manifest.requires_plane() {
-        let plane_root = from_current_directory(&required_path(
-            manifest.provisioning.plane_root.as_ref(),
-            "plane_root",
+    let backend = if manifest.requires_backend() {
+        let backend_root = from_current_directory(&required_path(
+            manifest.provisioning.backend_root.as_ref(),
+            "backend_root",
         )?)?;
         Some(
             LocalBuild {
-                target_root: plane_root.join("target"),
-                source_root: plane_root,
+                target_root: backend_root.join("target"),
+                source_root: backend_root,
                 cpu_target: manifest.provisioning.cpu_target.clone(),
             }
-            .build(LocalBinary::Plane)?,
+            .build(LocalBinary::Backend)?,
         )
     } else {
         None
@@ -103,7 +103,7 @@ fn resolve_source(manifest: &SuiteManifest) -> Result<ResolvedStack, BenchError>
         benchmark: None,
         iggy_server: Some(iggy_server),
         iggy_bench: Some(iggy_bench),
-        plane,
+        backend,
         authoritative: manifest.authoritative,
         warning: None,
     })
@@ -142,12 +142,13 @@ fn resolve_paths(manifest: &SuiteManifest) -> Result<ResolvedStack, BenchError> 
         None,
         None,
     )?;
-    let plane = manifest
+    let backend = manifest
         .provisioning
-        .plane
+        .backend
         .as_ref()
         .map(|path| {
             let path = from_current_directory(path)?;
+            // the backend repository names its binary
             BinaryManifest::inspect("plane", &path, "path", "caller-provided", false, None, None)
         })
         .transpose()?;
@@ -156,13 +157,13 @@ fn resolve_paths(manifest: &SuiteManifest) -> Result<ResolvedStack, BenchError> 
         benchmark: None,
         iggy_server: Some(server),
         iggy_bench: Some(bench),
-        plane,
+        backend,
         authoritative: false,
         warning: Some(format!(
             "path mode records binary digests but has no source provenance for CPU target `{cpu_target}`"
         )),
     };
-    resolved.verify(manifest.requires_plane())?;
+    resolved.verify(manifest.requires_backend())?;
     Ok(resolved)
 }
 
@@ -187,14 +188,14 @@ fn resolve_artifacts(
         "iggy_bench_version",
     )?;
     let cpu_target = &manifest.provisioning.cpu_target;
-    let plane = manifest
-        .requires_plane()
+    let backend = manifest
+        .requires_backend()
         .then(|| {
             let version = required_text(
-                manifest.provisioning.plane_version.as_deref(),
-                "plane_version",
+                manifest.provisioning.backend_version.as_deref(),
+                "backend_version",
             )?;
-            source.resolve(ArtifactKind::Plane, version, cpu_target, &cache_root)
+            source.resolve(ArtifactKind::Backend, version, cpu_target, &cache_root)
         })
         .transpose()?;
     let resolved = ResolvedStack {
@@ -212,11 +213,11 @@ fn resolve_artifacts(
             cpu_target,
             &cache_root,
         )?),
-        plane,
+        backend,
         authoritative: manifest.authoritative,
         warning: None,
     };
-    resolved.verify(manifest.requires_plane())?;
+    resolved.verify(manifest.requires_backend())?;
     Ok(resolved)
 }
 
@@ -244,7 +245,7 @@ fn resolve_compose(manifest: &SuiteManifest) -> Result<ResolvedStack, BenchError
         benchmark: None,
         iggy_server: None,
         iggy_bench: None,
-        plane: None,
+        backend: None,
         authoritative: false,
         warning: Some(
             "Docker Compose is a non-authoritative convenience tier because container scheduling, networking, cgroups, and filesystem layers can affect results"
@@ -308,7 +309,8 @@ mod tests {
     use crate::manifest::BenchmarkLayer;
 
     #[test]
-    fn given_managed_artifact_suite_without_plane_identity_when_validated_then_should_reject_it() {
+    fn given_managed_artifact_suite_without_backend_identity_when_validated_then_should_reject_it()
+    {
         let mut manifest = SuiteManifest::load(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/suite-minimal.toml"),
         )
@@ -319,7 +321,7 @@ mod tests {
         manifest.scenarios[0].layer = BenchmarkLayer::L4;
         let error = manifest
             .validate()
-            .expect_err("managed artifact mode should require a plane identity");
-        assert!(error.to_string().contains("plane_version"));
+            .expect_err("managed artifact mode should require a backend identity");
+        assert!(error.to_string().contains("backend_version"));
     }
 }

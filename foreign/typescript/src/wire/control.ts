@@ -246,8 +246,8 @@ export interface ProjectionBinding {
   readonly index: string
   readonly notify: boolean
   readonly retention?: RetentionPolicy
-  /** Lets the plane skip a record it proved the destination or the extraction
-   * rejects, instead of holding the partition. The skipped record goes to the
+  /** Lets the managed backend skip a record it proved the destination or the
+   * extraction rejects, instead of holding the partition. The skipped record goes to the
    * dead-letter topic. */
   readonly skipRejected: boolean
 }
@@ -309,8 +309,8 @@ export class ProjectionBindingBuilder {
     return this
   }
 
-  /** Lets the plane skip a record it proved the destination or the extraction
-   * rejects, instead of holding the partition. Every skip is an ordered
+  /** Lets the managed backend skip a record it proved the destination or the
+   * extraction rejects, instead of holding the partition. Every skip is an ordered
    * control record, and the skipped record goes to the dead-letter topic. */
   skipRejected(): this {
     this.skipRejectedRecords = true

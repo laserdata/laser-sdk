@@ -633,7 +633,7 @@ impl Kv {
 
 // The managed KV store is the durable, managed `StateStore`: hand a `Kv` to any
 // seam that wants a point store (a durable `Deduplicator`, a `Cursor` checkpoint,
-// per-agent state) and it persists off the log via the fork. Richer ops (`scan`,
+// per-agent state) and it persists off the log via the managed backend. Richer ops (`scan`,
 // `ttl`, `delete_many`) stay on the inherent `Kv` API. The trait is the narrow
 // `get`/`set`/`delete` shape shared with `InMemoryStore` / `FileStore`, so a
 // `StateStore`-routed `set` never expires (reach for the inherent `set(..).ttl(..)`

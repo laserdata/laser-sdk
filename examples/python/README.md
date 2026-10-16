@@ -74,7 +74,7 @@ LASER_TOKEN='<token>' \
 
 Each focused script covers one primitive. Unsupported managed phases report the missing capability and exit cleanly.
 
-| script | primitive | shows | needs plane? | docs |
+| script | primitive | shows | needs a managed backend? | docs |
 | --- | --- | --- | --- | --- |
 | [`log.py`](log.py) | Log | write two messages, read them back through one typed reader | no | [`/laser-sdk/log`](https://docs.laserdata.cloud/laser-sdk/log) |
 | [`query.py`](query.py) | Views | declare a view over a topic, publish host readings, query the maintained view | yes | [`/laser-sdk/views`](https://docs.laserdata.cloud/laser-sdk/views) |
@@ -93,7 +93,7 @@ Each focused script covers one primitive. Unsupported managed phases report the 
 | script | layer | shows |
 | --- | --- | --- |
 | [`native_streaming.py`](native_streaming.py) | generic | Laser's direct VSR producer and live consumer-group path: tuned batching/linger/retries, exact-width typed headers, keyed routing, 1000 messages published and drained through interval-or-each auto commit, then again through explicit commit-after-success offsets. |
-| [`event_analytics.py`](event_analytics.py) | generic | one clickstream, every read model: a cursor folds a live ops ticker while the producer streams, the managed plane materializes a queryable index for request mix / slowest-route / windowed analytics, a second cursor resumes from a checkpoint, and a registered JSON Schema guards the index against malformed events (the analytics, resume, and schema phases skip cleanly on Apache Iggy) |
+| [`event_analytics.py`](event_analytics.py) | generic | one clickstream, every read model: a cursor folds a live ops ticker while the producer streams, the managed backend materializes a queryable index for request mix / slowest-route / windowed analytics, a second cursor resumes from a checkpoint, and a registered JSON Schema guards the index against malformed events (the analytics, resume, and schema phases skip cleanly on Apache Iggy) |
 | [`fleet_tape.py`](fleet_tape.py) | generic | a fleet telemetry tape with two readers on one connection: host CPU readings stream to a feed topic where a cursor folds a live fleet view (last CPU, sample-weighted mean CPU, samples per host), and the same readings index to a queryable tape for sample and mean CPU aggregates, then a typed handle (`laser.topic(name).json(Reading)`) replays the tape as dataclass values to audit the totals (the tape analytics skip on Apache Iggy) |
 | [`firehose.py`](firehose.py) | generic | a volume load generator: many concurrent producers publish big, richly indexed telemetry events across many org indexes, each materialized into its own queryable index, then a few sample analytics run. Scaled by the `LASER_FIREHOSE_*` knobs |
 | [`incident_desk.py`](incident_desk.py) | agentic | the full-AGDX showcase, peer of the Rust `incident-desk`: a ticket firehose into a queryable index, semantic memory recall, a four-agent desk (triage queries the index and fans deadline-bounded specialist calls, the specialist answers from recalled memory plus the LLM, a key-value-deduplicated resolver applies capacity grants effectively once behind a durable approval gate, the approver stands in for the human), a compare-and-swap quota-ledger retry loop with read-your-writes, speculative bulk-resolution in a copy-on-write fork, and the whole incident rebuilt from its conversation as the audit trail (semantic memory is in-process, the index, key-value, and fork phases skip cleanly on Apache Iggy) |
@@ -108,7 +108,7 @@ Every example runs green on a local Apache Iggy. The managed phases (query, key-
 
 The CDC managed phase also demonstrates **create-and-bind setup, the group's numeric ID, and independent A/B groups**. Revision pause stops new reads while allowing in-flight acknowledgments, then resume continues the same policy.
 
-The CDC example also filters fields inside **CBOR, Avro, and Protobuf payloads** with matching typed fleet readings. Install its optional dependencies with `uv sync --extra examples` from `foreign/python`. The shared schemas live in `examples/shared/`. Avro and Protobuf require plane for writer-schema registration.
+The CDC example also filters fields inside **CBOR, Avro, and Protobuf payloads** with matching typed fleet readings. Install its optional dependencies with `uv sync --extra examples` from `foreign/python`. The shared schemas live in `examples/shared/`. Avro and Protobuf require a managed backend for writer-schema registration.
 
 ## Sessions
 

@@ -2,7 +2,7 @@
 
 The change feed reports when a projected view advances. This example reads those notifications before querying the view.
 
-Managed by `laser-plane` in Laser Stack or LaserData Cloud, using the same view shape as the `query` example under this run's own `readings_v1_<token>` name. On Apache Iggy without `laser-plane`, this prints one pointer and exits clean.
+Managed by the managed backend in Laser Stack or LaserData Cloud, using the same view shape as the `query` example under this run's own `readings_v1_<token>` name. On Apache Iggy without a managed backend, this prints one pointer and exits clean.
 
 ## What it shows
 

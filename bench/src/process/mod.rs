@@ -21,10 +21,11 @@ use crate::manifest::Environment;
 
 const IGGY_USERNAME: &str = "iggy";
 const IGGY_PASSWORD: &str = "iggy";
-const PLANE_HEALTH_PATH: &str = "/health";
-const PLANE_READY_PATH: &str = "/ready";
+const BACKEND_HEALTH_PATH: &str = "/health";
+const BACKEND_READY_PATH: &str = "/ready";
 const COMPOSE_IGGY_SERVICE: &str = "iggy";
-const COMPOSE_PLANE_SERVICE: &str = "plane";
+// the Compose file the manifest points at names the service
+const COMPOSE_BACKEND_SERVICE: &str = "plane";
 const COMPOSE_IGGY_PORT: &str = "8090";
 
 pub struct ComposeServices {
@@ -43,9 +44,9 @@ impl ComposeServices {
     pub fn start(
         compose_file: &Path,
         logs_directory: &Path,
-        requires_plane: bool,
-        profile: PlaneProfile,
-    ) -> Result<(Self, NativeIggy, Option<NativePlane>), BenchError> {
+        requires_backend: bool,
+        profile: BackendProfile,
+    ) -> Result<(Self, NativeIggy, Option<NativeBackend>), BenchError> {
         let compose_file = compose_file.canonicalize().map_err(|error| {
             BenchError::Invalid(format!(
                 "failed to resolve Compose file `{}`: {error}",
@@ -60,12 +61,12 @@ impl ComposeServices {
             stopped: false,
         };
         let mut args = vec!["up", "-d", "--wait", COMPOSE_IGGY_SERVICE];
-        if requires_plane {
-            args.push(COMPOSE_PLANE_SERVICE);
+        if requires_backend {
+            args.push(COMPOSE_BACKEND_SERVICE);
         }
         services.run_checked(&args)?;
-        match services.resolve(requires_plane, profile) {
-            Ok((iggy, plane)) => Ok((services, iggy, plane)),
+        match services.resolve(requires_backend, profile) {
+            Ok((iggy, backend)) => Ok((services, iggy, backend)),
             Err(error) => {
                 let _ = services.finish();
                 Err(error)
@@ -84,9 +85,9 @@ impl ComposeServices {
 
     fn resolve(
         &self,
-        requires_plane: bool,
-        profile: PlaneProfile,
-    ) -> Result<(NativeIggy, Option<NativePlane>), BenchError> {
+        requires_backend: bool,
+        profile: BackendProfile,
+    ) -> Result<(NativeIggy, Option<NativeBackend>), BenchError> {
         let port = self.output_checked(&["port", COMPOSE_IGGY_SERVICE, COMPOSE_IGGY_PORT])?;
         let port = parse_compose_port(&port)?;
         let username = self.service_environment(COMPOSE_IGGY_SERVICE, "IGGY_ROOT_USERNAME")?;
@@ -98,11 +99,11 @@ impl ComposeServices {
             format!("{username}:{password}@{address}"),
             iggy_pid,
         );
-        let plane = requires_plane
-            .then(|| self.service_pid(COMPOSE_PLANE_SERVICE))
+        let backend = requires_backend
+            .then(|| self.service_pid(COMPOSE_BACKEND_SERVICE))
             .transpose()?
-            .map(|pid| NativePlane::external(pid, profile));
-        Ok((iggy, plane))
+            .map(|pid| NativeBackend::external(pid, profile));
+        Ok((iggy, backend))
     }
 
     fn service_environment(&self, service: &str, key: &str) -> Result<String, BenchError> {
@@ -208,15 +209,15 @@ impl Drop for ComposeServices {
 #[strum(
     serialize_all = "snake_case",
     parse_err_ty = BenchError,
-    parse_err_fn = invalid_plane_profile
+    parse_err_fn = invalid_backend_profile
 )]
-pub enum PlaneProfile {
+pub enum BackendProfile {
     #[default]
     Embedded,
     Postgres,
 }
 
-impl PlaneProfile {
+impl BackendProfile {
     #[must_use]
     pub fn label(self) -> &'static str {
         self.into()
@@ -231,15 +232,15 @@ impl PlaneProfile {
     }
 }
 
-fn invalid_plane_profile(value: &str) -> BenchError {
-    BenchError::Invalid(format!("unsupported plane profile `{value}`"))
+fn invalid_backend_profile(value: &str) -> BenchError {
+    BenchError::Invalid(format!("unsupported backend profile `{value}`"))
 }
 
 pub struct NativeIggy {
     child: Option<Child>,
     external_pid: Option<u32>,
     run_directory: PathBuf,
-    plane_socket: Option<PathBuf>,
+    backend_socket: Option<PathBuf>,
     pub address: SocketAddr,
     pub connection_string: String,
     pub system_path: PathBuf,
@@ -247,7 +248,7 @@ pub struct NativeIggy {
 
 pub struct StoppedIggy {
     run_directory: PathBuf,
-    plane_socket: Option<PathBuf>,
+    backend_socket: Option<PathBuf>,
     address: SocketAddr,
     system_path: PathBuf,
 }
@@ -269,7 +270,7 @@ impl NativeIggy {
             child: None,
             external_pid: Some(pid),
             run_directory: PathBuf::new(),
-            plane_socket: None,
+            backend_socket: None,
             address,
             connection_string,
             system_path: PathBuf::new(),
@@ -284,7 +285,7 @@ impl NativeIggy {
     pub async fn start(
         manifest: &BinaryManifest,
         run_directory: &Path,
-        plane_socket: Option<&Path>,
+        backend_socket: Option<&Path>,
         environment: &Environment,
     ) -> Result<Self, BenchError> {
         if manifest.name != "iggy-server" {
@@ -303,7 +304,7 @@ impl NativeIggy {
         Self::spawn(
             manifest,
             run_directory,
-            plane_socket.map(Path::to_path_buf),
+            backend_socket.map(Path::to_path_buf),
             address,
             system_path,
             environment,
@@ -315,7 +316,7 @@ impl NativeIggy {
     async fn spawn(
         manifest: &BinaryManifest,
         run_directory: &Path,
-        plane_socket: Option<PathBuf>,
+        backend_socket: Option<PathBuf>,
         address: SocketAddr,
         system_path: PathBuf,
         environment: &Environment,
@@ -334,12 +335,13 @@ impl NativeIggy {
             .env("IGGY_HTTP_ENABLED", "false")
             .env("IGGY_QUIC_ENABLED", "false")
             .env("IGGY_WEBSOCKET_ENABLED", "false")
-            .env("IGGY_PLANE_ENABLED", plane_socket.is_some().to_string())
+            // the streaming server reads its configuration under these names
+            .env("IGGY_PLANE_ENABLED", backend_socket.is_some().to_string())
             .env("RUST_LOG", "warn")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
-        if let Some(socket) = plane_socket.as_ref() {
+        if let Some(socket) = backend_socket.as_ref() {
             command
                 .env("IGGY_PLANE_SOCKET_PATH", socket)
                 .env("IGGY_PLANE_REQUEST_TIMEOUT", "5s");
@@ -359,7 +361,7 @@ impl NativeIggy {
             child: Some(child),
             external_pid: None,
             run_directory: run_directory.to_path_buf(),
-            plane_socket,
+            backend_socket,
             address,
             connection_string: format!("{IGGY_USERNAME}:{IGGY_PASSWORD}@{address}"),
             system_path,
@@ -376,7 +378,7 @@ impl NativeIggy {
     pub async fn stop_for_restart(mut self) -> Result<StoppedIggy, BenchError> {
         let stopped = StoppedIggy {
             run_directory: self.run_directory.clone(),
-            plane_socket: self.plane_socket.clone(),
+            backend_socket: self.backend_socket.clone(),
             address: self.address,
             system_path: self.system_path.clone(),
         };
@@ -493,7 +495,7 @@ impl StoppedIggy {
         NativeIggy::spawn(
             manifest,
             &self.run_directory,
-            self.plane_socket,
+            self.backend_socket,
             self.address,
             self.system_path,
             environment,
@@ -511,23 +513,23 @@ impl Drop for NativeIggy {
     }
 }
 
-pub struct NativePlane {
+pub struct NativeBackend {
     child: Option<Child>,
     external_pid: Option<u32>,
     run_directory: PathBuf,
     pub health_address: Option<SocketAddr>,
     pub socket_path: PathBuf,
     pub db_path: PathBuf,
-    pub profile: PlaneProfile,
+    pub profile: BackendProfile,
 }
 
-pub struct StoppedPlane {
+pub struct StoppedBackend {
     run_directory: PathBuf,
     socket_path: PathBuf,
     db_path: PathBuf,
 }
 
-impl NativePlane {
+impl NativeBackend {
     /// Operating-system process identifier for resource accounting.
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
@@ -537,21 +539,22 @@ impl NativePlane {
             .or(self.external_pid)
     }
 
-    /// Represent an externally managed plane process whose container health was already checked.
+    /// Represent an externally managed backend process whose container health was already checked.
     #[must_use]
-    pub fn external(pid: u32, profile: PlaneProfile) -> Self {
+    pub fn external(pid: u32, profile: BackendProfile) -> Self {
         Self {
             child: None,
             external_pid: Some(pid),
             run_directory: PathBuf::new(),
             health_address: None,
+            // the Compose image fixes these paths
             socket_path: PathBuf::from("/run/laserdata/plane.sock"),
             db_path: PathBuf::from("/var/lib/laser-plane/index.db"),
             profile,
         }
     }
 
-    /// Start the resolved plane binary against the provided Iggy server and query socket.
+    /// Start the resolved backend binary against the provided Iggy server and query socket.
     ///
     /// # Errors
     ///
@@ -563,14 +566,15 @@ impl NativePlane {
         socket_path: PathBuf,
         environment: &Environment,
     ) -> Result<Self, BenchError> {
+        // the backend repository names its binary
         if manifest.name != "plane" {
             return Err(BenchError::Invalid(format!(
-                "only plane is supported, resolved `{}`",
+                "only the `plane` binary is supported, resolved `{}`",
                 manifest.name
             )));
         }
         manifest.verify()?;
-        let data_directory = run_directory.join("plane-data");
+        let data_directory = run_directory.join("backend-data");
         fs::create_dir_all(&data_directory).map_err(|source| BenchError::Write {
             path: data_directory.clone(),
             source,
@@ -583,7 +587,7 @@ impl NativePlane {
             socket_path,
             db_path,
             environment,
-            "plane",
+            "backend",
         )
         .await
     }
@@ -600,16 +604,17 @@ impl NativePlane {
         let health_address = available_address()?;
         let stdout = create_log(&run_directory.join(format!("{log_name}.stdout.log")))?;
         let stderr = create_log(&run_directory.join(format!("{log_name}.stderr.log")))?;
-        let profile = environment.plane_profile;
+        let profile = environment.backend_profile;
         let mut command = Command::new(&manifest.path);
         command
+            // the backend process reads its configuration under these names
             .env("LD_PLANE_IGGY_URL", format!("tcp://{}", iggy.address))
             .env("LD_PLANE_IGGY_USERNAME", IGGY_USERNAME)
             .env("LD_PLANE_IGGY_PASSWORD", IGGY_PASSWORD)
             .env("LD_PLANE_IGGY_TLS_DISABLED", "true")
             .env(
                 "LD_PLANE_IGGY_PAT_FILE",
-                "/nonexistent/laser-bench-plane.pat",
+                "/nonexistent/laser-bench-backend.pat",
             )
             .env("LD_PLANE_CLUSTER_KIND", "standalone")
             .env("LD_PLANE_DB_PATH", &db_path)
@@ -620,21 +625,21 @@ impl NativePlane {
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
         match profile {
-            PlaneProfile::Embedded => {}
-            PlaneProfile::Postgres => configure_postgres(&mut command, environment)?,
+            BackendProfile::Embedded => {}
+            BackendProfile::Postgres => configure_postgres(&mut command, environment)?,
         }
         let child = command
             .spawn()
-            .map_err(|error| BenchError::Invalid(format!("failed to start plane: {error}")))?;
+            .map_err(|error| BenchError::Invalid(format!("failed to start backend: {error}")))?;
         if let Some(host) = environment.host.as_ref() {
             pin_process(
                 child
                     .id()
-                    .ok_or_else(|| BenchError::Invalid("plane process has no PID".to_owned()))?,
-                &host.plane_cpus,
+                    .ok_or_else(|| BenchError::Invalid("backend process has no PID".to_owned()))?,
+                &host.backend_cpus,
             )?;
         }
-        let mut plane = Self {
+        let mut backend = Self {
             child: Some(child),
             external_pid: None,
             run_directory: run_directory.to_path_buf(),
@@ -643,11 +648,11 @@ impl NativePlane {
             db_path,
             profile,
         };
-        plane.wait_available(Duration::from_secs(30)).await?;
-        Ok(plane)
+        backend.wait_available(Duration::from_secs(30)).await?;
+        Ok(backend)
     }
 
-    /// Restart plane against the same database and Iggy socket contract.
+    /// Restart the backend against the same database and Iggy socket contract.
     ///
     /// # Errors
     ///
@@ -665,13 +670,13 @@ impl NativePlane {
             .await
     }
 
-    /// Stop plane while retaining the state required for an in-place restart.
+    /// Stop the backend while retaining the state required for an in-place restart.
     ///
     /// # Errors
     ///
-    /// Returns an error when plane cannot be stopped or its stale socket cannot be removed.
-    pub async fn stop_for_restart(self) -> Result<StoppedPlane, BenchError> {
-        let stopped = StoppedPlane {
+    /// Returns an error when the backend cannot be stopped or its stale socket cannot be removed.
+    pub async fn stop_for_restart(self) -> Result<StoppedBackend, BenchError> {
+        let stopped = StoppedBackend {
             run_directory: self.run_directory.clone(),
             socket_path: self.socket_path.clone(),
             db_path: self.db_path.clone(),
@@ -686,7 +691,7 @@ impl NativePlane {
         Ok(stopped)
     }
 
-    /// Stop the plane process and wait for process exit.
+    /// Stop the backend process and wait for process exit.
     ///
     /// # Errors
     ///
@@ -698,11 +703,11 @@ impl NativePlane {
         child
             .kill()
             .await
-            .map_err(|error| BenchError::Invalid(format!("failed to stop plane: {error}")))?;
+            .map_err(|error| BenchError::Invalid(format!("failed to stop backend: {error}")))?;
         child
             .wait()
             .await
-            .map_err(|error| BenchError::Invalid(format!("failed to wait for plane: {error}")))?;
+            .map_err(|error| BenchError::Invalid(format!("failed to wait for backend: {error}")))?;
         if self.socket_path.exists() {
             fs::remove_file(&self.socket_path).map_err(|source| BenchError::Write {
                 path: self.socket_path.clone(),
@@ -712,18 +717,18 @@ impl NativePlane {
         Ok(())
     }
 
-    /// Wait for plane to complete its backend handshake with Iggy.
+    /// Wait for the backend to complete its handshake with Iggy.
     ///
     /// # Errors
     ///
-    /// Returns an error when readiness does not converge or plane exits.
+    /// Returns an error when readiness does not converge or the backend exits.
     pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), BenchError> {
-        self.wait_for_endpoint(PLANE_READY_PATH, timeout, "become ready")
+        self.wait_for_endpoint(BACKEND_READY_PATH, timeout, "become ready")
             .await
     }
 
     async fn wait_available(&mut self, timeout: Duration) -> Result<(), BenchError> {
-        self.wait_for_endpoint(PLANE_HEALTH_PATH, timeout, "become available")
+        self.wait_for_endpoint(BACKEND_HEALTH_PATH, timeout, "become available")
             .await
     }
 
@@ -745,19 +750,23 @@ impl NativePlane {
                 .child
                 .as_mut()
                 .ok_or_else(|| {
-                    BenchError::Invalid("external plane readiness is coordinator-owned".to_owned())
+                    BenchError::Invalid(
+                        "external backend readiness is coordinator-owned".to_owned(),
+                    )
                 })?
                 .try_wait()
-                .map_err(|error| BenchError::Invalid(format!("failed to inspect plane: {error}")))?
+                .map_err(|error| {
+                    BenchError::Invalid(format!("failed to inspect backend: {error}"))
+                })?
             {
-                let detail = plane_exit_detail(&self.run_directory);
+                let detail = backend_exit_detail(&self.run_directory);
                 return Err(BenchError::Invalid(format!(
-                    "plane exited before readiness with {status}{detail}"
+                    "backend exited before readiness with {status}{detail}"
                 )));
             }
             if Instant::now() >= deadline {
                 return Err(BenchError::Invalid(format!(
-                    "plane did not {expectation} on {health_address} within {timeout:?}"
+                    "backend did not {expectation} on {health_address} within {timeout:?}"
                 )));
             }
             sleep(Duration::from_millis(20)).await;
@@ -765,21 +774,21 @@ impl NativePlane {
     }
 }
 
-fn plane_exit_detail(run_directory: &Path) -> String {
+fn backend_exit_detail(run_directory: &Path) -> String {
     let iggy_log = run_directory.join("iggy.stdout.log");
     if fs::read_to_string(&iggy_log)
         .is_ok_and(|log| log.contains("rejecting login: incompatible protocol version"))
     {
         return format!(
-            "; Iggy rejected plane's client protocol, rebuild or replace plane; logs: {}",
+            "; Iggy rejected the backend's client protocol, rebuild or replace the backend; logs: {}",
             run_directory.display()
         );
     }
     format!("; logs: {}", run_directory.display())
 }
 
-impl StoppedPlane {
-    /// Start plane from retained database state after a controlled outage.
+impl StoppedBackend {
+    /// Start the backend from retained database state after a controlled outage.
     ///
     /// # Errors
     ///
@@ -790,22 +799,22 @@ impl StoppedPlane {
         iggy: &NativeIggy,
         environment: &Environment,
         restart: u32,
-    ) -> Result<NativePlane, BenchError> {
+    ) -> Result<NativeBackend, BenchError> {
         manifest.verify()?;
-        NativePlane::spawn(
+        NativeBackend::spawn(
             manifest,
             &self.run_directory,
             iggy,
             self.socket_path,
             self.db_path,
             environment,
-            &format!("plane.restart-{restart:03}"),
+            &format!("backend.restart-{restart:03}"),
         )
         .await
     }
 }
 
-impl Drop for NativePlane {
+impl Drop for NativeBackend {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
@@ -833,6 +842,7 @@ fn configure_postgres(command: &mut Command, environment: &Environment) -> Resul
         "timeout": environment.postgres_timeout,
         "serves": "kv,graph,runs,folds,forks",
     }]);
+    // the backend process reads its configuration under these names
     command.env("LD_PLANE_BACKENDS", serde_json::to_string(&declaration)?);
     Ok(())
 }
@@ -915,20 +925,20 @@ mod tests {
 
     #[test]
     fn given_embedded_profile_when_rendering_label_then_should_use_manifest_name() {
-        assert_eq!(PlaneProfile::Embedded.label(), "embedded");
+        assert_eq!(BackendProfile::Embedded.label(), "embedded");
     }
 
     #[test]
-    fn given_plane_profiles_when_parsed_then_should_route_projections_to_selected_backend() {
+    fn given_backend_profiles_when_parsed_then_should_route_projections_to_selected_backend() {
         let postgres = "postgres"
-            .parse::<PlaneProfile>()
+            .parse::<BackendProfile>()
             .expect("Postgres profile should parse");
         let embedded = "embedded"
-            .parse::<PlaneProfile>()
+            .parse::<BackendProfile>()
             .expect("embedded profile should parse");
         assert_eq!(postgres.projection_backend(), "postgres");
         assert_eq!(embedded.projection_backend(), "embedded");
-        assert!("local".parse::<PlaneProfile>().is_err());
+        assert!("local".parse::<BackendProfile>().is_err());
     }
 
     #[test]
@@ -945,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn given_protocol_rejection_when_plane_exits_then_should_report_rebuild_action() {
+    fn given_protocol_rejection_when_backend_exits_then_should_report_rebuild_action() {
         let directory = tempfile::tempdir().expect("temporary directory should be available");
         fs::write(
             directory.path().join("iggy.stdout.log"),
@@ -953,9 +963,9 @@ mod tests {
         )
         .expect("Iggy log should be written");
 
-        let detail = plane_exit_detail(directory.path());
+        let detail = backend_exit_detail(directory.path());
 
-        assert!(detail.contains("rebuild or replace plane"));
+        assert!(detail.contains("rebuild or replace the backend"));
         assert!(detail.contains(&directory.path().display().to_string()));
     }
 }

@@ -456,7 +456,7 @@ pub enum DestinationHttpOperation {
     GetMetrics,
 }
 
-/// One closed destination HTTP operation forwarded from Iggy to Plane.
+/// One closed destination HTTP operation forwarded from the streaming server to the managed backend.
 ///
 /// The operation enum prevents arbitrary paths or methods from crossing the
 /// sidecar boundary. Path parameters stay textual, while query and body carry
@@ -470,7 +470,7 @@ pub struct DestinationHttpRequest {
     pub body: Vec<u8>,
 }
 
-/// Plane's HTTP-shaped response for one [`DestinationHttpRequest`].
+/// The managed backend's HTTP-shaped response for one [`DestinationHttpRequest`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationHttpReply {
     pub status: u16,
@@ -569,7 +569,7 @@ pub fn fork_rows_path(id: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Capabilities {
-    /// Connected to a managed plane at all (the root: with no plane every managed
+    /// Connected to a managed backend at all (the root: with no backend every managed
     /// surface below is off, and the reply still answers `200` with `managed:
     /// false`).
     pub managed: bool,

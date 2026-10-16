@@ -111,7 +111,7 @@ pub struct FilterBinding {
 
 /// A position in the catalog's control log: the partition and the offset of
 /// the record whose fold produced an outcome. A group read may require the
-/// serving plane to have examined the log through this position before it
+/// managed backend to have examined the log through this position before it
 /// answers, which gives the application that configured the group a
 /// read-your-writes guarantee through any node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -211,7 +211,7 @@ pub struct FilterMutationRequest {
     pub mutation: FilterMutation,
 }
 
-/// Operational limits captured when the plane accepts a catalog command.
+/// Operational limits captured when the managed backend accepts a catalog command.
 /// Zero disables a limit. Older commands keep the original defaults on replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterCatalogLimits {
@@ -243,7 +243,7 @@ const fn default_max_catalog_bytes() -> u64 {
 
 /// The mutation the catalog appends to its control log, stamped by the
 /// streaming server with the acting user and, for a bind or unbind, the
-/// group's verified identity, then by the plane with the caller's grants and,
+/// group's verified identity, then by the managed backend with the caller's grants and,
 /// for a registration, the allocated filter id. Applying it is deterministic,
 /// so every replica, and every replay of the log, records the same outcome.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -254,7 +254,7 @@ pub struct FilterCatalogCommand {
     pub mutation: FilterMutation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<FilterGroupIdentity>,
-    /// The id a registration takes, allocated by the plane before the append
+    /// The id a registration takes, allocated by the managed backend before the append
     /// so a replay of any part of the log assigns the same id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_id: Option<u32>,
@@ -436,11 +436,11 @@ pub struct ResolveFilterPolicy {
     /// Without it the lookup fails with `not_found`, the strict behavior.
     #[serde(default)]
     pub allow_unbound: bool,
-    /// Answer only once the plane has examined the control log through this
+    /// Answer only once the managed backend has examined the control log through this
     /// position, otherwise `catalog_unavailable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_catalog_position: Option<CatalogPosition>,
-    /// Answer only once the plane has examined the control log through the
+    /// Answer only once the managed backend has examined the control log through the
     /// head it reads from the control partition primary now.
     #[serde(default)]
     pub confirm_head: bool,
@@ -456,7 +456,7 @@ pub struct WatchFilterCatalog {
 }
 
 /// Internal: an opaque catalog version. It changes on each control-log fold
-/// and starts with a random token on each plane process to fence old caches.
+/// and starts with a random token on each backend process to fence old caches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterCatalogVersion {
     pub v: u32,

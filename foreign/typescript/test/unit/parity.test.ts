@@ -77,7 +77,7 @@ void test("given_each_rust_classifier_when_applied_to_its_failure_then_should_an
   assert.equal(isNotFound(iggyFailure(2011)), true)
   assert.equal(isNotFound(iggyFailure(20)), true)
   assert.equal(isNotFound(new QueryExecutionError("gone", { kind: "index_not_found" })), true)
-  assert.equal(isUnsupported(new UnsupportedError("no plane")), true)
+  assert.equal(isUnsupported(new UnsupportedError("no managed backend")), true)
   assert.equal(isUnsupported(new ForkExecutionError("no", { kind: "unsupported" })), true)
   assert.equal(isVersionSkew(new KvExecutionError("skew", { kind: "version" })), true)
   assert.equal(isVersionConflict(new KvExecutionError("race", { kind: "versionConflict" })), true)

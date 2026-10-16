@@ -55,11 +55,11 @@ graph = ["streaming"]
 # `cargo test --workspace` stays unit-only and infrastructure-free.
 integration = []
 # Managed key-value store over the `AGDX_KV` managed commands, backed by
-# laser-plane's point-state backend in Laser Stack or LaserData Cloud.
+# the managed backend's point-state store in Laser Stack or LaserData Cloud.
 # trait-variant backs the injectable coordination transport seam, async-trait
 # its object-safe (`Arc<dyn ..>`) counterpart for a runtime-selected transport.
 kv = ["dep:async-trait", "dep:trait-variant", "streaming"]
-# The managed tier in one word: everything laser-plane serves over the
+# The managed tier in one word: everything the managed backend serves over the
 # command band. `--features managed` instead of remembering which per-surface
 # features compose it.
 managed = [
@@ -91,7 +91,7 @@ rbac = ["streaming"]
 # Client-side schema-first codec helpers: compile a registered `SchemaDef`
 # (Avro / Protobuf) locally, encode Avro bodies from serde values, and validate
 # payloads against the registered definition before publishing - the same
-# decode semantics the laser-plane projector applies.
+# decode semantics the managed backend's projector applies.
 schema-codecs = ["dep:apache-avro", "dep:jsonschema", "dep:prost-reflect", "projections"]
 # Envelope signing and verification: activate the dormant `Signature` field with
 # Ed25519 keys and a per-agent key registry keyed by the enrolled principal. The
@@ -115,7 +115,7 @@ streaming = [
     "laser-wire/codecs",
 ]
 # The materialized-view change feed: `Laser::watch()` over the `ChangeRecord`s
-# laser-plane publishes per committed projector batch.
+# the managed backend publishes per committed projector batch.
 watch = ["streaming"]
 
 [dependencies]

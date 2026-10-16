@@ -16,7 +16,7 @@ Run `npm run setup` once, then run from `examples/typescript`:
 npm run example:graph
 ```
 
-This is managed by `laser-plane` in Laser Stack or LaserData Cloud. On Apache Iggy without `laser-plane`, the example prints a skip notice and returns.
+This needs the managed backend of Laser Stack or LaserData Cloud. On Apache Iggy without a managed backend, the example prints a skip notice and returns.
 
 ```sh
 LASER_CONNECTION_STRING=user:pwd@your-host npm run example:graph

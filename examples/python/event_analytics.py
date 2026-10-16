@@ -4,12 +4,12 @@ A clickstream topic with each read model the platform offers layered over it:
 
   - HOT PATH    a cursor tails the raw log live while the producer streams,
                 folding a rolling ops ticker (events seen, errors).
-  - ANALYTICS   the managed plane materializes a queryable index and answers the
+  - ANALYTICS   the managed backend materializes a queryable index and answers the
                 aggregates a dashboard needs (mix, slowest routes, windows).
   - EXPORT      an independent cursor tails the same log with a checkpoint,
                 resuming exactly where it stopped after a restart.
   - SCHEMAS     a registered JSON Schema guards the index against malformed
-                events (managed plane only).
+                events (managed backend only).
 
 The analytics, export-resume, and schema phases are managed features and skip
 cleanly on Apache Iggy.
@@ -279,7 +279,7 @@ async def run_guarded_ingest(laser: ls.Laser) -> None:
     schema_id = await laser.schemas().register(
         {"kind": "json_schema", "schema": EVENT_JSON_SCHEMA}, name="clickstream_event"
     )
-    print(f"the managed plane allocated writer-schema id {schema_id} for the Event guard")
+    print(f"the managed backend allocated writer-schema id {schema_id} for the Event guard")
 
     await laser.topic(GUARDED_TOPIC).ensure(partitions=_common.PARTITIONS)
     await _common.start_projector(laser, GUARDED_TOPIC, COLUMNS, index=GUARDED_INDEX)

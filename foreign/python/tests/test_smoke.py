@@ -118,7 +118,7 @@ def test_compiled_avro_rejects_a_mismatched_value():
 
 
 def test_compiled_json_schema_validates_a_value():
-    # A JSON Schema validates an already-decoded value (the managed-plane check).
+    # A JSON Schema validates an already-decoded value (the managed backend's check).
     source = {"kind": "json_schema", "schema": '{"type":"object","required":["n"]}'}
     schema = ls.CompiledSchema.compile(source)
     assert schema.validate_value({"n": 1})

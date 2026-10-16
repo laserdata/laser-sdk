@@ -18,7 +18,7 @@ use super::{
 use crate::BenchError;
 use crate::agdx::{record_payload, seeded_payload};
 use crate::engine::{LoadResult, Operation};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Display, EnumString, IntoStaticStr, Serialize, PartialEq, Eq,
@@ -42,7 +42,7 @@ fn invalid_batch_arm(value: &str) -> BenchError {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ManagedBatchSummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub namespace: String,
     pub commands_per_operation: usize,
     pub configuration: serde_json::Value,
@@ -72,7 +72,7 @@ pub async fn run_managed_batch_evidence(
     laser: &Laser,
     case: &ManagedCase,
     arm: ManagedBatchArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     scenario: &str,
     seed: u64,
     monitored_processes: &[(String, u32)],
@@ -108,7 +108,7 @@ pub async fn run_managed_batch_evidence(
             namespace,
             commands_per_operation: case.batch_size,
             configuration: serde_json::json!({
-                "path": "laser_execute_batch_through_iggy_and_plane",
+                "path": "laser_execute_batch_through_iggy_and_backend",
                 "backend_profile": profile,
                 "setup_timed": false,
                 "validation_boundary": "each_reply_slot",
@@ -220,7 +220,7 @@ async fn wait_for_managed(laser: &Laser, timeout: Duration) -> Result<(), BenchE
         }
         if Instant::now() >= deadline {
             return Err(BenchError::Invalid(format!(
-                "plane did not advertise managed batching within {timeout:?}"
+                "backend did not advertise managed batching within {timeout:?}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

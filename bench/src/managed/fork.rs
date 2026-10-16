@@ -14,7 +14,7 @@ use super::{
 };
 use crate::BenchError;
 use crate::engine::{LoadResult, Operation};
-use crate::process::PlaneProfile;
+use crate::process::BackendProfile;
 
 const ID_FIELD: &str = "id";
 
@@ -45,7 +45,7 @@ fn invalid_fork_arm(value: &str) -> BenchError {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ForkSummary {
     pub operation: ManagedArmSummary,
-    pub backend_profile: PlaneProfile,
+    pub backend_profile: BackendProfile,
     pub fork_prefix: String,
     pub table: String,
     pub base_rows: u64,
@@ -78,7 +78,7 @@ pub async fn run_fork_evidence(
     laser: &Laser,
     case: &ManagedCase,
     arm: ForkArm,
-    profile: PlaneProfile,
+    profile: BackendProfile,
     scenario: &str,
     seed: u64,
     monitored_processes: &[(String, u32)],
@@ -139,7 +139,7 @@ pub async fn run_fork_evidence(
             },
             rows_per_operation: usize::try_from(rows_per_operation).unwrap_or(usize::MAX),
             configuration: serde_json::json!({
-                "path": "laser_fork_through_iggy_and_plane",
+                "path": "laser_fork_through_iggy_and_backend",
                 "backend_profile": profile,
                 "setup_timed": false,
                 "validation_timed": false,
@@ -158,7 +158,7 @@ async fn wait_for_forks(laser: &Laser, timeout: Duration) -> Result<(), BenchErr
         }
         if Instant::now() >= deadline {
             return Err(BenchError::Invalid(format!(
-                "plane did not advertise forks within {timeout:?}"
+                "backend did not advertise forks within {timeout:?}"
             )));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

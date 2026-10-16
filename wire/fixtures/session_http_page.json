@@ -1,0 +1,52 @@
+{
+  "items": [
+    {
+      "stream": "agents",
+      "id": "00000000000000000000000002",
+      "label": "incident",
+      "namespace": "ops",
+      "agent": "planner",
+      "parent": "00000000000000000000000001",
+      "root": "00000000000000000000000001",
+      "status": "active",
+      "idle": false,
+      "over_budget": false,
+      "pause_requested": false,
+      "cancel_requested": true,
+      "started_at": 1717171717000000,
+      "first_event_at": 1717171717000000,
+      "last_event_at": 1717171717000005,
+      "last_heartbeat_at": 1717171717000004,
+      "events": 12,
+      "model_calls": 2,
+      "tool_calls": 3,
+      "tokens_in": 100,
+      "tokens_out": 50,
+      "cost_micros": 1250,
+      "errors": 1,
+      "budget": {
+        "tokens": 10000
+      },
+      "sdk": {
+        "language": "rust",
+        "version": "0.8.0"
+      },
+      "flags": {
+        "events_truncated": true
+      },
+      "frontier": [
+        {
+          "topic_id": 3,
+          "topic_generation": 1717171717000000,
+          "partition_id": 1,
+          "folded": 41,
+          "head": 42,
+          "retained_from": 7
+        }
+      ]
+    }
+  ],
+  "cursor": "next",
+  "total": 9,
+  "truncated": false
+}

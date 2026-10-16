@@ -15,7 +15,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use crate::BenchError;
 use crate::metrics::{CgroupSnapshot, ProcessSnapshot};
 
-const PLANE_METRICS_PATH: &str = "/metrics";
+const BACKEND_METRICS_PATH: &str = "/metrics";
 const MAX_HTTP_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -32,7 +32,7 @@ pub struct TelemetryPoint {
     pub processes: BTreeMap<String, ProcessSnapshot>,
     pub cgroups: BTreeMap<String, CgroupSnapshot>,
     pub iggy: serde_json::Value,
-    pub plane: Option<serde_json::Value>,
+    pub backend: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -68,7 +68,7 @@ impl TelemetrySampler {
     pub async fn start(
         connection_string: &str,
         processes: Vec<(String, u32)>,
-        plane_address: Option<SocketAddr>,
+        backend_address: Option<SocketAddr>,
         interval: Duration,
         enable_perf: bool,
     ) -> Result<Self, BenchError> {
@@ -85,7 +85,7 @@ impl TelemetrySampler {
         let task = tokio::spawn(sample_until_stopped(
             laser,
             processes,
-            plane_address,
+            backend_address,
             interval,
             stop_rx,
             perf_observers,
@@ -110,20 +110,20 @@ impl TelemetrySampler {
 async fn sample_until_stopped(
     laser: Laser,
     processes: Vec<(String, u32)>,
-    plane_address: Option<SocketAddr>,
+    backend_address: Option<SocketAddr>,
     interval: Duration,
     mut stop: oneshot::Receiver<()>,
     perf_observers: Vec<PerfObserver>,
     mut perf: BTreeMap<String, PerfMeasurement>,
 ) -> Result<TelemetrySeries, BenchError> {
     let started = Instant::now();
-    let mut points = vec![sample(&laser, &processes, plane_address, started).await?];
+    let mut points = vec![sample(&laser, &processes, backend_address, started).await?];
     let mut ticker = interval_at(started + interval, interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = &mut stop => {
-                points.push(sample(&laser, &processes, plane_address, started).await?);
+                points.push(sample(&laser, &processes, backend_address, started).await?);
                 for observer in perf_observers {
                     let (name, measurement) = finish_perf_observer(observer).await?;
                     perf.insert(name, measurement);
@@ -136,7 +136,7 @@ async fn sample_until_stopped(
                 });
             }
             _ = ticker.tick() => {
-                points.push(sample(&laser, &processes, plane_address, started).await?);
+                points.push(sample(&laser, &processes, backend_address, started).await?);
             }
         }
     }
@@ -254,7 +254,7 @@ fn unavailable_perf(reason: &str) -> PerfMeasurement {
 async fn sample(
     laser: &Laser,
     processes: &[(String, u32)],
-    plane_address: Option<SocketAddr>,
+    backend_address: Option<SocketAddr>,
     started: Instant,
 ) -> Result<TelemetryPoint, BenchError> {
     let mut process_snapshots = BTreeMap::new();
@@ -270,8 +270,8 @@ async fn sample(
         .get_stats()
         .await
         .map_err(|error| BenchError::Invalid(format!("Iggy stats scrape failed: {error}")))?;
-    let plane = match plane_address {
-        Some(address) => Some(fetch_json(address, PLANE_METRICS_PATH).await?),
+    let backend = match backend_address {
+        Some(address) => Some(fetch_json(address, BACKEND_METRICS_PATH).await?),
         None => None,
     };
     Ok(TelemetryPoint {
@@ -279,7 +279,7 @@ async fn sample(
         processes: process_snapshots,
         cgroups,
         iggy: serde_json::to_value(iggy)?,
-        plane,
+        backend,
     })
 }
 
@@ -287,7 +287,7 @@ async fn fetch_json(address: SocketAddr, path: &str) -> Result<serde_json::Value
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .map_err(|error| {
-            BenchError::Invalid(format!("plane metrics connection failed: {error}"))
+            BenchError::Invalid(format!("backend metrics connection failed: {error}"))
         })?;
     stream
         .write_all(
@@ -295,13 +295,15 @@ async fn fetch_json(address: SocketAddr, path: &str) -> Result<serde_json::Value
                 .as_bytes(),
         )
         .await
-        .map_err(|error| BenchError::Invalid(format!("plane metrics request failed: {error}")))?;
+        .map_err(|error| BenchError::Invalid(format!("backend metrics request failed: {error}")))?;
     let mut response = Vec::new();
     stream
         .take(MAX_HTTP_RESPONSE_BYTES)
         .read_to_end(&mut response)
         .await
-        .map_err(|error| BenchError::Invalid(format!("plane metrics response failed: {error}")))?;
+        .map_err(|error| {
+            BenchError::Invalid(format!("backend metrics response failed: {error}"))
+        })?;
     parse_json_response(&response)
 }
 
@@ -309,7 +311,7 @@ fn parse_json_response(response: &[u8]) -> Result<serde_json::Value, BenchError>
     let separator = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| BenchError::Invalid("plane metrics response has no body".to_owned()))?;
+        .ok_or_else(|| BenchError::Invalid("backend metrics response has no body".to_owned()))?;
     let headers = &response[..separator];
     let status = headers
         .split(|byte| *byte == b'\n')
@@ -317,7 +319,7 @@ fn parse_json_response(response: &[u8]) -> Result<serde_json::Value, BenchError>
         .unwrap_or_default();
     if !(status.starts_with(b"HTTP/1.1 200") || status.starts_with(b"HTTP/1.0 200")) {
         return Err(BenchError::Invalid(format!(
-            "plane metrics returned `{}`",
+            "backend metrics returned `{}`",
             String::from_utf8_lossy(status).trim()
         )));
     }

@@ -1,4 +1,4 @@
-@consistency @plane
+@consistency @managed
 Feature: Managed reads keep up with the client's own writes
   Every managed write reply carries the position its fold applied. The client
   keeps the highest position per surface and sends it with each later read of

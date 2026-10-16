@@ -86,7 +86,7 @@ function safeModeFilter(): ConsumerFilter {
   )
 }
 
-// A consumer group filter needs the catalog, which only a managed plane serves.
+// A consumer group filter needs the catalog, which only a managed backend serves.
 class NeedsCatalog extends Error {}
 
 async function withSource(
@@ -101,7 +101,7 @@ async function withSource(
     await run(laser, stream)
   } catch (error) {
     if (!(error instanceof NeedsCatalog)) throw error
-    context.skip("a consumer group filter needs a managed plane")
+    context.skip("a consumer group filter needs a managed backend")
   } finally {
     await laser
       .stream(stream)
@@ -580,6 +580,7 @@ void test(
     let transport: ApacheIggyTransport | undefined
     try {
       const [leader, follower] = await cluster.leaderAndFollower()
+      // the streaming server reads this configuration name
       cluster.setNodeEnvironment(follower, { IGGY_PLANE_FILTERS_ENABLED: "false" })
       await cluster.restartNode(follower)
       cluster.routeEndpointTo(leader)
@@ -799,7 +800,7 @@ async function withAgentStream(
     await run(laser)
   } catch (error) {
     if (!(error instanceof NeedsCatalog)) throw error
-    context.skip("binding a role group needs a managed plane")
+    context.skip("binding a role group needs a managed backend")
   } finally {
     await laser
       .stream(stream)

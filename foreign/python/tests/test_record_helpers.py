@@ -52,7 +52,7 @@ def test_given_a_mutation_when_building_a_checkpoint_envelope_then_should_stamp_
     assert envelope["request_id"] == REQUEST_ID
     assert envelope["expected_global_state_revision"] == 4
     assert envelope["mutation"] == SET_DESIRED_STATE
-    assert "supervisor_assertion" not in envelope
+    assert "operator_assertion" not in envelope
 
 
 def test_given_a_malformed_request_id_when_building_a_checkpoint_envelope_then_should_raise():
@@ -110,7 +110,7 @@ def test_given_a_graph_return_when_checking_the_default_then_should_be_nodes(ret
     assert ls.graph_return_is_nodes(returns) is nodes
 
 
-def supervisor_assertion(**claims):
+def operator_assertion(**claims):
     return {
         "claims": {
             "v": 1,
@@ -129,17 +129,17 @@ def supervisor_assertion(**claims):
     }
 
 
-def test_given_a_well_formed_supervisor_assertion_when_validated_then_should_pass():
-    assert ls.validate_supervisor_actor_assertion(supervisor_assertion()) is None
+def test_given_a_well_formed_operator_assertion_when_validated_then_should_pass():
+    assert ls.validate_operator_actor_assertion(operator_assertion()) is None
 
 
 @pytest.mark.parametrize(
     "claims",
     [{"v": 2}, {"deployment_id": 0}, {"expires_at_micros": 1_000_000}],
 )
-def test_given_a_broken_supervisor_assertion_when_validated_then_should_raise_invalid(claims):
+def test_given_a_broken_operator_assertion_when_validated_then_should_raise_invalid(claims):
     with pytest.raises(ls.InvalidError):
-        ls.validate_supervisor_actor_assertion(supervisor_assertion(**claims))
+        ls.validate_operator_actor_assertion(operator_assertion(**claims))
 
 
 def test_given_an_entity_when_minting_its_content_id_then_should_match_the_node_dict_id():

@@ -300,8 +300,8 @@ fn given_result_codes_when_compared_then_should_match_the_dictionary() {
     assert_eq!(ResultCode::TargetUnavailable.code(), 18);
     assert_eq!(ResultCode::Pending.code(), 19);
     assert_eq!(ResultCode::Pending.http_status(), 503);
-    assert_eq!(ResultCode::PlaneUnavailable.code(), 20);
-    assert_eq!(ResultCode::PlaneUnavailable.http_status(), 503);
+    assert_eq!(ResultCode::BackendUnavailable.code(), 20);
+    assert_eq!(ResultCode::BackendUnavailable.http_status(), 503);
     assert_eq!(ResultCode::from_code(2), ResultCode::NotFound);
     assert_eq!(ResultCode::from_code(404), ResultCode::Unrecognized(404));
     assert_eq!(ResultCode::NotFound.http_status(), 404);

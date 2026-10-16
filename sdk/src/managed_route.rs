@@ -62,7 +62,7 @@ impl ManagedRoute {
             tracing::info!(
                 target: "laser",
                 node = %node.name,
-                "managed requests moved to another node after its plane failed"
+                "managed requests moved to another node after its backend failed"
             );
             *pinned = Some(Pinned {
                 node: node.name.clone(),

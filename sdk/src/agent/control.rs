@@ -21,7 +21,7 @@ pub struct PendingControl {
     pub cancel_requested: bool,
     /// A control request for the session arrived on another partition of
     /// `agent.control` than the one its conversation id routes to. Such a
-    /// request is never applied, here or by the plane.
+    /// request is never applied, here or by the managed backend.
     pub control_conflict: bool,
 }
 
@@ -97,7 +97,7 @@ pub(crate) type ControlPosition = (u32, u64);
 
 /// The `agent.control` partition a session's control records belong on: the
 /// partition Iggy routes the conversation id key to, XXH32 with seed zero
-/// over the conversation string modulo the partition count. The plane applies
+/// over the conversation string modulo the partition count. The managed backend applies
 /// the same rule, so both refuse a record on any other partition.
 pub(crate) fn control_partition(conversation: ConversationId, partitions: u32) -> Option<u32> {
     (partitions > 0).then(|| xxh32(conversation.to_string().as_bytes()) % partitions)

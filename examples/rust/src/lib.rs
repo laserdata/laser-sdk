@@ -251,7 +251,7 @@ pub fn env_bool(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-/// A projector handle for the query examples. Query is managed by `laser-plane`,
+/// A projector handle for the query examples. Query is served by the managed backend,
 /// so the projection is registered on Laser Stack or LaserData Cloud. Returned
 /// by [`start_projector`].
 pub struct Projector;
@@ -262,7 +262,7 @@ impl Projector {
 
 /// Register `topic`'s projection over `fields` on a managed deployment so
 /// `query(topic)` returns rows. This requires Laser Stack or LaserData Cloud.
-/// On Apache Iggy without `laser-plane`, registration and query both return
+/// On Apache Iggy without a managed backend, registration and query both return
 /// `LaserError::Unsupported`.
 pub async fn start_projector(
     laser: &Laser,
@@ -314,7 +314,7 @@ pub async fn ensure_view(
         .build();
     laser.bindings().apply(binding).await?;
 
-    // Wait until laser-plane has applied the registration and created the index
+    // Wait until the managed backend has applied the registration and created the index
     // before we return, so records published next flow into a live
     // projector rather than being missed by one that spawns afterwards. A query
     // errors until the table exists, then returns an empty page.
@@ -322,7 +322,7 @@ pub async fn ensure_view(
     while laser.query(index).fetch().await.is_err() {
         if Instant::now() >= deadline {
             return Err(LaserError::Invalid(format!(
-                "laser-plane did not create index `{index}` in time (is the managed deployment running and consuming `control.commands`?)"
+                "the managed backend did not create index `{index}` in time (is the managed deployment running and consuming `control.commands`?)"
             )));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

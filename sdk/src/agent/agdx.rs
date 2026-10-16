@@ -520,7 +520,7 @@ impl<'a> AgdxSend<'a> {
     /// Sign the envelope with `key` just before sending (after every `with_*`
     /// refinement, so the signature covers the final shape). The consuming SDK
     /// verifies it against the enrolled key registry, the authorship and
-    /// control-plane authorization gate. Requires the `sign` feature.
+    /// authorization gate. Requires the `sign` feature.
     #[cfg(feature = "sign")]
     pub fn signed_by(mut self, key: &'a crate::sign::SigningKey) -> Self {
         self.sign_key = Some(key);

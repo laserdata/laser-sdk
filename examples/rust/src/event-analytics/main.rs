@@ -311,7 +311,7 @@ async fn wait_for_projection(laser: &Laser, expected: usize) -> Result<(), Laser
     let deadline = Instant::now() + PROJECTOR_TIMEOUT;
     // Await-then-query where the deployment publishes the change feed (LaserData
     // Cloud with a notifying binding): each tick drains the feed and re-runs the
-    // count only when the plane reported the view advanced. Elsewhere (the local
+    // count only when the backend reported the view advanced. Elsewhere (the local
     // managed change feed) every tick queries, the plain bounded poll.
     let mut feed = laser
         .capabilities()

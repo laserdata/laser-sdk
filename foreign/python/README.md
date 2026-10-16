@@ -154,7 +154,7 @@ while (record := await records.next()) is not None:
 
 ## Schema-first bodies (Avro / Protobuf)
 
-Compile the registered writer schema before publishing records that use it. The client encodes each value and rejects values that do not match. The managed plane resolves the schema ID to extract indexed columns.
+Compile the registered writer schema before publishing records that use it. The client encodes each value and rejects values that do not match. The managed backend resolves the schema ID to extract indexed columns.
 
 ```python
 from laser_sdk import CompiledSchema
@@ -169,7 +169,7 @@ for reading in samples:
 await batch.send()
 ```
 
-`CompiledSchema` provides `validate`, `validate_value`, `decode`, and `encode_avro`. `laser.schemas()` also provides `get`, `list`, and `drop`. The publish builder provides `.avro(compiled, schema_id, value)`. For an encoded Protobuf body, use `.raw_bytes(bytes, "protobuf")` or batch `.add_raw_bytes(..)`. Schema registration requires the `laser-plane` registry in Laser Stack or LaserData Cloud.
+`CompiledSchema` provides `validate`, `validate_value`, `decode`, and `encode_avro`. `laser.schemas()` also provides `get`, `list`, and `drop`. The publish builder provides `.avro(compiled, schema_id, value)`. For an encoded Protobuf body, use `.raw_bytes(bytes, "protobuf")` or batch `.add_raw_bytes(..)`. Schema registration requires the schema registry of Laser Stack or LaserData Cloud.
 
 ## Query (managed)
 
@@ -687,6 +687,8 @@ watch = laser.sessions().watch(1_000)
 change = await watch.next()
 ```
 
+A list page holds `"rebuilding": True` while the stream's index is rebuilding or catching up on the serving node, so `items` and `total` can be incomplete. The key is absent otherwise.
+
 Inside a handler, `await ctx.session().pending_control()` returns the pause and cancel requests the agent recorded from `agent.control`. The runtime never interrupts a handler. `control(...).signed_by(key)` signs control records. `spawn_agent(..., sessions=laser.sessions(fail_on_dead_letter=True))` fails the session of a dead-lettered record.
 
 An operator can pause a session. `pause()` names the agents that must acknowledge, set them with `participants([...])` or let the SDK read them from the session. Agents hold work that arrives while the session is paused and handle it after `resume()`. `await session.parked()` lists held work that was never handled, for example after a cancel while paused.
@@ -710,7 +712,7 @@ wf.step(
 
 ## Change feed (managed)
 
-Await a view's advance instead of polling it blind. A projection binding built with notify makes the plane publish one change record per committed batch, and `laser.watch()` reads that feed. Gated on the `watch` capability: `laser.watch()` raises `UnsupportedError` elsewhere. Resume with `watch(from_offsets=)` or `reader.from_offsets(saved)`.
+Await a view's advance instead of polling it blind. A projection binding built with notify makes the managed backend publish one change record per committed batch, and `laser.watch()` reads that feed. Gated on the `watch` capability: `laser.watch()` raises `UnsupportedError` elsewhere. Resume with `watch(from_offsets=)` or `reader.from_offsets(saved)`.
 
 ```python
 feed = laser.watch(index="readings_v1")

@@ -6,7 +6,7 @@ Laser SDK provides streaming, queries, key-value state, forks, graphs, and agent
 
 Rust ([`laser-sdk` on crates.io](https://crates.io/crates/laser-sdk)) defines the reference SDK behavior. Python ([`laser-sdk` on PyPI](https://pypi.org/project/laser-sdk/), [source](foreign/python/README.md)) calls the Rust implementation. TypeScript ([`@laserdata/laser-sdk` on npm](https://www.npmjs.com/package/@laserdata/laser-sdk), [source](foreign/typescript/README.md)) provides a native Node client. Shared test data and behavior scenarios compare the clients. The [`laser-wire` crate](https://crates.io/crates/laser-wire) ([source](wire/README.md)) defines the data exchanged between them.
 
-> [Laser Stack](https://github.com/laserdata/laser-stack) runs the Iggy fork and `laser-plane` for local development. It supports the managed SDK operations, including queries. In the Laser Stack checkout, run `./scripts/up` to start the services and obtain `LASER_CONNECTION_STRING`. Laser Stack excludes proprietary Cloud features such as the Stream and Data UI.
+> [Laser Stack](https://github.com/laserdata/laser-stack) runs Laser Streams and the managed backend for local development. It supports the managed SDK operations, including queries. In the Laser Stack checkout, run `./scripts/up` to start the services and obtain `LASER_CONNECTION_STRING`. Laser Stack excludes proprietary Cloud features such as the Stream and Data UI.
 
 Read the three-language guides at [docs.laserdata.cloud/laser-sdk](https://docs.laserdata.cloud/laser-sdk). Start with the [quickstart](https://docs.laserdata.cloud/laser-sdk/quickstart) or the focused [`examples/`](examples/README.md).
 
@@ -297,7 +297,7 @@ Agent fabric (opt in with the `agent` feature):
 | AGDX envelope | A typed, versioned, fixture-pinned agent message format on the log, with producer verbs, resumable token streams, and deterministic reassembly. ([notes](docs/agdx.md)) |
 | Action governance | A pre-effect policy hook (`ActionGovernor`) over everything an agent publishes: allow, observe, block, step-up, modify, or defer each send, typed or raw topic publish, AGDX verb, and memory write **before it runs**. Enforce or shadow mode records every non-allow decision as digest-chained evidence. `QuorumGovernor` runs named governors concurrently under `All` / `Any` / `AtLeast(n)`. Every mandatory voter must affirm, invalid configurations and mandatory errors block, and conflicting body replacements block. `SwappableGovernor` changes the active policy without reconnecting. Defense in depth above server-owned RBAC. |
 | Durable intent | SDK-level typed records for asynchronous effect approval, not an AGDX wire extension. Fallible `Intent::builder().build()` validates the frozen voter set, threshold, deadline, and body digest. Fallible `Vote::cast` binds an eligible voter to that digest and policy version. `decide` ignores invalid, early, late, and future ballots, then returns a canonical commit or abort. Mandatory voters must allow, conflicting repeats abort, and `Decision::authorizes` verifies the exact intent before an effect runs. Voter identity is trusted only under a signed-principal or topology-isolated deployment profile. |
-| Swarm activity | A supervisor's replay-safe read model over governance evidence: `SwarmActivity::observe` deduplicates by decision id, `.agent(name)` reads one agent's counts and deterministic latest decision, and `.agents()` lists every folded agent busiest first. |
+| Swarm activity | A coordinator's replay-safe read model over governance evidence: `SwarmActivity::observe` deduplicates by decision id, `.agent(name)` reads one agent's counts and deterministic latest decision, and `.agents()` lists every folded agent busiest first. |
 | Crash context | A recovery tool's one-call bundle over an already-read journal tail, dead-letter capsule, and latest governance decision. `.summarize()` emits a bounded deterministic digest with control characters escaped, so untrusted payloads cannot forge diagnostic lines. It performs no I/O and never invokes a model. |
 | Edge bridges | A2A, MCP, and AG-UI mapped onto AGDX over the durable log, no SSE. ([interop](docs/interop.md)) |
 
@@ -322,7 +322,7 @@ Agent routing, contracts, fan-out, and workflows run as client-side state machin
 
 Capability negotiation runs during connection setup. A managed call against Apache Iggy without a managed backend returns `LaserError::Unsupported`. The underlying client remains available through `topic.iggy_producer()`, `topic.iggy_consumer(..)`, and `laser.client()`.
 
-Laser Stack runs the LaserData Apache Iggy fork with `laser-plane`. Apache Iggy owns the durable log and VSR connection. `laser-plane` maintains the managed read models and handles query, projection, schema, KV, fork, graph, and run operations.
+Laser Stack runs Laser Streams and the managed backend. Laser Streams owns the durable log and VSR connection. The managed backend maintains the managed read models and handles query, projection, schema, KV, fork, graph, and run operations.
 
 ### Authorization
 

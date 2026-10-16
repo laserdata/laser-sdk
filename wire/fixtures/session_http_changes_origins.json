@@ -1,0 +1,55 @@
+{
+  "rows": [
+    {
+      "seq": 4406,
+      "sessions": [
+        "00000000000000000000000002"
+      ],
+      "positions": [
+        [
+          0,
+          0,
+          0,
+          5,
+          0,
+          0,
+          0,
+          3,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          40
+        ]
+      ],
+      "truncated": false,
+      "origin": "links"
+    },
+    {
+      "seq": 4407,
+      "sessions": [
+        "00000000000000000000000002"
+      ],
+      "truncated": false,
+      "origin": "maintenance"
+    },
+    {
+      "seq": 4408,
+      "sessions": [
+        "00000000000000000000000002"
+      ],
+      "truncated": false,
+      "origin": "expiry"
+    }
+  ],
+  "floor": 4401,
+  "resync": false,
+  "series": 7654321098765432101
+}

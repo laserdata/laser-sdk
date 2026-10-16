@@ -42,7 +42,7 @@ pub struct Record {
     #[builder(into)]
     pub projection_ref: Option<String>,
     // Writer-schema id for a schema-first codec (Avro, Protobuf), stamped as
-    // `agdx.sid`. laser-plane resolves it against the schema registry. It does
+    // `agdx.sid`. The managed backend resolves it against the schema registry. It does
     // not select materialization routing, which uses `projection_ref`.
     pub schema_id: Option<u32>,
     /// Logical schema fingerprint required for an Arrow IPC record.

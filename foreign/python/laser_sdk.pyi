@@ -437,8 +437,8 @@ __all__ = [
     "result_code_code",
     "result_code_from_code",
     "result_code_http_status",
+    "result_code_is_backend_unavailable",
     "result_code_is_pending",
-    "result_code_is_plane_unavailable",
     "result_code_is_retryable",
     "resume_offsets",
     "schema_def_content_type",
@@ -462,9 +462,9 @@ __all__ = [
     "typed_value_validate_canonical",
     "unmet_requirements",
     "validate_agent_presence",
+    "validate_operator_actor_assertion",
     "validate_role_name",
     "validate_signature",
-    "validate_supervisor_actor_assertion",
     "verify_card",
     "verify_delegation",
     "verify_evidence_chain",
@@ -903,7 +903,7 @@ class AgdxStream:
 @typing.final
 class AgentActivity:
     r"""
-    One agent's folded activity, so a supervisor answers "what has this agent
+    One agent's folded activity, so a coordinator answers "what has this agent
     been doing" from evidence already read off the audit topic, without
     re-deriving counts by hand every time.
     """
@@ -1646,7 +1646,7 @@ class Budget:
 class Capabilities:
     r"""
     A read-only snapshot of the connected deployment's capabilities.
-    Managed features depend on advertised backend support. The server can provide consumer-group reads without a plane.
+    Managed features depend on advertised backend support. The server can provide consumer-group reads without a managed backend.
     """
     OPEN: Capabilities
     r"""
@@ -1655,7 +1655,7 @@ class Capabilities:
     @property
     def managed(self) -> builtins.bool:
         r"""
-        Connected to a managed plane (the root managed switch).
+        Connected to a managed backend (the root managed switch).
         """
     @property
     def query(self) -> QueryCaps:
@@ -2078,7 +2078,7 @@ class CompiledSchema:
     def decode(self, payload: typing.Any) -> typing.Any:
         r"""
         Decode `payload` under this schema into a Python value, the model the
-        managed plane extracts indexed fields from. Raises `CodecError` when the
+        managed backend extracts indexed fields from. Raises `CodecError` when the
         payload does not decode.
         """
 
@@ -2866,7 +2866,7 @@ class DestinationCaps:
 
 @typing.final
 class Destinations:
-    def mutate(self, expected_global_state_revision: builtins.int, mutation: typing.Any, *, supervisor_assertion: typing.Optional[typing.Any] = None) -> typing.Any:
+    def mutate(self, expected_global_state_revision: builtins.int, mutation: typing.Any, *, operator_assertion: typing.Optional[typing.Any] = None) -> typing.Any:
         r"""
         Submit one bounded public checkpoint mutation dict.
         """
@@ -2889,9 +2889,9 @@ class Destinations:
     def record_block(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, block: typing.Any) -> typing.Any: ...
     def clear_block(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, expected_code: typing.Any) -> typing.Any: ...
     def record_retention_gap(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, gap: typing.Any) -> typing.Any: ...
-    def accept_retention_gap(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, next_offset: builtins.int, supervisor_assertion: typing.Any) -> typing.Any: ...
-    def supersede_generation(self, expected_global_state_revision: builtins.int, expected_definition_revision: builtins.int, replacement: typing.Any, supervisor_assertion: typing.Any) -> typing.Any: ...
-    def record_repair(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, repair: typing.Any, supervisor_assertion: typing.Any) -> typing.Any: ...
+    def accept_retention_gap(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, next_offset: builtins.int, operator_assertion: typing.Any) -> typing.Any: ...
+    def supersede_generation(self, expected_global_state_revision: builtins.int, expected_definition_revision: builtins.int, replacement: typing.Any, operator_assertion: typing.Any) -> typing.Any: ...
+    def record_repair(self, expected_global_state_revision: builtins.int, destination_id: builtins.str, destination_generation: builtins.int, expected_checkpoint_revision: builtins.int, repair: typing.Any, operator_assertion: typing.Any) -> typing.Any: ...
     def get(self, destination_id: builtins.str, *, consistency: builtins.str) -> typing.Any:
         r"""
         Read one destination declaration and checkpoint status.
@@ -3082,7 +3082,7 @@ class FilterCaps:
     def native(self) -> builtins.bool:
         r"""
         Filtered reads, previews, sample tests, and validation, served by the
-        streaming server without a managed plane.
+        streaming server without a managed backend.
         """
     @property
     def catalog(self) -> builtins.bool:
@@ -3619,7 +3619,7 @@ class GraphHandle:
 class GroupFilter:
     r"""
     A consumer group's filter policy. Build it with `ConsumerGroup.filter`.
-    Every verb needs a managed plane that serves the filter catalog. Catalog
+    Every verb needs a managed backend that serves the filter catalog. Catalog
     replies are dicts in the wire shape.
     """
     def configure(self, filter: ConsumerFilter) -> typing.Any:
@@ -4619,8 +4619,8 @@ class Laser:
     def capabilities(self) -> typing.Any:
         r"""
         The capability set this client negotiated with the connected infrastructure.
-        A set without a managed plane is probed again when it is at least one second
-        old, so a plane that was not ready at connect is picked up.
+        A set without a managed backend is probed again when it is at least one second
+        old, so a backend that was not ready at connect is picked up.
         """
     def refresh_capabilities(self) -> typing.Any:
         r"""
@@ -4887,7 +4887,7 @@ class Laser:
         r"""
         Advertise this connection's live presence (a dict mirroring
         `AgentPresence`: `v`, `agent`, `inbox`, ...), so a registry can route
-        work to its inbox. Served by the LaserData Iggy fork.
+        work to its inbox. Served by Laser Streams.
         """
     def clear_presence(self) -> typing.Any:
         r"""
@@ -6011,8 +6011,8 @@ class ProjectionBindingBuilder:
         """
     def skip_rejected(self) -> ProjectionBindingBuilder:
         r"""
-        Let the plane skip a record it proved the destination or the extraction
-        rejects, instead of holding the partition. Every skip is an ordered
+        Let the managed backend skip a record it proved the destination or the
+        extraction rejects, instead of holding the partition. Every skip is an ordered
         control record, and the skipped record goes to the dead-letter topic.
         """
     def build(self) -> typing.Any:
@@ -8593,7 +8593,7 @@ class Workflow:
         `after`
         declares the dependencies that order the step. `verify(output) -> bool`
         gates completion. `exclusive` claims a fenced lease (needs the managed
-        plane). `fence_namespace` also makes the step exclusive and aligns the
+        backend). `fence_namespace` also makes the step exclusive and aligns the
         lease with a handler's fenced KV effect. `on_timeout` is `"fail"`
         (default) or `"reassign"` (re-acquire the
         lease, bumping the fence, and hand the task to a fresh holder. Needs an
@@ -9144,11 +9144,11 @@ def mint_ulid() -> builtins.str:
     (correlation, record, channel, execution, and destination ids).
     """
 
-def new_checkpoint_request_envelope(request_id: builtins.str, expected_global_state_revision: builtins.int, mutation: typing.Any, *, supervisor_assertion: typing.Optional[typing.Any] = None) -> typing.Any:
+def new_checkpoint_request_envelope(request_id: builtins.str, expected_global_state_revision: builtins.int, mutation: typing.Any, *, operator_assertion: typing.Optional[typing.Any] = None) -> typing.Any:
     r"""
     Build the checkpoint request envelope dict `Laser.execute_checkpoint` takes,
-    stamped with the checkpoint op version. `supervisor_assertion` attaches the
-    signed supervisor actor a privileged mutation requires.
+    stamped with the checkpoint op version. `operator_assertion` attaches the
+    signed operator actor a privileged mutation requires.
     """
 
 def new_conversation_id() -> builtins.str: ...
@@ -9232,16 +9232,16 @@ def result_code_http_status(code: builtins.str) -> builtins.int:
     The HTTP status a result code name maps onto.
     """
 
+def result_code_is_backend_unavailable(code: builtins.str) -> builtins.bool:
+    r"""
+    Whether this result code name means the node's own managed backend did not answer.
+    The request may still apply, so only the same operation identity repeats it.
+    """
+
 def result_code_is_pending(code: builtins.str) -> builtins.bool:
     r"""
     Whether a mutation with this result code name was accepted with an
     outcome that is still unknown. Only the same operation identity may repeat it.
-    """
-
-def result_code_is_plane_unavailable(code: builtins.str) -> builtins.bool:
-    r"""
-    Whether this result code name means the node's own plane did not answer.
-    The request may still apply, so only the same operation identity repeats it.
     """
 
 def result_code_is_retryable(code: builtins.str) -> builtins.bool:
@@ -9378,6 +9378,13 @@ def validate_agent_presence(presence: typing.Any) -> None:
     violation.
     """
 
+def validate_operator_actor_assertion(assertion: typing.Any) -> None:
+    r"""
+    Check an operator actor assertion dict before sending it: version,
+    nonzero identities, a validity window within the maximum lifetime, and
+    the key id and signature lengths. Raises `InvalidError` on a violation.
+    """
+
 def validate_role_name(name: builtins.str) -> None:
     r"""
     Check a role name against the rule every tier enforces: non-empty, at most
@@ -9389,13 +9396,6 @@ def validate_signature(signature: typing.Any) -> None:
     r"""
     Check a `signature` dict against its scheme's registered lengths. Unknown
     scheme codes pass. Raises `ValidateError` on a violation.
-    """
-
-def validate_supervisor_actor_assertion(assertion: typing.Any) -> None:
-    r"""
-    Check a supervisor actor assertion dict before sending it: version,
-    nonzero identities, a validity window within the maximum lifetime, and
-    the key id and signature lengths. Raises `InvalidError` on a violation.
     """
 
 def verify_card(card: typing.Any, signature: typing.Any, verifying: typing.Sequence[builtins.int]) -> None:

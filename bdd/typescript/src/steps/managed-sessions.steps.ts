@@ -990,6 +990,17 @@ Then(
 );
 
 Then(
+  "the session list of the stream is not rebuilding",
+  async function (this: LaserWorld) {
+    const sessions = sessionsOf(this);
+    await eventually("a session list that is not rebuilding", async () => {
+      const page = await sessions.list().fetch();
+      return page.rebuilding ? undefined : page;
+    });
+  },
+);
+
+Then(
   /^the indexed events of the session are (".+")$/,
   async function (this: LaserWorld, list: string) {
     const expected = list.split(", ").map((name) => name.replace(/^"|"$/g, ""));

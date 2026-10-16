@@ -32,8 +32,8 @@ pub const AGDX_HELLO_CODE: u32 = AGDX_COMMAND_BASE;
 pub const AGDX_BACKEND_HELLO_CODE: u32 = AGDX_COMMAND_BASE + 1;
 /// Fork-native command code: set this connection's advertised metadata (the
 /// transport-level discovery primitive). Handled by the streaming server itself,
-/// not forwarded to the plane, because it touches per-connection session state the
-/// plane never sees. Connection-scoped and cleared on disconnect.
+/// not forwarded to the managed backend, because it touches per-connection session state the
+/// backend never sees. Connection-scoped and cleared on disconnect.
 pub const AGDX_SET_CLIENT_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 2;
 /// Fork-native command code: list every connection with its advertised metadata.
 /// The discovery read, answered by the streaming server from its connection table.
@@ -51,7 +51,7 @@ pub const AGDX_GET_CLIENTS_METADATA_CODE: u32 = AGDX_COMMAND_BASE + 3;
 /// decoded client-side as the typed unsupported, so no capability bit is
 /// needed.
 pub const AGDX_BATCH_CODE: u32 = AGDX_COMMAND_BASE + 20;
-/// Managed command code: submit one public checkpoint mutation to Plane.
+/// Managed command code: submit one public checkpoint mutation to the managed backend.
 pub const AGDX_CHECKPOINT_CODE: u32 = AGDX_COMMAND_BASE + 21;
 /// Fork-native command code: read one destination and its checkpoint status.
 pub const AGDX_DESTINATION_GET_CODE: u32 = AGDX_COMMAND_BASE + 22;
@@ -83,9 +83,9 @@ pub const AGDX_AUTHZ_BIND_ROLES_CODE: u32 = AGDX_AUTHZ_BASE + 6;
 /// Managed command code: read the authorization change history (audit).
 pub const AGDX_AUTHZ_HISTORY_CODE: u32 = AGDX_AUTHZ_BASE + 7;
 /// Managed command code: publish one [`crate::control::ControlCommand`] through
-/// Plane. The reply is a [`crate::result::CommandError`] whose `Ok` code means
-/// Plane accepted the control-log append. Applying the command remains
-/// asynchronous.
+/// the managed backend. The reply is a [`crate::result::CommandError`] whose
+/// `Ok` code means the backend accepted the control-log append. Applying the
+/// command remains asynchronous.
 pub const AGDX_CONTROL_PUBLISH_CODE: u32 = AGDX_AUTHZ_BASE + 8;
 
 // Query family block (1_000_200..=1_000_299). Direct query ops reserve the
@@ -271,7 +271,7 @@ pub const AGDX_FILTER_OPERATION_CODE: u32 = AGDX_DELIVERY_BASE + 16;
 /// filtered read (a saved revision or a group binding). Never sent by a client.
 pub const AGDX_RESOLVE_FILTER_POLICY_CODE: u32 = AGDX_DELIVERY_BASE + 17;
 /// Internal command code: the streaming server waits for the next change of the
-/// filter catalog its plane replayed. A zero wait confirms cached policies
+/// filter catalog its managed backend replayed. A zero wait confirms cached policies
 /// before use. Never sent by a client.
 pub const AGDX_WATCH_FILTER_CATALOG_CODE: u32 = AGDX_DELIVERY_BASE + 18;
 
@@ -313,7 +313,7 @@ pub const CHANGE_OP_VERSION: u32 = 1;
 pub const CLIENT_METADATA_OP_VERSION: u32 = 1;
 /// Wire version of public checkpoint mutation requests and status replies.
 pub const CHECKPOINT_OP_VERSION: u32 = 1;
-/// Iggy-to-Plane destination HTTP carriage version.
+/// Server-to-backend destination HTTP carriage version.
 pub const DESTINATION_HTTP_OP_VERSION: u32 = 1;
 /// Wire version of the agent presence body ([`crate::agent::AgentPresence`]) an
 /// agent advertises in its connection metadata. Carried in the body's own `v`
@@ -349,10 +349,10 @@ pub const fn is_barrier_read(code: u32) -> bool {
     )
 }
 
-/// Whether a Plane-served managed command changes state and therefore must
+/// Whether a backend-served managed command changes state and therefore must
 /// carry a stable operation identity across transport retries. Iggy's custom
 /// authorization mutations use their established request `mutation_id`
-/// instead of this Plane envelope.
+/// instead of this managed envelope.
 pub const fn is_idempotent_managed_request(code: u32) -> bool {
     matches!(
         code,

@@ -1,7 +1,7 @@
 use crate::agent::wire_id;
 use crate::authz::{
-    Action, Feature, SUPERVISOR_ASSERTION_KEY_ID_BYTES, SupervisorActorAssertion,
-    SupervisorAssertionAction,
+    Action, Feature, OPERATOR_ASSERTION_KEY_ID_BYTES, OperatorActorAssertion,
+    OperatorAssertionAction,
 };
 use crate::destination::{
     BackendBinding, DestinationDesiredState, DestinationId, MaterializationDestination,
@@ -23,7 +23,7 @@ pub const MAX_REPAIR_DETAIL_BYTES: usize = 4_096;
 pub const MAX_CHECKPOINT_LEASE_DURATION_MICROS: u64 = 300_000_000;
 
 wire_id!(
-    /// Stable identity of one Plane process incarnation that may own a destination.
+    /// Stable identity of one managed backend process incarnation that may own a destination.
     CheckpointOwnerId
 );
 
@@ -598,7 +598,7 @@ pub struct CheckpointRequestEnvelope {
     pub expected_global_state_revision: u64,
     pub mutation: PublicCheckpointMutation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_assertion: Option<SupervisorActorAssertion>,
+    pub operator_assertion: Option<OperatorActorAssertion>,
 }
 
 impl CheckpointRequestEnvelope {
@@ -612,13 +612,13 @@ impl CheckpointRequestEnvelope {
             request_id,
             expected_global_state_revision,
             mutation,
-            supervisor_assertion: None,
+            operator_assertion: None,
         }
     }
 
     #[must_use]
-    pub fn with_supervisor_assertion(mut self, assertion: SupervisorActorAssertion) -> Self {
-        self.supervisor_assertion = Some(assertion);
+    pub fn with_operator_assertion(mut self, assertion: OperatorActorAssertion) -> Self {
+        self.operator_assertion = Some(assertion);
         self
     }
 }
@@ -636,7 +636,7 @@ impl Validate for CheckpointRequestEnvelope {
             return Err(InvalidError::new("checkpoint request id must be nonzero"));
         }
         self.mutation.validate()?;
-        validate_supervisor_assertion(self)
+        validate_operator_assertion(self)
     }
 }
 
@@ -1015,15 +1015,15 @@ pub struct CheckpointMutationStamp {
     pub committed_at_micros: u64,
     pub iggy_actor_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_actor: Option<VerifiedSupervisorActor>,
+    pub operator_actor: Option<VerifiedOperatorActor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifiedSupervisorActor {
+pub struct VerifiedOperatorActor {
     pub request_id: CheckpointRequestId,
     pub deployment_id: u32,
     pub cloud_user_id: u32,
-    pub action: SupervisorAssertionAction,
+    pub action: OperatorAssertionAction,
     pub destination_id: DestinationId,
     pub destination_generation: u64,
     pub expected_revision: u64,
@@ -1039,7 +1039,7 @@ impl Validate for CheckpointMutationStamp {
                 "checkpoint committed timestamp must be nonzero",
             ));
         }
-        if let Some(actor) = &self.supervisor_actor
+        if let Some(actor) = &self.operator_actor
             && (actor.request_id.as_u128() == 0
                 || actor.deployment_id == 0
                 || actor.cloud_user_id == 0
@@ -1047,10 +1047,10 @@ impl Validate for CheckpointMutationStamp {
                 || actor.destination_generation == 0
                 || actor.expected_revision == 0
                 || actor.issued_at_micros == 0
-                || actor.key_id.len() != SUPERVISOR_ASSERTION_KEY_ID_BYTES)
+                || actor.key_id.len() != OPERATOR_ASSERTION_KEY_ID_BYTES)
         {
             return Err(InvalidError::new(
-                "verified supervisor actor evidence is invalid",
+                "verified operator actor evidence is invalid",
             ));
         }
         Ok(())
@@ -1748,7 +1748,7 @@ fn validate_optional_filter(label: &str, value: Option<&str>) -> Result<(), Inva
     Ok(())
 }
 
-fn validate_supervisor_assertion(envelope: &CheckpointRequestEnvelope) -> Result<(), InvalidError> {
+fn validate_operator_assertion(envelope: &CheckpointRequestEnvelope) -> Result<(), InvalidError> {
     let required = match &envelope.mutation {
         PublicCheckpointMutation::AcceptRetentionGap {
             destination_id,
@@ -1756,7 +1756,7 @@ fn validate_supervisor_assertion(envelope: &CheckpointRequestEnvelope) -> Result
             expected_checkpoint_revision,
             ..
         } => Some((
-            SupervisorAssertionAction::AcceptRetentionGap,
+            OperatorAssertionAction::AcceptRetentionGap,
             *destination_id,
             *destination_generation,
             *expected_checkpoint_revision,
@@ -1765,7 +1765,7 @@ fn validate_supervisor_assertion(envelope: &CheckpointRequestEnvelope) -> Result
             expected_definition_revision,
             replacement,
         } => Some((
-            SupervisorAssertionAction::SupersedeGeneration,
+            OperatorAssertionAction::SupersedeGeneration,
             replacement.id,
             replacement.generation,
             *expected_definition_revision,
@@ -1776,20 +1776,20 @@ fn validate_supervisor_assertion(envelope: &CheckpointRequestEnvelope) -> Result
             expected_checkpoint_revision,
             ..
         } => Some((
-            SupervisorAssertionAction::RecordRepair,
+            OperatorAssertionAction::RecordRepair,
             *destination_id,
             *destination_generation,
             *expected_checkpoint_revision,
         )),
         _ => None,
     };
-    match (required, &envelope.supervisor_assertion) {
+    match (required, &envelope.operator_assertion) {
         (None, None) => Ok(()),
         (None, Some(_)) => Err(InvalidError::new(
-            "supervisor assertion is not accepted for this checkpoint mutation",
+            "operator assertion is not accepted for this checkpoint mutation",
         )),
         (Some(_), None) => Err(InvalidError::new(
-            "high-risk checkpoint mutation requires a supervisor assertion",
+            "high-risk checkpoint mutation requires a operator assertion",
         )),
         (
             Some((action, destination_id, destination_generation, expected_revision)),
@@ -1803,7 +1803,7 @@ fn validate_supervisor_assertion(envelope: &CheckpointRequestEnvelope) -> Result
                 || assertion.claims.expected_revision != Some(expected_revision)
             {
                 return Err(InvalidError::new(
-                    "supervisor assertion is not bound to this request, action, and destination",
+                    "operator assertion is not bound to this request, action, and destination",
                 ));
             }
             Ok(())
@@ -2086,7 +2086,7 @@ mod tests {
             stamp: CheckpointMutationStamp {
                 committed_at_micros: 22,
                 iggy_actor_id: 23,
-                supervisor_actor: None,
+                operator_actor: None,
             },
             mutation: ReplicatedCheckpointMutationBody::RegisterDestination {
                 destination: destination(),
@@ -2130,7 +2130,7 @@ mod tests {
         let stamp = CheckpointMutationStamp {
             committed_at_micros: 1,
             iggy_actor_id: 0,
-            supervisor_actor: None,
+            operator_actor: None,
         };
 
         stamp

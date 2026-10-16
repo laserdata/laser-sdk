@@ -7,7 +7,7 @@ async fn binding_from(world: &mut LaserWorld, stream: String, topic: String) {
     world.binding_builder = Some(ProjectionBinding::builder().source(stream, topic));
 }
 
-#[when("the binding lets the plane skip rejected records")]
+#[when("the binding lets the backend skip rejected records")]
 async fn skip_rejected(world: &mut LaserWorld) {
     let builder = world.binding_builder.take().expect("a binding builder");
     world.binding_builder = Some(builder.skip_rejected());

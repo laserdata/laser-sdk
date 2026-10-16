@@ -15,7 +15,7 @@ This example runs an incident desk for a host fleet whose agents coordinate thro
 5. Record the diagnosis as a note for later incidents.
 6. Rebuild the incident with `ConversationState::load` from its conversation records.
 
-Queries, KV, approvals, and forks require Laser Stack or LaserData Cloud. Without `laser-plane`, the example explains the requirement and exits before creating the desk. The `memory` example also demonstrates local `VectorMemory` independently.
+Queries, KV, approvals, and forks require Laser Stack or LaserData Cloud. Without a managed backend, the example explains the requirement and exits before creating the desk. The `memory` example also demonstrates local `VectorMemory` independently.
 
 ## Run it
 

@@ -1023,6 +1023,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SessionPage.total` | dict key | `SessionPage.total` | serde-dict, keywords |
 | `SessionPage.searched` | dict key | `SessionPage.searched` | serde-dict, keywords |
 | `SessionPage.truncated` | dict key | `SessionPage.truncated` | serde-dict, keywords |
+| `SessionPage.rebuilding` | dict key | `SessionPage.rebuilding` | serde-dict, keywords |
 | `SessionParking` | dict via `ParkedRecords.records` | `wire.SessionParking` | serde-dict |
 | `SessionParking.source` | dict key | `wire.SessionParking.source` | serde-dict, keywords |
 | `SessionParking.role` | dict key | `wire.SessionParking.role` | serde-dict, keywords |
@@ -1552,7 +1553,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Destinations::get` | `Destinations.get` | `Destinations.get` |  |
 | `Destinations::list` | `Destinations.list` | `Destinations.list` |  |
 | `Destinations::mutate` | `Destinations.mutate` | `Destinations.mutate` |  |
-| `Destinations::mutate_with_supervisor_assertion` | `Destinations.mutate(supervisor_assertion=)` | `Destinations.mutateWithSupervisorAssertion` | overload |
+| `Destinations::mutate_with_operator_assertion` | `Destinations.mutate(operator_assertion=)` | `Destinations.mutateWithOperatorAssertion` | overload |
 | `Destinations::observe_partition_lifecycle` | `Destinations.observe_partition_lifecycle` | `Destinations.observePartitionLifecycle` |  |
 | `Destinations::prepare` | `Destinations.prepare` | `Destinations.prepare` |  |
 | `Destinations::query_routes` | `Destinations.query_routes` | `Destinations.queryRoutes` |  |
@@ -2885,9 +2886,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `CheckpointRequestEnvelope.request_id` | dict key | `CheckpointRequestEnvelope.requestId` | serde-dict, keywords |
 | `CheckpointRequestEnvelope.expected_global_state_revision` | dict key | `CheckpointRequestEnvelope.expectedGlobalStateRevision` | serde-dict, keywords |
 | `CheckpointRequestEnvelope.mutation` | dict key | `CheckpointRequestEnvelope.mutation` | serde-dict, keywords |
-| `CheckpointRequestEnvelope.supervisor_assertion` | dict key | `CheckpointRequestEnvelope.supervisorAssertion` | serde-dict, keywords |
+| `CheckpointRequestEnvelope.operator_assertion` | dict key | `CheckpointRequestEnvelope.operatorAssertion` | serde-dict, keywords |
 | `CheckpointRequestEnvelope::new` | `fn:new_checkpoint_request_envelope` | `CheckpointRequestEnvelope` | free-function, keywords |
-| `CheckpointRequestEnvelope::with_supervisor_assertion` | `fn:new_checkpoint_request_envelope(supervisor_assertion=)` | `CheckpointRequestEnvelope.supervisorAssertion` | keywords |
+| `CheckpointRequestEnvelope::with_operator_assertion` | `fn:new_checkpoint_request_envelope(operator_assertion=)` | `CheckpointRequestEnvelope.operatorAssertion` | keywords |
 | `CheckpointRequestId` | omitted | `wire.CheckpointRequestId` | plain-value |
 | `CheckpointRequestId::as_u128` | omitted | `wire.CheckpointRequestId.asU128` | plain-value |
 | `CheckpointRequestId::from_bytes` | omitted | `wire.CheckpointRequestId.fromBytes` | plain-value |
@@ -3163,6 +3164,26 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `NodeId::from_bytes` | omitted | `NodeId.fromBytes` | plain-value |
 | `NodeId::from_u128` | omitted | `NodeId.fromU128` | plain-value |
 | `NodeId::to_bytes` | omitted | `NodeId.toBytes` | plain-value |
+| `OperatorActorAssertion` | dict via `Destinations.mutate` | `wire.OperatorActorAssertion` | serde-dict |
+| `OperatorActorAssertion.claims` | dict key | `wire.OperatorActorAssertion.claims` | serde-dict, keywords |
+| `OperatorActorAssertion.key_id` | dict key | `wire.OperatorActorAssertion.keyId` | serde-dict, keywords |
+| `OperatorActorAssertion.signature` | dict key | `wire.OperatorActorAssertion.signature` | serde-dict, keywords |
+| `OperatorActorAssertion::validate` | `fn:validate_operator_actor_assertion` | `fn:validateOperatorAssertion` | free-function |
+| `OperatorActorClaims` | dict via `Destinations.mutate` | `wire.OperatorActorClaims` | serde-dict |
+| `OperatorActorClaims.v` | dict key | `wire.OperatorActorClaims.v` | serde-dict, keywords |
+| `OperatorActorClaims.request_id` | dict key | `wire.OperatorActorClaims.requestId` | serde-dict, keywords |
+| `OperatorActorClaims.deployment_id` | dict key | `wire.OperatorActorClaims.deploymentId` | serde-dict, keywords |
+| `OperatorActorClaims.cloud_user_id` | dict key | `wire.OperatorActorClaims.cloudUserId` | serde-dict, keywords |
+| `OperatorActorClaims.action` | dict key | `wire.OperatorActorClaims.action` | serde-dict, keywords |
+| `OperatorActorClaims.destination_id` | dict key | `wire.OperatorActorClaims.destinationId` | serde-dict, keywords |
+| `OperatorActorClaims.destination_generation` | dict key | `wire.OperatorActorClaims.destinationGeneration` | serde-dict, keywords |
+| `OperatorActorClaims.expected_revision` | dict key | `wire.OperatorActorClaims.expectedRevision` | serde-dict, keywords |
+| `OperatorActorClaims.issued_at_micros` | dict key | `wire.OperatorActorClaims.issuedAtMicros` | serde-dict, keywords |
+| `OperatorActorClaims.expires_at_micros` | dict key | `wire.OperatorActorClaims.expiresAtMicros` | serde-dict, keywords |
+| `OperatorAssertionAction` | omitted | `wire.OperatorAssertionAction` | plain-value |
+| `OperatorAssertionAction::AcceptRetentionGap` | omitted | `wire.OperatorAssertionAction` | plain-value |
+| `OperatorAssertionAction::SupersedeGeneration` | omitted | `wire.OperatorAssertionAction` | plain-value |
+| `OperatorAssertionAction::RecordRepair` | omitted | `wire.OperatorAssertionAction` | plain-value |
 | `PartitionCheckpoint` | dict via `Destinations.get` | `wire.PartitionCheckpoint` | serde-dict |
 | `PartitionCheckpoint.incarnation` | dict key | `wire.PartitionCheckpoint.incarnation` | serde-dict, keywords |
 | `PartitionCheckpoint.started_at_offset` | dict key | `wire.PartitionCheckpoint.startedAtOffset` | serde-dict, keywords |
@@ -3327,26 +3348,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `StartPolicy::Beginning` | dict key | `wire.StartPolicy` | serde-dict, plain-value |
 | `StartPolicy::CapturedLatest` | dict key | `wire.StartPolicy` | serde-dict, plain-value |
 | `StartPolicy::Explicit` | dict key | `wire.StartPolicy` | serde-dict, plain-value |
-| `SupervisorActorAssertion` | dict via `Destinations.mutate` | `wire.SupervisorActorAssertion` | serde-dict |
-| `SupervisorActorAssertion.claims` | dict key | `wire.SupervisorActorAssertion.claims` | serde-dict, keywords |
-| `SupervisorActorAssertion.key_id` | dict key | `wire.SupervisorActorAssertion.keyId` | serde-dict, keywords |
-| `SupervisorActorAssertion.signature` | dict key | `wire.SupervisorActorAssertion.signature` | serde-dict, keywords |
-| `SupervisorActorAssertion::validate` | `fn:validate_supervisor_actor_assertion` | `fn:validateSupervisorAssertion` | free-function |
-| `SupervisorActorClaims` | dict via `Destinations.mutate` | `wire.SupervisorActorClaims` | serde-dict |
-| `SupervisorActorClaims.v` | dict key | `wire.SupervisorActorClaims.v` | serde-dict, keywords |
-| `SupervisorActorClaims.request_id` | dict key | `wire.SupervisorActorClaims.requestId` | serde-dict, keywords |
-| `SupervisorActorClaims.deployment_id` | dict key | `wire.SupervisorActorClaims.deploymentId` | serde-dict, keywords |
-| `SupervisorActorClaims.cloud_user_id` | dict key | `wire.SupervisorActorClaims.cloudUserId` | serde-dict, keywords |
-| `SupervisorActorClaims.action` | dict key | `wire.SupervisorActorClaims.action` | serde-dict, keywords |
-| `SupervisorActorClaims.destination_id` | dict key | `wire.SupervisorActorClaims.destinationId` | serde-dict, keywords |
-| `SupervisorActorClaims.destination_generation` | dict key | `wire.SupervisorActorClaims.destinationGeneration` | serde-dict, keywords |
-| `SupervisorActorClaims.expected_revision` | dict key | `wire.SupervisorActorClaims.expectedRevision` | serde-dict, keywords |
-| `SupervisorActorClaims.issued_at_micros` | dict key | `wire.SupervisorActorClaims.issuedAtMicros` | serde-dict, keywords |
-| `SupervisorActorClaims.expires_at_micros` | dict key | `wire.SupervisorActorClaims.expiresAtMicros` | serde-dict, keywords |
-| `SupervisorAssertionAction` | omitted | `wire.SupervisorAssertionAction` | plain-value |
-| `SupervisorAssertionAction::AcceptRetentionGap` | omitted | `wire.SupervisorAssertionAction` | plain-value |
-| `SupervisorAssertionAction::SupersedeGeneration` | omitted | `wire.SupervisorAssertionAction` | plain-value |
-| `SupervisorAssertionAction::RecordRepair` | omitted | `wire.SupervisorAssertionAction` | plain-value |
 | `TableFormat` | omitted | `wire.TableFormat` | plain-value |
 | `TableFormat::IcebergV2` | omitted | `wire.TableFormat` | plain-value |
 | `UuidValue` | omitted | `UuidValue` | plain-value |
@@ -3926,13 +3927,13 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `ResultCode::StaleGeneration` | omitted | `ResultCode` | plain-value |
 | `ResultCode::TargetUnavailable` | omitted | `ResultCode` | plain-value |
 | `ResultCode::Pending` | omitted | `ResultCode` | plain-value |
-| `ResultCode::PlaneUnavailable` | omitted | `ResultCode` | plain-value |
+| `ResultCode::BackendUnavailable` | omitted | `ResultCode` | plain-value |
 | `ResultCode::Unrecognized` | omitted | `ResultCode` | plain-value |
 | `ResultCode::code` | `fn:result_code_code` | `fn:code` | free-function |
 | `ResultCode::from_code` | `fn:result_code_from_code` | `fn:resultCodeFromCode` | free-function |
 | `ResultCode::http_status` | `fn:result_code_http_status` | `fn:resultCodeHttpStatus` | free-function |
+| `ResultCode::is_backend_unavailable` | `fn:result_code_is_backend_unavailable` | `fn:resultCodeIsBackendUnavailable` | free-function |
 | `ResultCode::is_pending` | `fn:result_code_is_pending` | `fn:resultCodeIsPending` | free-function |
-| `ResultCode::is_plane_unavailable` | `fn:result_code_is_plane_unavailable` | `fn:resultCodeIsPlaneUnavailable` | free-function |
 | `ResultCode::is_retryable` | `fn:result_code_is_retryable` | `fn:isRetryable` | free-function |
 | `RetentionPolicy` | dict via `Bindings.apply` | `RetentionPolicy` | serde-dict |
 | `RetentionPolicy::MirrorLog` | dict key | `RetentionPolicy` | serde-dict, plain-value |

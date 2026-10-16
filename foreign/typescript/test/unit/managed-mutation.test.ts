@@ -30,7 +30,7 @@ import {
   resultCodeFromCode,
   resultCodeHttpStatus,
   resultCodeIsPending,
-  resultCodeIsPlaneUnavailable
+  resultCodeIsBackendUnavailable
 } from "../../src/wire/result.js"
 
 const PENDING = encodeNamed(
@@ -41,8 +41,8 @@ const PENDING = encodeNamed(
 )
 const UNAVAILABLE = encodeNamed(
   new Map<string, unknown>([
-    ["code", "plane_unavailable"],
-    ["message", "the managed plane on this node is unavailable, the request may still apply"]
+    ["code", "backend_unavailable"],
+    ["message", "the managed backend on this node is unavailable, the request may still apply"]
   ])
 )
 const CONFLICT = encodeNamed(
@@ -71,9 +71,9 @@ void test("given_a_pending_code_when_classified_then_should_match_the_shared_dic
   assert.equal(resultCodeHttpStatus(pending), 503)
   assert.equal(resultCodeIsPending(pending), true)
   assert.equal(resultCodeIsPending(resultCodeFromCode(12)), false)
-  assert.deepEqual(resultCodeFromCode(20), { kind: "known", name: "PlaneUnavailable" })
-  assert.equal(resultCodeIsPlaneUnavailable(resultCodeFromCode(20)), true)
-  assert.equal(resultCodeIsPlaneUnavailable(resultCodeFromCode(12)), false)
+  assert.deepEqual(resultCodeFromCode(20), { kind: "known", name: "BackendUnavailable" })
+  assert.equal(resultCodeIsBackendUnavailable(resultCodeFromCode(20)), true)
+  assert.equal(resultCodeIsBackendUnavailable(resultCodeFromCode(12)), false)
   assert.deepEqual(resultCodeFromCode(21), { kind: "unrecognized", code: 21 })
 })
 
@@ -102,7 +102,7 @@ void test("given_a_mutation_that_stays_pending_when_the_deadline_passes_then_sho
   for (const request of requests) assert.deepEqual(request, requests[0])
 })
 
-void test("given_an_unavailable_plane_when_a_mutation_is_sent_then_should_repeat_the_same_identity", async () => {
+void test("given_an_unavailable_backend_when_a_mutation_is_sent_then_should_repeat_the_same_identity", async () => {
   const requests: Uint8Array[] = []
   const transport = await ApacheIggyTransport.fromClient(
     fakeClient([UNAVAILABLE, APPLIED], requests)
@@ -144,7 +144,7 @@ void test("given_a_failed_shared_connection_when_choosing_nodes_then_should_skip
   )
 })
 
-void test("given_a_leader_whose_plane_is_down_when_a_mutation_is_sent_then_should_move_it_with_the_same_identity", async () => {
+void test("given_a_leader_whose_backend_is_down_when_a_mutation_is_sent_then_should_move_it_with_the_same_identity", async () => {
   const shared: Uint8Array[] = []
   const moved: Uint8Array[] = []
   const client = Object.assign(fakeClient([UNAVAILABLE], shared), {

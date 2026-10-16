@@ -26,7 +26,7 @@ Start with the focused `log`, `query`, `watch`, `kv`, `cdc`, `graph`, `recall`, 
 - Python: [`python/README.md`](python/README.md): the Python ports, the same environment conventions, one runnable script per scenario.
 - TypeScript: [`typescript/README.md`](typescript/README.md): the native Node ports and package-level smoke tests.
 
-Examples run on Apache Iggy, Laser Stack, or LaserData Cloud with no code change. Laser Stack runs the complete managed examples locally. Against Apache Iggy without `laser-plane`, phases that need KV, query, forks, graph, or RBAC print the missing capability and exit cleanly. Managed state under a stream's scoped names, such as key-value entries and memory views, belongs to that stream, so a rerun on a recreated stream starts from empty state.
+Examples run on Apache Iggy, Laser Stack, or LaserData Cloud with no code change. Laser Stack runs the complete managed examples locally. Against Apache Iggy without a managed backend, phases that need KV, query, forks, graph, or RBAC print the missing capability and exit cleanly. Managed state under a stream's scoped names, such as key-value entries and memory views, belongs to that stream, so a rerun on a recreated stream starts from empty state.
 
 ## Sessions
 

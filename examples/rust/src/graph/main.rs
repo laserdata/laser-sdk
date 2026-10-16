@@ -2,7 +2,7 @@ use laser_examples::{fresh_run, init_tracing, laser, managed_feature_ready, phas
 use laser_sdk::prelude::full::*;
 
 // The Graph primitive: nodes and edges built from what your messages mention,
-// traversable and time-aware. Managed by laser-plane.
+// traversable and time-aware. Managed by the managed backend.
 const GRAPH: &str = "kg";
 const HOST: &str = "host:node-7";
 const RELATION: &str = "runs";

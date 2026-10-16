@@ -26,7 +26,7 @@ The maintained artifact versions are:
 | --- | --- |
 | Iggy server | `0.9.5-ld` |
 | `iggy-bench` | `0.6.0` |
-| plane | `0.23.0` |
+| managed backend | `0.23.0` |
 
 ## Default Campaign
 
@@ -37,11 +37,11 @@ The default campaign contains 37 scenarios when the optional PostgreSQL MCP cont
 | Iggy | Upstream VSR pinned producers, 10 GB total, 1 KiB records, batch size 100 |
 | Streaming | Matched raw Iggy and Laser publish acknowledgement, partition-consumer throughput, and consumer-group throughput |
 | AGDX | Parallel publish, request and reply, chunk streams, reliable partition lanes, fan-out, scatter, and context policies |
-| Managed | Parallel KV, batch operations, query, durable memory, forks, graph, plus projection visibility and a labeled direct-plane diagnostic |
+| Managed | Parallel KV, batch operations, query, durable memory, forks, graph, plus projection visibility and a labeled direct backend diagnostic |
 | Local memory | Deterministic `VectorMemory` remember and recall |
 | MCP | `McpBridge` and a minimal Streamable HTTP control |
 | Rust client | Connect, capability negotiation, topology setup, first publish, and warmed publish |
-| Recovery | SDK consumer resume, graceful Iggy restart, plane memory recovery, and plane projection recovery |
+| Recovery | SDK consumer resume, graceful Iggy restart, backend memory recovery, and backend projection recovery |
 
 Set `BENCH_MCP_POSTGRES_DSN` to add the durable PostgreSQL MCP control, recovery case, and triage comparison. Set `BENCH_MCP_POSTGRES_PID` when process accounting must include PostgreSQL.
 
@@ -109,9 +109,9 @@ Smoke results validate mechanics only. Default local results support development
 - Output directories are immutable.
 - One campaign may run from a checkout at a time.
 
-The test runner binary builds with `lto = true` and `codegen-units = 1`, matching the Iggy fork's release policy, and records that profile in the binary manifest. When a suite declares host CPU controls, the Tokio runtime is sized to the pinned client CPU set and the worker count is recorded in every report.
+The test runner binary builds with `lto = true` and `codegen-units = 1`, matching the Laser Streams release policy, and records that profile in the binary manifest. When a suite declares host CPU controls, the Tokio runtime is sized to the pinned client CPU set and the worker count is recorded in every report.
 
-Reports include aggregate throughput, the terminal's per-lane average, record and byte rates where applicable, supported latency percentiles, correctness outcomes, one-second workload series, process metrics, cgroup metrics, Iggy statistics, and plane metrics. A total throughput value already includes every configured producer or consumer lane and must not be multiplied again. HDR histograms are stored separately and referenced by SHA-256.
+Reports include aggregate throughput, the terminal's per-lane average, record and byte rates where applicable, supported latency percentiles, correctness outcomes, one-second workload series, process metrics, cgroup metrics, Iggy statistics, and backend metrics. A total throughput value already includes every configured producer or consumer lane and must not be multiplied again. HDR histograms are stored separately and referenced by SHA-256.
 
 ## Provisioning
 
@@ -123,7 +123,7 @@ mode = "artifact"
 cpu_target = "skylake"
 iggy_server_version = "0.9.5-ld"
 iggy_bench_version = "0.6.0"
-plane_version = "0.23.0"
+backend_version = "0.23.0"
 ```
 
 Path mode runs caller-provided native binaries and records their digests:
@@ -134,7 +134,7 @@ mode = "path"
 cpu_target = "skylake"
 iggy_server = "/absolute/path/to/iggy-server"
 iggy_bench = "/absolute/path/to/iggy-bench"
-plane = "/absolute/path/to/plane"
+backend = "/absolute/path/to/backend"
 ```
 
 Docker Compose is available for deployment checks. Compose results are labeled non-authoritative because container scheduling, networking, cgroups, and filesystems affect the measurement boundary.
@@ -146,7 +146,7 @@ An authoritative streaming campaign requires:
 - signed native artifacts for every required service
 - at least 10 paired repetitions and 120 seconds per arm
 - raw-Iggy A/A host-stability calibration
-- disjoint client, Iggy, and plane CPU sets
+- disjoint client, Iggy, and backend CPU sets
 - declared NUMA node, clocksource, governor, SMT, turbo, filesystem, and disk
 - accepted correctness, scheduler, telemetry, and statistical gates
 

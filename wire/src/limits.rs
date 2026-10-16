@@ -74,7 +74,7 @@ pub const MIN_LEASE_TTL_MICROS: u64 = 1_000_000;
 /// microseconds. A lease is a bounded-TTL lock whose whole purpose is that a
 /// dead holder's ownership expires; an unbounded request would let one crashed
 /// holder park a key for hours. The ceiling matches
-/// [`crate::authz::MAX_SUPERVISOR_ASSERTION_TTL_MICROS`]: the same "how long
+/// [`crate::authz::MAX_OPERATOR_ASSERTION_TTL_MICROS`]: the same "how long
 /// may one unattended grant outlive the process that asked for it" question.
 /// The store may still grant less (`granted_ttl_micros`), so this bounds the
 /// *request*, and a holder needing longer renews.

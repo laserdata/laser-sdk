@@ -1313,10 +1313,10 @@ function isStaleReply(reply: Uint8Array): boolean {
   }
 }
 
-function isPlaneUnavailableReply(reply: Uint8Array): boolean {
+function isBackendUnavailableReply(reply: Uint8Array): boolean {
   try {
     const value = decodeOne(reply, "CommandError")
-    return value instanceof Map && value.get("code") === "plane_unavailable"
+    return value instanceof Map && value.get("code") === "backend_unavailable"
   } catch {
     return false
   }
@@ -1329,12 +1329,14 @@ export function pendingReplyMessage(reply: Uint8Array): string | undefined {
   } catch {
     return undefined
   }
-  // Pending: accepted, outcome unknown. PlaneUnavailable: the node's own plane
-  // did not answer, and the request may still apply. Unavailable: the node was
-  // too busy to forward it. Each repeats the same identity.
+  // Pending: accepted, outcome unknown. BackendUnavailable: the node's own
+  // managed backend did not answer, and the request may still apply.
+  // Unavailable: the node was too busy to forward it. Each repeats the same
+  // identity.
   if (!(value instanceof Map)) return undefined
   const code: unknown = value.get("code")
-  if (code !== "pending" && code !== "plane_unavailable" && code !== "unavailable") return undefined
+  if (code !== "pending" && code !== "backend_unavailable" && code !== "unavailable")
+    return undefined
   const message: unknown = value.get("message")
   return typeof message === "string" ? message : code
 }
@@ -1345,7 +1347,7 @@ export class ApacheIggyTransport implements LaserTransport {
   private readonly reconnectLock = new Mutex()
   private readonly publishLane = new Mutex()
   private readonly disconnected = new WeakSet<SimpleClient>()
-  // The node managed requests use after the shared connection's plane failed.
+  // The node managed requests use after the shared connection's backend failed.
   private managedNode: ManagedNode | undefined
   private managedMove: Promise<void> | undefined
   // The operation versions the first hello on the shared connection announced.
@@ -1588,8 +1590,8 @@ export class ApacheIggyTransport implements LaserTransport {
       }
       if (code === AGDX_HELLO_CODE && node === undefined) this.rememberHello(reply)
       // A read is safe to send again, so it moves once to another node when
-      // this node's plane did not answer. The move armed the barrier.
-      if (isPlaneUnavailableReply(reply) && (await this.moveManaged(node?.name))) {
+      // this node's backend did not answer. The move armed the barrier.
+      if (isBackendUnavailableReply(reply) && (await this.moveManaged(node?.name))) {
         const retry = this.readFrame(code, payload, barrier !== 0)
         const movedNode = this.managedNode
         let moved: Uint8Array
@@ -1648,7 +1650,7 @@ export class ApacheIggyTransport implements LaserTransport {
         const pending = pendingReplyMessage(reply)
         if (pending === undefined) return reply
         unknown = pending
-        nodeFailed = isPlaneUnavailableReply(reply)
+        nodeFailed = isBackendUnavailableReply(reply)
       } catch (cause) {
         // A pinned node's connection has no reconnect, so any failure there
         // leaves the outcome unknown and moves the request.
@@ -1694,7 +1696,7 @@ export class ApacheIggyTransport implements LaserTransport {
     if (!isBarrierRead(code)) return read
     const surface = positionSurfaceOf(code)
     const minPosition = surface === undefined ? undefined : this.seenFrontier[surface]
-    // A session read: the plane keeps only the positions of the read's own
+    // A session read: the backend keeps only the positions of the read's own
     // stream.
     const minSessions = surface === undefined ? (this.seenFrontier.sessions ?? []) : []
     return encodeNamed(
@@ -1736,8 +1738,8 @@ export class ApacheIggyTransport implements LaserTransport {
   }
 
   /**
-   * Moves managed requests off `failed` to another roster node whose plane is
-   * ready and speaks the versions this transport negotiated, as Rust
+   * Moves managed requests off `failed` to another roster node whose backend
+   * is ready and speaks the versions this transport negotiated, as Rust
    * `ManagedRoute::repin`. Concurrent callers share one move. Returns whether
    * a node other than `failed` now serves managed requests.
    */

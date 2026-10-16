@@ -33,7 +33,7 @@ pub(crate) fn announce_stack(stack: &provision::ResolvedStack) {
         &stack.benchmark,
         &stack.iggy_server,
         &stack.iggy_bench,
-        &stack.plane,
+        &stack.backend,
     ]
     .into_iter()
     .flatten()
@@ -113,16 +113,16 @@ pub(crate) fn recovery_scenario(scenario: &laser_bench::manifest::Scenario) -> b
         && scenario
             .driver
             .parse::<RecoveryDriver>()
-            .is_ok_and(RecoveryDriver::requires_plane)
+            .is_ok_and(RecoveryDriver::requires_backend)
 }
 
-pub(crate) fn scenario_requires_plane(scenario: &laser_bench::manifest::Scenario) -> bool {
+pub(crate) fn scenario_requires_backend(scenario: &laser_bench::manifest::Scenario) -> bool {
     (scenario.layer == BenchmarkLayer::L4 && !local_memory_driver_supported(&scenario.driver))
         || scenario.name.starts_with("managed-")
         || scenario
             .driver
             .parse::<RecoveryDriver>()
-            .is_ok_and(RecoveryDriver::requires_plane)
+            .is_ok_and(RecoveryDriver::requires_backend)
 }
 
 pub(crate) async fn execute_scenario(
@@ -133,7 +133,7 @@ pub(crate) async fn execute_scenario(
 ) -> Result<(), BenchError> {
     let host_before = HostSnapshot::capture(output)?;
     if let Some(requirements) = manifest.environment.host.as_ref() {
-        requirements.validate(&host_before, scenario_requires_plane(scenario))?;
+        requirements.validate(&host_before, scenario_requires_backend(scenario))?;
         pin_process(std::process::id(), &requirements.client_cpus)?;
     }
     write_json(
@@ -142,7 +142,7 @@ pub(crate) async fn execute_scenario(
     )?;
     let benchmark_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let stack = resolve_stack(manifest, benchmark_root)?;
-    stack.verify(manifest.requires_plane())?;
+    stack.verify(manifest.requires_backend())?;
     write_json(
         &output.join("resolved-stack.json"),
         &serde_json::to_value(&stack)?,
@@ -205,23 +205,23 @@ pub(crate) async fn execute_native_run(
         .iggy_server
         .as_ref()
         .ok_or_else(|| BenchError::Invalid("native run requires iggy-server".to_owned()))?;
-    let plane_socket = if scenario_requires_plane(execution.scenario) {
-        Some(plane_socket_path(execution.output)?)
+    let backend_socket = if scenario_requires_backend(execution.scenario) {
+        Some(backend_socket_path(execution.output)?)
     } else {
         None
     };
     let server = NativeIggy::start(
         server_manifest,
         &services,
-        plane_socket.as_deref(),
+        backend_socket.as_deref(),
         &execution.manifest.environment,
     )
     .await?;
-    let plane = start_plane(execution, &services, &server, plane_socket).await?;
+    let backend = start_backend(execution, &services, &server, backend_socket).await?;
     Box::pin(execute_started_run(
         execution,
         server,
-        plane,
+        backend,
         Some(server_manifest),
     ))
     .await
@@ -246,7 +246,7 @@ pub(crate) async fn execute_compose_run(
         Ok(ManagedDriver::Uds)
     ) {
         return Err(BenchError::Invalid(
-            "Compose mode cannot expose plane's diagnostic Unix socket to the benchmark client"
+            "Compose mode cannot expose the backend's diagnostic Unix socket to the benchmark client"
                 .to_owned(),
         ));
     }
@@ -256,13 +256,13 @@ pub(crate) async fn execute_compose_run(
         .compose_file
         .as_deref()
         .ok_or_else(|| BenchError::Invalid("Compose mode requires compose_file".to_owned()))?;
-    let (compose, server, plane) = ComposeServices::start(
+    let (compose, server, backend) = ComposeServices::start(
         compose_file,
         services,
-        scenario_requires_plane(execution.scenario),
-        execution.manifest.environment.plane_profile,
+        scenario_requires_backend(execution.scenario),
+        execution.manifest.environment.backend_profile,
     )?;
-    let result = Box::pin(execute_started_run(execution, server, plane, None)).await;
+    let result = Box::pin(execute_started_run(execution, server, backend, None)).await;
     let shutdown = compose.shutdown();
     result.and_then(|result| shutdown.map(|()| result))
 }
@@ -270,12 +270,12 @@ pub(crate) async fn execute_compose_run(
 pub(crate) async fn execute_started_run(
     execution: DirectExecution<'_>,
     server: NativeIggy,
-    mut plane: Option<NativePlane>,
+    mut backend: Option<NativeBackend>,
     server_manifest: Option<&BinaryManifest>,
 ) -> Result<Option<DirectPairSummary>, BenchError> {
     let laser = server.probe_vsr().await?;
-    if let Some(plane) = plane.as_mut() {
-        plane.wait_ready(Duration::from_secs(30)).await?;
+    if let Some(backend) = backend.as_mut() {
+        backend.wait_ready(Duration::from_secs(30)).await?;
     }
     if matches!(
         execution.scenario.driver.parse::<RecoveryDriver>(),
@@ -284,20 +284,20 @@ pub(crate) async fn execute_started_run(
         let server_manifest = server_manifest.ok_or_else(|| {
             BenchError::Invalid("Iggy restart requires a harness-owned native binary".to_owned())
         })?;
-        return execute_iggy_restart_path(laser, server, plane, server_manifest, execution).await;
+        return execute_iggy_restart_path(laser, server, backend, server_manifest, execution).await;
     }
     if recovery_scenario(execution.scenario) {
-        let plane = plane
+        let backend = backend
             .take()
-            .ok_or_else(|| BenchError::Invalid("L7 scenario requires plane".to_owned()))?;
-        let result = execute_recovery(&laser, &server, plane, execution).await;
+            .ok_or_else(|| BenchError::Invalid("L7 scenario requires the backend".to_owned()))?;
+        let result = execute_recovery(&laser, &server, backend, execution).await;
         drop(laser);
         let server_shutdown = server.shutdown().await;
-        let (plane, telemetry, report) = result?;
-        let plane_shutdown = plane.shutdown().await;
+        let (backend, telemetry, report) = result?;
+        let backend_shutdown = backend.shutdown().await;
         write_json(&execution.output.join("telemetry.json"), &telemetry)?;
         write_validated_report(execution.output, report)?;
-        plane_shutdown?;
+        backend_shutdown?;
         server_shutdown?;
         return Ok(None);
     }
@@ -310,18 +310,18 @@ pub(crate) async fn execute_started_run(
                 .ok_or_else(|| BenchError::Invalid("Iggy PID unavailable".to_owned()))?,
         ),
     ];
-    if let Some(plane) = plane.as_ref() {
+    if let Some(backend) = backend.as_ref() {
         telemetry_processes.push((
-            "plane".to_owned(),
-            plane
+            "backend".to_owned(),
+            backend
                 .pid()
-                .ok_or_else(|| BenchError::Invalid("plane PID unavailable".to_owned()))?,
+                .ok_or_else(|| BenchError::Invalid("backend PID unavailable".to_owned()))?,
         ));
     }
     let telemetry = TelemetrySampler::start(
         &server.connection_string,
         telemetry_processes,
-        plane.as_ref().and_then(|plane| plane.health_address),
+        backend.as_ref().and_then(|backend| backend.health_address),
         Duration::from_secs(1),
         execution
             .manifest
@@ -331,11 +331,11 @@ pub(crate) async fn execute_started_run(
             .is_some_and(|host| host.perf_counters),
     )
     .await?;
-    let result = execute_layer(&laser, &server, plane.as_ref(), execution).await;
+    let result = execute_layer(&laser, &server, backend.as_ref(), execution).await;
     let telemetry_result = telemetry.stop().await;
     drop(laser);
-    let plane_shutdown = match plane {
-        Some(plane) => plane.shutdown().await,
+    let backend_shutdown = match backend {
+        Some(backend) => backend.shutdown().await,
         None => Ok(()),
     };
     let server_shutdown = server.shutdown().await;
@@ -345,12 +345,12 @@ pub(crate) async fn execute_started_run(
         &execution.output.join("telemetry.json"),
         &serde_json::to_value(telemetry)?,
     )?;
-    plane_shutdown?;
+    backend_shutdown?;
     server_shutdown?;
     Ok(result)
 }
 
-pub(crate) fn plane_socket_path(output: &Path) -> Result<PathBuf, BenchError> {
+pub(crate) fn backend_socket_path(output: &Path) -> Result<PathBuf, BenchError> {
     let mut hasher = DefaultHasher::new();
     output.hash(&mut hasher);
     let runtime = std::env::temp_dir().join(format!(
@@ -366,27 +366,26 @@ pub(crate) fn plane_socket_path(output: &Path) -> Result<PathBuf, BenchError> {
             path: runtime.clone(),
             source,
         })?;
-    Ok(runtime.join("plane.sock"))
+    Ok(runtime.join("backend.sock"))
 }
 
-pub(crate) async fn start_plane(
+pub(crate) async fn start_backend(
     execution: DirectExecution<'_>,
     services: &Path,
     server: &NativeIggy,
-    plane_socket: Option<PathBuf>,
-) -> Result<Option<NativePlane>, BenchError> {
-    if !scenario_requires_plane(execution.scenario) {
+    backend_socket: Option<PathBuf>,
+) -> Result<Option<NativeBackend>, BenchError> {
+    if !scenario_requires_backend(execution.scenario) {
         return Ok(None);
     }
-    let plane_manifest = execution
-        .stack
-        .plane
-        .as_ref()
-        .ok_or_else(|| BenchError::Invalid("managed run requires a plane binary".to_owned()))?;
-    let socket = plane_socket
-        .ok_or_else(|| BenchError::Invalid("managed run requires a plane socket".to_owned()))?;
-    NativePlane::start(
-        plane_manifest,
+    let backend_manifest =
+        execution.stack.backend.as_ref().ok_or_else(|| {
+            BenchError::Invalid("managed run requires a backend binary".to_owned())
+        })?;
+    let socket = backend_socket
+        .ok_or_else(|| BenchError::Invalid("managed run requires a backend socket".to_owned()))?;
+    NativeBackend::start(
+        backend_manifest,
         services,
         server,
         socket,
@@ -399,13 +398,13 @@ pub(crate) async fn start_plane(
 pub(crate) async fn execute_iggy_restart_path(
     laser: laser_sdk::laser::Laser,
     server: NativeIggy,
-    plane: Option<NativePlane>,
+    backend: Option<NativeBackend>,
     server_manifest: &laser_bench::binary::BinaryManifest,
     execution: DirectExecution<'_>,
 ) -> Result<Option<DirectPairSummary>, BenchError> {
     let result = execute_iggy_recovery(laser, server, server_manifest, execution).await;
-    if let Some(plane) = plane {
-        plane.shutdown().await?;
+    if let Some(backend) = backend {
+        backend.shutdown().await?;
     }
     result?.shutdown().await?;
     Ok(None)
@@ -414,7 +413,7 @@ pub(crate) async fn execute_iggy_restart_path(
 pub(crate) async fn execute_layer(
     laser: &laser_sdk::laser::Laser,
     server: &NativeIggy,
-    plane: Option<&NativePlane>,
+    backend: Option<&NativeBackend>,
     execution: DirectExecution<'_>,
 ) -> Result<Option<DirectPairSummary>, BenchError> {
     match execution.scenario.layer {
@@ -435,9 +434,10 @@ pub(crate) async fn execute_layer(
             Ok(None)
         }
         BenchmarkLayer::L4 if managed_driver_supported(&execution.scenario.driver) => {
-            let plane = plane
-                .ok_or_else(|| BenchError::Invalid("L4 scenario requires plane".to_owned()))?;
-            execute_managed(laser, server, plane, execution).await?;
+            let backend = backend.ok_or_else(|| {
+                BenchError::Invalid("L4 scenario requires the backend".to_owned())
+            })?;
+            execute_managed(laser, server, backend, execution).await?;
             Ok(None)
         }
         BenchmarkLayer::L4 if local_memory_driver_supported(&execution.scenario.driver) => {

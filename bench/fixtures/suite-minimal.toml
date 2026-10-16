@@ -6,7 +6,7 @@ authoritative = false
 mode = "source"
 cpu_target = "native"
 iggy_root = "/path/to/iggy-source"
-plane_root = "/path/to/plane-source"
+backend_root = "/path/to/backend-source"
 
 [environment]
 tier = "A"
