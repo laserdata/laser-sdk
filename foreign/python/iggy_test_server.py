@@ -1,6 +1,7 @@
 import json
 import os
 import select
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -13,6 +14,24 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 RESOLVER = REPOSITORY_ROOT / "scripts" / "resolve-test-iggy-server.sh"
+
+
+def _data_root():
+    base = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+    root = base / "laser-python-test-iggy"
+    root.mkdir(exist_ok=True)
+    for previous in root.iterdir():
+        if not previous.name.isdecimal():
+            continue
+        try:
+            os.kill(int(previous.name), 0)
+        except ProcessLookupError:
+            shutil.rmtree(previous, ignore_errors=True)
+        except PermissionError:
+            pass
+    current = root / str(os.getpid())
+    current.mkdir(exist_ok=True)
+    return current
 
 
 class IggyTestServer:
@@ -37,7 +56,7 @@ class IggyTestServer:
             timeout=310,
         )
         binary = resolved.stdout.strip()
-        self._temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-")
+        self._temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-", dir=_data_root())
         data_path = Path(self._temporary.name)
         self._port = _free_port()
         self._log = (data_path / "test-server.log").open("w")
@@ -55,6 +74,7 @@ class IggyTestServer:
                 "IGGY_SHARDING_CPU_ALLOCATION": "2",
                 "IGGY_SHARDING_PIN_CORES": "false",
                 "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
+                "IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT": "1s",
             }
         )
         self._process = subprocess.Popen(
@@ -146,7 +166,7 @@ class IggyTestCluster:
         self._proxy_thread = threading.Thread(target=self._proxy.serve_forever, daemon=True)
         self._proxy_thread.start()
         for replica_id in range(3):
-            temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-cluster-")
+            temporary = tempfile.TemporaryDirectory(prefix="laser-iggy-cluster-", dir=_data_root())
             self._temporaries.append(temporary)
             self._logs.append(None)
             self._processes.append(None)
@@ -244,6 +264,7 @@ class IggyTestCluster:
                 "IGGY_SHARDING_CPU_ALLOCATION": "1",
                 "IGGY_SHARDING_PIN_CORES": "false",
                 "IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL": "200 ms",
+                "IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT": "1s",
             }
         )
         for node in range(3):

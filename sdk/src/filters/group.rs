@@ -73,8 +73,10 @@ impl Membership {
     }
 
     pub(crate) fn is_due(&self) -> bool {
-        self.synced_at
-            .is_none_or(|synced_at| synced_at.elapsed() >= ASSIGNMENT_REFRESH)
+        self.partitions.is_empty()
+            || self
+                .synced_at
+                .is_none_or(|synced_at| synced_at.elapsed() >= ASSIGNMENT_REFRESH)
     }
 
     /// Re-read the assignment before the next read, because the server fenced

@@ -242,8 +242,7 @@ pub const AGDX_SESSION_CHANGES_CODE: u32 = AGDX_AGENT_BASE + 16;
 pub const AGDX_DELIVERY_BASE: u32 = AGDX_COMMAND_BASE + 800;
 /// Server-native command code: read one bounded page of matching records.
 pub const AGDX_FILTERED_POLL_CODE: u32 = AGDX_DELIVERY_BASE;
-/// Server-native command code: acknowledge a filtered page, fenced to the source
-/// generation the page was read from.
+/// Server-native command code: acknowledge a page under its current group policy.
 pub const AGDX_FILTERED_ACK_CODE: u32 = AGDX_DELIVERY_BASE + 1;
 /// Server-native command code: preview a filter over stored records without
 /// joining a consumer group or storing an offset.

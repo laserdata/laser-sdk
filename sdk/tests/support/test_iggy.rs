@@ -9,8 +9,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -20,6 +20,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_ATTEMPTS: usize = 5;
 const IGGY_SERVER_ENV: &str = "LASER_TEST_IGGY_SERVER";
 const CLUSTER_SIZE: usize = 3;
+const TMPFS: &str = "/dev/shm";
+
+static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 struct ClusterNodeProcess {
     child: OwnedServer,
@@ -50,7 +53,7 @@ impl TestIggyCluster {
         let proxy_task = spawn_stable_proxy(proxy_port, proxy_target.clone()).await;
         let mut nodes = Vec::with_capacity(CLUSTER_SIZE);
         for replica_id in 0..CLUSTER_SIZE {
-            let data_dir = tempfile::tempdir().expect("cluster node data directory");
+            let data_dir = tempfile::tempdir_in(data_root()).expect("cluster node data directory");
             let log_path = data_dir.path().join("test-server.log");
             let child = spawn_cluster_node(
                 &binary,
@@ -199,7 +202,8 @@ impl TestIggy {
         let binary = resolve_server_binary();
         let mut attempt = 1;
         loop {
-            let data_dir = tempfile::tempdir().expect("create Iggy test data directory");
+            let data_dir =
+                tempfile::tempdir_in(data_root()).expect("create Iggy test data directory");
             let tcp_port = free_host_port();
             let child = spawn_server(&binary, data_dir.path(), tcp_port, &env);
             let server = Self {
@@ -308,7 +312,9 @@ impl TestIggy {
             .await?
             .is_none()
         {
-            client.create_stream(&stream).await?;
+            client
+                .create_stream(&stream, &StreamCreateOptions::default())
+                .await?;
         }
         let stream_id = Identifier::named(&stream)?;
         let topic_id = Identifier::named(topic)?;
@@ -364,6 +370,8 @@ fn spawn_server(
         .env("IGGY_SHARDING_CPU_ALLOCATION", "2")
         .env("IGGY_SHARDING_PIN_CORES", "false")
         .env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
+        // An uncommitted group handoff waits this long, the default outlasts every read bound.
+        .env("IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT", "1s")
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -386,7 +394,7 @@ fn spawn_cluster_node(
     command
         .arg("--replica-id")
         .arg(replica_id.to_string())
-        .env("IGGY_PATH", data_dir)
+        .env("IGGY_PATH", data_dir.join("data"))
         .env("IGGY_CLUSTER_ENABLED", "true")
         .env("IGGY_CLUSTER_NAME", "laser-sdk-rolling-restart")
         .env("IGGY_MESSAGE_BUS_RECONNECT_PERIOD", "100ms")
@@ -399,6 +407,8 @@ fn spawn_cluster_node(
         .env("IGGY_SHARDING_CPU_ALLOCATION", "1")
         .env("IGGY_SHARDING_PIN_CORES", "false")
         .env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "200 ms")
+        // An uncommitted group handoff waits this long, the default outlasts every read bound.
+        .env("IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT", "1s")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     for node in 0..CLUSTER_SIZE {
@@ -442,6 +452,35 @@ fn graceful_stop(child: &mut Child) {
     }
     child.kill().expect("kill cluster node after grace period");
     child.wait().expect("reap cluster node");
+}
+
+// Upstream builds each new partition with directory fsyncs, one at a time per shard. On a disk
+// the bootstrap topics of parallel tests queue for seconds, so server data lives on tmpfs.
+fn data_root() -> &'static Path {
+    DATA_ROOT.get_or_init(|| {
+        let tmpfs = Path::new(TMPFS);
+        if !tmpfs.is_dir() {
+            return std::env::temp_dir();
+        }
+        let root = tmpfs.join("laser-sdk-test-iggy");
+        remove_exited_runs(&root);
+        let run = root.join(std::process::id().to_string());
+        std::fs::create_dir_all(&run).expect("create the test server data root");
+        run
+    })
+}
+
+// Shared servers sit in statics that never drop, so each run keeps its data under its process
+// id and the next run removes what exited runs left in memory.
+fn remove_exited_runs(root: &Path) {
+    let Ok(runs) = std::fs::read_dir(root) else {
+        return;
+    };
+    for run in runs.flatten() {
+        if !Path::new("/proc").join(run.file_name()).exists() {
+            let _ = std::fs::remove_dir_all(run.path());
+        }
+    }
 }
 
 fn resolve_server_binary() -> PathBuf {

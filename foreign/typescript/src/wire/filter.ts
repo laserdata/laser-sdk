@@ -98,7 +98,6 @@ const FILTER_ERROR_REASONS: ReadonlySet<FilterErrorReason> = new Set<FilterError
   "conflict",
   "source_changed",
   "membership_stale",
-  "not_primary",
   "catalog_unavailable",
   "revision_disabled",
   "too_large",
@@ -1118,22 +1117,30 @@ export interface CatalogPosition {
   readonly operationId?: bigint
 }
 
-/** Which replica serves the read. */
-export type ReadMode = "primary" | "local"
-
-export function readModeIsPrimary(mode: ReadMode): boolean {
-  return mode === "primary"
-}
-
-/** The exact source history a page was read from. */
+/**
+ * The exact source history a page was read from. A recreated stream, topic, or
+ * partition changes it. The partition is named by its incarnation, the value
+ * its route reports.
+ */
 export interface SourceGeneration {
   readonly streamId: number
   readonly streamCreatedAtMicros: bigint
   readonly topicId: number
   readonly topicCreatedAtMicros: bigint
   readonly partitionId: number
-  readonly partitionCreatedRevision: bigint
-  readonly purgeGeneration: bigint
+  readonly partitionIncarnation: bigint
+}
+
+/**
+ * The partition owner a page was read under. The reader stores the page's
+ * offset with it and the page's partition incarnation, so the store is refused
+ * once the partition was recreated or its group assignment moved.
+ */
+export interface AckContext {
+  /** The consumer group owner generation, zero for an independent consumer. */
+  readonly ownerGeneration: bigint
+  /** The metadata operation the primary had applied when it served the read. */
+  readonly metadataOp: bigint
 }
 
 export interface Continuation {
@@ -1142,11 +1149,6 @@ export interface Continuation {
   readonly generation: SourceGeneration
   /** The digest of the filter the page ran, absent for an unfiltered page. */
   readonly digest?: Uint8Array
-  /**
-   * The route the page was read on. A continuation from a local page never
-   * resumes a primary read, because a local replica can lag a purge.
-   */
-  readonly readMode: ReadMode
   readonly mode: ExecutionMode
   readonly policyGeneration: bigint
 }
@@ -1160,6 +1162,26 @@ export type FilteredStart =
   | { readonly kind: "timestamp"; readonly micros: bigint }
   | { readonly kind: "continue"; readonly continuation: Continuation }
 
+export interface FilteredAck {
+  readonly v: number
+  readonly source: FilterSource
+  readonly partitionId: number
+  readonly consumer: FilterConsumer
+  readonly groupId?: bigint
+  readonly generation: SourceGeneration
+  readonly ackContext: AckContext
+  readonly digest?: Uint8Array
+  readonly offset: bigint
+  readonly mode: ExecutionMode
+  readonly policyGeneration: bigint
+}
+
+export interface AckReceipt {
+  readonly partitionId: number
+  readonly offset: bigint
+  readonly generation: SourceGeneration
+}
+
 export interface FilteredPollRequest {
   readonly v: number
   readonly source: FilterSource
@@ -1169,7 +1191,6 @@ export interface FilteredPollRequest {
   readonly start: FilteredStart
   readonly count: number
   readonly maxReplyBytes: number
-  readonly readMode: ReadMode
   /** Most source records to examine. A normal consumer sets it to `count`. */
   readonly maxExamined?: number
   /** Serve only once the catalog has been examined through this position. */
@@ -1239,7 +1260,7 @@ export interface FilteredPage {
   readonly partitionId: number
   readonly policy: AppliedPolicy
   readonly generation: SourceGeneration
-  readonly readMode: ReadMode
+  readonly ackContext: AckContext
   readonly nextScanOffset?: bigint
   readonly safeAckOffset?: bigint
   readonly frontier: bigint
@@ -1261,32 +1282,11 @@ export function filteredPageNextStart(page: FilteredPage, original: FilteredStar
       nextScanOffset: page.nextScanOffset,
       generation: page.generation,
       ...(page.policy.digest === undefined ? {} : { digest: page.policy.digest }),
-      readMode: page.readMode,
       mode: page.policy.mode,
       policyGeneration: page.policy.policyGeneration,
       ...(page.policy.groupId !== undefined ? { groupId: page.policy.groupId } : {})
     }
   }
-}
-
-export interface FilteredAck {
-  readonly groupId?: bigint
-  readonly v: number
-  readonly source: FilterSource
-  readonly partitionId: number
-  readonly consumer: FilterConsumer
-  readonly generation: SourceGeneration
-  /** The digest of the filter the page ran, absent for an unfiltered page. */
-  readonly digest?: Uint8Array
-  readonly offset: bigint
-  readonly mode: ExecutionMode
-  readonly policyGeneration: bigint
-}
-
-export interface AckReceipt {
-  readonly partitionId: number
-  readonly offset: bigint
-  readonly generation: SourceGeneration
 }
 
 export interface FilterPreviewRequest {
@@ -1329,7 +1329,6 @@ export interface FilterPreview {
   readonly v: number
   readonly partitionId: number
   readonly policy: AppliedPolicy
-  readonly readMode: ReadMode
   readonly examined: number
   readonly matched: number
   readonly faults: number
@@ -1381,7 +1380,6 @@ export type FilterErrorReason =
   | "conflict"
   | "source_changed"
   | "membership_stale"
-  | "not_primary"
   | "catalog_unavailable"
   | "revision_disabled"
   | "too_large"
@@ -1423,8 +1421,8 @@ export function filterErrorCheckVersion(v: number): FilterError | undefined {
 }
 
 export type FilterOutcome =
-  | { readonly kind: "page"; readonly page: FilteredPage }
   | { readonly kind: "acknowledged"; readonly receipt: AckReceipt }
+  | { readonly kind: "page"; readonly page: FilteredPage }
   | { readonly kind: "preview"; readonly preview: FilterPreview }
   | { readonly kind: "tested"; readonly result: FilterTestResult }
   | { readonly kind: "validated"; readonly validation: FilterValidation }
@@ -1740,6 +1738,19 @@ function validateDigest(digest: Uint8Array): void {
   if (digest.byteLength !== 32) throw new InvalidError("a digest must be 32 bytes")
 }
 
+export function validateFilteredAck(request: FilteredAck): void {
+  validateVersion(request.v)
+  validateSource(request.source)
+  validateConsumer(request.consumer)
+  validatePolicyIdentity(request.mode, request.digest)
+  if (request.mode === "unfiltered" && request.consumer.kind === "consumer")
+    throw new InvalidError("only a consumer group runs unfiltered")
+  if ((request.consumer.kind !== "consumer") !== (request.groupId !== undefined))
+    throw new InvalidError("a group acknowledgment must retain its group identity")
+  if (request.generation.partitionId !== request.partitionId)
+    throw new InvalidError("an acknowledgment names another partition's generation")
+}
+
 export function validateFilteredPollRequest(request: FilteredPollRequest): void {
   validateVersion(request.v)
   validateSource(request.source)
@@ -1795,20 +1806,6 @@ export function validatePolicyIdentity(mode: ExecutionMode, digest: Uint8Array |
     validateDigest(digest)
   } else if (digest !== undefined) {
     throw new InvalidError("an unfiltered policy carries no digest")
-  }
-}
-
-export function validateFilteredAck(ack: FilteredAck): void {
-  validateVersion(ack.v)
-  validateSource(ack.source)
-  validateConsumer(ack.consumer)
-  validatePolicyIdentity(ack.mode, ack.digest)
-  if (ack.mode === "unfiltered" && ack.consumer.kind === "consumer")
-    throw new InvalidError("only a consumer group runs unfiltered")
-  if ((ack.consumer.kind !== "consumer") !== (ack.groupId !== undefined))
-    throw new InvalidError("a group acknowledgment must retain its group identity")
-  if (ack.generation.partitionId !== ack.partitionId) {
-    throw new InvalidError("an acknowledgment names another partition's generation")
   }
 }
 
@@ -2142,8 +2139,14 @@ export function encodeSourceGeneration(generation: SourceGeneration): Map<string
     ["topic_id", generation.topicId],
     ["topic_created_at_micros", generation.topicCreatedAtMicros],
     ["partition_id", generation.partitionId],
-    ["partition_created_revision", generation.partitionCreatedRevision],
-    ["purge_generation", generation.purgeGeneration]
+    ["partition_incarnation", generation.partitionIncarnation]
+  ])
+}
+
+export function encodeAckContext(context: AckContext): Map<string, unknown> {
+  return mapOf([
+    ["owner_generation", context.ownerGeneration],
+    ["metadata_op", context.metadataOp]
   ])
 }
 
@@ -2170,14 +2173,44 @@ export function encodeFilteredStart(start: FilteredStart): unknown {
             ...(start.continuation.digest === undefined
               ? []
               : [["digest", start.continuation.digest] as const]),
-            ...(start.continuation.readMode === "primary"
-              ? []
-              : [["read_mode", start.continuation.readMode] as const]),
             ["mode", start.continuation.mode],
             ["policy_generation", start.continuation.policyGeneration]
           ])
         ]
       ])
+  }
+}
+
+export function encodeFilteredAck(request: FilteredAck): Map<string, unknown> {
+  return mapOf([
+    ...(request.groupId === undefined ? [] : [["group_id", request.groupId] as const]),
+    ["v", request.v],
+    ["source", encodeFilterSource(request.source)],
+    ["partition_id", request.partitionId],
+    ["consumer", encodeFilterConsumer(request.consumer)],
+    ["generation", encodeSourceGeneration(request.generation)],
+    ["ack_context", encodeAckContext(request.ackContext)],
+    ...(request.digest === undefined ? [] : [["digest", request.digest] as const]),
+    ["offset", request.offset],
+    ["mode", request.mode],
+    ["policy_generation", request.policyGeneration]
+  ])
+}
+
+export function decodeFilteredAck(value: unknown, context: string): FilteredAck {
+  const map = expectMap(value, context)
+  return {
+    v: requiredU32(map, "v", context),
+    source: decodeFilterSource(map.get("source"), context),
+    partitionId: requiredU32(map, "partition_id", context),
+    consumer: decodeFilterConsumer(map.get("consumer"), context),
+    generation: decodeSourceGeneration(map.get("generation"), context),
+    ackContext: decodeAckContext(map.get("ack_context"), context),
+    offset: field.requiredU64(map, "offset", context),
+    mode: map.has("mode") ? decodeExecutionMode(map.get("mode"), context) : "filtered",
+    policyGeneration: field.optionalU64(map, "policy_generation", context) ?? 0n,
+    ...(map.has("group_id") ? { groupId: field.requiredU64(map, "group_id", context) } : {}),
+    ...(map.has("digest") ? { digest: requiredBytes(map, "digest", context) } : {})
   }
 }
 
@@ -2191,26 +2224,10 @@ export function encodeFilteredPollRequest(request: FilteredPollRequest): Map<str
     ["start", encodeFilteredStart(request.start)],
     ["count", request.count],
     ["max_reply_bytes", request.maxReplyBytes],
-    ["read_mode", request.readMode],
     ...(request.maxExamined === undefined ? [] : [["max_examined", request.maxExamined] as const]),
     ...(request.minCatalogPosition === undefined
       ? []
       : [["min_catalog_position", encodeCatalogPosition(request.minCatalogPosition)] as const])
-  ])
-}
-
-export function encodeFilteredAck(ack: FilteredAck): Map<string, unknown> {
-  return mapOf([
-    ...(ack.groupId === undefined ? [] : [["group_id", ack.groupId] as const]),
-    ["v", ack.v],
-    ["source", encodeFilterSource(ack.source)],
-    ["partition_id", ack.partitionId],
-    ["consumer", encodeFilterConsumer(ack.consumer)],
-    ["generation", encodeSourceGeneration(ack.generation)],
-    ...(ack.digest === undefined ? [] : [["digest", ack.digest] as const]),
-    ["offset", ack.offset],
-    ["mode", ack.mode],
-    ["policy_generation", ack.policyGeneration]
   ])
 }
 
@@ -2271,7 +2288,7 @@ export function encodeFilteredPage(page: FilteredPage): Map<string, unknown> {
     ["partition_id", page.partitionId],
     ["policy", encodeAppliedPolicy(page.policy)],
     ["generation", encodeSourceGeneration(page.generation)],
-    ["read_mode", page.readMode]
+    ["ack_context", encodeAckContext(page.ackContext)]
   ])
   setIf(map, "next_scan_offset", page.nextScanOffset)
   setIf(map, "safe_ack_offset", page.safeAckOffset)
@@ -2301,14 +2318,6 @@ export function encodeFilteredPage(page: FilteredPage): Map<string, unknown> {
   return map
 }
 
-function encodeAckReceipt(receipt: AckReceipt): Map<string, unknown> {
-  return mapOf([
-    ["partition_id", receipt.partitionId],
-    ["offset", receipt.offset],
-    ["generation", encodeSourceGeneration(receipt.generation)]
-  ])
-}
-
 export function encodeFilterError(error: FilterError): Map<string, unknown> {
   return mapOf([
     ["code", resultCodeWord(error.code) ?? "backend"],
@@ -2333,10 +2342,19 @@ function encodeExplanation(explanation: FilterExplanation): Map<string, unknown>
 
 function encodeFilterOutcome(outcome: FilterOutcome): Map<string, unknown> {
   switch (outcome.kind) {
+    case "acknowledged":
+      return mapOf([
+        [
+          "acknowledged",
+          mapOf([
+            ["partition_id", outcome.receipt.partitionId],
+            ["offset", outcome.receipt.offset],
+            ["generation", encodeSourceGeneration(outcome.receipt.generation)]
+          ])
+        ]
+      ])
     case "page":
       return mapOf([["page", encodeFilteredPage(outcome.page)]])
-    case "acknowledged":
-      return mapOf([["acknowledged", encodeAckReceipt(outcome.receipt)]])
     case "tested":
       return mapOf([
         [
@@ -2370,7 +2388,6 @@ function encodeFilterPreview(preview: FilterPreview): Map<string, unknown> {
     ["v", preview.v],
     ["partition_id", preview.partitionId],
     ["policy", encodeAppliedPolicy(preview.policy)],
-    ["read_mode", preview.readMode],
     ["examined", preview.examined],
     ["matched", preview.matched],
     ["faults", preview.faults],
@@ -3108,8 +3125,15 @@ export function decodeSourceGeneration(value: unknown, context: string): SourceG
     topicId: requiredU32(map, "topic_id", context),
     topicCreatedAtMicros: field.requiredU64(map, "topic_created_at_micros", context),
     partitionId: requiredU32(map, "partition_id", context),
-    partitionCreatedRevision: field.requiredU64(map, "partition_created_revision", context),
-    purgeGeneration: field.requiredU64(map, "purge_generation", context)
+    partitionIncarnation: field.requiredU64(map, "partition_incarnation", context)
+  }
+}
+
+export function decodeAckContext(value: unknown, context: string): AckContext {
+  const map = expectMap(value, context)
+  return {
+    ownerGeneration: field.requiredU64(map, "owner_generation", context),
+    metadataOp: field.requiredU64(map, "metadata_op", context)
   }
 }
 
@@ -3137,9 +3161,6 @@ export function decodeFilteredStart(value: unknown, context: string): FilteredSt
           nextScanOffset: field.requiredU64(map, "next_scan_offset", context),
           generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`),
           ...(map.has("digest") ? { digest: requiredBytes(map, "digest", context) } : {}),
-          readMode: map.has("read_mode")
-            ? decodeReadMode(map.get("read_mode"), `${context}.read_mode`)
-            : "primary",
           mode: map.has("mode")
             ? decodeExecutionMode(map.get("mode"), `${context}.mode`)
             : "filtered",
@@ -3150,10 +3171,6 @@ export function decodeFilteredStart(value: unknown, context: string): FilteredSt
     default:
       throw new CodecError(`\`${tag}\` is not a recognized filtered start`, context, "start")
   }
-}
-
-function decodeReadMode(value: unknown, context: string): ReadMode {
-  return oneOf(value, new Set<ReadMode>(["primary", "local"]), context)
 }
 
 export function decodeFilteredPollRequest(value: unknown, context: string): FilteredPollRequest {
@@ -3167,9 +3184,6 @@ export function decodeFilteredPollRequest(value: unknown, context: string): Filt
     start: decodeFilteredStart(map.get("start"), `${context}.start`),
     count: requiredU32(map, "count", context),
     maxReplyBytes: requiredU32(map, "max_reply_bytes", context),
-    readMode: map.has("read_mode")
-      ? decodeReadMode(map.get("read_mode"), `${context}.read_mode`)
-      : "primary",
     ...(map.has("max_examined") ? { maxExamined: requiredU32(map, "max_examined", context) } : {}),
     ...(map.has("min_catalog_position")
       ? {
@@ -3179,23 +3193,6 @@ export function decodeFilteredPollRequest(value: unknown, context: string): Filt
           )
         }
       : {})
-  }
-}
-
-export function decodeFilteredAck(value: unknown, context: string): FilteredAck {
-  const map = expectMap(value, context)
-  const groupId = field.optionalU64(map, "group_id", context)
-  return {
-    ...(groupId !== undefined ? { groupId } : {}),
-    v: requiredU32(map, "v", context),
-    source: decodeFilterSource(map.get("source"), `${context}.source`),
-    partitionId: requiredU32(map, "partition_id", context),
-    consumer: decodeFilterConsumer(map.get("consumer"), `${context}.consumer`),
-    generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`),
-    ...(map.has("digest") ? { digest: requiredBytes(map, "digest", context) } : {}),
-    offset: field.requiredU64(map, "offset", context),
-    mode: map.has("mode") ? decodeExecutionMode(map.get("mode"), `${context}.mode`) : "filtered",
-    policyGeneration: field.optionalU64(map, "policy_generation", context) ?? 0n
   }
 }
 
@@ -3229,7 +3226,7 @@ export function decodeFilteredPage(value: unknown, context: string): FilteredPag
     partitionId: requiredU32(map, "partition_id", context),
     policy: decodeAppliedPolicy(map.get("policy"), `${context}.policy`),
     generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`),
-    readMode: decodeReadMode(map.get("read_mode"), `${context}.read_mode`),
+    ackContext: decodeAckContext(map.get("ack_context"), `${context}.ack_context`),
     ...(nextScanOffset !== undefined ? { nextScanOffset } : {}),
     ...(safeAckOffset !== undefined ? { safeAckOffset } : {}),
     frontier: field.requiredU64(map, "frontier", context),
@@ -3256,15 +3253,6 @@ export function decodeFilteredPage(value: unknown, context: string): FilteredPag
       expectU64(item, `${context}.unevaluated[${String(index)}]`)
     ),
     records: requiredBytes(map, "records", context)
-  }
-}
-
-function decodeAckReceipt(value: unknown, context: string): AckReceipt {
-  const map = expectMap(value, context)
-  return {
-    partitionId: requiredU32(map, "partition_id", context),
-    offset: field.requiredU64(map, "offset", context),
-    generation: decodeSourceGeneration(map.get("generation"), `${context}.generation`)
   }
 }
 
@@ -3316,7 +3304,6 @@ function decodeFilterPreview(value: unknown, context: string): FilterPreview {
     v: requiredU32(map, "v", context),
     partitionId: requiredU32(map, "partition_id", context),
     policy: decodeAppliedPolicy(map.get("policy"), `${context}.policy`),
-    readMode: decodeReadMode(map.get("read_mode"), `${context}.read_mode`),
     examined: requiredU32(map, "examined", context),
     matched: requiredU32(map, "matched", context),
     faults: requiredU32(map, "faults", context),
@@ -3349,10 +3336,19 @@ function decodeFilterPreview(value: unknown, context: string): FilterPreview {
 function decodeFilterOutcome(value: unknown, context: string): FilterOutcome {
   const [tag, inner] = singleVariantTag(value, context)
   switch (tag) {
+    case "acknowledged": {
+      const map = expectMap(inner, context)
+      return {
+        kind: "acknowledged",
+        receipt: {
+          partitionId: requiredU32(map, "partition_id", context),
+          offset: field.requiredU64(map, "offset", context),
+          generation: decodeSourceGeneration(map.get("generation"), context)
+        }
+      }
+    }
     case "page":
       return { kind: "page", page: decodeFilteredPage(inner, `${context}.page`) }
-    case "acknowledged":
-      return { kind: "acknowledged", receipt: decodeAckReceipt(inner, `${context}.acknowledged`) }
     case "preview":
       return { kind: "preview", preview: decodeFilterPreview(inner, `${context}.preview`) }
     case "tested": {

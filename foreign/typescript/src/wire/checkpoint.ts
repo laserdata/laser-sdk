@@ -1550,7 +1550,7 @@ function equalIncarnation(left: SourceIncarnation, right: SourceIncarnation): bo
     left.streamId === right.streamId &&
     left.topicId === right.topicId &&
     left.partitionId === right.partitionId &&
-    left.partitionCreatedRevision === right.partitionCreatedRevision
+    left.partitionIncarnation === right.partitionIncarnation
   )
 }
 

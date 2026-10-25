@@ -198,7 +198,8 @@ void test("given_never_expire_and_an_expiry_when_a_producer_is_built_then_should
 
 void test("given_a_timestamp_start_when_polling_then_should_send_the_iggy_timestamp_strategy", async () => {
   const requests: Uint8Array[] = []
-  const empty = new Uint8Array(16)
+  // An empty polled body: the 40-byte head and no records.
+  const empty = new Uint8Array(40)
   const client = {
     clientProvider: () => Promise.resolve({}),
     sendBinaryRequest: (_code: number, payload: Buffer) => {

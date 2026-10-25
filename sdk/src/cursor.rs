@@ -340,9 +340,6 @@ mod tests {
             created_at: IggyTimestamp::from(0),
             name: "events".to_owned(),
             size: IggyByteSize::from(0),
-            message_expiry: IggyExpiry::NeverExpire,
-            compression_algorithm: CompressionAlgorithm::None,
-            max_topic_size: MaxTopicSize::ServerDefault,
             messages_count: state.messages * u64::from(state.partitions),
             partitions_count: state.partitions,
             partitions: Vec::new(),
@@ -378,6 +375,7 @@ mod tests {
             })
             .collect();
         Json(PolledMessages {
+            context: PartitionContext::default(),
             partition_id: partition,
             current_offset: state.messages.saturating_sub(1),
             count: messages.len() as u32,

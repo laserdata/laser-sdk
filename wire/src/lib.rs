@@ -95,7 +95,7 @@ pub mod prelude {
         Coerce, ConsumerFilter, FaultPolicy, FieldPath, FilterBinding, FilterCodec, FilterConsumer,
         FilterError, FilterErrorReason, FilterExpr, FilterGroupRef, FilterMutation,
         FilterMutationOutcome, FilterMutationStatus, FilterRef, FilterSource, FilteredPage,
-        FilteredStart, ReadMode, StopReason, TimestampFormat,
+        FilteredStart, StopReason, TimestampFormat,
     };
     pub use crate::fork::{ForkError, ForkInfo, ForkKind, ForkOutcome, ForkReply, ForkStatus};
     pub use crate::graph::{

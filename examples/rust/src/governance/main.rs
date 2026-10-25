@@ -2,7 +2,7 @@ use laser_examples::{
     PARTITIONS, env_u64, fresh_run, init_tracing, laser, managed_feature_ready, phase, stream_for,
 };
 use laser_sdk::edge_auth::{EdgeClaims, authorize_edge};
-use laser_sdk::iggy::prelude::{Identifier, UserClient, UserStatus};
+use laser_sdk::iggy::prelude::{Identifier, UserClient, UserCreateOptions, UserStatus};
 use laser_sdk::prelude::full::*;
 use laser_sdk::rbac::{
     Action, Effect, Feature, Grant, ResourcePattern, Role, delegated_allow, grants_allow,
@@ -80,6 +80,7 @@ async fn demo_user_id(laser: &Laser) -> Result<u32, LaserError> {
             "governance-demo-secret",
             UserStatus::Active,
             None,
+            &UserCreateOptions::default(),
         )
         .await?;
     Ok(created.id)

@@ -2,7 +2,11 @@
 use crate::agent::clock::{Clock, SystemClock};
 use crate::cursor::Cursor;
 use crate::error::LaserError;
+#[cfg(feature = "query")]
+use crate::iggy::prelude::ClusterClient;
 use crate::laser::Laser;
+#[cfg(feature = "query")]
+use crate::nodes::Target;
 use crate::provenance::AgentTopic;
 use crate::types::{AgentId, MintUlid, PrincipalId};
 use laser_wire::agent::{
@@ -687,18 +691,35 @@ impl ClientMetadataRequest<'_> {
     /// connections. Use [`page`](Self::page) instead when the set may be large.
     pub async fn all(self) -> Result<Vec<ClientMetadata>, LaserError> {
         let mut all = Vec::new();
-        let mut cursor = self.query.after_client_id;
-        loop {
-            let mut request = ClientMetadataRequest {
-                laser: self.laser,
-                query: self.query.clone(),
-            };
-            request.query.after_client_id = cursor;
-            let page = request.page().await?;
-            all.extend(page.clients);
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
+        let metadata = self.laser.client().get_cluster_metadata().await?;
+        let mut replicas: Vec<_> = metadata.nodes.iter().map(|node| node.replica_id).collect();
+        replicas.sort_unstable();
+        replicas.dedup();
+        for replica in replicas {
+            let mut query = self.query.clone();
+            loop {
+                let payload = encode_named(&query)?;
+                let (reply, _) = self
+                    .laser
+                    .send_managed_to(
+                        AGDX_GET_CLIENTS_METADATA_CODE,
+                        payload,
+                        Target::Replica(replica),
+                    )
+                    .await?;
+                let page: ClientMetadataList = decode_named(&reply)?;
+                all.extend(page.clients);
+                match page.next_cursor {
+                    Some(next) if query.after_client_id.is_none_or(|previous| next > previous) => {
+                        query.after_client_id = Some(next)
+                    }
+                    Some(_) => {
+                        return Err(LaserError::Protocol(
+                            "the client metadata page did not advance".to_owned(),
+                        ));
+                    }
+                    None => break,
+                }
             }
         }
         Ok(all)

@@ -175,18 +175,15 @@ async def test_given_an_unbound_group_when_consumed_then_should_deliver_every_re
             assert stored.stored_offset == (1 if allow_replay else 2)
             await consumer.delete_offset(partition=0)
             assert await consumer.stored_offset(0) is None
-            assert await consumer.last_stored_offset(0) == (1 if allow_replay else 2)
+            assert await consumer.last_stored_offset(0) is None
             await consumer.store_offset(1, partition=0)
             stored = await consumer.stored_offset(0)
-            if allow_replay:
-                assert stored is not None
-                assert stored.stored_offset == 1
-            else:
-                assert stored is None
+            assert stored is not None
+            assert stored.stored_offset == 1
             await consumer.store_offset(0, partition=0)
             stored = await consumer.stored_offset(0)
             assert stored is not None
-            assert stored.stored_offset == 0
+            assert stored.stored_offset == (0 if allow_replay else 1)
     finally:
         await consumer.shutdown()
     assert (await group.info()).filter is None
@@ -522,16 +519,6 @@ async def test_given_a_local_guard_when_reading_then_should_agree_with_the_serve
     await filtered.close()
 
 
-async def test_given_a_local_reader_when_acknowledging_then_should_refuse(laser):
-    await publish(laser, [DECOMMISSION])
-    filtered = await reader(laser, "safe-mode-local", start="first", read_mode="local")
-    page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
-
-    with pytest.raises(ls.InvalidError):
-        await filtered.ack_page(page)
-    await filtered.close()
-
-
 async def test_given_stored_records_when_previewed_then_should_judge_them_without_progress(
     laser,
 ):
@@ -834,5 +821,22 @@ async def test_given_a_raised_page_bound_when_80_pages_are_outstanding_then_shou
             assert [record.offset for record in page.records] == [offset]
             pages.append(page)
         await filtered.ack_through(pages[-1].records[-1])
+    finally:
+        await filtered.close()
+
+
+async def test_given_a_released_policy_when_acknowledging_its_page_then_should_refuse(laser):
+    group = await bound_group(laser, "policy-ack")
+    await publish(laser, [SAFE_MODE, GROUND_STATION, DECOMMISSION])
+    filtered = await group.reader(start="first")
+    try:
+        page = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
+        await group.filter().release()
+        with pytest.raises(ls.FilterError) as refused:
+            await filtered.ack_page(page)
+        assert refused.value.reason == "conflict"
+        current = await asyncio.wait_for(filtered.next_page(), READ_TIMEOUT)
+        assert current.records[0].offset == 0
+        await filtered.ack_page(current)
     finally:
         await filtered.close()

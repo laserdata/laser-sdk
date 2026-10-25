@@ -4,6 +4,8 @@
 
 ```ts
 
+/// <reference types="node" />
+
 import type { SendMessagesConfirmation } from 'apache-iggy';
 import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
@@ -64,6 +66,12 @@ export const A2aMethod: {
 
 // @public (undocumented)
 export type A2aMethod = (typeof A2aMethod)[keyof typeof A2aMethod];
+
+// @public
+export interface AckContext {
+    readonly metadataOp: bigint;
+    readonly ownerGeneration: bigint;
+}
 
 // @public (undocumented)
 export type Action = "read" | "write" | "delete" | "admin" | "unrecognized";
@@ -1863,7 +1871,6 @@ export interface Continuation {
     readonly nextScanOffset: bigint;
     // (undocumented)
     readonly policyGeneration: bigint;
-    readonly readMode: ReadMode;
 }
 
 // @public (undocumented)
@@ -2575,7 +2582,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     ackPage(page: MatchedPage): Promise<void>;
     ackThrough(record: MatchedRecord): Promise<void>;
     close(): Promise<void>;
-    dataConnectionsOpened(): number;
     examinedInRound(): number;
     idleIntervalMs(): number;
     nextPage(options?: {
@@ -2601,7 +2607,6 @@ export class FilteredReaderBuilder {
     maxReplyBytes(bytes: number): this;
     maxUnackedPages(pages: number): this;
     partition(partitionId: number): this;
-    readMode(mode: ReadMode): this;
     start(start: FilteredStart): this;
 }
 
@@ -2640,7 +2645,7 @@ export function filterErrorCheckVersion(v: number): FilterError | undefined;
 export function filterErrorInvalid(error: InvalidError): FilterError;
 
 // @public (undocumented)
-export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "not_primary" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
+export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
 /** A reason this build does not know. The error's `code` still classifies it. */
 | "unknown";
 
@@ -2795,8 +2800,6 @@ export interface FilterPreview {
     readonly partitionId: number;
     // (undocumented)
     readonly policy: AppliedPolicy;
-    // (undocumented)
-    readonly readMode: ReadMode;
     // (undocumented)
     readonly records: readonly PreviewRecord[];
     // (undocumented)
@@ -6139,12 +6142,6 @@ export interface RawSql {
 // @public (undocumented)
 export function readinessReasons(capabilities: Capabilities, resourceId: BackendResourceId): readonly BackendReadinessReason[] | undefined;
 
-// @public
-export type ReadMode = "primary" | "local";
-
-// @public (undocumented)
-export function readModeIsPrimary(mode: ReadMode): boolean;
-
 // @public (undocumented)
 export class RecallBuilder {
     // (undocumented)
@@ -7196,11 +7193,9 @@ export interface Sort {
 // @public
 export interface SourceGeneration {
     // (undocumented)
-    readonly partitionCreatedRevision: bigint;
-    // (undocumented)
     readonly partitionId: number;
     // (undocumented)
-    readonly purgeGeneration: bigint;
+    readonly partitionIncarnation: bigint;
     // (undocumented)
     readonly streamCreatedAtMicros: bigint;
     // (undocumented)
@@ -7919,8 +7914,8 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:481:7 - (ae-forgotten-export) The symbol "Dispatch" needs to be exported by the entry point index.d.ts
-// src/client/laser.ts:764:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
+// src/client/laser.ts:483:7 - (ae-forgotten-export) The symbol "Dispatch" needs to be exported by the entry point index.d.ts
+// src/client/laser.ts:766:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point index.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point index.d.ts
 // src/wire/agent.ts:106:31 - (ae-forgotten-export) The symbol "TaskStateName" needs to be exported by the entry point index.d.ts
@@ -7932,7 +7927,7 @@ export interface WorkflowOutcome {
 // src/wire/checkpoint.ts:399:7 - (ae-forgotten-export) The symbol "DestinationId" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:404:7 - (ae-forgotten-export) The symbol "CheckpointOwnerLease" needs to be exported by the entry point index.d.ts
 // src/wire/checkpoint.ts:409:7 - (ae-forgotten-export) The symbol "QueryRouteId" needs to be exported by the entry point index.d.ts
-// src/wire/filter.ts:300:40 - (ae-forgotten-export) The symbol "FilterLiteral" needs to be exported by the entry point index.d.ts
+// src/wire/filter.ts:299:40 - (ae-forgotten-export) The symbol "FilterLiteral" needs to be exported by the entry point index.d.ts
 // src/wire/result.ts:26:31 - (ae-forgotten-export) The symbol "ResultCodeName" needs to be exported by the entry point index.d.ts
 
 // (No @packageDocumentation comment for this package)

@@ -1997,7 +1997,7 @@ mod tests {
             stream_id: 2,
             topic_id: 3,
             partition_id,
-            partition_created_revision: 4,
+            partition_incarnation: 4,
         }
     }
 

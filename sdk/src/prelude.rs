@@ -91,7 +91,6 @@ pub mod full {
     pub use crate::filters::{
         ConsumerFilter, ExecutionMode, FaultPolicy, FilterBinding, FilterExpr, FilterGroupRef,
         FilteredReaderBuilder, FilteredStart, GroupFilterSpec, MatchedPage, MatchedRecord,
-        ReadMode,
     };
     #[cfg(feature = "fork")]
     pub use crate::fork::{ForkInfo, ForkKind, ForkStatus};

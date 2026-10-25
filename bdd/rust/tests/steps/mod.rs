@@ -2,6 +2,7 @@ pub mod agent;
 pub mod bindings;
 pub mod bridges;
 pub mod capabilities;
+pub mod clients;
 pub mod consistency;
 pub mod data_stack;
 pub mod filters;

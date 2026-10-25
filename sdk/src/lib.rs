@@ -64,13 +64,14 @@ pub mod laser;
 ))]
 mod managed;
 #[cfg(feature = "streaming")]
-mod managed_route;
 #[cfg(feature = "mcp-bridge")]
 pub mod mcp;
 #[cfg(feature = "agent")]
 pub mod memory;
 #[cfg(feature = "streaming")]
 pub mod message;
+#[cfg(feature = "streaming")]
+mod nodes;
 #[cfg(feature = "streaming")]
 mod poll;
 pub mod prelude;

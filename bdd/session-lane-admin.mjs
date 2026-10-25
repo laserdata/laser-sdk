@@ -14,6 +14,12 @@ if (
 const laser = await Laser.connectWithStream(endpoint, stream);
 try {
   switch (change) {
+    case "record count": {
+      const topic = await laser.client.topic.get({ streamId: stream, topicId: "agent.sessions" });
+      if (topic === null) throw new Error("the current session lane is missing");
+      process.stdout.write(topic.messagesCount.toString());
+      break;
+    }
     case "writer credentials": {
       if (username === undefined)
         throw new Error("writer fixture needs a username");

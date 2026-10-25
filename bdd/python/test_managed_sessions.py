@@ -1026,6 +1026,26 @@ def refuse_replacement_source_record(world):
     assert world.run(lambda: managed.laser.read_at(managed.retained_source)) is None
 
 
+def _lane_record_count(world):
+    result = subprocess.run(
+        [
+            "rtk",
+            "proxy",
+            "node",
+            str(SCENARIOS.parent / "session-lane-admin.mjs"),
+            world.endpoint,
+            world.session.stream,
+            "record count",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return int(result.stdout.strip())
+
+
 def _assert_stale_lane(world, write):
     try:
         world.run(write)
@@ -1038,7 +1058,7 @@ def _assert_stale_lane(world, write):
 @then("retained session handles refuse lifecycle and state writes as stale")
 def refuse_retained_lane(world):
     managed = _managed(world)
-    before = len(world.run(lambda: world.session.context()))
+    before = _lane_record_count(world)
     _assert_stale_lane(world, lambda: world.session.cancel())
     _assert_stale_lane(world, lambda: managed.retained.cancel())
     _assert_stale_lane(world, lambda: managed.retained_state.set("after", 2))
@@ -1051,16 +1071,16 @@ def refuse_retained_lane(world):
     _assert_stale_lane(
         world, lambda: managed.sessions.submit("worker", b"{}").from_("planner").send()
     )
-    assert len(world.run(lambda: world.session.context())) == before
+    assert _lane_record_count(world) == before
 
 
 @then("a fresh handle refuses the stale lane registration")
 def refuse_stale_registration(world):
     managed = _managed(world)
-    before = len(world.run(lambda: world.session.context()))
+    before = _lane_record_count(world)
     fresh = managed.laser.sessions().open(world.session.conversation).as_agent("planner")
     _assert_stale_lane(world, lambda: fresh.cancel())
-    assert len(world.run(lambda: world.session.context())) == before
+    assert _lane_record_count(world) == before
 
 
 @when("the session source is explicitly removed and registered again")

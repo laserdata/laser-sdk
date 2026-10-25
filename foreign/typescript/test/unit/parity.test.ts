@@ -311,7 +311,11 @@ void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_shou
     assert.equal(consumer.lastStoredOffset(0), allowReplay ? 1n : 7n)
     await consumer.deleteOffset()
     assert.deepEqual(deleted, [0])
-    assert.equal(consumer.lastStoredOffset(0), allowReplay ? 1n : 7n)
+    assert.equal(
+      consumer.lastStoredOffset(0),
+      undefined,
+      "a deletion forgets the local record, so the next store reaches the server"
+    )
     await consumer.storeOffset(1n)
     await consumer.storeOffset(0n)
     await consumer.storeOffset(2n)
@@ -331,7 +335,7 @@ void test("given_a_native_consumer_when_offsets_are_stored_and_deleted_then_shou
           ]
         : [
             [0, 7n],
-            [0, 0n],
+            [0, 1n],
             [0, 2n]
           ]
     )

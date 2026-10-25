@@ -4,6 +4,8 @@
 
 ```ts
 
+/// <reference types="node" />
+
 import type { SendMessagesConfirmation } from 'apache-iggy';
 import type { SendMessagesResponse } from 'apache-iggy';
 import { SimpleClient } from 'apache-iggy';
@@ -81,6 +83,12 @@ interface AcceptedOperationView {
     readonly state: OperationState;
     // (undocumented)
     readonly submittedAtMicros: bigint;
+}
+
+// @public
+export interface AckContext {
+    readonly metadataOp: bigint;
+    readonly ownerGeneration: bigint;
 }
 
 // @public (undocumented)
@@ -2758,7 +2766,6 @@ export interface Continuation {
     readonly nextScanOffset: bigint;
     // (undocumented)
     readonly policyGeneration: bigint;
-    readonly readMode: ReadMode;
 }
 
 // @public (undocumented)
@@ -3067,6 +3074,9 @@ export class Decision {
 
 // @public (undocumented)
 function decodeAcceptedOperationJson(text: string): AcceptedOperationView;
+
+// @public (undocumented)
+function decodeAckContext(value: unknown, context: string): AckContext;
 
 // @public (undocumented)
 function decodeAgentCard(map: CborMap, context: string): AgentCard_2;
@@ -4431,6 +4441,9 @@ export function enabledBackends(capabilities: Capabilities): readonly BackendDes
 function encodeAcceptedOperationJson(value: AcceptedOperationView): string;
 
 // @public (undocumented)
+function encodeAckContext(context: AckContext): Map<string, unknown>;
+
+// @public (undocumented)
 function encodeAgentCard(card: AgentCard_2): Map<string, unknown>;
 
 // @public (undocumented)
@@ -4623,7 +4636,7 @@ function encodeFilterCatalogReply(reply: FilterCatalogReply): Map<string, unknow
 function encodeFilterConsumer(consumer: FilterConsumer): Map<string, unknown>;
 
 // @public (undocumented)
-function encodeFilteredAck(ack: FilteredAck): Map<string, unknown>;
+function encodeFilteredAck(request: FilteredAck): Map<string, unknown>;
 
 // @public (undocumented)
 function encodeFilteredPage(page: FilteredPage): Map<string, unknown>;
@@ -5675,7 +5688,10 @@ interface FilterDetail {
 // @public (undocumented)
 interface FilteredAck {
     // (undocumented)
+    readonly ackContext: AckContext;
+    // (undocumented)
     readonly consumer: FilterConsumer;
+    // (undocumented)
     readonly digest?: Uint8Array;
     // (undocumented)
     readonly generation: SourceGeneration;
@@ -5698,6 +5714,8 @@ interface FilteredAck {
 // @public
 interface FilteredPage {
     // (undocumented)
+    readonly ackContext: AckContext;
+    // (undocumented)
     readonly evaluationLimits?: {
         readonly maxPayloadBytes: number;
         readonly maxDepth: number;
@@ -5718,8 +5736,6 @@ interface FilteredPage {
     readonly partitionId: number;
     // (undocumented)
     readonly policy: AppliedPolicy;
-    // (undocumented)
-    readonly readMode: ReadMode;
     // (undocumented)
     readonly records: Uint8Array;
     // (undocumented)
@@ -5750,8 +5766,6 @@ interface FilteredPollRequest {
     // (undocumented)
     readonly partitionId: number;
     // (undocumented)
-    readonly readMode: ReadMode;
-    // (undocumented)
     readonly source: FilterSource;
     // (undocumented)
     readonly start: FilteredStart;
@@ -5769,7 +5783,6 @@ export class FilteredReader implements AsyncDisposable, AsyncIterable<MatchedRec
     ackPage(page: MatchedPage): Promise<void>;
     ackThrough(record: MatchedRecord): Promise<void>;
     close(): Promise<void>;
-    dataConnectionsOpened(): number;
     examinedInRound(): number;
     idleIntervalMs(): number;
     nextPage(options?: {
@@ -5795,7 +5808,6 @@ export class FilteredReaderBuilder {
     maxReplyBytes(bytes: number): this;
     maxUnackedPages(pages: number): this;
     partition(partitionId: number): this;
-    readMode(mode: ReadMode): this;
     start(start: FilteredStart): this;
 }
 
@@ -5834,7 +5846,7 @@ export function filterErrorCheckVersion(v: number): FilterError | undefined;
 export function filterErrorInvalid(error: InvalidError): FilterError;
 
 // @public (undocumented)
-export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "not_primary" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
+export type FilterErrorReason = "invalid_request" | "unsupported" | "version_skew" | "not_found" | "conflict" | "source_changed" | "membership_stale" | "catalog_unavailable" | "revision_disabled" | "too_large" | "unauthenticated" | "forbidden" | "unavailable" | "capacity_exhausted" | "backend"
 /** A reason this build does not know. The error's `code` still classifies it. */
 | "unknown";
 
@@ -6079,11 +6091,11 @@ function filterOperationPath(operationId: bigint): string;
 
 // @public (undocumented)
 type FilterOutcome = {
-    readonly kind: "page";
-    readonly page: FilteredPage;
-} | {
     readonly kind: "acknowledged";
     readonly receipt: AckReceipt;
+} | {
+    readonly kind: "page";
+    readonly page: FilteredPage;
 } | {
     readonly kind: "preview";
     readonly preview: FilterPreview;
@@ -6148,8 +6160,6 @@ export interface FilterPreview {
     readonly partitionId: number;
     // (undocumented)
     readonly policy: AppliedPolicy;
-    // (undocumented)
-    readonly readMode: ReadMode;
     // (undocumented)
     readonly records: readonly PreviewRecord[];
     // (undocumented)
@@ -11771,12 +11781,6 @@ export interface RawSql {
 // @public (undocumented)
 export function readinessReasons(capabilities: Capabilities, resourceId: BackendResourceId): readonly BackendReadinessReason[] | undefined;
 
-// @public
-export type ReadMode = "primary" | "local";
-
-// @public (undocumented)
-export function readModeIsPrimary(mode: ReadMode): boolean;
-
 // @public (undocumented)
 export class RecallBuilder {
     // (undocumented)
@@ -13591,11 +13595,9 @@ interface SourceGap {
 // @public
 export interface SourceGeneration {
     // (undocumented)
-    readonly partitionCreatedRevision: bigint;
-    // (undocumented)
     readonly partitionId: number;
     // (undocumented)
-    readonly purgeGeneration: bigint;
+    readonly partitionIncarnation: bigint;
     // (undocumented)
     readonly streamCreatedAtMicros: bigint;
     // (undocumented)
@@ -13611,9 +13613,9 @@ interface SourceIncarnation {
     // (undocumented)
     readonly cluster: PhysicalClusterIncarnation;
     // (undocumented)
-    readonly partitionCreatedRevision: bigint;
-    // (undocumented)
     readonly partitionId: number;
+    // (undocumented)
+    readonly partitionIncarnation: bigint;
     // (undocumented)
     readonly streamId: number;
     // (undocumented)
@@ -14471,7 +14473,7 @@ type ValidateError = {
 };
 
 // @public (undocumented)
-function validateFilteredAck(ack: FilteredAck): void;
+function validateFilteredAck(request: FilteredAck): void;
 
 // @public (undocumented)
 function validateFilteredPollRequest(request: FilteredPollRequest): void;
@@ -15470,16 +15472,15 @@ declare namespace wire {
         timestampFormatMicrosFromInteger,
         filterConsumerIsGroup,
         executionModeIsFiltered,
-        readModeIsPrimary,
         faultReasonIsForeign,
         appliedPolicyFiltered,
         appliedPolicyUnfiltered,
         filteredPageNextStart,
         filterErrorInvalid,
         filterErrorCheckVersion,
+        validateFilteredAck,
         validateFilteredPollRequest,
         validatePolicyIdentity,
-        validateFilteredAck,
         validateFilterPreviewRequest,
         validateFilterTestRequest,
         validateFilterGroupRef,
@@ -15494,9 +15495,11 @@ declare namespace wire {
         encodeCatalogPosition,
         decodeCatalogPosition,
         encodeSourceGeneration,
+        encodeAckContext,
         encodeFilteredStart,
-        encodeFilteredPollRequest,
         encodeFilteredAck,
+        decodeFilteredAck,
+        encodeFilteredPollRequest,
         encodeFilterPreviewRequest,
         encodeHeaderScalar,
         encodeFilterTestRequest,
@@ -15522,9 +15525,9 @@ declare namespace wire {
         decodeFilterConsumer,
         decodeFilterRef,
         decodeSourceGeneration,
+        decodeAckContext,
         decodeFilteredStart,
         decodeFilteredPollRequest,
-        decodeFilteredAck,
         decodeFilteredPage,
         decodeFilterError,
         decodeFilterReply,
@@ -15562,18 +15565,18 @@ declare namespace wire {
         FilterRef,
         ExecutionMode,
         CatalogPosition,
-        ReadMode,
         SourceGeneration,
+        AckContext,
         Continuation,
         FilteredStart,
+        FilteredAck,
+        AckReceipt,
         FilteredPollRequest,
         StopReason,
         FaultReason,
         RecordFault,
         AppliedPolicy,
         FilteredPage,
-        FilteredAck,
-        AckReceipt,
         FilterPreviewRequest,
         FilterVerdict as Verdict,
         Truth,
@@ -16571,7 +16574,7 @@ export interface WorkflowOutcome {
 
 // Warnings were encountered during analysis:
 //
-// src/client/laser.ts:764:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
+// src/client/laser.ts:766:16 - (ae-forgotten-export) The symbol "ClientOwnership" needs to be exported by the entry point full.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "load" needs to be exported by the entry point full.d.ts
 // src/conversation-state.ts:212:31 - (ae-forgotten-export) The symbol "loadWith" needs to be exported by the entry point full.d.ts
 

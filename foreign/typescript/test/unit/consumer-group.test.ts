@@ -446,21 +446,35 @@ void test("given_a_repeated_catalog_cursor_when_deleted_then_should_fail_without
   assert.equal(fixture.remaining().length, 9)
 })
 
-void test("given_a_single_node_deployment_when_a_laser_group_routes_reads_then_should_probe_the_node_count", async () => {
+void test("given_a_laser_group_when_it_routes_a_read_then_should_look_the_partition_route_up", async () => {
+  const requests: (readonly [number, Uint8Array])[] = []
+  // incarnation, metadata op, view, partition count, then primary replica 2
+  let route = new Uint8Array(25)
+  route[24] = 2
   const client = {
     clientProvider: () => Promise.resolve({ protocol: "vsr" }),
     destroy: () => Promise.resolve(),
-    cluster: {
-      getClusterMetadata: () =>
-        Promise.resolve({
-          name: "single-node",
-          nodes: [{ name: "iggy-node", ip: "127.0.0.1", endpoints: { tcp: 20032 } }]
-        })
+    sendBinaryRequest: (code: number, payload: Buffer) => {
+      requests.push([code, new Uint8Array(payload)])
+      return Promise.resolve(Buffer.from(route))
     }
   } as unknown as IggyClient
   await using laser = await Laser.fromClient(client)
   const context = (laser as unknown as { groupContext(): GroupContext }).groupContext()
-  assert.equal(await context.transport.clusterNodeCount?.(), 1)
+  assert.equal(await context.transport.partitionPrimary?.("orbit", "fleet", 3), 2)
+  const encoded = new TextEncoder()
+  assert.deepEqual(requests, [
+    [
+      105,
+      Uint8Array.of(2, 5, ...encoded.encode("orbit"), 2, 5, ...encoded.encode("fleet"), 3, 0, 0, 0)
+    ]
+  ])
+  route = new Uint8Array(24)
+  await assert.rejects(
+    context.transport.partitionPrimary?.("orbit", "fleet", 3) ?? Promise.resolve(),
+    ProtocolError,
+    "a route of another length comes from a mismatched build"
+  )
 })
 
 void test("given_a_topic_when_addressing_its_group_then_should_hand_back_the_same_topic", () => {

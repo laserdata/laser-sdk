@@ -7,6 +7,7 @@ import {
   MemoryHandle,
   type Capabilities,
   type Checkpoint,
+  type ClientMetadata,
   type ContextMessage,
   type LaserError,
   type AgentHandle,
@@ -52,6 +53,8 @@ export class LaserWorld {
   kv = new KvEngine();
   cas?: CasResult;
   notedPosition: MutationPosition | undefined;
+  clients: readonly ClientMetadata[] = [];
+  clientUser: number | undefined;
   graph = new GraphEngine();
   bridgeHops: readonly string[] = [];
   bridgeLoopRejected = false;

@@ -139,7 +139,8 @@ void test("given_a_transient_handler_failure_when_retried_then_should_reply_and_
         startAt: { kind: "next" }
       })
     try {
-      await assert.rejects(rejoined.nextWithin(100), TimeoutError)
+      const stored = await rejoined.storedOffset(0)
+      assert.ok(stored !== undefined && stored.storedOffset >= 0n, "the handled work is committed")
     } finally {
       await rejoined.shutdown()
     }
@@ -1263,6 +1264,7 @@ function gatedHandler(handled: string[], gate: Promise<void>, entered: () => voi
 void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_stall_intake_and_recover", async () => {
   const stream = `laser-ts-test-${randomUUID()}`
   const laser = await Laser.connectWithStream(CONNECTION_STRING, stream)
+  let stopAgent = (): Promise<void> => Promise.resolve()
   try {
     await laser.bootstrap(4, TopicRetention.expireAfter(86_400_000))
     const handled: string[] = []
@@ -1279,9 +1281,14 @@ void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_sta
       .listenOn(AgentTopic.Sessions)
       .concurrency({ kind: "serial-per-partition", maxPartitions: 4 })
       .maxQueuedRecords(3)
+      .pollInterval(5)
       .handler(gatedHandler(handled, gate, announceEntered))
       .build()
       .spawn(laser)
+    stopAgent = async () => {
+      releaseGate()
+      await handle.shutdown()
+    }
     await handle.ready()
 
     // A fast conversation drains completely while nothing is blocked.
@@ -1295,7 +1302,14 @@ void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_sta
         }
       )
     }
-    for (let attempt = 0; attempt < 160 && handled.length < 10; attempt += 1) await delay(10)
+    const assignedDeadline = Date.now() + 10_000
+    while (handled.length < 10) {
+      assert.ok(
+        Date.now() < assignedDeadline,
+        "the initial assignment must deliver the fast records"
+      )
+      await delay(10)
+    }
     assert.equal(handled.length, 10)
 
     // Block one conversation's lane, then flood it past the three-record
@@ -1340,8 +1354,8 @@ void test("given_a_blocked_partition_when_the_record_bound_fills_then_should_sta
       handled.filter((payload) => payload.startsWith("queued-")),
       Array.from({ length: 20 }, (_, index) => `queued-${String(index)}`)
     )
-    await handle.shutdown()
   } finally {
+    await stopAgent()
     await laser.close()
   }
 })

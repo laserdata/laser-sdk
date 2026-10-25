@@ -17,7 +17,6 @@ import {
   filterErrorInvalid,
   filterExprCaseInsensitive,
   filteredPageNextStart,
-  readModeIsPrimary,
   recordPolicyIsReject,
   textPredicateValidate,
   timestampFormatMicrosFromInteger,
@@ -30,8 +29,7 @@ const GENERATION = {
   topicId: 3,
   topicCreatedAtMicros: 4n,
   partitionId: 0,
-  partitionCreatedRevision: 5n,
-  purgeGeneration: 6n
+  partitionIncarnation: 5n
 }
 
 function page(nextScanOffset?: bigint): FilteredPage {
@@ -40,7 +38,7 @@ function page(nextScanOffset?: bigint): FilteredPage {
     partitionId: 0,
     policy: appliedPolicyUnfiltered(7n, 9n),
     generation: GENERATION,
-    readMode: "local",
+    ackContext: { ownerGeneration: 6n, metadataOp: 8n },
     ...(nextScanOffset === undefined ? {} : { nextScanOffset }),
     frontier: 100n,
     examined: 1,
@@ -57,8 +55,6 @@ void test("given_word_enums_when_classified_then_should_match_the_rust_predicate
   assert.equal(filterConsumerIsGroup({ kind: "consumer", name: "solo" }), false)
   assert.equal(executionModeIsFiltered("filtered"), true)
   assert.equal(executionModeIsFiltered("unfiltered"), false)
-  assert.equal(readModeIsPrimary("primary"), true)
-  assert.equal(readModeIsPrimary("local"), false)
   assert.equal(recordPolicyIsReject("reject"), true)
   assert.equal(recordPolicyIsReject("pass"), false)
   for (const reason of [
@@ -97,7 +93,6 @@ void test("given_a_page_when_continuing_then_should_resume_after_it_or_repeat_th
     continuation: {
       nextScanOffset: 42n,
       generation: GENERATION,
-      readMode: "local",
       mode: "unfiltered",
       policyGeneration: 9n,
       groupId: 7n

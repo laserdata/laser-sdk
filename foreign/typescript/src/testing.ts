@@ -1,3 +1,5 @@
+/// <reference types="node" preserve="true" />
+
 import { AgentCtx } from "./agent/context.js"
 import type { AgentMessage } from "./agent/reliable-consumer.js"
 import { ADVERTISED_INBOX_ROUTE, type InboxRoute } from "./agent/router.js"

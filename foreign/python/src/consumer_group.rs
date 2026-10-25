@@ -4,7 +4,7 @@ use crate::errors::{InvalidError, to_pyerr};
 use crate::filters::{PyConsumerFilter, PyFilteredReader, filter_headers, filtered_start};
 use crate::stream::PyTopic;
 use crate::transport::{ConsumerConfig, PyConsumer, configure_consumer};
-use laser_sdk::filters::{FilteredStart, GroupFilterSpec, ReadMode};
+use laser_sdk::filters::{FilteredStart, GroupFilterSpec};
 use laser_sdk::stream::{ConsumerGroup, ConsumerGroupInfo};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -173,7 +173,6 @@ impl PyConsumerGroup {
     /// the source records one page examines, independent of `count`.
     /// `max_reply_bytes` bounds record bytes per page.
     /// `max_unacked_pages` bounds outstanding pages per partition, default 1024.
-    /// `read_mode` is primary or local. Local reads cannot acknowledge.
     /// `local_guard` checks delivered records against the filter locally.
     /// `idle_interval_ms` is milliseconds, finite and non-negative.
     #[pyo3(signature = (
@@ -183,7 +182,6 @@ impl PyConsumerGroup {
         max_examined=None,
         max_reply_bytes=None,
         max_unacked_pages=None,
-        read_mode="primary",
         local_guard=false,
         idle_interval_ms=None,
         partitions=None,
@@ -197,7 +195,6 @@ impl PyConsumerGroup {
         max_examined: Option<u32>,
         max_reply_bytes: Option<u32>,
         max_unacked_pages: Option<usize>,
-        read_mode: &str,
         local_guard: bool,
         idle_interval_ms: Option<f64>,
         partitions: Option<Vec<u32>>,
@@ -206,15 +203,6 @@ impl PyConsumerGroup {
             .map(filtered_start)
             .transpose()?
             .unwrap_or(FilteredStart::Next);
-        let read_mode = match read_mode {
-            "primary" => ReadMode::Primary,
-            "local" => ReadMode::Local,
-            other => {
-                return Err(InvalidError::new_err(format!(
-                    "read_mode must be `primary` or `local`, got `{other}`"
-                )));
-            }
-        };
         let idle_interval = idle_interval_ms
             .map(|ms| duration_ms(ms, "idle_interval_ms"))
             .transpose()?;
@@ -224,7 +212,6 @@ impl PyConsumerGroup {
                 .reader()
                 .map_err(to_pyerr)?
                 .start(start)
-                .read_mode(read_mode)
                 .local_guard(local_guard);
             for partition in partitions.unwrap_or_default() {
                 builder = builder.partition(partition);

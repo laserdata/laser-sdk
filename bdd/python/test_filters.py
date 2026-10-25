@@ -271,7 +271,12 @@ def read_bounded_scan(world):
         await group.create(filter=safe_mode())
         reader = await group.reader(start="first", count=1, max_examined=100)
         try:
-            empty, more = await reader.read_round()
+            async with asyncio.timeout(READ_TIMEOUT):
+                while True:
+                    empty, more = await reader.read_round()
+                    if reader.examined_in_round() > 0:
+                        break
+                    await asyncio.sleep(0.01)
             assert empty is None
             assert more is True
             assert reader.examined_in_round() == 100
@@ -313,3 +318,28 @@ def consume_bounded_scan(world):
             await consumer.shutdown()
 
     world.filtered = world.run(read)
+
+
+@when("the anomaly desk rejects a page after releasing its policy")
+def reject_old_policy(world):
+    async def run():
+        group = world.laser.topic(TOPIC).consumer_group("policy-ack")
+        await group.create(filter=safe_mode())
+        reader = await group.reader(start="first")
+        try:
+            page = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
+            await group.filter().release()
+            try:
+                await reader.ack_page(page)
+            except ls.FilterError as error:
+                assert error.reason == "conflict"
+            else:
+                raise AssertionError("old policy acknowledged")
+            current = await asyncio.wait_for(reader.next_page(), READ_TIMEOUT)
+            assert current.records[0].offset == 0
+            await reader.ack_page(current)
+            return [record.message.payload for record in current.records]
+        finally:
+            await reader.close()
+
+    world.filtered = world.run(run)

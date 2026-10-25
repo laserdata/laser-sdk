@@ -17,7 +17,6 @@ __all__ = [
     "AGDX_AUTHZ_WHOAMI_CODE",
     "AGDX_COMMAND_BASE",
     "AGDX_DECODE_RECORD_CODE",
-    "AGDX_FILTERED_ACK_CODE",
     "AGDX_FILTERED_POLL_CODE",
     "AGDX_FILTER_MUTATE_CODE",
     "AGDX_FILTER_OPERATION_CODE",
@@ -64,6 +63,7 @@ __all__ = [
     "AGDX_REGISTER_SCHEMA_CODE",
     "AGENT_ID",
     "AUTHZ_OP_VERSION",
+    "AckContext",
     "ActionCounters",
     "ActionDecision",
     "Agdx",
@@ -430,7 +430,6 @@ __all__ = [
     "query_new",
     "query_operational",
     "query_target_operational",
-    "read_mode_is_primary",
     "record_policy_is_reject",
     "resolve_body",
     "response_envelope",
@@ -482,7 +481,6 @@ AGDX_AUTHZ_LIST_ROLES_CODE: builtins.int = 1000101
 AGDX_AUTHZ_WHOAMI_CODE: builtins.int = 1000100
 AGDX_COMMAND_BASE: builtins.int = 1000000
 AGDX_DECODE_RECORD_CODE: builtins.int = 1000223
-AGDX_FILTERED_ACK_CODE: builtins.int = 1000801
 AGDX_FILTERED_POLL_CODE: builtins.int = 1000800
 AGDX_FILTER_MUTATE_CODE: builtins.int = 1000810
 AGDX_FILTER_OPERATION_CODE: builtins.int = 1000816
@@ -676,6 +674,14 @@ class A2aBridge:
         the path. Raises `InvalidError` when `previous` already holds this
         bridge, or while a call is in flight. Returns the bridge.
         """
+
+@typing.final
+class AckContext:
+    @property
+    def owner_generation(self) -> builtins.int: ...
+    @property
+    def metadata_op(self) -> builtins.int: ...
+    def __new__(cls, owner_generation: builtins.int, metadata_op: builtins.int) -> AckContext: ...
 
 @typing.final
 class ActionCounters:
@@ -2117,9 +2123,7 @@ class Consumer:
     exposes manual offset storage for commit-after-handle delivery. A group
     consumer on a server that resolves group policies runs the group's
     filter, or none, without naming one, and commits through the group's
-    fenced acknowledgments. A purge restarts the partition at offset 0
-    without telling an open reader, which can keep its old position and skip
-    the replacement records, so rebuild it after a purge.
+    fenced acknowledgments.
     """
     def init(self) -> typing.Any:
         r"""
@@ -2344,7 +2348,7 @@ class ConsumerGroup:
         `commit(message)` for commit-after-handle delivery. `batch_length`
         also bounds the source records one partition poll examines.
         """
-    def reader(self, *, start: typing.Optional[typing.Any] = None, count: typing.Optional[builtins.int] = None, max_examined: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, read_mode: builtins.str = 'primary', local_guard: builtins.bool = False, idle_interval_ms: typing.Optional[builtins.float] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None) -> typing.Any:
+    def reader(self, *, start: typing.Optional[typing.Any] = None, count: typing.Optional[builtins.int] = None, max_examined: typing.Optional[builtins.int] = None, max_reply_bytes: typing.Optional[builtins.int] = None, max_unacked_pages: typing.Optional[builtins.int] = None, local_guard: builtins.bool = False, idle_interval_ms: typing.Optional[builtins.float] = None, partitions: typing.Optional[typing.Sequence[builtins.int]] = None) -> typing.Any:
         r"""
         Pages selected by the group's policy with original offsets, an independent
         scan budget, and explicit acknowledgments. An unbound group returns every
@@ -2355,7 +2359,6 @@ class ConsumerGroup:
         the source records one page examines, independent of `count`.
         `max_reply_bytes` bounds record bytes per page.
         `max_unacked_pages` bounds outstanding pages per partition, default 1024.
-        `read_mode` is primary or local. Local reads cannot acknowledge.
         `local_guard` checks delivered records against the filter locally.
         `idle_interval_ms` is milliseconds, finite and non-negative.
         """
@@ -3267,15 +3270,9 @@ class FilteredReader:
         its records can still be acknowledged. A rejoin retires every earlier
         page.
         """
-    def data_connections_opened(self) -> typing.Any:
-        r"""
-        Data connections this reader opened to partition primaries, including
-        routes later retired. A healthy reader opens one per node and keeps it.
-        """
     def close(self) -> typing.Any:
         r"""
-        Store completed progress, leave the group, and close the data
-        connections. Closing twice is a no-op.
+        Store completed progress and leave the group. Closing twice is a no-op.
         """
     def __aiter__(self) -> FilteredReader: ...
     def __anext__(self) -> typing.Any: ...
@@ -9193,11 +9190,6 @@ def query_operational(execution_id: builtins.str, index: builtins.str, deadline_
 def query_target_operational(index: builtins.str) -> typing.Any:
     r"""
     The operational query target dict for one materialized index.
-    """
-
-def read_mode_is_primary(mode: typing.Any) -> builtins.bool:
-    r"""
-    Whether the read `mode` (`primary` or `local`) reads the partition primary.
     """
 
 def record_policy_is_reject(policy: builtins.str) -> builtins.bool:

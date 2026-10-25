@@ -40,7 +40,13 @@ async def paused_transport(iggy_endpoint):
             await forwarding.wait()
             writer.write(data)
             await writer.drain()
-            if reply and pause_after_reply[0] is not None:
+            if (
+                reply
+                and header[208] == 160
+                and int.from_bytes(header[216:220], "little") == 0
+                and header[220] == 1
+                and pause_after_reply[0] is not None
+            ):
                 pause_after_reply[0] -= 1
                 if pause_after_reply[0] == 0:
                     forwarding.clear()

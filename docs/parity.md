@@ -1597,7 +1597,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 
 | Rust | Python | TypeScript | Notes |
 | --- | --- | --- | --- |
-| `filters::AGDX_FILTERED_ACK_CODE` | `const:AGDX_FILTERED_ACK_CODE` | `const:AGDX_FILTERED_ACK_CODE` |  |
 | `filters::AGDX_FILTERED_POLL_CODE` | `const:AGDX_FILTERED_POLL_CODE` | `const:AGDX_FILTERED_POLL_CODE` |  |
 | `filters::AGDX_FILTER_MUTATE_CODE` | `const:AGDX_FILTER_MUTATE_CODE` | `const:AGDX_FILTER_MUTATE_CODE` |  |
 | `filters::AGDX_FILTER_OPERATION_CODE` | `const:AGDX_FILTER_OPERATION_CODE` | `const:AGDX_FILTER_OPERATION_CODE` |  |
@@ -1609,6 +1608,9 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `filters::AGDX_LIST_FILTERS_CODE` | `const:AGDX_LIST_FILTERS_CODE` | `const:AGDX_LIST_FILTERS_CODE` |  |
 | `filters::AGDX_LIST_FILTER_BINDINGS_CODE` | `const:AGDX_LIST_FILTER_BINDINGS_CODE` | `const:AGDX_LIST_FILTER_BINDINGS_CODE` |  |
 | `filters::AGDX_LIST_FILTER_REVISIONS_CODE` | `const:AGDX_LIST_FILTER_REVISIONS_CODE` | `const:AGDX_LIST_FILTER_REVISIONS_CODE` |  |
+| `AckContext` | `AckContext` | `AckContext` |  |
+| `AckContext.owner_generation` | `AckContext.owner_generation` | `AckContext.ownerGeneration` | keywords |
+| `AckContext.metadata_op` | `AckContext.metadata_op` | `AckContext.metadataOp` | keywords |
 | `AppliedPolicy` | dict via `MatchedPage.policy` | `AppliedPolicy` | serde-dict |
 | `AppliedPolicy.group_id` | dict key | `AppliedPolicy.groupId` | serde-dict, keywords |
 | `AppliedPolicy.digest` | dict key | `AppliedPolicy.digest` | serde-dict, keywords |
@@ -1663,7 +1665,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `Continuation.next_scan_offset` | dict key | `Continuation.nextScanOffset` | serde-dict, keywords |
 | `Continuation.generation` | dict key | `Continuation.generation` | serde-dict, keywords |
 | `Continuation.digest` | dict key | `Continuation.digest` | serde-dict, keywords |
-| `Continuation.read_mode` | dict key | `Continuation.readMode` | serde-dict, keywords |
 | `Continuation.mode` | dict key | `Continuation.mode` | serde-dict, keywords |
 | `Continuation.policy_generation` | dict key | `Continuation.policyGeneration` | serde-dict, keywords |
 | `filters::DEFAULT_OUTCOME_WAIT` | `const:DEFAULT_OUTCOME_WAIT_MS` | `const:DEFAULT_OUTCOME_WAIT_MS` |  |
@@ -1727,7 +1728,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilterErrorReason::Conflict` | omitted | `FilterErrorReason` | plain-value |
 | `FilterErrorReason::SourceChanged` | omitted | `FilterErrorReason` | plain-value |
 | `FilterErrorReason::MembershipStale` | omitted | `FilterErrorReason` | plain-value |
-| `FilterErrorReason::NotPrimary` | omitted | `FilterErrorReason` | plain-value |
 | `FilterErrorReason::CatalogUnavailable` | omitted | `FilterErrorReason` | plain-value |
 | `FilterErrorReason::RevisionDisabled` | omitted | `FilterErrorReason` | plain-value |
 | `FilterErrorReason::TooLarge` | omitted | `FilterErrorReason` | plain-value |
@@ -1785,7 +1785,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilterPreview.v` | dict key | `FilterPreview.v` | serde-dict, keywords |
 | `FilterPreview.partition_id` | dict key | `FilterPreview.partitionId` | serde-dict, keywords |
 | `FilterPreview.policy` | dict key | `FilterPreview.policy` | serde-dict, keywords |
-| `FilterPreview.read_mode` | dict key | `FilterPreview.readMode` | serde-dict, keywords |
 | `FilterPreview.examined` | dict key | `FilterPreview.examined` | serde-dict, keywords |
 | `FilterPreview.matched` | dict key | `FilterPreview.matched` | serde-dict, keywords |
 | `FilterPreview.faults` | dict key | `FilterPreview.faults` | serde-dict, keywords |
@@ -1831,7 +1830,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilteredReader::ack_page` | `FilteredReader.ack_page` | `FilteredReader.ackPage` |  |
 | `FilteredReader::ack_through` | `FilteredReader.ack_through` | `FilteredReader.ackThrough` |  |
 | `FilteredReader::close` | `FilteredReader.close` | `FilteredReader.close` |  |
-| `FilteredReader::data_connections_opened` | `FilteredReader.data_connections_opened` | `FilteredReader.dataConnectionsOpened` |  |
 | `FilteredReader::examined_in_round` | `FilteredReader.examined_in_round` | `FilteredReader.examinedInRound` |  |
 | `FilteredReader::idle_interval` | `FilteredReader.idle_interval_ms` | `FilteredReader.idleIntervalMs` |  |
 | `FilteredReader::next_page` | `FilteredReader.next_page` | `FilteredReader.nextPage` |  |
@@ -1849,7 +1847,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `FilteredReaderBuilder::max_reply_bytes` | `ConsumerGroup.reader(max_reply_bytes=)` | `FilteredReaderBuilder.maxReplyBytes` | keywords |
 | `FilteredReaderBuilder::max_unacked_pages` | `ConsumerGroup.reader(max_unacked_pages=)` | `FilteredReaderBuilder.maxUnackedPages` | keywords |
 | `FilteredReaderBuilder::partition` | `ConsumerGroup.reader(partitions=)` | `FilteredReaderBuilder.partition` | keywords |
-| `FilteredReaderBuilder::read_mode` | `ConsumerGroup.reader(read_mode=)` | `FilteredReaderBuilder.readMode` | keywords |
 | `FilteredReaderBuilder::start` | `ConsumerGroup.reader(start=)` | `FilteredReaderBuilder.start` | keywords |
 | `FilteredStart` | dict via `ConsumerGroup.reader` | `FilteredStart` | serde-dict |
 | `FilteredStart::Next` | dict key | `FilteredStart` | serde-dict, plain-value |
@@ -1922,10 +1919,6 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `PreviewRecord.payload_text` | dict key | `PreviewRecord.payloadText` | serde-dict, keywords |
 | `PreviewRecord.payload_truncated` | dict key | `PreviewRecord.payloadTruncated` | serde-dict, keywords |
 | `PreviewRecord.explanation` | dict key | `PreviewRecord.explanation` | serde-dict, keywords |
-| `ReadMode` | omitted | `ReadMode` | plain-value |
-| `ReadMode::Primary` | omitted | `ReadMode` | plain-value |
-| `ReadMode::Local` | omitted | `ReadMode` | plain-value |
-| `ReadMode::is_primary` | `fn:read_mode_is_primary` | `fn:readModeIsPrimary` | free-function |
 | `RecordPolicy` | omitted | `RecordPolicy` | plain-value |
 | `RecordPolicy::Reject` | omitted | `RecordPolicy` | plain-value |
 | `RecordPolicy::Pass` | omitted | `RecordPolicy` | plain-value |
@@ -1936,8 +1929,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SourceGeneration.topic_id` | dict key | `SourceGeneration.topicId` | serde-dict, keywords |
 | `SourceGeneration.topic_created_at_micros` | dict key | `SourceGeneration.topicCreatedAtMicros` | serde-dict, keywords |
 | `SourceGeneration.partition_id` | dict key | `SourceGeneration.partitionId` | serde-dict, keywords |
-| `SourceGeneration.partition_created_revision` | dict key | `SourceGeneration.partitionCreatedRevision` | serde-dict, keywords |
-| `SourceGeneration.purge_generation` | dict key | `SourceGeneration.purgeGeneration` | serde-dict, keywords |
+| `SourceGeneration.partition_incarnation` | dict key | `SourceGeneration.partitionIncarnation` | serde-dict, keywords |
 | `StopReason` | omitted | `StopReason` | plain-value |
 | `StopReason::Filled` | omitted | `StopReason` | plain-value |
 | `StopReason::Budget` | omitted | `StopReason` | plain-value |
@@ -3331,7 +3323,7 @@ A peer may differ from the Rust spelling only for one of the reasons below. Any 
 | `SourceIncarnation.stream_id` | dict key | `wire.SourceIncarnation.streamId` | serde-dict, keywords |
 | `SourceIncarnation.topic_id` | dict key | `wire.SourceIncarnation.topicId` | serde-dict, keywords |
 | `SourceIncarnation.partition_id` | dict key | `wire.SourceIncarnation.partitionId` | serde-dict, keywords |
-| `SourceIncarnation.partition_created_revision` | dict key | `wire.SourceIncarnation.partitionCreatedRevision` | serde-dict, keywords |
+| `SourceIncarnation.partition_incarnation` | dict key | `wire.SourceIncarnation.partitionIncarnation` | serde-dict, keywords |
 | `SourceOffsetRange` | dict via `Destinations.prepare` | `wire.SourceOffsetRange` | serde-dict |
 | `SourceOffsetRange.incarnation` | dict key | `wire.SourceOffsetRange.incarnation` | serde-dict, keywords |
 | `SourceOffsetRange.start` | dict key | `wire.SourceOffsetRange.start` | serde-dict, keywords |

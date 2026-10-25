@@ -1,6 +1,7 @@
 use crate::capabilities::{Capabilities, HelloOutcome};
 use crate::connect_options::{ConnectOptions, connect_before};
 use crate::error::LaserError;
+use crate::nodes::{Nodes, Target};
 pub use crate::publish_options::PublishOptions;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -16,37 +17,6 @@ use tokio::time::{Duration, sleep};
 /// How long a managed mutation keeps repeating its frame while its outcome is
 /// unknown, the shared client contract deadline.
 pub(crate) use crate::retry::MANAGED_MUTATION_DEADLINE;
-
-const KV_READ_BARRIER: u8 = 1;
-const FORK_READ_BARRIER: u8 = 2;
-const GRAPH_READ_BARRIER: u8 = 4;
-const SESSION_READ_BARRIER: u8 = 8;
-const ALL_READ_BARRIERS: u8 =
-    KV_READ_BARRIER | FORK_READ_BARRIER | GRAPH_READ_BARRIER | SESSION_READ_BARRIER;
-
-/// The read barrier bit of a managed read's surface, or `0` for a command
-/// that takes none.
-fn barrier_bit(code: u32) -> u8 {
-    use laser_wire::codes::{
-        AGDX_FORK_LIST_CODE, AGDX_GRAPH_NEIGHBORS_CODE, AGDX_GRAPH_QUERY_CODE, AGDX_KV_EXISTS_CODE,
-        AGDX_KV_GET_CODE, AGDX_KV_NAMESPACES_CODE, AGDX_KV_SCAN_CODE,
-    };
-    match code {
-        AGDX_KV_GET_CODE | AGDX_KV_SCAN_CODE | AGDX_KV_NAMESPACES_CODE | AGDX_KV_EXISTS_CODE => {
-            KV_READ_BARRIER
-        }
-        AGDX_FORK_LIST_CODE => FORK_READ_BARRIER,
-        AGDX_GRAPH_QUERY_CODE | AGDX_GRAPH_NEIGHBORS_CODE => GRAPH_READ_BARRIER,
-        laser_wire::codes::AGDX_SESSION_GET_CODE
-        | laser_wire::codes::AGDX_SESSION_LIST_CODE
-        | laser_wire::codes::AGDX_SESSION_EVENTS_CODE
-        | laser_wire::codes::AGDX_SESSION_STATE_CODE
-        | laser_wire::codes::AGDX_SESSION_LINKS_CODE
-        | laser_wire::codes::AGDX_SESSION_SOURCES_CODE
-        | laser_wire::codes::AGDX_SESSION_CHANGES_CODE => SESSION_READ_BARRIER,
-        _ => 0,
-    }
-}
 
 /// The message of a managed reply that leaves a mutation's outcome unknown, or
 /// `None` for a final reply. `Pending` means the managed backend accepted the mutation
@@ -204,23 +174,20 @@ struct LaserInner {
     publish_generation: std::sync::atomic::AtomicU64,
     publish_options: PublishOptions,
     // The normalized connection string, when this handle built its own client.
-    // Dedicated connections (fenced-lease coordination, partition-primary data
-    // connections for filtered reads) reuse its credentials and TLS settings.
+    // Dedicated connections (fenced-lease coordination, group readers) reuse
+    // its credentials and TLS settings.
     connection_string: Option<String>,
     #[cfg(feature = "kv")]
     coordination: OnceCell<Arc<crate::kv::FencedLeaseClient<crate::kv::DedicatedKvTransport>>>,
     #[cfg(feature = "kv")]
     coordination_acquire_gate: tokio::sync::Mutex<()>,
     producers: DashMap<ProducerKey, ProducerCell>,
-    // The node managed requests use after the shared connection's managed backend failed.
-    managed_route: crate::managed_route::ManagedRoute,
-    // Surfaces whose next read must wait for the new node's fold to reach the
-    // mutation log head, one bit per surface, set by a node move.
-    read_barriers: std::sync::atomic::AtomicU8,
     // The highest mutation position seen per surface, from mutation and read
     // replies. Every KV, fork and graph read sends it back, so whichever node
     // answers has applied at least what this client wrote or read before.
     seen_frontier: std::sync::Mutex<laser_wire::mutation::AppliedFrontier>,
+    // The node each managed request goes to.
+    nodes: Nodes,
     pub(crate) producer_statistics: Arc<crate::stream::producer_statistics::ProducerRegistry>,
     negotiated: std::sync::RwLock<NegotiatedState>,
     // Lets one caller at a time re-probe an unmanaged capability set.
@@ -388,9 +355,8 @@ impl Laser {
                 client: std::sync::RwLock::new(Arc::new(client)),
                 publish_options: PublishOptions::default(),
                 reconnect_gate: tokio::sync::Mutex::new(()),
-                managed_route: Default::default(),
-                read_barriers: std::sync::atomic::AtomicU8::new(0),
                 seen_frontier: std::sync::Mutex::default(),
+                nodes: Nodes::new(caller_key()),
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
                 connection_string: None,
                 #[cfg(feature = "kv")]
@@ -601,6 +567,20 @@ impl Laser {
             .clone()
     }
 
+    /// Where this client's managed requests go.
+    pub(crate) fn nodes(&self) -> &Nodes {
+        &self.inner.nodes
+    }
+
+    #[doc(hidden)]
+    pub async fn caller_replica(&self) -> Result<u8, LaserError> {
+        self.nodes()
+            .caller_node(&self.client())
+            .await
+            .map(|(replica, _)| replica)
+            .map_err(LaserError::from)
+    }
+
     /// Close the shared connection. Every clone of this `Laser`, and every consumer or reply reader riding it, loses the connection too. A fenced-lease coordination connection this handle opened closes with it. Safe to call more than once.
     pub async fn close(&self) -> Result<(), LaserError> {
         self.inner.producer_statistics.close();
@@ -610,7 +590,6 @@ impl Laser {
         }
         #[cfg(feature = "agent")]
         self.inner.reply_hubs.clear();
-        self.inner.managed_route.close().await;
         self.client().shutdown().await.map_err(LaserError::from)
     }
 
@@ -887,7 +866,7 @@ impl Laser {
             .clone();
         #[allow(unused_mut)]
         let mut topology = None;
-        match probe_managed_host(&self.client()).await {
+        match probe_managed_host(&self.client(), &self.inner.nodes).await {
             Ok(Some(announce)) => {
                 merge_announcement(&mut capabilities, &announce);
                 topology = announce.topology;
@@ -1093,23 +1072,23 @@ impl Laser {
                         };
                         if let Some((stream_id, topic_id, route)) = source {
                             let mut batch: Vec<_> = chunk.iter().map(clone_iggy_message).collect();
-                            return Ok(self
-                                .client()
-                                .send_messages(
-                                    &Identifier::numeric(stream_id)?,
-                                    &Identifier::numeric(topic_id)?,
-                                    &route,
-                                    &mut batch,
-                                )
-                                .await?);
+                            let client = self.client();
+                            // Boxed so the driver's deep future does not
+                            // push every caller past the layout query limit.
+                            return Ok(Box::pin(client.send_messages(
+                                &Identifier::numeric(stream_id)?,
+                                &Identifier::numeric(topic_id)?,
+                                &route,
+                                &mut batch,
+                            ))
+                            .await?);
                         }
                         let producer = self.producer_on(stream, topic).await?;
-                        let sent = producer
-                            .send_with_partitioning(
-                                chunk.iter().map(clone_iggy_message).collect(),
-                                Some(partitioning.clone()),
-                            )
-                            .await;
+                        let sent = Box::pin(producer.send_with_partitioning(
+                            chunk.iter().map(clone_iggy_message).collect(),
+                            Some(partitioning.clone()),
+                        ))
+                        .await;
                         match sent {
                             // A cached producer can outlive a deleted and
                             // recreated stream or topic. Rebuild it once.
@@ -1117,12 +1096,11 @@ impl Laser {
                                 self.reconnect_for_publish(self.publish_generation())
                                     .await?;
                                 let producer = self.producer_on(stream, topic).await?;
-                                Ok(producer
-                                    .send_with_partitioning(
-                                        chunk.iter().map(clone_iggy_message).collect(),
-                                        Some(partitioning.clone()),
-                                    )
-                                    .await?)
+                                Ok(Box::pin(producer.send_with_partitioning(
+                                    chunk.iter().map(clone_iggy_message).collect(),
+                                    Some(partitioning.clone()),
+                                ))
+                                .await?)
                             }
                             other => Ok(other?),
                         }
@@ -1161,61 +1139,32 @@ impl Laser {
         code: u32,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, LaserError> {
+        Ok(self
+            .send_managed_to(code, payload, Target::of_code(code))
+            .await?
+            .0)
+    }
+
+    /// Send managed command `code` to `target` like
+    /// [`send_raw_with_response`](Self::send_raw_with_response), and name the
+    /// replica that answered, `None` for the metadata primary.
+    pub(crate) async fn send_managed_to(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        target: Target,
+    ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
         if !laser_wire::codes::is_idempotent_managed_request(code) {
-            // After a node move, the first read of each surface waits for the
-            // new node's fold to reach the log head, so it cannot miss this
-            // client's own earlier writes, even one whose reply was lost.
-            let barrier = barrier_bit(code);
-            let barriered = barrier != 0
-                && self
-                    .inner
-                    .read_barriers
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    & barrier
-                    != 0;
-            let frame = bytes::Bytes::from(self.read_frame(code, &payload, barriered)?);
-            let (node, client) = self.managed_client().await;
-            let reply = match client.send_binary_request(code, frame).await {
-                Ok(reply) => self.take_positioned(reply.to_vec()),
-                Err(error) => {
-                    // A pinned node does not reconnect. The caller decides
-                    // whether to send again, and the next request uses the
-                    // shared connection.
-                    if let Some(node) = node.as_deref() {
-                        self.inner.managed_route.unpin(node).await;
-                    }
-                    return Err(error.into());
-                }
-            };
-            // A read is safe to send again, so it moves once to another node
-            // when this node's managed backend did not answer.
-            if decode_named::<laser_wire::result::CommandError>(&reply)
-                .is_ok_and(|error| error.code.is_backend_unavailable())
-                && self.move_managed(node.as_deref()).await
-            {
-                let (moved_node, client) = self.managed_client().await;
-                // The move armed the barrier, so the one retry carries it.
-                let frame = bytes::Bytes::from(self.read_frame(code, &payload, barrier != 0)?);
-                let reply = match client.send_binary_request(code, frame).await {
-                    Ok(reply) => self.take_positioned(reply.to_vec()),
-                    Err(error) => {
-                        // The fresh pin fails like the first one: it goes,
-                        // so later requests do not fail on it first.
-                        if let Some(node) = moved_node.as_deref() {
-                            self.inner.managed_route.unpin(node).await;
-                        }
-                        return Err(error.into());
-                    }
-                };
-                if barrier != 0 {
-                    self.settle_barrier(barrier, &reply);
-                }
-                return Ok(reply);
-            }
-            if barriered {
-                self.settle_barrier(barrier, &reply);
-            }
-            return Ok(reply);
+            let frame = bytes::Bytes::from(self.read_frame(code, &payload)?);
+            let answered = self
+                .inner
+                .nodes
+                .send(&self.client(), code, frame, target)
+                .await?;
+            return Ok((
+                self.take_positioned(answered.reply.to_vec()),
+                answered.replica,
+            ));
         }
         let operation_id = u128::from(ulid::Ulid::generate());
         let frame =
@@ -1225,7 +1174,8 @@ impl Laser {
                 payload,
             })
             .map_err(|error| LaserError::Codec(format!("encode managed request: {error}")))?;
-        self.send_managed_mutation(code, operation_id, frame).await
+        self.send_managed_mutation(code, operation_id, frame, target)
+            .await
     }
 
     /// Send one managed mutation until its outcome is known. The frame, and
@@ -1241,32 +1191,32 @@ impl Laser {
         code: u32,
         operation_id: u128,
         frame: Vec<u8>,
-    ) -> Result<Vec<u8>, LaserError> {
+        target: Target,
+    ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
         let deadline = tokio::time::Instant::now() + MANAGED_MUTATION_DEADLINE;
         let mut delay = crate::retry::MANAGED_MUTATION.base;
         loop {
-            let (node, client) = self.managed_client().await;
-            let (unknown, node_failed) = match client
-                .send_binary_request(code, bytes::Bytes::from(frame.clone()))
+            let unknown = match self
+                .inner
+                .nodes
+                .send(
+                    &self.client(),
+                    code,
+                    bytes::Bytes::from(frame.clone()),
+                    target,
+                )
                 .await
             {
-                Ok(reply) => {
-                    let reply = self.take_positioned(reply.to_vec());
+                Ok(answered) => {
+                    let reply = self.take_positioned(answered.reply.to_vec());
                     match unknown_outcome(&reply) {
-                        Some(error) => (error.message, error.code.is_backend_unavailable()),
-                        None => return Ok(reply),
+                        Some(error) => error.message,
+                        None => return Ok((reply, answered.replica)),
                     }
                 }
-                Err(error) if crate::error::is_transient_iggy_io_error(&error) => {
-                    (error.to_string(), true)
-                }
+                Err(error) if crate::error::is_transient_iggy_io_error(&error) => error.to_string(),
                 Err(error) => return Err(error.into()),
             };
-            // The same frame goes to another node, so the move keeps the
-            // operation identity and the deadline.
-            if node_failed {
-                self.move_managed(node.as_deref()).await;
-            }
             let wait = jittered(delay);
             if tokio::time::Instant::now() + wait >= deadline {
                 return Err(LaserError::AmbiguousMutation(format!(
@@ -1288,22 +1238,12 @@ impl Laser {
         }
     }
 
-    /// The connection managed requests use: the node they moved to after a
-    /// managed backend failure, or the shared connection. The node name is `None` for
-    /// the shared connection.
-    async fn managed_client(&self) -> (Option<String>, Arc<IggyClient>) {
-        match self.inner.managed_route.pinned().await {
-            Some(pinned) => (Some(pinned.node), pinned.client),
-            None => (None, self.client()),
-        }
-    }
-
     /// The frame for managed read `code`. A KV, fork, graph or session read
     /// always goes in a
     /// [`ManagedReadEnvelope`](laser_wire::mutation::ManagedReadEnvelope)
     /// carrying the highest positions this client has seen for the surface, so
     /// the reply brings the answering node's frontier back.
-    fn read_frame(&self, code: u32, read: &[u8], log_head: bool) -> Result<Vec<u8>, LaserError> {
+    fn read_frame(&self, code: u32, read: &[u8]) -> Result<Vec<u8>, LaserError> {
         if !laser_wire::codes::is_barrier_read(code) {
             return Ok(read.to_vec());
         }
@@ -1326,7 +1266,7 @@ impl Laser {
             v: laser_wire::mutation::MANAGED_REQUEST_VERSION,
             read: read.to_vec(),
             min_position,
-            log_head,
+            log_head: false,
             min_sessions,
         })
         .map_err(|error| LaserError::Codec(format!("encode managed read: {error}")))
@@ -1362,47 +1302,6 @@ impl Laser {
             .clone()
     }
 
-    /// Clear a surface's pending read barrier once a barriered read was served.
-    /// A `Stale` answer keeps it, so the next read waits again.
-    fn settle_barrier(&self, barrier: u8, reply: &[u8]) {
-        let stale = decode_named::<laser_wire::result::CommandError>(reply)
-            .is_ok_and(|error| error.code == laser_wire::result::ResultCode::Stale);
-        if !stale {
-            self.inner
-                .read_barriers
-                .fetch_and(!barrier, std::sync::atomic::Ordering::AcqRel);
-        }
-    }
-
-    /// Move managed requests off `failed` to another node whose managed backend is
-    /// ready. Needs the connection string to dial that node, so a
-    /// bring-your-own client stays where it is. Returns whether a node other
-    /// than `failed` now serves managed requests.
-    async fn move_managed(&self, failed: Option<&str>) -> bool {
-        let Some(connection_string) = self.inner.connection_string.as_deref() else {
-            return false;
-        };
-        let versions = self
-            .inner
-            .negotiated
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .capabilities
-            .versions;
-        let moved = self
-            .inner
-            .managed_route
-            .repin(connection_string, &self.client(), failed, versions)
-            .await
-            .is_some_and(|node| Some(node.as_str()) != failed);
-        if moved {
-            self.inner
-                .read_barriers
-                .store(ALL_READ_BARRIERS, std::sync::atomic::Ordering::Release);
-        }
-        moved
-    }
-
     /// Send an already-framed managed command: the caller built (and holds)
     /// the `ManagedRequestEnvelope`, so nothing is wrapped here and a retry
     /// can reuse the exact bytes under the same operation id. The KV
@@ -1416,11 +1315,17 @@ impl Laser {
         code: u32,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, IggyError> {
-        let reply = self
-            .client()
-            .send_binary_request(code, bytes::Bytes::from(payload))
+        let answered = self
+            .inner
+            .nodes
+            .send(
+                &self.client(),
+                code,
+                bytes::Bytes::from(payload),
+                Target::Caller,
+            )
             .await?;
-        Ok(self.take_positioned(reply.to_vec()))
+        Ok(self.take_positioned(answered.reply.to_vec()))
     }
 
     /// A Iggy `IggyProducerBuilder` for `(stream, topic)`. laser-sdk builds on
@@ -1529,7 +1434,6 @@ impl Laser {
                             .batch_length(PUBLISH_BATCH_LENGTH as u32)
                             .build(),
                     )
-                    .send_retries(Some(0), None)
                     .build();
                 init_producer(&producer).await?;
                 Ok::<_, LaserError>(Arc::new(producer))
@@ -1574,6 +1478,7 @@ pub(crate) fn publish_failure(
         LaserError::Iggy(IggyError::ProducerSendFailed {
             cause,
             failed,
+            uncertain: _,
             committed,
             stream_name,
             topic_name,
@@ -1586,8 +1491,8 @@ pub(crate) fn publish_failure(
                 .collect();
             (
                 LaserError::Iggy(*cause),
-                stream_name,
-                topic_name,
+                stream_name.into(),
+                topic_name.into(),
                 unconfirmed,
             )
         }
@@ -1980,7 +1885,8 @@ impl LaserBuilder {
         // open-only, like any other probe failure, and the outcome records
         // that nothing was established, so a group consumer does not read a
         // deployment it could not classify as unfiltered.
-        match tokio::time::timeout_at(connect_deadline, probe_managed_host(&client)).await {
+        let nodes = Nodes::new(caller_key());
+        match tokio::time::timeout_at(connect_deadline, probe_managed_host(&client, &nodes)).await {
             Ok(Ok(Some(announce))) => {
                 if let Some(announced) = announce.topology.clone() {
                     topology = announced;
@@ -1996,9 +1902,8 @@ impl LaserBuilder {
                 client: std::sync::RwLock::new(Arc::new(client)),
                 publish_options,
                 reconnect_gate: tokio::sync::Mutex::new(()),
-                managed_route: Default::default(),
-                read_barriers: std::sync::atomic::AtomicU8::new(0),
                 seen_frontier: std::sync::Mutex::default(),
+                nodes,
                 publish_generation: std::sync::atomic::AtomicU64::new(0),
                 connection_string,
                 #[cfg(feature = "kv")]
@@ -2060,10 +1965,17 @@ impl LaserBuilder {
 // the transport failed or the reply did not decode.
 async fn probe_managed_host(
     client: &IggyClient,
+    nodes: &Nodes,
 ) -> Result<Option<laser_wire::hello::BackendAnnounce>, ()> {
-    match client
-        .send_binary_request(laser_wire::codes::AGDX_HELLO_CODE, Bytes::new())
+    match nodes
+        .send(
+            client,
+            laser_wire::codes::AGDX_HELLO_CODE,
+            Bytes::new(),
+            Target::Caller,
+        )
         .await
+        .map(|answered| answered.reply)
     {
         Ok(reply) if reply.is_empty() => Ok(None),
         Ok(reply) => decode_named::<laser_wire::hello::BackendAnnounce>(&reply)
@@ -2074,6 +1986,12 @@ async fn probe_managed_host(
         Err(IggyError::InvalidCommand) => Ok(None),
         Err(_) => Err(()),
     }
+}
+
+// The key that picks this client's node: random, so clients spread over the
+// cluster, and fixed for the handle's life.
+fn caller_key() -> u64 {
+    u64::try_from(ulid::Ulid::generate().random() & u128::from(u64::MAX)).unwrap_or_default()
 }
 
 fn merge_announcement(
@@ -2349,7 +2267,7 @@ fn normalize_connection_string(value: &str) -> Result<String, LaserError> {
             normalized.push_str("&tls=true");
         }
     }
-    resolve_tls(normalized)
+    resolve_tls(normalized).map(with_tls_domain)
 }
 
 // Split off the scheme. A string with no scheme gets `iggy://`. A `://` after
@@ -2489,17 +2407,6 @@ fn authority_start(after_scheme: &str) -> usize {
     before_query.rfind('@').map_or(0, |at| at + 1)
 }
 
-// The host and port a connection string dials, without scheme, userinfo,
-// path, or query.
-pub(crate) fn endpoint_of(connection_string: &str) -> &str {
-    let after_scheme = after_scheme(connection_string);
-    let host_and_port = &after_scheme[authority_start(after_scheme)..];
-    host_and_port
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(host_and_port)
-}
-
 // Strip scheme, userinfo, and port from a connection string's authority.
 pub(crate) fn host_of(connection_string: &str) -> &str {
     let after_scheme = after_scheme(connection_string);
@@ -2538,29 +2445,20 @@ fn has_query_param(connection_string: &str, key: &str) -> bool {
     })
 }
 
-// The same connection string aimed at another node of the deployment. Only the
-// host and port change. A TLS connection keeps verifying the original host
-// name, which the node certificates carry, instead of the node's address.
-pub(crate) fn with_endpoint(connection_string: &str, endpoint: &str) -> String {
-    let rest = after_scheme(connection_string);
-    let start = connection_string.len() - rest.len() + authority_start(rest);
-    let end = connection_string[start..]
-        .find(['/', '?', '#'])
-        .map_or(connection_string.len(), |length| start + length);
-    let rewritten = format!(
-        "{}{endpoint}{}",
-        &connection_string[..start],
-        &connection_string[end..]
-    );
-    let tls = query_of(connection_string).is_some_and(|query| {
+// The client dials every node at the address the cluster roster advertises.
+// Node certificates carry the deployment host name, so a TLS connection keeps
+// verifying the host it was given instead of each node's address.
+fn with_tls_domain(connection_string: String) -> String {
+    let tls = query_of(&connection_string).is_some_and(|query| {
         query
             .split('&')
             .any(|pair| pair.eq_ignore_ascii_case("tls=true"))
     });
-    if !tls || has_query_param(connection_string, "tls_domain") {
-        return rewritten;
+    if !tls || has_query_param(&connection_string, "tls_domain") {
+        return connection_string;
     }
-    format!("{rewritten}&tls_domain={}", host_of(connection_string))
+    let domain = host_of(&connection_string).to_owned();
+    format!("{connection_string}&tls_domain={domain}")
 }
 
 // An opt-out flag is read by value. Bare presence is not enough:
@@ -2724,7 +2622,9 @@ pub(crate) async fn ensure_stream(client: &IggyClient, stream: &str) -> Result<(
     {
         return Ok(());
     }
-    if let Err(error) = client.create_stream(stream).await
+    if let Err(error) = client
+        .create_stream(stream, &StreamCreateOptions::default())
+        .await
         && client
             .get_stream(&Identifier::named(stream)?)
             .await?
@@ -2904,9 +2804,10 @@ mod builder_conflict_tests {
             LaserError::Iggy(IggyError::ProducerSendFailed {
                 cause: Box::new(IggyError::Disconnected),
                 failed: Arc::new(vec![message(2)]),
+                uncertain: 0,
                 committed: Arc::new(vec![]),
-                stream_name: "stream".to_owned(),
-                topic_name: "topic".to_owned(),
+                stream_name: "stream".into(),
+                topic_name: "topic".into(),
             }),
             &[message(1), message(2), message(3)],
             vec![confirmed],
@@ -3083,30 +2984,27 @@ mod builder_conflict_tests {
 #[cfg(test)]
 mod connection_string_tests {
     use super::{
-        LaserError, PROD_CERT, endpoint_of, flag_value_enabled, has_query_param, host_of,
-        install_cert, is_laserdata_host, normalize_connection_string, resolve_tls,
-        resolve_tls_with,
+        LaserError, PROD_CERT, flag_value_enabled, has_query_param, host_of, install_cert,
+        is_laserdata_host, normalize_connection_string, resolve_tls, resolve_tls_with,
     };
 
     #[test]
-    fn given_another_node_when_aimed_at_then_should_keep_credentials_and_options() {
+    fn given_a_tls_connection_string_when_normalized_then_should_verify_the_given_host_on_every_node()
+     {
         assert_eq!(
-            super::with_endpoint(
-                "iggy+tcp://user:p/ss@host:8090?heartbeat_interval=5s",
-                "10.0.0.7:8091"
-            ),
-            "iggy+tcp://user:p/ss@10.0.0.7:8091?heartbeat_interval=5s",
+            normalize_connection_string(
+                "iggy+tcp://user:pass@edge.example.com:8090?tls=true&tls_ca_file=/ca.pem"
+            )
+            .expect("a TLS connection string normalizes"),
+            "iggy+tcp://user:pass@edge.example.com:8090?tls=true&tls_ca_file=/ca.pem&tls_domain=edge.example.com",
         );
-    }
-
-    #[test]
-    fn given_a_tls_connection_when_aimed_at_another_node_then_should_verify_the_original_host() {
         assert_eq!(
-            super::with_endpoint(
-                "iggy+tcp://user:pass@edge.laserdata.cloud:8090?tls=true",
-                "10.0.0.7:8090"
-            ),
-            "iggy+tcp://user:pass@10.0.0.7:8090?tls=true&tls_domain=edge.laserdata.cloud",
+            normalize_connection_string(
+                "iggy+tcp://user:pass@10.0.0.7:8090?tls=true&tls_ca_file=/ca.pem&tls_domain=edge.example.com"
+            )
+            .expect("an explicit TLS domain normalizes"),
+            "iggy+tcp://user:pass@10.0.0.7:8090?tls=true&tls_ca_file=/ca.pem&tls_domain=edge.example.com",
+            "an explicit domain is kept"
         );
     }
 
@@ -3247,12 +3145,12 @@ mod connection_string_tests {
         assert_eq!(
             normalize_connection_string("iggy:iggy@host:8090?tls_ca_file=/ca.crt")
                 .expect("a CA file alone"),
-            "iggy://iggy:iggy@host:8090?tls_ca_file=/ca.crt&tls=true",
+            "iggy://iggy:iggy@host:8090?tls_ca_file=/ca.crt&tls=true&tls_domain=host",
         );
         assert_eq!(
             normalize_connection_string("iggy:iggy@host?tls=true&tls_ca_file=/ca.crt")
                 .expect("an explicit TLS flag"),
-            "iggy://iggy:iggy@host:8090?tls=true&tls_ca_file=/ca.crt",
+            "iggy://iggy:iggy@host:8090?tls=true&tls_ca_file=/ca.crt&tls_domain=host",
         );
     }
 
@@ -3378,11 +3276,6 @@ mod connection_string_tests {
     #[test]
     fn given_a_bracketed_ipv6_authority_when_the_host_is_extracted_then_should_drop_the_brackets() {
         assert_eq!(host_of("iggy+tcp://u:p@[::1]:8090"), "::1");
-        assert_eq!(
-            endpoint_of("iggy+tcp://u:p@h.laserdata.cloud:8090?tls=true"),
-            "h.laserdata.cloud:8090"
-        );
-        assert_eq!(endpoint_of("iggy+tcp://u:p/q@[::1]:8090/x"), "[::1]:8090");
     }
 
     #[test]
@@ -3587,19 +3480,6 @@ mod managed_mutation_tests {
     }
 
     #[test]
-    fn given_barrier_reads_when_classified_then_every_wire_barrier_code_should_have_a_surface() {
-        for code in
-            laser_wire::codes::AGDX_COMMAND_BASE..laser_wire::codes::AGDX_COMMAND_BASE + 1000
-        {
-            assert_eq!(
-                super::barrier_bit(code) != 0,
-                laser_wire::codes::is_barrier_read(code),
-                "code {code}"
-            );
-        }
-    }
-
-    #[test]
     fn given_final_replies_when_classified_then_should_return_them() {
         assert_eq!(unknown_outcome(&reply(ResultCode::Conflict, "taken")), None);
         assert_eq!(unknown_outcome(&reply(ResultCode::Forbidden, "no")), None);
@@ -3642,7 +3522,7 @@ mod positioned_reply_tests {
     fn given_positioned_replies_when_taken_then_reads_should_carry_the_highest_position_seen() {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
         let first: ManagedReadEnvelope =
-            decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get", false).unwrap()).unwrap();
+            decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get").unwrap()).unwrap();
         assert_eq!(first.read, b"get");
         assert_eq!(first.min_position, None, "nothing seen yet");
         assert!(!first.log_head);
@@ -3651,9 +3531,9 @@ mod positioned_reply_tests {
         assert_eq!(laser.take_positioned(positioned(4, b"older")), b"older");
         assert_eq!(laser.seen_positions().kv, Some(at(9)));
         let next: ManagedReadEnvelope =
-            decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get", true).unwrap()).unwrap();
+            decode_named(&laser.read_frame(AGDX_KV_GET_CODE, b"get").unwrap()).unwrap();
         assert_eq!(next.min_position, Some(at(9)));
-        assert!(next.log_head);
+        assert!(!next.log_head);
     }
 
     #[test]
@@ -3715,12 +3595,8 @@ mod positioned_reply_tests {
             vec![session(1, "lane", 5), session(1, "inbox", 2)],
             "an older answer never lowers a unit"
         );
-        let read: ManagedReadEnvelope = decode_named(
-            &laser
-                .read_frame(AGDX_SESSION_GET_CODE, b"session", false)
-                .unwrap(),
-        )
-        .unwrap();
+        let read: ManagedReadEnvelope =
+            decode_named(&laser.read_frame(AGDX_SESSION_GET_CODE, b"session").unwrap()).unwrap();
         assert_eq!(read.read, b"session");
         assert_eq!(read.min_position, None);
         assert_eq!(read.min_sessions.len(), 2);
@@ -3738,7 +3614,7 @@ mod positioned_reply_tests {
         let laser = Laser::from_client(iggy::prelude::IggyClient::default());
         assert_eq!(
             laser
-                .read_frame(laser_wire::codes::AGDX_QUERY_CODE, b"query", false)
+                .read_frame(laser_wire::codes::AGDX_QUERY_CODE, b"query")
                 .unwrap(),
             b"query",
             "a read outside the folded surfaces is sent as it is"

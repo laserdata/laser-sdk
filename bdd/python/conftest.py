@@ -68,6 +68,8 @@ class World:
         self.error = None
         self.filtered = []
         self.noted_position = None
+        self.clients = []
+        self.client_user = None
 
     def run(self, factory):
         # `factory` is a zero-arg callable returning a coroutine. The binding's

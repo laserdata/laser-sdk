@@ -2,18 +2,22 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { OPEN_CAPABILITIES, type Capabilities } from "../../src/client/capabilities.js"
 import {
+  ConfigError,
   FilterExecutionError,
   InvalidError,
   ProtocolError,
   TransportError,
   UnsupportedError
 } from "../../src/client/errors.js"
-import type { CoordinatorConnection, NodeConnection } from "../../src/iggy/apache-iggy.js"
+import type {
+  CoordinatorConnection,
+  FencedPosition,
+  ManagedTarget
+} from "../../src/iggy/apache-iggy.js"
 import {
   FilteredReader,
   FilteredReaderBuilder,
   Filters,
-  sessionReuse,
   type FilterTransport
 } from "../../src/managed/filters.js"
 import { CompiledFilter } from "../../src/wire/filter-eval.js"
@@ -28,51 +32,64 @@ import {
   FilterExpr,
   consumerFilterDigest,
   decodeFilteredPollRequest,
+  decodeFilteredAck,
   encodeFilterReply,
   type FilteredPage,
   type FilteredPollRequest,
-  type FilteredStart,
-  type ReadMode
+  type FilteredStart
 } from "../../src/wire/filter.js"
 
-const ATTACH_CONSUMER_SESSION_CODE = 14
-const GET_POLL_ROUTING_CODE = 103
-const GET_CONSUMER_OFFSET_ROUTING_CODE = 123
 const SYNC_CONSUMER_GROUP_CODE = 606
+const INVALID_IDENTIFIER = 6
+const HISTORY_UNAVAILABLE = 87
+const NOT_PRIMARY = 89
+const CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009
 
 const filter = ConsumerFilter.json(FilterExpr.present("mode"))
 const generation = {
   streamId: 1,
   streamCreatedAtMicros: 1n,
-  topicId: 1,
+  topicId: 2,
   topicCreatedAtMicros: 1n,
   partitionId: 0,
-  partitionCreatedRevision: 1n,
-  purgeGeneration: 0n
+  partitionIncarnation: 17n
 }
+const ackContext = { ownerGeneration: 4n, metadataOp: 40n }
 const capabilities: Capabilities = {
   ...OPEN_CAPABILITIES,
   filters: { native: true, catalog: false, groupPolicyReads: true }
 }
 
-// A standard polled-messages body with one batch holding `offsets`.
-function body(partitionId: number, frontier: bigint, offsets: readonly bigint[]): Uint8Array {
+// The polled head: partition, current offset, count, then the partition context.
+const HEAD = 40
+
+// A standard polled-messages body with one batch holding `offsets`, read
+// under the page's partition context.
+function body(
+  partitionId: number,
+  frontier: bigint,
+  offsets: readonly bigint[],
+  context = { incarnation: 17n, ownerGeneration: 4n, metadataOp: 40n }
+): Uint8Array {
   const payload = new TextEncoder().encode(`{"mode":"safe"}`)
   const frameBytes = 48 + payload.byteLength
   const batchBytes = offsets.length === 0 ? 0 : 256 + frameBytes * offsets.length
-  const out = new Uint8Array(16 + batchBytes)
+  const out = new Uint8Array(HEAD + batchBytes)
   const view = new DataView(out.buffer)
   view.setUint32(0, partitionId, true)
   view.setBigUint64(4, frontier, true)
   view.setUint32(12, offsets.length, true)
+  view.setBigUint64(16, context.incarnation, true)
+  view.setBigUint64(24, context.ownerGeneration, true)
+  view.setBigUint64(32, context.metadataOp, true)
   const base = offsets[0]
   if (base === undefined) return out
-  view.setBigUint64(16 + 8, base, true)
-  view.setBigUint64(16 + 16, 1_700_000_000_123_456n, true)
-  view.setBigUint64(16 + 32, BigInt(batchBytes), true)
-  view.setUint32(16 + 48, offsets.length, true)
+  view.setBigUint64(HEAD + 8, base, true)
+  view.setBigUint64(HEAD + 16, 1_700_000_000_123_456n, true)
+  view.setBigUint64(HEAD + 32, BigInt(batchBytes), true)
+  view.setUint32(HEAD + 48, offsets.length, true)
   offsets.forEach((offset, index) => {
-    const frame = 16 + 256 + index * frameBytes
+    const frame = HEAD + 256 + index * frameBytes
     view.setUint32(frame + 24, Number(offset - base), true)
     view.setUint32(frame + 36, payload.byteLength, true)
     out.set(payload, frame + 48)
@@ -81,7 +98,6 @@ function body(partitionId: number, frontier: bigint, offsets: readonly bigint[])
 }
 
 function page(
-  mode: ReadMode,
   overrides: Partial<FilteredPage> & { readonly offsets?: readonly bigint[] } = {}
 ): FilteredPage {
   const { offsets = [], ...fields } = overrides
@@ -92,9 +108,9 @@ function page(
     partitionId,
     policy: { digest: consumerFilterDigest(filter), mode: "filtered", policyGeneration: 0n },
     generation: { ...generation, partitionId },
-    readMode: mode,
+    ackContext,
     nextScanOffset,
-    ...(mode === "primary" ? { safeAckOffset: nextScanOffset - 1n } : {}),
+    safeAckOffset: nextScanOffset - 1n,
     frontier: 1000n,
     examined: Math.max(1, offsets.length),
     matched: offsets.length,
@@ -105,17 +121,35 @@ function page(
   }
 }
 
-function pageReply(value: FilteredPage): Uint8Array {
-  return encodeNamed(encodeFilterReply({ kind: "ok", outcome: { kind: "page", page: value } }))
+// A page that examined nothing, which offers no acknowledgment offset.
+function unscanned(partitionId: number): FilteredPage {
+  const { safeAckOffset: _safe, nextScanOffset: _next, ...rest } = page({ partitionId })
+  return {
+    ...rest,
+    policy: {
+      digest: consumerFilterDigest(filter),
+      groupId: 3n,
+      mode: "filtered",
+      policyGeneration: 0n
+    },
+    examined: 0
+  }
 }
 
-function ackReply(offset: bigint): Uint8Array {
-  return encodeNamed(
-    encodeFilterReply({
-      kind: "ok",
-      outcome: { kind: "acknowledged", receipt: { partitionId: 0, offset, generation } }
-    })
-  )
+function groupPage(overrides: Partial<FilteredPage> & { readonly offsets?: readonly bigint[] }) {
+  return page({
+    policy: {
+      digest: consumerFilterDigest(filter),
+      groupId: 3n,
+      mode: "filtered",
+      policyGeneration: 0n
+    },
+    ...overrides
+  })
+}
+
+function pageReply(value: FilteredPage): Uint8Array {
+  return encodeNamed(encodeFilterReply({ kind: "ok", outcome: { kind: "page", page: value } }))
 }
 
 function staleReply(message: string): Uint8Array {
@@ -127,15 +161,11 @@ function staleReply(message: string): Uint8Array {
   )
 }
 
-function route(): Uint8Array {
-  const reply = new Uint8Array(32 + 4 + 1 + 4 + 9 + 10)
-  const view = new DataView(reply.buffer)
-  view.setUint32(32, 1, true)
-  reply[36] = 110
-  view.setUint32(37, 9, true)
-  reply.set(new TextEncoder().encode("127.0.0.1"), 41)
-  view.setUint16(50, 8090, true)
-  return reply
+// A server refusal as the transport surfaces it.
+function refusal(errorCode: number, retryable = false): TransportError {
+  return new TransportError(`refused with ${String(errorCode)}`, retryable, {
+    cause: Object.assign(new Error("server refusal"), { errorCode })
+  })
 }
 
 function assignment(generationId: bigint, partitions: readonly number[]): Uint8Array {
@@ -162,26 +192,108 @@ function baseTransport(sendManaged: FilterTransport["sendManaged"]): FilterTrans
   }
 }
 
-function coordinatorOf(transport: FilterTransport): CoordinatorConnection {
-  return {
-    send: (code, payload) => transport.sendManaged(code, payload),
+interface Coordinator {
+  readonly connection: CoordinatorConnection
+  readonly polls: { readonly target: ManagedTarget; readonly request: FilteredPollRequest }[]
+  readonly stored: FencedPosition[]
+  readonly lookups: number[]
+}
+
+/**
+ * A coordinator whose polls `poll` answers. The route lookup names replica 1
+ * unless `primary` says otherwise. Stores succeed unless `store` says
+ * otherwise. Group syncs answer with `sync`.
+ */
+function coordinatorOf(spec: {
+  readonly poll: (request: FilteredPollRequest, target: ManagedTarget) => Promise<Uint8Array>
+  readonly primary?: (partitionId: number) => Promise<number>
+  readonly store?: (position: FencedPosition) => Promise<void>
+  readonly sync?: () => Promise<Uint8Array>
+}): Coordinator {
+  const polls: Coordinator["polls"] = []
+  const stored: FencedPosition[] = []
+  const lookups: number[] = []
+  const connection: CoordinatorConnection = {
+    send: (code) => {
+      assert.equal(code, SYNC_CONSUMER_GROUP_CODE, "only the group sync rides the plain send")
+      return spec.sync === undefined ? Promise.resolve(assignment(1n, [0])) : spec.sync()
+    },
+    sendManagedTo: async (code, payload, target) => {
+      if (code === AGDX_FILTERED_ACK_CODE) {
+        const ack = decodeFilteredAck(decodeOne(payload, "acknowledgment"), "acknowledgment")
+        const position: FencedPosition = {
+          streamId: ack.generation.streamId,
+          topicId: ack.generation.topicId,
+          consumer:
+            ack.groupId === undefined
+              ? {
+                  kind: "consumer",
+                  name: ack.consumer.kind === "consumer" ? ack.consumer.name : "reader"
+                }
+              : { kind: "group", id: Number(ack.groupId) },
+          partitionId: ack.partitionId,
+          offset: ack.offset,
+          context: {
+            incarnation: ack.generation.partitionIncarnation,
+            ownerGeneration: ack.ackContext.ownerGeneration,
+            metadataOp: ack.ackContext.metadataOp
+          }
+        }
+        if (spec.store !== undefined) await spec.store(position)
+        stored.push(position)
+        return {
+          reply: encodeNamed(
+            encodeFilterReply({
+              kind: "ok",
+              outcome: {
+                kind: "acknowledged",
+                receipt: {
+                  partitionId: ack.partitionId,
+                  offset: ack.offset,
+                  generation: ack.generation
+                }
+              }
+            })
+          )
+        }
+      }
+      assert.equal(code, AGDX_FILTERED_POLL_CODE)
+      const request = pollOf(payload)
+      polls.push({ target, request })
+      return { reply: await spec.poll(request, target) }
+    },
+    partitionPrimary: (_stream, _topic, partitionId) => {
+      lookups.push(partitionId)
+      return spec.primary === undefined ? Promise.resolve(1) : spec.primary(partitionId)
+    },
+    storePosition: async (position) => {
+      if (spec.store !== undefined) await spec.store(position)
+      stored.push(position)
+    },
     joinConsumerGroup: () => Promise.resolve(),
     leaveConsumerGroup: () => Promise.resolve(),
     close: () => Promise.resolve()
   }
+  return { connection, polls, stored, lookups }
 }
 
 function reader(
-  transport: FilterTransport,
-  mode: ReadMode,
-  guarded?: ConsumerFilter,
-  layout: { readonly partitionIds?: readonly number[]; readonly idleIntervalMs?: number } = {}
+  coordinator: Coordinator,
+  layout: {
+    readonly guarded?: ConsumerFilter
+    readonly partitionIds?: readonly number[]
+    readonly idleIntervalMs?: number
+    readonly maxUnackedPages?: number
+  } = {}
 ): FilteredReader {
+  const transport = baseTransport(() =>
+    Promise.reject(new Error("the shared transport is not used"))
+  )
   const start: FilteredStart = { kind: "first" }
   return FilteredReader.create({
     transport,
     filters: new Filters(transport, () => Promise.resolve(capabilities)),
-    coordinator: coordinatorOf(transport),
+    coordinator: coordinator.connection,
     request: {
       v: FILTER_OP_VERSION,
       source: { stream: "orbit", topic: "fleet_changes" },
@@ -190,22 +302,21 @@ function reader(
       filter: { kind: "inline", filter },
       start,
       count: 10,
-      maxReplyBytes: 1024 * 1024,
-      readMode: mode
+      maxReplyBytes: 1024 * 1024
     },
     start,
     idleIntervalMs: layout.idleIntervalMs ?? 1,
-    guard: guarded === undefined ? undefined : CompiledFilter.compile(guarded),
+    ...(layout.maxUnackedPages === undefined ? {} : { maxUnackedPages: layout.maxUnackedPages }),
+    guard: layout.guarded === undefined ? undefined : CompiledFilter.compile(layout.guarded),
     membership: undefined,
     partitionIds: layout.partitionIds ?? [0]
   })
 }
 
-function groupReader(coordinator: CoordinatorConnection, data: NodeConnection) {
+function groupReader(coordinator: Coordinator) {
   const transport: FilterTransport = {
     ...baseTransport(() => Promise.reject(new Error("the shared transport is not used"))),
-    openCoordinator: () => Promise.resolve(coordinator),
-    openNodeConnection: () => Promise.resolve(data)
+    openCoordinator: () => Promise.resolve(coordinator.connection)
   }
   return FilteredReaderBuilder.create(
     transport,
@@ -255,8 +366,7 @@ void test("given_a_server_without_native_filters_when_a_bound_reader_is_built_th
   const transport: FilterTransport = {
     ...baseTransport(unexpectedTransport),
     joinConsumerGroup: unexpectedTransport,
-    openCoordinator: unexpectedTransport,
-    openNodeConnection: unexpectedTransport
+    openCoordinator: unexpectedTransport
   }
   const withoutNative = (): Promise<Capabilities> =>
     Promise.resolve({
@@ -282,17 +392,18 @@ void test("given_a_server_without_native_filters_when_a_bound_reader_is_built_th
 
 void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_group_read_that_delivered_everything", async () => {
   const unfiltered = (overrides: Partial<FilteredPage> = {}) =>
-    page("local", {
+    page({
       offsets: [0n],
       policy: { groupId: 3n, mode: "unfiltered", policyGeneration: 2n },
       ...overrides
     })
   const read = async (kind: "bound" | "group", served: FilteredPage) => {
-    const transport = baseTransport(() => Promise.resolve(pageReply(served)))
+    const coordinator = coordinatorOf({ poll: () => Promise.resolve(pageReply(served)) })
+    const transport = baseTransport(() => Promise.reject(new Error("unused")))
     const filtered = FilteredReader.create({
       transport,
       filters: new Filters(transport, () => Promise.resolve(capabilities)),
-      coordinator: coordinatorOf(transport),
+      coordinator: coordinator.connection,
       request: {
         v: FILTER_OP_VERSION,
         source: { stream: "orbit", topic: "fleet_changes" },
@@ -301,8 +412,7 @@ void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_grou
         filter: { kind },
         start: { kind: "first" },
         count: 10,
-        maxReplyBytes: 1024 * 1024,
-        readMode: "local"
+        maxReplyBytes: 1024 * 1024
       },
       start: { kind: "first" },
       idleIntervalMs: 1,
@@ -334,27 +444,15 @@ void test("given_an_unfiltered_page_when_read_then_should_need_an_automatic_grou
 })
 
 void test("given_an_over_budget_page_when_a_bounded_group_read_returns_then_should_reject_the_progress", async () => {
-  const transport = baseTransport(() =>
-    Promise.resolve(
-      pageReply(
-        page("local", {
-          offsets: [],
-          examined: 3,
-          nextScanOffset: 3n,
-          policy: {
-            groupId: 3n,
-            digest: consumerFilterDigest(filter),
-            mode: "filtered",
-            policyGeneration: 0n
-          }
-        })
-      )
-    )
-  )
+  const coordinator = coordinatorOf({
+    poll: () =>
+      Promise.resolve(pageReply(groupPage({ offsets: [], examined: 3, nextScanOffset: 3n })))
+  })
+  const transport = baseTransport(() => Promise.reject(new Error("unused")))
   const filtered = FilteredReader.create({
     transport,
     filters: new Filters(transport, () => Promise.resolve(capabilities)),
-    coordinator: coordinatorOf(transport),
+    coordinator: coordinator.connection,
     request: {
       v: FILTER_OP_VERSION,
       source: { stream: "orbit", topic: "fleet_changes" },
@@ -364,8 +462,7 @@ void test("given_an_over_budget_page_when_a_bounded_group_read_returns_then_shou
       start: { kind: "first" },
       count: 2,
       maxExamined: 2,
-      maxReplyBytes: 1024,
-      readMode: "local"
+      maxReplyBytes: 1024
     },
     start: { kind: "first" },
     idleIntervalMs: 1,
@@ -401,37 +498,45 @@ void test("given_group_policy_reads_without_an_evaluator_when_an_automatic_reade
 })
 
 void test("given_inconsistent_reply_metadata_when_reading_without_a_guard_then_should_reject", async () => {
-  const forgedCount = new Uint8Array(16)
+  const forgedCount = new Uint8Array(HEAD)
   new DataView(forgedCount.buffer).setUint32(12, 0xffffffff, true)
-  const variants: readonly Partial<FilteredPage>[] = [
-    { records: forgedCount },
-    { readMode: "primary" },
-    { safeAckOffset: 0n },
-    { partitionId: 1 },
-    { matched: 1 },
-    { policy: { mode: "filtered", policyGeneration: 0n } },
-    { examined: 0 }
+  const { safeAckOffset: _safe, ...withoutAckOffset } = page()
+  const variants: readonly FilteredPage[] = [
+    page({ records: forgedCount }),
+    page({ safeAckOffset: 5n }),
+    withoutAckOffset,
+    page({ partitionId: 1 }),
+    page({ matched: 1 }),
+    page({ policy: { mode: "filtered", policyGeneration: 0n } }),
+    page({ examined: 0 }),
+    page({
+      records: body(0, 1000n, [], { incarnation: 17n, ownerGeneration: 5n, metadataOp: 40n })
+    }),
+    page({
+      records: body(0, 1000n, [], { incarnation: 18n, ownerGeneration: 4n, metadataOp: 40n })
+    }),
+    page({
+      records: body(0, 1000n, [], { incarnation: 17n, ownerGeneration: 4n, metadataOp: 41n })
+    })
   ]
   for (const variant of variants) {
-    const transport = baseTransport(() => Promise.resolve(pageReply(page("local", variant))))
-    const filtered = reader(transport, "local")
+    const filtered = reader(coordinatorOf({ poll: () => Promise.resolve(pageReply(variant)) }))
     await assert.rejects(filtered.tryNextPage(), ProtocolError)
     await filtered.close()
   }
 })
 
 void test("given_stored_record_headers_when_matched_then_should_carry_them_to_the_record", async () => {
-  const served = page("local", { offsets: [0n] })
+  const served = page({ offsets: [0n] })
   const records = served.records.slice()
   const view = new DataView(records.buffer)
-  const frame = 16 + 256
-  view.setBigUint64(16 + 24, 1_000n, true)
+  const frame = HEAD + 256
+  view.setBigUint64(HEAD + 24, 1_000n, true)
   view.setBigUint64(frame, 42n, true)
   view.setBigUint64(frame + 8, 7n, true)
   view.setUint32(frame + 28, 5, true)
   const filtered = reader(
-    baseTransport(() => Promise.resolve(pageReply({ ...served, records }))),
-    "local"
+    coordinatorOf({ poll: () => Promise.resolve(pageReply({ ...served, records })) })
   )
   const record = (await filtered.tryNextPage())?.records[0]
   assert.equal(record?.message.checksum, 42n)
@@ -439,20 +544,18 @@ void test("given_stored_record_headers_when_matched_then_should_carry_them_to_th
   assert.equal(record.message.originTimestampMicros, 1_005n)
   assert.equal(record.message.userHeaders, undefined)
   assert.equal(record.message.currentOffset, record.frontier)
+  assert.equal(record.message.timestampMicros, 1_700_000_000_123_456n, "micros stay exact")
   await filtered.close()
 })
 
 void test("given_a_command_error_reply_when_reading_then_should_classify_its_result_code", async () => {
-  const refusal = encodeNamed(
+  const unsupported = encodeNamed(
     new Map<string, unknown>([
       ["code", "unsupported"],
       ["message", "filtered reads are not served"]
     ])
   )
-  const filtered = reader(
-    baseTransport(() => Promise.resolve(refusal)),
-    "local"
-  )
+  const filtered = reader(coordinatorOf({ poll: () => Promise.resolve(unsupported) }))
   await assert.rejects(
     filtered.tryNextPage(),
     (error: unknown) =>
@@ -461,50 +564,136 @@ void test("given_a_command_error_reply_when_reading_then_should_classify_its_res
   await filtered.close()
 })
 
-void test("given_local_pages_when_never_acknowledged_then_should_keep_reading_past_the_pending_cap", async () => {
+void test("given_unacknowledged_pages_when_the_cap_is_reached_then_should_refuse_to_read_more", async () => {
   let next = 0n
-  const transport = baseTransport(() => {
-    const offset = next
-    next += 1n
-    return Promise.resolve(
-      pageReply(page("local", { offsets: [offset], nextScanOffset: offset + 1n }))
-    )
+  const coordinator = coordinatorOf({
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    }
   })
-  const filtered = reader(transport, "local")
-  for (let read = 0; read < 70; read += 1) {
+  const filtered = reader(coordinator, { maxUnackedPages: 2 })
+  for (let read = 0; read < 2; read += 1) {
     const found = await filtered.tryNextPage()
-    assert.equal(found?.records.length, 1, `page ${String(read)} is read`)
-    assert.equal(found.safeAckOffset, undefined, "a local page offers no acknowledgment")
-    assert.equal(
-      found.records[0]?.message.timestampMicros,
-      1_700_000_000_123_456n,
-      "micros stay exact"
-    )
+    assert.equal(found?.safeAckOffset, BigInt(read), "every page offers its acknowledgment")
   }
+  await assert.rejects(filtered.tryNextPage(), (error: unknown) => {
+    assert.ok(error instanceof InvalidError)
+    assert.match(error.message, /unacknowledged pages/)
+    return true
+  })
+  assert.equal(coordinator.polls.length, 2, "a saturated partition is not read")
   await filtered.close()
 })
 
-void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_should_keep_the_later_record_pending", async () => {
-  const stored: bigint[] = []
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          if (code === AGDX_FILTERED_POLL_CODE)
-            return Promise.resolve(
-              pageReply(page("primary", { offsets: [3n, 7n], nextScanOffset: 10n }))
-            )
-          const ack = decodeOne(payload, "ack") as Map<string, unknown>
-          const offset = BigInt(ack.get("offset") as number | bigint)
-          stored.push(offset)
-          return Promise.resolve(ackReply(offset))
+void test("given_a_known_route_when_reading_then_should_send_every_poll_to_the_partition_primary", async () => {
+  let next = 0n
+  const coordinator = coordinatorOf({
+    primary: () => Promise.resolve(2),
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    }
+  })
+  const filtered = reader(coordinator)
+  for (let read = 0; read < 3; read += 1) await filtered.tryNextPage()
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [
+      { kind: "replica", replica: 2 },
+      { kind: "replica", replica: 2 },
+      { kind: "replica", replica: 2 }
+    ]
+  )
+  assert.deepEqual(coordinator.lookups, [0], "the route is looked up once and kept")
+  await filtered.close()
+})
+
+void test("given_a_route_the_lookup_cannot_give_when_reading_then_should_read_on_the_callers_node", async () => {
+  let next = 0n
+  const coordinator = coordinatorOf({
+    primary: () => Promise.reject(refusal(1002)),
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(pageReply(page({ offsets: [offset], nextScanOffset: offset + 1n })))
+    }
+  })
+  const filtered = reader(coordinator)
+  assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+  await filtered.tryNextPage()
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.target),
+    [{ kind: "caller" }, { kind: "caller" }]
+  )
+  assert.deepEqual(coordinator.lookups, [0, 0], "an unknown route is looked up again")
+  await filtered.close()
+})
+
+for (const [label, failure] of [
+  ["not_primary", refusal(NOT_PRIMARY)],
+  ["invalid_identifier", refusal(INVALID_IDENTIFIER)],
+  ["lost_link", new TransportError("the link to the replica was lost", true)]
+] as const) {
+  void test(`given_a_poll_failing_with_${label}_when_reading_then_should_look_the_route_up_again_and_resend_once`, async () => {
+    let refused = false
+    const leaders = [1, 2]
+    const coordinator = coordinatorOf({
+      primary: () => Promise.resolve(leaders.shift() ?? 2),
+      poll: (_request, target) => {
+        if (!refused) {
+          refused = true
+          return Promise.reject(failure)
         }
-      })
-  }
-  const filtered = reader(transport, "primary")
+        assert.deepEqual(target, { kind: "replica", replica: 2 })
+        return Promise.resolve(pageReply(page({ offsets: [0n] })))
+      }
+    })
+    const filtered = reader(coordinator)
+    assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+    assert.deepEqual(
+      coordinator.polls.map((poll) => poll.target),
+      [
+        { kind: "replica", replica: 1 },
+        { kind: "replica", replica: 2 }
+      ]
+    )
+    assert.deepEqual(coordinator.lookups, [0, 0])
+    await filtered.close()
+  })
+}
+
+void test("given_a_route_stale_twice_when_reading_then_should_surface_the_refusal_and_look_it_up_next_time", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.reject(refusal(NOT_PRIMARY)),
+    primary: () => Promise.resolve(1)
+  })
+  const filtered = reader(coordinator, { idleIntervalMs: 0 })
+  await assert.rejects(filtered.tryNextPage(), TransportError)
+  assert.equal(coordinator.polls.length, 2, "one resend after a fresh lookup")
+  await assert.rejects(filtered.tryNextPage(), TransportError)
+  assert.deepEqual(coordinator.lookups, [0, 0, 0, 0], "a stale route is never kept")
+  await filtered.close()
+})
+
+void test("given_a_read_on_the_callers_node_when_it_fails_then_should_not_resend_it_here", async () => {
+  const coordinator = coordinatorOf({
+    primary: () => Promise.reject(refusal(1002)),
+    poll: () => Promise.reject(refusal(NOT_PRIMARY))
+  })
+  const filtered = reader(coordinator)
+  await assert.rejects(filtered.tryNextPage(), TransportError)
+  assert.equal(coordinator.polls.length, 1, "the caller's node moves on inside the node choice")
+  await filtered.close()
+})
+
+void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_should_store_a_fenced_position", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [3n, 7n], nextScanOffset: 10n })))
+  })
+  const filtered = reader(coordinator)
   const found = await filtered.tryNextPage()
   assert.ok(found)
   const checkpoint = found.records[0]
@@ -512,293 +701,141 @@ void test("given_a_checkpoint_inside_a_page_when_acknowledged_through_then_shoul
   assert.ok(checkpoint)
   assert.ok(later)
   await filtered.ackThrough(checkpoint)
-  assert.deepEqual(stored, [3n])
+  assert.deepEqual(coordinator.stored, [
+    {
+      streamId: 1,
+      topicId: 2,
+      consumer: { kind: "consumer", name: "reader" },
+      partitionId: 0,
+      offset: 3n,
+      context: { incarnation: 17n, ownerGeneration: 4n, metadataOp: 40n }
+    }
+  ])
   await filtered.ack(later)
-  assert.deepEqual(stored, [3n, 9n])
+  assert.deepEqual(
+    coordinator.stored.map((position) => position.offset),
+    [3n, 9n]
+  )
   await filtered.close()
 })
 
-void test("given_a_lost_ack_route_when_retrying_then_should_use_offset_routing", async () => {
-  const routed: number[] = []
-  let acknowledgments = 0
-  const transport: FilterTransport = {
-    ...baseTransport((code) => {
-      routed.push(code)
-      return Promise.resolve(route())
-    }),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: async (code) => {
-          await Promise.resolve()
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return new Uint8Array()
-          if (code === AGDX_FILTERED_POLL_CODE) return pageReply(page("primary"))
-          assert.equal(code, AGDX_FILTERED_ACK_CODE)
-          if (acknowledgments++ === 0)
-            return encodeNamed(
-              encodeFilterReply({
-                kind: "err",
-                error: {
-                  code: { kind: "known", name: "Unavailable" },
-                  reason: "not_primary",
-                  message: "route changed"
-                }
-              })
-            )
-          return ackReply(0n)
-        }
-      })
-  }
-  const filtered = reader(transport, "primary")
-  assert.equal(await filtered.tryNextPage(), undefined)
-  assert.deepEqual(routed, [GET_POLL_ROUTING_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE])
-  assert.equal(acknowledgments, 2)
+void test("given_a_group_page_when_acknowledged_then_should_store_under_the_numeric_group_it_named", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(groupPage({ offsets: [0n] }))),
+    sync: () => Promise.resolve(assignment(1n, [0]))
+  })
+  const filtered = await groupReader(coordinator).build()
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert(record !== undefined)
+  await filtered.ack(record)
+  assert.deepEqual(coordinator.stored[0]?.consumer, { kind: "group", id: 3 })
   await filtered.close()
 })
 
-void test("given_a_lost_ack_reply_when_the_next_ack_runs_then_should_store_the_same_target_again", async () => {
-  const stored: bigint[] = []
-  let failNext = true
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          if (code === AGDX_FILTERED_POLL_CODE)
-            return Promise.resolve(
-              pageReply(page("primary", { offsets: [0n, 1n], nextScanOffset: 2n }))
-            )
-          const ack = decodeOne(payload, "ack") as Map<string, unknown>
-          const offset = BigInt(ack.get("offset") as number | bigint)
-          if (failNext) {
-            failNext = false
-            return Promise.reject(new Error("the reply was lost"))
-          }
-          stored.push(offset)
-          return Promise.resolve(ackReply(offset))
-        }
-      })
-  }
-  const filtered = reader(transport, "primary")
+void test("given_a_lost_store_reply_when_the_next_ack_runs_then_should_store_the_same_target_again", async () => {
+  let failures = 2
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [0n, 1n], nextScanOffset: 2n }))),
+    store: (position) => {
+      if (position.offset === 1n && failures > 0) {
+        failures -= 1
+        return Promise.reject(new TransportError("the reply was lost", true))
+      }
+      return Promise.resolve()
+    }
+  })
+  const filtered = reader(coordinator)
   const found = await filtered.tryNextPage()
   assert(found !== undefined)
   const [first, second] = found.records
   assert(first !== undefined && second !== undefined)
   await filtered.ack(first)
-  await assert.rejects(filtered.ack(second), /filtered command/)
+  await assert.rejects(filtered.ack(second), /the reply was lost/)
   await filtered.ack({ ...second })
   assert.deepEqual(
-    stored,
+    coordinator.stored.map((position) => position.offset),
     [1n],
     "the unstored target is sent again, and a spread copy still acknowledges"
   )
   await filtered.close()
 })
 
-void test("given_a_single_node_when_a_primary_is_routed_then_should_dial_the_endpoint_the_caller_dialed", async () => {
-  const dialed: (readonly [string, number])[] = []
-  const read = async (nodes: number) => {
-    const coordinator: CoordinatorConnection = {
-      send: (code) =>
-        Promise.resolve(code === SYNC_CONSUMER_GROUP_CODE ? assignment(1n, [0]) : route()),
-      joinConsumerGroup: () => Promise.resolve(),
-      leaveConsumerGroup: () => Promise.resolve(),
-      close: () => Promise.resolve()
-    }
-    const data: NodeConnection = {
-      close: () => Promise.resolve(),
-      send: (code, payload) => {
-        if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-        const request = pollOf(payload)
-        const {
-          safeAckOffset: _safe,
-          nextScanOffset: _next,
-          ...unscanned
-        } = page("primary", { partitionId: request.partitionId })
-        return Promise.resolve(
-          pageReply({
-            ...unscanned,
-            policy: {
-              digest: consumerFilterDigest(filter),
-              groupId: 3n,
-              mode: "filtered",
-              policyGeneration: 0n
-            },
-            examined: 0
-          })
-        )
-      }
-    }
-    const transport: FilterTransport = {
-      ...baseTransport(() => Promise.reject(new Error("the shared transport is not used"))),
-      openCoordinator: () => Promise.resolve(coordinator),
-      openNodeConnection: (ip, port) => {
-        dialed.push([ip, port])
-        return Promise.resolve(data)
-      },
-      clusterNodeCount: () => Promise.resolve(nodes)
-    }
-    const filtered = await FilteredReaderBuilder.create(
-      transport,
-      () => Promise.resolve(capabilities),
-      new Filters(transport, () => Promise.resolve(capabilities)),
-      { stream: "orbit", topic: "fleet_changes" },
-      { kind: "group", name: "anomaly-desk" },
-      { kind: "bound" }
-    )
-      .start({ kind: "first" })
-      .build()
-    // The dial is what this test is about, the page itself is not served.
-    await filtered.tryNextPage().catch(() => undefined)
-    await filtered.close().catch(() => undefined)
-  }
-  await read(1)
-  assert.deepEqual(dialed, [["", 0]], "one node: the caller's own endpoint, port zero")
-  dialed.length = 0
-  await read(3)
-  assert.equal(dialed.length, 1)
-  assert.notEqual(dialed[0]?.[1], 0, "a cluster: the primary's advertised endpoint")
+void test("given_a_changed_history_when_storing_then_should_restart_the_partition_from_its_stored_offset", async () => {
+  const coordinator = coordinatorOf({
+    poll: () => Promise.resolve(pageReply(page({ offsets: [0n] }))),
+    store: () => Promise.reject(refusal(HISTORY_UNAVAILABLE))
+  })
+  const filtered = reader(coordinator)
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert(record !== undefined)
+  await assert.rejects(filtered.ack(record), TransportError)
+  await filtered.tryNextPage().catch(() => undefined)
+  assert.deepEqual(
+    coordinator.polls.map((poll) => poll.request.start.kind),
+    ["first", "next"],
+    "the partition starts over after its stored offset"
+  )
+  assert.deepEqual(coordinator.lookups, [0, 0], "a recreated partition is routed again")
+  await filtered.close()
 })
 
-function probedTransport(refusals: number): {
-  readonly transport: FilterTransport
-  readonly probes: () => number
-  readonly dialed: (readonly [string, number])[]
-  loseRoute: () => void
-} {
-  let probes = 0
-  let loseRoute = false
-  const dialed: (readonly [string, number])[] = []
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    publishOptions: () => ({ timeoutMs: 1_000, maxRetries: 2, retryBackoffMs: 1 }),
-    clusterNodeCount: () => {
-      probes += 1
-      return probes <= refusals
-        ? Promise.reject(new TransportError("cluster metadata is temporarily unavailable", true))
-        : Promise.resolve(1)
+void test("given_a_moved_assignment_when_storing_then_should_sync_the_group_before_the_next_read", async () => {
+  let syncs = 0
+  let next = 0n
+  const coordinator = coordinatorOf({
+    poll: () => {
+      const offset = next
+      next += 1n
+      return Promise.resolve(
+        pageReply(groupPage({ offsets: [offset], nextScanOffset: offset + 1n }))
+      )
     },
-    openNodeConnection: (ip, port) => {
-      dialed.push([ip, port])
-      if (ip !== "" || port !== 0) {
-        return Promise.reject(new TransportError("the advertised port is unreachable", true))
-      }
-      return Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          if (loseRoute) {
-            loseRoute = false
-            return Promise.resolve(staleReply("the data connection lost its route"))
-          }
-          const request = pollOf(payload)
-          const offset =
-            request.start.kind === "continue" ? request.start.continuation.nextScanOffset : 0n
-          return Promise.resolve(
-            pageReply(page("primary", { offsets: [offset], nextScanOffset: offset + 1n }))
-          )
-        }
-      })
+    store: () => Promise.reject(refusal(CONSUMER_GROUP_PARTITION_NOT_OWNED)),
+    sync: () => {
+      syncs += 1
+      return Promise.resolve(assignment(1n, [0]))
     }
-  }
-  return {
-    transport,
-    probes: () => probes,
-    dialed,
-    loseRoute: () => {
-      loseRoute = true
-    }
-  }
-}
-
-void test("given_a_transiently_refused_topology_probe_when_reading_then_should_probe_again_and_cache_success", async () => {
-  const probed = probedTransport(2)
-  const filtered = reader(probed.transport, "primary", undefined, { idleIntervalMs: 0 })
-  try {
-    const first = await filtered.tryNextPage()
-    assert.equal(first?.records[0]?.offset, 0n)
-    assert.deepEqual(probed.dialed, [["", 0]])
-    assert.equal(probed.probes(), 3, "two refusals and the probe that answers")
-
-    probed.loseRoute()
-    assert.equal(await filtered.tryNextPage(), undefined)
-    const rerouted = await filtered.tryNextPage()
-    assert.equal(rerouted?.records[0]?.offset, 1n)
-    assert.deepEqual(probed.dialed, [
-      ["", 0],
-      ["", 0]
-    ])
-    assert.equal(probed.probes(), 3, "successful topology discovery stays cached after rerouting")
-  } finally {
-    await filtered.close()
-  }
+  })
+  const filtered = await groupReader(coordinator).build()
+  const record = (await filtered.tryNextPage())?.records[0]
+  assert(record !== undefined)
+  const before = syncs
+  await assert.rejects(filtered.ack(record), TransportError)
+  await filtered.tryNextPage()
+  assert.equal(syncs, before + 1, "a refused store expires the membership")
+  await filtered.close().catch(() => undefined)
 })
 
-void test("given_a_topology_probe_refused_past_the_retry_count_when_reading_again_then_should_recover_the_mapped_endpoint", async () => {
-  const probed = probedTransport(3)
-  const filtered = reader(probed.transport, "primary", undefined, { idleIntervalMs: 0 })
-  try {
-    await assert.rejects(filtered.tryNextPage(), TransportError)
-    assert.equal(probed.probes(), 3, "the first probe and two retries")
-    assert.deepEqual(probed.dialed, [], "failed discovery must not dial an unverified endpoint")
-    const recovered = await filtered.tryNextPage()
-    assert.equal(recovered?.records[0]?.offset, 0n)
-    assert.deepEqual(probed.dialed, [["", 0]])
-    assert.equal(probed.probes(), 4)
-  } finally {
-    await filtered.close()
-  }
+void test("given_a_delayed_first_assignment_when_reading_then_should_preserve_the_requested_start", async () => {
+  let assigned: readonly number[] = []
+  const coordinator = coordinatorOf({
+    sync: () => Promise.resolve(assignment(1n, assigned)),
+    poll: (request) =>
+      Promise.resolve(pageReply({ ...unscanned(request.partitionId), nextScanOffset: 0n }))
+  })
+  const filtered = await groupReader(coordinator).start({ kind: "first" }).build()
+  await filtered.tryNextPage()
+  assigned = [0]
+  await filtered.tryNextPage()
+  assert.deepEqual(coordinator.polls[0]?.request.start, { kind: "first" })
+  await filtered.close()
 })
 
 void test("given_a_rebalance_when_a_partition_is_gained_then_should_start_it_at_the_stored_offset", async () => {
   let assigned: readonly number[] = [0]
   let generationId = 1n
   let expireOnce = false
-  const starts = new Map<number, string[]>()
-  const coordinator: CoordinatorConnection = {
-    send: (code) =>
-      Promise.resolve(
-        code === SYNC_CONSUMER_GROUP_CODE ? assignment(generationId, assigned) : route()
-      ),
-    joinConsumerGroup: () => Promise.resolve(),
-    leaveConsumerGroup: () => Promise.resolve(),
-    close: () => Promise.resolve()
-  }
-  const data: NodeConnection = {
-    close: () => Promise.resolve(),
-    send: (code, payload) => {
-      if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-      const request = pollOf(payload)
-      starts.set(request.partitionId, [
-        ...(starts.get(request.partitionId) ?? []),
-        request.start.kind
-      ])
+  const coordinator = coordinatorOf({
+    sync: () => Promise.resolve(assignment(generationId, assigned)),
+    poll: (request) => {
       if (expireOnce && request.partitionId === 0) {
         expireOnce = false
         return Promise.resolve(staleReply("rebalanced"))
       }
-      const {
-        safeAckOffset: _safe,
-        nextScanOffset: _next,
-        ...unscanned
-      } = page("primary", { partitionId: request.partitionId })
-      return Promise.resolve(
-        pageReply({
-          ...unscanned,
-          policy: {
-            digest: consumerFilterDigest(filter),
-            groupId: 3n,
-            mode: "filtered",
-            policyGeneration: 0n
-          },
-          examined: 0
-        })
-      )
+      return Promise.resolve(pageReply(unscanned(request.partitionId)))
     }
-  }
-  const filtered = await groupReader(coordinator, data).start({ kind: "last" }).build()
+  })
+  const filtered = await groupReader(coordinator).start({ kind: "last" }).build()
   await filtered.tryNextPage()
   assigned = [0, 1]
   generationId = 2n
@@ -806,50 +843,36 @@ void test("given_a_rebalance_when_a_partition_is_gained_then_should_start_it_at_
   await filtered.tryNextPage()
   await filtered.tryNextPage()
   assert.deepEqual(filtered.partitions(), [0, 1])
-  assert.equal(starts.get(0)?.[0], "last", "the build start applies at the build")
-  assert.equal(starts.get(1)?.[0], "next", "a gained partition resumes after the stored offset")
+  const starts = (partitionId: number) =>
+    coordinator.polls
+      .filter((poll) => poll.request.partitionId === partitionId)
+      .map((poll) => poll.request.start.kind)
+  assert.equal(starts(0)[0], "last", "the build start applies at the build")
+  assert.equal(starts(1)[0], "next", "a gained partition resumes after the stored offset")
   await filtered.close()
 })
 
 void test("given_a_rejoin_when_an_old_record_is_acknowledged_then_should_name_the_rejoin", async () => {
   let rejoin = false
-  const coordinator: CoordinatorConnection = {
-    send: (code) => {
-      if (code !== SYNC_CONSUMER_GROUP_CODE) return Promise.resolve(route())
+  let reads = 0
+  const coordinator = coordinatorOf({
+    sync: () => {
       if (rejoin) {
         rejoin = false
         return Promise.resolve(new Uint8Array())
       }
       return Promise.resolve(assignment(1n, [0]))
     },
-    joinConsumerGroup: () => Promise.resolve(),
-    leaveConsumerGroup: () => Promise.resolve(),
-    close: () => Promise.resolve()
-  }
-  let reads = 0
-  const data: NodeConnection = {
-    close: () => Promise.resolve(),
-    send: (code) => {
-      if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
+    poll: () => {
       reads += 1
       if (reads === 2) {
         rejoin = true
         return Promise.resolve(staleReply("the member was removed"))
       }
-      return Promise.resolve(
-        pageReply({
-          ...page("primary", { offsets: [0n] }),
-          policy: {
-            digest: consumerFilterDigest(filter),
-            groupId: 3n,
-            mode: "filtered",
-            policyGeneration: 0n
-          }
-        })
-      )
+      return Promise.resolve(pageReply(groupPage({ offsets: [0n] })))
     }
-  }
-  const filtered = await groupReader(coordinator, data).build()
+  })
+  const filtered = await groupReader(coordinator).build()
   const before = await filtered.tryNextPage()
   const record = before?.records[0]
   assert(record !== undefined)
@@ -864,149 +887,48 @@ void test("given_a_rejoin_when_an_old_record_is_acknowledged_then_should_name_th
 })
 
 void test("given_one_failing_partition_when_reading_then_should_still_read_the_others", async () => {
-  const transport: FilterTransport = {
-    ...baseTransport(() => Promise.resolve(route())),
-    openNodeConnection: () =>
-      Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-          const request = pollOf(payload)
-          if (request.partitionId === 0) return Promise.reject(new Error("node unreachable"))
-          return Promise.resolve(pageReply(page("primary", { partitionId: 1, offsets: [0n] })))
-        }
-      })
-  }
-  const filtered = reader(transport, "primary", undefined, {
-    partitionIds: [0, 1],
-    idleIntervalMs: 60_000
+  const coordinator = coordinatorOf({
+    poll: (request) =>
+      request.partitionId === 0
+        ? Promise.reject(new Error("node unreachable"))
+        : Promise.resolve(pageReply(page({ partitionId: 1, offsets: [0n] })))
   })
+  const filtered = reader(coordinator, { partitionIds: [0, 1], idleIntervalMs: 60_000 })
   const found = await filtered.tryNextPage()
   assert.equal(found?.partitionId, 1, "the failing partition does not starve the healthy one")
-  await assert.rejects(filtered.tryNextPage(), /filtered command/)
+  await assert.rejects(filtered.tryNextPage(), /node unreachable/)
   await filtered.close()
 })
 
-for (const refusals of [1, 2]) {
-  void test(`given_${String(refusals)}_primary_refusals_when_reading_then_should_route_again_next_round_and_surface_a_repeat`, async () => {
+for (const losses of [1, 2]) {
+  void test(`given_${String(losses)}_lost_assignments_when_reading_then_should_sync_the_next_round_and_surface_a_repeat`, async () => {
     let polls = 0
-    const transport: FilterTransport = {
-      ...baseTransport(() => Promise.resolve(route())),
-      openNodeConnection: () =>
-        Promise.resolve({
-          close: () => Promise.resolve(),
-          send: (code) => {
-            if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-            assert.equal(code, AGDX_FILTERED_POLL_CODE)
-            polls += 1
-            return Promise.resolve(
-              polls <= refusals
-                ? encodeNamed(
-                    encodeFilterReply({
-                      kind: "err",
-                      error: {
-                        code: { kind: "known", name: "Unavailable" },
-                        reason: "not_primary",
-                        message: "owner settling"
-                      }
-                    })
-                  )
-                : pageReply(page("primary", { offsets: [0n] }))
-            )
-          }
-        })
-    }
-    const filtered = reader(transport, "primary")
+    const coordinator = coordinatorOf({
+      poll: () => {
+        polls += 1
+        return Promise.resolve(
+          polls <= losses ? staleReply("owner settling") : pageReply(page({ offsets: [0n] }))
+        )
+      }
+    })
+    const filtered = reader(coordinator)
     try {
-      // The lost route ends the round empty. The next round routes again.
+      // The lost assignment ends the round empty. The next round reads again.
       assert.equal(await filtered.tryNextPage(), undefined)
-      if (refusals === 1) assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
+      if (losses === 1) assert.equal((await filtered.tryNextPage())?.records[0]?.offset, 0n)
       else
         await assert.rejects(
           filtered.tryNextPage(),
           (error: unknown) =>
-            error instanceof FilterExecutionError && error.detail.reason === "not_primary"
+            error instanceof FilterExecutionError && error.detail.reason === "membership_stale"
         )
       assert.equal(polls, 2)
+      assert.deepEqual(coordinator.lookups, [0, 0], "a lost assignment drops the route")
     } finally {
       await filtered.close()
     }
   })
 }
-
-// Session bytes: a u128 client id, a u64 session number, then the u64 metadata watermark.
-function session(clientId: bigint, number: bigint, watermark: bigint): Uint8Array {
-  const bytes = new Uint8Array(32)
-  const view = new DataView(bytes.buffer)
-  view.setBigUint64(0, clientId, true)
-  view.setBigUint64(16, number, true)
-  view.setBigUint64(24, watermark, true)
-  return bytes
-}
-
-void test("given_session_bytes_when_compared_then_should_replace_the_connection_only_for_another_session", () => {
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 3n, 12n)), "raise")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 3n, 10n)), "keep")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 3n, 9n)), "keep")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(7n, 4n, 10n)), "replace")
-  assert.equal(sessionReuse(session(7n, 3n, 10n), session(8n, 3n, 10n)), "replace")
-})
-
-void test("given_two_partitions_on_one_node_and_a_rising_watermark_when_reading_then_should_keep_one_connection", async () => {
-  let watermark = 0n
-  let opened = 0
-  const attached: bigint[] = []
-  const transport: FilterTransport = {
-    ...baseTransport(() => {
-      watermark += 1n
-      const reply = route()
-      reply.set(session(7n, 3n, watermark), 0)
-      return Promise.resolve(reply)
-    }),
-    openNodeConnection: () => {
-      opened += 1
-      return Promise.resolve({
-        close: () => Promise.resolve(),
-        send: (code, payload) => {
-          if (code === ATTACH_CONSUMER_SESSION_CODE) {
-            attached.push(new DataView(payload.buffer, payload.byteOffset).getBigUint64(24, true))
-            return Promise.resolve(new Uint8Array())
-          }
-          if (code === AGDX_FILTERED_POLL_CODE) {
-            const partitionId = pollOf(payload).partitionId
-            return Promise.resolve(
-              pageReply(
-                page("primary", { partitionId, generation: { ...generation, partitionId } })
-              )
-            )
-          }
-          const ack = decodeOne(payload, "ack") as Map<string, unknown>
-          const partitionId = Number(ack.get("partition_id"))
-          const offset = BigInt(ack.get("offset") as number | bigint)
-          return Promise.resolve(
-            encodeNamed(
-              encodeFilterReply({
-                kind: "ok",
-                outcome: {
-                  kind: "acknowledged",
-                  receipt: { partitionId, offset, generation: { ...generation, partitionId } }
-                }
-              })
-            )
-          )
-        }
-      })
-    }
-  }
-  const built = reader(transport, "primary", undefined, { partitionIds: [0, 1] })
-  for (let read = 0; read < 8; read += 1) {
-    await built.tryNextPage()
-  }
-  assert.equal(opened, 1, "both partitions share the one data connection")
-  assert.equal(built.dataConnectionsOpened(), 1)
-  assert.deepEqual(attached, [1n, 2n], "the second route raised the floor on the open connection")
-  await built.close()
-})
 
 void test("given_unevaluated_records_when_guarded_then_should_require_a_reproducible_pass_fault", async () => {
   const passing = { ...filter, faultPolicy: "pass" as const }
@@ -1015,69 +937,44 @@ void test("given_unevaluated_records_when_guarded_then_should_require_a_reproduc
     [passing, 4, true],
     [passing, 1024, false]
   ] as const) {
-    const transport = baseTransport(() =>
-      Promise.resolve(
-        pageReply(
-          page("local", {
-            offsets: [0n],
-            policy: {
-              digest: consumerFilterDigest(definition),
-              mode: "filtered",
-              policyGeneration: 0n
-            },
-            unevaluated: [0n],
-            evaluationLimits: { maxPayloadBytes: limit, maxDepth: 64 }
-          })
+    const coordinator = coordinatorOf({
+      poll: () =>
+        Promise.resolve(
+          pageReply(
+            page({
+              offsets: [0n],
+              policy: {
+                digest: consumerFilterDigest(definition),
+                mode: "filtered",
+                policyGeneration: 0n
+              },
+              unevaluated: [0n],
+              evaluationLimits: { maxPayloadBytes: limit, maxDepth: 64 }
+            })
+          )
         )
-      )
-    )
-    const filtered = reader(transport, "local", definition)
+    })
+    const filtered = reader(coordinator, { guarded: definition })
     if (accepted) assert.equal((await filtered.tryNextPage())?.records.length, 1)
     else await assert.rejects(filtered.tryNextPage())
     await filtered.close()
   }
 })
 
-void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_release_the_reopened_route", async () => {
+void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_retire_it", async () => {
   let assigned: readonly number[] = [0]
   let generationId = 1n
   let polls = 0
-  let closed = 0
-  const coordinator: CoordinatorConnection = {
-    send: (code) =>
+  const coordinator = coordinatorOf({
+    sync: () => Promise.resolve(assignment(generationId, assigned)),
+    poll: () =>
       Promise.resolve(
-        code === SYNC_CONSUMER_GROUP_CODE ? assignment(generationId, assigned) : route()
-      ),
-    joinConsumerGroup: () => Promise.resolve(),
-    leaveConsumerGroup: () => Promise.resolve(),
-    close: () => Promise.resolve()
-  }
-  const data: NodeConnection = {
-    close: () => {
-      closed += 1
-      return Promise.resolve()
-    },
-    send: (code) => {
-      if (code === ATTACH_CONSUMER_SESSION_CODE) return Promise.resolve(new Uint8Array())
-      if (code === AGDX_FILTERED_ACK_CODE) return Promise.resolve(ackReply(0n))
-      if (polls++ > 0) return Promise.resolve(staleReply("partition revoked"))
-      return Promise.resolve(
-        pageReply(
-          page("primary", {
-            offsets: [0n],
-            stop: "filled",
-            policy: {
-              digest: consumerFilterDigest(filter),
-              groupId: 3n,
-              mode: "filtered",
-              policyGeneration: 0n
-            }
-          })
-        )
+        polls++ > 0
+          ? staleReply("partition revoked")
+          : pageReply(groupPage({ offsets: [0n], stop: "filled" }))
       )
-    }
-  }
-  const filtered = await groupReader(coordinator, data).build()
+  })
+  const filtered = await groupReader(coordinator).build()
   const record = (await filtered.tryNextPage())?.records[0]
   assert(record !== undefined)
   assigned = []
@@ -1085,8 +982,26 @@ void test("given_a_revoked_partition_when_its_last_record_is_stored_then_should_
   await filtered.tryNextPage()
   await filtered.tryNextPage()
   assert.deepEqual(filtered.partitions(), [])
-  const before = closed
   await filtered.ack(record)
-  assert.equal(closed, before + 1, "the acknowledgment-only route is released")
+  assert.deepEqual(
+    coordinator.stored.map((position) => position.offset),
+    [0n],
+    "a revoked partition still stores what it handed out"
+  )
+  await assert.rejects(filtered.ack(record), FilterExecutionError, "and then it is retired")
   await filtered.close()
+})
+
+void test("given_an_injected_client_without_targeted_requests_when_reading_then_should_name_what_is_missing", async () => {
+  const transport = baseTransport(() => Promise.resolve(assignment(1n, [0])))
+  const built = await FilteredReaderBuilder.create(
+    transport,
+    () => Promise.resolve(capabilities),
+    new Filters(transport, () => Promise.resolve(capabilities)),
+    { stream: "orbit", topic: "fleet_changes" },
+    { kind: "group", name: "anomaly-desk" },
+    { kind: "bound" }
+  ).build()
+  await assert.rejects(built.tryNextPage(), ConfigError)
+  await built.close()
 })

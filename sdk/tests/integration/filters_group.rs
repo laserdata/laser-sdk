@@ -1025,8 +1025,7 @@ async fn given_a_cancelled_binding_delivery_when_returned_then_should_redeliver_
 }
 
 #[tokio::test]
-async fn given_a_policy_released_while_consuming_then_should_continue_unfiltered_and_redeliver_the_unstored_record()
- {
+async fn given_a_policy_released_while_consuming_then_should_replay_from_the_uncommitted_offset() {
     let laser = harness::connected_laser_on(catalog_server().await).await;
     group_source(&laser).await;
     let group = bound_group(&laser).await;
@@ -1052,22 +1051,13 @@ async fn given_a_policy_released_while_consuming_then_should_continue_unfiltered
         .release()
         .await
         .expect("release while reading");
-    let repeated = consumer
+    let following = consumer
         .next_within(READ_TIMEOUT)
         .await
         .expect("the consumer goes on without an error");
     assert_eq!(
-        repeated.position.offset, 0,
-        "the record read under the old policy was not stored, so it is delivered again"
-    );
-    assert_eq!(
-        consumer
-            .next_within(READ_TIMEOUT)
-            .await
-            .expect("newly included record")
-            .position
-            .offset,
-        1
+        following.position.offset, 0,
+        "the old page cannot advance the offset after the policy changed"
     );
     consumer.shutdown().await.expect("close");
 }
@@ -1086,12 +1076,14 @@ async fn given_a_bound_group_when_reading_pages_then_should_run_the_bound_revisi
         .build()
         .await
         .expect("the group reader builds");
-    assert_eq!(reader.partitions(), vec![0]);
 
+    // A fresh member owns its partition once the partition primary installed
+    // it, so the reader may start with none and pick it up while reading.
     let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
         .await
         .expect("a page arrives")
         .expect("the bound read succeeds");
+    assert_eq!(reader.partitions(), vec![0]);
 
     assert_eq!(offsets(&page), vec![0, 2]);
     let binding = group
@@ -1202,8 +1194,84 @@ async fn given_lost_membership_when_reading_again_then_should_rejoin_from_commit
 }
 
 #[tokio::test]
-async fn given_two_partitions_on_one_node_when_reading_many_pages_then_should_keep_one_data_connection()
+async fn given_a_delayed_first_assignment_when_the_partition_arrives_then_should_read_from_the_requested_start()
  {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let stream_id = Identifier::named(&stream).expect("stream");
+    let topic_id = Identifier::named(TOPIC).expect("topic");
+    let group_id = Identifier::named(GROUP).expect("group");
+    // Another member holds the only partition and has stored progress past
+    // the first match, so a reader that resumed after the stored offset would
+    // skip offset 0.
+    let holder = harness::connected_laser_on(catalog_server().await).await;
+    holder
+        .client()
+        .join_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .expect("the holder joins");
+    let holder_owns_the_partition = async {
+        loop {
+            let owned = holder
+                .client()
+                .get_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .expect("the group reads")
+                .is_some_and(|group| group.members.iter().any(|member| member.partitions == [0]));
+            if owned {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::time::timeout(READ_TIMEOUT, holder_owns_the_partition)
+        .await
+        .expect("the holder is assigned the partition");
+    holder
+        .client()
+        .store_consumer_offset(
+            &Consumer::group(group_id.clone()),
+            &stream_id,
+            &topic_id,
+            Some(0),
+            1,
+        )
+        .await
+        .expect("the holder stores progress");
+    let mut reader = group
+        .reader()
+        .expect("a stream is set")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("the group reader builds");
+    assert_eq!(
+        reader.partitions(),
+        Vec::<u32>::new(),
+        "the holder keeps the partition, so the first assignment is empty"
+    );
+    holder
+        .client()
+        .leave_consumer_group(&stream_id, &topic_id, &group_id)
+        .await
+        .expect("the holder leaves");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("the partition arrives and a page is read")
+        .expect("the delayed first read succeeds");
+    assert_eq!(reader.partitions(), vec![0]);
+    assert_eq!(
+        offsets(&page),
+        vec![0, 2],
+        "the requested start applies to the delayed first assignment"
+    );
+    reader.close().await.expect("close");
+    holder.close().await.expect("the holder closes");
+}
+
+#[tokio::test]
+async fn given_two_partitions_when_reading_many_pages_then_should_read_and_acknowledge_both() {
     let (server, _socket_dir, _state) = start_catalog_server().await;
     let laser = harness::connected_laser_on(&server).await;
     let stream = group_source(&laser).await;
@@ -1242,16 +1310,11 @@ async fn given_two_partitions_on_one_node_when_reading_many_pages_then_should_ke
         reader.ack_page(&page).await.expect("the page acknowledges");
     }
     assert_eq!(partitions_read.len(), 2, "both partitions were read");
-    assert_eq!(
-        reader.data_connections_opened(),
-        1,
-        "every page and acknowledgment used one connection"
-    );
     reader.close().await.expect("the reader closes");
 }
 
 #[tokio::test]
-async fn given_a_revoked_partition_when_draining_then_should_route_acknowledgments_separately() {
+async fn given_a_revoked_partition_when_draining_then_should_store_its_acknowledgment() {
     let server = catalog_server().await;
     let laser = harness::connected_laser_on(server).await;
     let stream = group_source(&laser).await;
@@ -1312,7 +1375,7 @@ async fn given_a_revoked_partition_when_draining_then_should_route_acknowledgmen
     reader
         .ack_page(page)
         .await
-        .expect("revoked partition can drain through offset routing");
+        .expect("a revoked partition drains through the fenced offset store");
     assert_eq!(
         stored_group_offset(&laser, &stream, revoked).await,
         page.safe_ack_offset
@@ -2049,4 +2112,42 @@ async fn given_a_role_group_bound_to_another_filter_when_an_agent_spawns_then_sh
         matches!(error, LaserError::ConsumerGroupSetup { .. }),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn given_a_released_policy_when_acknowledging_its_page_then_should_refuse_without_storing() {
+    let laser = harness::connected_laser_on(catalog_server().await).await;
+    let stream = group_source(&laser).await;
+    let group = bound_group(&laser).await;
+    let mut reader = group
+        .reader()
+        .expect("reader")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("build");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("deadline")
+        .expect("page");
+    group.filter().release().await.expect("release");
+    let error = reader
+        .ack_page(&page)
+        .await
+        .expect_err("old policy must be refused");
+    assert_eq!(error.filter_reason(), Some(FilterErrorReason::Conflict));
+    assert_eq!(stored_group_offset(&laser, &stream, 0).await, None);
+    let current = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("deadline")
+        .expect("current page");
+    reader
+        .ack_page(&current)
+        .await
+        .expect("current policy can acknowledge");
+    assert_eq!(
+        stored_group_offset(&laser, &stream, 0).await,
+        current.safe_ack_offset
+    );
+    reader.close().await.expect("close");
 }

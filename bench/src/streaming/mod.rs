@@ -8,8 +8,8 @@ use laser_sdk::batching::BatchingProducer;
 use laser_sdk::cursor::Cursor;
 use laser_sdk::iggy::prelude::{
     AutoCommit, BackgroundConfig, Consumer as IggyConsumerIdentity, DirectConfig, Identifier,
-    IggyByteSize, IggyConsumer, IggyDuration, IggyMessage, MessageClient, NonZeroIggyDuration,
-    Partitioning, PollingStrategy,
+    IggyByteSize, IggyConsumer, IggyDuration, IggyMessage, MessageClient, Partitioning,
+    PollingStrategy,
 };
 use laser_sdk::laser::Laser;
 use laser_sdk::stream::{
@@ -2298,13 +2298,6 @@ async fn raw_producer_with_partition(
                 .build(),
         )
         .partitioning(partitioning)
-        .send_retries(
-            Some(3),
-            Some(
-                NonZeroIggyDuration::try_from(Duration::from_secs(1))
-                    .expect("retry interval should be non-zero"),
-            ),
-        )
         .do_not_create_stream_if_not_exists()
         .do_not_create_topic_if_not_exists()
         .build();
@@ -2372,13 +2365,6 @@ async fn raw_background_producer(
         .map_err(|error| sdk_error(&error))?
         .background(background_config(case))
         .partitioning(Partitioning::balanced())
-        .send_retries(
-            Some(3),
-            Some(
-                NonZeroIggyDuration::try_from(Duration::from_secs(1))
-                    .expect("retry interval should be non-zero"),
-            ),
-        )
         .do_not_create_stream_if_not_exists()
         .do_not_create_topic_if_not_exists()
         .build();

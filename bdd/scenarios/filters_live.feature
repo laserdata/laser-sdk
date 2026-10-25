@@ -40,3 +40,8 @@ Feature: Consumer filters on a streaming server
   Scenario: A normal group consumer preserves the source batch limit
     When the anomaly desk consumes a hundred non-matches before its first match
     Then its first match follows an empty scan of one hundred records
+
+  @managed
+  Scenario: A released policy cannot acknowledge an old page
+    When the anomaly desk rejects a page after releasing its policy
+    Then it receives every original feed record

@@ -10,21 +10,27 @@ import {
 } from "../../src/iggy/apache-iggy.js"
 import { Consumer } from "../../src/stream/consumer.js"
 
+// The polled head: partition, current offset, count, then the partition context.
+const HEAD = 40
+
 // One stored record: a batch at offset 40 holding one frame with a header block.
 function storedRecord(headers: Uint8Array): Uint8Array {
   const payload = new TextEncoder().encode(`{"mode":"safe"}`)
   const frameBytes = 48 + payload.byteLength + headers.byteLength
-  const out = new Uint8Array(16 + 256 + frameBytes)
+  const out = new Uint8Array(HEAD + 256 + frameBytes)
   const view = new DataView(out.buffer)
   view.setUint32(0, 3, true)
   view.setBigUint64(4, 99n, true)
   view.setUint32(12, 1, true)
-  view.setBigUint64(16 + 8, 40n, true)
-  view.setBigUint64(16 + 16, 1_700_000_000_123_456n, true)
-  view.setBigUint64(16 + 24, 1_700_000_000_000_007n, true)
-  view.setBigUint64(16 + 32, BigInt(256 + frameBytes), true)
-  view.setUint32(16 + 48, 1, true)
-  const frame = 16 + 256
+  view.setBigUint64(16, 17n, true)
+  view.setBigUint64(24, 4n, true)
+  view.setBigUint64(32, 40n, true)
+  view.setBigUint64(HEAD + 8, 40n, true)
+  view.setBigUint64(HEAD + 16, 1_700_000_000_123_456n, true)
+  view.setBigUint64(HEAD + 24, 1_700_000_000_000_007n, true)
+  view.setBigUint64(HEAD + 32, BigInt(256 + frameBytes), true)
+  view.setUint32(HEAD + 48, 1, true)
+  const frame = HEAD + 256
   view.setBigUint64(frame, 0xabcdn, true)
   view.setBigUint64(frame + 8, 5n, true)
   view.setBigUint64(frame + 16, 1n, true)

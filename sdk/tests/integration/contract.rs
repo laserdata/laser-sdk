@@ -207,6 +207,24 @@ async fn given_a_verified_slow_agent_when_pickup_expires_then_should_honor_its_s
     worker.ready().await.expect("worker joins its group");
 
     let caller = harness::verified(&laser, Arc::new(registry)).await;
+    // A fresh group member reads once its partition primary installed it, so a
+    // first contract without an expiry proves the agent consumes before the
+    // tight one is sent.
+    let warmed = caller
+        .contract(Router::to(
+            "slow-rotator".parse().expect("slow-rotator id is valid"),
+        ))
+        .from("orchestrator".parse().expect("orchestrator id is valid"))
+        .payload(Bytes::from("rotate-42"))
+        .inbox_route(InboxRoute::Fixed(AgentTopic::Sessions))
+        .deadline(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("the warm-up contract resolves and sends");
+    assert!(
+        matches!(warmed, Contract::Completed(_)),
+        "the agent consumes before the expiring contract, got {warmed:?}"
+    );
     let outcome = caller
         .contract(Router::to(
             "slow-rotator".parse().expect("slow-rotator id is valid"),

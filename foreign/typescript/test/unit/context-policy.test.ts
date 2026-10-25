@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { ConfigError } from "../../src/client/errors.js"
+import { ConfigError, TransportError } from "../../src/client/errors.js"
 import type { Laser } from "../../src/client/laser.js"
 import {
   Chain,
@@ -121,4 +121,36 @@ void test("given_a_scoped_memory_with_lineage_when_remembering_then_should_stamp
   assert.equal(linked.producer(), producer)
   await linked.remember(new Uint8Array([1])).send()
   assert.deepEqual(scopes, [{ conversation, origin, producer }])
+})
+
+void test("given_retired_cached_history_when_assembling_live_context_then_should_restart_once_without_restarting_checkpoints", async () => {
+  for (const pinned of [false, true]) {
+    let reads = 0
+    const stale = new TransportError("history unavailable", false, {
+      cause: Object.assign(new Error("history"), { errorCode: 87 })
+    })
+    const cursor = {
+      partitions: [0],
+      batch: () => cursor,
+      fromOffsets: () => cursor,
+      until: () => cursor,
+      pollRecords: () => Promise.resolve([])
+    }
+    const laser = {
+      topic: () => ({
+        partitionCount: () => Promise.resolve(1),
+        replay: () => Promise.resolve(cursor),
+        tailOffsets: () => {
+          reads += 1
+          return reads === 1 ? Promise.reject(stale) : Promise.resolve(new Map([[0, 0n]]))
+        }
+      })
+    } as unknown as Laser
+    const builder = ContextAssembler.builder().conversationId(ConversationId.new())
+    if (pinned) builder.fromOffsets(new Map([[0, 1n]]))
+    if (pinned)
+      await assert.rejects(builder.build().assemble(laser), (error: unknown) => error === stale)
+    else assert.deepEqual(await builder.build().assemble(laser), [])
+    assert.equal(reads, pinned ? 1 : 2)
+  }
 })
