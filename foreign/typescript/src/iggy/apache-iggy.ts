@@ -3,7 +3,6 @@ import { JOIN_GROUP } from "apache-iggy/dist/wire/consumer-group/join-group.comm
 import { SYNC_GROUP } from "apache-iggy/dist/wire/consumer-group/sync-group.command.js"
 import { GET_STREAM } from "apache-iggy/dist/wire/stream/get-stream.command.js"
 import { GET_TOPIC } from "apache-iggy/dist/wire/topic/get-topic.command.js"
-import type { ClusterNode } from "apache-iggy/dist/wire/cluster/cluster.utils.js"
 import { connectOptions } from "../client/connect-options.js"
 import {
   publishOptions,
@@ -24,12 +23,14 @@ import {
 import type {
   ClientConfig,
   ClientCredentials,
+  PartitionContext,
   RawClient,
   SendMessagesConfirmation,
   SendMessagesResponse
 } from "apache-iggy"
 import { readFileSync } from "node:fs"
-import { isIP } from "node:net"
+import { Socket, isIP } from "node:net"
+import { TLSSocket } from "node:tls"
 import {
   AmbiguousMutationError,
   ConfigError,
@@ -49,25 +50,13 @@ import { Mutex } from "../runtime/mutex.js"
 import { mintUlidValue } from "../runtime/ulid.js"
 import { decodeOne, encodeNamed, expectMap } from "../wire/cbor.js"
 import {
-  AGDX_FORK_LIST_CODE,
-  AGDX_GRAPH_NEIGHBORS_CODE,
-  AGDX_GRAPH_QUERY_CODE,
-  AGDX_HELLO_CODE,
-  AGDX_KV_EXISTS_CODE,
-  AGDX_KV_GET_CODE,
-  AGDX_KV_NAMESPACES_CODE,
-  AGDX_KV_SCAN_CODE,
-  AGDX_SESSION_CHANGES_CODE,
-  AGDX_SESSION_EVENTS_CODE,
-  AGDX_SESSION_GET_CODE,
-  AGDX_SESSION_LINKS_CODE,
-  AGDX_SESSION_LIST_CODE,
-  AGDX_SESSION_SOURCES_CODE,
-  AGDX_SESSION_STATE_CODE,
+  AGDX_AUTHZ_BIND_ROLES_CODE,
+  AGDX_AUTHZ_DEFINE_ROLE_CODE,
+  AGDX_AUTHZ_DELETE_ROLE_CODE,
+  AGDX_COMMAND_BASE,
   isBarrierRead,
   isIdempotentManagedRequest
 } from "../wire/codes.js"
-import { type OpVersions, decodeBackendAnnounce } from "../wire/hello.js"
 import {
   type AppliedFrontier,
   MANAGED_REQUEST_VERSION,
@@ -143,7 +132,9 @@ const DEFAULT_TCP_PORT = 8090
 const ACCEPT_STAGE = "Iggy server to accept the connection"
 const LOGIN_STAGE = "Iggy login reply"
 const VSR_HEARTBEAT_INTERVAL_MS = 5_000
-const POLLED_HEAD_BYTES = 16
+// partition_id u32, current_offset u64, messages_count u32, then the
+// partition context: incarnation, owner generation, and metadata op, u64 each.
+export const POLLED_HEAD_BYTES = 40
 const BATCH_HEADER_BYTES = 256
 const FRAME_HEADER_BYTES = 48
 const STRING_HEADER_KIND = 2
@@ -177,6 +168,13 @@ const RESYNC_REQUIRED_PARTITION = 0xffff_ffff
 const GROUP_ASSIGNMENT_REFRESH_MS = 5_000
 const GROUP_POLL_MAX_ATTEMPTS = 2
 const TRANSIENT_NOT_COMMITTED = 57
+const INVALID_IDENTIFIER = 6
+const NOT_PRIMARY = 89
+const GET_PARTITION_ROUTE_CODE = 105
+// incarnation u64, metadata_op u64, view u32, partitions_count u32, primary_replica u8
+const PARTITION_ROUTE_BYTES = 25
+const PINNED_QUERIES = 1024
+const U64_MASK = (1n << 64n) - 1n
 
 interface GroupCursor {
   generation: bigint
@@ -198,15 +196,62 @@ export type ConsumerOffsetTarget =
   | { readonly kind: "group"; readonly name: string }
   | { readonly kind: "consumer"; readonly name: string }
 
+/** Where a managed request goes, as Rust `nodes::Target`. */
+export type ManagedTarget =
+  /** The metadata primary, the only node that submits the replicated authorization writes. */
+  | { readonly kind: "metadata_primary" }
+  /** The node this client spreads its requests to. */
+  | { readonly kind: "caller" }
+  /** One replica, by the id cluster metadata names it with. */
+  | { readonly kind: "replica"; readonly replica: number }
+
+/** A managed reply and the replica that sent it, absent when the metadata primary answered. */
+export interface ManagedAnswer {
+  readonly reply: Uint8Array
+  readonly replica?: number
+}
+
+export interface ManagedSendOptions {
+  readonly retryAfterReconnect?: boolean
+  /** The node the request goes to, when not the one its code picks. */
+  readonly target?: ManagedTarget
+  /** Overrides the mutation deadline, for tests.
+   * @internal */
+  readonly mutationDeadlineMs?: number
+}
+
+/** A consumer offset stored under the partition owner a filtered page was read under. */
+export interface FencedPosition {
+  readonly streamId: number
+  readonly topicId: number
+  /** A group by the numeric id its page named, or an independent consumer by name. */
+  readonly consumer:
+    | { readonly kind: "group"; readonly id: number }
+    | { readonly kind: "consumer"; readonly name: string }
+  readonly partitionId: number
+  readonly offset: bigint
+  readonly context: PartitionContext
+}
+
 export interface LaserTransport {
   readonly publishRetriesManaged?: boolean
   readonly kind: "apache-iggy"
   readonly iggyClient: SimpleClient
-  sendManaged(
+  sendManaged(code: number, payload: Uint8Array, options?: ManagedSendOptions): Promise<Uint8Array>
+  /** Sends managed command `code` to `target`, and names the replica that answered. */
+  sendManagedTo?(
     code: number,
     payload: Uint8Array,
-    options?: { readonly retryAfterReconnect?: boolean }
-  ): Promise<Uint8Array>
+    target: ManagedTarget,
+    options?: ManagedSendOptions
+  ): Promise<ManagedAnswer>
+  /** The node every managed request of this connection goes to, shared by its clones. */
+  replicaIds?(): Promise<readonly number[]>
+  readonly nodes?: Nodes
+  /** The replica id of one partition's primary. */
+  partitionPrimary?(streamId: string, topicId: string, partitionId: number): Promise<number>
+  /** Stores a consumer group offset fenced to the partition incarnation and owner it was read under. */
+  storePosition?(position: FencedPosition): Promise<void>
   /** The highest mutation position seen per managed surface. */
   seenPositions?(): AppliedFrontier
   ensureStream(name: string): Promise<void>
@@ -331,14 +376,6 @@ export interface LaserTransport {
     name: string | number
   ): Promise<void>
   /**
-   * An ordinary authenticated connection to another node of this deployment,
-   * with the same credentials and TLS settings. A node that reports an
-   * unspecified address is reached through the host this transport connected to.
-   */
-  openNodeConnection?(ip: string, port: number): Promise<NodeConnection>
-  /** How many nodes the deployment has, when the transport can ask. */
-  clusterNodeCount?(): Promise<number>
-  /**
    * A second authenticated connection to the node this transport reaches,
    * which holds its own consumer-group memberships and never rejoins them on
    * its own. A group reader joins through it, so every reader is its own
@@ -354,19 +391,22 @@ export interface LaserTransport {
   close(): Promise<void>
 }
 
-/** A connection to one node, owned by its opener. */
+/** A connection owned by its opener. A managed command goes to its node like any managed request. */
 export interface NodeConnection {
   send(code: number, payload: Uint8Array): Promise<Uint8Array>
   close(): Promise<void>
 }
 
-interface ManagedNode {
-  readonly name: string
-  readonly connection: NodeConnection
-}
-
-/** A dedicated coordinator connection, owned by its opener. */
+/**
+ * A dedicated coordinator connection, owned by its opener. It holds a group
+ * reader's membership, and its targeted requests pick their node with the
+ * opener's node choice, as a Rust reader sends over its own client with the
+ * `Laser`'s nodes.
+ */
 export interface CoordinatorConnection extends NodeConnection {
+  sendManagedTo(code: number, payload: Uint8Array, target: ManagedTarget): Promise<ManagedAnswer>
+  partitionPrimary(streamId: string, topicId: string, partitionId: number): Promise<number>
+  storePosition(position: FencedPosition): Promise<void>
   joinConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
   leaveConsumerGroup(streamId: string, topicId: string, name: string | number): Promise<void>
 }
@@ -558,6 +598,31 @@ export function serverErrorCode(error: unknown): number | undefined {
   return undefined
 }
 
+/** The head of a standard polled-messages body. */
+export interface PolledHead {
+  readonly partitionId: number
+  readonly currentOffset: bigint
+  readonly count: number
+  /** The partition incarnation, owner, and metadata op the poll was served under. */
+  readonly context: PartitionContext
+}
+
+export function decodePolledHead(body: Uint8Array): PolledHead {
+  if (body.byteLength < POLLED_HEAD_BYTES)
+    throw new ProtocolError("the polled record body has a malformed head")
+  const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
+  return {
+    partitionId: view.getUint32(0, true),
+    currentOffset: view.getBigUint64(4, true),
+    count: view.getUint32(12, true),
+    context: {
+      incarnation: view.getBigUint64(16, true),
+      ownerGeneration: view.getBigUint64(24, true),
+      metadataOp: view.getBigUint64(32, true)
+    }
+  }
+}
+
 /**
  * The records of a standard polled-messages body, decoded exactly as stored:
  * original offsets, per-record microsecond timestamps, payloads, and typed
@@ -566,10 +631,8 @@ export function serverErrorCode(error: unknown): number | undefined {
 export function decodePolledBody(body: Uint8Array): readonly PolledMessage[] {
   const malformed = (what: string): ProtocolError =>
     new ProtocolError(`the polled record body has a malformed ${what}`)
-  if (body.byteLength < POLLED_HEAD_BYTES) throw malformed("head")
+  const { partitionId, currentOffset } = decodePolledHead(body)
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength)
-  const partitionId = view.getUint32(0, true)
-  const currentOffset = view.getBigUint64(4, true)
   const messages: PolledMessage[] = []
   let position = POLLED_HEAD_BYTES
   while (position < body.byteLength) {
@@ -964,34 +1027,9 @@ interface ConnectedClient {
   readonly raw: RawClient
 }
 
-export interface ClientConnectionEvents {
-  readonly redirecting: boolean
-  on(event: "error", listener: (cause?: unknown) => void): void
-  on(event: "disconnected", listener: (hadError: boolean) => void): void
-  once(event: "error", listener: (cause?: unknown) => void): void
-  once(event: "connect", listener: () => void): void
-  off(event: "error", listener: (cause?: unknown) => void): void
-  off(event: "connect", listener: () => void): void
-}
-
-interface RawClientConnection {
-  readonly connection: ClientConnectionEvents
-}
-
-// The client swaps sockets on its own when it follows a leader move or walks
-// the roster. That drop is deliberate and nothing was lost, so retiring the
-// client on it would abort the very send it is relocating.
-export function watchConnectionLoss(connection: ClientConnectionEvents, onLost: () => void): void {
-  connection.on("disconnected", () => {
-    if (connection.redirecting) return
-    onLost()
-  })
-}
-
 async function connectSimpleClient(
   parsed: ParsedConnectionString,
-  deadline?: number,
-  pinned = false
+  deadline?: number
 ): Promise<ConnectedClient> {
   const config: ClientConfig = parsed.tls
     ? {
@@ -1030,34 +1068,8 @@ async function connectSimpleClient(
     throw new ConfigError("invalid Apache Iggy client configuration", { cause })
   }
   try {
-    const connection = (raw as RawClient & RawClientConnection).connection
-    const client = pinned ? pinnedClient(raw, deadline) : new SimpleClient(raw)
-    // The client emits `connect` only once the transport, TLS included, is up, so it
-    // separates a server that never accepts the socket from one that never answers login.
-    let accepted = false
-    const markAccepted = (): void => {
-      accepted = true
-    }
-    connection.once("connect", markAccepted)
-    const ready = new Promise<void>((resolve, reject) => {
-      const failed = (cause?: unknown): void => {
-        reject(cause instanceof Error ? cause : new Error(String(cause)))
-      }
-      connection.once("error", failed)
-      const login = async (): Promise<void> => {
-        if (pinned) {
-          const connection = (raw as RawClient & PinnedRawClient).connection
-          await connection.connect(true)
-          if ("token" in parsed.credentials) await client.session.loginWithToken(parsed.credentials)
-          else await client.session.login(parsed.credentials)
-        }
-        await client.client.getMe()
-      }
-      login().then(() => {
-        connection.off("error", failed)
-        resolve()
-      }, reject)
-    })
+    const client = new SimpleClient(raw)
+    const ready = client.client.getMe()
     void ready.catch(() => undefined)
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
@@ -1068,7 +1080,7 @@ async function connectSimpleClient(
             new Promise<never>((_, reject) => {
               timer = setTimeout(
                 () => {
-                  reject(new TimeoutError(accepted ? LOGIN_STAGE : ACCEPT_STAGE))
+                  reject(new TimeoutError(transportUp(raw) ? LOGIN_STAGE : ACCEPT_STAGE))
                 },
                 Math.max(0, deadline - Date.now())
               )
@@ -1076,9 +1088,7 @@ async function connectSimpleClient(
           ]))
     } finally {
       clearTimeout(timer)
-      connection.off("connect", markAccepted)
     }
-    connection.on("error", () => undefined)
     return { client, raw }
   } catch (cause) {
     raw.destroy()
@@ -1089,59 +1099,19 @@ async function connectSimpleClient(
   }
 }
 
-interface PinnedRawClient {
-  readonly connection: ClientConnectionEvents & { connect(boundDial?: boolean): Promise<unknown> }
-  readonly _queueCommand?: (
-    code: number,
-    payload: Buffer,
-    handleResponse: boolean,
-    last: boolean,
-    followsLeaderMoves: boolean,
-    deadline: number
-  ) => ReturnType<RawClient["sendCommand"]>
-}
-
-// Use the same request queue the Apache Iggy SDK uses for its native partition
-// data connections. This bypasses coordinator login settlement on this connection.
-function pinnedClient(raw: RawClient, loginDeadline: number | undefined): SimpleClient {
-  const data = raw as RawClient & PinnedRawClient
-  const queue = data._queueCommand
-  if (typeof queue !== "function")
-    throw new UnsupportedError(
-      "this Apache Iggy SDK does not expose the partition data request queue required by filtered Primary reads",
-      { surface: "filters" }
-    )
-  const facade: RawClient = {
-    sendCommand(code, payload, options) {
-      return queue.call(
-        data,
-        code,
-        payload,
-        options?.handleResponse ?? true,
-        options?.last ?? true,
-        false,
-        options?.deadline ??
-          (raw.isAuthenticated
-            ? Date.now() + connectOptions().timeoutMs
-            : (loginDeadline ?? Date.now() + connectOptions().timeoutMs))
-      )
-    },
-    get isAuthenticated() {
-      return raw.isAuthenticated
-    },
-    authenticate: (credentials) => raw.authenticate(credentials),
-    destroy: () => {
-      raw.destroy()
-    },
-    on: (event, callback) => {
-      raw.on(event, callback)
-    },
-    once: (event, callback) => {
-      raw.once(event, callback)
-    },
-    getReadStream: () => raw.getReadStream()
+// Whether the socket the client dialed last is up, its TLS handshake included,
+// which separates a server that never accepts the connection from one that
+// never answers the login.
+function transportUp(raw: RawClient | undefined): boolean {
+  let socket: unknown
+  try {
+    socket = raw?.getReadStream()
+  } catch {
+    return false
   }
-  return new SimpleClient(facade)
+  if (!(socket instanceof Socket) || socket.readyState !== "open") return false
+  // The peer's certificate is known once the handshake finished.
+  return !(socket instanceof TLSSocket) || Object.keys(socket.getPeerCertificate()).length > 0
 }
 
 // A failure a later attempt can clear: no server reply, or a server reply the
@@ -1211,76 +1181,229 @@ async function connectWithRetry(
  * as Rust `MANAGED_MUTATION_DEADLINE`. */
 export { MANAGED_MUTATION_DEADLINE_MS }
 
-/** The message of a surface-neutral `Pending` reply, `undefined` for any other
- * reply. A typed surface reply never decodes as this shape. */
-/**
- * The roster nodes managed requests may move to, in roster order, as Rust
- * `managed_route::candidates`. The failed node is skipped. Without a pinned
- * node the shared connection was on the leader, so the leader is skipped.
- * Nodes that report themselves stopping or unreachable are skipped too.
- * @internal
- */
-export function managedCandidates(
-  nodes: readonly ClusterNode[],
-  failed: string | undefined
-): ClusterNode[] {
-  return nodes.filter(
-    (node) =>
-      (failed === undefined ? node.role !== "Leader" : node.name !== failed) &&
-      node.status !== "Stopping" &&
-      node.status !== "Unreachable"
+/** Where `code` goes when nothing more specific names its node, as Rust
+ * `Target::of_code`. A standard Iggy command keeps the client's own routing,
+ * the way Rust sends it as a typed call. */
+export function managedTargetOf(code: number): ManagedTarget {
+  if (
+    code < AGDX_COMMAND_BASE ||
+    code === AGDX_AUTHZ_DEFINE_ROLE_CODE ||
+    code === AGDX_AUTHZ_DELETE_ROLE_CODE ||
+    code === AGDX_AUTHZ_BIND_ROLES_CODE
   )
+    return { kind: "metadata_primary" }
+  return { kind: "caller" }
 }
 
-function sameVersions(left: OpVersions, right: OpVersions): boolean {
+/**
+ * The caller's node: the roster entry the caller key picks, moved one entry on
+ * per failed link, as Rust `nodes::pick`.
+ * @internal
+ */
+export function pickNode(
+  roster: readonly number[],
+  callerKey: bigint,
+  moved: bigint
+): number | undefined {
+  if (roster.length === 0) return undefined
+  return roster[Number(((callerKey + moved) & U64_MASK) % BigInt(roster.length))]
+}
+
+/** Whether the node a partition request went to no longer leads the partition
+ * or cannot be reached, so its route is looked up again, as Rust
+ * `is_route_stale`. */
+export function isRouteStale(error: unknown): boolean {
+  const code = serverErrorCode(error)
+  return code === NOT_PRIMARY || code === INVALID_IDENTIFIER || isTransientFailure(error)
+}
+
+// A failure Rust `is_transient_iggy_io_error` names: a lost or refused link
+// before a reply, or a reply the cluster marks transient.
+function isTransientFailure(error: unknown): boolean {
   return (
-    left.query === right.query &&
-    left.control === right.control &&
-    left.kv === right.kv &&
-    left.fork === right.fork &&
-    left.agent === right.agent &&
-    left.graph === right.graph &&
-    (left.checkpoint ?? 0) === (right.checkpoint ?? 0) &&
-    (left.filter ?? 0) === (right.filter ?? 0) &&
-    left.features === right.features
+    error instanceof AmbiguousMutationError || (error instanceof TransportError && error.retryable)
   )
 }
 
-const KV_READ_BARRIER = 1
-const FORK_READ_BARRIER = 2
-const GRAPH_READ_BARRIER = 4
-const SESSION_READ_BARRIER = 8
-const ALL_READ_BARRIERS =
-  KV_READ_BARRIER | FORK_READ_BARRIER | GRAPH_READ_BARRIER | SESSION_READ_BARRIER
+type Runner = <Value>(
+  operation: (client: SimpleClient) => Promise<Value>,
+  message: string
+) => Promise<Value>
 
 /**
- * The read barrier bit of a managed read's surface, `0` for a command that
- * takes none, as Rust `barrier_bit`.
- * @internal
+ * Picks the node of every managed request, as Rust `nodes::Nodes`. Every node
+ * answers every managed request from shared state, so a client keeps to one
+ * node chosen by a key of its own, which spreads clients over the cluster, and
+ * moves to the next node after a failed link.
  */
-export function barrierBit(code: number): number {
-  switch (code) {
-    case AGDX_KV_GET_CODE:
-    case AGDX_KV_SCAN_CODE:
-    case AGDX_KV_NAMESPACES_CODE:
-    case AGDX_KV_EXISTS_CODE:
-      return KV_READ_BARRIER
-    case AGDX_FORK_LIST_CODE:
-      return FORK_READ_BARRIER
-    case AGDX_GRAPH_QUERY_CODE:
-    case AGDX_GRAPH_NEIGHBORS_CODE:
-      return GRAPH_READ_BARRIER
-    case AGDX_SESSION_GET_CODE:
-    case AGDX_SESSION_LIST_CODE:
-    case AGDX_SESSION_EVENTS_CODE:
-    case AGDX_SESSION_STATE_CODE:
-    case AGDX_SESSION_LINKS_CODE:
-    case AGDX_SESSION_SOURCES_CODE:
-    case AGDX_SESSION_CHANGES_CODE:
-      return SESSION_READ_BARRIER
-    default:
-      return 0
+export class Nodes {
+  // Ascending replica ids, empty until the first request reads them.
+  private roster: readonly number[] = []
+  // Failed links so far, each one moves the caller to the next node.
+  private moved = 0n
+  // The node each recent query ran on, newest last.
+  private readonly queries: { readonly executionId: bigint; readonly replica: number }[] = []
+
+  constructor(private readonly callerKey: bigint = callerKeyOf()) {}
+
+  /**
+   * Sends `code` to `target`. A request to the caller's node moves on to the
+   * next node after a failed link, at most once per node, and reads the roster
+   * again once when a replica id is no longer in it. A request to a named
+   * replica is sent there only.
+   */
+  async send(
+    run: Runner,
+    code: number,
+    payload: Uint8Array,
+    target: ManagedTarget
+  ): Promise<ManagedAnswer> {
+    const buffer = toNodeBuffer(payload)
+    switch (target.kind) {
+      case "metadata_primary":
+        return {
+          reply: fromNodeBuffer(
+            await run(
+              (client) => client.sendBinaryRequest(code, buffer),
+              `managed command ${String(code)} failed`
+            )
+          )
+        }
+      case "replica":
+        return {
+          reply: fromNodeBuffer(
+            await run(
+              (client) => client.sendBinaryRequestToReplica(code, buffer, target.replica),
+              `managed command ${String(code)} to replica ${String(target.replica)} failed`
+            )
+          ),
+          replica: target.replica
+        }
+      case "caller":
+        return this.sendToCaller(run, code, buffer)
+    }
   }
+
+  /** The caller's node and the roster size, reading the roster when none is known. */
+  async callerNode(run: Runner): Promise<{ readonly replica: number; readonly nodes: number }> {
+    const picked = this.pick()
+    if (picked !== undefined) return picked
+    const metadata = await run(
+      (client) => client.cluster.getClusterMetadata(),
+      "failed to read the cluster metadata"
+    )
+    this.roster = [...new Set(metadata.nodes.map((node) => node.replicaId))].sort(
+      (left, right) => left - right
+    )
+    const read = this.pick()
+    if (read === undefined) {
+      throw new TransportError("the cluster metadata names no replica", false, {
+        cause: Object.assign(new Error("invalid identifier"), { errorCode: INVALID_IDENTIFIER })
+      })
+    }
+    return read
+  }
+
+  /** Records a failed link to `replica`. The caller moves on only when
+   * `replica` is still its node, so concurrent failures move it once. */
+  failed(replica: number): void {
+    if (pickNode(this.roster, this.callerKey, this.moved) === replica) this.moved += 1n
+  }
+
+  forgetRoster(): void {
+    this.roster = []
+  }
+
+  /** Remembers the node a query ran on, so its pages, status and cancellation
+   * reach the plane that holds its state. */
+  pinQuery(executionId: bigint, replica: number): void {
+    const index = this.queries.findIndex((pinned) => pinned.executionId === executionId)
+    if (index >= 0) this.queries.splice(index, 1)
+    if (this.queries.length === PINNED_QUERIES) this.queries.shift()
+    this.queries.push({ executionId, replica })
+  }
+
+  /** The node of a pinned query, or the caller's node. */
+  queryTarget(executionId: bigint): ManagedTarget {
+    const pinned = this.queries.find((query) => query.executionId === executionId)
+    return pinned === undefined ? { kind: "caller" } : { kind: "replica", replica: pinned.replica }
+  }
+
+  private async sendToCaller(run: Runner, code: number, buffer: Buffer): Promise<ManagedAnswer> {
+    let rosterRead = false
+    let failedLinks = 0
+    for (;;) {
+      const { replica, nodes } = await this.callerNode(run)
+      try {
+        const reply = await run(
+          (client) => client.sendBinaryRequestToReplica(code, buffer, replica),
+          `managed command ${String(code)} to replica ${String(replica)} failed`
+        )
+        if (backendUnavailable(reply)) {
+          this.failed(replica)
+          failedLinks += 1
+          if (failedLinks < nodes) continue
+        }
+        return { reply: fromNodeBuffer(reply), replica }
+      } catch (error) {
+        if (serverErrorCode(error) === INVALID_IDENTIFIER && !rosterRead) {
+          rosterRead = true
+          this.forgetRoster()
+          continue
+        }
+        if (!isTransientFailure(error)) throw error
+        this.failed(replica)
+        failedLinks += 1
+        if (failedLinks >= nodes) throw error
+      }
+    }
+  }
+
+  private pick(): { readonly replica: number; readonly nodes: number } | undefined {
+    const replica = pickNode(this.roster, this.callerKey, this.moved)
+    return replica === undefined ? undefined : { replica, nodes: this.roster.length }
+  }
+}
+
+function backendUnavailable(reply: Uint8Array): boolean {
+  try {
+    const value: unknown = decodeOne(reply, "CommandError")
+    return (
+      value instanceof Map &&
+      value.get("code") === "backend_unavailable" &&
+      typeof value.get("message") === "string"
+    )
+  } catch {
+    return false
+  }
+}
+
+// The key that picks a client's node: random, so clients spread over the
+// cluster, and fixed for the connection's life.
+function callerKeyOf(): bigint {
+  return mintUlidValue() & U64_MASK
+}
+
+function fromNodeBuffer(reply: Buffer): Uint8Array {
+  return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
+}
+
+function encodePartitionRoute(streamId: string, topicId: string, partitionId: number): Uint8Array {
+  const stream = encodeIdentifier(streamId)
+  const topic = encodeIdentifier(topicId)
+  const request = new Uint8Array(stream.byteLength + topic.byteLength + 4)
+  request.set(stream, 0)
+  request.set(topic, stream.byteLength)
+  new DataView(request.buffer).setUint32(stream.byteLength + topic.byteLength, partitionId, true)
+  return request
+}
+
+// The primary replica of a route reply. A reply of any other length comes from
+// a mismatched build.
+function decodePartitionPrimary(reply: Uint8Array): number {
+  if (reply.byteLength !== PARTITION_ROUTE_BYTES)
+    throw new ProtocolError("the partition route reply has an unexpected length")
+  return reply[PARTITION_ROUTE_BYTES - 1] ?? 0
 }
 
 /**
@@ -1304,24 +1427,8 @@ export function openPositioned(reply: Uint8Array): {
   }
 }
 
-function isStaleReply(reply: Uint8Array): boolean {
-  try {
-    const value = decodeOne(reply, "CommandError")
-    return value instanceof Map && value.get("code") === "stale"
-  } catch {
-    return false
-  }
-}
-
-function isBackendUnavailableReply(reply: Uint8Array): boolean {
-  try {
-    const value = decodeOne(reply, "CommandError")
-    return value instanceof Map && value.get("code") === "backend_unavailable"
-  } catch {
-    return false
-  }
-}
-
+/** The message of a surface-neutral `Pending` reply, `undefined` for any other
+ * reply. A typed surface reply never decodes as this shape. */
 export function pendingReplyMessage(reply: Uint8Array): string | undefined {
   let value: unknown
   try {
@@ -1347,14 +1454,6 @@ export class ApacheIggyTransport implements LaserTransport {
   private readonly reconnectLock = new Mutex()
   private readonly publishLane = new Mutex()
   private readonly disconnected = new WeakSet<SimpleClient>()
-  // The node managed requests use after the shared connection's backend failed.
-  private managedNode: ManagedNode | undefined
-  private managedMove: Promise<void> | undefined
-  // The operation versions the first hello on the shared connection announced.
-  private helloVersions: OpVersions | undefined
-  // Surfaces whose next read must wait for the new node's fold to reach the
-  // mutation log head, one bit per surface, set by a node move.
-  private readBarriers = 0
   // The highest mutation position seen per surface, from mutation and read
   // replies. Every KV, fork and graph read sends it back, so whichever node
   // answers has applied at least what this client wrote or read before.
@@ -1378,8 +1477,19 @@ export class ApacheIggyTransport implements LaserTransport {
     private client: SimpleClient,
     private readonly connection: ParsedConnectionString | undefined,
     private readonly ownership: ClientOwnership,
-    private readonly publishConfig: PublishOptions
+    private readonly publishConfig: PublishOptions,
+    readonly nodes: Nodes = new Nodes()
   ) {}
+
+  async replicaIds(): Promise<readonly number[]> {
+    const metadata = await this.runner()(
+      (client) => client.cluster.getClusterMetadata(),
+      "failed to read the cluster metadata"
+    )
+    return [...new Set(metadata.nodes.map((node) => node.replicaId))].sort(
+      (left, right) => left - right
+    )
+  }
 
   publishTimeoutMs(): number {
     return this.publishConfig.timeoutMs
@@ -1405,9 +1515,7 @@ export class ApacheIggyTransport implements LaserTransport {
     const config = publishOptions(options)
     const parsed = parseConnectionString(connectionString)
     const connected = await connectWithRetry(parsed, deadline)
-    const transport = new ApacheIggyTransport(connected.client, parsed, "owned", config)
-    transport.watch(connected)
-    return transport
+    return new ApacheIggyTransport(connected.client, parsed, "owned", config)
   }
 
   static async fromClient(
@@ -1516,7 +1624,6 @@ export class ApacheIggyTransport implements LaserTransport {
             throw cause
           }
           this.client = connected.client
-          this.watch(connected)
           return
         } catch (error) {
           lastError = error
@@ -1552,65 +1659,35 @@ export class ApacheIggyTransport implements LaserTransport {
     })
   }
 
-  private watch(connected: ConnectedClient): void {
-    watchConnectionLoss((connected.raw as RawClient & RawClientConnection).connection, () => {
-      this.disconnected.add(connected.client)
-    })
-  }
-
   async sendManaged(
     code: number,
     payload: Uint8Array,
-    options?: {
-      readonly retryAfterReconnect?: boolean
-      /** Overrides the mutation deadline, for tests.
-       * @internal */
-      readonly mutationDeadlineMs?: number
-    }
+    options?: ManagedSendOptions
   ): Promise<Uint8Array> {
+    return (
+      await this.sendManagedTo(code, payload, options?.target ?? managedTargetOf(code), options)
+    ).reply
+  }
+
+  /**
+   * Sends managed command `code` to `target` and names the replica that
+   * answered, as Rust `send_managed_to`. A read goes in its read frame, a
+   * mutation repeats its frame until its outcome is known.
+   */
+  async sendManagedTo(
+    code: number,
+    payload: Uint8Array,
+    target: ManagedTarget,
+    options?: ManagedSendOptions
+  ): Promise<ManagedAnswer> {
     if (!isIdempotentManagedRequest(code)) {
-      // After a node move, the first read of each surface waits for the new
-      // node's fold to reach the log head, so it cannot miss this client's own
-      // earlier writes, even one whose reply was lost.
-      const barrier = barrierBit(code)
-      const barriered = (this.readBarriers & barrier) !== 0
-      const request = this.readFrame(code, payload, barriered)
-      const node = this.managedNode
-      let reply: Uint8Array
-      try {
-        reply = await this.sendManagedOn(node, code, request, options)
-      } catch (cause) {
-        // A pinned node does not reconnect. The caller decides whether to
-        // send again, and the next request uses the shared connection.
-        if (node !== undefined && this.managedNode === node) {
-          this.managedNode = undefined
-          await node.connection.close()
-        }
-        throw cause
-      }
-      if (code === AGDX_HELLO_CODE && node === undefined) this.rememberHello(reply)
-      // A read is safe to send again, so it moves once to another node when
-      // this node's backend did not answer. The move armed the barrier.
-      if (isBackendUnavailableReply(reply) && (await this.moveManaged(node?.name))) {
-        const retry = this.readFrame(code, payload, barrier !== 0)
-        const movedNode = this.managedNode
-        let moved: Uint8Array
-        try {
-          moved = await this.sendManagedOn(movedNode, code, retry, options)
-        } catch (cause) {
-          // The fresh pin fails like the first one: it goes, so later
-          // requests do not fail on it first.
-          if (movedNode !== undefined && this.managedNode === movedNode) {
-            this.managedNode = undefined
-            await movedNode.connection.close()
-          }
-          throw cause
-        }
-        if (barrier !== 0) this.settleBarrier(barrier, moved)
-        return moved
-      }
-      if (barriered) this.settleBarrier(barrier, reply)
-      return reply
+      const answer = await this.nodes.send(
+        this.runner(options),
+        code,
+        this.readFrame(code, payload),
+        target
+      )
+      return { ...answer, reply: this.takePositioned(answer.reply) }
     }
     const operationId = mintUlidValue()
     const frame = encodeNamed(
@@ -1620,7 +1697,7 @@ export class ApacheIggyTransport implements LaserTransport {
         payload
       })
     )
-    return this.sendManagedMutation(code, operationId, frame, options)
+    return this.sendManagedMutation(code, operationId, frame, target, options)
   }
 
   /**
@@ -1636,35 +1713,24 @@ export class ApacheIggyTransport implements LaserTransport {
     code: number,
     operationId: bigint,
     frame: Uint8Array,
-    options?: { readonly retryAfterReconnect?: boolean; readonly mutationDeadlineMs?: number }
-  ): Promise<Uint8Array> {
+    target: ManagedTarget,
+    options?: ManagedSendOptions
+  ): Promise<ManagedAnswer> {
     const deadlineMs = options?.mutationDeadlineMs ?? MANAGED_MUTATION_DEADLINE_MS
     const deadline = Date.now() + deadlineMs
     let delay = MANAGED_MUTATION.baseMs
     for (;;) {
       let unknown: string
-      const node = this.managedNode
-      let nodeFailed: boolean
       try {
-        const reply = await this.sendManagedOn(node, code, frame, options)
+        const answer = await this.nodes.send(this.runner(options), code, frame, target)
+        const reply = this.takePositioned(answer.reply)
         const pending = pendingReplyMessage(reply)
-        if (pending === undefined) return reply
+        if (pending === undefined) return { ...answer, reply }
         unknown = pending
-        nodeFailed = isBackendUnavailableReply(reply)
       } catch (cause) {
-        // A pinned node's connection has no reconnect, so any failure there
-        // leaves the outcome unknown and moves the request.
-        const ambiguous =
-          node !== undefined ||
-          cause instanceof AmbiguousMutationError ||
-          (cause instanceof TransportError && cause.retryable)
-        if (!ambiguous) throw cause
+        if (!isTransientFailure(cause)) throw cause
         unknown = cause instanceof Error ? cause.message : String(cause)
-        nodeFailed = true
       }
-      // The same frame goes to another node, so the move keeps the operation
-      // identity and the deadline.
-      if (nodeFailed) await this.moveManaged(node?.name)
       const wait = jittered(delay)
       if (Date.now() + wait >= deadline) {
         throw new AmbiguousMutationError(
@@ -1676,14 +1742,10 @@ export class ApacheIggyTransport implements LaserTransport {
     }
   }
 
-  private async sendManagedOn(
-    node: ManagedNode | undefined,
-    code: number,
-    payload: Uint8Array,
-    options?: { readonly retryAfterReconnect?: boolean }
-  ): Promise<Uint8Array> {
-    if (node === undefined) return this.sendManagedPreframed(code, payload, options)
-    return this.takePositioned(await node.connection.send(code, payload))
+  // Runs one operation on this connection, reconnecting it as `execute` does.
+  private runner(options?: ManagedSendOptions): Runner {
+    return (operation, message) =>
+      this.execute(operation, message, options?.retryAfterReconnect ?? true)
   }
 
   /**
@@ -1692,7 +1754,7 @@ export class ApacheIggyTransport implements LaserTransport {
    * positions this client has seen for the surface, so the reply brings the
    * answering node's frontier back.
    */
-  private readFrame(code: number, read: Uint8Array, logHead: boolean): Uint8Array {
+  private readFrame(code: number, read: Uint8Array): Uint8Array {
     if (!isBarrierRead(code)) return read
     const surface = positionSurfaceOf(code)
     const minPosition = surface === undefined ? undefined : this.seenFrontier[surface]
@@ -1704,7 +1766,6 @@ export class ApacheIggyTransport implements LaserTransport {
         v: MANAGED_REQUEST_VERSION,
         read,
         ...(minPosition !== undefined ? { minPosition } : {}),
-        ...(logHead ? { logHead } : {}),
         ...(minSessions.length > 0 ? { minSessions } : {})
       })
     )
@@ -1724,90 +1785,15 @@ export class ApacheIggyTransport implements LaserTransport {
     return this.seenFrontier
   }
 
-  /** Clears a surface's pending barrier once a barriered read was served. */
-  private settleBarrier(barrier: number, reply: Uint8Array): void {
-    if (!isStaleReply(reply)) this.readBarriers &= ~barrier
-  }
-
-  private rememberHello(reply: Uint8Array): void {
-    try {
-      this.helloVersions ??= decodeBackendAnnounce(reply).versions
-    } catch {
-      // Not an announcement, so nothing was negotiated to compare against.
-    }
-  }
-
-  /**
-   * Moves managed requests off `failed` to another roster node whose backend
-   * is ready and speaks the versions this transport negotiated, as Rust
-   * `ManagedRoute::repin`. Concurrent callers share one move. Returns whether
-   * a node other than `failed` now serves managed requests.
-   */
-  private async moveManaged(failed: string | undefined): Promise<boolean> {
-    if (this.connection === undefined || this.closed) return false
-    this.managedMove ??= this.repinManaged(failed).finally(() => {
-      this.managedMove = undefined
-    })
-    await this.managedMove
-    const current = this.managedNode?.name
-    return current !== undefined && current !== failed
-  }
-
-  private async repinManaged(failed: string | undefined): Promise<void> {
-    if (this.managedNode?.name !== failed) return
-    let nodes: readonly ClusterNode[]
-    try {
-      nodes = (
-        await this.execute(
-          (client) => client.cluster.getClusterMetadata(),
-          "failed to read the cluster metadata"
-        )
-      ).nodes
-    } catch {
-      return
-    }
-    for (const node of managedCandidates(nodes, failed)) {
-      let connection: NodeConnection
-      try {
-        connection = await this.openNodeConnection(node.ip, node.endpoints.tcp)
-      } catch {
-        continue
-      }
-      let serves: boolean
-      try {
-        const announce = decodeBackendAnnounce(
-          await connection.send(AGDX_HELLO_CODE, new Uint8Array())
-        )
-        serves =
-          announce.ready !== false &&
-          (this.helloVersions === undefined || sameVersions(this.helloVersions, announce.versions))
-      } catch {
-        serves = false
-      }
-      if (!serves) {
-        await connection.close()
-        continue
-      }
-      const old = this.managedNode
-      this.managedNode = { name: node.name, connection }
-      this.readBarriers = ALL_READ_BARRIERS
-      if (old !== undefined) await old.connection.close()
-      return
-    }
-  }
-
+  /** Sends an already framed managed command to the caller's node, as Rust
+   * `send_raw_preframed`. */
   async sendManagedPreframed(
     code: number,
     payload: Uint8Array,
-    options?: { readonly retryAfterReconnect?: boolean }
+    options?: ManagedSendOptions
   ): Promise<Uint8Array> {
-    const buffer = toNodeBuffer(payload)
-    const reply = await this.execute(
-      (client) => client.sendBinaryRequest(code, buffer),
-      `managed command ${String(code)} failed`,
-      options?.retryAfterReconnect ?? true
-    )
-    return this.takePositioned(new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength))
+    const answer = await this.nodes.send(this.runner(options), code, payload, { kind: "caller" })
+    return this.takePositioned(answer.reply)
   }
 
   async ensureStream(name: string): Promise<void> {
@@ -2297,6 +2283,43 @@ export class ApacheIggyTransport implements LaserTransport {
     )
   }
 
+  /**
+   * The replica id of one partition's primary, as any bound replica answers it
+   * from its applied metadata, as Rust `partition_primary`.
+   */
+  async partitionPrimary(streamId: string, topicId: string, partitionId: number): Promise<number> {
+    const request = toNodeBuffer(encodePartitionRoute(streamId, topicId, partitionId))
+    const reply = await this.execute(
+      (client) => client.sendBinaryRequest(GET_PARTITION_ROUTE_CODE, request),
+      `failed to read the route of partition ${String(partitionId)}`
+    )
+    return decodePartitionPrimary(fromNodeBuffer(reply))
+  }
+
+  /**
+   * Stores a consumer group offset fenced to the partition incarnation and
+   * group owner it was read under, as Rust `store_consumer_position`. A changed
+   * history answers `HistoryUnavailable`, a moved assignment
+   * `ConsumerGroupPartitionNotOwned`.
+   */
+  async storePosition(position: FencedPosition): Promise<void> {
+    await this.execute(
+      (client) =>
+        client.offset.store({
+          streamId: position.streamId,
+          topicId: position.topicId,
+          consumer:
+            position.consumer.kind === "group"
+              ? Consumer.Group(position.consumer.id)
+              : { kind: 1 as const, id: position.consumer.name },
+          partitionId: position.partitionId,
+          offset: position.offset,
+          context: position.context
+        }),
+      `failed to store the position of partition ${String(position.partitionId)}`
+    )
+  }
+
   async deleteOffset(
     streamId: string,
     topicId: string,
@@ -2426,47 +2449,6 @@ export class ApacheIggyTransport implements LaserTransport {
     })
   }
 
-  async openNodeConnection(ip: string, port: number): Promise<NodeConnection> {
-    if (this.connection === undefined) {
-      throw new ConfigError(
-        "a node connection needs a Laser connected from a connection string, not an injected client"
-      )
-    }
-    const unspecified = ip.length === 0 || ip === "0.0.0.0" || ip === "::" || ip === "[::]"
-    const host = unspecified ? this.connection.host : ip
-    // Port zero means the endpoint this transport dialed itself.
-    const connected = await connectSimpleClient(
-      {
-        ...this.connection,
-        host,
-        port: port === 0 ? this.connection.port : port,
-        ...(this.connection.servername === undefined && isIP(this.connection.host) === 0
-          ? { servername: this.connection.host }
-          : {})
-      },
-      Date.now() + connectOptions().timeoutMs,
-      true
-    )
-    const client = connected.client
-    return {
-      async send(code: number, payload: Uint8Array): Promise<Uint8Array> {
-        const reply = await client.sendBinaryRequest(code, toNodeBuffer(payload))
-        return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
-      },
-      async close(): Promise<void> {
-        await client.destroy().catch(() => undefined)
-      }
-    }
-  }
-
-  async clusterNodeCount(): Promise<number> {
-    const metadata = await this.execute(
-      (client) => client.cluster.getClusterMetadata(),
-      "failed to read the cluster metadata"
-    )
-    return metadata.nodes.length
-  }
-
   async openCoordinator(): Promise<CoordinatorConnection> {
     if (this.connection === undefined) {
       throw new ConfigError(
@@ -2483,15 +2465,24 @@ export class ApacheIggyTransport implements LaserTransport {
       "owned",
       this.publishConfig
     )
-    coordinator.watch(connected)
+    const nodes = this.nodes
     return {
+      // A connection of its own picks its own node, as a Rust `Laser` connected
+      // for it would.
       async send(code: number, payload: Uint8Array): Promise<Uint8Array> {
-        const reply = await coordinator.execute(
-          (client) => client.sendBinaryRequest(code, toNodeBuffer(payload)),
-          `coordinator command ${String(code)} failed`
+        const answer = await coordinator.nodes.send(
+          coordinator.runner(),
+          code,
+          payload,
+          managedTargetOf(code)
         )
-        return new Uint8Array(reply.buffer, reply.byteOffset, reply.byteLength)
+        return answer.reply
       },
+      sendManagedTo: (code, payload, target) =>
+        nodes.send(coordinator.runner(), code, payload, target),
+      partitionPrimary: (streamId, topicId, partitionId) =>
+        coordinator.partitionPrimary(streamId, topicId, partitionId),
+      storePosition: (position) => coordinator.storePosition(position),
       async joinConsumerGroup(
         streamId: string,
         topicId: string,
@@ -2519,9 +2510,6 @@ export class ApacheIggyTransport implements LaserTransport {
   async close(): Promise<void> {
     this.closed = true
     this.consumerGroups.clear()
-    const managed = this.managedNode
-    this.managedNode = undefined
-    if (managed !== undefined) await managed.connection.close()
     if (this.ownership === "owned") await this.client.destroy()
   }
 

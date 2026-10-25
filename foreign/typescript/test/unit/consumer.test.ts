@@ -41,8 +41,7 @@ function matchedPage(records: readonly MatchedRecord[]): MatchedPage {
       topicId: 1,
       topicCreatedAtMicros: 1n,
       partitionId: 0,
-      partitionCreatedRevision: 1n,
-      purgeGeneration: 0n
+      partitionIncarnation: 1n
     },
     stop: "end_of_visible",
     examined: records.length,

@@ -1217,6 +1217,7 @@ fn set_fields(py: Python<'_>, pyerr: &PyErr, err: &SdkError) -> PyResult<()> {
         SdkError::Iggy(IggyError::ProducerSendFailed {
             cause,
             failed,
+            uncertain: _,
             committed,
             stream_name,
             topic_name,

@@ -1,3 +1,5 @@
+/// <reference types="node" preserve="true" />
+
 import type { LaserObserver, ObservationLevel, SpanScope } from "./observe.js"
 
 export interface OpenTelemetrySpan {

@@ -22,6 +22,7 @@ import {
   decodeFilterMutationRequest,
   decodeFilterReply,
   decodeFilteredAck,
+  encodeFilteredAck,
   decodeFilteredPollRequest,
   decodeHeaderScalar,
   encodeConsumerFilter,
@@ -29,7 +30,6 @@ import {
   encodeFilterCatalogReply,
   encodeFilterMutationRequest,
   encodeFilterReply,
-  encodeFilteredAck,
   encodeFilteredPollRequest,
   parseCanonicalJson,
   rustDouble,
@@ -61,6 +61,9 @@ async function assertRoundTrip<T>(
 }
 
 void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byte_identically", async () => {
+  await assertRoundTrip("filter_ack.bin", decodeFilteredAck, encodeFilteredAck)
+  await assertRoundTrip("filter_ack_unfiltered.bin", decodeFilteredAck, encodeFilteredAck)
+  await assertRoundTrip("filter_reply_acknowledged.bin", decodeFilterReply, encodeFilterReply)
   const filter = await assertRoundTrip(
     "filter_consumer_filter.bin",
     decodeConsumerFilter,
@@ -78,7 +81,7 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     decodeFilteredPollRequest,
     encodeFilteredPollRequest
   )
-  assert.equal(poll.readMode, "primary")
+  assert.equal(poll.partitionId, 0)
   const byId = await assertRoundTrip(
     "filter_poll_request_group_id.bin",
     decodeFilteredPollRequest,
@@ -119,16 +122,13 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
     revision: 2,
     enabled: false
   })
-  const ack = await assertRoundTrip("filter_ack.bin", decodeFilteredAck, encodeFilteredAck)
-  assert.equal(ack.mode, "filtered")
-  assert.equal(ack.policyGeneration, 1n)
-  const unfilteredAck = await assertRoundTrip(
-    "filter_ack_unfiltered.bin",
-    decodeFilteredAck,
-    encodeFilteredAck
-  )
-  assert.equal(unfilteredAck.mode, "unfiltered")
-  assert.equal(unfilteredAck.digest, undefined)
+  const page = await assertRoundTrip("filter_reply_page.bin", decodeFilterReply, encodeFilterReply)
+  if (page.kind === "ok" && page.outcome.kind === "page") {
+    assert.equal(page.outcome.page.generation.partitionIncarnation, 17n)
+    assert.deepEqual(page.outcome.page.ackContext, { ownerGeneration: 4n, metadataOp: 40n })
+  } else {
+    assert.fail("the page fixture is a page")
+  }
   const unfilteredPage = await assertRoundTrip(
     "filter_reply_page_unfiltered.bin",
     decodeFilterReply,
@@ -141,12 +141,7 @@ void test("given_the_rust_filter_fixtures_when_decoded_then_should_re_encode_byt
   } else {
     assert.fail("the unfiltered fixture is a page")
   }
-  for (const name of [
-    "filter_reply_page.bin",
-    "filter_reply_acknowledged.bin",
-    "filter_reply_revision_disabled.bin",
-    "filter_reply_error.bin"
-  ]) {
+  for (const name of ["filter_reply_revision_disabled.bin", "filter_reply_error.bin"]) {
     await assertRoundTrip(name, decodeFilterReply, encodeFilterReply)
   }
   for (const name of [

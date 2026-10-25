@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, execFile } from "node:child_process"
-import { open, mkdtemp, readFile, rm } from "node:fs/promises"
+import { open, mkdir, readdir, access, mkdtemp, readFile, rm } from "node:fs/promises"
 import { createServer, createConnection } from "node:net"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -16,6 +16,23 @@ const args = process.argv.slice(3)
 if (command === undefined) {
   console.error("usage: run-with-test-iggy.mjs <command> [args...]")
   process.exit(2)
+}
+
+async function dataRoot() {
+  const base = await access("/dev/shm").then(() => "/dev/shm", () => tmpdir())
+  const root = join(base, "laser-typescript-test-iggy")
+  await mkdir(root, { recursive: true })
+  for (const previous of await readdir(root)) {
+    if (!/^\d+$/.test(previous)) continue
+    try {
+      process.kill(Number(previous), 0)
+    } catch (error) {
+      if (error.code === "ESRCH") await rm(join(root, previous), { recursive: true, force: true })
+    }
+  }
+  const current = join(root, String(process.pid))
+  await mkdir(current, { recursive: true })
+  return current
 }
 
 function configuredEndpoint(env) {
@@ -142,7 +159,7 @@ if (external !== undefined) {
     const binary = stdout.trim()
     if (binary.length === 0)
       throw new Error("Iggy test server resolver returned no path")
-    directory = await mkdtemp(join(tmpdir(), "laser-iggy-"))
+    directory = await mkdtemp(join(await dataRoot(), "laser-iggy-"))
     const port = await freePort()
     const logPath = join(directory, "test-server.log")
     log = await open(logPath, "w")
@@ -160,6 +177,7 @@ if (external !== undefined) {
         IGGY_SHARDING_CPU_ALLOCATION: "2",
         IGGY_SHARDING_PIN_CORES: "false",
         IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
+        IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: "1s",
       },
       stdio: ["ignore", log.fd, log.fd],
     })

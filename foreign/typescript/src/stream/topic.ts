@@ -388,7 +388,7 @@ export class Topic {
    * Empty when the topic does not exist yet. */
   async tailOffsets(): Promise<ReadonlyMap<number, bigint>> {
     const partitionCount = (await this.partitionCount()) ?? 0
-    const tails = await Promise.all(
+    const settled = await Promise.allSettled(
       Array.from({ length: partitionCount }, async (_, partitionId) => {
         const polled = await this.transport.pollMessages(
           this.streamName,
@@ -402,6 +402,9 @@ export class Topic {
         return [partitionId, last === undefined ? 0n : last.offset + 1n] as const
       })
     )
+    const failure = settled.find((result) => result.status === "rejected")
+    if (failure?.status === "rejected") throw failure.reason
+    const tails = settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
     return new Map(tails)
   }
 

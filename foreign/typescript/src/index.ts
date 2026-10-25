@@ -1,3 +1,5 @@
+/// <reference types="node" preserve="true" />
+
 export {
   LaserError,
   ConfigError,
@@ -210,13 +212,13 @@ export {
   filterExprCaseInsensitive,
   filterExprReadsHeaders,
   filterExprReadsPayload,
-  readModeIsPrimary,
   recordPolicyIsReject,
   textPredicateValidate,
   timestampFormatMicrosFromInteger,
   timestampFormatMicrosFromText
 } from "./wire/filter.js"
 export type {
+  AckContext,
   AppliedPolicy,
   Coerce,
   CoercedPredicate,
@@ -244,7 +246,6 @@ export type {
   HeaderScalar,
   PathSegment,
   PreviewRecord,
-  ReadMode,
   RecordPolicy,
   SourceGeneration,
   StopReason,

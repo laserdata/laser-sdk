@@ -126,7 +126,8 @@ export class TestIggy {
         IGGY_SHARD_RUNTIME_CAPACITY: "256",
         IGGY_SHARDING_CPU_ALLOCATION: "2",
         IGGY_SHARDING_PIN_CORES: "false",
-        IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
+        IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
+        IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: "1s"
       },
       stdio: ["ignore", this.log.fd, this.log.fd]
     })
@@ -324,7 +325,8 @@ export class TestIggyCluster {
       IGGY_SHARD_RUNTIME_CAPACITY: "256",
       IGGY_SHARDING_CPU_ALLOCATION: "1",
       IGGY_SHARDING_PIN_CORES: "false",
-      IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms"
+      IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL: "200 ms",
+      IGGY_CONSUMER_GROUP_REBALANCING_TIMEOUT: "1s"
     }
     for (let node = 0; node < 3; node += 1) {
       const prefix = `IGGY_CLUSTER_NODES_${String(node)}`

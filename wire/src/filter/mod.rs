@@ -30,11 +30,11 @@ pub use expr::{
 };
 pub use path::{FieldPath, PathSegment};
 pub use read::{
-    AckReceipt, AppliedPolicy, Continuation, ExecutionMode, ExplainNode, FaultReason,
+    AckContext, AckReceipt, AppliedPolicy, Continuation, ExecutionMode, ExplainNode, FaultReason,
     FilterConsumer, FilterDecodeLimits, FilterError, FilterErrorReason, FilterExplanation,
     FilterHeader, FilterOutcome, FilterPreview, FilterPreviewRequest, FilterRef, FilterReply,
     FilterSource, FilterTestRequest, FilterTestResult, FilterValidation, FilteredAck, FilteredPage,
-    FilteredPollRequest, FilteredStart, HeaderScalar, PreviewRecord, ReadMode, RecordFault,
-    SourceGeneration, StopReason, Truth, Verdict,
+    FilteredPollRequest, FilteredStart, HeaderScalar, PreviewRecord, RecordFault, SourceGeneration,
+    StopReason, Truth, Verdict,
 };
 pub use text::{TextMatch, TextMatcher, TextPredicate};

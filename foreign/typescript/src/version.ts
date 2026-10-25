@@ -1,3 +1,3 @@
 /** The package version this SDK reports in session starts and bridge metadata.
  * A unit test keeps it equal to the version in `package.json`. */
-export const SDK_VERSION = "0.8.2"
+export const SDK_VERSION = "0.9.0-dev.1"

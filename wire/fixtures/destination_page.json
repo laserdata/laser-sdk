@@ -210,7 +210,7 @@
               "stream_id": 2,
               "topic_id": 3,
               "partition_id": 0,
-              "partition_created_revision": 4
+              "partition_incarnation": 4
             },
             "started_at_offset": 100,
             "next_offset": 150,

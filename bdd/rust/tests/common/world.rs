@@ -79,6 +79,9 @@ pub struct LaserWorld {
     pub last_cas: Option<Result<u64, KvError>>,
     /// A managed position noted by the consistency scenarios.
     pub noted_position: Option<laser_sdk::wire::mutation::MutationPosition>,
+    /// The connections the client-listing scenarios listed and the user they name.
+    pub clients: Vec<laser_sdk::wire::clients::ClientMetadata>,
+    pub client_user: Option<u32>,
     /// The in-memory reference memory engine and the ids of the items remembered
     /// so far (keyed by their text body), for the memory-semantics scenarios (no
     /// Iggy, no transport).

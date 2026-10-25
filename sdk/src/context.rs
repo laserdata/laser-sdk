@@ -333,6 +333,22 @@ impl ContextAssembler {
         let mut seen = std::collections::BTreeSet::new();
         self.topics
             .retain(|topic| seen.insert(topic.topic_string()));
+        let restart = self.from_offsets.is_empty()
+            && self.from_checkpoint.is_none()
+            && self.to_checkpoint.is_none();
+        match self.read_once(laser, span).await {
+            Err(LaserError::Iggy(IggyError::HistoryUnavailable)) if restart => {
+                self.read_once(laser, span).await
+            }
+            result => result,
+        }
+    }
+
+    async fn read_once(
+        &self,
+        laser: &Laser,
+        span: ReadSpan,
+    ) -> Result<Vec<ContextMessage>, LaserError> {
         let stream = Identifier::named(laser.stream_required()?)?;
         let Some(stream_details) = laser.client().get_stream(&stream).await? else {
             return Ok(Vec::new());
@@ -440,13 +456,25 @@ impl ContextAssembler {
             });
         }
         let mut collected: Vec<(u64, usize, ContextMessage)> = Vec::new();
+        let mut failure = None;
         while let Some(joined) = drains.join_next().await {
-            let (topic_idx, matched) = joined.map_err(join_failed)??;
-            collected.extend(
-                matched
-                    .into_iter()
-                    .map(|(timestamp, message)| (timestamp, topic_idx, message)),
-            );
+            match joined.map_err(join_failed).and_then(|result| result) {
+                Ok((topic_idx, matched)) => collected.extend(
+                    matched
+                        .into_iter()
+                        .map(|(timestamp, message)| (timestamp, topic_idx, message)),
+                ),
+                Err(error) => {
+                    if failure.is_none()
+                        || !matches!(error, LaserError::Iggy(IggyError::HistoryUnavailable))
+                    {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         // Order by Iggy-assigned timestamp: a single global clock across topics,
         // since each topic has its own independent offset space. Ties break on

@@ -426,21 +426,7 @@ impl ProducerBuilder {
                     .build(),
             ),
         };
-        let retry_interval = self
-            .retry_interval
-            .map(|duration| {
-                positive_duration(
-                    duration,
-                    "producer retry interval must be greater than zero",
-                )
-            })
-            .transpose()?;
-        builder = builder
-            .partitioning(self.routing.into_partitioning()?)
-            .send_retries(
-                if background { self.retries } else { Some(0) },
-                retry_interval,
-            );
+        builder = builder.partitioning(self.routing.into_partitioning()?);
         builder = if self.create_stream {
             builder.create_stream_if_not_exists()
         } else {
@@ -603,7 +589,7 @@ impl Producer {
         routing: Option<Arc<Partitioning>>,
     ) -> Result<SendMessagesResponse, LaserError> {
         if self.background {
-            return Ok(self.inner.send_with_partitioning(messages, routing).await?);
+            return Ok(Box::pin(self.inner.send_with_partitioning(messages, routing)).await?);
         }
         crate::laser::prepare_publish_messages(&mut messages);
         let mut confirmations = Vec::new();
@@ -617,13 +603,11 @@ impl Producer {
                             self.laser.publish_generation(),
                             std::sync::atomic::Ordering::Release,
                         );
-                        Ok(self
-                            .inner
-                            .send_with_partitioning(
-                                chunk.iter().map(crate::laser::clone_iggy_message).collect(),
-                                routing.clone(),
-                            )
-                            .await?)
+                        Ok(Box::pin(self.inner.send_with_partitioning(
+                            chunk.iter().map(crate::laser::clone_iggy_message).collect(),
+                            routing.clone(),
+                        ))
+                        .await?)
                     },
                     || {
                         self.laser.reconnect_for_publish(
@@ -1159,10 +1143,7 @@ impl From<ReceivedMessage> for ConsumerMessage {
     }
 }
 
-/// An initialized live reader with server-managed offsets. A purge restarts
-/// the partition at offset 0 without telling an open reader, which can keep
-/// its old position and skip the replacement records, so rebuild it after a
-/// purge.
+/// An initialized live reader with server-managed offsets.
 pub struct Consumer {
     yielded_zero: BTreeSet<u32>,
     inner: Option<ConsumerInner>,

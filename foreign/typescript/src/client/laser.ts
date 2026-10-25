@@ -8,6 +8,8 @@ import {
   type ClientOwnership,
   type IggyClient,
   type LaserTransport,
+  type ManagedAnswer,
+  type ManagedTarget,
   NEVER_EXPIRE,
   type SendMessagesResponse,
   serverErrorCode
@@ -960,6 +962,48 @@ export class Laser implements AsyncDisposable {
     }
   }
 
+  // The managed transport whose replies name the replica that answered.
+  private answeringTransport(): {
+    readonly sendManagedTo: (
+      commandCode: number,
+      payload: Uint8Array,
+      target: ManagedTarget
+    ) => Promise<ManagedAnswer>
+  } {
+    return {
+      sendManagedTo: (commandCode, payload, target) =>
+        this.observe("laser.managed", { operation: "managed", commandCode }, () => {
+          const transport = this.transport
+          return transport.sendManagedTo === undefined
+            ? transport
+                .sendManaged(commandCode, payload, { target })
+                .then((reply): ManagedAnswer => ({ reply }))
+            : transport.sendManagedTo(commandCode, payload, target)
+        })
+    }
+  }
+
+  // A query's pages, status, and cancellation reach the plane that ran it.
+  private pinningTransport(executionId: QueryExecutionId): ManagedTransport {
+    const answering = this.answeringTransport()
+    return {
+      sendManaged: async (commandCode, payload, options) => {
+        const answer = await answering.sendManagedTo(
+          commandCode,
+          payload,
+          options?.target ?? { kind: "caller" }
+        )
+        if (answer.replica !== undefined)
+          this.transport.nodes?.pinQuery(executionId.asU128(), answer.replica)
+        return answer.reply
+      }
+    }
+  }
+
+  private queryNode(executionId: QueryExecutionId): ManagedTarget {
+    return this.transport.nodes?.queryTarget(executionId.asU128()) ?? { kind: "caller" }
+  }
+
   /**
    * The highest mutation position this client has seen per managed surface,
    * as Rust `Laser::seen_positions`. Every KV, fork and graph reply raises it,
@@ -1863,14 +1907,14 @@ export class Laser implements AsyncDisposable {
         ...(transport.joinExistingConsumerGroup !== undefined
           ? { joinExistingConsumerGroup: transport.joinExistingConsumerGroup.bind(transport) }
           : {}),
-        ...(transport.openNodeConnection !== undefined
-          ? { openNodeConnection: transport.openNodeConnection.bind(transport) }
+        ...(transport.sendManagedTo !== undefined
+          ? { sendManagedTo: this.answeringTransport().sendManagedTo }
           : {}),
-        ...(transport.clusterNodeCount !== undefined
-          ? { clusterNodeCount: transport.clusterNodeCount.bind(transport) }
+        ...(transport.partitionPrimary !== undefined
+          ? { partitionPrimary: transport.partitionPrimary.bind(transport) }
           : {}),
-        ...(transport.publishOptions !== undefined
-          ? { publishOptions: transport.publishOptions.bind(transport) }
+        ...(transport.storePosition !== undefined
+          ? { storePosition: transport.storePosition.bind(transport) }
           : {}),
         ...(transport.openCoordinator !== undefined
           ? { openCoordinator: transport.openCoordinator.bind(transport) }
@@ -2089,7 +2133,7 @@ export class Laser implements AsyncDisposable {
       )
     }
     const reply = await sendQueryUntil(query.deadlineMicros, () =>
-      executeManaged(this.managedTransport(), capabilities, QueryCommand, {
+      executeManaged(this.pinningTransport(query.executionId), capabilities, QueryCommand, {
         v: QUERY_OP_VERSION,
         query
       })
@@ -2118,12 +2162,18 @@ export class Laser implements AsyncDisposable {
       })
     }
     const reply = await sendQueryUntil(deadlineMicros, () =>
-      executeManaged(this.managedTransport(), capabilities, QueryPageCommand, {
-        v: QUERY_OP_VERSION,
-        executionId,
-        cursor,
-        deadlineMicros
-      })
+      executeManaged(
+        this.managedTransport(),
+        capabilities,
+        QueryPageCommand,
+        {
+          v: QUERY_OP_VERSION,
+          executionId,
+          cursor,
+          deadlineMicros
+        },
+        { target: this.queryNode(executionId) }
+      )
     )
     if (reply.kind === "ok") {
       if (reply.result.context.executionId.asU128() !== executionId.asU128()) {
@@ -2143,10 +2193,13 @@ export class Laser implements AsyncDisposable {
         feature: "execution_status"
       })
     }
-    const reply = await executeManaged(this.managedTransport(), capabilities, QueryStatusCommand, {
-      v: QUERY_OP_VERSION,
-      executionId
-    })
+    const reply = await executeManaged(
+      this.managedTransport(),
+      capabilities,
+      QueryStatusCommand,
+      { v: QUERY_OP_VERSION, executionId },
+      { target: this.queryNode(executionId) }
+    )
     if (reply.kind === "ok") {
       if (reply.status.executionId.asU128() !== executionId.asU128()) {
         throw new ProtocolError("query status execution id does not match the request")
@@ -2165,10 +2218,13 @@ export class Laser implements AsyncDisposable {
         feature: "cancellation"
       })
     }
-    const reply = await executeManaged(this.managedTransport(), capabilities, QueryCancelCommand, {
-      v: QUERY_OP_VERSION,
-      executionId
-    })
+    const reply = await executeManaged(
+      this.managedTransport(),
+      capabilities,
+      QueryCancelCommand,
+      { v: QUERY_OP_VERSION, executionId },
+      { target: this.queryNode(executionId) }
+    )
     if (reply.kind === "ok") {
       if (reply.status.executionId.asU128() !== executionId.asU128()) {
         throw new ProtocolError("query status execution id does not match the request")

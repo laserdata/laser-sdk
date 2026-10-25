@@ -6,7 +6,7 @@ use laser_sdk::LaserError;
 use laser_sdk::filters::{
     Coerce, ConsumerFilter, ExecutionMode, FaultPolicy, FilterError, FilterErrorReason, FilterExpr,
     FilterHeader, FilteredReader, FilteredStart, HeaderScalar, MatchedPage, MatchedRecord,
-    ReadMode, RecordPolicy, TextMatch, TimestampFormat,
+    RecordPolicy, TextMatch, TimestampFormat,
 };
 use laser_sdk::query::CmpOp;
 use laser_sdk::wire::filter::eval::{
@@ -23,6 +23,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+#[gen_stub_pyclass]
+#[pyclass(name = "AckContext", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyAckContext {
+    #[pyo3(get)]
+    owner_generation: u64,
+    #[pyo3(get)]
+    metadata_op: u64,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAckContext {
+    #[new]
+    fn new(owner_generation: u64, metadata_op: u64) -> Self {
+        Self {
+            owner_generation,
+            metadata_op,
+        }
+    }
+}
 
 /// One predicate or a composition of predicates over a record. Build it with
 /// the static constructors: `FilterExpr.pred("after.mode", "eq", "safe")`.
@@ -805,17 +827,7 @@ impl PyFilteredReader {
         })
     }
 
-    /// Data connections this reader opened to partition primaries, including
-    /// routes later retired. A healthy reader opens one per node and keeps it.
-    fn data_connections_opened<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.clone();
-        future_into_py(py, async move {
-            Ok(state.lock().await.open()?.data_connections_opened())
-        })
-    }
-
-    /// Store completed progress, leave the group, and close the data
-    /// connections. Closing twice is a no-op.
+    /// Store completed progress and leave the group. Closing twice is a no-op.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let (state, returned) = (self.state.clone(), self.returned.clone());
         let returned_pages = self.returned_pages.clone();
@@ -1146,13 +1158,6 @@ pub(crate) fn execution_mode_is_filtered(mode: &Bound<'_, PyAny>) -> PyResult<bo
 #[pyfunction]
 pub(crate) fn fault_reason_is_foreign(reason: &str) -> PyResult<bool> {
     Ok(fault_reason(reason)?.is_foreign())
-}
-
-/// Whether the read `mode` (`primary` or `local`) reads the partition primary.
-#[gen_stub_pyfunction]
-#[pyfunction]
-pub(crate) fn read_mode_is_primary(mode: &Bound<'_, PyAny>) -> PyResult<bool> {
-    Ok(py_to_de::<ReadMode>(mode)?.is_primary())
 }
 
 /// Whether the record `policy` (`reject` or `pass`) skips the record.

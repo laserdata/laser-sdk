@@ -212,6 +212,7 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<consumer_group::PyConsumerGroup>()?;
     module.add_class::<consumer_group::PyConsumerGroupInfo>()?;
     module.add_class::<consumer_group::PyGroupFilter>()?;
+    module.add_class::<filters::PyAckContext>()?;
     module.add_class::<filters::PyFilterExpr>()?;
     module.add_class::<filters::PyFieldPath>()?;
     module.add_class::<filters::PyConsumerFilter>()?;
@@ -224,7 +225,6 @@ fn laser_sdk(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(filters::fault_reason_is_foreign, module)?)?;
-    module.add_function(wrap_pyfunction!(filters::read_mode_is_primary, module)?)?;
     module.add_function(wrap_pyfunction!(filters::record_policy_is_reject, module)?)?;
     module.add_function(wrap_pyfunction!(filters::filter_error_reason_code, module)?)?;
     module.add_function(wrap_pyfunction!(

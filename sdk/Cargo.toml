@@ -108,7 +108,6 @@ streaming = [
     "dep:futures",
     "dep:iggy_binary_protocol",
     "dep:iggy_common",
-    "dep:secrecy",
     "dep:serde_json",
     "dep:tokio",
     "dep:tracing",
@@ -134,7 +133,6 @@ iggy_common = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
 laser-wire = { workspace = true, features = ["builders", "cbor"] }
 prost-reflect = { workspace = true, optional = true }
-secrecy = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

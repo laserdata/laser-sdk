@@ -1,7 +1,7 @@
 use laser_wire::filter::{
-    ExecutionMode, FaultReason, FilteredPage, FilteredStart, SourceGeneration, StopReason,
+    AckContext, AppliedPolicy, FaultReason, FilteredPage, FilteredStart, SourceGeneration,
+    StopReason,
 };
-use laser_wire::schema::Digest32;
 use std::collections::{BTreeSet, VecDeque};
 use tokio::time::Instant;
 
@@ -23,15 +23,14 @@ pub(crate) struct PartitionProgress {
 }
 
 /// The offset a completed prefix of pages makes safe to store, with the
-/// history and the policy it was read under.
+/// group, the history and the partition owner it was read under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AckTarget {
     pub(crate) group_id: Option<u64>,
     pub(crate) offset: u64,
     pub(crate) generation: SourceGeneration,
-    pub(crate) digest: Option<Digest32>,
-    pub(crate) mode: ExecutionMode,
-    pub(crate) policy_generation: u64,
+    pub(crate) ack_context: AckContext,
+    pub(crate) policy: AppliedPolicy,
 }
 
 /// Why a partition cannot be read past its current position.
@@ -124,9 +123,8 @@ impl PartitionProgress {
             group_id: page.policy.group_id,
             offset,
             generation: page.generation,
-            digest: page.policy.digest.clone(),
-            mode: page.policy.mode,
-            policy_generation: page.policy.policy_generation,
+            ack_context: page.ack_context,
+            policy: page.policy.clone(),
         });
         let outstanding: BTreeSet<u64> = offsets.into_iter().collect();
         match self.pages.back_mut() {
@@ -235,7 +233,8 @@ impl PartitionProgress {
 mod tests {
     use super::*;
     use laser_wire::codes::FILTER_OP_VERSION;
-    use laser_wire::filter::{AppliedPolicy, Continuation, ReadMode, RecordFault};
+    use laser_wire::filter::{AppliedPolicy, Continuation, ExecutionMode, RecordFault};
+    use laser_wire::schema::Digest32;
 
     fn generation() -> SourceGeneration {
         SourceGeneration {
@@ -244,8 +243,7 @@ mod tests {
             topic_id: 2,
             topic_created_at_micros: 20,
             partition_id: 0,
-            partition_created_revision: 30,
-            purge_generation: 0,
+            partition_incarnation: 30,
         }
     }
 
@@ -262,7 +260,7 @@ mod tests {
                 policy_generation: 0,
             },
             generation: generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext::default(),
             next_scan_offset,
             safe_ack_offset: next_scan_offset.and_then(|next| next.checked_sub(1)),
             frontier: 100,
@@ -363,7 +361,6 @@ mod tests {
                 next_scan_offset: 42,
                 generation: generation(),
                 digest: Some(Digest32::new([7; 32])),
-                read_mode: ReadMode::Primary,
                 mode: ExecutionMode::Filtered,
                 policy_generation: 0,
             })

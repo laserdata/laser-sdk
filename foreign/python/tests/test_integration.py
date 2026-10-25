@@ -352,19 +352,17 @@ async def test_given_native_offsets_when_rewound_and_deleted_then_should_follow_
         assert stored.stored_offset == expected
         await consumer.delete_offset(partition=0)
         assert await consumer.stored_offset(0) is None
-        assert await consumer.last_stored_offset(0) == expected
+        assert await consumer.last_stored_offset(0) is None
         await consumer.store_offset(1, partition=0)
         stored = await consumer.stored_offset(0)
-        if allow_replay:
-            assert stored is not None
-            assert stored.stored_offset == 1
-        else:
-            assert stored is None
+        assert stored is not None
+        assert stored.stored_offset == 1
         await consumer.store_offset(0, partition=0)
+        rewound = 0 if allow_replay else 1
         stored = await consumer.stored_offset(0)
         assert stored is not None
-        assert stored.stored_offset == 0
-        assert await consumer.last_stored_offset(0) == 0
+        assert stored.stored_offset == rewound
+        assert await consumer.last_stored_offset(0) == rewound
     finally:
         await consumer.shutdown()
 

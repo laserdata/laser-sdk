@@ -220,9 +220,7 @@ export function resolveConsumerOptions(
  * server that resolves group policies reads through the group reader: the
  * server runs the group's filter, or none, and commits go through the group's
  * fenced acknowledgments. `batchLength` then also bounds the source records
- * one partition poll examines. A purge restarts the partition at offset 0
- * without telling an open reader, which can keep its old position and skip
- * the replacement records, so rebuild it after a purge.
+ * one partition poll examines.
  */
 export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable {
   private readonly batchLength: number
@@ -461,9 +459,8 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
     this.requireNative("storeOffset")
     if (offset < 0n) throw new InvalidError("offset must be non-negative")
     const partition = this.currentPartition(partitionId)
-    if (!this.allowReplay && offset >= 1n && offset <= (this.storedOffsets.get(partition) ?? 0n)) {
-      return
-    }
+    const stored = this.storedOffsets.get(partition)
+    if (!this.allowReplay && stored !== undefined && offset <= stored) return
     await this.transport.storeOffset(
       this.streamName,
       this.topicName,
@@ -485,6 +482,8 @@ export class Consumer implements AsyncIterable<ConsumerMessage>, AsyncDisposable
       })
     }
     const partition = this.currentPartition(partitionId)
+    // Cancellation can hide a committed delete, so a later store must reach the server.
+    this.storedOffsets.delete(partition)
     await this.transport.deleteOffset(this.streamName, this.topicName, this.target, partition)
     this.explicitOffsets.delete(partition)
     const consumed = this.consumedOffsets.get(partition)

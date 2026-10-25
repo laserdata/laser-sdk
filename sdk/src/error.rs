@@ -826,6 +826,7 @@ mod tests {
             let error = LaserError::Iggy(IggyError::ProducerSendFailed {
                 cause: Box::new(cause),
                 failed: std::sync::Arc::new(Vec::new()),
+                uncertain: 0,
                 committed: std::sync::Arc::new(Vec::new()),
                 stream_name: "s".into(),
                 topic_name: "t".into(),
@@ -843,6 +844,7 @@ mod tests {
         let send = LaserError::Iggy(IggyError::ProducerSendFailed {
             cause: Box::new(IggyError::Unauthorized),
             failed: std::sync::Arc::new(Vec::new()),
+            uncertain: 0,
             committed: std::sync::Arc::new(Vec::new()),
             stream_name: "s".into(),
             topic_name: "t".into(),

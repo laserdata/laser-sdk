@@ -8,7 +8,7 @@ export interface SourceIncarnation {
   readonly streamId: number
   readonly topicId: number
   readonly partitionId: number
-  readonly partitionCreatedRevision: bigint
+  readonly partitionIncarnation: bigint
 }
 export interface SourceScope {
   readonly stream: string
@@ -29,7 +29,7 @@ export function encodeSourceIncarnation(value: SourceIncarnation): Map<string, u
     ["stream_id", value.streamId],
     ["topic_id", value.topicId],
     ["partition_id", value.partitionId],
-    ["partition_created_revision", value.partitionCreatedRevision]
+    ["partition_incarnation", value.partitionIncarnation]
   ])
 }
 export function decodeSourceIncarnation(map: CborMap, context: string): SourceIncarnation {
@@ -38,7 +38,7 @@ export function decodeSourceIncarnation(map: CborMap, context: string): SourceIn
     streamId: field.requiredU32(map, "stream_id", context),
     topicId: field.requiredU32(map, "topic_id", context),
     partitionId: field.requiredU32(map, "partition_id", context),
-    partitionCreatedRevision: field.requiredU64(map, "partition_created_revision", context)
+    partitionIncarnation: field.requiredU64(map, "partition_incarnation", context)
   }
 }
 export function encodeSourceScope(value: SourceScope): Map<string, unknown> {
@@ -84,8 +84,8 @@ export function decodeSourceCut(map: CborMap, context: string): SourceCut {
   }
 }
 export function validateSourceIncarnation(value: SourceIncarnation): void {
-  if (value.cluster.asU128() === 0n || value.partitionCreatedRevision === 0n) {
-    throw new InvalidError("source incarnation identity or creation revision is invalid")
+  if (value.cluster.asU128() === 0n || value.partitionIncarnation === 0n) {
+    throw new InvalidError("source incarnation identity or partition incarnation is invalid")
   }
 }
 export function validateSourceScope(value: SourceScope): void {
@@ -101,7 +101,7 @@ export function validateSourceCut(value: SourceCut): void {
     validateSourceIncarnation(partition.incarnation)
     if (
       partition.incarnation.cluster.asU128() === 0n ||
-      partition.incarnation.partitionCreatedRevision === 0n ||
+      partition.incarnation.partitionIncarnation === 0n ||
       partition.retainedStart > partition.endExclusive ||
       partition.incarnation.partitionId <= previous
     )

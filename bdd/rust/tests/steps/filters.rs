@@ -2,7 +2,9 @@ use crate::common::test_iggy::fresh_connected_laser;
 use crate::common::world::LaserWorld;
 use cucumber::{given, then, when};
 use laser_bdd::filter_fixtures::{feed, filter, record};
-use laser_sdk::filters::{FaultPolicy, FilterHeader, FilteredStart, HeaderScalar, Verdict};
+use laser_sdk::filters::{
+    FaultPolicy, FilterErrorReason, FilterHeader, FilteredStart, HeaderScalar, Verdict,
+};
 use laser_sdk::iggy::prelude::{Consumer, ConsumerOffsetClient, Identifier};
 use laser_sdk::prelude::{CommitPolicy, ConsumerStart, ProducerMessage, Routing};
 use laser_sdk::types::MintUlid;
@@ -375,7 +377,17 @@ async fn hundred_non_matches(world: &mut LaserWorld) {
         .build()
         .await
         .expect("bounded reader");
-    let (empty, more) = reader.read_round().await.expect("first bounded scan");
+    let (empty, more) = tokio::time::timeout(READ_TIMEOUT, async {
+        loop {
+            let result = reader.read_round().await.expect("bounded scan");
+            if reader.examined_in_round() > 0 {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first assignment becomes readable");
     assert!(empty.is_none() && more);
     assert_eq!(reader.examined_in_round(), 100);
     let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
@@ -462,4 +474,42 @@ async fn hundred_non_matches_consumer(world: &mut LaserWorld) {
         .await
         .expect("acknowledge matching work");
     consumer.shutdown().await.expect("close");
+}
+
+#[when("the anomaly desk rejects a page after releasing its policy")]
+async fn reject_old_policy(world: &mut LaserWorld) {
+    let laser = world.laser().clone();
+    let group = laser.topic(TOPIC).consumer_group("policy-ack");
+    group
+        .create()
+        .filter(filter("safe mode"))
+        .build()
+        .await
+        .expect("group");
+    let mut reader = group
+        .reader()
+        .expect("reader")
+        .start(FilteredStart::First)
+        .build()
+        .await
+        .expect("build");
+    let page = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("deadline")
+        .expect("page");
+    group.filter().release().await.expect("release");
+    let refused = reader.ack_page(&page).await.expect_err("old policy");
+    assert_eq!(refused.filter_reason(), Some(FilterErrorReason::Conflict));
+    let current = tokio::time::timeout(READ_TIMEOUT, reader.next_page())
+        .await
+        .expect("deadline")
+        .expect("current page");
+    assert_eq!(current.records[0].offset, 0);
+    world.filtered_payloads = current
+        .records
+        .iter()
+        .map(|record| record.message.payload.to_vec())
+        .collect();
+    reader.ack_page(&current).await.expect("current policy");
+    reader.close().await.expect("close");
 }

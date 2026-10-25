@@ -63,7 +63,6 @@ constants! {
     "AGDX_AUTHZ_WHOAMI_CODE": u32 = laser_sdk::wire::codes::AGDX_AUTHZ_WHOAMI_CODE,
     "AGDX_COMMAND_BASE": u32 = laser_sdk::wire::codes::AGDX_COMMAND_BASE,
     "AGDX_DECODE_RECORD_CODE": u32 = laser_sdk::wire::codes::AGDX_DECODE_RECORD_CODE,
-    "AGDX_FILTERED_ACK_CODE": u32 = laser_sdk::wire::codes::AGDX_FILTERED_ACK_CODE,
     "AGDX_FILTERED_POLL_CODE": u32 = laser_sdk::wire::codes::AGDX_FILTERED_POLL_CODE,
     "AGDX_FILTER_MUTATE_CODE": u32 = laser_sdk::wire::codes::AGDX_FILTER_MUTATE_CODE,
     "AGDX_FILTER_OPERATION_CODE": u32 = laser_sdk::wire::codes::AGDX_FILTER_OPERATION_CODE,

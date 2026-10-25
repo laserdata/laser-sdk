@@ -332,7 +332,7 @@ mod tests {
             stream_id: 10,
             topic_id: 20,
             partition_id,
-            partition_created_revision: 7,
+            partition_incarnation: 7,
         }
     }
 

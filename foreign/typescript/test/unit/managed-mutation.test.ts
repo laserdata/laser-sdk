@@ -5,8 +5,6 @@ import { consumerBackoff } from "../../src/agent/reliable-consumer.js"
 import { AmbiguousMutationError } from "../../src/client/errors.js"
 import {
   ApacheIggyTransport,
-  barrierBit,
-  managedCandidates,
   openPositioned,
   pendingReplyMessage
 } from "../../src/iggy/apache-iggy.js"
@@ -16,15 +14,8 @@ import {
   encodeManagedReplyEnvelope,
   positionSurfaceOf
 } from "../../src/wire/mutation.js"
-import { encodeBackendAnnounce, newOpVersions } from "../../src/wire/hello.js"
 import { encodeNamed, expectMap } from "../../src/wire/cbor.js"
-import {
-  AGDX_HELLO_CODE,
-  AGDX_KV_GET_CODE,
-  AGDX_KV_SET_CODE,
-  AGDX_SESSION_GET_CODE,
-  isBarrierRead
-} from "../../src/wire/codes.js"
+import { AGDX_KV_GET_CODE, AGDX_KV_SET_CODE, AGDX_SESSION_GET_CODE } from "../../src/wire/codes.js"
 import { decodeOne } from "../../src/wire/cbor.js"
 import {
   resultCodeFromCode,
@@ -53,13 +44,19 @@ const CONFLICT = encodeNamed(
 )
 const APPLIED = new Uint8Array([0xa1, 0x62, 0x6f, 0x6b, 0xf6])
 
+// A one-node client: every managed request reaches replica 0.
 function fakeClient(replies: Uint8Array[], requests: Uint8Array[]): IggyClient {
   return {
     clientProvider: () => Promise.resolve({}),
-    sendBinaryRequest: (_code: number, payload: Buffer) => {
+    sendBinaryRequestToReplica: (_code: number, payload: Buffer, replica: number) => {
+      assert.equal(replica, 0)
       requests.push(new Uint8Array(payload))
       const reply = replies.length > 1 ? replies.shift() : replies[0]
       return Promise.resolve(Buffer.from(reply ?? APPLIED))
+    },
+    cluster: {
+      getClusterMetadata: () =>
+        Promise.resolve({ name: "single", nodes: [{ replicaId: 0, name: "node" }] })
     },
     destroy: () => Promise.resolve()
   } as unknown as IggyClient
@@ -112,82 +109,6 @@ void test("given_an_unavailable_backend_when_a_mutation_is_sent_then_should_repe
   assert.equal(requests.length, 2)
   assert.deepEqual(requests[1], requests[0])
   assert.equal(pendingReplyMessage(CONFLICT), undefined)
-})
-
-type Node = Parameters<typeof managedCandidates>[0][number]
-
-function rosterNode(name: string, role: "Leader" | "Follower", status: string): Node {
-  return {
-    name,
-    ip: "10.0.0.1",
-    endpoints: { tcp: 8090, quic: 8080, http: 8070, websocket: 8060 },
-    role,
-    status
-  } as Node
-}
-
-const ROSTER = [
-  rosterNode("a", "Leader", "Healthy"),
-  rosterNode("b", "Follower", "Healthy"),
-  rosterNode("c", "Follower", "Unreachable"),
-  rosterNode("d", "Follower", "Healthy")
-]
-
-void test("given_a_failed_shared_connection_when_choosing_nodes_then_should_skip_the_leader_and_unreachable_nodes", () => {
-  assert.deepEqual(
-    managedCandidates(ROSTER, undefined).map((node) => node.name),
-    ["b", "d"]
-  )
-  assert.deepEqual(
-    managedCandidates(ROSTER, "b").map((node) => node.name),
-    ["a", "d"]
-  )
-})
-
-void test("given_a_leader_whose_backend_is_down_when_a_mutation_is_sent_then_should_move_it_with_the_same_identity", async () => {
-  const shared: Uint8Array[] = []
-  const moved: Uint8Array[] = []
-  const client = Object.assign(fakeClient([UNAVAILABLE], shared), {
-    cluster: { getClusterMetadata: () => Promise.resolve({ name: "cluster", nodes: ROSTER }) }
-  })
-  const transport = await ApacheIggyTransport.fromClient(client)
-  const internals = transport as unknown as {
-    connection: unknown
-    openNodeConnection: (ip: string, port: number) => Promise<unknown>
-  }
-  internals.connection = { host: "10.0.0.1", port: 8090 }
-  const announce = encodeBackendAnnounce({
-    versions: newOpVersions(1, 1, 1, 1),
-    ready: true,
-    backends: []
-  })
-  internals.openNodeConnection = () =>
-    Promise.resolve({
-      send: (code: number, payload: Uint8Array) => {
-        if (code === AGDX_HELLO_CODE) return Promise.resolve(announce)
-        moved.push(payload)
-        return Promise.resolve(APPLIED)
-      },
-      close: () => Promise.resolve()
-    })
-  const reply = await transport.sendManaged(AGDX_KV_SET_CODE, new Uint8Array([9]))
-  assert.deepEqual(reply, APPLIED)
-  assert.equal(shared.length, 1)
-  assert.equal(moved.length, 1)
-  assert.deepEqual(moved[0], shared[0], "the moved request keeps its frame and identity")
-
-  // The first read after the move waits for the new node's fold to reach the
-  // log head. Once one is served, reads stop waiting for the head.
-  const read = encodeNamed(new Map<string, unknown>([["v", 1n]]))
-  await transport.sendManaged(AGDX_KV_GET_CODE, read)
-  const barriered = decodeOne(moved[1] ?? new Uint8Array(), "ManagedReadEnvelope")
-  assert.ok(barriered instanceof Map)
-  assert.deepEqual([...barriered.keys()], ["v", "read", "log_head"])
-  assert.deepEqual(barriered.get("read"), read)
-  await transport.sendManaged(AGDX_KV_GET_CODE, read)
-  const next = decodeOne(moved[2] ?? new Uint8Array(), "ManagedReadEnvelope")
-  assert.ok(next instanceof Map)
-  assert.deepEqual([...next.keys()], ["v", "read"])
 })
 
 void test("given_positioned_replies_when_reads_follow_then_should_send_the_highest_position_seen", async () => {
@@ -257,13 +178,6 @@ void test("given_a_session_reply_with_positions_when_a_session_read_follows_then
   )
   assert.deepEqual(sent.minSessions, [session])
   assert.equal(sent.minPosition, undefined)
-})
-
-void test("given_barrier_codes_when_classified_then_only_reads_of_folded_surfaces_should_carry_a_bit", () => {
-  assert.equal(isBarrierRead(AGDX_KV_GET_CODE), true)
-  assert.notEqual(barrierBit(AGDX_KV_GET_CODE), 0)
-  assert.equal(isBarrierRead(AGDX_KV_SET_CODE), false)
-  assert.equal(barrierBit(AGDX_KV_SET_CODE), 0)
 })
 
 void test("given_consumer_failures_when_backing_off_then_should_jitter_within_the_upper_half", () => {

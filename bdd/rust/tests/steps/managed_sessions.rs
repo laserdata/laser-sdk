@@ -1387,6 +1387,35 @@ async fn change_lane_source(world: &mut LaserWorld, change: String) {
     );
 }
 
+async fn lane_record_count(world: &LaserWorld) -> u64 {
+    let endpoint = format!(
+        "iggy:iggy@{}",
+        std::env::var("LASER_BDD_ADDR").expect("managed address")
+    );
+    let stream = world.managed.sessions().stream().expect("stream");
+    let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../session-lane-admin.mjs");
+    let output = tokio::process::Command::new("rtk")
+        .args(["proxy", "node"])
+        .arg(helper)
+        .arg(endpoint)
+        .arg(stream)
+        .arg("record count")
+        .arg("1")
+        .output()
+        .await
+        .expect("read current lane count");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("count text")
+        .trim()
+        .parse()
+        .expect("count")
+}
+
 fn assert_stale_lane<T>(result: Result<T, LaserError>) {
     assert!(
         matches!(
@@ -1408,11 +1437,7 @@ async fn refuse_retained_lane(world: &mut LaserWorld) {
         .retained_state
         .as_ref()
         .expect("a retained state handle");
-    let before = session
-        .context()
-        .await
-        .expect("read the current lane")
-        .len();
+    let before = lane_record_count(world).await;
     assert_stale_lane(session.cancel().await);
     assert_stale_lane(clone.cancel().await);
     assert_stale_lane(state.set("after", serde_json::json!(2)).await);
@@ -1443,11 +1468,7 @@ async fn refuse_retained_lane(world: &mut LaserWorld) {
             .await,
     );
     assert_eq!(
-        session
-            .context()
-            .await
-            .expect("read the lane after refusal")
-            .len(),
+        lane_record_count(world).await,
         before,
         "refused writes append no records"
     );
@@ -1461,14 +1482,7 @@ async fn refuse_stale_registration(world: &mut LaserWorld) {
         .as_ref()
         .expect("the original session")
         .conversation();
-    let before = world
-        .session
-        .as_ref()
-        .expect("the session")
-        .context()
-        .await
-        .expect("read the lane")
-        .len();
+    let before = lane_record_count(world).await;
     assert_stale_lane(
         laser
             .sessions()
@@ -1477,17 +1491,7 @@ async fn refuse_stale_registration(world: &mut LaserWorld) {
             .cancel()
             .await,
     );
-    assert_eq!(
-        world
-            .session
-            .as_ref()
-            .expect("the session")
-            .context()
-            .await
-            .expect("read the lane")
-            .len(),
-        before
-    );
+    assert_eq!(lane_record_count(world).await, before);
 }
 
 #[when("the session source is explicitly removed and registered again")]

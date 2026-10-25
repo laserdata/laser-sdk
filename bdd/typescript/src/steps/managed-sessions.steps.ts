@@ -1246,6 +1246,12 @@ When(
   },
 );
 
+async function laneRecordCount(world: LaserWorld): Promise<bigint> {
+  const helper = fileURLToPath(new URL("../../../session-lane-admin.mjs", import.meta.url));
+  const { stdout } = await promisify(execFile)("rtk", ["proxy", "node", helper, world.endpoint, world.requireSession().stream(), "record count", "1"], { timeout: 60_000 });
+  return BigInt(stdout.trim());
+}
+
 const staleLaneError = (error: unknown): boolean =>
   error instanceof SessionError && error.detail.kind === "stale";
 
@@ -1336,7 +1342,7 @@ Then(
     assert.ok(
       state.retained !== undefined && state.retainedState !== undefined,
     );
-    const before = (await session.context()).length;
+    const before = await laneRecordCount(this);
     await assert.rejects(session.cancel(), staleLaneError);
     await assert.rejects(state.retained.cancel(), staleLaneError);
     await assert.rejects(state.retainedState.set("after", 2), staleLaneError);
@@ -1360,7 +1366,7 @@ Then(
       staleLaneError,
     );
     assert.equal(
-      (await session.context()).length,
+      await laneRecordCount(this),
       before,
       "refused writes append no records",
     );
@@ -1371,7 +1377,7 @@ Then(
   "a fresh handle refuses the stale lane registration",
   async function (this: LaserWorld) {
     const session = this.requireSession();
-    const before = (await session.context()).length;
+    const before = await laneRecordCount(this);
     await assert.rejects(
       laserOf(this)
         .sessions()
@@ -1380,7 +1386,7 @@ Then(
         .cancel(),
       staleLaneError,
     );
-    assert.equal((await session.context()).length, before);
+    assert.equal(await laneRecordCount(this), before);
   },
 );
 

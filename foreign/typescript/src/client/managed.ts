@@ -1,4 +1,4 @@
-import type { LaserTransport } from "../iggy/apache-iggy.js"
+import type { LaserTransport, ManagedSendOptions } from "../iggy/apache-iggy.js"
 import { decodeOne } from "../wire/cbor.js"
 import type { ManagedCommand } from "../wire/commands.js"
 import { ResultCodeName } from "../wire/result.js"
@@ -69,7 +69,7 @@ export async function executeManaged<Request, Reply>(
   capabilities: Capabilities,
   command: ManagedCommand<Request, Reply>,
   request: Request,
-  options?: { readonly retryAfterReconnect?: boolean }
+  options?: ManagedSendOptions
 ): Promise<Reply> {
   requireManagedCommand(capabilities, command)
   command.validate?.(request)

@@ -1,8 +1,6 @@
 import assert from "node:assert/strict"
 import { randomUUID } from "node:crypto"
 import { test } from "node:test"
-import { setTimeout as delay } from "node:timers/promises"
-import { Consumer, PollingStrategy } from "apache-iggy"
 import { Laser } from "../../src/client/laser.js"
 import { CancelledError, TimeoutError } from "../../src/client/errors.js"
 
@@ -43,12 +41,21 @@ void test("given_native_offset_history_when_rewound_and_deleted_then_should_foll
     assert.equal((await consumer.storedOffset(0))?.storedOffset, expected)
     await consumer.deleteOffset(0)
     assert.equal(await consumer.storedOffset(0), undefined)
-    assert.equal(consumer.lastStoredOffset(0), expected)
+    assert.equal(
+      consumer.lastStoredOffset(0),
+      undefined,
+      "a deletion forgets the local record, so the next store reaches the server"
+    )
     await consumer.storeOffset(1n, 0)
-    assert.equal((await consumer.storedOffset(0))?.storedOffset, allowReplay ? 1n : undefined)
+    assert.equal((await consumer.storedOffset(0))?.storedOffset, 1n)
     await consumer.storeOffset(0n, 0)
-    assert.equal((await consumer.storedOffset(0))?.storedOffset, 0n)
-    assert.equal(consumer.lastStoredOffset(0), 0n)
+    const rewound = allowReplay ? 0n : 1n
+    assert.equal(
+      consumer.lastStoredOffset(0),
+      rewound,
+      "zero moves the offset back only with replay allowed"
+    )
+    assert.equal((await consumer.storedOffset(0))?.storedOffset, rewound)
   }
 })
 
@@ -220,71 +227,6 @@ void test("given_default_polling_when_shutdown_after_offset_zero_then_should_res
     const resumed = topic.consumer("partial", 0, { batchLength: 4 })
     assert.equal((await resumed.nextWithin(2_000)).position.offset, 1n)
     await resumed.shutdown()
-  } finally {
-    await laser.close()
-  }
-})
-
-// A purge restarts the partition at offset zero and clears every stored
-// offset. A consumer rebuilt after the purge reads the replacement history
-// from its first record, whatever its commit mode or start position.
-void test("given_a_purged_topic_when_the_consumer_is_rebuilt_then_should_start_at_the_new_offset_zero", async () => {
-  const laser = await Laser.connect(CONNECTION_STRING)
-  try {
-    const variants = [
-      { group: false, options: {} },
-      { group: false, options: { commitPolicy: { kind: "disabled" as const } } },
-      { group: false, options: { startAt: { kind: "first" as const } } },
-      { group: true, options: {} },
-      { group: true, options: { commitPolicy: { kind: "disabled" as const } } }
-    ]
-    for (const { group, options } of variants) {
-      const streamName = `laser-ts-test-${randomUUID()}`
-      const topic = laser.stream(streamName).topic("telemetry")
-      await laser.stream(streamName).ensure()
-      await topic.ensure(1)
-      for (const value of ["telemetry-0", "telemetry-1", "telemetry-2"])
-        await topic.send(utf8(value))
-      const open = () =>
-        group
-          ? topic.consumerGroup("ground-station").consumer({ ...options, batchLength: 3 })
-          : Promise.resolve(topic.consumer("ground-station", 0, { ...options, batchLength: 3 }))
-      const before = await open()
-      for (let expected = 0n; expected < 3n; expected++) {
-        const record = await before.nextWithin(2_000)
-        assert.equal(record.position.offset, expected)
-        if ("commitPolicy" in options) await before.commit(record)
-      }
-      await before.shutdown()
-
-      await laser.client.topic.purge({ streamId: streamName, topicId: "telemetry" })
-      // Metadata commits before the owner applies the purge. Wait for the empty source before publishing its replacement.
-      const deadline = performance.now() + 5_000
-      for (;;) {
-        const polled = await laser.client.message.poll({
-          streamId: streamName,
-          topicId: "telemetry",
-          partitionId: 0,
-          consumer: Consumer.Single,
-          pollingStrategy: PollingStrategy.First,
-          count: 3,
-          autocommit: false
-        })
-        if (polled.count === 0) break
-        assert(performance.now() < deadline, "the owner did not apply the purge")
-        await delay(10)
-      }
-      for (const value of ["safe-mode-0", "safe-mode-1"]) await topic.send(utf8(value))
-
-      const after = await open()
-      try {
-        const record = await after.nextWithin(2_000)
-        assert.equal(record.position.offset, 0n)
-        assert.equal(decodeUtf8(record.payload), "safe-mode-0")
-      } finally {
-        await after.shutdown()
-      }
-    }
   } finally {
     await laser.close()
   }

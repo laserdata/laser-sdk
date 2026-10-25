@@ -1,5 +1,6 @@
 use crate::error::LaserError;
 use crate::laser::Laser;
+use crate::nodes::Target;
 use crate::query::{
     AGDX_QUERY_CODE, AggCall, AggFunc, Aggregate, CmpOp, Consistency, Dir, Filter, KeyMatch,
     QUERY_OP_VERSION, Query, QueryError, QueryExecutionId, QueryExecutionStatus, QueryResult,
@@ -132,9 +133,12 @@ impl Laser {
         // The encoded query envelope rides the `AGDX_QUERY` managed command: the
         // server forwards it to LaserData Cloud over its local socket and returns
         // the `QueryReply` bytes, off the log, no reply topic, no correlation poll.
-        let payload = self
-            .send_query_until(AGDX_QUERY_CODE, payload, deadline_micros)
+        let (payload, replica) = self
+            .send_query_until(AGDX_QUERY_CODE, payload, deadline_micros, Target::Caller)
             .await?;
+        if let Some(replica) = replica {
+            self.nodes().pin_query(execution_id, replica);
+        }
         match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
             QueryReply::Ok(result) => validate_query_result(*result, execution_id),
             QueryReply::Err(error) => Err(error.into()),
@@ -154,10 +158,11 @@ impl Laser {
         code: u32,
         payload: Vec<u8>,
         deadline_micros: u64,
-    ) -> Result<Vec<u8>, LaserError> {
+        target: Target,
+    ) -> Result<(Vec<u8>, Option<u8>), LaserError> {
         tokio::time::timeout(
             query_reply_wait(deadline_micros, now_micros())?,
-            self.send_raw_with_response(code, payload),
+            self.send_managed_to(code, payload, target),
         )
         .await
         .map_err(|_| LaserError::Timeout("no query reply by the query deadline"))?
@@ -182,8 +187,13 @@ impl Laser {
         request.validate()?;
         let payload = encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let payload = self
-            .send_query_until(crate::query::AGDX_QUERY_PAGE_CODE, payload, deadline_micros)
+        let (payload, _) = self
+            .send_query_until(
+                crate::query::AGDX_QUERY_PAGE_CODE,
+                payload,
+                deadline_micros,
+                self.nodes().query_target(execution_id),
+            )
             .await?;
         match crate::error::decode_managed_reply::<QueryReply>(&payload)? {
             QueryReply::Ok(result) => validate_query_result(*result, execution_id),
@@ -210,8 +220,12 @@ impl Laser {
         request.validate()?;
         let payload = encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let payload = self
-            .send_raw_with_response(crate::query::AGDX_QUERY_CANCEL_CODE, payload)
+        let (payload, _) = self
+            .send_managed_to(
+                crate::query::AGDX_QUERY_CANCEL_CODE,
+                payload,
+                self.nodes().query_target(execution_id),
+            )
             .await?;
         match crate::error::decode_managed_reply::<QueryCancelReply>(&payload)? {
             QueryCancelReply::Ok(status) => validate_query_status(status, execution_id),
@@ -238,8 +252,12 @@ impl Laser {
         request.validate()?;
         let payload = encode_named(&request)
             .map_err(|error| LaserError::Codec(format!("encode request: {error}")))?;
-        let payload = self
-            .send_raw_with_response(crate::query::AGDX_QUERY_STATUS_CODE, payload)
+        let (payload, _) = self
+            .send_managed_to(
+                crate::query::AGDX_QUERY_STATUS_CODE,
+                payload,
+                self.nodes().query_target(execution_id),
+            )
             .await?;
         match crate::error::decode_managed_reply::<QueryStatusReply>(&payload)? {
             QueryStatusReply::Ok(status) => validate_query_status(status, execution_id),

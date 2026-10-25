@@ -361,7 +361,13 @@ When(
       .count(1)
       .maxExamined(100)
       .build();
-    const [empty, more] = await reader.readRound();
+    let [empty, more] = await reader.readRound();
+    const deadline = Date.now() + READ_TIMEOUT_MS;
+    while (reader.examinedInRound() === 0) {
+      assert.ok(Date.now() < deadline, "the first assignment becomes readable");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      [empty, more] = await reader.readRound();
+    }
     assert.equal(empty, undefined);
     assert.equal(more, true);
     assert.equal(reader.examinedInRound(), 100);
@@ -415,3 +421,17 @@ When(
     }
   },
 );
+
+
+When("the anomaly desk rejects a page after releasing its policy", async function (this: LaserWorld) {
+  const group = this.requireLaser().topic(TOPIC).consumerGroup("policy-ack");
+  await group.create({ filter: safeMode() });
+  await using reader = await group.reader().start({ kind: "first" }).build();
+  const page = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS });
+  await group.filter().release();
+  await assert.rejects(reader.ackPage(page), /conflict/);
+  const current = await reader.nextPage({ timeoutMs: READ_TIMEOUT_MS });
+  assert.equal(current.records[0]?.offset, 0n);
+  this.filtered = current.records.map((record) => record.message.payload);
+  await reader.ackPage(current);
+});

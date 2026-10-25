@@ -116,27 +116,6 @@ pub enum FilteredStart {
     Continue(Continuation),
 }
 
-/// Which replica serves the read.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum ReadMode {
-    /// The partition primary, through an attached consumer session. The owner
-    /// proves the page came from the generation the reply names. Required for
-    /// acknowledgments.
-    #[default]
-    Primary,
-    /// Whatever replica the connection reaches. It may lag without bound, so it
-    /// serves diagnostics and previews, never acknowledgments.
-    Local,
-}
-
-impl ReadMode {
-    pub const fn is_primary(&self) -> bool {
-        matches!(self, Self::Primary)
-    }
-}
-
 /// How the server selected the records of a page. `Unfiltered` is the explicit
 /// policy of a group without a binding, never a fallback: it carries no digest
 /// and the page holds every record the owner read returned.
@@ -174,9 +153,10 @@ fn validate_policy_identity(
     }
 }
 
-/// The exact source history a page was read from. A purge or a recreated
-/// stream, topic, or partition changes it, so a continuation or acknowledgment
-/// from an older history is rejected rather than applied to new records.
+/// The exact source history a page was read from. A recreated stream, topic,
+/// or partition changes it, so a continuation or acknowledgment from an older
+/// history is rejected rather than applied to new records. The partition is
+/// named by its incarnation, the value its route reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceGeneration {
     pub stream_id: u32,
@@ -184,8 +164,18 @@ pub struct SourceGeneration {
     pub topic_id: u32,
     pub topic_created_at_micros: u64,
     pub partition_id: u32,
-    pub partition_created_revision: u64,
-    pub purge_generation: u64,
+    pub partition_incarnation: u64,
+}
+
+/// The partition owner a page was read under. The reader stores the page's
+/// offset with it and the page's partition incarnation, so the store is refused
+/// once the partition was recreated or its consumer group assignment moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckContext {
+    /// The consumer group owner generation, zero for an independent consumer.
+    pub owner_generation: u64,
+    /// The metadata operation the serving node had applied when it read the page.
+    pub metadata_op: u64,
 }
 
 /// The resume point a page hands to the next request.
@@ -198,10 +188,6 @@ pub struct Continuation {
     /// The digest of the filter the page ran, absent for an unfiltered page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest32>,
-    /// The route the page was read on. A continuation from a local page never
-    /// resumes a primary read, because a local replica can lag a purge.
-    #[serde(default, skip_serializing_if = "ReadMode::is_primary")]
-    pub read_mode: ReadMode,
     #[serde(default)]
     pub mode: ExecutionMode,
     /// The group's policy generation the page ran under, zero for an
@@ -223,8 +209,6 @@ pub struct FilteredPollRequest {
     pub count: u32,
     /// Most record bytes to return. The server may lower it.
     pub max_reply_bytes: u32,
-    #[serde(default)]
-    pub read_mode: ReadMode,
     /// Most source records to examine. The server lowers it to its own
     /// budget. Absent means the server budget alone. A normal consumer sets
     /// it to `count`, so a batch of 100 examines at most 100 records.
@@ -370,25 +354,28 @@ impl Validate for AppliedPolicy {
 
 /// One page of a filtered read.
 ///
-/// `records` is a standard polled-messages body: the matching records keep
-/// their original offsets, ids, timestamps, headers, and payload bytes.
+/// `records` is a standard polled-messages body: its head names the partition,
+/// the head offset, the record count and the partition context the page was
+/// served under, and the matching records keep their original offsets, ids,
+/// timestamps, headers, and payload bytes.
 /// `next_scan_offset` is the first record the server has not examined, `None`
 /// when nothing was examined and the start selector must be sent again.
-/// `safe_ack_offset` is the last examined offset. The reader may acknowledge it
-/// only after every returned record at or below it is fully handled.
+/// `safe_ack_offset` is the last examined offset. The reader may store it, with
+/// `ack_context`, only after every returned record at or below it is fully
+/// handled.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FilteredPage {
     pub v: u32,
     pub partition_id: u32,
     pub policy: AppliedPolicy,
     pub generation: SourceGeneration,
-    pub read_mode: ReadMode,
+    pub ack_context: AckContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_scan_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_ack_offset: Option<u64>,
-    /// The serving replica's partition head when the page was read. Reported,
-    /// never used as scan progress.
+    /// The primary's partition head when the page was read. Reported, never
+    /// used as scan progress.
     pub frontier: u64,
     pub examined: u32,
     pub matched: u32,
@@ -415,7 +402,6 @@ impl FilteredPage {
                 next_scan_offset,
                 generation: self.generation,
                 digest: self.policy.digest.clone(),
-                read_mode: self.read_mode,
                 mode: self.policy.mode,
                 policy_generation: self.policy.policy_generation,
             }),
@@ -436,6 +422,7 @@ pub struct FilteredAck {
     pub partition_id: u32,
     pub consumer: FilterConsumer,
     pub generation: SourceGeneration,
+    pub ack_context: AckContext,
     /// The digest of the filter the page ran, absent for an unfiltered page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<Digest32>,
@@ -505,7 +492,6 @@ pub struct FilterPreview {
     pub v: u32,
     pub partition_id: u32,
     pub policy: AppliedPolicy,
-    pub read_mode: ReadMode,
     pub examined: u32,
     pub matched: u32,
     pub faults: u32,
@@ -618,13 +604,11 @@ pub enum FilterErrorReason {
     /// A policy or mutation precondition does not hold (a different digest is
     /// bound, a name is taken, an expected revision moved).
     Conflict,
-    /// The source history changed (purge or recreation) since the page or
-    /// continuation was issued.
+    /// The source history changed (recreation) since the page or continuation
+    /// was issued.
     SourceChanged,
     /// The consumer no longer owns the partition, or its session ended.
     MembershipStale,
-    /// This node is not the partition primary. Resolve the route again.
-    NotPrimary,
     /// The catalog cannot confirm the policy right now.
     CatalogUnavailable,
     /// The saved revision is paused. Pending records may still be acknowledged.
@@ -654,7 +638,7 @@ impl FilterErrorReason {
             Self::NotFound => ResultCode::NotFound,
             Self::Conflict => ResultCode::Conflict,
             Self::SourceChanged => ResultCode::StaleGeneration,
-            Self::MembershipStale | Self::NotPrimary => ResultCode::Stale,
+            Self::MembershipStale => ResultCode::Stale,
             Self::CatalogUnavailable | Self::Unavailable | Self::RevisionDisabled => {
                 ResultCode::Unavailable
             }
@@ -913,8 +897,7 @@ mod tests {
             topic_id: 2,
             topic_created_at_micros: 20,
             partition_id: 0,
-            partition_created_revision: 30,
-            purge_generation: 0,
+            partition_incarnation: 30,
         }
     }
 
@@ -931,7 +914,6 @@ mod tests {
             start: FilteredStart::Next,
             count: 100,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: None,
             min_catalog_position: None,
         }
@@ -959,7 +941,6 @@ mod tests {
                 ..generation()
             },
             digest: Some(Digest32::new([1; 32])),
-            read_mode: ReadMode::Primary,
             mode: ExecutionMode::Filtered,
             policy_generation: 0,
         });
@@ -976,7 +957,6 @@ mod tests {
             next_scan_offset: 7,
             generation: generation(),
             digest: Some(Digest32::new([1; 32])),
-            read_mode: ReadMode::Primary,
             mode: ExecutionMode::Unfiltered,
             policy_generation: 1,
         });
@@ -1046,7 +1026,10 @@ mod tests {
                 policy_generation: 0,
             },
             generation: generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext {
+                owner_generation: 4,
+                metadata_op: 40,
+            },
             next_scan_offset: Some(1397),
             safe_ack_offset: Some(1396),
             frontier: 2000,
@@ -1065,7 +1048,6 @@ mod tests {
                 next_scan_offset: 1397,
                 generation: generation(),
                 digest: Some(Digest32::new([9; 32])),
-                read_mode: ReadMode::Primary,
                 mode: ExecutionMode::Filtered,
                 policy_generation: 0,
             })
@@ -1081,10 +1063,10 @@ mod tests {
     #[test]
     fn given_error_reasons_when_classified_then_should_map_to_shared_codes() {
         assert_eq!(
-            FilterError::new(FilterErrorReason::SourceChanged, "purged").code,
+            FilterError::new(FilterErrorReason::SourceChanged, "recreated").code,
             ResultCode::StaleGeneration
         );
-        assert_eq!(FilterErrorReason::NotPrimary.code(), ResultCode::Stale);
+        assert_eq!(FilterErrorReason::MembershipStale.code(), ResultCode::Stale);
         assert_eq!(FilterErrorReason::Conflict.code(), ResultCode::Conflict);
         assert_eq!(
             FilterErrorReason::CatalogUnavailable.code(),

@@ -742,12 +742,15 @@ impl ErrorCallback for PyErrorCallback {
     fn call(&self, ctx: ErrorCtx) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let hook = self.0.clone();
         Box::pin(async move {
+            // A background failure reports no uncertain head, and the
+            // exception lists every record of the failed tail as unconfirmed.
             let error = LaserError::Iggy(IggyError::ProducerSendFailed {
                 cause: ctx.cause,
                 failed: ctx.messages,
+                uncertain: 0,
                 committed: ctx.committed,
-                stream_name: ctx.stream_name,
-                topic_name: ctx.topic_name,
+                stream_name: ctx.stream_name.into(),
+                topic_name: ctx.topic_name.into(),
             });
             let Some(hook) = hook else {
                 log::error!("background send failed, its records are dropped: {error}");
@@ -1199,9 +1202,7 @@ impl PyConsumerMessage {
 /// exposes manual offset storage for commit-after-handle delivery. A group
 /// consumer on a server that resolves group policies runs the group's
 /// filter, or none, without naming one, and commits through the group's
-/// fenced acknowledgments. A purge restarts the partition at offset 0
-/// without telling an open reader, which can keep its old position and skip
-/// the replacement records, so rebuild it after a purge.
+/// fenced acknowledgments.
 #[gen_stub_pyclass]
 #[pyclass(name = "Consumer")]
 pub struct PyConsumer {

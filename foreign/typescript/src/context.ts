@@ -1,3 +1,4 @@
+import { iggyErrorCode } from "./client/error-classify.js"
 import { ConfigError, InvalidError } from "./client/errors.js"
 import { INTERNAL_TRANSPORT } from "./client/internals.js"
 import type { Laser } from "./client/laser.js"
@@ -7,6 +8,7 @@ import type { Provenance } from "./provenance/provenance.js"
 import type { AgentId, ConversationId, MessageId } from "./types/ids.js"
 import { type AgentEnvelope, estimateTokens } from "./wire/agent.js"
 
+const HISTORY_UNAVAILABLE = 87
 const READ_BATCH = 1_000
 
 /**
@@ -399,7 +401,26 @@ async function readContext(
   laser: Laser,
   whole: boolean
 ): Promise<readonly ContextMessage[]> {
-  const perTopic = await Promise.all(
+  try {
+    return await readCurrentContext(options, laser, whole)
+  } catch (error) {
+    if (
+      iggyErrorCode(error) !== HISTORY_UNAVAILABLE ||
+      options.fromOffsets.size > 0 ||
+      options.fromCheckpoint !== undefined ||
+      options.toCheckpoint !== undefined
+    )
+      throw error
+    return readCurrentContext(options, laser, whole)
+  }
+}
+
+async function readCurrentContext(
+  options: ContextAssemblerOptions,
+  laser: Laser,
+  whole: boolean
+): Promise<readonly ContextMessage[]> {
+  const settled = await Promise.allSettled(
     options.topics.map(async (topic, topicIndex) => {
       // The log timestamp orders the merged read, like in Rust.
       const collected: (ContextMessage & { readonly topicIndex: number })[] = []
@@ -460,6 +481,15 @@ async function readContext(
       }
       return collected
     })
+  )
+  const failure =
+    settled.find(
+      (result) =>
+        result.status === "rejected" && iggyErrorCode(result.reason) !== HISTORY_UNAVAILABLE
+    ) ?? settled.find((result) => result.status === "rejected")
+  if (failure?.status === "rejected") throw failure.reason
+  const perTopic = settled.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : []
   )
   const ordered = perTopic.flat().sort((left, right) => {
     if (left.timestampMicros !== right.timestampMicros) {

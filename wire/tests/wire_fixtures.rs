@@ -51,13 +51,13 @@ use laser_wire::destination::{
     QueryRouteTarget, RecreatedPartitionPolicy, StartPolicy, TableFormat,
 };
 use laser_wire::filter::{
-    AckReceipt, AppliedPolicy, CatalogPosition, ConsumerFilter, ExecutionMode, FilterBinding,
-    FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterConsumer, FilterError,
-    FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef, FilterMutation,
-    FilterMutationOutcome, FilterMutationRequest, FilterMutationResult, FilterMutationStatus,
-    FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource, FilterValidation,
-    FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart, GroupFilterSpec,
-    GroupPolicyUnbound, ReadMode, SourceGeneration, StopReason,
+    AckContext, AckReceipt, AppliedPolicy, CatalogPosition, ConsumerFilter, ExecutionMode,
+    FilterBinding, FilterCatalogCommand, FilterCatalogOutcome, FilterCatalogReply, FilterConsumer,
+    FilterError, FilterErrorReason, FilterExpr, FilterGroupIdentity, FilterGroupRef,
+    FilterMutation, FilterMutationOutcome, FilterMutationRequest, FilterMutationResult,
+    FilterMutationStatus, FilterOutcome, FilterRef, FilterReply, FilterRevisionRef, FilterSource,
+    FilterValidation, FilteredAck, FilteredPage, FilteredPollRequest, FilteredStart,
+    GroupFilterSpec, GroupPolicyUnbound, SourceGeneration, StopReason,
 };
 use laser_wire::fork::{
     ForkCreate, ForkInfo, ForkKind, ForkOutcome, ForkPut, ForkReply, ForkStatus,
@@ -630,7 +630,7 @@ fn canonical_incarnation(partition_id: u32) -> SourceIncarnation {
         stream_id: 2,
         topic_id: 3,
         partition_id,
-        partition_created_revision: 4,
+        partition_incarnation: 4,
     }
 }
 
@@ -3424,6 +3424,22 @@ fn canonical_safe_mode_filter() -> ConsumerFilter {
     ]))
 }
 
+// A standard polled-messages head with no records: partition 0, the head
+// offset, a zero count and the partition context the page was served under.
+fn polled_head(
+    frontier: u64,
+    incarnation: u64,
+    owner_generation: u64,
+    metadata_op: u64,
+) -> Vec<u8> {
+    let mut body = vec![0; 40];
+    body[4..12].copy_from_slice(&frontier.to_le_bytes());
+    body[16..24].copy_from_slice(&incarnation.to_le_bytes());
+    body[24..32].copy_from_slice(&owner_generation.to_le_bytes());
+    body[32..40].copy_from_slice(&metadata_op.to_le_bytes());
+    body
+}
+
 fn canonical_generation() -> SourceGeneration {
     SourceGeneration {
         stream_id: 1,
@@ -3431,8 +3447,7 @@ fn canonical_generation() -> SourceGeneration {
         topic_id: 2,
         topic_created_at_micros: TIMESTAMP_MICROS + 1,
         partition_id: 0,
-        partition_created_revision: 17,
-        purge_generation: 0,
+        partition_incarnation: 17,
     }
 }
 
@@ -3468,6 +3483,42 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             reads_headers: false,
         },
     );
+    let acknowledgment = FilteredAck {
+        v: laser_wire::codes::FILTER_OP_VERSION,
+        source: FilterSource {
+            stream: "orbit".to_owned(),
+            topic: "fleet_changes".to_owned(),
+        },
+        partition_id: 0,
+        consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
+        group_id: Some(3),
+        generation: canonical_generation(),
+        ack_context: AckContext {
+            owner_generation: 4,
+            metadata_op: 40,
+        },
+        digest: Some(filter.digest()),
+        offset: 6,
+        mode: ExecutionMode::Filtered,
+        policy_generation: 2,
+    };
+    assert_frame("filter_ack.bin", &acknowledgment);
+    assert_frame(
+        "filter_ack_unfiltered.bin",
+        &FilteredAck {
+            digest: None,
+            mode: ExecutionMode::Unfiltered,
+            ..acknowledgment
+        },
+    );
+    assert_frame(
+        "filter_reply_acknowledged.bin",
+        &FilterReply::Ok(FilterOutcome::Acknowledged(AckReceipt {
+            partition_id: 0,
+            offset: 6,
+            generation: canonical_generation(),
+        })),
+    );
     assert_frame(
         "filter_poll_request.bin",
         &FilteredPollRequest {
@@ -3485,7 +3536,6 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             start: FilteredStart::Next,
             count: 200,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: None,
             min_catalog_position: None,
         },
@@ -3504,7 +3554,6 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             start: FilteredStart::Next,
             count: 200,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: None,
             min_catalog_position: None,
         },
@@ -3523,7 +3572,6 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             start: FilteredStart::Next,
             count: 100,
             max_reply_bytes: 1024 * 1024,
-            read_mode: ReadMode::Primary,
             max_examined: Some(100),
             min_catalog_position: Some(CatalogPosition {
                 partition_id: 0,
@@ -3553,7 +3601,10 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
                 policy_generation: 1,
             },
             generation: canonical_generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext {
+                owner_generation: 4,
+                metadata_op: 40,
+            },
             next_scan_offset: Some(1397),
             safe_ack_offset: Some(1396),
             frontier: 2000,
@@ -3563,11 +3614,7 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             fault: None,
             unevaluated: Vec::new(),
             evaluation_limits: None,
-            records: {
-                let mut body = vec![0; 16];
-                body[4..12].copy_from_slice(&2000_u64.to_le_bytes());
-                body
-            },
+            records: polled_head(2000, 17, 4, 40),
         })),
     );
     assert_frame(
@@ -3577,7 +3624,10 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             partition_id: 0,
             policy: AppliedPolicy::unfiltered(canonical_identity().group_id, 0),
             generation: canonical_generation(),
-            read_mode: ReadMode::Primary,
+            ack_context: AckContext {
+                owner_generation: 4,
+                metadata_op: 40,
+            },
             next_scan_offset: Some(100),
             safe_ack_offset: Some(99),
             frontier: 2000,
@@ -3587,62 +3637,14 @@ fn given_consumer_filter_frames_when_encoded_then_should_match_golden_fixtures()
             fault: None,
             unevaluated: Vec::new(),
             evaluation_limits: None,
-            records: {
-                let mut body = vec![0; 16];
-                body[4..12].copy_from_slice(&2000_u64.to_le_bytes());
-                body
-            },
-        })),
-    );
-    assert_frame(
-        "filter_ack.bin",
-        &FilteredAck {
-            group_id: Some(canonical_identity().group_id),
-            v: laser_wire::codes::FILTER_OP_VERSION,
-            source: FilterSource {
-                stream: "orbit".to_owned(),
-                topic: "fleet_changes".to_owned(),
-            },
-            partition_id: 0,
-            consumer: FilterConsumer::Group("anomaly-desk".to_owned()),
-            generation: canonical_generation(),
-            digest: Some(filter.digest()),
-            offset: 1396,
-            mode: ExecutionMode::Filtered,
-            policy_generation: 1,
-        },
-    );
-    assert_frame(
-        "filter_ack_unfiltered.bin",
-        &FilteredAck {
-            group_id: Some(canonical_identity().group_id),
-            v: laser_wire::codes::FILTER_OP_VERSION,
-            source: FilterSource {
-                stream: "orbit".to_owned(),
-                topic: "fleet_changes".to_owned(),
-            },
-            partition_id: 0,
-            consumer: FilterConsumer::GroupId(canonical_identity().group_id),
-            generation: canonical_generation(),
-            digest: None,
-            offset: 99,
-            mode: ExecutionMode::Unfiltered,
-            policy_generation: 0,
-        },
-    );
-    assert_frame(
-        "filter_reply_acknowledged.bin",
-        &FilterReply::Ok(FilterOutcome::Acknowledged(AckReceipt {
-            partition_id: 0,
-            offset: 1396,
-            generation: canonical_generation(),
+            records: polled_head(2000, 17, 4, 40),
         })),
     );
     assert_frame(
         "filter_reply_error.bin",
         &FilterReply::Err(FilterError::new(
             FilterErrorReason::SourceChanged,
-            "partition 0 was purged",
+            "partition 0 was recreated",
         )),
     );
 }

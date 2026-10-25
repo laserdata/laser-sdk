@@ -1,5 +1,11 @@
 use crate::error::{LaserError, decode_managed_reply};
+use crate::iggy::prelude::Identifier;
 use crate::laser::Laser;
+use crate::nodes::{Target, is_route_stale, partition_primary};
+use crate::retry::{
+    FILTER_MUTATION_ATTEMPTS as MUTATION_ATTEMPTS,
+    FILTER_MUTATION_BACKOFF as MUTATION_RETRY_BACKOFF,
+};
 #[cfg(feature = "filters")]
 use laser_wire::codes::AGDX_LIST_FILTER_BINDINGS_CODE;
 use laser_wire::codes::{
@@ -25,10 +31,6 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
 const DEFAULT_PREVIEW_RECORDS: u32 = 20;
-use crate::retry::{
-    FILTER_MUTATION_ATTEMPTS as MUTATION_ATTEMPTS,
-    FILTER_MUTATION_BACKOFF as MUTATION_RETRY_BACKOFF,
-};
 const OUTCOME_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the typed catalog verbs wait for a mutation's authoritative
 /// outcome before they report it as ambiguous.
@@ -420,6 +422,17 @@ impl<'a> Filters<'a> {
         code: u32,
         request: &impl Serialize,
     ) -> Result<FilterOutcome, LaserError> {
+        self.native_to(code, request, Target::Caller).await
+    }
+
+    // A request a partition's primary no longer takes goes to the caller's
+    // node, which serves it from its own copy.
+    async fn native_to(
+        &self,
+        code: u32,
+        request: &impl Serialize,
+        target: Target,
+    ) -> Result<FilterOutcome, LaserError> {
         if !self.laser.capabilities().await.filters.native {
             return Err(LaserError::unsupported(
                 "filters",
@@ -428,7 +441,19 @@ impl<'a> Filters<'a> {
         }
         let payload = encode_named(request)
             .map_err(|error| LaserError::Codec(format!("encode filter request: {error}")))?;
-        let reply = self.laser.send_raw_with_response(code, payload).await?;
+        let reply = match self
+            .laser
+            .send_managed_to(code, payload.clone(), target)
+            .await
+        {
+            Err(LaserError::Iggy(error)) if target != Target::Caller && is_route_stale(&error) => {
+                self.laser
+                    .send_managed_to(code, payload, Target::Caller)
+                    .await?
+            }
+            sent => sent?,
+        }
+        .0;
         match decode_managed_reply::<FilterReply>(&reply)? {
             FilterReply::Ok(outcome) => Ok(outcome),
             FilterReply::Err(error) => Err(error.into()),
@@ -513,9 +538,20 @@ impl FilterPreviewBuilder<'_> {
 
     pub async fn send(self) -> Result<FilterPreview, LaserError> {
         self.request.validate()?;
+        let target = match partition_primary(
+            &self.filters.laser.client(),
+            &Identifier::named(&self.request.source.stream)?,
+            &Identifier::named(&self.request.source.topic)?,
+            self.request.partition_id,
+        )
+        .await
+        {
+            Ok(replica) => Target::Replica(replica),
+            Err(_) => Target::Caller,
+        };
         match self
             .filters
-            .native(AGDX_FILTER_PREVIEW_CODE, &self.request)
+            .native_to(AGDX_FILTER_PREVIEW_CODE, &self.request, target)
             .await?
         {
             FilterOutcome::Preview(preview) => Ok(preview),

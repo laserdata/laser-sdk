@@ -52,8 +52,6 @@ def test_given_word_values_when_classified_then_should_match_the_rust_helpers():
     assert ls.execution_mode_is_filtered("unfiltered") is False
     assert ls.fault_reason_is_foreign("foreign_codec") is True
     assert ls.fault_reason_is_foreign("malformed") is False
-    assert ls.read_mode_is_primary("primary") is True
-    assert ls.read_mode_is_primary("local") is False
     assert ls.record_policy_is_reject("reject") is True
     assert ls.record_policy_is_reject("pass") is False
     assert ls.filter_error_reason_code("not_found") == "NotFound"
@@ -121,3 +119,11 @@ def test_given_a_filter_op_version_when_checked_then_should_raise_version_skew_f
         ls.FilterError.check_version(ls.FILTER_OP_VERSION + 1)
     assert raised.value.reason == "version_skew"
     assert raised.value.version_skew
+
+
+def test_given_an_ack_context_when_constructed_then_should_preserve_owner_and_metadata_op():
+    context = ls.AckContext(owner_generation=7, metadata_op=41)
+    assert context.owner_generation == 7
+    assert context.metadata_op == 41
+    with pytest.raises(OverflowError):
+        ls.AckContext(owner_generation=-1, metadata_op=41)
