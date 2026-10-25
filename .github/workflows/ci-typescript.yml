@@ -64,7 +64,7 @@ jobs:
               git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               meaningful_paths="$(
                 git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" |
-                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$|^bench/|^fuzz/|^docker-compose\.yml$|^Cargo\.(toml|lock)$|^sdk/|^bdd/rust/|^examples/rust/|^foreign/python/|^bdd/python/|^examples/python/' || true
+                  grep -Ev '(^|/)[^/]+\.mdx?$|^docs/|^scripts/|^\.agents/|^\.claude/|^\.codex/|^\.github/|^foreign/python/pyproject\.toml$|^bench/|^fuzz/|^docker-compose\.yml$|^Cargo\.(toml|lock)$|^sdk/|^bdd/rust/|^examples/rust/|^foreign/python/|^bdd/python/|^examples/python/|^foreign/typescript/scripts/(validate-release|publish-release)\.mjs$' || true
               )"
               pyproject_changes="$(
                 git diff --unified=0 "${BASE_SHA}" "${HEAD_SHA}" -- foreign/python/pyproject.toml |
